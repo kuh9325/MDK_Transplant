@@ -222,26 +222,33 @@ works correctly** — aim/look in gameplay responds to relative motion.
 Unconditional OS-level grab before first focus is not guaranteeable from
 config alone; `CAPMOUSE /C` + `autolock` covers launch and click cases.
 
-### Mouse wheel / Z-axis passthrough
+### Mouse wheel / Z-axis — resolved for DOS (not exposed by MDKDOS.EXE)
 
 | Setting | Value | Notes |
 |---|---|---|
-| `[sdl] mouse_wheel_key` | `0` | never convert wheel to keys — wheel goes to the emulated mouse |
+| `[sdl] mouse_wheel_key` | `0` | never convert wheel to keys — wheel goes to the emulated mouse (correct passthrough default; avoids wheel→arrow-key noise in menus) |
 | `[keyboard] auxdevice` | `intellimouse` | wheel-capable PS/2 AUX device (default, made explicit) |
 
 Probe evidence (guest `MPROBE.COM` over COM1): INT 33h `AX=0011h` returns
 `AX=574Dh` (`'WM'` signature) + `CX=0001` — this DOSBox-X build exposes a
-**wheel-capable INT 33h API** (REPRODUCIBLE). So physical wheel events can
-reach a guest that queries the INT33 wheel extension.
+wheel-capable INT 33h API (REPRODUCIBLE).
 
-**MDK consumption: UNKNOWN.** No supported mechanism can synthesize wheel
-events without host input (AUTOTYPE types guest keys only; mapper events
-are host-side; KBC `0xD3` AUX injection feeds int15h subscribers, not the
-INT33 wheel counter). Whether MDK's `MouseWAxesMap`/`MouseDAxesMap`
-(`A0G`, semantics UNKNOWN) routes wheel→sniper zoom requires a physical
-wheel test or static analysis — documented as the one UNVERIFIED item.
-Keyboard zoom (`KeyZoomIn=19` R, `KeyZoomOut=33` F in BUILD_A's cfg) is the
-proven fallback path.
+**MDK DOS: OBSERVED (user-verified) — the in-game mouse configuration
+exposes only X and Y axes; no Z-axis/wheel assignment exists in
+MDKDOS.EXE.** Wheel→sniper-zoom is therefore **not** a DOS-runtime
+requirement and is not a Phase 2A blocker; `mouse_wheel_key=0` is kept as
+the correct generic passthrough but no Z axis can surface in this build.
+Sniper zoom remains available on the original keyboard controls
+(documented default A/Z; BUILD_A's `MDK.CFG` maps `KeyZoomIn=19` R,
+`KeyZoomOut=33` F). No wheel-injection TSRs, drivers, or patches will be
+built for the DOS lane.
+
+**Deferred — Win95 lane:** whether `MDK95.EXE` (or renderer variants)
+exposes a native Z-axis/wheel sniper-zoom binding; historical
+configuration evidence suggests it may. For the eventual macOS-native
+implementation, wheel→sniper-zoom is recorded as a compatibility/
+usability target to verify against the Win95 build — not a DOS-runtime
+requirement.
 
 ### MDK mouse configuration
 
