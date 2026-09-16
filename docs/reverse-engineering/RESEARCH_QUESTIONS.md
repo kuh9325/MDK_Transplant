@@ -43,7 +43,7 @@ with their evidence level and a pointer to the supporting document.
 - [UNKNOWN] Physics model — gravity, terminal velocity, sniper-mode mechanics
 - [OBSERVED, partial] Level transition / streaming behavior — New Game loads `FALL3D\*` (freefall) then a `TRAVERSE\LEVEL*` dataset (BUILD_A shows `LEVEL7` for the entry level — internal numbering vs displayed order UNKNOWN); level session ends back at intro/menu with `LASTGAME.SAV` write — trigger (death vs quit vs timeout) not yet separated
 - [OBSERVED] Attract-mode structure — intro FLIC → looping `MISC\MDKS_001..011.GIF` slideshow that requires a keypress to break (verified by no-key control run); menu files `STATS.MTI/BNI` on break
-- [OBSERVED, partial] DOS input path — game consumes real INT9-level scancodes (8042-injected input drives menus/gameplay); BIOS buffer stuffing has no effect; `MDK.CFG` remaps gameplay keys (`KeyUp=17` W etc.); menu nav uses arrows; F2/F3 = save/load (traversal only per MDKDOS.TXT)
+- [OBSERVED, partial] DOS input path — game consumes real INT9-level scancodes (8042-injected input drives menus/gameplay); BIOS buffer stuffing has no effect; `MDK.CFG` remaps gameplay keys (`KeyUp=17` W etc.); menu nav uses arrows; F2/F3 = save/load (traversal only per MDKDOS.TXT); captured (locked) mouse gives correct relative movement in-game (user-verified); INT33 wheel API present in emulator — whether MDK queries it for sniper zoom is UNKNOWN
 - [UNKNOWN] Freefall control model — whether steering is required/possible, or the fall auto-completes to traversal
 - [UNKNOWN] Difficulty scaling parameters
 

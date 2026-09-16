@@ -1,9 +1,9 @@
-# Runtime Oracle — Phase 2A/2A.1
+# Runtime Oracle — Phase 2A/2A.1/2A.2
 
 Status: DOS lane interactive baseline complete — automated input, gameplay
-entry, in-game save, and controlled quit all verified under DOSBox-X.
-Win95 lane blocked (see below). Recorded 2026-09-17 (2A), updated same
-date for 2A.1.
+entry, in-game save, controlled quit, automatic mouse capture, and wheel
+passthrough configuration all verified under DOSBox-X. Win95 lane blocked
+(see below). Recorded 2026-09-17 (2A), updated same date for 2A.1/2A.2.
 
 Everything in this document describes runtime behavior of **BUILD_A**
 (`original/installed/`), a third-party repack with self-described
@@ -45,7 +45,7 @@ permission-blocked, DOS-lane observation uses a **guest-side observer**
 | Emulator | DOSBox-X **2026.08.31** SDL2, Homebrew formula, arm64 (`/opt/homebrew/bin/dosbox-x`) |
 | Executable | `MDKDOS.EXE` (LE, DOS/4GW-bound; SHA-256 `7471fa6a…df591b`) |
 | Runtime copy | `runtime-private/dos/mdk/` — full copy of BUILD_A (ignored) |
-| Config | `scripts/runtime/dosbox-x-mdkdos.conf` (`machine=svga_s3`, `memsize=32`, `sbtype=sb16` 220/5/1, `cycles=max`) |
+| Config | `scripts/runtime/dosbox-x-mdkdos.conf` (`machine=svga_s3`, `memsize=32`, `sbtype=sb16` 220/5/1, `cycles=max`, `autolock=true`, `mouse_emulation=locked`, `mouse_wheel_key=0`, `auxdevice=intellimouse`, `CAPMOUSE /C` in autoexec) |
 | Copied-config change | `MDK.CFG` in the COPY only: `SoundID=0xE015`, `SoundIRQ=5`, `SoundDMA=1`, `SoundPort=0x220` (SB16 for HMI SOS; see `scripts/runtime/setup-runtime.sh`) |
 
 ### Launch procedure
@@ -205,6 +205,78 @@ above were caused by injected input, not timers.
 - `MDK.CFG` in BUILD_A maps movement to WASD-style scancodes
   (`KeyUp=17` W, `KeyDown=31` S, `KeySideL=30` A, `KeySideR=32` D);
   arrows still drive menus.
+
+## Phase 2A.2 — mouse capture, wheel passthrough, audio, stability
+
+### Mouse capture (automatic)
+
+| Setting | Value | Notes |
+|---|---|---|
+| `[sdl] autolock` | `true` | locks the pointer on first window click; Ctrl+F10 releases |
+| `[sdl] mouse_emulation` | `locked` | relative-motion emulation while captured (DOSBox-X default, made explicit) |
+| autoexec `CAPMOUSE /C` | — | DOSBox-X internal command; requests capture at launch so no click is needed |
+
+Manual Ctrl+F10 is no longer required in the documented launch path.
+**OBSERVED (user-verified): with the pointer locked, MDK's mouse movement
+works correctly** — aim/look in gameplay responds to relative motion.
+Unconditional OS-level grab before first focus is not guaranteeable from
+config alone; `CAPMOUSE /C` + `autolock` covers launch and click cases.
+
+### Mouse wheel / Z-axis passthrough
+
+| Setting | Value | Notes |
+|---|---|---|
+| `[sdl] mouse_wheel_key` | `0` | never convert wheel to keys — wheel goes to the emulated mouse |
+| `[keyboard] auxdevice` | `intellimouse` | wheel-capable PS/2 AUX device (default, made explicit) |
+
+Probe evidence (guest `MPROBE.COM` over COM1): INT 33h `AX=0011h` returns
+`AX=574Dh` (`'WM'` signature) + `CX=0001` — this DOSBox-X build exposes a
+**wheel-capable INT 33h API** (REPRODUCIBLE). So physical wheel events can
+reach a guest that queries the INT33 wheel extension.
+
+**MDK consumption: UNKNOWN.** No supported mechanism can synthesize wheel
+events without host input (AUTOTYPE types guest keys only; mapper events
+are host-side; KBC `0xD3` AUX injection feeds int15h subscribers, not the
+INT33 wheel counter). Whether MDK's `MouseWAxesMap`/`MouseDAxesMap`
+(`A0G`, semantics UNKNOWN) routes wheel→sniper zoom requires a physical
+wheel test or static analysis — documented as the one UNVERIFIED item.
+Keyboard zoom (`KeyZoomIn=19` R, `KeyZoomOut=33` F in BUILD_A's cfg) is the
+proven fallback path.
+
+### MDK mouse configuration
+
+Writable-copy `MDK.CFG` already carries mouse bindings:
+`MouseWAxesMap=A0G`, `MouseDAxesMap=A0G`, `MouseWButtMapD=32768`,
+`MouseDButtMapC=0`, `MouseDButtMapD=32768`. No offline edit needed —
+mouse works with the shipped values once the pointer is captured
+(user-observed). The map encoding is UNKNOWN; not modified.
+
+### Smoke test under the new config (REPRODUCIBLE — 3rd reproduction)
+
+Headless run with `-debug -log-int21` + `serial1=file` reproduced the full
+chain: attract → menu (`STATS.MTI`) → New Game (`FALL3D_1.MTI` →
+`LOAD_7.LBB` → `LEVEL7.CMI` + full LEVEL7 dataset) → traversal save
+(`SMKT.SAV`, 33,041 B, `SAVE` magic — third independent write) → serial
+frame dump (327,689 B = `FRAM`+mode `0x69`+5×64KB+`FEND`) → clean game
+exit (`int21 ah=4c`, text mode restored, emulator idle at DOS prompt).
+~11 min wall, no crash, no descriptor fault this run.
+
+### Audio
+
+- `SBLASTER:Raising IRQ` + DSP/DMA activity stream through the session
+  (676 IRQs in the smoke run) — emulated SB16 hardware path REPRODUCIBLE.
+- WAV/AVI capture: **not achievable headless** in this build.
+  `-avistart` parses with a warning and arms the recorder (`USING
+  AVI+ZMBV`) but never opens a capture file even windowed with
+  `output=surface`; `mapper_recwave`/`recmtwave` are host-input mapper
+  events unreachable from guest-side injection, and host keystroke
+  synthesis is TCC-blocked. Audible output remains UNVERIFIED.
+
+### Stability (2A.2)
+
+- Full smoke session: ~11 min wall, clean exit, no termination anomaly.
+- No recurrence of the earlier rare descriptor faults or slideshow hangs
+  this run; they remain documented emulated-edge flakes with retry budget.
 
 ## Win95 lane — BLOCKED
 
