@@ -1,7 +1,9 @@
-# Runtime Oracle — Phase 2A
+# Runtime Oracle — Phase 2A/2A.1
 
-Status: DOS lane bootstrap complete (menu reached). Win95 lane blocked
-(see below). Recorded 2026-09-17.
+Status: DOS lane interactive baseline complete — automated input, gameplay
+entry, in-game save, and controlled quit all verified under DOSBox-X.
+Win95 lane blocked (see below). Recorded 2026-09-17 (2A), updated same
+date for 2A.1.
 
 Everything in this document describes runtime behavior of **BUILD_A**
 (`original/installed/`), a third-party repack with self-described
@@ -54,9 +56,27 @@ scripts/runtime/run-mdk-dos.sh     # launch (logs to runtime-private/logs/)
 scripts/runtime/reset-dos.sh       # clean state: delete copy, rebuild from BUILD_A
 ```
 
-The conf mounts `runtime-private/dos/mdk` as `C:`, loads the observer TSR,
-then runs `MDKDOS.EXE`. There is intentionally no `exit` so post-exit state
-stays inspectable.
+The conf mounts `runtime-private/dos/mdk` as `C:` and runs `MDKDOS.EXE`.
+There is intentionally no `exit` so post-exit state stays inspectable.
+
+**Headless automated run (verified recipe):**
+
+```sh
+# 1. Generate TSRs into the disposable copy:
+python3 analysis-private/scripts/build_injkey.py runtime-private/dos/mdk/INJKEY.COM
+python3 analysis-private/scripts/bsnap.py       runtime-private/dos/mdk/SNAP.COM 470 5
+# 2. For a serial frame dump add to the conf:  serial1 = file file:/tmp/mdk-com1.bin
+# 3. Launch headless:
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+  dosbox-x -conf scripts/runtime/dosbox-x-mdkdos.conf \
+  -defaultdir "$PWD" -debug -log-int21 > runtime-private/logs/run.log 2>&1 &
+```
+
+The `-debug -log-int21` log records every guest file open by name —
+attract/menu/level transitions are all observable via filenames
+(`MDKS_*.GIF` slideshow cycle → `STATS.MTI/BNI` menu → `FALL3D\*` +
+`TRAVERSE\LEVEL7\*` level load → `SAVES\*` writes → `EXIT.TXT` quit).
+`inb/outb`-level keyboard injection needs no host permissions.
 
 ### Clean state / persistence
 
@@ -67,22 +87,27 @@ stays inspectable.
   the observer.
 - `runtime-private/captures/` holds decoded captures (ignored).
 
-### Guest-side observer (instrumentation, not part of the game)
+### Guest-side observer / injector (instrumentation, not part of the game)
 
-`SHOTKEY.COM` (built by `analysis-private/scripts/build_shotkey.py` from
-`shotkey.s`, both ignored) is a real-mode TSR loaded before the game. It:
+Two real-mode TSRs generated into the disposable runtime copy (sources in
+`analysis-private/scripts/`, all ignored; loaded conditionally by the conf
+autoexec via `if exist`):
 
-- hooks INT 08h (timer, 18.2 Hz — still reflected to real mode under
-  DOS/4GW);
-- every ~3 s writes `C:\SHnn.BIN` (then `QHnn.BIN` after 99): BIOS/VESA mode,
-  256-color DAC palette, text memory, and VESA banked windows via INT10
-  4F05h;
-- stuffs scripted BIOS-buffer keys (0040:001A) on a time schedule.
+- `INJKEY.COM` (`injkey.s` / `build_injkey.py`) — hooks INT 08h and injects
+  scheduled scancodes through keyboard-controller command `0xD2` (port
+  64h) + data port 60h: real IRQ1 → real-mode INT 9 path. This is the
+  **working input mechanism** (see Phase 2A.1 results).
+- `SNAP.COM` (`snap.s` / `bsnap.py`) — one-shot VESA bank dump streamed to
+  COM1; requires `serial1 = file file:<host-path>` in the conf. Pure port
+  I/O, no DOS calls in interrupt context.
+- `SHOTKEY.COM` (`shotkey.s` / `build_shotkey.py`, deprecated for input) —
+  INT 08h video-RAM dumps to `C:\SHnn.BIN` + BIOS-buffer key stuffing.
+  Frame capture worked (VESA `0x4101` PNGs); BIOS-buffer input did NOT
+  reach the game. The heavy dump path also proved unstable mid-game
+  (see Stability). Retained for intro/menu captures only.
 
-`analysis-private/scripts/decode_shots.py` converts dumps to PNG
-(VESA 8bpp) or text. The observer perturbs timing slightly and must not be
-treated as part of the original runtime; for interactive runs it can be
-removed from the conf autoexec.
+`analysis-private/scripts/decode_shots.py` converts SHnn/QHnn dumps to PNG
+(VESA 8bpp) or text.
 
 ### Smoke-test results (BUILD_A, PROVISIONAL)
 
@@ -98,14 +123,88 @@ removed from the conf autoexec.
 | Gameplay entry | Not reached (input not demonstrated) |
 | Clean termination | OBSERVED once — emulator exited cleanly ~1 min after the capture schedule ended; mechanism undetermined (possible menu Quit via a late key, or emulator-level event; no crash report) |
 
-### Known DOS-lane limitations
+## Phase 2A.1 — interactive DOS oracle results
+
+All results are **PROVISIONAL** (BUILD_A repack) and were produced
+headless (`SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`) with
+`-debug -log-int21` file-I/O logging as the observation channel.
+
+### Input mechanism — RESOLVED
+
+| Mechanism | Result |
+|---|---|
+| Host synthetic input (CGEvent/HID tap) | **BLOCKED** — `CGPreflightPostEventAccess`/`AXIsProcessTrusted` both false; TCC |
+| DOSBox-X `AUTOTYPE` | **UNUSABLE for scheduling** — present and functional, but blocks the shell while running and caps `-w` at 30 s; cannot be scheduled to fire minutes into the game from autoexec |
+| BIOS keyboard-buffer stuffing (SHOTKEY) | **NO EFFECT** — game does not poll INT 16h for gameplay input |
+| **8042 KBC command `0xD2` via guest TSR (INJKEY)** | **WORKING** — injects raw set-1 scancodes (explicit make/break) through port 64h/60h, raising real IRQ1 → game's own INT9 handler. Proven at DOS prompt (injected `exit` quit the shell) and in-game |
+
+INJKEY.COM hooks INT 08h, counts ticks (~18.2 Hz emulated), and fires a
+compile-time schedule of make/break scancode pairs. Emulated-tick to
+wall-time ratio is load-dependent (≈1:1.6–1:3); schedule values are
+nominal emulated seconds.
+
+### Verified input sequence (REPRODUCIBLE — 2 independent runs)
+
+Nominal-tick schedule (seconds × 18.2):
+
+| t (nom s) | Keys | Effect observed |
+|---|---|---|
+| 250 | Enter | attract slideshow stops → main menu (STATS.MTI/BNI open) |
+| 268/278 | Down, Up | menu navigation window |
+| 292, 310 | Enter ×2 | **New Game** → `FALL3D\*` + `MISC\LOAD_7.LBB` + `TRAVERSE\LEVEL7\*` load burst |
+| 345–430 | arrow/W holds | freefall steering attempts (fall appears to auto-complete) |
+| 450 | F2 + "SMKT" + Enter | **save dialog → `SAVES\SMKT.SAV` created, 33,041 bytes, `SAVE` header** — F2 is traversal-only per MDKDOS.TXT, so traversal gameplay was live |
+| 475–516 | W hold, Ctrl, Alt, Space | movement/fire/jump/sniper-mode inputs delivered |
+| 560–605 | Esc, Enter ×2 | **level exits → `LASTGAME.SAV` written → menu → clean quit to DOS** (`EXIT.TXT`) |
+
+Differential control (no keys injected): attract slideshow looped
+indefinitely (21+ cycles, >2× normal menu window) — proves the transitions
+above were caused by injected input, not timers.
+
+### Results table (Phase 2A.1)
+
+| Check | Result |
+|---|---|
+| Automated input | **REPRODUCIBLE** — KBC 0xD2 injection, guest TSR |
+| Menu navigation | **REPRODUCIBLE** — attract break, item selection, quit-confirm |
+| Gameplay entry | **REPRODUCIBLE** — New Game → freefall (FALL3D) → traversal level data (LEVEL7 dir naming is BUILD_A's internal layout; provisional) |
+| In-game input | **REPRODUCIBLE** — F2 save dialog + text entry + confirm produced `SMKT.SAV` (33,041 B) in two runs |
+| Player control | **PARTIAL** — movement/fire/jump/sniper keys delivered on schedule while in-game; screen-space effect not captured (frame dump torn; see below) |
+| Audio | **OBSERVED at hardware level** — `SBLASTER:Raising IRQ` streams through menu and gameplay (452 IRQs in the traversal window); audible host output unverified (headless dummy driver) |
+| Frame capture | **PARTIAL** — SNAP.COM streamed 320 KB VESA banks over COM1 mid-traversal; decode shows real pixel data but torn/banded (mid-draw sampling / bank-granularity) |
+| Controlled quit | **REPRODUCIBLE** — Esc + Enter → game exits to DOS → `EXIT.TXT` marker |
+
+### Runtime stability notes
+
+- Bare `MDKDOS.EXE` (no TSR) is stable ≥9 min headless; game self-quits
+  only via menu/quit input.
+- INJKEY/SNAP (lightweight int8 TSRs, no DOS calls in context) survived
+  full ~10-min nominal schedules including gameplay and clean quit.
+- The earlier heavy dump TSR (int21 file I/O + int10 bank-switch inside
+  int8) crashed nondeterministically with descriptor faults / wild writes
+  — InDOS reentrancy is the likely mechanism; it is deprecated.
+- Two further non-fatal flake modes observed with TSRs resident: rare
+  early descriptor faults (`E_Exit: JMP Illegal descriptor type N`), and
+  two slideshow-phase hangs ending `WARN SBLASTER:DMA ended when previous
+  IRQ had not yet been acked`. Both are emulated-edge instabilities, not
+  consistent — treat long automated runs as needing retry budget.
+- Emulated-time vs wall-time ratio drifts (≈1:1.6–1:3 under load);
+  schedules must be expressed in emulated ticks, not wall time.
+
+### Known DOS-lane limitations (post-2A.1)
 
 - Host TCC permissions block `screencapture` and keystroke injection —
-  all evidence is guest-side framebuffer dumps.
-- VESA dumps show occasional torn/partial frames (mid-draw sampling).
-- The observer perturbs timing; intro pacing (~7 min to menu) may differ
-  from an uninstrumented run.
-- Untested: sound output, savegames, level entry, in-game rendering.
+  all evidence is guest-side: file-I/O logs, serial-channel dumps, and
+  filesystem artifacts (`.SAV`, `EXIT.TXT`).
+- No clean gameplay screenshot yet: serial bank-dump frames are torn;
+  the int21-based dump TSR is too unstable mid-game.
+- Audible audio unverified headless; emulated SB16 IRQ/DMA activity is
+  the strongest current evidence.
+- What ends the traversal session (death vs quit key vs timeout) is not
+  fully separated — the quit keys land near the same window.
+- `MDK.CFG` in BUILD_A maps movement to WASD-style scancodes
+  (`KeyUp=17` W, `KeyDown=31` S, `KeySideL=30` A, `KeySideR=32` D);
+  arrows still drive menus.
 
 ## Win95 lane — BLOCKED
 

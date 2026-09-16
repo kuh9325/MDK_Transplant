@@ -39,9 +39,12 @@ with their evidence level and a pointer to the supporting document.
 - [UNKNOWN] Camera model — third-person follow behavior, constraints
 - [UNKNOWN] Weapon/projectile system — hitscan vs simulated projectiles, spread, damage
 - [UNKNOWN] RNG — generator, seeding, determinism
-- [UNKNOWN] Save-game structures and versioning
+- [OBSERVED, partial] Save-game structures and versioning — F2 traversal save produces `SAVES\<name>.SAV` (~33 KB, `SAVE` tag at offset 8); `LASTGAME.SAV` written on level exit; field semantics UNKNOWN
 - [UNKNOWN] Physics model — gravity, terminal velocity, sniper-mode mechanics
-- [UNKNOWN] Level transition / streaming behavior
+- [OBSERVED, partial] Level transition / streaming behavior — New Game loads `FALL3D\*` (freefall) then a `TRAVERSE\LEVEL*` dataset (BUILD_A shows `LEVEL7` for the entry level — internal numbering vs displayed order UNKNOWN); level session ends back at intro/menu with `LASTGAME.SAV` write — trigger (death vs quit vs timeout) not yet separated
+- [OBSERVED] Attract-mode structure — intro FLIC → looping `MISC\MDKS_001..011.GIF` slideshow that requires a keypress to break (verified by no-key control run); menu files `STATS.MTI/BNI` on break
+- [OBSERVED, partial] DOS input path — game consumes real INT9-level scancodes (8042-injected input drives menus/gameplay); BIOS buffer stuffing has no effect; `MDK.CFG` remaps gameplay keys (`KeyUp=17` W etc.); menu nav uses arrows; F2/F3 = save/load (traversal only per MDKDOS.TXT)
+- [UNKNOWN] Freefall control model — whether steering is required/possible, or the fall auto-completes to traversal
 - [UNKNOWN] Difficulty scaling parameters
 
 ## Rendering
@@ -58,7 +61,7 @@ with their evidence level and a pointer to the supporting document.
 
 ## Platform / IO
 
-- [UNKNOWN] Input abstraction differences across builds
+- [OBSERVED, partial] Input abstraction — DOS build reads INT9/port-60h scancodes directly (8042 cmd 0xD2 injection works; BIOS buffer stuffing does not); Win95 imports DINPUT; cross-build comparison UNKNOWN
 - [OBSERVED, partial] Audio output APIs per build — DOS build uses HMI Sound Operating System (`hmidet.386`/`hmidrv.386`, `MISC\HMISETUP.INI` listing SB/GUS/ESS/etc. device IDs); Windows builds import `DSOUND.dll` (DirectSoundCreate). Mac UNKNOWN.
 - [OBSERVED, partial] CD-ROM vs installed-data layout and runtime file resolution order — `MDK.CFG` contains `cddata`/`hddata` path keys (both `.\` in BUILD_A = full HDD install); `MDKDOS.EXE` references `MISC\FLIC\SHINY.FLC`, absent from the tree (CD-only content? UNKNOWN). Resolution order UNKNOWN.
 - [OBSERVED, partial] Configuration file formats — `MDK.CFG` is text key=value (sound device/IRQ/DMA/port, mouse mappings, `ForcePCorrect`, `D3DOptions`); `HMISETUP.INI` is INI-format. Registry/preferences usage UNKNOWN.
