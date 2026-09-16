@@ -1,7 +1,15 @@
 # Original Data Checklist
 
 Phase 0 finding: **no original MDK files were present** in the project root or
-in explicitly provided locations at baseline. That is expected, not a failure.
+in explicitly provided locations at baseline.
+
+Phase 1 update (2026-09-16): an installed PC tree was supplied at
+`original/installed/` (inventoried as BUILD_A — see
+`docs/reverse-engineering/ORIGINAL_BUILDS.md`). It covers the executable,
+DLL/driver, data-archive, level, video, config, and documentation items
+below for the DOS + Windows builds. Still not supplied: Classic Mac build,
+CD-ROM image/installer, and a verifiably unmodified retail dump (BUILD_A
+executables are NoCD-fixed per its own readme).
 
 This checklist describes what the user may later place into a local drop-zone
 directory (e.g. `original/` — git-ignored) from a **legally owned** copy.
