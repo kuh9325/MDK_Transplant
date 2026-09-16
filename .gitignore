@@ -1,0 +1,52 @@
+# ============================================================
+# MDK-Native .gitignore
+# Phase 0: preserve evidence, exclude proprietary material.
+# Rules are intentionally narrow — do not hide our own source.
+# ============================================================
+
+# --- Local environment / OS noise ---
+.DS_Store
+__pycache__/
+*.pyc
+.devin/config.local.json
+
+# --- Local build output (future native implementation) ---
+build/
+out/
+*.o
+*.obj
+
+# --- Directories reserved for user-supplied ORIGINAL MDK material ---
+# These must NEVER be committed. They exist only as local drop-zones.
+original/
+retail/
+gog/
+cdrom/
+game-data/
+proprietary/
+analysis-private/
+
+# --- Common original executable / archive / disc-image formats ---
+# Scoped broadly enough to catch stray drops, narrow enough not to
+# hide our own future source or synthetic test fixtures.
+*.exe
+*.dll
+*.com
+*.sys
+*.ovl
+*.iso
+*.dmg
+*.cab
+*.img
+*.ima
+*.cue
+*.ccd
+*.toc
+*.mdf
+*.mds
+*.nrg
+*.pqa
+
+# CD-ROM .bin/.dat tracks and game data archives: ignore only inside
+# the proprietary drop-zones (handled by dir rules above). If a stray
+# large binary blob appears elsewhere, review it before committing.
