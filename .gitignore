@@ -25,6 +25,7 @@ cdrom/
 game-data/
 proprietary/
 analysis-private/
+runtime-private/
 
 # --- Common original executable / archive / disc-image formats ---
 # Scoped broadly enough to catch stray drops, narrow enough not to

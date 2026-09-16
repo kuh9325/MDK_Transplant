@@ -73,6 +73,12 @@ all executables "NoCD-Fixed". Consequences:
   EVIDENCE: LE module name `mdk`; repack readme rename claim; original
   `READMEE.TXT` documents the DOS version being launched as "MDK").
 
+**Runtime status (Phase 2A):** BUILD_A is in use as
+`PROVISIONAL_RUNTIME_SOURCE`. `MDKDOS.EXE` launches to the main menu
+under DOSBox-X 2026.08.31 from a disposable copy — see
+`RUNTIME_ORACLE.md`. All runtime observations remain PROVISIONAL pending
+a verified-clean build.
+
 #### Executables (all x86 32-bit; OBSERVED via headers/imports)
 
 | File | Size | Format | Role (evidence) |

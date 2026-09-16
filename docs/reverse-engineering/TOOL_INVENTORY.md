@@ -1,7 +1,8 @@
 # Tool & Machine Inventory
 
-Recorded: 2026-09-16 (Phase 0 baseline)
-Method: availability checks only — nothing was installed or configured.
+Recorded: 2026-09-16 (Phase 0 baseline); updated 2026-09-17 (Phase 2A).
+Phase 0 method was availability checks only; Phase 2A installed one
+runtime tool (DOSBox-X, below).
 
 ## Machine
 
@@ -27,9 +28,11 @@ Method: availability checks only — nothing was installed or configured.
 | Hopper | NOT installed |
 | ImHex | NOT installed |
 | Kaitai Struct compiler | NOT installed |
-| DOSBox / DOSBox-X | NOT installed |
-| QEMU | NOT installed |
-| Wine / CrossOver | NOT installed |
+| DOSBox-X | **2026.08.31** SDL2 — Homebrew formula, arm64, `/opt/homebrew/bin/dosbox-x` (Phase 2A; see `RUNTIME_ORACLE.md`) |
+| DOSBox / DOSBox-staging | NOT installed |
+| QEMU | NOT installed (11.1.1 bottled in Homebrew; planned Win95-lane tool once OS media is supplied) |
+| Wine / CrossOver | NOT installed (`wine-stable` cask is x86-only + Gatekeeper-disabled; no Rosetta) |
+| Rosetta 2 | NOT installed |
 | radare2 | NOT installed |
 | Binary Ninja | NOT installed |
 | LIEF (Python) | NOT installed |
