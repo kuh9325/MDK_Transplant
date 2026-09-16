@@ -62,3 +62,25 @@ Boundary notes (intentions, not commitments):
 - No renderer, no gameplay, no decoders.
 - Subsystem boundaries will be revised once the original builds' actual
   module organization is observed.
+
+## Phase 2B cross-check (ORIGINAL ENGINE OBSERVATION)
+
+`EXECUTABLE_MAP.md` supports the tentative boundaries above:
+
+- A **platform layer** per OS is real in the original: identical engine
+  source-path strings (`mdksrc\main\*`, `mdksrc\share\*`) in DOS and Win95
+  builds, with only platform modules swapped (`dos\opthmi.c`+VESA+INT9 vs
+  DirectDraw/DirectInput/DirectSound). ⇒ planned `platform` boundary matches.
+- The original is **mode-dispatch monolithic**, not cleanly layered: one
+  main loop (`MDK95 FUN_0040103c`) switches on a primary-mode global with
+  modal overlay sub-modes. Native ports should reproduce this state machine
+  rather than impose a modern loop shape.
+- Renderer is modular at link time (software / D3D / Glide / SGL / Vérité
+  variants share the same engine image except the render module), which
+  supports keeping `renderer` behind an abstraction.
+- `asset parsing` (chunk/`readbin`/`mdkfopen`/`setupob`) is a distinct
+  shared layer — consistent with the tentative split.
+
+No boundary changes are warranted yet; game-logic internals (AI, physics,
+camera) remain insufficiently mapped to validate `game logic`/`world`
+subdivision.

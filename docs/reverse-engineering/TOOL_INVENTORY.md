@@ -1,8 +1,9 @@
 # Tool & Machine Inventory
 
-Recorded: 2026-09-16 (Phase 0 baseline); updated 2026-09-17 (Phase 2A).
+Recorded: 2026-09-16 (Phase 0 baseline); updated 2026-09-17 (Phase 2A, Phase 2B).
 Phase 0 method was availability checks only; Phase 2A installed one
-runtime tool (DOSBox-X, below).
+runtime tool (DOSBox-X, below); Phase 2B installed the static-analysis
+toolchain (OpenJDK 21 + Ghidra 12.1.3, below).
 
 ## Machine
 
@@ -24,7 +25,8 @@ runtime tool (DOSBox-X, below).
 
 | Tool | Status |
 |---|---|
-| Ghidra | NOT installed |
+| Ghidra | **12.1.3 PUBLIC** (`ghidra_12.1.3_PUBLIC_20260817.zip`, official SHA-256 `93a5d11a…81fd54`), private install `analysis-private/ghidra/`; macOS arm64 natives built via `support/gradle/gradlew buildNatives`; used headless for Phase 2B (see EXECUTABLE_MAP.md) |
+| OpenJDK | **21.0.12.1** Homebrew `openjdk@21`, `/opt/homebrew/opt/openjdk@21` (keg-only; required by Ghidra 12.x) |
 | Hopper | NOT installed |
 | ImHex | NOT installed |
 | Kaitai Struct compiler | NOT installed |
