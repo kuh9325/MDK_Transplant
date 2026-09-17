@@ -38,9 +38,11 @@ build/native/mdk-native.app/Contents/MacOS/mdk-native \
 CLI options: `--data-path DIR` (read-only data root), `--frames N`
 (quit after N frames), `--selftest` (inject + verify synthetic input
 events), `--dump-ppm FILE` (write last presented frame),
-`--preview-resource FILE RECORD` (Phase 4A: decode + present one
-proven paletted BNI visual resource — e.g.
-`--preview-resource MISC/OPTIONS.BNI MDKOPT`; requires `--data-path`),
+`--preview-resource FILE RECORD` (Phase 4A/4B: decode + present one
+proven BNI visual resource — the paletted `MISC/OPTIONS.BNI MDKOPT`,
+or the indexed-only `STREAM/STREAM.BNI BG` whose palette is resolved
+by the proven stream-context binding `SYS_PAL[0:64]` + `PAL[64:256]`;
+requires `--data-path`),
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -58,7 +60,8 @@ src/
              mode_dispatch.*     — PrimaryModeId/SubModeId dispatcher
              data_root.*         --data-path validation (read-only seam)
              indexed_image.*     — decoded indexed visual + blit (4A)
-             bni_image.*         — proven BNI bitmap payload decoder (4A)
+             bni_image.*         — proven BNI bitmap payload decoders (4A/4B)
+             stream_context.*    — STREAM.BNI backdrop palette binding (4B)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -170,10 +173,12 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- Runtime original-data use is limited to the Phase 4A preview: one
+- Runtime original-data use is limited to the Phase 4A/4B preview: one
   named record from one BNI file (`--preview-resource`), decoded by
-  the proven paletted-bitmap layout into the indexed framebuffer — see
-  `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
+  the proven paletted-bitmap layout or — for `STREAM/STREAM.BNI BG`
+  only — the proven external-palette binding (`SYS_PAL` head + `PAL`
+  tail, resolved via `MISC/MDKFONT.FTI`) into the indexed framebuffer
+  — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.
 - Window-close quit and resize were code-verified; physical

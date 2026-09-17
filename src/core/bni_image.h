@@ -28,7 +28,9 @@
 //   surface to surface row 60+i; the blit is a contiguous copy so
 //   payload row order == surface row order). Stride == width (the
 //   54000-dword copy has no row padding). No transparency: the blit
-//   overwrites every work-surface byte.
+//   overwrites every work-surface byte. The indexed-only class is
+//   the same shape (the BG blit FUN_0042e684 copies with stride 600
+//   == width, top-down, overwriting every byte).
 //
 // The 768-byte head is only a palette when the consumer uses it as
 // one — probe order checks the paletted shape FIRST because a
@@ -79,6 +81,19 @@ std::string_view bniImageShapeName(BniImageShape s);
 // verbatim (R,G,B order per the proven SetEntries path).
 std::optional<IndexedImage> decodeBniPalettedImage(
     std::span<const std::byte> payload, std::string* error = nullptr);
+
+// Decode an indexed-only BNI image (the BG/SPACE/PLANET class) with
+// an externally supplied palette. `imagePayload` must tile EXACTLY:
+// size == 4 + w*h, w/h > 0. `palettePayload` must be exactly the
+// 768-byte effective RGB table (256 x {R,G,B}) the consumer uploads —
+// this decoder never invents colors and never reaches for a sibling
+// record itself; pairing an image with its palette is the caller's
+// (context) responsibility (see core/stream_context.h for the one
+// proven binding so far).
+std::optional<IndexedImage> decodeBniIndexedImage(
+    std::span<const std::byte> imagePayload,
+    std::span<const std::byte> palettePayload,
+    std::string* error = nullptr);
 
 } // namespace mdk
 

@@ -21,6 +21,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/sni_directory.h"
+#include "core/stream_context.h"
 
 #include <bit>
 #include <cstdio>
@@ -568,6 +569,41 @@ int selftest() {
        img->palette[7].r == 7 && img->palette[7].g == 248;
   std::fprintf(stderr, "selftest bni-paletted-image: %s\n",
                ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic indexed-only + composed-palette check (Phase 4B; no
+  // original data): {u16 w, u16 h, px} decoded against a 768-byte
+  // palette composed SYS_PAL-head + PAL-tail style.
+  {
+    std::vector<std::byte> idx(4 + 6);  // 3x2 indexed-only image
+    idx[0] = std::byte{3};
+    idx[2] = std::byte{2};
+    for (int i = 0; i < 6; ++i) {
+      idx[4 + i] = static_cast<std::byte>(i + 9);
+    }
+    std::vector<std::byte> sysPal(192), palRec(768);
+    for (int i = 0; i < 192; ++i) {
+      sysPal[i] = static_cast<std::byte>(i + 1);
+    }
+    for (int i = 0; i < 768; ++i) {
+      palRec[i] = static_cast<std::byte>((i * 3) & 0xff);
+    }
+    const auto composed =
+        mdk::composeStreamPalette(sysPal, palRec, &derr);
+    const auto img2 = composed
+        ? mdk::decodeBniIndexedImage(idx, *composed, &derr)
+        : std::nullopt;
+    ok = composed && img2 && img2->width == 3 && img2->height == 2 &&
+         img2->pixels.size() == 6 && img2->pixels[5] == 14 &&
+         img2->hasPalette &&
+         img2->palette[0].r == 1 &&          // SYS_PAL head
+         img2->palette[64].r ==              // PAL tail @+0xc0
+             static_cast<std::uint8_t>((0xc0 * 3) & 0xff);
+    std::fprintf(stderr, "selftest bni-indexed-image: %s\n",
+                 ok ? "PASS" : "FAIL");
+  }
   return ok ? 0 : 1;
 }
 
@@ -781,8 +817,40 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(probe.pixelBytes),
                 probe.headerBytes);
     if (probe.shape == mdk::BniImageShape::kIndexedOnly) {
-      std::printf("palette:   none embedded — the consumer resolves a "
-                  "separate palette record (not decoded here)\n");
+      // Indexed-only records carry no palette; the consumer binds one
+      // from context. The only binding proven so far is the STREAM
+      // backdrop (FUN_0042b270): SYS_PAL head + PAL record tail.
+      if (!mdk::isStreamBackdropRequest(*target, *visualInfoName)) {
+        std::printf("palette:   none embedded — no proven "
+                    "external-palette binding for this context "
+                    "(Phase 4B proves %s %s only)\n",
+                    std::string(mdk::kStreamBniFile).c_str(),
+                    std::string(mdk::kStreamImageRecord).c_str());
+        return 0;
+      }
+      const auto fti = root->readFile(std::string(mdk::kStreamSystemFile),
+                                      kEntriesMaxBytes, &err);
+      if (!fti) {
+        std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
+        return 1;
+      }
+      std::string derr;
+      const auto img = mdk::decodeStreamBackdrop(
+          std::span<const std::byte>(file->data(), file->size()),
+          std::span<const std::byte>(fti->data(), fti->size()), &derr);
+      if (!img) {
+        std::printf("decode:    FAILED (%s)\n", derr.c_str());
+        return 1;
+      }
+      std::printf("palette:   external — STREAM context "
+                  "(FUN_0042b270): %s %s[0:64] + %s[64:256] "
+                  "(record bytes [0xc0,0x300))\n",
+                  std::string(mdk::kStreamSystemFile).c_str(),
+                  std::string(mdk::kStreamSystemRecord).c_str(),
+                  std::string(mdk::kStreamPaletteRecord).c_str());
+      std::printf("decode:    ok — digest=%016llx\n",
+                  static_cast<unsigned long long>(
+                      mdk::imageDigest(*img)));
       return 0;
     }
     std::string derr;

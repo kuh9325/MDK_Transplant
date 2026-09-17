@@ -144,6 +144,34 @@ FtiDirectory inspectFtiDirectory(std::span<const std::byte> file) {
   return result;
 }
 
+const FtiRecord* findFtiRecord(const FtiDirectory& dir,
+                               std::string_view name) {
+  const auto fold = [](char c) {
+    return (c >= 'a' && c <= 'z') ? static_cast<char>(c - 0x20) : c;
+  };
+  for (const auto& e : dir.records) {
+    std::size_t i = 0;
+    for (; i < e.nameField.size(); ++i) {
+      const auto b = e.nameField[i];
+      const char c = static_cast<char>(b);
+      if (b == std::byte{0}) {
+        break;
+      }
+      if (i >= name.size() || fold(c) != fold(name[i])) {
+        break;
+      }
+    }
+    // Matched when the loop consumed all of `name` and stopped at a
+    // field NUL or the field end.
+    const bool fieldEnded = i == e.nameField.size() ||
+                            e.nameField[i] == std::byte{0};
+    if (i == name.size() && fieldEnded) {
+      return &e;
+    }
+  }
+  return nullptr;
+}
+
 std::string_view ftiDirectoryStatusName(FtiDirectoryStatus s) {
   switch (s) {
     case FtiDirectoryStatus::kOk:                  return "ok";

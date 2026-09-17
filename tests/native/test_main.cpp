@@ -17,6 +17,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/sni_directory.h"
+#include "core/stream_context.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
 
@@ -2510,6 +2511,278 @@ void test_bni_image() {
   }
 }
 
+// Synthetic indexed-only image payload {u16le w, u16le h, px[w*h]}
+// and 768-byte RGB palette (no original data) — the Phase 4B shape.
+std::vector<std::byte> makeIndexedOnlyImage(std::uint16_t w,
+                                            std::uint16_t h) {
+  std::vector<std::byte> v(4 + std::size_t(w) * h, std::byte{0});
+  v[0] = static_cast<std::byte>(w & 0xff);
+  v[1] = static_cast<std::byte>(w >> 8);
+  v[2] = static_cast<std::byte>(h & 0xff);
+  v[3] = static_cast<std::byte>(h >> 8);
+  for (std::size_t i = 4; i < v.size(); ++i) {
+    v[i] = static_cast<std::byte>((i - 4) % 256);  // ramp 0..255
+  }
+  return v;
+}
+
+std::vector<std::byte> makeRgbPalette(std::size_t bytes,
+                                      int seed) {
+  std::vector<std::byte> v(bytes, std::byte{0});
+  for (std::size_t i = 0; i < bytes; ++i) {
+    v[i] = static_cast<std::byte>((i + seed) & 0xff);
+  }
+  return v;
+}
+
+void test_bni_indexed_image() {
+  // decodeBniIndexedImage — valid image + 768-byte RGB palette.
+  {
+    const auto img = mdk::decodeBniIndexedImage(
+        makeIndexedOnlyImage(7, 5), makeRgbPalette(768, 0));
+    CHECK(img.has_value());
+    CHECK(img->width == 7 && img->height == 5 && img->stride == 7);
+    CHECK(img->pixels.size() == 35);
+    for (std::size_t i = 0; i < 35; ++i) {
+      CHECK(img->pixels[i] == static_cast<std::uint8_t>(i % 256));
+    }
+    CHECK(img->hasPalette);
+    // palette byte i -> entry i/3, channel i%3.
+    CHECK(img->palette[0].r == 0 && img->palette[0].g == 1 &&
+          img->palette[0].b == 2);
+    CHECK(img->palette[255].r == 253 && img->palette[255].g == 254 &&
+          img->palette[255].b == 255);
+  }
+
+  // 1x1 minimum size.
+  {
+    const auto img = mdk::decodeBniIndexedImage(
+        makeIndexedOnlyImage(1, 1), makeRgbPalette(768, 0));
+    CHECK(img.has_value());
+    CHECK(img->pixels.size() == 1 && img->pixels[0] == 0);
+  }
+
+  // Top-down row mapping: pixels[y*w+x] == payload[4 + y*w + x].
+  {
+    auto raw = makeIndexedOnlyImage(4, 2);
+    raw[4 + 1 * 4 + 2] = std::byte{0xab};  // row 1, col 2
+    const auto img =
+        mdk::decodeBniIndexedImage(raw, makeRgbPalette(768, 0));
+    CHECK(img->pixels[1 * 4 + 2] == 0xab);
+    CHECK(img->pixels[2] == 2);  // row 0 col 2 = ramp value
+  }
+
+  // Truncated pixel region / truncated dims -> refused.
+  {
+    auto v = makeIndexedOnlyImage(4, 3);
+    v.pop_back();
+    CHECK(!mdk::decodeBniIndexedImage(v, makeRgbPalette(768, 0))
+               .has_value());
+    const std::vector<std::byte> head(v.begin(), v.begin() + 3);
+    CHECK(!mdk::decodeBniIndexedImage(head, makeRgbPalette(768, 0))
+               .has_value());
+    const std::vector<std::byte> dims(v.begin(), v.begin() + 4);
+    CHECK(!mdk::decodeBniIndexedImage(dims, makeRgbPalette(768, 0))
+               .has_value());
+  }
+
+  // Trailing slack -> refused (exact tiling).
+  {
+    auto v = makeIndexedOnlyImage(4, 3);
+    v.push_back(std::byte{0});
+    CHECK(!mdk::decodeBniIndexedImage(v, makeRgbPalette(768, 0))
+               .has_value());
+  }
+
+  // Zero/overflowing dimensions -> refused.
+  {
+    auto v = makeIndexedOnlyImage(0, 3);
+    v.resize(4);  // isolate the w==0 rule (size would tile at 4)
+    CHECK(!mdk::decodeBniIndexedImage(v, makeRgbPalette(768, 0))
+               .has_value());
+    auto big = makeIndexedOnlyImage(4, 3);
+    big[0] = std::byte{0xff};  // w = 0xff04 -> w*h escapes payload
+    big[1] = std::byte{0xff};
+    CHECK(!mdk::decodeBniIndexedImage(big, makeRgbPalette(768, 0))
+               .has_value());
+  }
+
+  // Palette size: exactly 768 required — short and long both fail.
+  {
+    const auto img = makeIndexedOnlyImage(2, 2);
+    CHECK(!mdk::decodeBniIndexedImage(img, makeRgbPalette(767, 0))
+               .has_value());
+    CHECK(!mdk::decodeBniIndexedImage(img, makeRgbPalette(769, 0))
+               .has_value());
+    CHECK(!mdk::decodeBniIndexedImage(img, {}).has_value());
+  }
+
+  // The indexed decoder refuses the paletted layout.
+  {
+    std::string err;
+    CHECK(!mdk::decodeBniIndexedImage(makePalettedImage(4, 3),
+                                      makeRgbPalette(768, 0), &err)
+               .has_value());
+    CHECK(!err.empty());
+  }
+
+  // Deterministic digest across the external-palette path.
+  {
+    const auto a = mdk::decodeBniIndexedImage(makeIndexedOnlyImage(8, 4),
+                                              makeRgbPalette(768, 0));
+    const auto b = mdk::decodeBniIndexedImage(makeIndexedOnlyImage(8, 4),
+                                              makeRgbPalette(768, 0));
+    CHECK(a && b);
+    CHECK(mdk::imageDigest(*a) == mdk::imageDigest(*b));
+    const auto c = mdk::decodeBniIndexedImage(makeIndexedOnlyImage(8, 4),
+                                              makeRgbPalette(768, 9));
+    CHECK(c && mdk::imageDigest(*a) != mdk::imageDigest(*c));
+  }
+}
+
+void test_stream_context() {
+  // composeStreamPalette: entries 0-63 from SYS_PAL head, 64-255
+  // from PAL bytes [0xc0, 0x300) — the FUN_0042b270 composition.
+  {
+    const auto sys = makeRgbPalette(192, 0x10);
+    const auto pal = makeRgbPalette(768, 0x80);
+    const auto out = mdk::composeStreamPalette(sys, pal);
+    CHECK(out.has_value());
+    CHECK(out->size() == 768);
+    for (std::size_t i = 0; i < 192; ++i) {
+      CHECK((*out)[i] == sys[i]);  // head from SYS_PAL
+    }
+    for (std::size_t i = 0; i < 576; ++i) {
+      CHECK((*out)[0xc0 + i] == pal[0xc0 + i]);  // tail from PAL+0xc0
+    }
+    // Verify the tail really starts at 0xc0, not 0.
+    CHECK((*out)[0xc0] == pal[0xc0]);
+    CHECK((*out)[0xc0] != pal[0] || pal[0] == pal[0xc0]);
+  }
+
+  // Malformed inputs: wrong sizes rejected.
+  {
+    const auto sys = makeRgbPalette(192, 0);
+    const auto pal = makeRgbPalette(768, 0);
+    CHECK(!mdk::composeStreamPalette(makeRgbPalette(191, 0), pal)
+               .has_value());
+    CHECK(!mdk::composeStreamPalette(makeRgbPalette(193, 0), pal)
+               .has_value());
+    CHECK(!mdk::composeStreamPalette(sys, makeRgbPalette(767, 0))
+               .has_value());
+    CHECK(!mdk::composeStreamPalette(sys, makeRgbPalette(769, 0))
+               .has_value());
+  }
+
+  // isStreamBackdropRequest: case-insensitive, '/' and '\'
+  // equivalent — matches DOS path semantics.
+  {
+    CHECK(mdk::isStreamBackdropRequest("STREAM/STREAM.BNI", "BG"));
+    CHECK(mdk::isStreamBackdropRequest("stream\\stream.bni", "bg"));
+    CHECK(mdk::isStreamBackdropRequest("STREAM\\STREAM.BNI", "Bg"));
+    CHECK(!mdk::isStreamBackdropRequest("STREAM/STREAM.BNI",
+                                        "PLANET"));
+    CHECK(!mdk::isStreamBackdropRequest("FALL3D/FALL3D.BNI", "BG"));
+    CHECK(!mdk::isStreamBackdropRequest("STREAM/STREAM.BNI", ""));
+  }
+
+  // End-to-end on fully synthetic container bytes: a BNI with
+  // {PAL 768B, BG {u16 w,h,px}} plus an FTI with {SYS_PAL 192B}.
+  auto bni = SyntheticBni::build({{"PAL", 768}, {"BG", 4 + 12}});
+  auto fti = SyntheticFti::build({{"SYS_PAL", 192}, {"FONTSML", 8}});
+  {
+    const auto bdir = mdk::inspectBniDirectory(bni.buf);
+    const auto fdir = mdk::inspectFtiDirectory(fti.buf);
+    CHECK(bdir.status == mdk::BniDirectoryStatus::kOk);
+    CHECK(fdir.status == mdk::FtiDirectoryStatus::kOk);
+    const auto* pr = mdk::findBniRecord(bdir, "PAL");
+    const auto* br = mdk::findBniRecord(bdir, "BG");
+    const auto* sr = mdk::findFtiRecord(fdir, "SYS_PAL");
+    CHECK(pr && br && sr);
+    // Fill PAL: bytes i = i&0xff (offset marker at 0xc0).
+    for (std::size_t i = 0; i < 768; ++i) {
+      bni.buf[pr->payloadFileOffset + i] =
+          static_cast<std::byte>(i & 0xff);
+    }
+    // Fill BG: 4x3, pixels ramp from 0x20.
+    bni.buf[br->payloadFileOffset + 0] = std::byte{4};
+    bni.buf[br->payloadFileOffset + 2] = std::byte{3};
+    for (std::size_t i = 0; i < 12; ++i) {
+      bni.buf[br->payloadFileOffset + 4 + i] =
+          static_cast<std::byte>(0x20 + i);
+    }
+    // Fill SYS_PAL: bytes i = 0x40 + i.
+    for (std::size_t i = 0; i < 192; ++i) {
+      fti.buf[sr->payloadFileOffset + i] =
+          static_cast<std::byte>(0x40 + i);
+    }
+    const auto img = mdk::decodeStreamBackdrop(bni.buf, fti.buf);
+    CHECK(img.has_value());
+    CHECK(img->width == 4 && img->height == 3);
+    CHECK(img->pixels.size() == 12 && img->pixels[0] == 0x20 &&
+          img->pixels[11] == 0x2b);
+    CHECK(img->hasPalette);
+    // entries 0-63 from SYS_PAL (0x40+i), entries 64-255 from
+    // PAL[0xc0+i] (value (0xc0+i)&0xff == i since pal[i]=i&0xff).
+    CHECK(img->palette[0].r == 0x40 && img->palette[0].g == 0x41);
+    CHECK(img->palette[63].b == 0x40 + 191);
+    CHECK(img->palette[64].r == 0xc0 && img->palette[64].g == 0xc1);
+    CHECK(img->palette[255].b == 0xff);
+  }
+
+  // Missing required records -> fail.
+  {
+    std::string err;
+    auto noPal = SyntheticBni::build({{"BG", 4 + 12}});
+    CHECK(!mdk::decodeStreamBackdrop(noPal.buf, fti.buf, &err)
+               .has_value());
+    CHECK(err.find("PAL") != std::string::npos);
+
+    auto noBg = SyntheticBni::build({{"PAL", 768}});
+    CHECK(!mdk::decodeStreamBackdrop(noBg.buf, fti.buf, &err)
+               .has_value());
+    CHECK(err.find("BG") != std::string::npos);
+
+    auto noSys = SyntheticFti::build({{"FONTSML", 8}});
+    CHECK(!mdk::decodeStreamBackdrop(bni.buf, noSys.buf, &err)
+               .has_value());
+    CHECK(err.find("SYS_PAL") != std::string::npos);
+  }
+
+  // Wrong record class: BG pointing at a non-image payload -> fail.
+  {
+    std::string err;
+    auto bad = SyntheticBni::build({{"PAL", 768}, {"BG", 20}});
+    const auto bd = mdk::inspectBniDirectory(bad.buf);
+    const auto* br = mdk::findBniRecord(bd, "BG");
+    bad.buf[br->payloadFileOffset] = std::byte{9};  // bogus dims
+    CHECK(!mdk::decodeStreamBackdrop(bad.buf, fti.buf, &err)
+               .has_value());
+    CHECK(!err.empty());
+  }
+
+  // Malformed palette record (wrong size) -> fail.
+  {
+    std::string err;
+    auto badPal = SyntheticBni::build({{"PAL", 700}, {"BG", 4 + 12}});
+    const auto bd = mdk::inspectBniDirectory(badPal.buf);
+    const auto* br = mdk::findBniRecord(bd, "BG");
+    badPal.buf[br->payloadFileOffset + 0] = std::byte{4};
+    badPal.buf[br->payloadFileOffset + 2] = std::byte{3};
+    CHECK(!mdk::decodeStreamBackdrop(badPal.buf, fti.buf, &err)
+               .has_value());
+    CHECK(!err.empty());
+  }
+
+  // Malformed container inputs -> fail, not crash.
+  {
+    std::string err;
+    const std::array<std::byte, 16> junk = {std::byte{7}};
+    CHECK(!mdk::decodeStreamBackdrop(junk, fti.buf, &err).has_value());
+    CHECK(!mdk::decodeStreamBackdrop(bni.buf, junk, &err).has_value());
+  }
+}
+
 void test_indexed_image_blit() {
   // Centered 1:1 placement inside the 600x360 work surface.
   {
@@ -2787,6 +3060,8 @@ int main() {
   test_fti_directory();
   test_bni_directory();
   test_bni_image();
+  test_bni_indexed_image();
+  test_stream_context();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

@@ -108,4 +108,49 @@ std::optional<IndexedImage> decodeBniPalettedImage(
   return img;
 }
 
+std::optional<IndexedImage> decodeBniIndexedImage(
+    std::span<const std::byte> imagePayload,
+    std::span<const std::byte> palettePayload, std::string* error) {
+  const auto fail = [&](const char* msg) -> std::optional<IndexedImage> {
+    if (error) {
+      *error = msg;
+    }
+    return std::nullopt;
+  };
+
+  const BniImageProbe p = probeBniImage(imagePayload);
+  if (p.shape != BniImageShape::kIndexedOnly) {
+    char buf[160];
+    std::snprintf(
+        buf, sizeof(buf),
+        "payload does not match the indexed-only layout "
+        "{u16 w,u16 h,px[w*h]} exactly (probe: %s, %llu bytes)",
+        std::string(bniImageShapeName(p.shape)).c_str(),
+        static_cast<unsigned long long>(imagePayload.size()));
+    return fail(buf);
+  }
+  if (palettePayload.size() != kBniImagePaletteBytes) {
+    return fail("external palette must be exactly 768 bytes "
+                "(256 RGB entries)");
+  }
+
+  IndexedImage img;
+  img.width = p.width;
+  img.height = p.height;
+  img.stride = p.width;
+  img.hasPalette = true;
+  for (int i = 0; i < compat::kPaletteEntries; ++i) {
+    const std::size_t off = static_cast<std::size_t>(i) * 3;
+    img.palette[i] = {static_cast<std::uint8_t>(palettePayload[off + 0]),
+                      static_cast<std::uint8_t>(palettePayload[off + 1]),
+                      static_cast<std::uint8_t>(palettePayload[off + 2])};
+  }
+  img.pixels.resize(p.pixelBytes);
+  for (std::size_t i = 0; i < p.pixelBytes; ++i) {
+    img.pixels[i] =
+        static_cast<std::uint8_t>(imagePayload[kBniImageDimHeaderBytes + i]);
+  }
+  return img;
+}
+
 } // namespace mdk

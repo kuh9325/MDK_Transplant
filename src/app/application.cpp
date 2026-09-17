@@ -11,6 +11,7 @@
 #include "core/indexed_image.h"
 #include "core/log.h"
 #include "core/mode_dispatch.h"
+#include "core/stream_context.h"
 #include "input/input_state.h"
 #include "platform/sdl_host.h"
 #include "renderer/presenter.h"
@@ -31,13 +32,16 @@ static constexpr const char* kTag = "app";
 static constexpr std::size_t kPreviewMaxBytes = 512ull * 1024 * 1024;
 
 // Load + decode the --preview-resource target: DataRoot -> BNI
-// directory -> named record -> paletted-bitmap decoder. Fills `err`
-// and returns nullopt on any failure.
+// directory -> named record -> bitmap decoder. Paletted records use
+// the embedded palette (Phase 4A); the one proven indexed-only
+// context (STREAM/STREAM.BNI BG) resolves its external palette per
+// the original binding (Phase 4B). Fills `err` and returns nullopt
+// on any failure.
 static std::optional<IndexedImage> loadPreviewImage(
     DataRoot& root, const std::string& relFile, const std::string& name,
     std::string* err) {
   if (fileFamilyForPath(relFile) != MdkFileFamily::kBni) {
-    *err = "preview supports BNI resources only (Phase 4A decoder "
+    *err = "preview supports BNI resources only (Phase 4A/4B decoder "
            "coverage): " + relFile;
     return std::nullopt;
   }
@@ -60,6 +64,37 @@ static std::optional<IndexedImage> loadPreviewImage(
   }
   const std::span<const std::byte> payload(
       file->data() + rec->payloadFileOffset, rec->payloadSize());
+  const auto probe = probeBniImage(payload);
+  if (probe.shape == BniImageShape::kIndexedOnly) {
+    // Indexed-only records need the consumer's external palette.
+    // The only binding proven so far is the STREAM backdrop
+    // (FUN_0042b270): SYS_PAL head + PAL record tail.
+    if (!isStreamBackdropRequest(relFile, rec->name())) {
+      *err = "indexed-only record has no proven external-palette "
+             "binding in this context (Phase 4B proves " +
+             std::string(kStreamBniFile) + " " +
+             std::string(kStreamImageRecord) + " only)";
+      return std::nullopt;
+    }
+    const auto fti = root.readFile(std::string(kStreamSystemFile),
+                                   kPreviewMaxBytes, err);
+    if (!fti) {
+      return std::nullopt;
+    }
+    auto img = decodeStreamBackdrop(
+        std::span<const std::byte>(file->data(), file->size()),
+        std::span<const std::byte>(fti->data(), fti->size()), err);
+    if (img) {
+      log::info(kTag, "preview: %s %s — %dx%d indexed, %llu pixel "
+                "bytes, STREAM context palette (SYS_PAL[0:64] + "
+                "PAL[64:256]), digest=%016llx",
+                relFile.c_str(), rec->name().c_str(), img->width,
+                img->height,
+                static_cast<unsigned long long>(img->pixels.size()),
+                static_cast<unsigned long long>(imageDigest(*img)));
+    }
+    return img;
+  }
   auto img = decodeBniPalettedImage(payload, err);
   if (img) {
     log::info(kTag, "preview: %s %s — %dx%d indexed, %llu pixel bytes, "

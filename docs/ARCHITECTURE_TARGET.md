@@ -52,7 +52,7 @@ Boundary notes (intentions, not commitments):
 | GPU backend | IMPLEMENTED (Phase 3A): Metal presentation of the software framebuffer |
 | Build system | IMPLEMENTED (Phase 3A): CMake ≥3.24, out-of-tree `build/` |
 | Data access | IMPLEMENTED (Phase 3B): `DataRoot` read-only resolver + `BinaryReader` + container envelope — see `DATA_ACCESS.md` |
-| Resource decoding | STARTED (Phase 4A): `IndexedImage` + first proven decoder (BNI paletted bitmap) — see `ENGINE_RECONSTRUCTION.md` |
+| Resource decoding | STARTED (Phase 4A/4B): `IndexedImage` + two proven decoders (BNI paletted bitmap; BNI indexed-only bitmap with the STREAM context palette) — see `ENGINE_RECONSTRUCTION.md` |
 | Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B/4A |
 
 > Phase 3A implements the bottom two layers (`platform`, `renderer`
@@ -68,7 +68,10 @@ Boundary notes (intentions, not commitments):
 > Phase 4A adds the first decoded-resource path: one proven BNI visual
 > payload (`MISC/OPTIONS.BNI` `MDKOPT`) flows through `DataRoot` →
 > directory parser → `decodeBniPalettedImage` → `IndexedImage` → the
-> indexed framebuffer → Metal. See `ENGINE_RECONSTRUCTION.md`.
+> indexed framebuffer → Metal. Phase 4B adds the indexed-only variant:
+> `STREAM/STREAM.BNI` `BG` → `decodeStreamBackdrop` (SYS_PAL head +
+> `PAL` tail, the proven consumer binding) → `decodeBniIndexedImage`.
+> See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

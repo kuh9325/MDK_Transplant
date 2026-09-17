@@ -122,6 +122,17 @@ struct FtiDirectory {
 // distinguishes "not this format" from "malformed".
 FtiDirectory inspectFtiDirectory(std::span<const std::byte> file);
 
+// Locate a record by name — the directory-level counterpart of the
+// original lookup (FUN_00414890: record scan + exact two-u32 name
+// compare). The original zero-pads the query into a stack buffer, so
+// a name shorter than 8 bytes matches the field up to its first NUL;
+// this helper is ASCII case-INSENSITIVE (a native tooling
+// convenience — all observed names are uppercase anyway) and bounded:
+// the stored name is the field up to its first NUL (all 8 bytes if
+// unterminated). Returns nullptr when not found.
+const FtiRecord* findFtiRecord(const FtiDirectory& dir,
+                               std::string_view name);
+
 std::string_view ftiDirectoryStatusName(FtiDirectoryStatus s);
 
 } // namespace mdk

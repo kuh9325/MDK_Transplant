@@ -964,9 +964,14 @@ Two payload layouts are CODE-CORROBORATED inside BNI records:
   `FUN_00403a00` reads the two head u16s and returns payload+4 plus
   the `w*h` count. OBSERVED byte-exact in `BG`, `SPACE`, `PLANET`,
   `MOON`, `EARTH`, `SKULL` (and `TRAVSPRT` `SKULL`). The palette is
-  resolved by the consumer context (separate `PAL` records) — that
-  binding is not yet proven, so this shape is classified by
-  `probeBniImage` but has no decoder yet.
+  resolved by the consumer context — the first binding is proven in
+  Phase 4B: the stream init `FUN_0042b270` composes the effective
+  palette as `SYS_PAL` head (entries 0-63, via `DAT_00540820`) +
+  `PAL` record bytes `[0xc0,0x300)` (entries 64-255) for `STREAM/
+  STREAM.BNI` `BG` — see `ENGINE_RECONSTRUCTION.md`. Decoded by
+  `src/core/bni_image.*` (`decodeBniIndexedImage`); the context
+  binding lives in `src/core/stream_context.*`. Other contexts'
+  palette bindings remain unproven.
 
 ## Unknown fields
 
