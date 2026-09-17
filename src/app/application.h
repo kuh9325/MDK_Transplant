@@ -21,6 +21,14 @@ struct AppConfig {
   // the normal indexed framebuffer + Metal path. Requires --data-path.
   std::optional<std::string> previewFile;
   std::optional<std::string> previewRecord;
+  // --preview-font FILE RECORD [TEXT]: decode one proven FTI font
+  // record (Phase 4C: FONTSML/FONTBIG glyph layout) and present its
+  // glyphs through the indexed framebuffer. Requires --data-path.
+  // Without TEXT an atlas of every mapped glyph is drawn; with TEXT
+  // the byte string is drawn once using the proven advance rule.
+  std::optional<std::string> fontPreviewFile;
+  std::optional<std::string> fontPreviewRecord;
+  std::optional<std::string> fontPreviewText;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
   bool relativeMouse = true;  // --no-relative-mouse to disable

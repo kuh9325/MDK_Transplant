@@ -290,8 +290,10 @@ Phase 3H additions (all via `mdk-inspect --entries`, read-only):
   all tagged files; never read by the SNI loader) and the 12-byte
   trailer itself.
 - `.FTI`/`.BNI` payload interiors — the directories are proven and
-  enumerable; per-payload structure and any per-payload typing remain
-  UNKNOWN (bounded only — see DATA_FORMATS.md).
+  enumerable; per-payload structure is proven only for the records
+  decoded in Phase 4 (BNI `MDKOPT`/indexed `BG` bitmaps, FTI
+  `FONTSML`/`FONTBIG` font tables); all other per-payload structure and
+  typing remains UNKNOWN (bounded only — see DATA_FORMATS.md).
 - `.LBB`, `.SAV`, `.386` formats.
 - Compression/encryption (none observed anywhere).
 - Whether a retail/GOG dump matches BUILD_A bytes.

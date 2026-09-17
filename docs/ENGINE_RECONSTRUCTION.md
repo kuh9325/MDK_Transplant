@@ -344,3 +344,189 @@ Grounded in 4A+4B:
 4. **FALL3D context palette** — only worth doing if it proves a
    genuinely different binding mechanism (multi-record palette
    animation) rather than repeating the stream pattern.
+
+# Phase 4C — FTI font/glyph decode
+
+Phase 4C added the third vertical slice: one original FTI font record
+decoded to individual glyphs and presented through the indexed
+framebuffer — the first engine capability that is a *service* (a
+glyph table consumed by byte strings) rather than a whole-screen
+image.
+
+## Selected resource
+
+**`FONTSML` in `MISC/MDKFONT.FTI`** — the general-purpose UI text font
+(span `[0x18d90, 0x2555b)`, 51,147 bytes, 204 mapped glyphs).
+
+### Why this resource (candidate comparison)
+
+| Candidate | Verdict |
+|---|---|
+| `FONTSML` | **Selected** — every required property is CODE-CORROBORATED through its own consumer chain (`FUN_00414d88` measure / `FUN_00414dd4` draw, ~40 static call sites incl. options screens), and all 204 glyph extents tile the payload exactly to EOF. |
+| `FONTBIG` | Same glyph format, independently proven through `FUN_00414be8`/`FUN_00414c34`/`FUN_00414f64` — 152 mapped glyphs, 2 trailing pad bytes. The shared decoder handles it, but one font satisfied the phase rule; kept as a validated second decode (`--preview-font`/`--font-info` accept it). |
+| `F8` | A different format entirely — `FUN_00414a08` reads `font + ch*8` (8×8 1bpp rows, MSB-first) and writes a *caller-supplied* color index for set bits. Not needed; deferred. |
+
+## Original functions traced (statics, MDK95.EXE)
+
+| Address | Role |
+|---|---|
+| `FUN_004149c4` | Font resolver: FTI lookups `F8` → `DAT_0054164c`, `FONTSML` → `DAT_00541644`, `FONTBIG` → `DAT_00541648` (name bytes confirmed in the EXE at `0x4950dc`–`0x4950ee`); sets the `DAT_0049a76c` initialized flag consumed by the `"Font table not initialized!"` diagnostic path |
+| `FUN_00414d88` | FONTSML width measure: per byte `x += glyph[2]`, missing entry `x += 4` |
+| `FUN_00414dd4` | FONTSML 1:1 draw (below) — plus a single-char trailing marker via `FUN_00414b28` (uses `glyph[1]` as a position offset; selection-marker, not decoded here) |
+| `FUN_00414f1c` | FONTSML centered draw — `x = 300 - measure/2` |
+| `FUN_00414be8` | FONTBIG width measure: per byte `x += glyph[2]`, missing `x += 6` |
+| `FUN_00414c34` | FONTBIG 1:1 draw — identical glyph format/blit semantics |
+| `FUN_00414f64` | FONTBIG scaled draw — same `{s8,s8,u8,px}` header fields read the same way under 16.16 subpixel stepping |
+| `FUN_00414a08`/`FUN_00414ac0` | F8 mask draw — the 1bpp format, deferred |
+| `FUN_00423a24` | Timing/fade factor feeding the scaled path (`FUN_00423b38`) — not part of glyph decode |
+| `FUN_00423b38` | Options-scale text: `FUN_00423a24` → `FUN_00414be8` → `FUN_00414f64` |
+| `FUN_0040163c` | `SYS_PAL` consumer: copies the 192-byte record into the resident palette head `DAT_00540820` and forces entry 0 black |
+
+## Proven record format (CODE-CORROBORATED + byte-exact)
+
+```
+record+0x000  u32 glyphOffset[256]   indexed DIRECTLY by the input
+              byte (MOVZX char -> *4 — no ASCII subtraction, no case
+              fold, no code-page map). 0 = no glyph for that byte.
+record+off    glyph:
+  +0 s8   top     bitmap rows whose last is the pen row: bitmap row 0
+                  draws at fb row (penY - top)
+  +1 s8   bottom  bitmap rows below the pen row (negative allowed:
+                  '!' keeps its whole body on/above the pen)
+  +2 u8   width   row width AND horizontal advance
+  +3 u8   pixels[width * (top + bottom + 1)]
+                  row-major, top row first; byte 0 = skip
+                  (transparent), nonzero = final palette index
+                  written verbatim — no mask, no caller color
+```
+
+Byte-exact corroboration (FONTSML): glyph `'!'` at `+0x4e79` reads
+`0c ff 04` → top 12, bottom -1, width 4, 12×4 bitmap; `offset[ch]` for
+ch=1 is `0x400` so the table is exactly 256 entries; all 204 glyphs
+tile to EOF with zero slack. FONTBIG: `'!'` at `+0x400` reads
+`19 ff 09` → 25×9; all 152 tile except 2 pad bytes at EOF.
+
+## Draw semantics (proven)
+
+`FUN_00414dd4`/`FUN_00414c34` inner loop:
+
+```
+dst = fb + penX + (penY - top)*600
+for r in 0..rows-1, c in 0..width-1:
+    b = px[r*width + c];  if (b != 0) dst[c] = b
+    dst += 600 per row
+penX += width                       // glyph advance
+unmapped byte: penX += 4 (FONTSML) // 6 (FONTBIG)   // constants in
+                                                   // the draw code
+```
+
+The original performs NO bounds clipping — callers keep text on-screen.
+The native helpers clip per-pixel (hardening only; identical output for
+in-bounds pens).
+
+## Color / transparency rule
+
+- Byte `0` in the bitmap = transparent (the original literally skips
+  the store). All nonzero bytes are final 8-bit palette indices.
+- No foreground-color argument exists on this path (unlike F8, which
+  colors a mask). The glyphs shade themselves — FONTSML uses indices
+  `{5,10,16,32..59}` (gray ramp 16–47 + red→yellow ramp 48–59 of
+  SYS_PAL); max index used: FONTSML 59, FONTBIG 62 — both inside the
+  resident 64-entry SYS_PAL head (`FUN_0040163c`). **CORROBORATED**
+  binding; the preview binds `SYS_PAL[0:64]` from the same FTI file
+  and leaves 64–255 zeroed (never referenced).
+- The glyph encoding is an MDK-specific map, NOT ASCII/CP437: codes
+  1–31 are keycap legend glyphs (`Esc`, `Tab`, `F1`–`F12`, `Num Lock`
+  …), 32 is unmapped (space = advance-only), 33+ carry
+  printable/digit/letter glyphs, high codes carry accented and
+  symbol glyphs.
+
+## Native decode architecture
+
+```
+--preview-font MISC/MDKFONT.FTI FONTSML
+  -> DataRoot.readFile            (read-only)
+  -> inspectFtiDirectory          (Phase 3H, unchanged)
+  -> findFtiRecord("FONTSML")     -> record span [0x18d90, 0x2555b)
+  -> decodeFtiFont(payload)       (new src/core/fti_font.*)
+       256-entry table walk, per-glyph extent check
+       {top,bottom,width,rows*w px} — bounds-checked, verbatim copy
+  -> findFtiRecord("SYS_PAL")     -> palette entries 0–63
+  -> atlas or text draw           (drawFtiGlyph/drawFtiText —
+       mirrors FUN_00414dd4: row 0 at penY-top, 0-skip, adv=width,
+       missing +4 for FONTSML / +6 for FONTBIG)
+  -> IndexedFramebuffer (600x360) + Palette -> Metal presenter
+```
+
+`decodeFtiFont` accepts only the record span — no filesystem or FTI
+directory knowledge. Malformed inputs (short table, offset inside the
+table, offset past the payload, truncated header, bitmap overrun,
+zero mapped glyphs) return a structured failure. Trailing slack after
+the last glyph is tolerated and reported (`trailingBytes`).
+
+## Preview command
+
+```sh
+build/native/mdk-native.app/Contents/MacOS/mdk-native \
+  --data-path original/installed \
+  --preview-font MISC/MDKFONT.FTI FONTSML            # atlas
+build/native/mdk-native.app/Contents/MacOS/mdk-native \
+  --data-path original/installed \
+  --preview-font MISC/MDKFONT.FTI FONTSML "MDK 1997" # text
+```
+
+Atlas mode draws every mapped glyph in table order on a diagnostic
+grid (presentation-only layout; the per-glyph rule is the proven one).
+Text mode draws one byte string using the proven advance rule —
+advance = glyph width, unmapped bytes advance 4 (FONTSML path) or 6
+(FONTBIG path). Font digest: `c7956b0fea14f2ac` (FONTSML),
+`99681a15ee8479f5` (FONTBIG) — `mdk-inspect --font-info` reports the
+same.
+
+`mdk-inspect --data-path DIR --font-info FILE RECORD [CODE]` prints
+metadata only (layout, mapping rule, mapped count, offset order,
+encoding, per-code glyph metrics, digest) — no payload bytes.
+
+Agent-side visual verification of `/tmp/mdk-phase4c.ppm` (atlas):
+204 recognizable glyphs — keycap legends, full alphanumerics, accented
+set — upright, correctly oriented, zero-transparent over black, gold
+SYS_PAL ramp shading; `/tmp/mdk-phase4c-text.ppm` (text): "MDK
+Transplant" rendered with correct spacing and descender placement.
+(Not a human gate.)
+
+## Explicit non-goals (Phase 4C)
+
+- No text-layout subsystem: no menus, labels, selection state,
+  wrapping, alignment, or the `FUN_00414b28` selection marker.
+- `F8` (1bpp mask font) and `ARROW` are not decoded.
+- The scaled FONTBIG path (`FUN_00414f64`) is evidence for the shared
+  glyph format only — no scaled rendering is implemented.
+- No localization: `FONTF/I/P/S.FTI` variants share the format
+  (verified structurally) but are not wired to a language switch.
+- STREAM's palette composition is NOT generalized — fonts bind the
+  resident SYS_PAL head by the font path's own evidence.
+- Phase 4A/4B semantics untouched: `MDKOPT` digest
+  `6017f4c4bd57c479`, STREAM `BG` digest `662bf1e20bdd351c`.
+
+## Remaining font unknowns
+
+- Whether the three trailing-marker calls in `FUN_00414dd4`'s tail
+  (selection bracket via `FUN_00414b28`) draw additional decoration in
+  some call contexts — glyph decode is unaffected.
+- `FONTBIG`'s 2-byte EOF pad: consistent with align4 payload packing;
+  semantically dead.
+- Whether any consumer reads a glyph's `pixels` for non-draw purposes
+  (e.g. hit-testing) — none observed.
+- The `F8` mask font's callers' color values — format proven, color
+  provenance per call site not traced (deferred).
+
+## Phase 4D candidate directions
+
+1. **`ARROW` decode + the first static options composition** —
+   MDKOPT backdrop (4A) + FONTSML text (4C) + the cursor; the options
+   orchestrator `FUN_0041dc90` already calls the FONTBIG scaled path
+   (`FUN_00423b38`) for item labels.
+2. **FONTBIG text-in-context** — same decoder, but the options menu
+   strings it draws would prove a real front-end label path.
+3. **`F8` color provenance** — only if an evidence-complete call site
+   makes it the cheapest remaining text path.

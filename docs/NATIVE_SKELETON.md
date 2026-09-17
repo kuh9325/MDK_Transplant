@@ -43,6 +43,11 @@ proven BNI visual resource — the paletted `MISC/OPTIONS.BNI MDKOPT`,
 or the indexed-only `STREAM/STREAM.BNI BG` whose palette is resolved
 by the proven stream-context binding `SYS_PAL[0:64]` + `PAL[64:256]`;
 requires `--data-path`),
+`--preview-font FILE RECORD [TEXT]` (Phase 4C: decode + present one
+proven FTI font record — `MISC/MDKFONT.FTI FONTSML`/`FONTBIG`; atlas
+of all mapped glyphs, or TEXT drawn with the proven advance rule;
+glyph indices resolve through the record's `SYS_PAL` palette head;
+requires `--data-path`),
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -62,6 +67,7 @@ src/
              indexed_image.*     — decoded indexed visual + blit (4A)
              bni_image.*         — proven BNI bitmap payload decoders (4A/4B)
              stream_context.*    — STREAM.BNI backdrop palette binding (4B)
+             fti_font.*          — FONTSML/FONTBIG glyph decode + draw (4C)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -173,11 +179,13 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- Runtime original-data use is limited to the Phase 4A/4B preview: one
-  named record from one BNI file (`--preview-resource`), decoded by
+- Runtime original-data use is limited to the Phase 4A/4B/4C previews:
+  one named record from one BNI file (`--preview-resource`), decoded by
   the proven paletted-bitmap layout or — for `STREAM/STREAM.BNI BG`
   only — the proven external-palette binding (`SYS_PAL` head + `PAL`
-  tail, resolved via `MISC/MDKFONT.FTI`) into the indexed framebuffer
+  tail, resolved via `MISC/MDKFONT.FTI`); and one FTI font record
+  (`--preview-font`, `FONTSML`/`FONTBIG` glyph layout) drawn into the
+  indexed framebuffer through the SYS_PAL palette head
   — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.

@@ -835,8 +835,8 @@ The not-found path is the shared `"Error finding %s"` fatal
 | `FUN_00401abc` | Startup: loads `MISC\MDKFONT.FTI` into `DAT_0049ff50`; if `DAT_00541530 != 0`, builds `MISC\FONT%c.FTI` via `FUN_0047d2e9` and reloads into the same slot; `MISC\FONTG.FTI` loads via `FUN_0041b004` |
 | `FUN_00414890` | THE resource lookup — 41 static callers engine-wide: walks `img+4` records with `piVar4 += 3` (12-byte stride), two-u32 name compare, returns `img + rec[+0x08]` |
 | `FUN_0047da70` | Emits `"Font table not initialized!"` when `DAT_0049ff50 == 0` |
-| `FUN_004149c4` | Font-record consumer (resolves `FONTSML`/`FONTBIG`) |
-| `FUN_0040163c` | `SYS_PAL` consumer |
+| `FUN_004149c4` | Font-record resolver: `F8`→`DAT_0054164c`, `FONTSML`→`DAT_00541644`, `FONTBIG`→`DAT_00541648` (Phase 4C — glyph payload interiors proven, below) |
+| `FUN_0040163c` | `SYS_PAL` consumer (192 RGB bytes → resident palette head `DAT_00540820`, entry 0 forced black) |
 | `FUN_004236fc` / `FUN_00423734` | `SND_PUSH` consumers |
 
 ### BUILD_A FTI inventory (all 5 parse `ok`)
@@ -852,6 +852,38 @@ The not-found path is the shared `"Error finding %s"` fatal
 One structural class across the corpus: same count, same record names
 (the five files differ only in localized payload content), offsets
 sorted+unique, first payload at dirEnd, payloads tile to EOF.
+
+### Proven payload interior: FONTSML / FONTBIG (Phase 4C)
+
+The two font records share one layout, proven by their separate
+consumer chains (`FUN_00414d88`/`FUN_00414dd4` for `FONTSML`,
+`FUN_00414be8`/`FUN_00414c34`/`FUN_00414f64` for `FONTBIG`):
+
+```
+record+0x000  u32 glyphOffset[256]  record-relative offsets indexed
+              DIRECTLY by the input byte (MOVZX char -> *4; no ASCII
+              base subtraction, no case fold, no code-page map).
+              Entry 0 = no glyph for that byte.
+record+off    glyph:
+  +0 s8  top     bitmap row 0 draws at framebuffer row (penY - top)
+  +1 s8  bottom  bitmap rows below the pen row (negative allowed)
+  +2 u8  width   row width AND pen advance
+  +3 u8  pixels[width * (top + bottom + 1)]
+                 row-major top-down; byte 0 = transparent (skipped),
+                 nonzero = final 8-bit palette index written verbatim
+```
+
+Missing-glyph advance is a constant in the draw code, not the payload:
+**4** on the FONTSML path, **6** on FONTBIG. Glyph indices are final
+palette indices (all <= 62 in the real fonts — inside the resident
+64-entry `SYS_PAL` head). Real payloads: `FONTSML` maps 204 codes
+(1–255; codes 1–31 are keycap legends, 32 unmapped) and tiles to EOF
+exactly; `FONTBIG` maps 152 (33–252) with 2 trailing pad bytes. The
+`F8` record is a DIFFERENT format (`font + ch*8`, 8×8 1bpp rows
+MSB-first, caller-supplied color — `FUN_00414a08`) and is not handled
+by this decoder. Decoder: `decodeFtiFont` in `src/core/fti_font.*`;
+inspector mode `mdk-inspect --font-info`; preview
+`mdk-native --preview-font FILE RECORD [TEXT]`.
 
 ## Proven interior directory: BNI
 

@@ -12,6 +12,7 @@
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/fti_directory.h"
+#include "core/fti_font.h"
 #include "core/indexed_image.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
@@ -3008,6 +3009,219 @@ void test_mode_dispatch() {
   CHECK(mdk::mode::observed::cinematic == 8);
 }
 
+// Synthetic FONTSML-layout font builder (no original data). Payload
+// layout mirrors the OBSERVED/CODE-CORROBORATED structure:
+// u32 offsetTable[256] then glyph records
+// {s8 top, s8 bottom, u8 width, u8 px[width*(top+bottom+1)]}.
+struct SyntheticFont {
+  std::vector<std::byte> buf;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  std::uint32_t addGlyph(std::int8_t top, std::int8_t bottom,
+                         std::uint8_t width,
+                         const std::vector<std::uint8_t>& px) {
+    const std::uint32_t off = static_cast<std::uint32_t>(buf.size());
+    buf.push_back(static_cast<std::byte>(top));
+    buf.push_back(static_cast<std::byte>(bottom));
+    buf.push_back(static_cast<std::byte>(width));
+    for (const auto v : px) {
+      buf.push_back(static_cast<std::byte>(v));
+    }
+    return off;
+  }
+  static SyntheticFont make() {
+    SyntheticFont f;
+    f.buf.assign(0x400, std::byte{0});
+    return f;
+  }
+};
+
+void test_fti_font() {
+  std::string err;
+
+  // Minimal valid font: 'A' -> 2x2 glyph; ' ' and 0 unmapped.
+  {
+    auto f = SyntheticFont::make();
+    f.put32(0x41 * 4, f.addGlyph(1, 0, 2, {9, 0, 0, 10}));
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font && font->mappedCount == 1);
+    CHECK(font->firstMapped == 0x41 && font->lastMapped == 0x41);
+    const auto* g = font->glyphFor(0x41);
+    CHECK(g && g->top == 1 && g->bottom == 0 && g->width == 2);
+    CHECK(g->rows() == 2 && g->pixels.size() == 4);
+    CHECK(g->pixels[0] == 9 && g->pixels[3] == 10);  // verbatim
+    CHECK(!font->glyphFor(' ') && !font->glyphFor(0));
+    CHECK(font->trailingBytes == 0);
+    CHECK(font->glyphDataStart == 0x400);
+  }
+
+  // Signed header bytes: bottom = -1 keeps the whole body on/above
+  // the pen row (the '!' shape in the real fonts).
+  {
+    auto f = SyntheticFont::make();
+    f.put32('!' * 4, f.addGlyph(3, -1, 1, {7, 7, 7}));
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font);
+    const auto* g = font->glyphFor('!');
+    CHECK(g && g->rows() == 3 && g->pixels.size() == 3);
+  }
+
+  // Draw rule: bitmap row 0 lands on penY - top; byte 0 skips;
+  // nonzero bytes overwrite verbatim.
+  {
+    auto f = SyntheticFont::make();
+    f.put32('A' * 4, f.addGlyph(2, 0, 2, {1, 2, 0, 3, 4, 5}));
+    f.put32('x' * 4, f.addGlyph(1, 1, 1, {6, 8, 7}));  // descender
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font);
+    mdk::IndexedFramebuffer fb(32, 16);
+    fb.clear(0);
+    mdk::drawFtiGlyph(*font->glyphFor('A'), fb, 4, 10);
+    // Rows land at penY - top .. penY + bottom = 8 .. 10.
+    CHECK(fb.at(4, 8) == 1 && fb.at(5, 8) == 2);
+    CHECK(fb.at(4, 9) == 0 && fb.at(5, 9) == 3);  // 0 byte = skip
+    CHECK(fb.at(4, 10) == 4 && fb.at(5, 10) == 5);
+    mdk::drawFtiGlyph(*font->glyphFor('x'), fb, 0, 10);
+    CHECK(fb.at(0, 9) == 6 && fb.at(0, 10) == 8);
+    CHECK(fb.at(0, 11) == 7);  // row below the pen
+    // Out-of-range pen positions clip per-pixel, never UB.
+    mdk::drawFtiGlyph(*font->glyphFor('A'), fb, -1, 0);
+  }
+
+  // String draw + measure: advance = glyph width; unmapped bytes use
+  // the caller's missing-glyph advance (4 FONTSML / 6 FONTBIG paths).
+  {
+    auto f = SyntheticFont::make();
+    f.put32('A' * 4, f.addGlyph(1, 0, 2, {1, 1, 1, 1}));
+    f.put32('B' * 4, f.addGlyph(1, 0, 3, {2, 2, 2, 2, 2, 2}));
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font);
+    mdk::IndexedFramebuffer fb(32, 8);
+    fb.clear(0);
+    const int end = mdk::drawFtiText(*font, "A B", fb, 0, 4, 4);
+    CHECK(end == 2 + 4 + 3);
+    CHECK(mdk::measureFtiText(*font, "A B", 4) == 9);
+    CHECK(fb.at(0, 3) == 1 && fb.at(6, 3) == 2);  // B starts at x=6
+    CHECK(mdk::measureFtiText(*font, "A B", 6) == 11);
+  }
+
+  // Non-positive row count: legal advance-only glyph — the original
+  // skips the draw loop but still advances the pen; consumed extent
+  // is the 3-byte header only.
+  {
+    auto f = SyntheticFont::make();
+    f.put32(0x80 * 4, f.addGlyph(0, -3, 2, {}));  // rows = -2
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font);
+    const auto* g = font->glyphFor(0x80);
+    CHECK(g && g->rows() == -2 && g->pixels.empty());
+    CHECK(g->consumedBytes() == 3);
+  }
+
+  // Trailing slack after the last glyph is tolerated (OBSERVED:
+  // FONTBIG ends with 2 pad bytes).
+  {
+    auto f = SyntheticFont::make();
+    f.put32('A' * 4, f.addGlyph(0, 0, 1, {7}));
+    f.buf.push_back(std::byte{0xaa});
+    f.buf.push_back(std::byte{0xbb});
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font && font->trailingBytes == 2);
+  }
+
+  // Duplicate offsets: two codes may share one glyph record (the
+  // original dereferences each entry independently).
+  {
+    auto f = SyntheticFont::make();
+    const std::uint32_t off = f.addGlyph(0, 0, 1, {5});
+    f.put32('A' * 4, off);
+    f.put32('B' * 4, off);
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font && font->mappedCount == 2);
+    CHECK(!font->offsetsUnique);
+    CHECK(font->glyphFor('A')->pixels[0] == 5);
+    CHECK(font->glyphFor('B')->pixels[0] == 5);
+  }
+
+  // Non-monotonic offsets still decode but are reported unsorted.
+  {
+    auto f = SyntheticFont::make();
+    const std::uint32_t o1 = f.addGlyph(0, 0, 1, {1});
+    const std::uint32_t o2 = f.addGlyph(0, 0, 1, {2});
+    f.put32('B' * 4, o1);  // 'B' -> earlier offset, 'A' -> later
+    f.put32('A' * 4, o2);
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font && !font->offsetsSortedAscending);
+    CHECK(font->glyphFor('A')->pixels[0] == 2);
+    CHECK(font->glyphFor('B')->pixels[0] == 1);
+  }
+
+  // Digest determinism.
+  {
+    auto f1 = SyntheticFont::make();
+    f1.put32('A' * 4, f1.addGlyph(1, 0, 2, {1, 2, 3, 4}));
+    auto f2 = SyntheticFont::make();
+    f2.put32('A' * 4, f2.addGlyph(1, 0, 2, {1, 2, 3, 4}));
+    auto f3 = SyntheticFont::make();
+    f3.put32('A' * 4, f3.addGlyph(1, 0, 2, {1, 2, 3, 9}));
+    const auto a = mdk::decodeFtiFont(f1.buf, &err);
+    const auto b = mdk::decodeFtiFont(f2.buf, &err);
+    const auto c = mdk::decodeFtiFont(f3.buf, &err);
+    CHECK(a && b && c);
+    CHECK(mdk::ftiFontDigest(*a) == mdk::ftiFontDigest(*b));
+    CHECK(mdk::ftiFontDigest(*a) != mdk::ftiFontDigest(*c));
+  }
+
+  // --- malformed inputs ---
+
+  // Truncated table.
+  {
+    const std::vector<std::byte> shortBuf(0x100, std::byte{0});
+    CHECK(!mdk::decodeFtiFont(shortBuf, &err));
+  }
+
+  // All-zero table: no mapped glyphs -> not a font resource.
+  {
+    const std::vector<std::byte> zeroTable(0x400, std::byte{0});
+    CHECK(!mdk::decodeFtiFont(zeroTable, &err));
+  }
+
+  // Offset pointing into the table region.
+  {
+    auto f = SyntheticFont::make();
+    f.put32('A' * 4, 0x100);  // < 0x400
+    CHECK(!mdk::decodeFtiFont(f.buf, &err));
+  }
+
+  // Offset past the payload.
+  {
+    auto f = SyntheticFont::make();
+    f.put32('A' * 4, 0xffff);
+    CHECK(!mdk::decodeFtiFont(f.buf, &err));
+  }
+
+  // Truncated glyph header (offset lands on the last 2 bytes).
+  {
+    auto f = SyntheticFont::make();
+    f.buf.push_back(std::byte{1});
+    f.buf.push_back(std::byte{2});
+    f.put32('A' * 4, 0x400);
+    CHECK(!mdk::decodeFtiFont(f.buf, &err));
+  }
+
+  // Bitmap overrun: header claims 4x4 (16 bytes) but only 2 remain.
+  {
+    auto f = SyntheticFont::make();
+    f.put32('A' * 4, f.addGlyph(3, 0, 4, {1, 2}));
+    CHECK(!mdk::decodeFtiFont(f.buf, &err));
+  }
+}
+
 void test_input_state() {
   mdk::InputState in;
   in.beginFrame();
@@ -3062,6 +3276,7 @@ int main() {
   test_bni_image();
   test_bni_indexed_image();
   test_stream_context();
+  test_fti_font();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

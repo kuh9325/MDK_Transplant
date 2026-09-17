@@ -7,6 +7,8 @@
 //   mdk-inspect --data-path DIR --container <relative-path>
 //   mdk-inspect --data-path DIR --entries <relative-path>
 //   mdk-inspect --data-path DIR --visual-info <relative-path> <record>
+//   mdk-inspect --data-path DIR --font-info <relative-path> <record>
+//               [<code>]
 //   mdk-inspect --selftest        (synthetic in-memory checks)
 
 #include "core/binary_reader.h"
@@ -18,6 +20,7 @@
 #include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/fti_directory.h"
+#include "core/fti_font.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/sni_directory.h"
@@ -25,6 +28,7 @@
 
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -43,6 +47,8 @@ int usage() {
                "--entries] <relative-path>\n"
                "       mdk-inspect --data-path DIR --visual-info "
                "<relative-path> <record>\n"
+               "       mdk-inspect --data-path DIR --font-info "
+               "<relative-path> <record> [<code>]\n"
                "       mdk-inspect --selftest\n");
   return 2;
 }
@@ -604,6 +610,37 @@ int selftest() {
     std::fprintf(stderr, "selftest bni-indexed-image: %s\n",
                  ok ? "PASS" : "FAIL");
   }
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic FONTSML-layout font check (Phase 4C; no original
+  // data): u32 offsetTable[256] then {s8 top, s8 bottom, u8 width,
+  // u8 px[w*(top+bottom+1)]} glyph records.
+  {
+    std::vector<std::byte> fontBuf(0x400, std::byte{0});
+    // 'A' (0x41) -> 2x2 glyph at 0x400; '!' (0x21) unmapped.
+    fontBuf[0x41 * 4] = std::byte{0x00};
+    fontBuf[0x41 * 4 + 1] = std::byte{0x04};  // offset 0x400
+    fontBuf.push_back(std::byte{1});          // top = 1
+    fontBuf.push_back(std::byte{0});          // bottom = 0
+    fontBuf.push_back(std::byte{2});          // width = 2
+    fontBuf.push_back(std::byte{9});
+    fontBuf.push_back(std::byte{0});
+    fontBuf.push_back(std::byte{0});
+    fontBuf.push_back(std::byte{10});
+    const auto font = mdk::decodeFtiFont(fontBuf, &derr);
+    const auto* g = font ? font->glyphFor(0x41) : nullptr;
+    ok = font && font->mappedCount == 1 && g && g->rows() == 2 &&
+         g->pixels.size() == 4 && g->pixels[0] == 9 &&
+         g->pixels[3] == 10 && !font->glyphFor(0x21) &&
+         mdk::ftiFontDigest(*font) != 0 &&
+         !mdk::decodeFtiFont(
+              std::span<const std::byte>(fontBuf.data(), 0x100), &derr)
+              .has_value();  // truncated table rejected
+    std::fprintf(stderr, "selftest fti-font: %s\n",
+                 ok ? "PASS" : "FAIL");
+  }
   return ok ? 0 : 1;
 }
 
@@ -613,6 +650,8 @@ int main(int argc, char** argv) {
   std::optional<std::string> dataPath;
   std::optional<std::string> target;
   std::optional<std::string> visualInfoName;
+  std::optional<std::string> fontInfoName;
+  std::optional<unsigned> fontInfoCode;
   bool entriesMode = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -644,6 +683,25 @@ int main(int argc, char** argv) {
       if (!n) return usage();
       target = v;
       visualInfoName = n;
+    } else if (!std::strcmp(a, "--font-info")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      const char* n = value(a);
+      if (!n) return usage();
+      target = v;
+      fontInfoName = n;
+      // Optional glyph code: decimal or 0xNN.
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        const char* c = argv[++i];
+        char* endp = nullptr;
+        const unsigned long cv = std::strtoul(c, &endp, 0);
+        if (!endp || *endp != '\0' || cv > 0xff) {
+          std::fprintf(stderr, "invalid glyph code: %s (want 0-255)\n",
+                       c);
+          return usage();
+        }
+        fontInfoCode = static_cast<unsigned>(cv);
+      }
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
@@ -751,7 +809,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!entriesMode && !visualInfoName) {
+  if (!entriesMode && !visualInfoName && !fontInfoName) {
     return 0;
   }
 
@@ -760,10 +818,14 @@ int main(int argc, char** argv) {
   // Phase 3F; DTI Phase 3G; FTI/BNI Phase 3H). Never prints payload
   // bytes. --visual-info: metadata-only report for one named record
   // against the proven BNI image layouts (Phase 4A) — no extraction.
+  // --font-info: metadata-only report for one named FTI record against
+  // the proven FONTSML/FONTBIG glyph layout (Phase 4C).
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
     std::printf("%s unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
-                visualInfoName ? "visual-info:" : "entries:  ",
+                visualInfoName ? "visual-info:"
+                               : (fontInfoName ? "font-info:  "
+                                               : "entries:  "),
                 std::string(mdk::fileFamilyName(family)).c_str(),
                 std::string(mdk::familySupportName(support)).c_str());
     return 1;
@@ -773,6 +835,85 @@ int main(int argc, char** argv) {
   if (!file) {
     std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
     return 1;
+  }
+
+  if (fontInfoName) {
+    if (family != mdk::MdkFileFamily::kFti) {
+      std::printf("font:      unsupported for family %s — Phase 4C "
+                  "proves the FTI FONTSML/FONTBIG glyph layout only\n",
+                  std::string(mdk::fileFamilyName(family)).c_str());
+      return 1;
+    }
+    const auto dir = mdk::inspectFtiDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    if (dir.status != mdk::FtiDirectoryStatus::kOk) {
+      std::printf("fti:       %s — %s\n",
+                  std::string(mdk::ftiDirectoryStatusName(dir.status))
+                      .c_str(),
+                  dir.detail.c_str());
+      return 1;
+    }
+    const mdk::FtiRecord* rec = mdk::findFtiRecord(dir, *fontInfoName);
+    if (!rec) {
+      std::printf("record:    %s — NOT FOUND\n", fontInfoName->c_str());
+      return 1;
+    }
+    std::printf("record:    %s\n", rec->name().c_str());
+    std::printf("span:      [0x%08llx, 0x%08llx) — %llu bytes\n",
+                static_cast<unsigned long long>(rec->payloadFileOffset),
+                static_cast<unsigned long long>(rec->payloadEnd),
+                static_cast<unsigned long long>(rec->payloadSize()));
+    const std::span<const std::byte> payload(
+        file->data() + rec->payloadFileOffset, rec->payloadSize());
+    std::string derr;
+    const auto font = mdk::decodeFtiFont(payload, &derr);
+    if (!font) {
+      std::printf("decode:    FAILED (%s)\n", derr.c_str());
+      return 1;
+    }
+    std::printf("layout:    u32 offsetTable[256] @+0x000; glyph "
+                "{s8 top, s8 bottom, u8 width, u8 px[w*(top+bottom+1)]}"
+                " — row-major top-down indexed bytes\n");
+    std::printf("mapping:   input byte -> table[byte] directly; "
+                "0 = unmapped (no ASCII/CP437 transform)\n");
+    std::printf("mapped:    %zu of 256 slots — first 0x%02x, last "
+                "0x%02x\n", font->mappedCount, font->firstMapped,
+                font->lastMapped);
+    std::printf("glyphs@:   record+0x%llx; trailing slack %llu bytes\n",
+                static_cast<unsigned long long>(font->glyphDataStart),
+                static_cast<unsigned long long>(font->trailingBytes));
+    std::printf("offsets:   %s, %s\n",
+                font->offsetsSortedAscending ? "sorted ascending"
+                                           : "NOT sorted",
+                font->offsetsUnique ? "unique" : "NOT unique");
+    std::printf("encoding:  verbatim 8-bit palette indices; byte 0 "
+                "skips (transparent); max index used %u\n",
+                font->maxPixelIndex);
+    std::printf("missing:   table entry 0 -> advance-only; proven "
+                "advance %d (FONTSML path) / %d (FONTBIG path)\n",
+                mdk::kFtiFontSmlMissingAdvance,
+                mdk::kFtiFontBigMissingAdvance);
+    std::printf("digest:    %016llx\n",
+                static_cast<unsigned long long>(
+                    mdk::ftiFontDigest(*font)));
+    if (fontInfoCode) {
+      const auto code = static_cast<std::uint8_t>(*fontInfoCode);
+      const mdk::FtiGlyph* g = font->glyphFor(code);
+      std::printf("glyph[0x%02x]: ", code);
+      if (!g) {
+        std::printf("unmapped (advance-only)\n");
+      } else {
+        std::printf("@0x%08llx top=%d bottom=%d width=%u rows=%d "
+                    "bitmap=%llu bytes consumed=%llu\n",
+                    static_cast<unsigned long long>(g->offset),
+                    int(g->top), int(g->bottom), unsigned(g->width),
+                    g->rows(),
+                    static_cast<unsigned long long>(g->pixels.size()),
+                    static_cast<unsigned long long>(
+                        g->consumedBytes()));
+      }
+    }
+    return 0;
   }
 
   if (visualInfoName) {
