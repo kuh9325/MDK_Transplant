@@ -139,7 +139,8 @@ logical name, stem-match, and the raw second u32 @16 (uninterpreted).
 
 `mdk-inspect --data-path DIR --entries <rel-path>` additionally reads
 the whole file (bounded) and enumerates the interior directory where a
-proven parser exists — `.SNI` (Phase 3C) and `.MTI` (Phase 3D):
+proven parser exists — `.SNI` (Phase 3C), `.MTI` (Phase 3D) and
+`.MTO` (Phase 3E):
 entry count, directory end, trailer status, and per-record metadata.
 For `.SNI`: name/raw field/blob offset/resolved file offset/size;
 sentinel records (`field==size==0xffffffff`) are reported as position
@@ -147,12 +148,15 @@ markers. For `.MTI`: name[8]/raw fields `+0x08 +0x0c +0x10 +0x14`/
 resolved payload file offset; index records (`+0x08==0xffffffff`) are
 marked and their ignored fields reported raw; payload records show
 the proven payload-header u16s (`hdr{a,b}` or `hdr{n,a,b}` for the
-extended variant) and the data start offset. Families without a
-proven interior parser are rejected with the support level — never
-guessed.
-`--selftest` runs synthetic envelope + SNI- + MTI-directory checks.
-Links `mdk_core` — the same code the app uses. Never prints payload
-bytes; never writes into the data root.
+extended variant) and the data start offset. For `.MTO`: per-entry
+name[8], block file offset/length, the embedded `.MAT` name and
+record metadata, and region A/B/C counts and spans (region A's
+array-B and array-C are the original's overlay-alien and
+overlay-sound records). Families without a proven interior parser are
+rejected with the support level — never guessed.
+`--selftest` runs synthetic envelope + SNI- + MTI- + MTO-directory
+checks. Links `mdk_core` — the same code the app uses. Never prints
+payload bytes; never writes into the data root.
 
 ## Validation performed (BUILD_A, read-only)
 
@@ -189,10 +193,24 @@ Phase 3D additions (all via `mdk-inspect --entries`, read-only):
   `envelope-only`/`unsupported` and reject `--entries`.
 - Manifest re-verified after Phase 3D inspection: 141/141 unchanged.
 
+Phase 3E additions (all via `mdk-inspect --entries`, read-only):
+
+- All 6 `.MTO` files in BUILD_A enumerate `ok` — 10 overlay entries
+  each (60 blocks): embedded `.MAT` tables (0–23 MTI records each,
+  483 total), region-A records (overlay-alien refs, overlay-sound
+  records ≤ the original's 0x10 cap, and the third record array),
+  the fixed 0x150-byte region B, and the region-C counted arrays.
+- `.CMI/.DTI/.FTI/.BNI/.LBB` correctly remain
+  `envelope-only`/`unsupported` and reject `--entries`.
+- Manifest re-verified after Phase 3E inspection: 141/141 unchanged.
+
 ## Explicit unknowns (not implemented)
 
-- Interior structures of `.MTO/.CMI/.DTI` (shape observations
+- Interior structures of `.CMI/.DTI` (shape observations
   recorded in `DATA_FORMATS.md`; none decoded).
+- `.MTO` region semantics: what region A's array-A records name, the
+  region-C arrays' roles, and all payload contents past the proven
+  boundaries (UNKNOWN — see DATA_FORMATS.md).
 - `.MTI` payload data past the proven u16 header, the `+0x08` low-16
   flag semantics, the `+0x0c`/`+0x10` param semantics, and what index
   records' `+0x0c` values index (all UNKNOWN — see DATA_FORMATS.md).

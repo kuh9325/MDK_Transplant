@@ -27,7 +27,7 @@ namespace mdk {
 // BUILD_A (executables, drivers, text/config, misc binary) shares
 // kOtherKnown — they are not MDK data families.
 enum class MdkFileFamily {
-  kMto,   // .MTO — tagged-name envelope (interior: NOT the SNI layout)
+  kMto,   // .MTO — tagged-name envelope; interior overlay directory PROVEN
   kSni,   // .SNI — tagged-name envelope; interior directory PROVEN
   kMti,   // .MTI — tagged-name envelope; interior directory PROVEN
           //      (name[8] + 4 fields, 24-byte stride — Phase 3D)

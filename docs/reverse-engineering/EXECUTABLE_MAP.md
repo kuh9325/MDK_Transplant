@@ -130,6 +130,7 @@ bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
 | Level bundle load | `FUN_0041b7b4` | STRONG_ | `LEVEL%dO.MTO/SNI`, `LEVEL%dS.MTI`, `.CMI/.DTI`, `FALL3D.*`, `TRAVERSE.SNI`, `TRAVSPRT.BNI`, `STREAM.*`, `TLEVEL.*`, `LOAD_CPY` |
 | .SNI directory | `FUN_00428a0c` (stream loader), `FUN_004259a8` (whole-blob loader), `FUN_00428c90`/`FUN_00429014` (entry lookup + payload read), `FUN_00428be8`/`FUN_00428828` (iterate) | STRONG_ | count u32@0x14, N×24-byte records `{name[12], u32@+0x0c, blobOff@+0x10, size@+0x14}`; seek `stored+4` SEEK_SET; name compare ≤12 (`MOV EBX,0xc`→`FUN_0042fa80`); blob image = file+4 — Phase 3C, see `../DATA_FORMATS.md` |
 | .MTI directory (material table, `loadmats.c`) | `FUN_0041a1e0` (table parser — shared), `FUN_0041a4d0` (level `LEVEL%dS.MTI` path via `FUN_00425c8c`), `FUN_0041a480` (`STATS/STREAM/FALL3D_%d.MTI` via `FUN_00425bfc`), `FUN_0041a820` (second table `DAT_0054b730`), `FUN_0041a590`/`FUN_0041a5ec`/`FUN_0041a694` (name lookups, 0x34-stride in-memory records, name at +0x28) | STRONG_ | count u32@0x14, N×24-byte records `{name[8], flags@+0x08, u32@+0x0c, u32@+0x10, blobOff@+0x14}`; `+0x08==0xffffffff` = index record (only `+0x0c` read); else `+0x14` dereferenced blob-relative (file pos = stored+4); flags `&0x30000` select 4- vs 8-byte payload u16 header; strings `matdef`/`matlkup`/`Texture %s not in material list` — Phase 3D, see `../DATA_FORMATS.md` |
+| .MTO overlay directory | `FUN_0041a84c` (dir load), `FUN_0041a910` (max-block scan → scratch alloc), `FUN_0041a9d8` (name lookup → fseek + len read), `FUN_0041aad0`/`FUN_0041ab44` (≤0x8000-chunk stream + accessor), `FUN_00432534` (block consumer → `FUN_0041a820`→`FUN_0041a1e0` on buf+0x10), `FUN_00419ee0` (region-C walk), `FUN_00403720` (overlay-alien resolve), `FUN_004287cc`/`FUN_00402e2c` (overlay sounds), `FUN_004387ec`/`FUN_00403498` (region-A lookups), `FUN_0041b7b4` (`LEVEL%dO.MTO` path) | STRONG_ | count u32@0x14, N×12-byte records `{name[8], fileOff@+0x08}` (fseek SEEK_SET, name compare bound 8); block u32 = self-inclusive byte len, streamed from off+4; each block embeds a tagged `.MAT` image at +0x10 (parsed by the shared MTI parser) + region A `{ca,cb,cc}` (overlay-alien/overlay-sound records, cc≤0x10 → `"Too many overlay sounds"`) + fixed 0x150-byte region B + nested region C ({10,44,36,12}-stride counted arrays, 2-byte pad iff c1 odd); strings `overlay`, `No overlay data for %s`, `Failed to resolve overlay alien %s` — Phase 3E, see `../DATA_FORMATS.md` |
 | Traversal load | `FUN_00433d40` | STRONG_ | `MISC\LOAD_%d.LBB`, `TLEVEL.*`, level families |
 | FALL3D/freefall | `FUN_0040ef28` (+init `FUN_0041e070`-equiv) | STRONG_ | `fall_3d.c` string, `FALL3D_%d.MTI`, `FALLP_%d/LEVEL_%d/POD_%d` |
 | Renderer (3D) | `FUN_00431300` draw_arena, `FUN_00432e2c` BSPShow, `FUN_0040bd40/…` poly sort | STRONG_ | `Overflowed MaxObjects in draw_arena`, `BSPShow %s not found`, `arena %s not found`, `Too many polygons for current sort list`, `3 Cooridors not allowed for arena` |
@@ -157,14 +158,18 @@ found`) — OBSERVED format skeleton, semantics UNKNOWN.
 
 All path strings are `.\`-relative or `C:\MDK.CFG`-absolute; `mdkfopen`
 resolves `cddata`/`hddata` roots (BUILD_A ships both as `.\`). Coordinated
-per-level families `%s\LEVEL%d\…`: `.MTO` objects, `O.SNI`/`S.SNI` sound,
-`S.MTI` imagery, `.CMI` collision/map, `.DTI` data. `FALL3D\FALL3D_%d.MTI`
+per-level families `%s\LEVEL%d\…`: `.MTO` overlay data, `O.SNI`/`S.SNI`
+sound, `S.MTI` imagery, `.CMI` collision/map, `.DTI` data.
+`FALL3D\FALL3D_%d.MTI`
 + `.SNI` + `.BNI` for freefall; `STREAM\` for mid-level streams;
 `MISC\` for fonts/config/movies/slideshow/sound set; `demo\` for input
 recordings; `SAVES\%.SAV` + `LASTGAME` for saves. (Phase 3C: the `.SNI`
 interior directory — count + 24-byte name/offset/size records — was the
 first proven interior format; Phase 3D adds the `.MTI` material-table
 directory — count + 24-byte name[8]/flags/params/blob-offset records;
+Phase 3E adds the `.MTO` overlay directory — count + 12-byte
+name[8]/file-offset records indexing overlay blocks that each embed a
+`.MAT` image plus three bounded data regions;
 see `../DATA_FORMATS.md`.)
 
 ## DOS ↔ Win95 shared code — CORROBORATED

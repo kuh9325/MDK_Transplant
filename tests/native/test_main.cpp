@@ -9,6 +9,7 @@
 #include "core/framebuffer.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
+#include "core/mto_directory.h"
 #include "core/sni_directory.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
@@ -281,13 +282,13 @@ void test_file_family() {
   CHECK(fileFamilyForPath(".SNI") == MdkFileFamily::kSni); // ext-only name
   CHECK(fileFamilyForPath("a.SNI.bak") == MdkFileFamily::kUnknown);
 
-  // Support levels (Phase 3C: SNI; Phase 3D: MTI).
+  // Support levels (Phase 3C: SNI; Phase 3D: MTI; Phase 3E: MTO).
   CHECK(fileFamilySupport(MdkFileFamily::kSni) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kMti) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kMto) ==
-        FamilySupport::kEnvelopeOnly);
+        FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kCmi) ==
         FamilySupport::kEnvelopeOnly);
   CHECK(fileFamilySupport(MdkFileFamily::kDti) ==
@@ -614,6 +615,188 @@ struct SyntheticMti {
   }
 };
 
+// Synthetic MTO builder (no original data). Layout mirrors the
+// OBSERVED+CODE-CORROBORATED structure:
+//   [u32 size-4][name12][u32 size-12][u32 count]
+//   [count x 12B records {name[8], u32 blockFileOff}]
+//   [overlay blocks, align4-chained] [name12 trailer]
+// Block: {u32 len, u32 ofsA, u32 ofsB, u32 ofsC} then an embedded
+// tagged ".MAT" file at +0x10, then region A {u32 size, struct
+// {ca,cb,cc} + rec12[ca] + rec12[cb] + rec24[cc] + blobs}, region B
+// span, region C {c1, rec10[c1], pad2|c1 odd, c2, rec44[c2], c3,
+// rec36[c3], c4, rec12[c4], u32, extra}.
+struct SyntheticMto {
+  using InnerRec =
+      std::tuple<const char*, std::uint32_t, std::uint32_t,
+                 std::uint32_t, std::uint32_t>;  // name,f08,f0c,f10,sz
+  struct BlockSpec {
+    const char* entryName;
+    const char* innerName;
+    std::vector<InnerRec> innerRecs = {};
+    std::uint32_t ca = 0, cb = 0, cc = 0;
+    std::uint32_t c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+    std::uint32_t regionBSize = 0x150;   // OBSERVED constant
+    std::uint32_t regionCExtra = 0;
+  };
+
+  std::vector<std::byte> buf;
+  std::vector<std::size_t> blockOffs;  // file offset of each block
+  std::vector<std::size_t> innerOffs;  // file offset of each .MAT image
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void put16(std::size_t off, std::uint16_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 12) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+  static std::uint64_t align4(std::uint64_t v) { return (v + 3) & ~3ull; }
+
+  static SyntheticMto build(const char* logicalName,
+                            std::initializer_list<BlockSpec> specs) {
+    SyntheticMto s;
+    const std::uint32_t count = static_cast<std::uint32_t>(specs.size());
+    const std::uint64_t dirEnd = 0x18 + std::uint64_t(count) * 12;
+
+    // Pass 1: compute total size (same arithmetic as pass 2).
+    std::uint64_t pos = dirEnd;
+    for (const auto& sp : specs) {
+      const std::uint64_t innerSize = 0x24 +
+          std::uint64_t(sp.innerRecs.size()) * 24 +
+          [&] {
+            std::uint64_t t = 0;
+            for (const auto& ir : sp.innerRecs) t += std::get<4>(ir);
+            return t;
+          }() + 12;
+      const std::uint64_t blobBase =
+          12 + sp.ca * 12ull + sp.cb * 12ull + sp.cc * 24ull;
+      const std::uint64_t sizeA =
+          blobBase + (sp.ca + sp.cb + sp.cc) * 8ull;
+      const std::uint64_t regionCSize =
+          4 + sp.c1 * 10ull + (sp.c1 & 1 ? 2 : 0) + 4 + sp.c2 * 44ull +
+          4 + sp.c3 * 36ull + 4 + sp.c4 * 12ull + 4 + sp.regionCExtra;
+      pos = align4(pos);
+      const std::uint64_t tA = pos + 0x10 + innerSize + 4;
+      pos = align4(tA + sizeA) + sp.regionBSize + regionCSize;
+    }
+    const std::uint64_t total = pos + 12;
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    // Pass 2: envelope + table 1.
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.putName(0x04, logicalName);
+    s.put32(0x10, static_cast<std::uint32_t>(total - 12));
+    s.put32(0x14, count);
+
+    pos = dirEnd;
+    std::uint32_t i = 0;
+    for (const auto& sp : specs) {
+      pos = align4(pos);
+      const std::uint64_t off = pos;
+      s.blockOffs.push_back(static_cast<std::size_t>(off));
+      const std::uint64_t rec = 0x18 + std::uint64_t(i) * 12;
+      s.putName(rec, sp.entryName, 8);
+      s.put32(rec + 8, static_cast<std::uint32_t>(off));
+
+      // Embedded ".MAT" file.
+      const std::uint64_t inner = off + 0x10;
+      s.innerOffs.push_back(static_cast<std::size_t>(inner));
+      std::uint64_t payloadSum = 0;
+      for (const auto& ir : sp.innerRecs) payloadSum += std::get<4>(ir);
+      const std::uint64_t innerSize =
+          0x24 + std::uint64_t(sp.innerRecs.size()) * 24 + payloadSum +
+          12;
+      const std::uint64_t innerEnd = inner + innerSize;
+      s.put32(inner + 0x00, static_cast<std::uint32_t>(innerSize - 4));
+      s.putName(inner + 0x04, sp.innerName);
+      s.put32(inner + 0x10, static_cast<std::uint32_t>(innerSize - 12));
+      s.put32(inner + 0x14,
+              static_cast<std::uint32_t>(sp.innerRecs.size()));
+      std::uint64_t pAt =
+          inner + 0x18 + std::uint64_t(sp.innerRecs.size()) * 24;
+      std::uint32_t j = 0;
+      for (const auto& ir : sp.innerRecs) {
+        const std::uint64_t r = inner + 0x18 + std::uint64_t(j) * 24;
+        s.putName(r, std::get<0>(ir), 8);
+        s.put32(r + 0x08, std::get<1>(ir));
+        s.put32(r + 0x0c, std::get<2>(ir));
+        s.put32(r + 0x10, std::get<3>(ir));
+        if (std::get<1>(ir) == 0xffffffffu) {
+          s.put32(r + 0x14, 0);
+        } else {
+          s.put32(r + 0x14,
+                  static_cast<std::uint32_t>(pAt - (inner + 4)));
+          pAt += std::get<4>(ir);
+        }
+        ++j;
+      }
+      s.putName(innerEnd - 12, sp.innerName);
+
+      // Region A: u32 size at innerEnd, struct at innerEnd+4.
+      const std::uint64_t tA = innerEnd + 4;
+      s.put32(off + 0x04,
+              static_cast<std::uint32_t>(tA - (off + 8)));
+      const std::uint64_t blobBase =
+          12 + sp.ca * 12ull + sp.cb * 12ull + sp.cc * 24ull;
+      const std::uint64_t sizeA =
+          blobBase + (sp.ca + sp.cb + sp.cc) * 8ull;
+      s.put32(innerEnd, static_cast<std::uint32_t>(sizeA));
+      s.put32(tA + 0x00, sp.ca);
+      s.put32(tA + 0x04, sp.cb);
+      s.put32(tA + 0x08, sp.cc);
+      std::uint64_t blob = tA + blobBase;
+      std::uint64_t q = tA + 12;
+      char nm[9];
+      for (std::uint32_t k = 0; k < sp.ca; ++k, q += 12, blob += 8) {
+        std::snprintf(nm, sizeof(nm), "RA%u", k);
+        s.putName(q, nm, 8);
+        s.put32(q + 8, static_cast<std::uint32_t>(blob - tA));
+        s.put32(blob, 1);  // count-prefixed blob shape
+      }
+      for (std::uint32_t k = 0; k < sp.cb; ++k, q += 12, blob += 8) {
+        std::snprintf(nm, sizeof(nm), "RB%u", k);
+        s.putName(q, nm, 8);
+        s.put32(q + 8, static_cast<std::uint32_t>(blob - tA));
+        s.put32(blob, 1);
+      }
+      for (std::uint32_t k = 0; k < sp.cc; ++k, q += 24, blob += 8) {
+        s.put32(q + 0x10, static_cast<std::uint32_t>(blob - tA));
+        s.put32(blob, 1);
+      }
+
+      // Region B (fixed-size span) then region C.
+      const std::uint64_t tB = align4(tA + sizeA);
+      s.put32(off + 0x08, static_cast<std::uint32_t>(tB - (off + 4)));
+      const std::uint64_t tC = tB + sp.regionBSize;
+      s.put32(off + 0x0c, static_cast<std::uint32_t>(tC - (off + 4)));
+      q = tC;
+      s.put32(q, sp.c1); q += 4;
+      for (std::uint32_t k = 0; k < sp.c1; ++k, q += 10) {
+        std::snprintf(nm, sizeof(nm), "RC%05u", k);
+        s.putName(q, nm, 10);
+      }
+      if (sp.c1 & 1) q += 2;
+      s.put32(q, sp.c2); q += 4 + sp.c2 * 44ull;
+      s.put32(q, sp.c3); q += 4 + sp.c3 * 36ull;
+      s.put32(q, sp.c4); q += 4 + sp.c4 * 12ull;
+      s.put32(q, 0); q += 4;
+      q += sp.regionCExtra;
+      s.put32(off + 0x00, static_cast<std::uint32_t>(q - off));
+      pos = q;
+      ++i;
+    }
+    s.putName(static_cast<std::size_t>(total - 12), logicalName);
+    return s;
+  }
+};
+
 void test_mti_directory() {
   using mdk::MtiDirectoryStatus;
   using mdk::inspectMtiDirectory;
@@ -806,6 +989,279 @@ void test_mti_directory() {
     s.put32(0x00, 0);
     const auto d = inspectMtiDirectory(s.buf);
     CHECK(d.status == MtiDirectoryStatus::kNotTaggedEnvelope);
+  }
+}
+
+void test_mto_directory() {
+  using mdk::MtoDirectoryStatus;
+  using mdk::inspectMtoDirectory;
+
+  // Valid two-block file: one populated block plus the corpus's
+  // "minimal" form (inner count 0, region A size 0xc, tiny region C).
+  {
+    auto s = SyntheticMto::build("TEST.MTO", {
+        {"OV1", "OV1.MAT",
+         {{"TEX_A", 0x00000000, 0, 0x40600000, 16},
+          {"TEX_B", 0x00020000, 0, 0, 8}},
+         2, 1, 1, 3, 2, 1, 2, 0x150, 8},
+        {"OV2", "OV2.MAT", {}, 0, 0, 0, 1, 1, 2, 4, 0x150, 0}});
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kOk);
+    CHECK(d.count == 2 && d.entries.size() == 2 && d.blocks.size() == 2);
+    CHECK(d.directoryEnd == 0x30);
+    CHECK(d.trailerPresent && d.secondaryEqualsTrailerOffset);
+    CHECK(d.entries[0].name() == "OV1");
+    CHECK(d.entries[0].blockFileOffset == s.blockOffs[0]);
+    CHECK(d.entries[1].name() == "OV2");
+    CHECK(d.entries[1].blockFileOffset == s.blockOffs[1]);
+
+    const auto& b0 = d.blocks[0];
+    CHECK(b0.innerName() == "OV1.MAT");
+    CHECK(b0.innerCount == 2 && b0.innerRecords.size() == 2);
+    CHECK(b0.innerRecords[0].name() == "TEX_A");
+    CHECK(!b0.innerRecords[0].isIndexRecord());
+    CHECK(!b0.innerRecords[0].hasExtendedHeader());
+    CHECK(b0.innerRecords[0].fieldAt0x10 == 0x40600000u);
+    CHECK(b0.innerRecords[1].hasExtendedHeader());  // flags & 0x30000
+    CHECK(b0.innerTrailerPresent &&
+          b0.innerSecondaryEqualsTrailerOffset);
+    CHECK(b0.regionACountA == 2 && b0.regionACountB == 1 &&
+          b0.regionACountC == 1);
+    CHECK(b0.regionAArrayA.size() == 2);
+    CHECK(b0.regionAArrayA[0].name() == "RA0");
+    CHECK(b0.regionAArrayA[0].fieldAt0x08 >= 12);
+    CHECK(b0.regionAArrayB.size() == 1 &&
+          b0.regionAArrayB[0].name() == "RB0");
+    CHECK(b0.regionAArrayC.size() == 1);
+    CHECK(b0.regionAArrayC[0].fieldAt0x10 >= 12);
+    CHECK(b0.regionBSize == 0x150);
+    CHECK(b0.regionCCount1 == 3 && b0.regionCNames.size() == 3);
+    CHECK(b0.regionCNames[0].name() == "RC00000");
+    CHECK(b0.regionCCount2 == 2 && b0.regionCCount3 == 1 &&
+          b0.regionCCount4 == 2);
+    // c1=3 is odd → the 2-byte pad path was exercised by the builder.
+
+    const auto& b1 = d.blocks[1];
+    CHECK(b1.innerCount == 0 && b1.innerRecords.empty());
+    CHECK(b1.regionASize == 0x0c);
+    CHECK(b1.regionACountA == 0 && b1.regionACountB == 0 &&
+          b1.regionACountC == 0);
+    CHECK(b1.regionAArrayA.empty() && b1.regionAArrayB.empty() &&
+          b1.regionAArrayC.empty());
+    CHECK(b1.regionCCount1 == 1 && b1.regionCCount4 == 4);
+  }
+
+  // Zero-entry directory: count=0 is legal.
+  {
+    auto s = SyntheticMto::build("EMPTY.MTO", {});
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kOk);
+    CHECK(d.count == 0 && d.entries.empty() && d.blocks.empty());
+    CHECK(d.directoryEnd == 0x18);
+  }
+
+  // Full-width 8-byte entry name (fills the field, no NUL inside).
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"ABCDEFGH", "FULLNAME.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kOk);
+    CHECK(d.entries[0].name() == "ABCDEFGH");
+    CHECK(d.entries[0].nameField[7] == std::byte{'H'});
+  }
+
+  // Block offset before the directory end → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    s.put32(0x18 + 8, 0x14);  // inside the directory itself
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kBlockOutOfBounds);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Block offset past the file end → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    s.put32(0x18 + 8, static_cast<std::uint32_t>(s.buf.size() - 8));
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kBlockOutOfBounds);
+  }
+
+  // Block length escaping the trailer bound → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    const std::size_t off = s.blockOffs[0];
+    s.put32(off, static_cast<std::uint32_t>(s.buf.size() - off + 8));
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kBlockOutOfBounds);
+  }
+
+  // Embedded ".MAT" size escaping the block → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    const std::size_t inner = s.innerOffs[0];
+    s.put32(inner, 0x40000000);
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Embedded record count running past the inner trailer → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {{"T", 0, 0, 0, 8}}, 0, 0, 0, 1, 0, 0, 0}});
+    const std::size_t inner = s.innerOffs[0];
+    s.put32(inner + 0x14, 9);  // 9 records, only 1 fits
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+  }
+
+  // Inner payload offset pointing into the inner directory → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {{"T", 0, 0, 0, 8}}, 0, 0, 0, 1, 0, 0, 0}});
+    const std::size_t inner = s.innerOffs[0];
+    s.put32(inner + 0x18 + 0x14, 0);  // img+0 = inside inner dir
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+  }
+
+  // Inner index record (flags=0xffffffff): no such record is OBSERVED
+  // in BUILD_A MTOs, but the shared MTI mechanism supports the class —
+  // preserved raw, its +0x14 never bounds-checked.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {{"IDX", 0xffffffff, 7, 0, 0}}, 0, 0, 0,
+          1, 0, 0, 0}});
+    const std::size_t inner = s.innerOffs[0];
+    s.put32(inner + 0x18 + 0x14, 0xdeadbeef);
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kOk);
+    CHECK(d.blocks[0].innerRecords[0].isIndexRecord());
+    CHECK(d.blocks[0].innerRecords[0].fieldAt0x0C == 7);
+    CHECK(d.blocks[0].innerRecords[0].fieldAt0x14 == 0xdeadbeefu);
+  }
+
+  // Region A arrays escaping the declared size → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    // Inflate ca past what regionASize covers.
+    const auto d0 = inspectMtoDirectory(s.buf);
+    CHECK(d0.status == MtoDirectoryStatus::kOk);
+    s.put32(d0.blocks[0].regionAOffset, 0x100);
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+  }
+
+  // Region A record offset pointing before the arrays or past the
+  // declared region → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 1, 0, 0, 1, 0, 0, 0}});
+    const auto d0 = inspectMtoDirectory(s.buf);
+    CHECK(d0.status == MtoDirectoryStatus::kOk);
+    // recA[0] sits at regionAOffset+12; its +8 field is the tA-rel off.
+    s.put32(d0.blocks[0].regionAOffset + 12 + 8, 4);  // < 12
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+
+    auto s2 = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 1, 0, 0, 1, 0, 0, 0}});
+    const auto e0 = inspectMtoDirectory(s2.buf);
+    s2.put32(e0.blocks[0].regionAOffset + 12 + 8,
+             e0.blocks[0].regionASize);  // == sizeA: outside region
+    const auto d2 = inspectMtoDirectory(s2.buf);
+    CHECK(d2.status == MtoDirectoryStatus::kInteriorMalformed);
+  }
+
+  // Region C counts escaping the block → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    const auto d0 = inspectMtoDirectory(s.buf);
+    CHECK(d0.status == MtoDirectoryStatus::kOk);
+    // c1=1 → rec10[1] + 2-byte pad; c2 field sits at tC+16.
+    s.put32(d0.blocks[0].regionCOffset + 16, 0x10000);
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+  }
+
+  // Region targets out of order (ofsB > ofsC) → rejected.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    const auto d0 = inspectMtoDirectory(s.buf);
+    CHECK(d0.status == MtoDirectoryStatus::kOk);
+    const std::size_t off = s.blockOffs[0];
+    s.put32(off + 0x08,
+            static_cast<std::uint32_t>(d0.blocks[0].fieldAt0x0C + 4));
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kInteriorMalformed);
+  }
+
+  // Inflated outer count → directory bound fails (division-first math;
+  // count*stride never overflows).
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    s.put32(0x14, 0xffffffff);
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kDirectoryOutOfBounds);
+  }
+
+  // Truncated header: envelope fine but file ends before count.
+  {
+    std::byte t[20] = {};
+    t[0] = std::byte{16};
+    std::memcpy(t + 4, "T.MTO", 5);
+    const auto d = inspectMtoDirectory(t);
+    CHECK(d.status == MtoDirectoryStatus::kTruncatedHeader);
+  }
+
+  // Not a tagged envelope → "not this format", not "malformed".
+  {
+    std::byte raw[64] = {};
+    const auto d = inspectMtoDirectory(raw);
+    CHECK(d.status == MtoDirectoryStatus::kNotTaggedEnvelope);
+
+    std::byte fti[32] = {};
+    fti[0] = std::byte{28};
+    fti[4] = std::byte{0x03};
+    const auto d2 = inspectMtoDirectory(fti);
+    CHECK(d2.status == MtoDirectoryStatus::kNotTaggedEnvelope);
+  }
+
+  // Missing trailer → still parses; trailerPresent reports the fact.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    for (std::size_t i = s.buf.size() - 12; i < s.buf.size(); ++i)
+      s.buf[i] = std::byte{'X'};
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kOk);
+    CHECK(!d.trailerPresent);
+  }
+
+  // Slack before the trailer: OBSERVED block lengths can leave an
+  // align4 gap — extend the file past the last block end. The old
+  // trailer bytes stay in place and become ordinary slack; the
+  // envelope fields move to the new size.
+  {
+    auto s = SyntheticMto::build("TEST.MTO",
+        {{"A", "A.MAT", {}, 0, 0, 0, 1, 0, 0, 0}});
+    const std::size_t oldSize = s.buf.size();
+    s.buf.resize(oldSize + 12);
+    s.put32(0x00, static_cast<std::uint32_t>(s.buf.size() - 4));
+    s.put32(0x10, static_cast<std::uint32_t>(s.buf.size() - 12));
+    s.putName(oldSize, "TEST.MTO");  // trailer at new size-12
+    const auto d = inspectMtoDirectory(s.buf);
+    CHECK(d.status == MtoDirectoryStatus::kOk);
+    CHECK(d.trailerPresent);
   }
 }
 
@@ -1003,6 +1459,7 @@ int main() {
   test_file_family();
   test_sni_directory();
   test_mti_directory();
+  test_mto_directory();
   test_data_root();
   test_mode_dispatch();
   test_input_state();

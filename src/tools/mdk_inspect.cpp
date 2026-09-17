@@ -13,6 +13,7 @@
 #include "core/data_root.h"
 #include "core/file_family.h"
 #include "core/mti_directory.h"
+#include "core/mto_directory.h"
 #include "core/sni_directory.h"
 
 #include <cstdio>
@@ -165,6 +166,90 @@ int selftest() {
        mdir.trailerPresent && mdir.secondaryEqualsTrailerOffset;
   std::fprintf(stderr, "selftest mti-directory: %s\n",
                ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic MTO-like fixture (no original data): tagged envelope +
+  // count=1 + one 12-byte record {name[8]="OV1", blockOff=0x24} + one
+  // overlay block + name trailer. File size 0xb8.
+  //
+  // Block @0x24, len=0x88 → [0x24, 0xac):
+  //   +0x00 len=0x88, +0x04 ofsA=0x4c, +0x08 ofsB=0x5c, +0x0c ofsC=0x70
+  //   embedded file @0x34 (innerSize=0x40 → innerEnd=0x74):
+  //     innerLen=0x3c, name "OV1.MAT"@0x38, sec=0x34@0x44, count=1@0x48,
+  //     rec @0x4c {"TEX", 0,0,0, imgOff=0x2c}, payload @0x64 {64,32},
+  //     trailer "OV1.MAT"@0x68
+  //   regionA: size=0x0c @0x74, struct {0,0,0} @0x78 → end 0x84
+  //   regionB [0x84, 0x98) — off+4+0x5c = 0x84
+  //   regionC @0x98 (off+4+0x70): c1..c4 = 0, u32, extra → 0xac = bend
+  std::byte mto[0xb8] = {};
+  const auto oput32 = [&](std::size_t off, std::uint32_t v) {
+    mto[off + 0] = static_cast<std::byte>(v & 0xff);
+    mto[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    mto[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    mto[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  };
+  const auto oput16 = [&](std::size_t off, std::uint16_t v) {
+    mto[off + 0] = static_cast<std::byte>(v & 0xff);
+    mto[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+  };
+  const auto oputName = [&](std::size_t off, const char* s) {
+    for (std::size_t i = 0; s[i] && off + i < sizeof(mto); ++i) {
+      mto[off + i] = static_cast<std::byte>(s[i]);
+    }
+  };
+  oput32(0x00, sizeof(mto) - 4);
+  oputName(0x04, "TEST.MAT");
+  oput32(0x10, sizeof(mto) - 12);
+  oput32(0x14, 1);                // overlay count
+  oputName(0x18, "OV1");          // table-1 record
+  oput32(0x20, 0x24);             // block file offset
+  oput32(0x24, 0x88);             // blockLength → bend 0xac
+  oput32(0x28, 0x4c);             // ofsA → 0x24+8+0x4c = 0x78
+  oput32(0x2c, 0x5c);             // ofsB → 0x24+4+0x5c = 0x84
+  oput32(0x30, 0x70);             // ofsC → 0x24+4+0x70 = 0x98
+  oput32(0x34, 0x3c);             // innerLen → innerSize 0x40
+  oputName(0x38, "OV1.MAT");
+  oput32(0x44, 0x34);             // inner secondary = innerSize-12
+  oput32(0x48, 1);                // inner count
+  oputName(0x4c, "TEX");          // inner record name[8]
+  oput32(0x60, 0x2c);             // rec+0x14: img(0x38)+0x2c = 0x64
+  oput16(0x64, 64);               // payload header {64, 32}
+  oput16(0x66, 32);
+  oputName(0x68, "OV1.MAT");      // inner trailer → innerEnd 0x74
+  oput32(0x74, 0x0c);             // regionA size (self-exclusive)
+  // regionA struct @0x78: ca=cb=cc=0 (zeros)
+  // regionB [0x84,0x98) zeros; regionC @0x98: c1..c4=0 + u32 (zeros)
+  oputName(sizeof(mto) - 12, "TEST.MAT");
+
+  const auto odir = mdk::inspectMtoDirectory(
+      std::span<const std::byte>(mto, sizeof(mto)));
+  ok = odir.status == mdk::MtoDirectoryStatus::kOk &&
+       odir.count == 1 && odir.entries.size() == 1 &&
+       odir.entries[0].name() == "OV1" &&
+       odir.entries[0].blockFileOffset == 0x24 &&
+       odir.blocks.size() == 1 &&
+       odir.blocks[0].blockLength == 0x88 &&
+       odir.blocks[0].innerName() == "OV1.MAT" &&
+       odir.blocks[0].innerCount == 1 &&
+       odir.blocks[0].innerRecords.size() == 1 &&
+       odir.blocks[0].innerRecords[0].name() == "TEX" &&
+       odir.blocks[0].innerRecords[0].headerFieldA == 64 &&
+       odir.blocks[0].innerRecords[0].headerFieldB == 32 &&
+       odir.blocks[0].innerRecords[0].payloadDataFileOffset == 0x68 &&
+       odir.blocks[0].innerTrailerPresent &&
+       odir.blocks[0].innerSecondaryEqualsTrailerOffset &&
+       odir.blocks[0].regionASize == 0x0c &&
+       odir.blocks[0].regionACountA == 0 &&
+       odir.blocks[0].regionBOffset == 0x84 &&
+       odir.blocks[0].regionBSize == 0x14 &&
+       odir.blocks[0].regionCOffset == 0x98 &&
+       odir.blocks[0].regionCCount1 == 0 &&
+       odir.blocks[0].regionCExtraOffset == 0xac &&
+       odir.trailerPresent && odir.secondaryEqualsTrailerOffset;
+  std::fprintf(stderr, "selftest mto-directory: %s\n",
+               ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 
@@ -309,8 +394,8 @@ int main(int argc, char** argv) {
   }
 
   // --entries: enumerate interior directory metadata where a proven
-  // parser exists (SNI Phase 3C; MTI Phase 3D). Never prints payload
-  // bytes.
+  // parser exists (SNI Phase 3C; MTI Phase 3D; MTO Phase 3E). Never
+  // prints payload bytes.
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
     std::printf("entries:   unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
@@ -375,6 +460,113 @@ int main(int argc, char** argv) {
                     e.headerFieldA, e.headerFieldB,
                     static_cast<unsigned long long>(
                         e.payloadDataFileOffset));
+      }
+    }
+    return 0;
+  }
+
+  if (family == mdk::MdkFileFamily::kMto) {
+    const auto dir = mdk::inspectMtoDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    std::printf("entries:   MTO overlay directory (count u32 @0x14, "
+                "records 12 bytes @0x18, name[8] + file offset)\n");
+    std::printf("status:    %s%s%s\n",
+                std::string(mdk::mtoDirectoryStatusName(dir.status)).c_str(),
+                dir.detail.empty() ? "" : " — ",
+                dir.detail.empty() ? "" : dir.detail.c_str());
+    if (dir.status != mdk::MtoDirectoryStatus::kOk) {
+      return 1;
+    }
+    std::printf("count:     %u\n", dir.count);
+    std::printf("dir-end:   0x%llx\n",
+                static_cast<unsigned long long>(dir.directoryEnd));
+    std::printf("trailer:   name[12] @ size-12 %s\n",
+                dir.trailerPresent ? "present" : "ABSENT");
+    std::printf("u32@0x10:  %u — %s trailer offset\n",
+                dir.secondaryLength,
+                dir.secondaryEqualsTrailerOffset ? "equals"
+                                                 : "does not equal");
+
+    for (std::size_t i = 0; i < dir.entries.size(); ++i) {
+      const auto& e = dir.entries[i];
+      const auto& b = dir.blocks[i];
+      std::printf("  [%3zu] %-8s blockOff=0x%08llx blockLen=0x%x "
+                  "inner=%-12s innerRecs=%u\n",
+                  i, e.name().c_str(),
+                  static_cast<unsigned long long>(e.blockFileOffset),
+                  b.blockLength, b.innerName().c_str(), b.innerCount);
+      std::printf("         fields{0x04=0x%x 0x08=0x%x 0x0c=0x%x} "
+                  "innerTrailer=%s regionA{size=0x%x ca=%u cb=%u "
+                  "cc=%u} regionB@0x%llx(0x%llx) regionC@0x%llx{c1=%u "
+                  "c2=%u c3=%u c4=%u extra@0x%llx}\n",
+                  b.fieldAt0x04, b.fieldAt0x08, b.fieldAt0x0C,
+                  b.innerTrailerPresent ? "yes" : "no",
+                  b.regionASize, b.regionACountA, b.regionACountB,
+                  b.regionACountC,
+                  static_cast<unsigned long long>(b.regionBOffset),
+                  static_cast<unsigned long long>(b.regionBSize),
+                  static_cast<unsigned long long>(b.regionCOffset),
+                  b.regionCCount1, b.regionCCount2, b.regionCCount3,
+                  b.regionCCount4,
+                  static_cast<unsigned long long>(b.regionCExtraOffset));
+      for (std::size_t j = 0; j < b.innerRecords.size(); ++j) {
+        const auto& mr = b.innerRecords[j];
+        if (mr.isIndexRecord()) {
+          std::printf("           mat[%3zu] %-8s INDEX index=%u "
+                      "field0x10=0x%08x field0x14=0x%08x\n",
+                      j, mr.name().c_str(), mr.fieldAt0x0C,
+                      mr.fieldAt0x10, mr.fieldAt0x14);
+        } else if (mr.headerCount) {
+          std::printf("           mat[%3zu] %-8s flags=0x%08x "
+                      "f0x0c=0x%08x f0x10=0x%08x imgOff=0x%08x "
+                      "fileOff=0x%08llx hdr{n=%u,a=%u,b=%u} "
+                      "dataOff=0x%08llx\n",
+                      j, mr.name().c_str(), mr.fieldAt0x08,
+                      mr.fieldAt0x0C, mr.fieldAt0x10, mr.fieldAt0x14,
+                      static_cast<unsigned long long>(
+                          mr.payloadDataFileOffset -
+                          mr.payloadHeaderBytes()),
+                      *mr.headerCount, mr.headerFieldA, mr.headerFieldB,
+                      static_cast<unsigned long long>(
+                          mr.payloadDataFileOffset));
+        } else {
+          std::printf("           mat[%3zu] %-8s flags=0x%08x "
+                      "f0x0c=0x%08x f0x10=0x%08x imgOff=0x%08x "
+                      "fileOff=0x%08llx hdr{a=%u,b=%u} "
+                      "dataOff=0x%08llx\n",
+                      j, mr.name().c_str(), mr.fieldAt0x08,
+                      mr.fieldAt0x0C, mr.fieldAt0x10, mr.fieldAt0x14,
+                      static_cast<unsigned long long>(
+                          mr.payloadDataFileOffset -
+                          mr.payloadHeaderBytes()),
+                      mr.headerFieldA, mr.headerFieldB,
+                      static_cast<unsigned long long>(
+                          mr.payloadDataFileOffset));
+        }
+      }
+      for (std::size_t j = 0; j < b.regionAArrayA.size(); ++j) {
+        const auto& nr = b.regionAArrayA[j];
+        std::printf("           regA-A[%3zu] %-8s off=0x%08x\n",
+                    j, nr.name().c_str(), nr.fieldAt0x08);
+      }
+      for (std::size_t j = 0; j < b.regionAArrayB.size(); ++j) {
+        const auto& nr = b.regionAArrayB[j];
+        std::printf("           regA-B[%3zu] %-8s off=0x%08x "
+                    "(overlay-alien lookup target)\n",
+                    j, nr.name().c_str(), nr.fieldAt0x08);
+      }
+      for (std::size_t j = 0; j < b.regionAArrayC.size(); ++j) {
+        const auto& sr = b.regionAArrayC[j];
+        std::printf("           regA-C[%3zu] {0x%08x 0x%08x 0x%08x "
+                    "0x%04x 0x%04x off=0x%08x 0x%08x} "
+                    "(overlay-sound record)\n",
+                    j, sr.fieldAt0x00, sr.fieldAt0x04, sr.fieldAt0x08,
+                    sr.fieldAt0x0C, sr.fieldAt0x0E, sr.fieldAt0x10,
+                    sr.fieldAt0x14);
+      }
+      for (std::size_t j = 0; j < b.regionCNames.size(); ++j) {
+        std::printf("           regC-name[%3zu] %s\n",
+                    j, b.regionCNames[j].name().c_str());
       }
     }
     return 0;

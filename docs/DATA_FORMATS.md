@@ -1,11 +1,13 @@
-# Data Formats — Phase 3D
+# Data Formats — Phase 3E
 
-Status: second interior directory mapped. This document records
+Status: third interior directory mapped. This document records
 evidence-backed file-format structure for the proprietary families
 found under the data root. Phase 3B established the top-level
 envelope; Phase 3C added explicit file-family dispatch and the first
-proven interior directory (`.SNI`); Phase 3D adds the second proven
-interior directory (`.MTI`, metadata only).
+proven interior directory (`.SNI`); Phase 3D added the second proven
+interior directory (`.MTI`, metadata only); Phase 3E adds the third
+proven interior directory (`.MTO`, metadata only — the original's
+"overlay" subsystem).
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`.
 "BUILD_A" = `original/installed/` — the NoCD repack; data integrity vs
@@ -28,7 +30,7 @@ delegates to it — no duplicated extension tables.
 
 | Family | Ext | Envelope | Support | Interior status |
 |---|---|---|---|---|
-| MTO | `.MTO` | tagged-name | envelope-only | interior ≠ SNI: `u32 count @0x14` then `{name[8], u32}` pairs (12-stride) + a second table (OBSERVED, not decoded) |
+| MTO | `.MTO` | tagged-name | **directory-metadata** | count + 12-byte `{name[8], u32 fileOff}` records → overlay blocks containing an embedded `.MAT`/MTI image + regions A/B/C (below) |
 | SNI | `.SNI` | tagged-name | **directory-metadata** | count + 24-byte directory records proven (below) |
 | MTI | `.MTI` | tagged-name | **directory-metadata** | count + 24-byte records `{name[8], u32 flags, u32, u32, u32 off}` proven (below) |
 | CMI | `.CMI` | tagged-name | envelope-only | length-prefixed name records + u32 (OBSERVED, not decoded) |
@@ -288,6 +290,168 @@ allocation tag `"matdef"`, lookup tag `"matlkup"`, failure message
 use offsets (`fieldAt0x08` etc.) because per-field semantics beyond
 the proven behavior remain UNKNOWN.
 
+## Proven interior directory: MTO
+
+Evidence class: OBSERVED (6/6 `.MTO` files = 60/60 overlay blocks in
+BUILD_A) + CODE-CORROBORATED (MDK95.EXE overlay cluster
+`FUN_0041a84c`…`FUN_0041ab44`, stream consumer `FUN_00432534`, the
+shared MTI parser `FUN_0041a1e0` running on each block's embedded
+image, and the region-C walker `FUN_00419ee0`).
+
+### Subsystem naming (CODE-CORROBORATED)
+
+The original's own strings call this the **overlay** subsystem:
+allocation tag `"overlay"`, lookup failure `"No overlay data for %s"`,
+the record-cap diagnostic `"Too many overlay sounds"`, and the
+resolver diagnostic `"Failed to resolve overlay alien %s"`. Paths are
+built as `"%s\LEVEL%d\LEVEL%dO.MTO"` (`FUN_0041b7b4`) and
+`"TLEVEL.mto"` (`FUN_00433d40`); nearby assert/source strings name
+`setupob.c`, `loadmats.c`, `soundset.c`, `traverse.c`, `tr_alcmd.c`.
+The parser therefore says "overlay block"/"overlay data" and
+"overlay-alien"/"overlay-sound" records — it does NOT call a block an
+object/model/actor/mesh; that semantic step remains UNPROVEN.
+
+### Outer layout
+
+```
+file offset
+0x00  u32le        blob length = fileSize - 4          (envelope)
+0x04  char[12]     logical name "<stem>.MAT"           (envelope)
+0x10  u32le        = fileSize - 12 (envelope)
+0x14  u32le        overlay count N   (CODE-CORROBORATED: fread 4 at
+                   fseek(0x14, SEEK_SET) in FUN_0041a84c)
+0x18  record[N]    12-byte directory records (fread N x 12):
+  +0x00  char[8]   entry name, NUL-padded; the original compares at
+                   most 8 bytes (MOV EBX,0x8 → bounded compare)
+  +0x08  u32le     FILE-ABSOLUTE offset of the overlay block
+                   (CODE-CORROBORATED: fseek(stored, SEEK_SET) in
+                   FUN_0041a9d8)
+…     blocks       OBSERVED: align4-chained inside [dirEnd, size-12)
+size-12  char[12]  trailer = name field repeat
+```
+
+Block streaming (CODE-CORROBORATED): the u32 at the block offset is
+the block's byte length, read by `FUN_0041a9d8`; `FUN_0041aad0` then
+streams `len` bytes starting at `off+4` in ≤0x8000 chunks. The stored
+length is therefore SELF-INCLUSIVE — the last four streamed bytes run
+into the align4 slack after the block. All interior offsets resolve
+inside `[off, off+len)`, so this is harmless and is preserved as
+OBSERVED behavior, never "corrected".
+
+### Overlay block interior
+
+```
+block-relative
++0x00  u32le   block length (self-inclusive, see above)
++0x04  u32le   region-A target: struct base = off+8+ofsA
++0x08  u32le   region-B target: base = off+4+ofsB
++0x0c  u32le   region-C target: base = off+4+ofsC
++0x10          embedded tagged ".MAT" file (full envelope below)
+```
+
+Embedded ".MAT" file (OBSERVED 60/60; CODE-CORROBORATED — the
+original runs `FUN_0041a1e0`, the MTI table parser, on `buf+0x10`):
+
+```
+inner+0x00  u32le    innerSize - 4   (same envelope convention)
+inner+0x04  char[12] inner name "<ENTRY>.MAT"
+inner+0x10  u32le    = innerSize - 12
+inner+0x14  u32le    MTI record count
+inner+0x18  rec[N]   MTI 24-byte records {name[8], flags, u32, u32,
+                     u32 off}; +0x14 payload offsets are relative to
+                     the embedded NAME FIELD (inner+4) — file pos =
+                     off+0x14+stored (CODE-CORROBORATED: the parser's
+                     blob base is the image pointer it is handed)
+…           payloads inside [innerDirEnd, innerEnd-12)
+innerEnd-12 char[12] trailer = inner name repeat (OBSERVED 60/60)
+```
+
+Record classes are the shared MTI ones (index flag 0xffffffff exists
+in the mechanism but is OBSERVED-absent in all 483 MTO records; flags
+∈ {0, 2, 0x20000}).
+
+Region A at `off+8+ofsA`, preceded by a self-exclusive `u32 sizeA`
+at `off+4+ofsA` (OBSERVED: `tA == innerEnd+4`, i.e.
+`ofsA == innerLen+0x10`, in 60/60):
+
+```
+tA+0x00  u32le countA → rec12[countA] {name[8], u32 tA-relative off}
+tA+0x04  u32le countB → rec12[countB] {name[8], u32 tA-relative off}
+         CODE-CORROBORATED: resolved by FUN_00403720 — "Failed to
+         resolve overlay alien %s" → overlay-alien references
+tA+0x08  u32le countC → rec24[countC]
+         {u32,u32,u32,u16,u16,u32 tA-rel off,u32}
+         CODE-CORROBORATED: countC > 0x10 aborts with "Too many
+         overlay sounds"; FUN_004287cc/FUN_00402e2c resolve them →
+         overlay-sound records
+…        trailing blobs that the record offsets index
+align4(tA + sizeA) == region-B base (OBSERVED 60/60)
+```
+
+Region B at `off+4+ofsB`: exactly 0x150 bytes in 60/60 blocks; the
+original copies it into a fixed structure (`DAT_00540dcc`-based).
+Palette-like; semantics UNKNOWN — reported as a fixed-size span.
+
+Region C at `off+4+ofsC` (CODE-CORROBORATED walk — `FUN_00419ee0`):
+
+```
+u32le c1;  rec10[c1] name fields; 2-byte pad iff c1 odd
+u32le c2;  rec44[c2]
+u32le c3;  rec36[c3]
+u32le c4;  rec12[c4]
+u32le;     trailing data to block end
+```
+
+### Field-by-field evidence matrix
+
+| Element | BUILD_A bytes | Original code | Status |
+|---|---|---|---|
+| count @0x14 | 10 in all 6 files | fread 4 after fseek(0x14, SEEK_SET) | CODE-CORROBORATED |
+| table-1 stride 12 | records tile [0x18, 0x90) | alloc `count*0xc`; fread(...,12,count); lookup walk stride 0xc | CODE-CORROBORATED |
+| name[8] | NUL-padded ≤8, no dups | compare bound 8 (MOV EBX,0x8) | CODE-CORROBORATED |
+| +0x08 = file offset | align4-chained targets | fseek(stored, SEEK_SET) in FUN_0041a9d8 | CODE-CORROBORATED |
+| block u32 = byte len | next = align4(off+len) | fread 4 → DAT_0054b758 = stream byte count | CODE-CORROBORATED |
+| stream base off+4 | interiors resolve | FUN_0041aad0 streams `len` bytes after the len field | CODE-CORROBORATED |
+| embedded .MAT @+0x10 | full envelope 60/60 | FUN_0041a1e0 (MTI parser) on buf+0x10 | CODE-CORROBORATED |
+| f04/f08/f0c targets | chain 60/60 | buf+buf[0]+4 / buf+buf[1] / buf+buf[2] consumers | CODE-CORROBORATED |
+| region A 3-array layout | 60/60 sane, 595 recs | FUN_00432534 reads {ca,cb,cc}; cc ≤ 0x10 | CODE-CORROBORATED |
+| region B size 0x150 | 60/60 | fixed-size copy in FUN_00432534 | OBSERVED + fixed consumer |
+| region C nested walk | 60/60 sane | FUN_00419ee0 stride chain {10,44,36,12} | CODE-CORROBORATED |
+| f20 = innerSize-12 | 60/60 | — | OBSERVED |
+| f04 == innerLen+0x10 (tA = innerEnd+4) | 60/60 | implied by layout | STRONG invariant |
+| inner flags vocabulary | {0, 2, 0x20000} | MTI `flags & 0x30000` test | OBSERVED |
+| index records in MTO | 0 of 483 | mechanism exists | OBSERVED-absent |
+| overlay sounds cap | cc ≤ 11 | cc > 0x10 → "Too many overlay sounds" | CODE-CORROBORATED |
+| name-field ASCII shape | all printable | no validation in original | OBSERVED (parser hardening) |
+
+### OBSERVED corpus statistics
+
+- 6 files `TRAVERSE/LEVEL{3..8}/LEVEL{3..8}O.MTO`, count=10 each →
+  60 overlay blocks, one structural class, zero anomalies.
+- blockLen range 0x259–0x1ad7bc.
+- Embedded MTI records: 0–23 per block, 483 total; no index records.
+- Region A: countA 0–19 (319 records), countB 0–13 (166), countC
+  0–11 (110); 13 blocks carry the empty form (sizeA=0xc).
+- Region B: 0x150 in 60/60.
+- Region C: c1 1–32, c2 1–3050, c3 2–5314, c4 4–2878.
+
+### Original loader functions (static evidence)
+
+| Address | Role (observed behavior) |
+|---|---|
+| `FUN_0041a84c` | MTO open + directory load: fseek(0x14), fread count, alloc `count*0xc` (tag "overlay"), fread 12-stride records |
+| `FUN_0041a910` | Iterates all records, fseeks each `+0x08`, reads the block len, allocs max-block scratch |
+| `FUN_0041a9d8` | Name lookup (bound 8) → fseek(rec+8, SEEK_SET) → fread 4 → block len; failure "No overlay data for %s" |
+| `FUN_0041aad0` | Chunked streamer: ≤0x8000 bytes per call into the scratch buffer |
+| `FUN_0041ab44` | Stream-buffer accessor |
+| `FUN_00432534` | Block consumer: runs `FUN_0041a820`→`FUN_0041a1e0` (MTI parser) on buf+0x10; reads regions A/B/C; enforces cc ≤ 0x10 |
+| `FUN_00419ee0` | Region-C counted-array walk ({10,44,36,12} strides + odd pad) |
+| `FUN_004287cc`/`FUN_00402e2c` | Overlay-sound processing/resolution |
+| `FUN_00403720` | Overlay-alien resolution ("Failed to resolve overlay alien %s") |
+| `FUN_004387ec`/`FUN_00403498` | Region-A name lookups |
+| `FUN_0041b7b4` | `"%s\LEVEL%d\LEVEL%dO.MTO"` path builder |
+| `FUN_00433d40` | Level-bundle loader; `"TLEVEL.mto"` path |
+
 ## Unknown fields
 
 - `u32 @0x10` (envelope): equals `fileSize - 12` in all tagged files and
@@ -307,6 +471,19 @@ the proven behavior remain UNKNOWN.
   what they index is UNKNOWN.
 - All payload contents past the proven header u16s: UNKNOWN (later
   phases).
+- MTO block `+0x04`/`+0x08`/`+0x0c`: the three region target bases are
+  proven (off+8+ofsA, off+4+ofsB, off+4+ofsC); why the original stores
+  them as offsets rather than chaining sizes is UNKNOWN.
+- MTO region-A array-A records: name+offset pairs whose semantic role
+  is UNKNOWN (the overlay-alien resolution uses array B; array A's
+  lookup consumers exist but their target semantics are unproven).
+- MTO region-A array-C record fields other than the `+0x10` offset:
+  semantics UNKNOWN (sound-processing reads them; no field names
+  proven).
+- MTO region B contents: fixed 0x150 bytes, palette-like; UNKNOWN.
+- MTO region C record internals (44/36/12-byte arrays, the c1 name
+  table's role, the trailing data): UNKNOWN.
+- MTO embedded ".MAT" payloads: same UNKNOWN level as MTI payloads.
 
 ## Families that do NOT share the SNI layout
 
@@ -315,32 +492,36 @@ Checked for "same count+stride+field order" against the SNI mechanism:
 - **MTI**: shares count@0x14 + 24-byte records + blob-relative offsets,
   but the record is `name[8]` + four u32s and `+0x14` is the offset
   (not `+0x10`); proven separately in Phase 3D (above).
-- **MTO**: `count @0x14` then `{name[8], u32}` 12-byte pairs followed by
-  a second table with name references (`DANT_1.MAT`) → different.
+- **MTO**: `count @0x14` + `{name[8], u32 fileOff}` 12-byte records →
+  self-contained overlay blocks each embedding a full tagged `.MAT`
+  file plus regions A/B/C; proven separately in Phase 3E (above).
 - **CMI**: length-prefixed strings (`len byte + chars + u32`), count at
   0x14 can be 0 with a second count following → different.
 - **DTI**: binary records, no names in the directory region → different.
 
-So each tagged family needs its own statics+bytes pass; SNI and MTI
-are proven, MTO/CMI/DTI interiors remain undecoded.
+So each tagged family needs its own statics+bytes pass; SNI, MTI and
+MTO are proven, CMI/DTI interiors remain undecoded.
 
 ## Unsupported payload semantics
 
 Per the phase brief, no semantics are assigned to SNI payloads (the
-RIFF/WAVE observation is byte-level only) or to MTI payload data past
-its proven u16 header; nothing in MTO/CMI/DTI/FTI/BNI interiors is
-decoded. The parsers enumerate boundaries — they never interpret or
-dump payload bytes.
+RIFF/WAVE observation is byte-level only), to MTI payload data past
+its proven u16 header, or to MTO block contents past the proven
+region boundaries; nothing in CMI/DTI/FTI/BNI interiors is decoded.
+The parsers enumerate boundaries — they never interpret or dump
+payload bytes.
 
-## Next targets (Phase 3E candidates, not started)
+## Next targets (Phase 3F candidates, not started)
 
-1. `.MTO` two-table interior (count + `{name8, off}` pairs + second
-   table) — object-bundle map.
-2. `.CMI` length-prefixed record stream (script/opcode stream?).
-3. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
+1. `.CMI` length-prefixed record stream (script/opcode stream?).
+2. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
+3. `.DTI` binary-record interior (no name table).
 4. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
    data blocks).
 5. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.
 6. MTI payload data interpretation past the proven header (the
    descriptor's derived shift/mask fields hint at bit-packed data;
    consumer functions needed).
+7. MTO region semantics — what the embedded `.MAT` images, region-A
+   arrays, and region-C arrays drive at load time (consumer-side
+   tracing beyond the proven directory structure).
