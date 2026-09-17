@@ -21,6 +21,7 @@
 #include "core/file_family.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
+#include "core/fti_sprite.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/sni_directory.h"
@@ -49,6 +50,8 @@ int usage() {
                "<relative-path> <record>\n"
                "       mdk-inspect --data-path DIR --font-info "
                "<relative-path> <record> [<code>]\n"
+               "       mdk-inspect --data-path DIR --sprite-info "
+               "<relative-path> <record>\n"
                "       mdk-inspect --selftest\n");
   return 2;
 }
@@ -651,6 +654,7 @@ int main(int argc, char** argv) {
   std::optional<std::string> target;
   std::optional<std::string> visualInfoName;
   std::optional<std::string> fontInfoName;
+  std::optional<std::string> spriteInfoName;
   std::optional<unsigned> fontInfoCode;
   bool entriesMode = false;
 
@@ -702,6 +706,13 @@ int main(int argc, char** argv) {
         }
         fontInfoCode = static_cast<unsigned>(cv);
       }
+    } else if (!std::strcmp(a, "--sprite-info")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      const char* n = value(a);
+      if (!n) return usage();
+      target = v;
+      spriteInfoName = n;
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
@@ -809,7 +820,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!entriesMode && !visualInfoName && !fontInfoName) {
+  if (!entriesMode && !visualInfoName && !fontInfoName &&
+      !spriteInfoName) {
     return 0;
   }
 
@@ -820,12 +832,16 @@ int main(int argc, char** argv) {
   // against the proven BNI image layouts (Phase 4A) — no extraction.
   // --font-info: metadata-only report for one named FTI record against
   // the proven FONTSML/FONTBIG glyph layout (Phase 4C).
+  // --sprite-info: metadata-only report for one named FTI record
+  // against the proven ARROW sprite-table layout (Phase 4D).
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
+    const char* label = visualInfoName  ? "visual-info:"
+                        : fontInfoName  ? "font-info:  "
+                        : spriteInfoName ? "sprite-info:"
+                                         : "entries:  ";
     std::printf("%s unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
-                visualInfoName ? "visual-info:"
-                               : (fontInfoName ? "font-info:  "
-                                               : "entries:  "),
+                label,
                 std::string(mdk::fileFamilyName(family)).c_str(),
                 std::string(mdk::familySupportName(support)).c_str());
     return 1;
@@ -835,6 +851,75 @@ int main(int argc, char** argv) {
   if (!file) {
     std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
     return 1;
+  }
+
+  if (spriteInfoName) {
+    if (family != mdk::MdkFileFamily::kFti) {
+      std::printf("sprite:    unsupported for family %s — Phase 4D "
+                  "proves the FTI ARROW sprite-table layout only\n",
+                  std::string(mdk::fileFamilyName(family)).c_str());
+      return 1;
+    }
+    const auto dir = mdk::inspectFtiDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    if (dir.status != mdk::FtiDirectoryStatus::kOk) {
+      std::printf("fti:       %s — %s\n",
+                  std::string(mdk::ftiDirectoryStatusName(dir.status))
+                      .c_str(),
+                  dir.detail.c_str());
+      return 1;
+    }
+    const mdk::FtiRecord* rec = mdk::findFtiRecord(dir, *spriteInfoName);
+    if (!rec) {
+      std::printf("record:    %s — NOT FOUND\n",
+                  spriteInfoName->c_str());
+      return 1;
+    }
+    std::printf("record:    %s\n", rec->name().c_str());
+    std::printf("span:      [0x%08llx, 0x%08llx) — %llu bytes\n",
+                static_cast<unsigned long long>(rec->payloadFileOffset),
+                static_cast<unsigned long long>(rec->payloadEnd),
+                static_cast<unsigned long long>(rec->payloadSize()));
+    const std::span<const std::byte> payload(
+        file->data() + rec->payloadFileOffset, rec->payloadSize());
+    std::string derr;
+    const auto sprite = mdk::decodeFtiSprite(payload, &derr);
+    if (!sprite) {
+      std::printf("decode:    FAILED (%s)\n", derr.c_str());
+      return 1;
+    }
+    std::printf("layout:    u32 blockBytes @+0; u32 frameCount @+4; "
+                "u32 frameOffset[] @+8 (each +4-relative); frame "
+                "{u16 w, u16 h, s16 hotX, s16 hotY, stream}\n");
+    std::printf("header:    blockBytes=%u frames=%llu payload=%llu "
+                "trailing=%llu\n",
+                sprite->blockBytes,
+                static_cast<unsigned long long>(sprite->frames.size()),
+                static_cast<unsigned long long>(sprite->payloadBytes),
+                static_cast<unsigned long long>(sprite->trailingBytes));
+    std::printf("stream:    cmds <0x80 literal (n=cmd+1); 0x80-0xfd "
+                "run (n=cmd-0x7c, value 0 = transparent); 0xfe row "
+                "break; 0xff end\n");
+    std::printf("colors:    final palette indices; byte 0 = "
+                "transparent (skipped, not color-keyed)\n");
+    for (std::size_t i = 0; i < sprite->frames.size(); ++i) {
+      const auto& f = sprite->frames[i];
+      std::printf("frame[%zu]:  @+0x%llx %ux%u hotspot (%d,%d) "
+                  "stream %zu B | lit %u run %u (transp %u) rows %u | "
+                  "adv %llu opaque %llu idx [%u..%u]\n",
+                  i,
+                  static_cast<unsigned long long>(f.frameFileOffset),
+                  f.width, f.height, f.hotspotX, f.hotspotY,
+                  f.stream.size(), f.literalPackets, f.runPackets,
+                  f.transparentRuns, f.rowBreaks,
+                  static_cast<unsigned long long>(f.pixelAdvances),
+                  static_cast<unsigned long long>(f.opaqueWrites),
+                  f.minPixelIndex, f.maxPixelIndex);
+    }
+    std::printf("digest:    %016llx\n",
+                static_cast<unsigned long long>(
+                    mdk::ftiSpriteDigest(*sprite)));
+    return 0;
   }
 
   if (fontInfoName) {

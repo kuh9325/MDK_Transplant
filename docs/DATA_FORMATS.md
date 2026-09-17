@@ -1,4 +1,4 @@
-# Data Formats — Phase 3F
+# Data Formats — Phase 4D
 
 Status: fourth interior directory mapped. This document records
 evidence-backed file-format structure for the proprietary families
@@ -884,6 +884,37 @@ MSB-first, caller-supplied color — `FUN_00414a08`) and is not handled
 by this decoder. Decoder: `decodeFtiFont` in `src/core/fti_font.*`;
 inspector mode `mdk-inspect --font-info`; preview
 `mdk-native --preview-font FILE RECORD [TEXT]`.
+
+### Proven payload interior: ARROW sprite table (Phase 4D)
+
+The `ARROW` record (the front-end cursor graphic) is a frame-indexed
+sprite with a command-stream bitmap, proven by its consumer chain
+(`FUN_004236c0` resolves → `FUN_00409760` header+hotspot →
+`FUN_00415ff0` stream blit into `DAT_00541650`):
+
+```
+record+0x00  u32 blockBytes    bytes after this field (ARROW: 91);
+                               not read by the draw path
+record+0x04  u32 frameCount    (ARROW: 1)
+record+0x08  u32 frameOffset[count]   each relative to +0x04
+frame:  +0 u16 width, +2 u16 height,
+        +4 s16 hotspotX, +6 s16 hotspotY   (dest = caller pos - hot)
+        +8 stream
+```
+
+Stream commands (`FUN_00415ff0`, OBSERVED): `0x00-0x7f` literal
+packet (`cmd+1` pixel bytes; each is a final palette index, byte 0
+skipped transparent, dest advances 1 per byte); `0x80-0xfd` run
+packet (`count = cmd-0x7c`, one value byte; value 0 = transparent
+skip, nonzero writes `count` copies); `0xfe` row break (next row,
+column resets to sprite x; returns at row 360); `0xff` end. Clipping:
+`x>=600||y>=360||x+w<=0||y+h<=0` or `x>=0 && x+w>600` draws nothing;
+`y<0` skip-decodes to row 0; `x<0` left-clips per packet; packets may
+spill past the declared row width into the next row (no per-row
+check). ARROW itself: 8×17, hotspot (0,0), all pixels index 1
+(white), 75-byte stream + 1 trailing pad byte. Decoder:
+`decodeFtiSprite` in `src/core/fti_sprite.*`; inspector mode
+`mdk-inspect --sprite-info`; preview `mdk-native --preview-sprite`.
 
 ## Proven interior directory: BNI
 

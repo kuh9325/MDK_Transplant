@@ -200,4 +200,67 @@ int measureFtiText(const FtiFont& font, std::string_view text,
   return w;
 }
 
+int drawFtiTextScaled(const FtiFont& font, std::string_view text,
+                      IndexedFramebuffer& fb, int penX, int penY,
+                      float scale, int missingAdvance) {
+  // FUN_00414f64: FCOMP d[0x4950f4] (0.05), JBE -> return.
+  if (scale <= 0.05f) {
+    return penX;
+  }
+  if (scale == 1.0f) {
+    return drawFtiText(font, text, fb, penX, penY, missingAdvance);
+  }
+
+  // 16.16 source step, truncated (x87 RC=11 FRNDINT).
+  const int srcStep =
+      static_cast<int>(65536.0 / static_cast<double>(scale));
+  const int stride = static_cast<int>(fb.stride());
+
+  double penPos = penX;  // original keeps the pen on the FP stack
+  for (const char ch : text) {
+    const auto code = static_cast<std::uint8_t>(ch);
+    const FtiGlyph* g = font.glyphFor(code);
+    if (!g) {
+      penPos = static_cast<double>(
+          static_cast<int>(penPos +
+                           static_cast<double>(missingAdvance) *
+                               static_cast<double>(scale)));
+      continue;
+    }
+    const int w = g->width;
+    const int glyphTopY = static_cast<int>(
+        static_cast<double>(penY) -
+        static_cast<double>(g->top) * static_cast<double>(scale));
+    int srcRow = (static_cast<int>(g->top) << 16) -
+                 (penY - glyphTopY) * srcStep;
+    const int srcRowEnd = (g->rows() << 16);
+    // dstRow is a flat offset like the original's row pointer.
+    long long dstRow = static_cast<long long>(
+        static_cast<int>(penPos) + glyphTopY * stride);
+    while (srcRow < srcRowEnd) {
+      const int srcLine = srcRow > 0 ? (srcRow >> 16) * w : 0;
+      long long dst = dstRow;
+      int srcCol = 0;
+      const int srcColEnd = w << 16;
+      while (srcCol < srcColEnd) {
+        const std::uint8_t v =
+            g->pixels[static_cast<std::size_t>(srcLine) +
+                      static_cast<std::size_t>(srcCol >> 16)];
+        if (v != 0 && dst >= 0 &&
+            dst < static_cast<long long>(fb.pixelCount())) {
+          fb.pixels()[static_cast<std::size_t>(dst)] = v;
+        }
+        ++dst;
+        srcCol += srcStep;
+      }
+      dstRow += stride;
+      srcRow += srcStep;
+    }
+    penPos = static_cast<double>(
+        static_cast<int>(penPos + static_cast<double>(w) *
+                                      static_cast<double>(scale)));
+  }
+  return static_cast<int>(penPos);
+}
+
 } // namespace mdk

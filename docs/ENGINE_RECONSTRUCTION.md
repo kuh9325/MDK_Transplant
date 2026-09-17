@@ -520,13 +520,184 @@ Transplant" rendered with correct spacing and descender placement.
 - The `F8` mask font's callers' color values — format proven, color
   provenance per call site not traced (deferred).
 
-## Phase 4D candidate directions
+# Phase 4D — ARROW decode + first static front-end composition
 
-1. **`ARROW` decode + the first static options composition** —
-   MDKOPT backdrop (4A) + FONTSML text (4C) + the cursor; the options
-   orchestrator `FUN_0041dc90` already calls the FONTBIG scaled path
-   (`FUN_00423b38`) for item labels.
-2. **FONTBIG text-in-context** — same decoder, but the options menu
-   strings it draws would prove a real front-end label path.
-3. **`F8` color provenance** — only if an evidence-complete call site
-   makes it the cheapest remaining text path.
+Phase 4D decoded the `ARROW` sprite resource and composed the first
+evidence-backed front-end frame from original resources using the
+original draw rules, coordinates, palette, and composition order.
+
+## The composition target (CORRECTED assumption)
+
+Two related UI paths were distinguished:
+
+- **Front-end root menu — `FUN_0041dc90`** (dispatched when
+  `DAT_00541493==0 && DAT_00541492!=0`): blits the resolved `MDKOPT`
+  pixel payload (`_DAT_0054bca0`, set by `FUN_0041d7b4`), draws the
+  `OPT0..OPT4` item labels, then draws `ARROW` at the raw mouse
+  position. **This is the only `MDKOPT`-backed screen — it is the
+  Phase 4D target.**
+- **Options sub-menu — `FUN_00420eac`** (state `0x0b`): memsets the
+  framebuffer to 0 and draws the `OM_*` labels + ARROW on black. It
+  does NOT blit `MDKOPT` in its redraw path.
+
+## ARROW consumer chain (OBSERVED, instruction-level)
+
+```
+FUN_004236c0(x, y)         front-end cursor-arrow draw
+  EAX = FUN_00414890("ARROW")   FTI lookup -> file+4+dirOffset
+  DAT_0049ac78 = content + 4    cached table base P
+  sprite = P + u32@(P+4)        frameOffsets[0]
+  FUN_00409760(x, y, sprite)
+FUN_00409760               generic sprite header (several call sites)
+  w=u16@+0  h=u16@+2  hx=s16@+4  hy=s16@+6
+  FUN_00415ff0(x-hx, y-hy, &{w,h}, sprite+8)
+FUN_00415ff0               command-stream blit into DAT_00541650
+```
+
+## ARROW record format (CODE-CORROBORATED + byte-exact)
+
+`MISC/MDKFONT.FTI` record `ARROW`, 96-byte content at file `0xecc`:
+
+```
++0x00 u32 blockBytes   91 (4 count + 4 offset + 8 hdr + 75 stream);
+                        not read by the draw path — metadata
++0x04 u32 frameCount   1
++0x08 u32 offset[]     each relative to +0x04; offsets[0] = 8
+frame:  u16 w, u16 h, s16 hotX, s16 hotY, stream   (ARROW: 8x17, 0,0)
+```
+
+## Stream commands (FUN_00415ff0, OBSERVED)
+
+| cmd | meaning |
+|-----|---------|
+| `0x00-0x7f` | literal packet: `cmd+1` pixel bytes follow; each byte is a final palette index — nonzero overwrites the destination, byte 0 is skipped (transparent). Dest advances 1 per byte. |
+| `0x80-0xfd` | run packet: `count = cmd - 0x7c` (4..129), one value byte follows; value 0 advances the dest by `count` without writing (transparent run), nonzero writes `count` copies. |
+| `0xfe` | row break: next row down; the column resets to the sprite x. If the row reaches 360 the draw returns. |
+| `0xff` | end of stream. |
+
+Original clipping (reproduced): `x>=600 || y>=360 || x+w<=0 || y+h<=0`
+draws nothing; `x>=0 && x+w>600` draws nothing (right edge is
+all-or-nothing — no per-pixel right clip); `y<0` consumes commands
+without writes until the row counter reaches 0 (top clip); `x<0`
+skips the left-of-zero part of each packet (left clip). Packets may
+spill past the declared row width into the next row — the stream is
+trusted (the destination pointer simply walks). Native hardening:
+decode requires a `0xff` inside the record span; the blitter bounds
+every write to the framebuffer. Behavior-identical on well-formed
+data.
+
+Color/transparency (CORROBORATED): stream bytes are final palette
+indices — no caller color, no mask; byte 0 is the only transparency
+mechanism (skips the destination write). ARROW uses only index 1 —
+white under both the MDKOPT palette head and SYS_PAL.
+
+## Decoded ARROW (real record)
+
+8x17 left-pointing arrow, hotspot (0,0), 75-byte stream: 8 literal +
+12 run packets (3 transparent runs), 16 row breaks, 91 pixel
+advances, 72 opaque writes, max index 1, digest `672fff8c63fa8f4a`.
+One pad byte follows the stream (reported as trailing slack).
+
+## Selected static state (entry-state register values, OBSERVED)
+
+`FUN_0041d85c` ("enter front-end") + `FUN_00418798` (one-time mouse
+reset, called at startup before the front-end) establish:
+
+- `DAT_0054bc98 = 1` — `FUN_00428290` finds `SAVES/*.SAV`; BUILD_A
+  has `1.SAV` + `2.SAV` -> the five-item menu.
+- `DAT_0049aa78 = 0` — selection = item 0 ("Continue").
+- `DAT_0049aaa0 = 0`, `DAT_0049aa8c = 0` — no override/blend
+  backdrop; `DAT_0049aa98 = 0` — item list = OPT0..OPT4.
+- `DAT_0054b634/38 = (300,180)` — mouse reset position; the
+  mouse-moved flag `DAT_0054b644` gates the `(mouseY-5)/36`
+  hit-test, so without input the selection stays 0. The arrow is
+  drawn at the raw mouse position (not beside the selection).
+
+## Composition (all OBSERVED)
+
+1. `memcpy(fb, MDKOPT+0x304, 0x34bc0)` — the 600x360 pixels verbatim.
+2. Items via `FUN_00423b38(selected, x_arg, y_i, text)`:
+   `y_i = 31 + 36*i` (0x1f + 0x24i); `x_arg = maxW/2` INTEGER
+   signed division (SAR pattern) where `maxW` = largest UNSCALED
+   `FUN_00414be8` measure over the drawn items; `scale = 1.0`
+   selected / `0.65f` unselected (`FUN_00423a24` ramp endpoints);
+   `finalX = trunc(x_arg - measure*scale*0.5)` — x87 truncation
+   toward zero (`FUN_0047d59a` sets RC=11); draw via
+   `FUN_00414f64` (FONTBIG scaled; marker flag 0).
+3. `FUN_004236c0(mouseX, mouseY)` — ARROW (hotspot 0,0).
+4. Palette: MDKOPT embedded 256-entry palette (`FUN_00413b40`
+   uploads head 64 + tail 192; `FUN_00416700` fades toward the same
+   endpoint — frozen).
+
+Strings (OBSERVED — the OPTi payloads are the NUL-terminated labels):
+OPT0 "Continue", OPT1 "New Game", OPT2 "Saved Game", OPT3 "Options",
+OPT4 "Quit". (No-saves branch: OPT1..OPT4 at y 31,67,103,139,
+selection 1.)
+
+`FUN_00414f64` scaled draw (OBSERVED, implemented as
+`drawFtiTextScaled`): `scale<=0.05` draws nothing; `scale==1.0` is
+the 1:1 path; otherwise 16.16 fixed-point source sampling —
+`srcStep = trunc(65536/scale)`, `glyphTopY = trunc(y - top*scale)`,
+`srcRow0 = (top<<16) - (y-glyphTopY)*srcStep`, missing-glyph pen
+advance `trunc(pen + 6*scale)`, mapped advance `trunc(pen + w*scale)`.
+
+## Digests and verification
+
+- `MDKOPT` `6017f4c4bd57c479` — Phase 4A regression intact.
+- `STREAM BG` `662bf1e20bdd351c` — Phase 4B regression intact.
+- `FONTSML` `c7956b0fea14f2ac`, `FONTBIG` `99681a15ee8479f5` —
+  Phase 4C intact.
+- `ARROW` `672fff8c63fa8f4a` (decoded sprite: block size + frame
+  header + stream bytes).
+- Composed frame `debd84b7f6e158dc` + palette `6a3cbda3822c5525`
+  (fnv1a64 over the 600x360 indexed pixels / expanded palette).
+- Agent-side PPM check `/tmp/mdk-phase4d-options.ppm`: the real MDK
+  front-end frame — MDKOPT art, five staggered left-side labels with
+  "Continue" at full scale and the rest at 0.65, the white 8x17
+  arrow at (300,180) pixel-exact. Not a human gate.
+
+## Native architecture
+
+```
+--preview-options
+  -> OPTIONS.BNI/MDKOPT  decodeBniPalettedImage  (Phase 4A)
+  -> MDKFONT.FTI/FONTBIG decodeFtiFont           (Phase 4C)
+  -> MDKFONT.FTI/ARROW   decodeFtiSprite         (Phase 4D)
+  -> MDKFONT.FTI/OPT0..4 verbatim C strings
+  -> SAVES/*.SAV presence (FUN_00428290 equivalent)
+  -> renderFrontendMenuFrame (src/core/frontend_menu.*):
+       backdrop memcpy -> items (centered scaled FONTBIG) -> ARROW
+  -> IndexedFramebuffer + Palette -> Metal presenter
+```
+
+`--preview-sprite FILE RECORD` draws one decoded FTI sprite over a
+diagnostic checkerboard (QA only — not part of the frame).
+`mdk-inspect --sprite-info FILE RECORD` reports metadata only
+(layout, header, per-frame dims/hotspot/stream stats, digest) — no
+payload bytes.
+
+## Explicit non-goals (Phase 4D)
+
+- No input-driven selection, cursor movement, option mutation,
+  submenus, saving, audio, transitions, fades, blinking, or
+  animation. The frame is a frozen stable state.
+- No `FUN_00414b28` selection-marker context (the front-end path
+  passes marker flag 0 — the marker is not the ARROW; both are
+  traced, only the arrow is used here).
+- The options sub-menu (`FUN_00420eac`, OM_* on cleared buffer) is
+  traced but not composed — it shares the same primitives.
+- `ARROW` sibling sprite records (other FUN_00409760 callers) share
+  the proven format but are not wired to consumers yet.
+
+## Phase 4E candidate directions
+
+1. **First interactive front-end state** — keyboard/mouse selection
+   between the five OPT items: selection index transitions
+   (`DAT_0049aa78`), the `(mouseY-5)/36` hit-test
+   (`DAT_0054b644`-gated), the 0.65->1.0 scale ramp
+   (`FUN_00423a24` accumulator), arrow following the mouse, and the
+   item-action dispatch (0x41de77..). Sounds still deferred.
+2. **The options sub-menu frame** — `FUN_00420eac` static variant
+   (cleared buffer + OM_* labels + arrow) as a second proven
+   composition target.
+3. **`F8` color provenance** — the 1bpp mask font's caller colors.

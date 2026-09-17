@@ -48,6 +48,13 @@ proven FTI font record — `MISC/MDKFONT.FTI FONTSML`/`FONTBIG`; atlas
 of all mapped glyphs, or TEXT drawn with the proven advance rule;
 glyph indices resolve through the record's `SYS_PAL` palette head;
 requires `--data-path`),
+`--preview-sprite FILE RECORD` (Phase 4D: decode + draw one proven
+FTI sprite-table record — `MISC/MDKFONT.FTI ARROW` — over a
+diagnostic checkerboard; requires `--data-path`),
+`--preview-options` (Phase 4D: compose the one proven static
+front-end frame — `MDKOPT` backdrop + `OPT0..OPT4` scaled centered
+FONTBIG labels + `ARROW` at the reset mouse position; resolves all
+resources itself; requires `--data-path`),
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -68,6 +75,11 @@ src/
              bni_image.*         — proven BNI bitmap payload decoders (4A/4B)
              stream_context.*    — STREAM.BNI backdrop palette binding (4B)
              fti_font.*          — FONTSML/FONTBIG glyph decode + draw (4C)
+                                  + scaled draw (FUN_00414f64 mirror, 4D)
+             fti_sprite.*        — FTI sprite-table decode + stream blit
+                                  (ARROW format, FUN_00415ff0 mirror, 4D)
+             frontend_menu.*    — static front-end frame composition
+                                  (FUN_0041dc90 stable state, 4D)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -179,13 +191,18 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- Runtime original-data use is limited to the Phase 4A/4B/4C previews:
+- Runtime original-data use is limited to the Phase 4A/4B/4C/4D
+  previews:
   one named record from one BNI file (`--preview-resource`), decoded by
   the proven paletted-bitmap layout or — for `STREAM/STREAM.BNI BG`
   only — the proven external-palette binding (`SYS_PAL` head + `PAL`
-  tail, resolved via `MISC/MDKFONT.FTI`); and one FTI font record
+  tail, resolved via `MISC/MDKFONT.FTI`); one FTI font record
   (`--preview-font`, `FONTSML`/`FONTBIG` glyph layout) drawn into the
-  indexed framebuffer through the SYS_PAL palette head
+  indexed framebuffer through the SYS_PAL palette head; one FTI sprite
+  record (`--preview-sprite`, the `ARROW` frame-table + command-stream
+  format) over a diagnostic checkerboard; and the composed static
+  front-end frame (`--preview-options`, `MDKOPT` + `OPT0..OPT4` +
+  `ARROW` in the proven draw order)
   — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.

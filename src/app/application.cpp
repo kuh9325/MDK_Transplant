@@ -8,8 +8,10 @@
 #include "core/data_root.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/frontend_menu.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
+#include "core/fti_sprite.h"
 #include "core/indexed_image.h"
 #include "core/log.h"
 #include "core/mode_dispatch.h"
@@ -23,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <vector>
 
 namespace mdk {
@@ -257,6 +261,248 @@ static bool loadFontPreview(DataRoot& root, const std::string& relFile,
   return true;
 }
 
+// Phase 4D sprite preview: resolve an FTI record, decode it with the
+// proven sprite-table decoder (ARROW format), bind SYS_PAL from the
+// same file when present (arrow pixels are palette indices), and draw
+// the sprite over a synthetic two-tone checkerboard so transparency is
+// inspectable. Diagnostic only — placement is not original. Fills
+// `err` and returns false on any failure.
+static bool loadSpritePreview(DataRoot& root, const std::string& relFile,
+                              const std::string& recName,
+                              IndexedFramebuffer& fb, Palette& palette,
+                              std::string* err) {
+  if (fileFamilyForPath(relFile) != MdkFileFamily::kFti) {
+    *err = "--preview-sprite supports .FTI sprite records only "
+           "(Phase 4D decoder coverage): " + relFile;
+    return false;
+  }
+  const auto file = root.readFile(relFile, kPreviewMaxBytes, err);
+  if (!file) {
+    return false;
+  }
+  const auto dir = inspectFtiDirectory(
+      std::span<const std::byte>(file->data(), file->size()));
+  if (dir.status != FtiDirectoryStatus::kOk) {
+    *err = "FTI directory: " +
+           std::string(ftiDirectoryStatusName(dir.status)) + " — " +
+           dir.detail;
+    return false;
+  }
+  const FtiRecord* rec = findFtiRecord(dir, recName);
+  if (!rec) {
+    *err = "record not found: " + recName;
+    return false;
+  }
+  const std::span<const std::byte> payload(
+      file->data() + rec->payloadFileOffset, rec->payloadSize());
+  std::string derr;
+  const auto sprite = decodeFtiSprite(payload, &derr);
+  if (!sprite) {
+    *err = "sprite decode (" + recName + "): " + derr;
+    return false;
+  }
+  const FtiSpriteFrame* frame = sprite->frame(0);
+  if (!frame) {
+    *err = "sprite record " + recName + " has no frame 0";
+    return false;
+  }
+
+  // Palette binding (CORROBORATED): sprite bytes are final palette
+  // indices; SYS_PAL is the resident palette for this file's records.
+  // Entries 64-255 are never referenced by ARROW (max index 1).
+  const FtiRecord* palRec = findFtiRecord(dir, "SYS_PAL");
+  if (palRec && palRec->payloadSize() >= 192) {
+    const std::byte* sp = file->data() + palRec->payloadFileOffset;
+    for (int i = 0; i < 64; ++i) {
+      palette.set(i, {static_cast<std::uint8_t>(sp[i * 3 + 0]),
+                      static_cast<std::uint8_t>(sp[i * 3 + 1]),
+                      static_cast<std::uint8_t>(sp[i * 3 + 2]), 255});
+    }
+  }
+
+  // Synthetic checkerboard (diagnostic only): SYS_PAL[10] orange /
+  // SYS_PAL[13] blue in 8px cells — the white index-1 arrow stands
+  // out on both; transparent gaps show the pattern through.
+  for (int y = 0; y < fb.height(); ++y) {
+    for (int x = 0; x < fb.width(); ++x) {
+      const bool cell = ((x / 8) + (y / 8)) & 1;
+      fb.put(x, y, cell ? 10 : 13);
+    }
+  }
+  // One draw at the proven reset-mouse position plus one offset draw
+  // so the hotspot/origin behavior is visible.
+  blitFtiSpriteFrame(*frame, fb, kFrontendMouseResetX,
+                     kFrontendMouseResetY);
+  blitFtiSpriteFrame(*frame, fb, 120, 60);
+  log::info(kTag,
+            "sprite preview: %s %s — %u frame(s), frame0 %ux%u hot "
+            "(%d,%d), %zu stream bytes, %llu opaque px, max idx %u, "
+            "digest=%016llx",
+            relFile.c_str(), rec->name().c_str(),
+            static_cast<unsigned>(sprite->frames.size()), frame->width,
+            frame->height, frame->hotspotX, frame->hotspotY,
+            frame->stream.size(),
+            static_cast<unsigned long long>(frame->opaqueWrites),
+            frame->maxPixelIndex,
+            static_cast<unsigned long long>(ftiSpriteDigest(*sprite)));
+  return true;
+}
+
+// Phase 4D options/front-end preview: compose the one proven static
+// front-end frame (FUN_0041dc90 stable entry state) — MDKOPT backdrop
+// + OPT0..OPT4 FONTBIG scaled centered labels + ARROW at the reset
+// mouse position. All bindings resolve through the proven original
+// paths; nothing is user-selectable. Fills `err` -> false on failure.
+static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
+                               Palette& palette, std::string* err) {
+  // Backdrop: MISC/OPTIONS.BNI record MDKOPT (Phase 4A decoder).
+  const auto bni = root.readFile("MISC/OPTIONS.BNI", kPreviewMaxBytes, err);
+  if (!bni) {
+    *err = "options preview: cannot read MISC/OPTIONS.BNI — " + *err;
+    return false;
+  }
+  const auto bdir = inspectBniDirectory(
+      std::span<const std::byte>(bni->data(), bni->size()));
+  if (bdir.status != BniDirectoryStatus::kOk) {
+    *err = "options preview: OPTIONS.BNI directory — " +
+           std::string(bniDirectoryStatusName(bdir.status)) + " — " +
+           bdir.detail;
+    return false;
+  }
+  const BniRecord* mdkopt = findBniRecord(bdir, "MDKOPT");
+  if (!mdkopt) {
+    *err = "options preview: record MDKOPT not found in OPTIONS.BNI";
+    return false;
+  }
+  const std::span<const std::byte> optPayload(
+      bni->data() + mdkopt->payloadFileOffset, mdkopt->payloadSize());
+  std::string derr;
+  const auto backdrop = decodeBniPalettedImage(optPayload, &derr);
+  if (!backdrop) {
+    *err = "options preview: MDKOPT decode — " + derr;
+    return false;
+  }
+
+  // FTI resources: FONTBIG font, ARROW sprite, OPT0..OPT4 strings.
+  const auto fti = root.readFile("MISC/MDKFONT.FTI", kPreviewMaxBytes, err);
+  if (!fti) {
+    *err = "options preview: cannot read MISC/MDKFONT.FTI — " + *err;
+    return false;
+  }
+  const auto fdir = inspectFtiDirectory(
+      std::span<const std::byte>(fti->data(), fti->size()));
+  if (fdir.status != FtiDirectoryStatus::kOk) {
+    *err = "options preview: MDKFONT.FTI directory — " +
+           std::string(ftiDirectoryStatusName(fdir.status)) + " — " +
+           fdir.detail;
+    return false;
+  }
+  auto ftiPayload = [&](const char* name, const FtiRecord*& recOut,
+                        std::span<const std::byte>& out) -> bool {
+    recOut = findFtiRecord(fdir, name);
+    if (!recOut) {
+      *err = std::string("options preview: record ") + name +
+             " not found in MDKFONT.FTI";
+      return false;
+    }
+    out = std::span<const std::byte>(
+        fti->data() + recOut->payloadFileOffset,
+        recOut->payloadSize());
+    return true;
+  };
+
+  const FtiRecord* rec = nullptr;
+  std::span<const std::byte> payload;
+  if (!ftiPayload("FONTBIG", rec, payload)) return false;
+  const auto fontBig = decodeFtiFont(payload, &derr);
+  if (!fontBig) {
+    *err = "options preview: FONTBIG decode — " + derr;
+    return false;
+  }
+  if (!ftiPayload("ARROW", rec, payload)) return false;
+  const auto arrow = decodeFtiSprite(payload, &derr);
+  if (!arrow) {
+    *err = "options preview: ARROW decode — " + derr;
+    return false;
+  }
+  const FtiSpriteFrame* arrowFrame = arrow->frame(0);
+  if (!arrowFrame) {
+    *err = "options preview: ARROW has no frame 0";
+    return false;
+  }
+
+  // OPTi payloads are the NUL-terminated label strings themselves
+  // (OBSERVED — the records ARE C strings drawn verbatim).
+  std::vector<std::string> optStrings(kFrontendOptCount);
+  for (int i = 0; i < kFrontendOptCount; ++i) {
+    char name[8];
+    std::snprintf(name, sizeof(name), "OPT%d", i);
+    if (!ftiPayload(name, rec, payload)) return false;
+    const std::span<const std::byte> span = payload;
+    const void* nul = std::memchr(span.data(), 0, span.size());
+    if (!nul) {
+      *err = std::string("options preview: ") + name +
+             " payload is not a NUL-terminated string";
+      return false;
+    }
+    optStrings[i].assign(
+        reinterpret_cast<const char*>(span.data()),
+        static_cast<const char*>(nul) -
+            reinterpret_cast<const char*>(span.data()));
+  }
+
+  // FUN_00428290 checks the SAVES directory for <name>.SAV files;
+  // BUILD_A has 1.SAV + 2.SAV -> the five-item "Continue" menu.
+  bool savesExist = false;
+  if (const auto savesDir = root.resolve("SAVES")) {
+    std::error_code ec;
+    for (const auto& e :
+         std::filesystem::directory_iterator(*savesDir, ec)) {
+      const auto ext = e.path().extension().string();
+      if (e.is_regular_file() &&
+          (ext == ".SAV" || ext == ".sav")) {
+        savesExist = true;
+        break;
+      }
+    }
+  }
+
+  const FrontendMenuSpec spec = frontendMenuSpec(savesExist);
+  std::vector<std::string_view> views(optStrings.begin(),
+                                      optStrings.end());
+  if (!renderFrontendMenuFrame(fb, palette, *backdrop, *fontBig,
+                               *arrowFrame, views, spec, &derr)) {
+    *err = "options preview: compose — " + derr;
+    return false;
+  }
+
+  // Deterministic digests (decoded representations, not the PPM).
+  const std::uint64_t fbDigest = fnv1a64(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(fb.pixels()),
+      fb.pixelCount()));
+  std::vector<std::byte> palBytes(palette.size() * 4);
+  for (int i = 0; i < palette.size(); ++i) {
+    const auto c = palette.get(i);
+    palBytes[i * 4 + 0] = static_cast<std::byte>(c.r);
+    palBytes[i * 4 + 1] = static_cast<std::byte>(c.g);
+    palBytes[i * 4 + 2] = static_cast<std::byte>(c.b);
+    palBytes[i * 4 + 3] = static_cast<std::byte>(c.a);
+  }
+  const std::uint64_t palDigest = fnv1a64(palBytes);
+  log::info(kTag,
+            "options preview: MDKOPT %dx%d digest=%016llx | FONTBIG "
+            "digest=%016llx | ARROW digest=%016llx | saves=%d sel=%d | "
+            "composed fb=%016llx palette=%016llx",
+            backdrop->width, backdrop->height,
+            static_cast<unsigned long long>(imageDigest(*backdrop)),
+            static_cast<unsigned long long>(ftiFontDigest(*fontBig)),
+            static_cast<unsigned long long>(ftiSpriteDigest(*arrow)),
+            savesExist ? 1 : 0, savesExist ? 0 : 1,
+            static_cast<unsigned long long>(fbDigest),
+            static_cast<unsigned long long>(palDigest));
+  return true;
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -310,8 +556,10 @@ int Application::run() {
   // decoded into the indexed framebuffer, then presented unchanged
   // every frame. The synthetic diagnostic scene stays the default
   // when no preview is requested.
-  const bool previewMode =
-      cfg_.previewFile.has_value() || cfg_.fontPreviewFile.has_value();
+  const bool previewMode = cfg_.previewFile.has_value() ||
+                           cfg_.fontPreviewFile.has_value() ||
+                           cfg_.spritePreviewFile.has_value() ||
+                           cfg_.optionsPreview;
   if (cfg_.previewFile) {
     if (!dataRoot) {
       log::error(kTag, "--preview-resource requires --data-path");
@@ -336,6 +584,28 @@ int Application::run() {
                          cfg_.fontPreviewRecord.value_or(""),
                          cfg_.fontPreviewText, fb, palette, &perr)) {
       log::error(kTag, "font preview failed: %s", perr.c_str());
+      return 2;
+    }
+  } else if (cfg_.spritePreviewFile) {
+    if (!dataRoot) {
+      log::error(kTag, "--preview-sprite requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadSpritePreview(*dataRoot, *cfg_.spritePreviewFile,
+                           cfg_.spritePreviewRecord.value_or(""),
+                           fb, palette, &perr)) {
+      log::error(kTag, "sprite preview failed: %s", perr.c_str());
+      return 2;
+    }
+  } else if (cfg_.optionsPreview) {
+    if (!dataRoot) {
+      log::error(kTag, "--preview-options requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadOptionsPreview(*dataRoot, fb, palette, &perr)) {
+      log::error(kTag, "options preview failed: %s", perr.c_str());
       return 2;
     }
   } else {
@@ -473,6 +743,15 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       if (i + 1 < argc && argv[i + 1][0] != '-') {
         cfg.fontPreviewText = argv[++i];
       }
+    } else if (!std::strcmp(a, "--preview-sprite")) {
+      const char* f = needValue(a);
+      if (!f) return false;
+      const char* r = needValue(a);
+      if (!r) return false;
+      cfg.spritePreviewFile = f;
+      cfg.spritePreviewRecord = r;
+    } else if (!std::strcmp(a, "--preview-options")) {
+      cfg.optionsPreview = true;
     } else if (!std::strcmp(a, "--selftest")) {
       cfg.selftest = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {

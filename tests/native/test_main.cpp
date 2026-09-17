@@ -11,8 +11,10 @@
 #include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/frontend_menu.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
+#include "core/fti_sprite.h"
 #include "core/indexed_image.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
@@ -3257,6 +3259,349 @@ void test_input_state() {
   CHECK(in.keyDown(30));
 }
 
+// Phase 4D sprite-record builder: {u32 blockBytes, u32 count,
+// u32 offs[count]} then frames {u16 w, u16 h, s16 hx, s16 hy, stream}.
+struct SyntheticSprite {
+  std::vector<std::byte> buf;
+
+  void u32(std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+      buf.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+    }
+  }
+  void u16(std::uint16_t v) {
+    buf.push_back(static_cast<std::byte>(v & 0xff));
+    buf.push_back(static_cast<std::byte>(v >> 8));
+  }
+  void frame(std::uint16_t w, std::uint16_t h, std::int16_t hx,
+             std::int16_t hy, const std::vector<std::uint8_t>& stream) {
+    u16(w);
+    u16(h);
+    u16(static_cast<std::uint16_t>(hx));
+    u16(static_cast<std::uint16_t>(hy));
+    for (const auto v : stream) {
+      buf.push_back(static_cast<std::byte>(v));
+    }
+  }
+  // One-frame record with the ARROW shape: offsets[0] = 8 (frame at
+  // payload+4+8).
+  static SyntheticSprite make1(std::uint16_t w, std::uint16_t h,
+                               std::int16_t hx, std::int16_t hy,
+                               const std::vector<std::uint8_t>& stream,
+                               std::uint32_t blockBytes = 0) {
+    SyntheticSprite s;
+    s.u32(blockBytes);  // reported only; original never reads it
+    s.u32(1);           // frameCount
+    s.u32(8);           // offsets[0]
+    s.frame(w, h, hx, hy, stream);
+    return s;
+  }
+};
+
+void test_fti_sprite() {
+  std::string err;
+
+  // Header + single frame decode; stats gathered from the stream.
+  {
+    // row0: literal 3px {1,0,2}; row break; row1: run x4 of 9; end.
+    auto s = SyntheticSprite::make1(
+        8, 4, 0, 0,
+        {0x02, 1, 0, 2, 0xfe, 0x80, 9, 0xff}, 30);
+    const auto sp = mdk::decodeFtiSprite(s.buf, &err);
+    CHECK(sp && sp->blockBytes == 30 && sp->frames.size() == 1);
+    const auto& f = sp->frames[0];
+    CHECK(f.width == 8 && f.height == 4 && f.hotspotX == 0 &&
+          f.hotspotY == 0);
+    CHECK(f.stream.size() == 8);
+    CHECK(f.literalPackets == 1 && f.runPackets == 1 &&
+          f.rowBreaks == 1);
+    CHECK(f.pixelAdvances == 7 && f.opaqueWrites == 6);
+    CHECK(f.maxPixelIndex == 9);
+    CHECK(mdk::ftiSpriteDigest(*sp) != 0);
+    CHECK(mdk::ftiSpriteDigest(*sp) ==
+          mdk::ftiSpriteDigest(*sp));  // deterministic
+  }
+
+  // Draw semantics: literal bytes verbatim, 0 transparent, run fills,
+  // transparent run skips, 0xfe next row, 0xff stops.
+  {
+    auto s = SyntheticSprite::make1(
+        8, 3, 0, 0,
+        {0x02, 5, 0, 7,       // row0: 5, skip, 7
+         0x84, 0,             // row0: transparent run x8 (cols 3..10)
+         0xfe,
+         0x83, 9,             // row1: run x7 of 9 (cols 0..6)
+         0x01, 3, 4,          // row1: literal 2px at cols 7,8
+         0xff});
+    const auto sp = mdk::decodeFtiSprite(s.buf, &err);
+    CHECK(sp);
+    mdk::IndexedFramebuffer fb(16, 8);
+    fb.clear(0x55);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 2, 1);
+    CHECK(fb.at(2, 1) == 5 && fb.at(4, 1) == 7);
+    CHECK(fb.at(3, 1) == 0x55);          // literal 0 = transparent
+    for (int x = 5; x <= 12; ++x) {
+      CHECK(fb.at(x, 1) == 0x55);        // transparent run skips
+    }
+    for (int x = 2; x <= 8; ++x) {
+      CHECK(fb.at(x, 2) == 9);           // run x7
+    }
+    CHECK(fb.at(9, 2) == 3 && fb.at(10, 2) == 4);  // literal after run
+    CHECK(fb.at(2, 3) == 0x55);          // stream ended
+  }
+
+  // Hotspot: dest = (x - hx, y - hy) like FUN_00409760.
+  {
+    auto s = SyntheticSprite::make1(2, 1, 2, 3, {0x01, 9, 9, 0xff});
+    const auto sp = mdk::decodeFtiSprite(s.buf, &err);
+    CHECK(sp);
+    mdk::IndexedFramebuffer fb(16, 8);
+    fb.clear(0);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 10, 6);
+    CHECK(fb.at(8, 3) == 9 && fb.at(9, 3) == 9);
+    CHECK(fb.at(10, 3) == 0);
+  }
+
+  // Run packet count classes: 0x80 -> 4 copies; 0xfd -> 129.
+  {
+    auto s = SyntheticSprite::make1(
+        8, 2, 0, 0, {0x80, 7, 0xfd, 8, 0xff});
+    const auto sp = mdk::decodeFtiSprite(s.buf, &err);
+    CHECK(sp && sp->frames[0].pixelAdvances == 4 + 129);
+    mdk::IndexedFramebuffer fb(140, 4);
+    fb.clear(0);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 0, 0);
+    CHECK(fb.at(3, 0) == 7 && fb.at(4, 0) == 8 && fb.at(132, 0) == 8);
+  }
+
+  // Malformed streams rejected at decode: truncated literal, truncated
+  // run value, missing 0xff, zero frames, offset out of bounds,
+  // truncated header.
+  {
+    auto bad1 = SyntheticSprite::make1(8, 1, 0, 0,
+                                       {0x05, 1, 2});  // lit wants 6
+    CHECK(!mdk::decodeFtiSprite(bad1.buf, &err));
+    auto bad2 = SyntheticSprite::make1(8, 1, 0, 0, {0x80});  // no value
+    CHECK(!mdk::decodeFtiSprite(bad2.buf, &err));
+    auto bad3 = SyntheticSprite::make1(8, 1, 0, 0,
+                                       {0x00, 1, 0xfe});  // no 0xff
+    CHECK(!mdk::decodeFtiSprite(bad3.buf, &err));
+    SyntheticSprite bad4;
+    bad4.u32(0); bad4.u32(0);  // count = 0
+    CHECK(!mdk::decodeFtiSprite(bad4.buf, &err));
+    SyntheticSprite bad5;
+    bad5.u32(0); bad5.u32(1); bad5.u32(0x400);  // frame off OOB
+    CHECK(!mdk::decodeFtiSprite(bad5.buf, &err));
+    std::vector<std::byte> bad6 = {std::byte{1}, std::byte{0}};
+    CHECK(!mdk::decodeFtiSprite(bad6, &err));
+  }
+
+  // Trailing bytes after 0xff are tolerated and reported (the real
+  // ARROW record has one pad byte).
+  {
+    auto s = SyntheticSprite::make1(1, 1, 0, 0, {0x00, 9, 0xff});
+    s.buf.push_back(std::byte{0xaa});
+    const auto sp = mdk::decodeFtiSprite(s.buf, &err);
+    CHECK(sp && sp->trailingBytes == 1);
+  }
+
+  // Clipping — mirrors FUN_00415ff0 exactly (bounds-hardened only):
+  {
+    auto s = SyntheticSprite::make1(4, 4, 0, 0,
+                                    {0x83, 9, 0xfe, 0x83, 8, 0xfe,
+                                     0x83, 7, 0xfe, 0x83, 6, 0xff});
+    const auto sp = mdk::decodeFtiSprite(s.buf, &err);
+    CHECK(sp);
+    mdk::IndexedFramebuffer fb(16, 8);
+    fb.clear(0);
+    // Left edge: x=-2 -> first two pixels of each run skipped; the
+    // run writes cols -2..4 so fb cols 0..4 land.
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, -2, 0);
+    CHECK(fb.at(0, 0) == 9 && fb.at(4, 0) == 9 && fb.at(5, 0) == 0);
+    // Top edge: y=-1 -> row0 consumed silently; sprite row1 lands on
+    // fb row 0.
+    fb.clear(0);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 0, -1);
+    CHECK(fb.at(0, 0) == 8 && fb.at(3, 0) == 8 && fb.at(0, 1) == 7);
+    // Right edge, x>=0: x+w>width -> NOTHING drawn (all-or-nothing).
+    fb.clear(0);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 14, 0);  // 14+4>16
+    CHECK(fb.at(14, 0) == 0);
+    // Fully outside: no writes, no crash.
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, -10, 0);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 0, 9);   // y>=height
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 16, 0);  // x>=width
+    // Bottom: 0xfe past the last row returns without writing.
+    fb.clear(0);
+    auto deep = SyntheticSprite::make1(
+        2, 2, 0, 0,
+        {0x01, 9, 9, 0xfe, 0x01, 8, 8, 0xfe, 0x01, 7, 7, 0xff});
+    const auto dsp = mdk::decodeFtiSprite(deep.buf, &err);
+    CHECK(dsp);
+    mdk::blitFtiSpriteFrame(dsp->frames[0], fb, 0, 7);  // row1 @y8>fb
+    CHECK(fb.at(0, 7) == 9 && fb.at(1, 7) == 9);
+    // Row spill: packets may pass the declared row width into the next
+    // row (the stream is trusted — original has no per-row clip).
+    fb.clear(0);
+    auto wide = SyntheticSprite::make1(
+        4, 2, 0, 0,
+        {0xfd, 5,   // run x129 at x=0 spills to row 1
+         0xff});
+    const auto wsp = mdk::decodeFtiSprite(wide.buf, &err);
+    CHECK(wsp);
+    mdk::IndexedFramebuffer fb2(40, 4);
+    fb2.clear(0);
+    mdk::blitFtiSpriteFrame(wsp->frames[0], fb2, 0, 0);
+    // 129 advances from flat offset 0: rows 0-2 fully, row3 cols 0-8.
+    CHECK(fb2.at(39, 0) == 5 && fb2.at(0, 1) == 5 &&
+          fb2.at(0, 3) == 5 && fb2.at(8, 3) == 5 && fb2.at(9, 3) == 0);
+  }
+}
+
+void test_frontend_menu() {
+  std::string err;
+
+  // Synthetic resources: 600x360 backdrop of index 0x55 with a
+  // ramp palette; a FONTBIG-shaped font mapping every needed byte to a
+  // uniform 2x2 glyph; a 2x2 arrow sprite of index 77.
+  mdk::IndexedImage backdrop;
+  backdrop.width = 600;
+  backdrop.height = 360;
+  backdrop.stride = 600;
+  backdrop.pixels.assign(600 * 360, 0x55);
+  backdrop.hasPalette = true;
+  for (int i = 0; i < 256; ++i) {
+    backdrop.palette[i] = {std::uint8_t(i), std::uint8_t(255 - i),
+                           std::uint8_t(i)};
+  }
+
+  auto f = SyntheticFont::make();
+  const char* needed = "ContinueNew GamSavdpQitlOs";  // OPT0..4 chars
+  for (const char* c = needed; *c; ++c) {
+    f.put32(static_cast<std::uint8_t>(*c) * 4,
+            f.addGlyph(1, 0, 2, {9, 9, 9, 9}));
+  }
+  const auto font = mdk::decodeFtiFont(f.buf, &err);
+  CHECK(font);
+
+  auto arrowS = SyntheticSprite::make1(
+      2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+  const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+  CHECK(arrow && arrow->frame(0));
+
+  const std::string_view opts[5] = {"Continue", "New Game",
+                                    "Saved Game", "Options", "Quit"};
+
+  // Spec shape: saves -> 5 items y=31+36i, sel 0; no saves -> 4 items
+  // y=31+36(i-1), sel 1; arrow at the reset mouse position.
+  {
+    const auto spec = mdk::frontendMenuSpec(true);
+    CHECK(spec.items.size() == 5 && spec.arrowX == 300 &&
+          spec.arrowY == 180);
+    for (int i = 0; i < 5; ++i) {
+      CHECK(spec.items[i].optIndex == i &&
+            spec.items[i].y == 31 + 36 * i &&
+            spec.items[i].selected == (i == 0));
+    }
+    const auto spec2 = mdk::frontendMenuSpec(false);
+    CHECK(spec2.items.size() == 4);
+    for (int i = 0; i < 4; ++i) {
+      CHECK(spec2.items[i].optIndex == i + 1 &&
+            spec2.items[i].y == 31 + 36 * i &&
+            spec2.items[i].selected == (i + 1 == 1));
+    }
+  }
+
+  // Composition: backdrop first, text over it, arrow last.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    fb.clear(0);
+    auto spec = mdk::frontendMenuSpec(true);
+    // Park the arrow ON the selected label's first glyph to prove
+    // draw order (arrow last). With every OPT char mapped (including
+    // ' ') all five measure 2px/char: "Saved Game" is widest at 20
+    // -> maxW=20 -> xArg=10; "Continue" w=16 at scale 1.0
+    // -> x = trunc(10 - 8) = 2; glyph top=1 -> rows 30..31, cols 2,3.
+    spec.arrowX = 2;
+    spec.arrowY = 30;
+    CHECK(mdk::renderFrontendMenuFrame(fb, palette, backdrop, *font,
+                                       *arrow->frame(0), opts, spec,
+                                       &err));
+    CHECK(fb.at(0, 0) == 0x55);              // backdrop landed
+    CHECK(palette.get(3).r == 3);            // embedded palette bound
+    CHECK(fb.at(2, 30) == 77);   // arrow overwrote 'C' pixels
+    CHECK(fb.at(3, 31) == 77);
+    CHECK(fb.at(4, 30) == 9);    // 'o' (penX 4) intact
+    // "New Game" unselected -> scale 0.65, y=67.
+    // measure = 16; x = trunc(10 - 16*0.65*0.5) = trunc(4.8) = 4;
+    // glyphTopY = trunc(67 - 0.65) = 66.
+    CHECK(fb.at(4, 66) == 9 && fb.at(4, 67) == 9);
+    // Arrow elsewhere must not have painted at the reset position.
+    CHECK(fb.at(300, 180) == 0x55);
+  }
+
+  // Arrow last at its own position when not overlapping text.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    const auto spec = mdk::frontendMenuSpec(true);
+    CHECK(mdk::renderFrontendMenuFrame(fb, palette, backdrop, *font,
+                                       *arrow->frame(0), opts, spec,
+                                       &err));
+    CHECK(fb.at(300, 180) == 77 && fb.at(301, 180) == 77 &&
+          fb.at(300, 181) == 77);
+    CHECK(fb.at(299, 180) == 0x55);
+    // Selected "Continue" at scale 1.0, x=2, rows 30-31, cols 2..17.
+    CHECK(fb.at(2, 30) == 9 && fb.at(17, 30) == 9);
+    // Unselected rows keep backdrop where no glyph lands.
+    CHECK(fb.at(2, 67) == 0x55);
+  }
+
+  // Contract failures.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::IndexedImage small;
+    small.width = small.height = small.stride = 4;
+    small.pixels.assign(16, 0);
+    const auto spec = mdk::frontendMenuSpec(true);
+    CHECK(!mdk::renderFrontendMenuFrame(fb, palette, small, *font,
+                                        *arrow->frame(0), opts, spec,
+                                        &err));
+    const std::string_view shortOpts[2] = {"A", "B"};
+    CHECK(!mdk::renderFrontendMenuFrame(fb, palette, backdrop, *font,
+                                        *arrow->frame(0), shortOpts,
+                                        spec, &err));
+  }
+
+  // Scaled font edge cases: scale<=0.05 draws nothing; scale==1.0 is
+  // the 1:1 path; trunc-toward-zero centering is honored.
+  {
+    mdk::IndexedFramebuffer fb(64, 32);
+    fb.clear(0);
+    auto f2 = SyntheticFont::make();
+    f2.put32('A' * 4, f2.addGlyph(1, 0, 4, {9, 9, 9, 9, 9, 9, 9, 9}));
+    const auto font2 = mdk::decodeFtiFont(f2.buf, &err);
+    CHECK(font2);
+    CHECK(mdk::drawFtiTextScaled(*font2, "AA", fb, 0, 10, 0.05f, 6) ==
+          0);
+    CHECK(fb.at(0, 9) == 0);                 // nothing drawn
+    const int end1 = mdk::drawFtiTextScaled(*font2, "AA", fb, 0, 10,
+                                            1.0f, 6);
+    CHECK(end1 == 8 && fb.at(0, 9) == 9);    // 1:1 path
+    fb.clear(0);
+    // scale 0.5: srcStep = trunc(65536/0.5) = 131072 = 2.0 in 16.16;
+    // srcColEnd = 4<<16 = 262144 -> output pixels = 2 per row.
+    const int end2 = mdk::drawFtiTextScaled(*font2, "A", fb, 0, 10,
+                                            0.5f, 6);
+    // pen advance = trunc(0 + 4*0.5) = 2.
+    CHECK(end2 == 2);
+    // glyphTopY = trunc(10 - 1*0.5) = 9; rows land at 9,10.
+    CHECK(fb.at(0, 9) == 9 && fb.at(1, 9) == 9 && fb.at(2, 9) == 0);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -3277,6 +3622,8 @@ int main() {
   test_bni_indexed_image();
   test_stream_context();
   test_fti_font();
+  test_fti_sprite();
+  test_frontend_menu();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

@@ -165,6 +165,31 @@ int drawFtiText(const FtiFont& font, std::string_view text,
 int measureFtiText(const FtiFont& font, std::string_view text,
                    int missingAdvance);
 
+// FUN_00414f64 — the FONTBIG scaled draw (Phase 4D). EVIDENCE
+// (instruction-level, original binary):
+//   scale <= 0.05        -> draws nothing (FCOMP d[0x4950f4], JBE)
+//   scale == 1.0         -> identical to drawFtiText (FUN_00414c34)
+//   otherwise, per mapped glyph:
+//     glyphTopY = trunc(y - top*scale)
+//     srcStep   = trunc(65536.0 / scale)          (16.16 source step)
+//     srcRow    = (top<<16) - (y - glyphTopY)*srcStep
+//     rows while srcRow < (top+bottom+1)<<16:
+//       srcLine = (srcRow>0 ? srcRow>>16 : 0) * width
+//       srcCol  = 0; while srcCol < width<<16:
+//         byte b = px[srcLine + (srcCol>>16)]; if b: dst = b
+//         srcCol += srcStep; dst++
+//       dstRow += stride; srcRow += srcStep
+//     penX = trunc(penX + width*scale)
+//   unmapped byte: penX = trunc(penX + missingAdvance*scale)
+// All truncations are the original's x87 truncation-toward-zero
+// (FUN_0047d59a sets RC=11 then FRNDINT). The original performs NO
+// clipping — this version bounds-checks each write (native
+// hardening only; unreachable for the proven options state).
+// Returns the pen x after the last byte (truncated pen position).
+int drawFtiTextScaled(const FtiFont& font, std::string_view text,
+                      IndexedFramebuffer& fb, int penX, int penY,
+                      float scale, int missingAdvance);
+
 } // namespace mdk
 
 #endif // MDK_CORE_FTI_FONT_H

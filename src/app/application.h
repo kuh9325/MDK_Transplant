@@ -29,6 +29,17 @@ struct AppConfig {
   std::optional<std::string> fontPreviewFile;
   std::optional<std::string> fontPreviewRecord;
   std::optional<std::string> fontPreviewText;
+  // --preview-sprite FILE RECORD: decode one proven FTI sprite record
+  // (Phase 4D: the ARROW cursor format — frame table + command stream)
+  // and draw it over a synthetic checkerboard so transparency is
+  // inspectable. Requires --data-path. QA aid only.
+  std::optional<std::string> spritePreviewFile;
+  std::optional<std::string> spritePreviewRecord;
+  // --preview-options: compose the one proven static front-end frame
+  // (Phase 4D): MDKOPT backdrop + OPT0..OPT4 scaled centered labels +
+  // ARROW at the reset mouse position, all from original resources.
+  // Requires --data-path. Static — no input, animation, or audio.
+  bool optionsPreview = false;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
   bool relativeMouse = true;  // --no-relative-mouse to disable
