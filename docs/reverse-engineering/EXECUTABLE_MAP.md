@@ -140,7 +140,7 @@ bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
 | Demo record/play | `FUN_004090fc` | STRONG_ | `demo.c`, `demo\%s`, `SAVE CORRUPT: demo file %s…` |
 | Enemy/AI | `FUN_004388d8`, `FUN_00454794/4549b4`, `FUN_004574d0` | TENTATIVE_ | `Alien %s looped %d commands`, `ENEMY name %s not found`, `Unrecognised controlalien`, `tr_alcmd.c`, `allocenm.c` |
 | Memory mgmt | `FUN_0041c780/41c7e8` | STRONG_ | `memblock.c`, `Total level/game memory` |
-| Chunk/container | `FUN_00404084` | STRONG_ | `chunks.c` (matches u32-len+tag file family) |
+| Object-pool allocator ("chunks") | `FUN_00404084` (+cluster `0x403f6c`–`0x406554`) | STRONG_ | `chunks.c` — Phase 3B re-analysis: in-memory pool of 60 × 0x1aa-byte object nodes (free list `DAT_004a1ec4`, alloc `FUN_00403f6c`, recycle `FUN_00404084`); **not** the file-envelope parser — earlier "(matches u32-len+tag file family)" note was wrong. File-envelope evidence lives in the mdkfopen path; see `../DATA_ACCESS.md` |
 | Object setup | `FUN_00428400` | TENTATIVE_ | `setupob.c` |
 | Shutdown | tail of `FUN_0040103c` + `FUN_0046bef8` (input release) | OBSERVED | WndProc close → quit flag → config write → exit |
 | Camera/sniper | UNKNOWN | — | `Bones tooth not found`, sniper strings exist; path not yet isolated |

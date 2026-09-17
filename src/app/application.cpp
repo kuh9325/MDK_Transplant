@@ -58,6 +58,7 @@ int Application::run() {
     }
     log::info(kTag, "data root (read-only): %s",
               dataRoot->path().string().c_str());
+    log::info(kTag, "resolver ready");
   } else {
     log::info(kTag, "no --data-path; diagnostic shell does not need data");
   }

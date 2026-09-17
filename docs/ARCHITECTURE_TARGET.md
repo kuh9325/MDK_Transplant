@@ -51,11 +51,18 @@ Boundary notes (intentions, not commitments):
 | Platform/windowing lib | IMPLEMENTED (Phase 3A): SDL3 3.4.16 via Homebrew (`SDL3::SDL3`) |
 | GPU backend | IMPLEMENTED (Phase 3A): Metal presentation of the software framebuffer |
 | Build system | IMPLEMENTED (Phase 3A): CMake ≥3.24, out-of-tree `build/` |
-| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A |
+| Data access | IMPLEMENTED (Phase 3B): `DataRoot` read-only resolver + `BinaryReader` + container envelope — see `DATA_ACCESS.md` |
+| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B |
 
 > Phase 3A implements the bottom two layers (`platform`, `renderer`
 > presentation boundary) plus a neutral input seam and a mode-dispatch
 > scaffold. See `NATIVE_SKELETON.md` for the realized structure.
+
+> Phase 3B adds the bottom of `asset parsing` + the file-IO half of
+> `platform`: read-only data-root resolution (case-insensitive,
+> root-confined), bounded binary reads, and the common u32+name
+> envelope parser — top-level only; interior semantics UNKNOWN.
+> See `DATA_ACCESS.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

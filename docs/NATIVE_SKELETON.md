@@ -139,9 +139,9 @@ deterministic. No fixed-step physics yet.
 
 `--data-path DIR` validates existence + is-directory, stores a
 canonicalized path, and logs it as read-only. The app launches fine
-without it. Nothing under the path is read, parsed, copied, or written —
-parsing original formats is a later phase. `--data-path` pointing at
-`original/installed/` is verified to be treated read-only.
+without it. Phase 3B extends this seam into a full read-only resolver
+(case-insensitive, root-confined) — see `DATA_ACCESS.md`; the
+diagnostic scene still never reads original data.
 
 ## Mode-dispatch scaffold
 

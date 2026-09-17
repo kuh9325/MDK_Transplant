@@ -1,7 +1,9 @@
 // Phase 3A unit tests for platform-neutral logic. No SDL, no Metal —
 // those paths are exercised by the runtime smoke test instead.
 
+#include "core/binary_reader.h"
 #include "core/compat.h"
+#include "core/container.h"
 #include "core/data_root.h"
 #include "core/framebuffer.h"
 #include "core/mode_dispatch.h"
@@ -11,7 +13,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 namespace {
@@ -110,16 +114,237 @@ void test_viewport() {
   CHECK(near(r.x, 200) && near(r.y, 120));
 }
 
+void test_binary_reader() {
+  const std::byte raw[] = {
+      std::byte{0x34}, std::byte{0x12},                         // u16
+      std::byte{0x78}, std::byte{0x56}, std::byte{0x34},
+      std::byte{0x12},                                          // u32
+      std::byte{'A'},  std::byte{'B'},  std::byte{'C'},
+      std::byte{'D'},                                           // tag
+      std::byte{0xff},
+  };
+  mdk::BinaryReader r(raw);
+  CHECK(r.size() == 11 && r.remaining() == 11);
+  CHECK(r.u16le() == 0x1234);
+  CHECK(r.u32le() == 0x12345678);
+  CHECK(r.position() == 6);
+  const auto tag = r.bytes(4);
+  CHECK(tag && tag->size() == 4 && (*tag)[0] == std::byte{'A'} &&
+        (*tag)[3] == std::byte{'D'});
+  CHECK(r.u8() == 0xff);
+  CHECK(r.atEnd());
+  CHECK(!r.u8().has_value());          // EOF
+  CHECK(!r.u16le().has_value());
+  CHECK(!r.peekU32le(8).has_value());  // truncated peek
+  CHECK(r.peekU32le(0) == 0x56781234ull); // bytes 0..3 as u32
+  CHECK(!r.seek(12));                  // past end
+  CHECK(r.seek(0) && r.position() == 0);
+
+  // Sub-reader bounds: slicing advances the parent, the slice cannot
+  // read past its own bounds.
+  CHECK(r.seek(6));
+  auto sub = r.subReader(4);
+  CHECK(sub && r.position() == 10);
+  CHECK(sub->u8() == 'A');
+  CHECK(!r.subReader(10).has_value()); // oversized slice fails, no move
+  CHECK(r.position() == 10);
+
+  // Oversized lengths and overflow-safe arithmetic.
+  mdk::BinaryReader empty(std::span<const std::byte>{});
+  CHECK(!empty.u8().has_value());
+  CHECK(empty.seek(0));
+  CHECK(!empty.seek(1));
+  CHECK(!r.skip(100));
+  CHECK(!r.bytes(std::size_t(-1)).has_value()); // would overflow n<=rem
+  CHECK(!r.peekU32le(std::size_t(-3)).has_value());
+}
+
+void test_container() {
+  using mdk::ContainerShape;
+
+  // Valid synthetic tag envelope: u32 len = size-4, name "TEST.MAT".
+  std::byte env[28] = {};
+  env[0] = std::byte{24};
+  std::memcpy(env + 4, "TEST.MAT", 8);
+  env[16] = std::byte{16}; // u32@16 = size-12, as observed in BUILD_A
+  const auto info = mdk::inspectContainer(env, sizeof(env));
+  CHECK(info.hasDeclaredLength && info.declaredLength == 24);
+  CHECK(info.lengthValid);
+  CHECK(info.shape == ContainerShape::kTaggedName);
+  CHECK(info.hasTag && info.tag[0] == std::byte{'T'});
+  CHECK(info.logicalName == "TEST.MAT");
+  CHECK(mdk::nameStemMatches(info, "TEST"));
+  CHECK(mdk::nameStemMatches(info, "test"));   // ASCII case-insensitive
+  CHECK(!mdk::nameStemMatches(info, "TES"));   // prefix-only rejected
+  CHECK(!mdk::nameStemMatches(info, "TESTX"));
+  CHECK(!mdk::nameStemMatches(info, "TESTTOOLONGNAME"));
+
+  // Zero-length payload envelope: size 4, declared 0 — admitted at the
+  // envelope level (original semantics UNKNOWN; we only check length).
+  const std::byte tiny[] = {std::byte{0}, std::byte{0}, std::byte{0},
+                            std::byte{0}};
+  const auto tinfo = mdk::inspectContainer(tiny, sizeof(tiny));
+  CHECK(tinfo.lengthValid && tinfo.shape == ContainerShape::kLengthEnvelope);
+
+  // Truncated headers.
+  const auto none0 = mdk::inspectContainer({}, 0);
+  CHECK(!none0.hasDeclaredLength && none0.shape == ContainerShape::kNone);
+  const std::byte three[3] = {};
+  CHECK(!mdk::inspectContainer(three, 3).hasDeclaredLength);
+
+  // Declared length beyond the file / wrong length -> not an envelope.
+  std::byte bad[20] = {};
+  bad[0] = std::byte{0xff};
+  std::memcpy(bad + 4, "TEST.MAT", 8);
+  const auto binfo = mdk::inspectContainer(bad, sizeof(bad));
+  CHECK(!binfo.lengthValid && binfo.shape == ContainerShape::kNone);
+
+  // Unknown / non-printable tag (the .FTI/.BNI shape): length valid,
+  // but the name field is binary — kLengthEnvelope, never kTaggedName.
+  std::byte cnt[24] = {};
+  cnt[0] = std::byte{20};
+  cnt[4] = std::byte{0x03}; // count-like field, non-ASCII run start
+  std::memcpy(cnt + 8, "ENTRYONE", 8);
+  const auto cinfo = mdk::inspectContainer(cnt, sizeof(cnt));
+  CHECK(cinfo.lengthValid);
+  CHECK(cinfo.shape == ContainerShape::kLengthEnvelope);
+  CHECK(cinfo.hasTag && !mdk::tagIsPrintable(cinfo.tag));
+
+  // Corrupt padding after NUL -> not a plausible name field.
+  std::byte pad[24] = {};
+  pad[0] = std::byte{20};
+  std::memcpy(pad + 4, "AB\0X", 4);
+  const auto pinfo = mdk::inspectContainer(pad, sizeof(pad));
+  CHECK(pinfo.lengthValid && pinfo.shape == ContainerShape::kLengthEnvelope);
+
+  // Full 12-char unterminated name is still tagged (MDKSOUND.SND case).
+  std::byte full[24] = {};
+  full[0] = std::byte{20};
+  std::memcpy(full + 4, "ABCDEFGHIJKL", 12);
+  const auto finfo = mdk::inspectContainer(full, sizeof(full));
+  CHECK(finfo.shape == ContainerShape::kTaggedName);
+  CHECK(finfo.logicalName == "ABCDEFGHIJKL");
+  CHECK(mdk::nameStemMatches(finfo, "ABCDEFGHIJKL"));
+  CHECK(!mdk::nameStemMatches(finfo, "ABCDEFGHIJK"));
+
+  // Family classification by extension.
+  using mdk::ParserFamily;
+  CHECK(mdk::parserFamilyForPath("TRAVERSE\\LEVEL7\\LEVEL7O.MTO") ==
+        ParserFamily::kTagEnvelope);
+  CHECK(mdk::parserFamilyForPath("misc/mdksound.sni") ==
+        ParserFamily::kTagEnvelope);
+  CHECK(mdk::parserFamilyForPath("MISC/FONTF.FTI") ==
+        ParserFamily::kLengthEnvelope);
+  CHECK(mdk::parserFamilyForPath("MISC/OPTIONS.BNI") ==
+        ParserFamily::kLengthEnvelope);
+  CHECK(mdk::parserFamilyForPath("MISC/LOAD_7.LBB") ==
+        ParserFamily::kOtherFormat);
+  CHECK(mdk::parserFamilyForPath("MISC/FLIC/MDK12.FLC") ==
+        ParserFamily::kOtherFormat);
+  CHECK(mdk::parserFamilyForPath("SAVES/X.SAV") == ParserFamily::kOtherFormat);
+  CHECK(mdk::parserFamilyForPath("FOO.XYZ") == ParserFamily::kUnknown);
+  CHECK(mdk::parserFamilyForPath("NOEXT") == ParserFamily::kUnknown);
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
       fs::temp_directory_path() / "mdk_native_test_dataroot";
-  fs::create_directories(tmp);
+  fs::remove_all(tmp);
+  fs::create_directories(tmp / "MISC");
+  fs::create_directories(tmp / "Traverse" / "LEVEL7");
+  {
+    std::ofstream(tmp / "MISC" / "LOAD_7.LBB", std::ios::binary)
+        << "synthetic";
+    std::ofstream(tmp / "Traverse" / "LEVEL7" / "level7o.mto",
+                  std::ios::binary)
+        << "data";
+  }
 
   std::string err;
   auto root = mdk::DataRoot::open(tmp, &err);
   CHECK(root.has_value());
-  CHECK(root->resolve("MISC").filename() == "MISC");
+
+  // Exact-case resolution.
+  err.clear();
+  auto p = root->resolve("MISC/LOAD_7.LBB", &err);
+  CHECK(p.has_value());
+  CHECK(p->filename() == "LOAD_7.LBB");
+
+  // Case-insensitive + mixed separators (the DOS-style request).
+  CHECK(root->resolve("misc\\load_7.lbb").has_value());
+  CHECK(root->resolve("Misc\\Load_7.LbB").has_value());
+  CHECK(root->resolve("traverse/level7/LEVEL7O.MTO").has_value());
+  CHECK(root->resolve("TRAVERSE\\LEVEL7/level7o.MTO").has_value());
+
+  // '.' components normalize away.
+  CHECK(root->resolve("./MISC/./LOAD_7.LBB").has_value());
+
+  // Missing file / missing directory.
+  CHECK(!root->resolve("MISC/LOAD_9.LBB", &err).has_value());
+  CHECK(!err.empty());
+  CHECK(!root->resolve("NOSUCH/X.BIN").has_value());
+
+  // Escape attempts: all rejected.
+  CHECK(!root->resolve("../foo").has_value());
+  CHECK(!root->resolve("../../etc/passwd").has_value());
+  CHECK(!root->resolve("MISC/../../etc/passwd").has_value());
+  CHECK(!root->resolve("MISC/../LOAD_7.LBB").has_value()); // any '..'
+  CHECK(!root->resolve("/etc/passwd").has_value());
+  CHECK(!root->resolve("\\abs\\path").has_value());
+  CHECK(!root->resolve("C:\\MDK.CFG").has_value());
+  CHECK(!root->resolve("c:relative").has_value());
+  CHECK(!root->resolve("").has_value());
+  CHECK(root->resolve("MISC\\").has_value()); // trailing sep -> the dir
+
+  // Read access: bounded + read-only.
+  const auto bytes = root->readFile("misc/load_7.lbb", 64, &err);
+  CHECK(bytes && bytes->size() == 9);
+  CHECK((*bytes)[0] == std::byte{'s'});
+  CHECK(!root->readFile("misc/load_7.lbb", 4).has_value()); // over bound
+  const auto head = root->readPrefix("misc\\LOAD_7.LBB", 4);
+  CHECK(head && head->size() == 4);
+  const auto sz = root->fileSize("MISC/LOAD_7.LBB");
+  CHECK(sz && *sz == 9);
+  CHECK(!root->fileSize("MISC", &err).has_value()); // dir is not a file
+
+  // Symlink escaping the root must be rejected even though the
+  // component names resolve cleanly.
+  const fs::path outside = tmp.parent_path() / "mdk_native_outside.bin";
+  {
+    std::ofstream(outside, std::ios::binary) << "x";
+  }
+  std::error_code ec;
+  fs::create_symlink(outside, tmp / "MISC" / "LINK.BIN", ec);
+  if (!ec) {
+    CHECK(!root->resolve("misc/link.bin").has_value());
+    fs::remove(tmp / "MISC" / "LINK.BIN");
+  }
+  fs::remove(outside);
+
+  // Case-insensitive ambiguity: on a case-sensitive volume both files
+  // can coexist; on case-insensitive volumes they cannot be created.
+  {
+    std::ofstream(tmp / "MISC" / "AMBIG.BIN", std::ios::binary) << "a";
+  }
+  {
+    std::ofstream c1(tmp / "MISC" / "CASE1.BIN", std::ios::binary);
+    c1 << "1";
+  }
+  {
+    std::ofstream c2(tmp / "MISC" / "case1.bin", std::ios::binary);
+    c2 << "2";
+  }
+  std::size_t caseEntries = 0;
+  for (const auto& e : fs::directory_iterator(tmp / "MISC")) {
+    const auto n = e.path().filename().string();
+    if (n == "CASE1.BIN" || n == "case1.bin") {
+      ++caseEntries;
+    }
+  }
+  if (caseEntries == 2) {
+    CHECK(!root->resolve("misc/case1.bin", &err).has_value());
+  }
 
   auto missing = mdk::DataRoot::open(tmp / "no_such_dir", &err);
   CHECK(!missing.has_value());
@@ -210,6 +435,8 @@ int main() {
   test_framebuffer();
   test_palette_expand();
   test_viewport();
+  test_binary_reader();
+  test_container();
   test_data_root();
   test_mode_dispatch();
   test_input_state();

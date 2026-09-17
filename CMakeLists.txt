@@ -26,6 +26,7 @@ find_package(SDL3 REQUIRED CONFIG)
 # --- core library: platform-neutral, unit-testable, no SDL/Metal headers ----
 add_library(mdk_core STATIC
   src/core/clock.cpp
+  src/core/container.cpp
   src/core/data_root.cpp
   src/core/framebuffer.cpp
   src/core/mode_dispatch.cpp
@@ -63,6 +64,12 @@ set_target_properties(mdk_native PROPERTIES
   MACOSX_BUNDLE_SHORT_VERSION_STRING "0.3.0"
   MACOSX_BUNDLE_INFO_STRING "MDK-Native compatibility reimplementation skeleton (Phase 3A)"
 )
+
+# --- developer inspection tool (links the same core parsers as the app) -----
+add_executable(mdk_inspect src/tools/mdk_inspect.cpp)
+target_link_libraries(mdk_inspect PRIVATE mdk_core)
+target_compile_options(mdk_inspect PRIVATE -Wall -Wextra)
+set_target_properties(mdk_inspect PROPERTIES OUTPUT_NAME "mdk-inspect")
 
 # --- tests ------------------------------------------------------------------
 option(MDK_BUILD_TESTS "Build native unit tests" ON)

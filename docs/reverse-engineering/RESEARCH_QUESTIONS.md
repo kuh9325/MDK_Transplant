@@ -17,7 +17,8 @@ with their evidence level and a pointer to the supporting document.
 
 ## Asset formats
 
-- [UNKNOWN] Level/mission container format — magic bytes, versioning, layout (BUILD_A `.CMI`/`.DTI`/`.MTO`/`LEVEL*S.MTI` begin with u32 length + `LEVE` tag; semantics UNKNOWN)
+- [OBSERVED, partial] Level/mission container format — no magic; the common envelope is `u32le @0 = fileSize−4` + 12-byte logical-name field `"<stem>.<ext>"` (tag = name[0..4) = stem prefix; internal exts `.MAT/.SND/.CMD/.DAT`), followed by `u32le @16 = fileSize−12` (semantics UNKNOWN). Validated on all 46 tag-family files in BUILD_A + the mdkfopen-path stem check (`FUN_0042fae8`). Interior layout (entry directories, payloads) UNKNOWN. See docs/DATA_ACCESS.md.
+- [CORRECTED — see DATA_ACCESS.md] `chunks.c` (`FUN_00404084` cluster) is an in-memory object-pool allocator, not the file-envelope parser — the earlier "chunk/container" label is downgraded.
 - [UNKNOWN] Texture/image formats — bit depth, palettes, compression
 - [UNKNOWN] Mesh/model representation — vertex/index formats, hierarchies
 - [UNKNOWN] Animation data — skeletal vs vertex vs procedural
@@ -26,7 +27,7 @@ with their evidence level and a pointer to the supporting document.
 - [OBSERVED, partial] Script/event system — `tr_alcmd.c` ("traverse alien commands") exists in both builds; strings `Alien %s looped %d commands`, `Unrecognised controlalien` indicate a per-alien command interpreter. Opcode set/format UNKNOWN.
 - [UNKNOWN] Audio formats — `.SNI` files exist (tags `FALL`/`LEVE`/`MDKS`) but encoding is UNKNOWN; DOS audio middleware identified as HMI SOS (`.386` drivers + `HMISETUP.INI`)
 - [OBSERVED, partial] Video/cinematic format — Autodesk FLIC (`.FLC`, magic 0xAF12, 600x360x8) and Interplay MVE (`.MVE`) files ship in `MISC/FLIC/`; no Smacker evidence. Playback path located: `FUN_0041d7b4` (MDK12 intro), `FUN_0041ebf4` (PIE), `FUN_0047b0fc` (MDKEND+FINISH.BNI ending), `FUN_0047b674` (MDKBZK.MVE, `Cannot open movie file`); decoder internals UNKNOWN.
-- [OBSERVED, partial] Archive/packing format for shipped data files — most proprietary families begin u32 length (file size−4) + 4-char tag equal to file stem; `.BNI` differs (non-ASCII second field); `.LBB` looks raw. Whether files are further compressed/packed inside is UNKNOWN.
+- [OBSERVED, partial] Archive/packing format for shipped data files — u32 `fileSize−4` envelope confirmed across all 57 files in `.MTO/.SNI/.MTI/.CMI/.DTI/.FTI/.BNI`; tag-family name field detailed in DATA_ACCESS.md. `.FTI` shares only the u32 (non-ASCII second field — corrects the Phase 1 tag claim); `.BNI` same shape; `.LBB` has no envelope. Whether payloads are further packed inside is UNKNOWN.
 - [UNKNOWN] Endianness consistency across x86 and PPC builds (no PPC build supplied)
 - [UNKNOWN] Whether any formats are shared across builds or platform-specific
 
