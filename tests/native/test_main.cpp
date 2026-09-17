@@ -5,8 +5,10 @@
 #include "core/compat.h"
 #include "core/container.h"
 #include "core/data_root.h"
+#include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/mode_dispatch.h"
+#include "core/sni_directory.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
 
@@ -16,6 +18,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -246,6 +250,301 @@ void test_container() {
   CHECK(mdk::parserFamilyForPath("NOEXT") == ParserFamily::kUnknown);
 }
 
+void test_file_family() {
+  using mdk::MdkFileFamily;
+  using mdk::FamilySupport;
+  using mdk::fileFamilyForPath;
+  using mdk::fileFamilySupport;
+
+  // Extension dispatch is case-insensitive and path-position aware.
+  CHECK(fileFamilyForPath("TRAVERSE\\LEVEL7\\LEVEL7O.MTO") ==
+        MdkFileFamily::kMto);
+  CHECK(fileFamilyForPath("misc/mdksound.sni") == MdkFileFamily::kSni);
+  CHECK(fileFamilyForPath("MISC\\MDKSOUND.SNI") == MdkFileFamily::kSni);
+  CHECK(fileFamilyForPath("a/b/c.mti") == MdkFileFamily::kMti);
+  CHECK(fileFamilyForPath("X.CMI") == MdkFileFamily::kCmi);
+  CHECK(fileFamilyForPath("X.DTI") == MdkFileFamily::kDti);
+  CHECK(fileFamilyForPath("X.FTI") == MdkFileFamily::kFti);
+  CHECK(fileFamilyForPath("X.BNI") == MdkFileFamily::kBni);
+  CHECK(fileFamilyForPath("X.LBB") == MdkFileFamily::kLbb);
+  CHECK(fileFamilyForPath("X.SAV") == MdkFileFamily::kSav);
+  CHECK(fileFamilyForPath("X.FLC") == MdkFileFamily::kFlic);
+  CHECK(fileFamilyForPath("X.MVE") == MdkFileFamily::kMve);
+  CHECK(fileFamilyForPath("X.GIF") == MdkFileFamily::kGif);
+  CHECK(fileFamilyForPath("X.FRC") == MdkFileFamily::kFrc);
+  CHECK(fileFamilyForPath("MDK95.EXE") == MdkFileFamily::kOtherKnown);
+  CHECK(fileFamilyForPath("README.TXT") == MdkFileFamily::kOtherKnown);
+  CHECK(fileFamilyForPath("X.XYZ") == MdkFileFamily::kUnknown);
+  CHECK(fileFamilyForPath("NOEXT") == MdkFileFamily::kUnknown);
+  CHECK(fileFamilyForPath("dir.with.dot/noext") == MdkFileFamily::kUnknown);
+  CHECK(fileFamilyForPath(".SNI") == MdkFileFamily::kSni); // ext-only name
+  CHECK(fileFamilyForPath("a.SNI.bak") == MdkFileFamily::kUnknown);
+
+  // Support levels (Phase 3C).
+  CHECK(fileFamilySupport(MdkFileFamily::kSni) ==
+        FamilySupport::kDirectoryMetadata);
+  CHECK(fileFamilySupport(MdkFileFamily::kMto) ==
+        FamilySupport::kEnvelopeOnly);
+  CHECK(fileFamilySupport(MdkFileFamily::kMti) ==
+        FamilySupport::kEnvelopeOnly);
+  CHECK(fileFamilySupport(MdkFileFamily::kCmi) ==
+        FamilySupport::kEnvelopeOnly);
+  CHECK(fileFamilySupport(MdkFileFamily::kDti) ==
+        FamilySupport::kEnvelopeOnly);
+  CHECK(fileFamilySupport(MdkFileFamily::kFti) ==
+        FamilySupport::kEnvelopeOnly);
+  CHECK(fileFamilySupport(MdkFileFamily::kBni) ==
+        FamilySupport::kEnvelopeOnly);
+  CHECK(fileFamilySupport(MdkFileFamily::kFlic) ==
+        FamilySupport::kStandardExternalFormat);
+  CHECK(fileFamilySupport(MdkFileFamily::kMve) ==
+        FamilySupport::kStandardExternalFormat);
+  CHECK(fileFamilySupport(MdkFileFamily::kGif) ==
+        FamilySupport::kStandardExternalFormat);
+  CHECK(fileFamilySupport(MdkFileFamily::kFrc) ==
+        FamilySupport::kStandardExternalFormat);
+  CHECK(fileFamilySupport(MdkFileFamily::kLbb) == FamilySupport::kUnsupported);
+  CHECK(fileFamilySupport(MdkFileFamily::kSav) == FamilySupport::kUnsupported);
+  CHECK(fileFamilySupport(MdkFileFamily::kOtherKnown) ==
+        FamilySupport::kUnsupported);
+  CHECK(fileFamilySupport(MdkFileFamily::kUnknown) ==
+        FamilySupport::kUnsupported);
+
+  // Envelope-level grouping stays consistent with the family table.
+  CHECK(mdk::parserFamilyForPath("x.sni") == mdk::ParserFamily::kTagEnvelope);
+  CHECK(mdk::parserFamilyForPath("x.bni") ==
+        mdk::ParserFamily::kLengthEnvelope);
+  CHECK(mdk::parserFamilyForPath("x.flc") == mdk::ParserFamily::kOtherFormat);
+}
+
+// Synthetic SNI file builder (no original data). Layout mirrors the
+// OBSERVED structure: [u32 size-4][name12][u32 size-12][u32 count]
+// [count x 24B records][payloads][name12 trailer].
+struct SyntheticSni {
+  std::vector<std::byte> buf;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 12) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+
+  // Build: logicalName, entries as {name, field0c, payloadSize};
+  // payload blobs are laid out contiguously from directory end.
+  static SyntheticSni build(const char* logicalName,
+                            std::initializer_list<
+                                std::tuple<const char*, std::uint32_t,
+                                           std::uint32_t>> entries) {
+    SyntheticSni s;
+    const std::uint32_t count = static_cast<std::uint32_t>(entries.size());
+    const std::uint64_t dirEnd = 0x18 + std::uint64_t(count) * 24;
+    std::uint64_t total = dirEnd;
+    for (const auto& [n, f, sz] : entries)
+      total += sz;
+    total += 12; // trailer
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.putName(0x04, logicalName);
+    s.put32(0x10, static_cast<std::uint32_t>(total - 12));
+    s.put32(0x14, count);
+    std::uint64_t payloadAt = dirEnd;
+    std::uint32_t i = 0;
+    for (const auto& [n, f, sz] : entries) {
+      const std::uint64_t rec = 0x18 + std::uint64_t(i) * 24;
+      s.putName(rec, n);
+      s.put32(rec + 0x0c, f);
+      s.put32(rec + 0x10,
+              static_cast<std::uint32_t>(payloadAt - 4)); // blob-relative
+      s.put32(rec + 0x14, sz);
+      payloadAt += sz;
+      ++i;
+    }
+    s.putName(static_cast<std::size_t>(total - 12), logicalName);
+    return s;
+  }
+};
+
+void test_sni_directory() {
+  using mdk::SniDirectoryStatus;
+  using mdk::inspectSniDirectory;
+
+  // Valid two-entry directory: offsets tile from dirEnd, trailer ok.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"CORRIDOR", 3, 100},
+                                            {"FOOT1", 0, 200}});
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kOk);
+    CHECK(d.count == 2 && d.entries.size() == 2);
+    CHECK(d.entries[0].name() == "CORRIDOR");
+    CHECK(d.entries[1].name() == "FOOT1");
+    CHECK(d.entries[0].fieldAt0x0C == 3 && d.entries[1].fieldAt0x0C == 0);
+    // dirEnd = 0x18 + 2*24 = 0x48. First payload at file offset dirEnd.
+    CHECK(d.directoryEnd == 0x48);
+    CHECK(d.entries[0].payloadFileOffset() == 0x48);
+    CHECK(d.entries[0].payloadFileEnd() == 0x48 + 100);
+    // blobOffset is stored relative to file offset 4.
+    CHECK(d.entries[0].blobOffset == 0x48 - 4);
+    CHECK(d.entries[1].payloadFileOffset() == 0x48 + 100);
+    CHECK(d.entries[1].payloadFileEnd() == s.buf.size() - 12);
+    CHECK(d.trailerPresent);
+    CHECK(d.secondaryEqualsTrailerOffset);
+    CHECK(d.secondaryLength == s.buf.size() - 12);
+  }
+
+  // Zero-entry directory: count=0, only the trailer after it.
+  {
+    auto s = SyntheticSni::build("EMPTY.SND", {});
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kOk);
+    CHECK(d.count == 0 && d.entries.empty());
+    CHECK(d.directoryEnd == 0x18);
+  }
+
+  // Name at exactly 12 bytes (no NUL terminator inside the field).
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"SNIPERSHOT12", 0, 8}});
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kOk);
+    CHECK(d.entries[0].name() == "SNIPERSHOT12");
+    CHECK(d.entries[0].nameField[11] == std::byte{'2'});
+  }
+
+  // Payload offset landing before directory end → rejected.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}});
+    s.put32(0x18 + 0x10, 0); // blobOff=0 → file offset 4 < dirEnd
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Payload end escaping past the trailer → rejected.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}});
+    s.put32(0x18 + 0x14, static_cast<std::uint32_t>(s.buf.size()));
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kEntryOutOfBounds);
+  }
+
+  // Directory table overrunning the file → rejected (count too large).
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}});
+    s.put32(0x14, 0xffffffff); // impossible count
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kDirectoryOutOfBounds);
+  }
+
+  // Inflated count in a 1-record file (total 64 B): count=2 needs the
+  // table to reach 0x48 > 0x40 → directory bound fails.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}});
+    s.put32(0x14, 2);
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kDirectoryOutOfBounds);
+  }
+
+  // Inflated count where the table still "fits" on disk (2-entry file
+  // with 20 B payloads, 124 B; count=3 → dirEnd 0x60 < 0x7c): the
+  // enlarged directory swallows entry 0's real payload start
+  // (0x48 < 0x60) — caught by the entry bounds check on the first
+  // invalidated entry.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 20}, {"B", 0, 20}});
+    s.put32(0x14, 3);
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Sentinel record class (OBSERVED: 'K_'-prefixed trailing entries
+  // with field0x0c == payloadSize == 0xffffffff): the stored offset is
+  // a real in-bounds position; size is never treated as a byte count.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}, {"B", 0, 20}});
+    // Overwrite entry 1 into a sentinel pointing at file offset 0x50
+    // (inside the payload region, before the trailer at size-12).
+    s.putName(0x18 + 24, "K_MARK");
+    s.put32(0x18 + 24 + 0x0c, 0xffffffff);
+    s.put32(0x18 + 24 + 0x10, 0x50 - 4); // blobOff → file 0x50
+    s.put32(0x18 + 24 + 0x14, 0xffffffff);
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kOk);
+    CHECK(d.entries.size() == 2);
+    CHECK(!d.entries[0].isSentinel());
+    CHECK(d.entries[1].isSentinel());
+    CHECK(d.entries[1].payloadFileOffset() == 0x50);
+
+    // Sentinel with an out-of-bounds marker position is still invalid.
+    auto s2 = s;
+    s2.put32(0x18 + 24 + 0x10,
+             static_cast<std::uint32_t>(s2.buf.size())); // way past EOF
+    const auto d2 = inspectSniDirectory(s2.buf);
+    CHECK(d2.status == SniDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d2.badEntryIndex == 1);
+  }
+
+  // Half-sentinel (only size == 0xffffffff) is NOT the sentinel class —
+  // treated as a normal entry with an impossible byte count.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}, {"B", 0, 4}});
+    s.put32(0x18 + 24 + 0x14, 0xffffffff); // size only
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(!d.entries.empty()); // entries vector may be partial on fail
+    CHECK(d.status == SniDirectoryStatus::kEntryOutOfBounds);
+  }
+
+  // Truncated header: envelope is fine but file ends before count.
+  {
+    // 20-byte tagged envelope (name valid, length valid), < 0x18.
+    std::byte t[20] = {};
+    t[0] = std::byte{16};
+    std::memcpy(t + 4, "T.SND", 5);
+    const auto d = inspectSniDirectory(t);
+    CHECK(d.status == SniDirectoryStatus::kTruncatedHeader);
+  }
+
+  // Not a tagged envelope → "not this format", not "malformed".
+  {
+    std::byte raw[64] = {};
+    const auto d = inspectSniDirectory(raw);
+    CHECK(d.status == SniDirectoryStatus::kNotTaggedEnvelope);
+
+    // Length-valid but non-tag name field (the FTI/BNI shape).
+    std::byte fti[32] = {};
+    fti[0] = std::byte{28};
+    fti[4] = std::byte{0x03};
+    const auto d2 = inspectSniDirectory(fti);
+    CHECK(d2.status == SniDirectoryStatus::kNotTaggedEnvelope);
+  }
+
+  // Missing trailer → payloads may extend to EOF; still parses.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}});
+    // Corrupt the trailer (all NUL now → name mismatch).
+    for (std::size_t i = s.buf.size() - 12; i < s.buf.size(); ++i)
+      s.buf[i] = std::byte{'X'};
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kOk);
+    CHECK(!d.trailerPresent);
+    // u32@0x10 still equals size-12 numerically.
+    CHECK(d.secondaryEqualsTrailerOffset);
+  }
+
+  // u32@0 length mismatch → envelope invalid → not this format.
+  {
+    auto s = SyntheticSni::build("TEST.SND", {{"A", 0, 4}});
+    s.put32(0x00, 0);
+    const auto d = inspectSniDirectory(s.buf);
+    CHECK(d.status == SniDirectoryStatus::kNotTaggedEnvelope);
+  }
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
@@ -437,6 +736,8 @@ int main() {
   test_viewport();
   test_binary_reader();
   test_container();
+  test_file_family();
+  test_sni_directory();
   test_data_root();
   test_mode_dispatch();
   test_input_state();

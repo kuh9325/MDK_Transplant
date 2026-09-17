@@ -1,6 +1,7 @@
 #include "core/container.h"
 
 #include "core/binary_reader.h"
+#include "core/file_family.h"
 
 #include <cstdio>
 
@@ -129,35 +130,28 @@ bool nameStemMatches(const ContainerInfo& info, std::string_view stem) {
 }
 
 ParserFamily parserFamilyForPath(std::string_view relPath) {
-  const auto slash = relPath.find_last_of("/\\");
-  const auto dot = relPath.find_last_of('.');
-  if (dot == std::string_view::npos ||
-      (slash != std::string_view::npos && dot < slash)) {
-    return ParserFamily::kUnknown;
-  }
-  std::string ext(relPath.substr(dot + 1));
-  for (char& c : ext) {
-    c = foldAsciiChar(c);
-  }
-
-  // OBSERVED in BUILD_A: tag-envelope families.
-  if (ext == "mto" || ext == "sni" || ext == "mti" || ext == "cmi" ||
-      ext == "dti") {
-    return ParserFamily::kTagEnvelope;
-  }
-  // OBSERVED in BUILD_A: u32 length envelope, non-tag second field.
-  if (ext == "fti" || ext == "bni") {
-    return ParserFamily::kLengthEnvelope;
-  }
-  // OBSERVED in BUILD_A: not this container — raw proprietary (.LBB,
-  // .SAV), standard external formats, executables, and text.
-  if (ext == "lbb" || ext == "sav" || ext == "flc" || ext == "mve" ||
-      ext == "gif" || ext == "frc" || ext == "cfg" || ext == "ini" ||
-      ext == "txt" || ext == "inf" || ext == "conf" || ext == "exe" ||
-      ext == "dll" || ext == "com" || ext == "vxd" || ext == "386" ||
-      ext == "ico" || ext == "pdf" || ext == "wmv" || ext == "db" ||
-      ext == "bat" || ext == "sys" || ext == "ovl") {
-    return ParserFamily::kOtherFormat;
+  // The extension→family table lives in file_family.cpp (single source
+  // of truth); this is only the envelope-level grouping of families.
+  switch (fileFamilyForPath(relPath)) {
+    case MdkFileFamily::kMto:
+    case MdkFileFamily::kSni:
+    case MdkFileFamily::kMti:
+    case MdkFileFamily::kCmi:
+    case MdkFileFamily::kDti:
+      return ParserFamily::kTagEnvelope;
+    case MdkFileFamily::kFti:
+    case MdkFileFamily::kBni:
+      return ParserFamily::kLengthEnvelope;
+    case MdkFileFamily::kLbb:
+    case MdkFileFamily::kSav:
+    case MdkFileFamily::kFlic:
+    case MdkFileFamily::kMve:
+    case MdkFileFamily::kGif:
+    case MdkFileFamily::kFrc:
+    case MdkFileFamily::kOtherKnown:
+      return ParserFamily::kOtherFormat;
+    case MdkFileFamily::kUnknown:
+      return ParserFamily::kUnknown;
   }
   return ParserFamily::kUnknown;
 }

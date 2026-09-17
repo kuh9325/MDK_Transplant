@@ -128,6 +128,7 @@ bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
 | Input | `FUN_0046bd14`, polls `46bc18/46b688/46b9b4` | CONFIRMED_ | DirectInputCreate + device error strings |
 | File I/O wrapper | `FUN_0041ae50` (`mdkfopen.c`) | STRONG_ | source-path string; used by all loaders |
 | Level bundle load | `FUN_0041b7b4` | STRONG_ | `LEVEL%dO.MTO/SNI`, `LEVEL%dS.MTI`, `.CMI/.DTI`, `FALL3D.*`, `TRAVERSE.SNI`, `TRAVSPRT.BNI`, `STREAM.*`, `TLEVEL.*`, `LOAD_CPY` |
+| .SNI directory | `FUN_00428a0c` (stream loader), `FUN_004259a8` (whole-blob loader), `FUN_00428c90`/`FUN_00429014` (entry lookup + payload read), `FUN_00428be8`/`FUN_00428828` (iterate) | STRONG_ | count u32@0x14, N×24-byte records `{name[12], u32@+0x0c, blobOff@+0x10, size@+0x14}`; seek `stored+4` SEEK_SET; name compare ≤12 (`MOV EBX,0xc`→`FUN_0042fa80`); blob image = file+4 — Phase 3C, see `../DATA_FORMATS.md` |
 | Traversal load | `FUN_00433d40` | STRONG_ | `MISC\LOAD_%d.LBB`, `TLEVEL.*`, level families |
 | FALL3D/freefall | `FUN_0040ef28` (+init `FUN_0041e070`-equiv) | STRONG_ | `fall_3d.c` string, `FALL3D_%d.MTI`, `FALLP_%d/LEVEL_%d/POD_%d` |
 | Renderer (3D) | `FUN_00431300` draw_arena, `FUN_00432e2c` BSPShow, `FUN_0040bd40/…` poly sort | STRONG_ | `Overflowed MaxObjects in draw_arena`, `BSPShow %s not found`, `arena %s not found`, `Too many polygons for current sort list`, `3 Cooridors not allowed for arena` |
@@ -159,7 +160,9 @@ per-level families `%s\LEVEL%d\…`: `.MTO` objects, `O.SNI`/`S.SNI` sound,
 `S.MTI` imagery, `.CMI` collision/map, `.DTI` data. `FALL3D\FALL3D_%d.MTI`
 + `.SNI` + `.BNI` for freefall; `STREAM\` for mid-level streams;
 `MISC\` for fonts/config/movies/slideshow/sound set; `demo\` for input
-recordings; `SAVES\%.SAV` + `LASTGAME` for saves.
+recordings; `SAVES\%.SAV` + `LASTGAME` for saves. (Phase 3C: the `.SNI`
+interior directory — count + 24-byte name/offset/size records — is the
+first proven interior format; see `../DATA_FORMATS.md`.)
 
 ## DOS ↔ Win95 shared code — CORROBORATED
 

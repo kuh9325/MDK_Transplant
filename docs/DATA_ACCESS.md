@@ -1,10 +1,11 @@
-# Data Access Layer — Phase 3B
+# Data Access Layer — Phase 3B/3C
 
 Status: implemented and validated (2026-09-17). This layer provides
 read-only, confined, case-insensitive access to a user-supplied MDK
-data root, a bounded binary reader, and the first evidence-backed
-container-envelope parser. No gameplay, no level parsing, no graphics
-decode.
+data root, a bounded binary reader, the evidence-backed
+container-envelope parser, an explicit file-family dispatch, and the
+first proven interior directory map (`.SNI`, metadata only). No
+gameplay, no level parsing, no graphics/audio decode.
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`.
 Throughout: "BUILD_A" = `original/installed/` (the NoCD-repack tree;
@@ -79,8 +80,9 @@ families in BUILD_A, cross-checked against loader code:
 | tag = name[0..4) = stem[0..4) | OBSERVED + code-corroborated | original fast-path check compares file bytes [4, 4+stemLen) vs request stem, ASCII-folded (`FUN_0042fae8`, `&0xdf` uppercase) |
 | u32 @16 = fileSize − 12 | OBSERVED (46/46 tag family) | semantics UNKNOWN — possibly an inner section/chunk length covering `[12, size)`; not interpreted |
 | end of envelope | OBSERVED | declared length ends exactly at EOF (single envelope per file) |
-| interior structure | UNKNOWN | named 8-byte entries visible after offset 20+ (e.g. `DANT_1`, `AMB02`, `EXPLODE`) — a per-family directory/index is HYPOTHESIS only |
-| padding/alignment | OBSERVED | name field NUL-padded to 12; no other alignment rule observed |
+| name-field trailer | OBSERVED (46/46 tag family) | last 12 bytes of every tagged file repeat the name field; u32@16 = size−12 == that trailer's file offset |
+| interior structure | OBSERVED for `.SNI` only | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
+| padding/alignment | OBSERVED | name field NUL-padded to 12; `.SNI` payloads 4-byte aligned (gaps 0 or 2) |
 | malformed handling | OBSERVED (code) | tag≠stem → treated as stale HD copy → re-copied from CD root (`FUN_0041ae50`) |
 
 ### chunks.c correction (Phase 2C targeted analysis)
@@ -94,6 +96,18 @@ allocator** — 60 nodes × 0x1aa bytes, free-list `DAT_004a1ec4`,
 file-boundary checks live in the mdkfopen path (`FUN_0041b3c4` et al.).
 Interior file structure remains UNKNOWN — the envelope parser below is
 therefore limited to the top level, per the phase brief.
+
+## File-family dispatch (Phase 3C)
+
+`fileFamilyForPath` (`src/core/file_family.cpp`) — case-insensitive,
+extension-driven classification, the single source of truth. One
+enumerator per observed BUILD_A extension family (conservative names —
+extensions, not guessed semantics); `fileFamilySupport` exposes the
+current parser level: `unsupported` / `envelope-only` /
+`directory-metadata` / `standard-external-format`. The full matrix and
+per-family interior evidence live in `DATA_FORMATS.md`.
+`parserFamilyForPath` (below) now delegates to the family table so the
+envelope grouping stays consistent.
 
 ## Parser applicability
 
@@ -118,11 +132,20 @@ length invariant and name-field plausibility gate `kTaggedName`.
 ## mdk-inspect
 
 `mdk-inspect --data-path DIR [--container] <rel-path>` prints:
-request, resolved path, size, extension family, declared u32 vs
-size−4, envelope shape, tag (escaped), logical name, stem-match, and
-the raw second u32 @16 (uninterpreted). `--selftest` runs a synthetic
-envelope check. Links `mdk_core` — the same code the app uses. Never
-prints payloads; never writes into the data root.
+request, resolved path, size, file family, envelope class, parser
+support level, declared u32 vs size−4, envelope shape, tag (escaped),
+logical name, stem-match, and the raw second u32 @16 (uninterpreted).
+
+`mdk-inspect --data-path DIR --entries <rel-path>` additionally reads
+the whole file (bounded) and enumerates the interior directory where a
+proven parser exists — `.SNI` only in Phase 3C: entry count, directory
+end, trailer status, and per-record name/raw field/blob offset/
+resolved file offset/size; sentinel records (`field==size==0xffffffff`)
+are reported as position markers. Families without a proven interior
+parser are rejected with the support level — never guessed.
+`--selftest` runs synthetic envelope + SNI-directory checks.
+Links `mdk_core` — the same code the app uses. Never prints payload
+bytes; never writes into the data root.
 
 ## Validation performed (BUILD_A, read-only)
 
@@ -139,11 +162,28 @@ prints payloads; never writes into the data root.
 - `../outside`, `misc\no_such.x` — rejected with clear errors.
 - Manifest re-verified after all inspection: 141/141 files unchanged.
 
+Phase 3C additions (all via `mdk-inspect --entries`, read-only):
+
+- All 15 `.SNI` files in BUILD_A enumerate `ok` — entry counts 3–53;
+  `LEVEL4S.SNI`/`LEVEL6S.SNI` carry 2 and 4 `K_*` sentinel records
+  respectively (offset bounds-checked, size field not a byte count).
+- `LEVEL7O.MTO`, `FONTF.FTI`, `LOAD_7.LBB`, `MDK12.FLC`, `MDK95.EXE`
+  correctly report `envelope-only`/`unsupported`/
+  `standard-external-format` and reject `--entries`.
+- Manifest re-verified after Phase 3C inspection: 141/141 unchanged.
+
 ## Explicit unknowns (not implemented)
 
-- Semantics of every interior structure: entry tables, per-family
-  payloads, the size−12 field, compression/encryption (none observed).
+- Interior structures of `.MTO/.MTI/.CMI/.DTI` (shape observations
+  recorded in `DATA_FORMATS.md`; none decoded).
+- `.SNI` payload contents (mostly RIFF/WAVE by byte inspection — not
+  decoded), the record `+0x0c` field, and the `K_*` sentinel records'
+  marked regions.
+- Semantics of the u32@16 field (equals size−12 == trailer offset in
+  all tagged files; never read by the SNI loader) and the 12-byte
+  trailer itself.
 - `.FTI`/`.BNI` directory layout (count-like u32 + 8-byte names is a
   shape observation only).
 - `.LBB`, `.SAV`, `.386` formats.
+- Compression/encryption (none observed anywhere).
 - Whether a retail/GOG dump matches BUILD_A bytes.
