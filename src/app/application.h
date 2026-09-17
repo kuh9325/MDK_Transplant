@@ -16,6 +16,11 @@ namespace mdk {
 struct AppConfig {
   std::optional<std::filesystem::path> dataPath; // --data-path (read-only)
   std::optional<std::filesystem::path> dumpPpm; // --dump-ppm (debug hook)
+  // --preview-resource FILE RECORD: decode one proven original visual
+  // resource (Phase 4A: paletted BNI bitmaps) and present it through
+  // the normal indexed framebuffer + Metal path. Requires --data-path.
+  std::optional<std::string> previewFile;
+  std::optional<std::string> previewRecord;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
   bool relativeMouse = true;  // --no-relative-mouse to disable

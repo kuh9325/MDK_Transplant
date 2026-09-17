@@ -37,7 +37,10 @@ build/native/mdk-native.app/Contents/MacOS/mdk-native \
 
 CLI options: `--data-path DIR` (read-only data root), `--frames N`
 (quit after N frames), `--selftest` (inject + verify synthetic input
-events), `--dump-ppm FILE` (write last presented frame), 
+events), `--dump-ppm FILE` (write last presented frame),
+`--preview-resource FILE RECORD` (Phase 4A: decode + present one
+proven paletted BNI visual resource — e.g.
+`--preview-resource MISC/OPTIONS.BNI MDKOPT`; requires `--data-path`),
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -54,6 +57,8 @@ src/
              viewport.*          — aspect-fit / presentation geometry
              mode_dispatch.*     — PrimaryModeId/SubModeId dispatcher
              data_root.*         --data-path validation (read-only seam)
+             indexed_image.*     — decoded indexed visual + blit (4A)
+             bni_image.*         — proven BNI bitmap payload decoder (4A)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -80,9 +85,10 @@ tests/native/test_main.cpp       — unit tests (linked to mdk_core only)
   256-entry RGBA `Palette`. (OBSERVED: original ~600x360 indexed back
   buffer `DAT_00541650`, 360-row present copy.)
 - Presentation canvas: 640x480, 4:3 (OBSERVED: `SetDisplayMode
-  640x480x8`). The 600x360 image is **centered** in the canvas
-  (PROJECT DECISION — original in-surface offset is UNKNOWN; candidate
-  targeted Phase 2C observation).
+  640x480x8`). The 600x360 image is **centered** in the canvas —
+  CODE-CORROBORATED in Phase 4A: the original present copy
+  (`FUN_0046c86c`) lands at column +20, row +60, i.e. exactly
+  centered.
 - `expandToBGRA` converts indexed→BGRA8 on CPU at present time. The
   indexed buffer is the authoritative working surface; expansion is a
   presentation detail.
@@ -164,11 +170,12 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- The app loads no original data at runtime; metadata-only interior
-  parsers for `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
-  `mdk-inspect` (Phases 3C–3H) but the skeleton scene does not consume
-  them. `.LBB/.SAV/.FLC/.MVE` remain unparsed.
-- Original 600x360→640x480 image offset UNKNOWN (currently centered).
+- Runtime original-data use is limited to the Phase 4A preview: one
+  named record from one BNI file (`--preview-resource`), decoded by
+  the proven paletted-bitmap layout into the indexed framebuffer — see
+  `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
+  `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
+  `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.
 - Window-close quit and resize were code-verified; physical
   keyboard/mouse input could not be host-injected on this machine (TCC),
   so `--selftest` exercises the identical event path instead.

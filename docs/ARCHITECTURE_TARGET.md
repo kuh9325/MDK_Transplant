@@ -52,7 +52,8 @@ Boundary notes (intentions, not commitments):
 | GPU backend | IMPLEMENTED (Phase 3A): Metal presentation of the software framebuffer |
 | Build system | IMPLEMENTED (Phase 3A): CMake ≥3.24, out-of-tree `build/` |
 | Data access | IMPLEMENTED (Phase 3B): `DataRoot` read-only resolver + `BinaryReader` + container envelope — see `DATA_ACCESS.md` |
-| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B |
+| Resource decoding | STARTED (Phase 4A): `IndexedImage` + first proven decoder (BNI paletted bitmap) — see `ENGINE_RECONSTRUCTION.md` |
+| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B/4A |
 
 > Phase 3A implements the bottom two layers (`platform`, `renderer`
 > presentation boundary) plus a neutral input seam and a mode-dispatch
@@ -63,6 +64,11 @@ Boundary notes (intentions, not commitments):
 > root-confined), bounded binary reads, and the common u32+name
 > envelope parser — top-level only; interior semantics UNKNOWN.
 > See `DATA_ACCESS.md`.
+
+> Phase 4A adds the first decoded-resource path: one proven BNI visual
+> payload (`MISC/OPTIONS.BNI` `MDKOPT`) flows through `DataRoot` →
+> directory parser → `decodeBniPalettedImage` → `IndexedImage` → the
+> indexed framebuffer → Metal. See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

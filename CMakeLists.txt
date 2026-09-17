@@ -26,6 +26,7 @@ find_package(SDL3 REQUIRED CONFIG)
 # --- core library: platform-neutral, unit-testable, no SDL/Metal headers ----
 add_library(mdk_core STATIC
   src/core/bni_directory.cpp
+  src/core/bni_image.cpp
   src/core/clock.cpp
   src/core/cmi_directory.cpp
   src/core/container.cpp
@@ -34,6 +35,7 @@ add_library(mdk_core STATIC
   src/core/file_family.cpp
   src/core/framebuffer.cpp
   src/core/fti_directory.cpp
+  src/core/indexed_image.cpp
   src/core/mode_dispatch.cpp
   src/core/mti_directory.cpp
   src/core/mto_directory.cpp

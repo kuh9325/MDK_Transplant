@@ -124,6 +124,16 @@ struct BniDirectory {
 // distinguishes "not this format" from "malformed".
 BniDirectory inspectBniDirectory(std::span<const std::byte> file);
 
+// Locate a record by name — the directory-level counterpart of the
+// original lookup (FUN_00403958: record scan + name compare). The
+// original's comparator is an unbounded case-sensitive C-string
+// compare; this helper is ASCII case-INSENSITIVE (a native tooling
+// convenience — all 178 observed names are uppercase anyway) and
+// bounded: the stored name is the field up to its first NUL (all 12
+// bytes if unterminated). Returns nullptr when not found.
+const BniRecord* findBniRecord(const BniDirectory& dir,
+                               std::string_view name);
+
 std::string_view bniDirectoryStatusName(BniDirectoryStatus s);
 
 } // namespace mdk

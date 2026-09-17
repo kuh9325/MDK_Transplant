@@ -6,10 +6,12 @@
 //   mdk-inspect --data-path DIR <relative-path>
 //   mdk-inspect --data-path DIR --container <relative-path>
 //   mdk-inspect --data-path DIR --entries <relative-path>
+//   mdk-inspect --data-path DIR --visual-info <relative-path> <record>
 //   mdk-inspect --selftest        (synthetic in-memory checks)
 
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
+#include "core/bni_image.h"
 #include "core/cmi_directory.h"
 #include "core/container.h"
 #include "core/data_root.h"
@@ -25,6 +27,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -37,6 +40,8 @@ int usage() {
   std::fprintf(stderr,
                "usage: mdk-inspect --data-path DIR [--container | "
                "--entries] <relative-path>\n"
+               "       mdk-inspect --data-path DIR --visual-info "
+               "<relative-path> <record>\n"
                "       mdk-inspect --selftest\n");
   return 2;
 }
@@ -526,6 +531,43 @@ int selftest() {
        bdir.firstPayloadAtDirectoryEnd;
   std::fprintf(stderr, "selftest bni-directory: %s\n",
                ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic BNI image checks (no original data): record lookup by
+  // name plus the Phase 4A paletted-bitmap decode
+  // {rgb[768], u16 w, u16 h, px[w*h]}.
+  ok = mdk::findBniRecord(bdir, "bonesanim") == &bdir.records[0] &&
+       mdk::findBniRecord(bdir, "RES2") == &bdir.records[1] &&
+       mdk::findBniRecord(bdir, "MISSING") == nullptr;
+  std::fprintf(stderr, "selftest bni-record-lookup: %s\n",
+               ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  std::vector<std::byte> pal(772 + 6);  // 2x3 paletted image
+  for (int i = 0; i < 256; ++i) {
+    pal[i * 3 + 0] = static_cast<std::byte>(i);
+    pal[i * 3 + 1] = static_cast<std::byte>(255 - i);
+    pal[i * 3 + 2] = static_cast<std::byte>(i);
+  }
+  pal[768] = std::byte{2};
+  pal[770] = std::byte{3};
+  for (int i = 0; i < 6; ++i) {
+    pal[772 + i] = static_cast<std::byte>(i + 40);
+  }
+  const auto probe = mdk::probeBniImage(pal);
+  std::string derr;
+  const auto img = mdk::decodeBniPalettedImage(pal, &derr);
+  ok = probe.shape == mdk::BniImageShape::kPaletted &&
+       img && img->width == 2 && img->height == 3 &&
+       img->stride == 2 && img->pixels.size() == 6 &&
+       img->pixels[5] == 45 && img->hasPalette &&
+       img->palette[7].r == 7 && img->palette[7].g == 248;
+  std::fprintf(stderr, "selftest bni-paletted-image: %s\n",
+               ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 
@@ -534,6 +576,7 @@ int selftest() {
 int main(int argc, char** argv) {
   std::optional<std::string> dataPath;
   std::optional<std::string> target;
+  std::optional<std::string> visualInfoName;
   bool entriesMode = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -558,6 +601,13 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       entriesMode = true;
+    } else if (!std::strcmp(a, "--visual-info")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      const char* n = value(a);
+      if (!n) return usage();
+      target = v;
+      visualInfoName = n;
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
@@ -665,17 +715,19 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!entriesMode) {
+  if (!entriesMode && !visualInfoName) {
     return 0;
   }
 
   // --entries: enumerate interior directory metadata where a proven
   // parser exists (SNI Phase 3C; MTI Phase 3D; MTO Phase 3E; CMI
   // Phase 3F; DTI Phase 3G; FTI/BNI Phase 3H). Never prints payload
-  // bytes.
+  // bytes. --visual-info: metadata-only report for one named record
+  // against the proven BNI image layouts (Phase 4A) — no extraction.
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
-    std::printf("entries:   unsupported for family %s (support: %s) — "
+    std::printf("%s unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
+                visualInfoName ? "visual-info:" : "entries:  ",
                 std::string(mdk::fileFamilyName(family)).c_str(),
                 std::string(mdk::familySupportName(support)).c_str());
     return 1;
@@ -685,6 +737,64 @@ int main(int argc, char** argv) {
   if (!file) {
     std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
     return 1;
+  }
+
+  if (visualInfoName) {
+    if (family != mdk::MdkFileFamily::kBni) {
+      std::printf("visual:    unsupported for family %s — Phase 4A "
+                  "proves BNI image payloads only\n",
+                  std::string(mdk::fileFamilyName(family)).c_str());
+      return 1;
+    }
+    const auto dir = mdk::inspectBniDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    if (dir.status != mdk::BniDirectoryStatus::kOk) {
+      std::printf("bni:       %s — %s\n",
+                  std::string(mdk::bniDirectoryStatusName(dir.status))
+                      .c_str(),
+                  dir.detail.c_str());
+      return 1;
+    }
+    const mdk::BniRecord* rec = mdk::findBniRecord(dir, *visualInfoName);
+    if (!rec) {
+      std::printf("record:    %s — NOT FOUND\n", visualInfoName->c_str());
+      return 1;
+    }
+    std::printf("record:    %s\n", rec->name().c_str());
+    std::printf("span:      [0x%08llx, 0x%08llx) — %llu bytes\n",
+                static_cast<unsigned long long>(rec->payloadFileOffset),
+                static_cast<unsigned long long>(rec->payloadEnd),
+                static_cast<unsigned long long>(rec->payloadSize()));
+    const std::span<const std::byte> payload(
+        file->data() + rec->payloadFileOffset, rec->payloadSize());
+    const auto probe = mdk::probeBniImage(payload);
+    std::printf("shape:     %s\n",
+                std::string(mdk::bniImageShapeName(probe.shape)).c_str());
+    if (probe.shape == mdk::BniImageShape::kOther) {
+      std::printf("           payload does not match a proven image "
+                  "layout\n");
+      return 1;
+    }
+    std::printf("dims:      %dx%d (stride %d, row-major top-down)\n",
+                probe.width, probe.height, probe.width);
+    std::printf("pixels:    %llu indexed bytes @ payload+0x%zx\n",
+                static_cast<unsigned long long>(probe.pixelBytes),
+                probe.headerBytes);
+    if (probe.shape == mdk::BniImageShape::kIndexedOnly) {
+      std::printf("palette:   none embedded — the consumer resolves a "
+                  "separate palette record (not decoded here)\n");
+      return 0;
+    }
+    std::string derr;
+    const auto img = mdk::decodeBniPalettedImage(payload, &derr);
+    if (!img) {
+      std::printf("decode:    FAILED (%s)\n", derr.c_str());
+      return 1;
+    }
+    std::printf("palette:   256 embedded RGB entries (R,G,B order)\n");
+    std::printf("decode:    ok — digest=%016llx\n",
+                static_cast<unsigned long long>(mdk::imageDigest(*img)));
+    return 0;
   }
 
   if (family == mdk::MdkFileFamily::kMti) {

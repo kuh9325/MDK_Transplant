@@ -3,6 +3,7 @@
 
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
+#include "core/bni_image.h"
 #include "core/cmi_directory.h"
 #include "core/compat.h"
 #include "core/container.h"
@@ -11,6 +12,7 @@
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/fti_directory.h"
+#include "core/indexed_image.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
@@ -2329,6 +2331,262 @@ void test_bni_directory() {
   }
 }
 
+// Synthetic palette-embedded BNI image payload (no original data):
+// {u8 rgb[768], u16le w, u16le h, u8 px[w*h]} — the CODE-CORROBORATED
+// MDKOPT-class layout.
+std::vector<std::byte> makePalettedImage(std::uint16_t w,
+                                         std::uint16_t h) {
+  std::vector<std::byte> v(772 + std::size_t(w) * h, std::byte{0});
+  for (int i = 0; i < 256; ++i) {  // deterministic synthetic palette
+    v[i * 3 + 0] = static_cast<std::byte>(i);
+    v[i * 3 + 1] = static_cast<std::byte>(255 - i);
+    v[i * 3 + 2] = static_cast<std::byte>((i * 2) & 0xff);
+  }
+  v[768] = static_cast<std::byte>(w & 0xff);
+  v[769] = static_cast<std::byte>(w >> 8);
+  v[770] = static_cast<std::byte>(h & 0xff);
+  v[771] = static_cast<std::byte>(h >> 8);
+  for (std::size_t i = 772; i < v.size(); ++i) {
+    v[i] = static_cast<std::byte>((i - 772) % 256);  // ramp 0..255
+  }
+  return v;
+}
+
+void test_bni_image() {
+  using mdk::BniImageShape;
+
+  // findBniRecord — bounded ASCII case-insensitive name match on the
+  // NUL-terminated field content.
+  {
+    auto s = SyntheticBni::build({{"KURT", 10}, {"BONESANIM", 6},
+                                  {"RES3", 4}});
+    const auto d = mdk::inspectBniDirectory(s.buf);
+    CHECK(d.status == mdk::BniDirectoryStatus::kOk);
+    CHECK(mdk::findBniRecord(d, "BONESANIM") == &d.records[1]);
+    CHECK(mdk::findBniRecord(d, "bonesanim") == &d.records[1]);
+    CHECK(mdk::findBniRecord(d, "kurt") == &d.records[0]);
+    CHECK(mdk::findBniRecord(d, "KUR") == nullptr);   // prefix only
+    CHECK(mdk::findBniRecord(d, "KURTX") == nullptr); // longer
+    CHECK(mdk::findBniRecord(d, "NOPE") == nullptr);
+    CHECK(mdk::findBniRecord(d, "") == nullptr);
+  }
+
+  // probe shape classification.
+  {
+    const auto pal = makePalettedImage(4, 3);
+    const auto p = mdk::probeBniImage(pal);
+    CHECK(p.shape == BniImageShape::kPaletted);
+    CHECK(p.width == 4 && p.height == 3);
+    CHECK(p.headerBytes == 772 && p.pixelBytes == 12);
+  }
+  {
+    // Indexed-only {u16 w, u16 h, px}: 4+6 for a 3x2.
+    std::vector<std::byte> v(10, std::byte{0});
+    v[0] = std::byte{3};
+    v[2] = std::byte{2};
+    const auto p = mdk::probeBniImage(v);
+    CHECK(p.shape == BniImageShape::kIndexedOnly);
+    CHECK(p.width == 3 && p.height == 2);
+    CHECK(p.headerBytes == 4 && p.pixelBytes == 6);
+  }
+  {
+    const std::array<std::byte, 20> junk = {std::byte{9}};
+    CHECK(mdk::probeBniImage(junk).shape == BniImageShape::kOther);
+    const std::vector<std::byte> empty;
+    CHECK(mdk::probeBniImage(empty).shape == BniImageShape::kOther);
+  }
+
+  // Smallest valid paletted image: 1x1.
+  {
+    const auto pal = makePalettedImage(1, 1);
+    CHECK(pal.size() == 773);
+    const auto img = mdk::decodeBniPalettedImage(pal);
+    CHECK(img.has_value());
+    CHECK(img->width == 1 && img->height == 1 && img->stride == 1);
+    CHECK(img->pixels.size() == 1 && img->pixels[0] == 0);
+    CHECK(img->hasPalette);
+    CHECK(img->palette[0].r == 0 && img->palette[0].g == 255 &&
+          img->palette[0].b == 0);
+    CHECK(img->palette[255].r == 255 && img->palette[255].g == 0 &&
+          img->palette[255].b == 254);
+  }
+
+  // Ordinary dimensions + exact pixel/palette preservation. The pixel
+  // ramp exercises all 256 indices — every one resolves through the
+  // embedded 256-entry palette.
+  {
+    const auto pal = makePalettedImage(7, 5);
+    const auto img = mdk::decodeBniPalettedImage(pal);
+    CHECK(img.has_value());
+    CHECK(img->width == 7 && img->height == 5);
+    CHECK(img->pixels.size() == 35);
+    for (std::size_t i = 0; i < 35; ++i) {
+      CHECK(img->pixels[i] == static_cast<std::uint8_t>(i % 256));
+    }
+    CHECK(img->palette[42].r == 42 && img->palette[42].g == 213 &&
+          img->palette[42].b == 84);
+  }
+
+  // Row-major top-down orientation: pixels[y*w+x] == payload
+  // [772 + y*w + x]; verified again through the framebuffer blit.
+  {
+    auto pal = makePalettedImage(4, 2);
+    pal[772 + 1 * 4 + 2] = std::byte{0xab};  // row 1, col 2
+    const auto img = mdk::decodeBniPalettedImage(pal);
+    CHECK(img->pixels[1 * 4 + 2] == 0xab);
+    CHECK(img->pixels[2] == 2);  // row 0 col 2 = ramp value
+  }
+
+  // Truncation: any payload shorter than the exact tiling is refused.
+  {
+    auto pal = makePalettedImage(4, 3);
+    pal.pop_back();
+    CHECK(!mdk::decodeBniPalettedImage(pal).has_value());
+    const std::vector<std::byte> headOnly(pal.begin(),
+                                          pal.begin() + 771);
+    CHECK(!mdk::decodeBniPalettedImage(headOnly).has_value());
+    const std::vector<std::byte> palOnly(pal.begin(),
+                                         pal.begin() + 768);
+    CHECK(!mdk::decodeBniPalettedImage(palOnly).has_value());
+  }
+
+  // Trailing slack: a payload larger than the exact tiling is refused
+  // — no silent truncation.
+  {
+    auto pal = makePalettedImage(4, 3);
+    pal.push_back(std::byte{0});
+    CHECK(!mdk::decodeBniPalettedImage(pal).has_value());
+  }
+
+  // Zero dimensions are malformed.
+  {
+    auto pal = makePalettedImage(0, 3);
+    pal.resize(772);  // size must match 772+0 to isolate the w==0 rule
+    CHECK(!mdk::decodeBniPalettedImage(pal).has_value());
+    auto pal2 = makePalettedImage(3, 0);
+    pal2.resize(772);
+    CHECK(!mdk::decodeBniPalettedImage(pal2).has_value());
+  }
+
+  // Declared dimensions escaping the payload: no overflow, no read
+  // outside the span.
+  {
+    auto pal = makePalettedImage(4, 3);
+    pal[768] = std::byte{0xff};  // w = 0x03ff
+    pal[769] = std::byte{0x03};
+    CHECK(!mdk::decodeBniPalettedImage(pal).has_value());
+    auto big = makePalettedImage(4, 3);
+    big[768] = std::byte{0xff};  // w = h = 65535 -> w*h ~ 4.3e9
+    big[769] = std::byte{0xff};
+    big[770] = std::byte{0xff};
+    big[771] = std::byte{0xff};
+    CHECK(!mdk::decodeBniPalettedImage(big).has_value());
+  }
+
+  // The paletted decoder refuses the indexed-only layout (and vice
+  // versa via the probe) — layout confusion must not decode.
+  {
+    std::vector<std::byte> v(10, std::byte{0});
+    v[0] = std::byte{3};
+    v[2] = std::byte{2};
+    std::string err;
+    CHECK(!mdk::decodeBniPalettedImage(v, &err).has_value());
+    CHECK(!err.empty());
+  }
+
+  // Deterministic digest: same payload -> same digest; one changed
+  // pixel or palette byte -> different digest.
+  {
+    const auto a = mdk::decodeBniPalettedImage(makePalettedImage(8, 4));
+    const auto b = mdk::decodeBniPalettedImage(makePalettedImage(8, 4));
+    CHECK(a && b);
+    CHECK(mdk::imageDigest(*a) == mdk::imageDigest(*b));
+    auto c = *b;
+    c.pixels[0] ^= 0x01;
+    CHECK(mdk::imageDigest(*a) != mdk::imageDigest(c));
+    auto d = *b;
+    d.palette[0].r ^= 0x01;
+    CHECK(mdk::imageDigest(*a) != mdk::imageDigest(d));
+  }
+}
+
+void test_indexed_image_blit() {
+  // Centered 1:1 placement inside the 600x360 work surface.
+  {
+    const auto pal = makePalettedImage(4, 2);
+    const auto img = mdk::decodeBniPalettedImage(pal);
+    CHECK(img.has_value());
+    mdk::IndexedFramebuffer fb(600, 360);
+    fb.clear(0);
+    mdk::Palette palette;
+    mdk::blitIndexedImage(*img, fb, palette);
+    const int ox = (600 - 4) / 2, oy = (360 - 2) / 2;
+    CHECK(fb.at(ox, oy) == 0);                 // image (0,0)
+    CHECK(fb.at(ox + 3, oy + 1) == 7);         // image (3,1)
+    CHECK(fb.at(0, 0) == 0);                   // outside stays 0
+    CHECK(fb.at(ox - 1, oy) == 0);
+    const auto c = palette.get(42);
+    CHECK(c.r == 42 && c.g == 213 && c.b == 84 && c.a == 255);
+  }
+
+  // Exact-fit image fills the whole surface (the MDKOPT 600x360 case
+  // — no border pixels remain).
+  {
+    const auto pal = makePalettedImage(600, 360);
+    const auto img = mdk::decodeBniPalettedImage(pal);
+    CHECK(img.has_value());
+    mdk::IndexedFramebuffer fb(600, 360);
+    fb.clear(0xaa);
+    mdk::Palette palette;
+    mdk::blitIndexedImage(*img, fb, palette);
+    CHECK(fb.at(0, 0) == 0);
+    CHECK(fb.at(599, 359) == 191);  // (216000-1) % 256
+    CHECK(fb.at(300, 180) == static_cast<std::uint8_t>(
+                              (180 * 600 + 300) % 256));
+  }
+
+  // Oversized image: uniform nearest-neighbor downscale, centered.
+  // 4x4 into 8x4: height-bound -> drawn 4x4 at ox=2 (identity rows).
+  {
+    mdk::IndexedImage img;
+    img.width = 4;
+    img.height = 4;
+    img.stride = 4;
+    img.pixels = {0, 0, 0, 0,
+                  0, 9, 9, 0,
+                  0, 9, 9, 0,
+                  0, 0, 0, 0};
+    mdk::IndexedFramebuffer fb(8, 4);
+    fb.clear(0xee);
+    mdk::Palette palette;
+    mdk::blitIndexedImage(img, fb, palette);
+    CHECK(fb.at(2, 1) == 0);
+    CHECK(fb.at(3, 1) == 9);
+    CHECK(fb.at(4, 1) == 9);
+    CHECK(fb.at(5, 1) == 0);
+    CHECK(fb.at(0, 0) == 0xee);  // untouched border
+    CHECK(!img.hasPalette);      // no palette -> palette untouched
+    CHECK(palette.get(0).r == 0 && palette.get(0).a == 255);
+  }
+
+  // 8x4 into 4x2: exact 2:1 nearest resample — fb(x,y) == img(2x,2y).
+  {
+    mdk::IndexedImage img;
+    img.width = 8;
+    img.height = 4;
+    img.stride = 8;
+    img.pixels.assign(32, 0);
+    img.pixels[2 * 8 + 2] = 9;  // img(2,2) -> fb(1,1)
+    img.pixels[1 * 8 + 7] = 5;  // img(7,1) — odd coords, never sampled
+    mdk::IndexedFramebuffer fb(4, 2);
+    fb.clear(0xee);
+    mdk::Palette palette;
+    mdk::blitIndexedImage(img, fb, palette);
+    CHECK(fb.at(1, 1) == 9);
+    CHECK(fb.at(0, 0) == 0 && fb.at(3, 0) == 0 && fb.at(3, 1) == 0);
+  }
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
@@ -2528,6 +2786,8 @@ int main() {
   test_dti_structure();
   test_fti_directory();
   test_bni_directory();
+  test_bni_image();
+  test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();
   test_input_state();

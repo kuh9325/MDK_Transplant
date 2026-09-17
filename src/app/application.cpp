@@ -1,10 +1,14 @@
 #include "app/application.h"
 
 #include "app/diagnostic_scene.h"
+#include "core/bni_directory.h"
+#include "core/bni_image.h"
 #include "core/clock.h"
 #include "core/compat.h"
 #include "core/data_root.h"
+#include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/indexed_image.h"
 #include "core/log.h"
 #include "core/mode_dispatch.h"
 #include "input/input_state.h"
@@ -21,6 +25,52 @@
 namespace mdk {
 
 static constexpr const char* kTag = "app";
+
+// Read cap for --preview-resource source files — far above the
+// largest BNI bundle in BUILD_A (~2.5 MB) while staying a sane bound.
+static constexpr std::size_t kPreviewMaxBytes = 512ull * 1024 * 1024;
+
+// Load + decode the --preview-resource target: DataRoot -> BNI
+// directory -> named record -> paletted-bitmap decoder. Fills `err`
+// and returns nullopt on any failure.
+static std::optional<IndexedImage> loadPreviewImage(
+    DataRoot& root, const std::string& relFile, const std::string& name,
+    std::string* err) {
+  if (fileFamilyForPath(relFile) != MdkFileFamily::kBni) {
+    *err = "preview supports BNI resources only (Phase 4A decoder "
+           "coverage): " + relFile;
+    return std::nullopt;
+  }
+  const auto file = root.readFile(relFile, kPreviewMaxBytes, err);
+  if (!file) {
+    return std::nullopt;
+  }
+  const auto dir = inspectBniDirectory(
+      std::span<const std::byte>(file->data(), file->size()));
+  if (dir.status != BniDirectoryStatus::kOk) {
+    *err = "BNI directory: " +
+           std::string(bniDirectoryStatusName(dir.status)) + " — " +
+           dir.detail;
+    return std::nullopt;
+  }
+  const BniRecord* rec = findBniRecord(dir, name);
+  if (!rec) {
+    *err = "record not found: " + name;
+    return std::nullopt;
+  }
+  const std::span<const std::byte> payload(
+      file->data() + rec->payloadFileOffset, rec->payloadSize());
+  auto img = decodeBniPalettedImage(payload, err);
+  if (img) {
+    log::info(kTag, "preview: %s %s — %dx%d indexed, %llu pixel bytes, "
+              "256-entry embedded palette, digest=%016llx",
+              relFile.c_str(), rec->name().c_str(), img->width,
+              img->height,
+              static_cast<unsigned long long>(img->pixels.size()),
+              static_cast<unsigned long long>(imageDigest(*img)));
+  }
+  return img;
+}
 
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
@@ -70,7 +120,29 @@ int Application::run() {
   IndexedFramebuffer fb(compat::kWorkWidth, compat::kWorkHeight);
   Palette palette;
   DiagnosticScene scene;
-  scene.buildPalette(palette);
+
+  // Phase 4A preview mode: one proven original visual resource
+  // decoded into the indexed framebuffer, then presented unchanged
+  // every frame. The synthetic diagnostic scene stays the default
+  // when no preview is requested.
+  const bool previewMode = cfg_.previewFile.has_value();
+  if (previewMode) {
+    if (!dataRoot) {
+      log::error(kTag, "--preview-resource requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    auto img = loadPreviewImage(*dataRoot, *cfg_.previewFile,
+                                cfg_.previewRecord.value_or(""), &perr);
+    if (!img) {
+      log::error(kTag, "preview failed: %s", perr.c_str());
+      return 2;
+    }
+    fb.clear(0);
+    blitIndexedImage(*img, fb, palette);
+  } else {
+    scene.buildPalette(palette);
+  }
 
   InputState input;
   Clock clock;
@@ -109,7 +181,11 @@ int Application::run() {
 
     dispatcher.dispatch({t.index, t.dtSeconds, t.elapsedSeconds});
 
-    scene.render(fb, palette);
+    // Preview frames are static: the decoded image was blitted once
+    // before the loop; the diagnostic scene owns rendering otherwise.
+    if (!previewMode) {
+      scene.render(fb, palette);
+    }
     if (!presenter->present(fb, palette)) {
       log::warn(kTag, "present failed (frame %llu)",
                 static_cast<unsigned long long>(t.index));
@@ -181,6 +257,13 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       const char* v = needValue(a);
       if (!v) return false;
       cfg.frames = std::strtoull(v, nullptr, 10);
+    } else if (!std::strcmp(a, "--preview-resource")) {
+      const char* f = needValue(a);
+      if (!f) return false;
+      const char* r = needValue(a);
+      if (!r) return false;
+      cfg.previewFile = f;
+      cfg.previewRecord = r;
     } else if (!std::strcmp(a, "--selftest")) {
       cfg.selftest = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {

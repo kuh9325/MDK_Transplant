@@ -946,6 +946,28 @@ Verdict: **shared outer envelope + shared addressing convention only**;
 the interior layouts are distinct and implemented as two separate
 parsers (`src/core/fti_directory.*`, `src/core/bni_directory.*`).
 
+### Proven BNI image payloads (Phase 4A)
+
+Two payload layouts are CODE-CORROBORATED inside BNI records:
+
+- **Palette-embedded bitmap** `{u8 rgb[768], u16le w, u16le h,
+  u8 px[w*h]}` — the `MDKOPT`/`L1_INTRM`/`L1..L5_MAP` class. The
+  consumer derives the pixel pointer as payload+0x304
+  (`FUN_0041d7b4`, `FUN_0041ebf4`), blits `w*h` bytes verbatim into
+  the 600x360 work surface, and uploads the 768-byte head as the
+  256-entry display palette (`FUN_00416700` → `FUN_0046d208` →
+  `IDirectDrawPalette::SetEntries`; `PALETTEENTRY` order proves the
+  file triplets are R,G,B). Rows are top-down, stride = width, no
+  transparency. All four observed payloads are 600x360 and tile
+  exactly. Decoded by `src/core/bni_image.*`.
+- **Indexed-only bitmap** `{u16le w, u16le h, u8 px[w*h]}` —
+  `FUN_00403a00` reads the two head u16s and returns payload+4 plus
+  the `w*h` count. OBSERVED byte-exact in `BG`, `SPACE`, `PLANET`,
+  `MOON`, `EARTH`, `SKULL` (and `TRAVSPRT` `SKULL`). The palette is
+  resolved by the consumer context (separate `PAL` records) — that
+  binding is not yet proven, so this shape is classified by
+  `probeBniImage` but has no decoder yet.
+
 ## Unknown fields
 
 ## Unknown fields
@@ -1012,9 +1034,11 @@ parsers (`src/core/fti_directory.*`, `src/core/bni_directory.*`).
   encode beyond name matching is UNKNOWN.
 - The expansion of "FTI": UNKNOWN — the subsystem diagnostic says
   "Font table", which describes the bundle's role, not the acronym.
-- BNI payload interiors (all records): UNKNOWN — bounded only;
-  payload-head u16 fields are read by FUN_004039d8/9ec/a00 lookup
-  variants but their semantics are UNKNOWN.
+- BNI payload interiors (records outside the image classes): UNKNOWN —
+  bounded only. Two image layouts are proven (Phase 4A, above);
+  payload-head u16 fields read by FUN_004039d8/9ec/a00 belong to the
+  `{u16 w, u16 h, px}` bitmap family — `FUN_00403a00`'s semantics are
+  now proven; the other lookup variants' consumers remain UNKNOWN.
 - The expansion of "BNI": UNKNOWN — no original string names it.
 - Whether FTI/BNI payloads carry trailing slack inside their spans:
   UNKNOWN — spans are inferred from the next stored offset; no stored
@@ -1054,8 +1078,10 @@ its proven u16 header, to MTO block contents past the proven region
 boundaries, to the CMI data region past its proven target-head shape,
 or to DTI sub-record payload fields past the proven type dispatch
 (the renderer-side field meanings for types 1/3/5/7/8/9 are not
-decoded); nothing in FTI/BNI payload interiors is decoded. The parsers
-enumerate boundaries — they never interpret or dump payload bytes.
+decoded); nothing in FTI payload interiors and nothing in BNI payload
+interiors outside the two proven image layouts (Phase 4A, above) is
+decoded. The parsers enumerate boundaries — they never interpret or
+dump payload bytes.
 
 ## Next targets (Phase 4 candidates, not started)
 
@@ -1075,9 +1101,9 @@ enumerate boundaries — they never interpret or dump payload bytes.
 6. MTO region semantics — what the embedded `.MAT` images, region-A
    arrays, and region-C arrays drive at load time (consumer-side
    tracing beyond the proven directory structure).
-7. FTI/BNI payload interiors — the directories are enumerable but
-   payload organization is UNKNOWN (candidate entry points: the
-   `FONTSML`/`FONTBIG` font consumers for FTI; `FUN_004039d8`-family
-   payload-head readers for BNI).
+7. FTI/BNI payload interiors — partially resolved in Phase 4A: the two
+   BNI image layouts are proven and decoded. Still UNKNOWN: all FTI
+   payload organization (candidate entry points: the `FONTSML`/
+   `FONTBIG` font consumers) and non-image BNI records.
 8. `.LBB` structure — the only BUILD_A data family with no proven
    envelope (separate later analysis).
