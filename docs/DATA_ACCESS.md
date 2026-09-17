@@ -140,7 +140,7 @@ logical name, stem-match, and the raw second u32 @16 (uninterpreted).
 `mdk-inspect --data-path DIR --entries <rel-path>` additionally reads
 the whole file (bounded) and enumerates the interior directory where a
 proven parser exists — `.SNI` (Phase 3C), `.MTI` (Phase 3D), `.MTO`
-(Phase 3E) and `.CMI` (Phase 3F):
+(Phase 3E), `.CMI` (Phase 3F) and `.DTI` (Phase 3G):
 entry count, directory end, trailer status, and per-record metadata.
 For `.SNI`: name/raw field/blob offset/resolved file offset/size;
 sentinel records (`field==size==0xffffffff`) are reported as position
@@ -156,11 +156,18 @@ overlay-sound records). For `.CMI`: the four counted variable-length
 tables (count field offset, records range, per-record offset/name/
 raw value/resolved file offset), and the bounded data-region span —
 record values are reported as image-relative offsets (image = file+4)
-without interpreting their targets. Families without a proven
+without interpreting their targets. For `.DTI`: the five-section TOC
+(image-relative offsets), the s0 parameter words, s1 keyed records,
+the s2 arena table (name[8], payload offset, scalar, and the
+enumerated 36-byte typed sub-records), the s3 palette count/span, and
+the s4 grid plane geometry — `--entries` is the generic
+metadata-inspection verb here even though `.DTI` is a sectioned
+bundle rather than a flat name directory. Families without a proven
 interior parser are rejected with the support level — never guessed.
 `--selftest` runs synthetic envelope + SNI- + MTI- + MTO- +
-CMI-directory checks. Links `mdk_core` — the same code the app uses.
-Never prints payload bytes; never writes into the data root.
+CMI-directory + DTI-structure checks. Links `mdk_core` — the same
+code the app uses. Never prints payload bytes; never writes into the
+data root.
 
 ## Validation performed (BUILD_A, read-only)
 
@@ -222,10 +229,21 @@ Phase 3F additions (all via `mdk-inspect --entries`, read-only):
   and reject `--entries`; `.SNI/.MTI/.MTO` keep their own parsers.
 - Manifest re-verified after Phase 3F inspection: 141/141 unchanged.
 
+Phase 3G additions (all via `mdk-inspect --entries`, read-only):
+
+- All 6 `.DTI` files in BUILD_A enumerate `ok` — five image-relative
+  TOC offsets @0x14 each, tiling params (0x74 bytes) / 10 keyed
+  records / 19 arena records (+ tiled `{count, count×36B}` payloads;
+  633 sub-records corpus-wide, types 1–9 observed) / palette
+  ({u32 count, 768-byte RGB table}) / grid planes
+  (`(cols+4)×rows` bytes per plane, 1 or 2 planes per the s0 flag).
+- `.FTI/.BNI/.LBB` correctly remain `envelope-only`/`unsupported`
+  and reject `--entries`; `.SNI/.MTI/.MTO/.CMI` keep their own
+  parsers.
+- Manifest re-verified after Phase 3G inspection: 141/141 unchanged.
+
 ## Explicit unknowns (not implemented)
 
-- Interior structure of `.DTI` (shape observations
-  recorded in `DATA_FORMATS.md`; not decoded).
 - `.CMI` data-region interior (≈99.9% of each file): the record
   values' targets and the region's own organization — bounded only.
   CMI table[0]'s consumer and the semantic role of each table past
@@ -239,6 +257,10 @@ Phase 3F additions (all via `mdk-inspect --entries`, read-only):
 - `.SNI` payload contents (mostly RIFF/WAVE by byte inspection — not
   decoded), the record `+0x0c` field, and the `K_*` sentinel records'
   marked regions.
+- `.DTI` field semantics past the proven structure: s0 word meanings,
+  the s1 key space, the s2 `+0x0c` scalar, and sub-record types
+  1/3/5/7/8/9 (only HotGen/HotPick/connect are proven — see
+  DATA_FORMATS.md).
 - Semantics of the u32@16 field (equals size−12 == trailer offset in
   all tagged files; never read by the SNI loader) and the 12-byte
   trailer itself.

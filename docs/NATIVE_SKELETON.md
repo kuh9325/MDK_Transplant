@@ -165,9 +165,9 @@ uploaded to Metal).
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
 - The app loads no original data at runtime; metadata-only interior
-  parsers for `.SNI/.MTI/.MTO/.CMI` exist in `mdk_core`/`mdk-inspect`
-  (Phases 3C–3F) but the skeleton scene does not consume them.
-  `.DTI/.FTI/.BNI/.LBB/.SAV/.FLC/.MVE` remain unparsed.
+  parsers for `.SNI/.MTI/.MTO/.CMI/.DTI` exist in `mdk_core`/
+  `mdk-inspect` (Phases 3C–3G) but the skeleton scene does not consume
+  them. `.FTI/.BNI/.LBB/.SAV/.FLC/.MVE` remain unparsed.
 - Original 600x360→640x480 image offset UNKNOWN (currently centered).
 - Window-close quit and resize were code-verified; physical
   keyboard/mouse input could not be host-injected on this machine (TCC),

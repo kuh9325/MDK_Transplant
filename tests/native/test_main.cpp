@@ -6,6 +6,7 @@
 #include "core/compat.h"
 #include "core/container.h"
 #include "core/data_root.h"
+#include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/mode_dispatch.h"
@@ -15,6 +16,7 @@
 #include "core/viewport.h"
 #include "input/input_state.h"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -284,7 +287,7 @@ void test_file_family() {
   CHECK(fileFamilyForPath("a.SNI.bak") == MdkFileFamily::kUnknown);
 
   // Support levels (Phase 3C: SNI; Phase 3D: MTI; Phase 3E: MTO;
-  // Phase 3F: CMI).
+  // Phase 3F: CMI; Phase 3G: DTI).
   CHECK(fileFamilySupport(MdkFileFamily::kSni) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kMti) ==
@@ -294,7 +297,7 @@ void test_file_family() {
   CHECK(fileFamilySupport(MdkFileFamily::kCmi) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kDti) ==
-        FamilySupport::kEnvelopeOnly);
+        FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kFti) ==
         FamilySupport::kEnvelopeOnly);
   CHECK(fileFamilySupport(MdkFileFamily::kBni) ==
@@ -1590,6 +1593,395 @@ void test_cmi_directory() {
   }
 }
 
+// Synthetic DTI builder (no original data). Layout mirrors the proven
+// structure: tagged envelope + five-entry image-relative TOC @0x14 +
+// s0 params (29 u32s) + s1 keyed records + s2 arena table with tiled
+// payloads + s3 palette + s4 grid + name trailer.
+struct SyntheticDti {
+  std::vector<std::byte> buf;
+  std::uint64_t s0File = 0, s1File = 0, s2File = 0, s3File = 0,
+                s4File = 0, trailerFile = 0;
+  std::vector<std::uint64_t> arenaRecFileOffs;
+  std::vector<std::uint64_t> arenaPayloadFileOffs;
+  std::vector<std::uint64_t> keyedFileOffs;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 12) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+  static std::uint32_t f32bits(float f) {
+    std::uint32_t v;
+    std::memcpy(&v, &f, 4);
+    return v;
+  }
+
+  struct Sub {                       // one 36-byte payload record
+    std::uint32_t type;
+    std::array<std::uint32_t, 8> fields;
+  };
+  struct Arena {                     // one s2 record
+    const char* name;                // <=8 chars, NUL-padded
+    float scalar;
+    std::vector<Sub> subs;
+  };
+
+  // tocOrder: section file order is always s0,s1,s2,s3,s4 — the TOC
+  // stores image offsets; `gridRows`/`gridCols`/`altFillA` drive s0's
+  // proven fields and the s4 plane size.
+  static SyntheticDti build(
+      const char* logicalName,
+      std::vector<std::pair<std::uint32_t, std::uint32_t>>
+          keyed,  // (word0, key) — floats zeroed
+      std::vector<Arena> arenas,
+      std::uint32_t paletteCount, std::uint32_t gridCols,
+      std::uint32_t gridRows, std::uint32_t altFillA,
+      bool dualPlane) {
+    SyntheticDti s;
+    // Section sizes (file bytes):
+    const std::uint64_t s0Bytes = 0x74;
+    const std::uint64_t s1Bytes = 4 + keyed.size() * 24;
+    std::uint64_t s2Bytes = 4 + arenas.size() * 16;
+    for (const auto& a : arenas)
+      s2Bytes += 4 + a.subs.size() * 36;
+    const std::uint64_t s3Bytes = 4 + 768;
+    const std::uint64_t planeBytes =
+        (static_cast<std::uint64_t>(gridCols) + 4) * gridRows;
+    const std::uint64_t s4Bytes = planeBytes * (dualPlane ? 2 : 1);
+
+    s.s0File = 0x28;
+    s.s1File = s.s0File + s0Bytes;
+    s.s2File = s.s1File + s1Bytes;
+    s.s3File = s.s2File + s2Bytes;
+    s.s4File = s.s3File + s3Bytes;
+    s.trailerFile = s.s4File + s4Bytes;
+    const std::uint64_t total = s.trailerFile + 12;
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.putName(0x04, logicalName);
+    s.put32(0x10, static_cast<std::uint32_t>(total - 12));
+    // TOC image offsets = file - 4.
+    s.put32(0x14, static_cast<std::uint32_t>(s.s0File - 4));
+    s.put32(0x18, static_cast<std::uint32_t>(s.s1File - 4));
+    s.put32(0x1c, static_cast<std::uint32_t>(s.s2File - 4));
+    s.put32(0x20, static_cast<std::uint32_t>(s.s3File - 4));
+    s.put32(0x24, static_cast<std::uint32_t>(s.s4File - 4));
+
+    // s0: only proven-read fields populated.
+    s.put32(static_cast<std::size_t>(s.s0File + 9 * 4), gridCols);
+    s.put32(static_cast<std::size_t>(s.s0File + 10 * 4), gridRows);
+    s.put32(static_cast<std::size_t>(s.s0File + 0x0b * 4), altFillA);
+
+    // s1 records: {word0, key, f32 x4 = 0}
+    s.put32(static_cast<std::size_t>(s.s1File),
+            static_cast<std::uint32_t>(keyed.size()));
+    for (std::size_t i = 0; i < keyed.size(); ++i) {
+      const std::uint64_t rp = s.s1File + 4 + i * 24;
+      s.keyedFileOffs.push_back(rp);
+      s.put32(static_cast<std::size_t>(rp), keyed[i].first);
+      s.put32(static_cast<std::size_t>(rp + 4), keyed[i].second);
+    }
+
+    // s2: count + 16-byte records + tiled payloads.
+    s.put32(static_cast<std::size_t>(s.s2File),
+            static_cast<std::uint32_t>(arenas.size()));
+    std::uint64_t pay = s.s2File + 4 + arenas.size() * 16;
+    for (std::size_t i = 0; i < arenas.size(); ++i) {
+      const std::uint64_t rp = s.s2File + 4 + i * 16;
+      s.arenaRecFileOffs.push_back(rp);
+      s.putName(static_cast<std::size_t>(rp), arenas[i].name, 8);
+      s.put32(static_cast<std::size_t>(rp + 8),
+              static_cast<std::uint32_t>(pay - 4));
+      s.put32(static_cast<std::size_t>(rp + 12),
+              f32bits(arenas[i].scalar));
+      s.arenaPayloadFileOffs.push_back(pay);
+      s.put32(static_cast<std::size_t>(pay),
+              static_cast<std::uint32_t>(arenas[i].subs.size()));
+      for (std::size_t j = 0; j < arenas[i].subs.size(); ++j) {
+        const std::uint64_t sp = pay + 4 + j * 36;
+        s.put32(static_cast<std::size_t>(sp), arenas[i].subs[j].type);
+        for (std::size_t f = 0; f < 8; ++f)
+          s.put32(static_cast<std::size_t>(sp + 4 + f * 4),
+                  arenas[i].subs[j].fields[f]);
+      }
+      pay += 4 + arenas[i].subs.size() * 36;
+    }
+
+    s.put32(static_cast<std::size_t>(s.s3File), paletteCount);
+    s.putName(static_cast<std::size_t>(s.trailerFile), logicalName);
+    return s;
+  }
+};
+
+void test_dti_structure() {
+  using mdk::DtiStructureStatus;
+  using mdk::inspectDtiStructure;
+
+  // Valid file: all sections populated; arena payload tiles inside s2.
+  {
+    auto s = SyntheticDti::build(
+        "TEST.DAT",
+        {{1, 0}, {2, 1}},
+        {{"ARENA_1", 4.0f,
+          {{6, {1000, 1, SyntheticDti::f32bits(1.0f),
+                SyntheticDti::f32bits(2.0f), SyntheticDti::f32bits(3.0f),
+                SyntheticDti::f32bits(4.0f), SyntheticDti::f32bits(5.0f),
+                SyntheticDti::f32bits(6.0f)}},
+           {2, {9, 0, 0, 0, 0, 0x534758, 0, 0}}}},  // "XGS" @0x18
+         {"CARENA_2", -8.0f, {}}},
+        0x70, 8, 4, 0xffffffff, false);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOk);
+    CHECK(d.tocImageOffsets[0] == 0x24);
+    CHECK(d.sections[0].fileStart == 0x28);
+    CHECK(d.sections[0].fileEnd == s.s1File);
+    CHECK(d.params[9] == 8 && d.params[10] == 4);
+    CHECK(d.keyedRecords.size() == 2);
+    CHECK(d.keyedRecords[0].word0 == 1 && d.keyedRecords[0].key == 0);
+    CHECK(d.keyedRecords[1].fileOffset == s.keyedFileOffs[1]);
+    CHECK(d.arenas.size() == 2);
+    CHECK(d.arenas[0].name() == "ARENA_1");
+    CHECK(d.arenas[0].nameEndsWithTerminator);
+    CHECK(d.arenas[0].payloadFileOffset ==
+          s.arenaPayloadFileOffs[0]);
+    CHECK(d.arenas[0].scalar() == 4.0f);
+    CHECK(d.arenas[0].subRecords.size() == 2);
+    CHECK(d.arenas[0].subRecords[0].type == 6);
+    CHECK(d.arenas[0].subRecords[0].fields[0] == 1000);
+    CHECK(d.arenas[0].subRecords[0].fields[1] == 1);
+    CHECK(d.arenas[0].subRecords[0].fieldAsFloat(2) == 1.0f);
+    CHECK(d.arenas[0].subRecords[1].type == 2);
+    CHECK(d.arenas[0].subRecords[1].name18() == "XGS");
+    CHECK(d.arenas[1].subRecords.empty());
+    CHECK(d.arenas[1].subRecordCount == 0);
+    CHECK(d.s2PayloadRegionStart == s.arenaPayloadFileOffs[0]);
+    CHECK(d.paletteCount == 0x70);
+    CHECK(d.paletteBytes.size() == 768);
+    CHECK(d.gridPlaneSize == 48 && d.gridPlaneCount == 1);
+    CHECK(d.sections[4].fileEnd == s.trailerFile);
+    CHECK(d.s1TrailingBytes == 0 && d.s3TrailingBytes == 0 &&
+          d.s4TrailingBytes == 0);
+    CHECK(d.trailerPresent && d.secondaryEqualsTrailerOffset);
+  }
+
+  // Dual-plane variant: altFillA > 0 (signed) → s4 holds two planes.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x40, 10, 5, 0x30,
+                                 true);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOk);
+    CHECK(d.gridPlaneCount == 2);
+    CHECK(d.gridPlaneSize == 14 * 5);
+    CHECK(d.sections[4].size() == 14 * 5 * 2);
+  }
+
+  // Zero-count sections: minimal valid interior (s1/s2 empty, arenas
+  // empty) — legal; counts are u32, zero is a valid count.
+  {
+    auto s = SyntheticDti::build("EMPTY.DAT", {}, {}, 0, 4, 2,
+                                 0xffffffff, false);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOk);
+    CHECK(d.keyedRecords.empty() && d.arenas.empty());
+    CHECK(d.sections[1].size() == 4 && d.sections[2].size() == 4);
+    CHECK(d.gridPlaneCount == 1 && d.gridPlaneSize == 16);
+  }
+
+  // Non-monotonic TOC: toc[2] < toc[1] → section bound fails.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    s.put32(0x1c, 0x10);  // s2 offset before s1
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kSectionOutOfBounds);
+    CHECK(d.badSection == 2);
+  }
+
+  // TOC entry past the image end → section bound fails.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    s.put32(0x20, static_cast<std::uint32_t>(s.buf.size()));  // s3
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kSectionOutOfBounds);
+    CHECK(d.badSection == 3);
+  }
+
+  // TOC entry inside the TOC itself (image < 0x24) → rejected.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    s.put32(0x14, 0x10);  // toc[0] inside the TOC
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kSectionOutOfBounds);
+    CHECK(d.badSection == 0);
+  }
+
+  // s0 span too small for the 29 proven words.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    // Move s1's TOC entry to s0File+0x40: s0 shrinks to 0x40 < 0x74
+    // while the ordering stays monotonic (0x24 < 0x64 < s2..s4).
+    s.put32(0x18, static_cast<std::uint32_t>(s.s0File - 4 + 0x40));
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kSectionOutOfBounds);
+    CHECK(d.badSection == 0);
+  }
+
+  // s1 count inflated past its section → record bound fails.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {{1, 0}}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    s.put32(static_cast<std::size_t>(s.s1File), 0x400);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kRecordOutOfBounds);
+    CHECK(d.badSection == 1);
+  }
+
+  // s2 count inflated → record bound fails.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {},
+                                 {{"A", 1.0f, {}}},
+                                 0x10, 8, 4, 0xffffffff, false);
+    s.put32(static_cast<std::size_t>(s.s2File), 0x400);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kRecordOutOfBounds);
+    CHECK(d.badSection == 2);
+  }
+
+  // Arena payload offset before the payload region (into the name
+  // table) → offset bound fails (native hardening).
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {},
+                                 {{"A", 1.0f, {}}},
+                                 0x10, 8, 4, 0xffffffff, false);
+    s.put32(static_cast<std::size_t>(s.arenaRecFileOffs[0] + 8),
+            static_cast<std::uint32_t>(s.s2File - 4));  // -> s2 count
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOffsetOutOfBounds);
+    CHECK(d.badSection == 2 && d.badRecord == 0);
+  }
+
+  // Arena payload offset past s2's end → offset bound fails.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {},
+                                 {{"A", 1.0f, {}}},
+                                 0x10, 8, 4, 0xffffffff, false);
+    s.put32(static_cast<std::size_t>(s.arenaRecFileOffs[0] + 8),
+            static_cast<std::uint32_t>(s.s3File - 4));  // -> s3 start
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOffsetOutOfBounds);
+    CHECK(d.badSection == 2 && d.badRecord == 0);
+  }
+
+  // Payload sub-record count inflated → record bound fails inside s2.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {},
+                                 {{"A", 1.0f,
+                                   {{1, {0, 0, 0, 0, 0, 0, 0, 0}}}}},
+                                 0x10, 8, 4, 0xffffffff, false);
+    s.put32(static_cast<std::size_t>(s.arenaPayloadFileOffs[0]),
+            0x1000);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kRecordOutOfBounds);
+    CHECK(d.badSection == 2 && d.badRecord == 0);
+  }
+
+  // s3 span too small for count + 768 palette bytes: shrink s3 by
+  // moving toc[4] earlier (still monotonic, still ≥ s3 start).
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    s.put32(0x24, static_cast<std::uint32_t>(s.s3File - 4 + 0x200));
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kSectionOutOfBounds);
+    CHECK(d.badSection == 3);
+  }
+
+  // s4 smaller than grid-derived plane size → section bound fails.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    // grid 8x4 needs 48 bytes; shrink the file's s4 span to 32 by
+    // truncating before the trailer (rebuild envelope for new size).
+    const std::uint64_t newTotal = s.s4File + 32 + 12;
+    s.buf.resize(static_cast<std::size_t>(newTotal));
+    s.put32(0x00, static_cast<std::uint32_t>(newTotal - 4));
+    s.put32(0x10, static_cast<std::uint32_t>(newTotal - 12));
+    s.putName(static_cast<std::size_t>(newTotal - 12), "TEST.DAT");
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kSectionOutOfBounds);
+    CHECK(d.badSection == 4);
+  }
+
+  // Missing trailer → interior extends to EOF; s4 must still hold the
+  // proven planes (the last bytes become grid, not trailer).
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    for (std::size_t i = s.buf.size() - 12; i < s.buf.size(); ++i)
+      s.buf[i] = std::byte{'X'};
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOk);
+    CHECK(!d.trailerPresent);
+    CHECK(d.sections[4].fileEnd == s.buf.size());
+    CHECK(d.s4TrailingBytes == 12);  // trailer bytes now inside s4
+  }
+
+  // Not a tagged envelope → "not this format", not "malformed".
+  {
+    std::byte raw[64] = {};
+    const auto d = inspectDtiStructure(raw);
+    CHECK(d.status == DtiStructureStatus::kNotTaggedEnvelope);
+  }
+
+  // u32@0 length mismatch → envelope invalid → not this format.
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {}, {}, 0x10, 8, 4,
+                                 0xffffffff, false);
+    s.put32(0x00, 0);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kNotTaggedEnvelope);
+  }
+
+  // Truncated before the TOC end (< 0x28).
+  {
+    std::byte t[0x24] = {};
+    t[0] = std::byte{0x20};
+    std::memcpy(t + 4, "T.DAT", 5);
+    const auto d = inspectDtiStructure(t);
+    CHECK(d.status == DtiStructureStatus::kTruncatedHeader);
+  }
+
+  // A CMI-shaped buffer fed to the DTI parser: the first CMI count at
+  // 0x14 is not a plausible TOC → rejected, never kOk.
+  {
+    auto c = SyntheticCmi::build("TEST.CMD",
+        {{{"A", 0}}, {{"B", 0}}, {{"C", 0}}, {{"D", 0}}}, 8);
+    const auto d = inspectDtiStructure(c.buf);
+    CHECK(d.status != DtiStructureStatus::kOk);
+  }
+
+  // Arena name without an internal NUL is preserved raw with the flag
+  // reporting the deviation (corpus names are all NUL-terminated).
+  {
+    auto s = SyntheticDti::build("TEST.DAT", {},
+                                 {{"ABCDEFGH", 1.0f, {}}},
+                                 0x10, 8, 4, 0xffffffff, false);
+    const auto d = inspectDtiStructure(s.buf);
+    CHECK(d.status == DtiStructureStatus::kOk);
+    CHECK(d.arenas[0].name() == "ABCDEFGH");
+    CHECK(!d.arenas[0].nameEndsWithTerminator);
+  }
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
@@ -1786,6 +2178,7 @@ int main() {
   test_mti_directory();
   test_mto_directory();
   test_cmi_directory();
+  test_dti_structure();
   test_data_root();
   test_mode_dispatch();
   test_input_state();

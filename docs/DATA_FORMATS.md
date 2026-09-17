@@ -35,7 +35,7 @@ delegates to it — no duplicated extension tables.
 | SNI | `.SNI` | tagged-name | **directory-metadata** | count + 24-byte directory records proven (below) |
 | MTI | `.MTI` | tagged-name | **directory-metadata** | count + 24-byte records `{name[8], u32 flags, u32, u32, u32 off}` proven (below) |
 | CMI | `.CMI` | tagged-name | **directory-metadata** | four counted variable-length tables `{u8 len, name[len], u32 imgOff}` + bounded data region (below) |
-| DTI | `.DTI` | tagged-name | envelope-only | binary records, no name table (OBSERVED, not decoded) |
+| DTI | `.DTI` | tagged-name | **directory-metadata** | five-section image-relative TOC: params / keyed records / arena table (+typed 36-byte payloads) / RGB table / byte grid (below) |
 | FTI | `.FTI` | length only | envelope-only | count-like u32 + 8-byte names (shape observation only) |
 | BNI | `.BNI` | length only | envelope-only | same shape as FTI |
 | LBB | `.LBB` | none observed | unsupported | raw structure; fails u32@0 envelope |
@@ -603,6 +603,187 @@ convention, not a file-format value (none observed in the corpus).
 | `FUN_0042fa50` | Unbounded C-string compare (name lookups) |
 | `FUN_0041c884` | 8-byte-aligned pool allocator (image allocation callback) |
 
+## Proven interior structure: DTI
+
+Evidence class: OBSERVED (6/6 `.DTI` files in BUILD_A —
+`TRAVERSE/LEVEL{3..8}/LEVEL{3..8}.DTI`, 3,931,716 bytes, 114 arena
+records, 60 keyed records, 633 payload sub-records) +
+CODE-CORROBORATED (MDK95.EXE whole-blob loader `FUN_00425c8c`,
+traversal loader `FUN_00433d40`, keyed-record lookup
+`FUN_00423bf0`/`FUN_0043490c`, connect pairing `FUN_00434e54`, arena
+name lookups `FUN_00432ec4`/`FUN_00432e2c`, palette upload
+`FUN_0046d490`/`FUN_004346e8`, grid samplers `FUN_0046ec60`/
+`FUN_0047a770`).
+
+### Naming note (what is and is not proven)
+
+`.DTI` files carry the internal logical name `"LEVELn.DAT"` — disk
+and internal extensions disagree as in every tagged family. **No
+original string expands "DTI"/"DAT".** The file is a five-section
+bundle, and only these original names are proven, scoped exactly to
+where the diagnostics fire:
+
+- **"arena"** — the s2 records (`"arena %s not found"`,
+  `FUN_00432ec4`; `"BSPShow %s not found"` is the lookup key in
+  `FUN_00432e2c`; `"Alien has NOT changed arenas"`).
+- **"connect"** — the type-6 payload sub-records (`"connect_%d"`,
+  `"Mismatched connect coords/type %s,%s : connect_%d"`,
+  `"Unmatched connect %s : connect_%d"`, all in `FUN_00434e54`).
+- **"HotGen" / "HotPick"** — the type-2 / type-4 payload
+  sub-records (`"HotGen %s not found"` / `"HotPick %s not found"`,
+  `FUN_00433d40`).
+- **"Cooridor"** (original spelling) — `"3 Cooridors not allowed
+  for arena"`, `"Used/Avail corridor"` pool stats; the C-prefixed
+  arena names (`CHMO_*`, `CMEAT_*`, …) are the corridor arenas —
+  CORROBORATED by the `name[0] == 'c'/'C'` flag quirk in the load
+  loop (non-C names get `+0x44 |= 3`, C names skip it).
+- **palette** — s3 feeds the runtime palette array
+  (`"init_palette failed"` exists for `FUN_0046d010`; the
+  3-byte→4-byte upload in `FUN_0046d490` and the entry-0 black
+  force at load are CODE-CORROBORATED).
+
+DTI as a whole is NOT proven to be "the arena format" — it is the
+per-level bundle that CONTAINS the arena table among five sections.
+
+### Layout
+
+```
+file offset
+0x00  u32le        blob length = fileSize - 4          (envelope)
+0x04  char[12]     logical name "<stem>.DAT"           (envelope)
+0x10  u32le        = fileSize - 12 (envelope; equals the trailer's
+                   file offset, OBSERVED 6/6)
+0x14  u32le x5     TOC: image-relative section offsets s0..s4
+                   (loaded image = file bytes [4, size), so target
+                   file offset = 4 + value; CODE-CORROBORATED —
+                   FUN_00433d40 dereferences img + img[0x10],
+                   img + img[0x18], img + img[0x1c], img + img[0x20]
+                   directly; FUN_00423bf0 uses img + img[0x14].
+                   OBSERVED strictly increasing, sections tiled
+                   back-to-back, toc[0] = 0x24 in all 6 files)
+      s0  [toc0, toc1)   parameter block — OBSERVED 0x74 = 29 u32s
+      s1  [toc1, toc2)   {u32 count, count x 24-byte records}
+      s2  [toc2, toc3)   {u32 count, count x 16-byte arena records}
+                         then tiled payloads {u32 count,
+                         count x 36-byte sub-records}
+      s3  [toc3, toc4)   {u32 count, u8 rgb[768]} — OBSERVED span 772
+      s4  [toc4, trailer) byte grid plane(s)
+size-12  char[12]  trailer = name field repeat
+```
+
+### s0 — parameter block (CODE-CORROBORATED per-field)
+
+All 29 words are read by `FUN_00433d40` at load:
+
+| Word | Destination / behavior |
+|---|---|
+| [0] | × 0x466 into `DAT_00540c48` — initial arena index |
+| [1..4] | → `DAT_00540bfc`/`c00`/`c04`/`c2c` (with saved copies `c08`/`c0c`/`c10`) — the view state `FUN_0043490c` also writes from s1 records; position-like floats + an angle (90/180/270-ish) in the corpus |
+| [5],[6] | fill bytes, replicated ×4 into `_DAT_0054ec9c`/`ecac` |
+| [7],[8] | → `_DAT_0054ecb8`/`ecbc` — backdrop sample base offsets (`FUN_0046ec60`) |
+| [9] | → `_DAT_0054ec8c` — grid columns−4 (row stride is +4; the value itself is the wrap modulus) |
+| [10] | → `_DAT_0054ec90` — grid rows |
+| [0x0b] | → `_DAT_0054eca0` — secondary fill byte A; when positive (signed) a second s4 plane exists (`_DAT_0054ec98`) and fills switch |
+| [0x0c] | → `_DAT_0054ecb0` — secondary fill byte B |
+| [13..28] | four u32 groups transposed into a 16-byte matrix `DAT_0054c5c0`, consumed by `FUN_00406d84` ×4 — role UNKNOWN |
+
+### s1 — keyed records (CODE-CORROBORATED stride; semantics UNKNOWN)
+
+`{u32 count, count × 24B}`; record = `{u32 word0, u32 key, f32 f[4]}`.
+`FUN_00423bf0` walks with `piVar2 += 6` (ints), matches `word[1]`
+against an argument, then calls `FUN_0043490c(word[3], word[4],
+word[5], word[6])` — **word[6] is the first u32 of the next record**
+(for the last record it reads s2's count). OBSERVED boundary-crossing
+read, reproduced in the docs rather than sanitized. Corpus: count=10
+in all 6 files; `word0` runs 1..9,0; keys run 0..9; floats look like
+position+heading presets. The only caller is the debug/cheat command
+handler `FUN_00423ca0`, whose command strings are obfuscated — key
+semantics UNKNOWN.
+
+### s2 — arena table + payloads (CODE-CORROBORATED)
+
+`{u32 count, count × 16B {char name[8], u32 payloadImageOff, f32
+scalar}}` — count=19 in all 6 files (10 main + 9 `C*` corridor arenas).
+The loader expands each record into a 0x466-stride runtime record
+(`_DAT_0054c670`), copies the name, stores the scalar at +0x462,
+stores payload count/array at +0x38/+0x3c, and calls the CMI table-3
+lookup `FUN_00458550` once per record → `+0x220` (**the proven
+CMI↔DTI link**: arena names like `HMO_*`/`MUSE_*`/`GUNT_*` are the
+same names CMI table[3] keys). Non-`c`/`C` names get `+0x44 |= 3` —
+the corridor-name quirk.
+
+Each `payloadImageOff` (image-relative; file = 4+v) points at
+`{u32 count, count × 36-byte sub-records}` inside s2's payload region;
+payloads tile contiguously and end exactly at toc[3] in all 6 files.
+
+Sub-record = `{u32 type, u32 field[8]}` (36 bytes). Type dispatch is
+CODE-CORROBORATED:
+
+| Type | Proven role | Evidence |
+|---|---|---|
+| 2 | "HotGen" | name @+0x18 (12 bytes) strcmp'd against the CMI enemy table; match index OR-ed into high half of field[1] (`"HotGen %s not found"`). Corpus: 23 records, all +0x18 names match enemy names |
+| 4 | "HotPick" | same +0x18 name field; match index overwrites field[1] (`"HotPick %s not found"`). Corpus: 9 |
+| 6 | "connect" | field[1] = connect-ID (>999 in file form), field[2] = side code (pairs 0↔1, 2↔3, 4↔5, 6↔7), fields[3..8] = six floats; `FUN_00434e54` pairs endpoints across arenas (same ID, identical floats, complementary sides) and rewrites field[1] to the partner arena index. Corpus: 168, all IDs 1000–1017 |
+| 1,3,5,7,8,9 | UNKNOWN | OBSERVED only; histogram {1:85, 3:58, 5:171, 7:23, 8:88, 9:8} — type 9 exists only in LEVEL6 |
+
+### s3 — RGB table (CODE-CORROBORATED as palette)
+
+`{u32 count, u8 rgb[768]}` — span exactly 772 bytes in all 6 files.
+`count` → `DAT_00540dcc` (corpus 112/112/112/64/112/112); the first
+three payload bytes are zeroed at load (entry 0 forced black);
+`FUN_004346e8` copies 0x90 u32s from +0xc0 (entries 64..255) to
+`DAT_005408e0`; `FUN_0046d490(0, count)` expands the `count×3`-byte
+RGB triplets into 4-byte entries of the runtime palette array
+`DAT_0054d7b8`. "init_palette" exists in the binary.
+
+### s4 — byte grid (CODE-CORROBORATED as backdrop image)
+
+`(s0[9]+4) × s0[10]` bytes per plane, one plane plus a second when
+`s0[0xb] > 0` (signed). The plane count × plane size equals the
+section span exactly in all 6 files (1804×360 single for LEVEL3/4/7/8;
+904×360 ×2 for LEVEL5/6). `FUN_0047a770` samples `s4 + plane*row +
+col` into the framebuffer rows (`DAT_00541650 + y*600`) with
+horizontal wrap at the s0[9] modulus; `FUN_0046ec60` blits columns.
+CORROBORATED usage: scrolling indexed-color backdrop (byte values are
+palette indices). Nothing semantic beyond "image bytes" is claimed.
+
+### CMI↔DTI relationship (answers the Phase 3F open question)
+
+`FUN_00433d40` loads `.CMI` then `.DTI`; the DTI s2 loop calls
+`FUN_00458550` — the CMI table-3 name lookup — once per arena record
+and stores the result at runtime `+0x220`. So the array iterated by
+the CMI table-3 consumer **is** the DTI-derived arena array, and the
+lookup keys are the arena names. PROVEN end to end.
+
+### Structural variants / anomalies
+
+- One structural class across all 6 files; only counts/sizes vary.
+- s4 plane count: 1 (LEVEL3/4/7/8) vs 2 (LEVEL5/6), driven by
+  `s0[0xb]` sign — OBSERVED exact-size match 6/6.
+- s2 sub-record type 9 exists only in LEVEL6 (`COLYM_*` arenas).
+- Zero-count payloads are normal (empty arenas store just `count=0`).
+- No other anomalies: all payload offsets land inside s2's payload
+  region; no trailing bytes in any section.
+
+### Original loader/consumer functions (static evidence)
+
+| Address | Role (observed behavior) |
+|---|---|
+| `FUN_00433d40` | Traversal loader: loads `.DTI` after `.CMI`, walks s0/s2/s3/s4, expands s2 records into 0x466-stride runtime records, resolves HotGen/HotPick names against the CMI enemy table, calls `FUN_00458550` per arena |
+| `FUN_00425c8c` | Whole-blob loader (same family as `FUN_00425d18`): fread u32@0, alloc, fread remaining bytes → image = file+4, stored at `_DAT_0054c67c` |
+| `FUN_00423bf0` | s1 lookup: `piVar2 += 6` walk, `word[1]` key match, `FUN_0043490c(word[3..6])` — word[6] reads the next record |
+| `FUN_0043490c` | Writes `DAT_00540bfc`/`c00`/`c04`/`c2c` — the same view-state globals s0[1..4] initialize |
+| `FUN_00423ca0` | Debug-command dispatcher; the only s1 consumer's caller (obfuscated command strings) |
+| `FUN_00434e54` | Connect pairing pass: matches type-6 records by connect-ID + endpoint floats + side pairing; rewrites field[1] to partner arena index; emits the three connect diagnostics |
+| `FUN_00432ec4` | Arena name lookup → `"arena %s not found"` |
+| `FUN_00432e2c` | Arena name lookup for the `"BSPShow %s"` key |
+| `FUN_004346e8` | Post-load: copies s3+0xc0 region (0x90 u32s) to `DAT_005408e0`; builds the 4 ramp tables from `DAT_0054c5c0` via `FUN_00406d84` |
+| `FUN_0046d490` | Expands count×3-byte RGB triplets into 4-byte palette entries at `DAT_0054d7b8` |
+| `FUN_0046ec60` / `FUN_0047a770` | s4 samplers: column/span copies into framebuffer rows with horizontal wrap; second plane at `s4 + planeSize` when `_DAT_0054ec98` |
+| `FUN_00435178` | Arena payload walker (portal/crossing tests on type-6 endpoint floats) |
+
+## Unknown fields
+
 ## Unknown fields
 
 - `u32 @0x10` (envelope): equals `fileSize - 12` in all tagged files and
@@ -647,6 +828,18 @@ convention, not a file-format value (none observed in the corpus).
 - CMI "enemy table" table-1 destination record fields (0x88-stride
   array): only +0x00 name / +0x0a flag / +0x20 pointer are proven.
 - The expansion of "CMI"/"CMD": UNKNOWN — no original string names it.
+- DTI s0 semantics per word: proven *destinations* (above), but what
+  the view params/fill bytes/ramp matrix MEAN is UNKNOWN.
+- DTI s1 record semantics: key space 0..9, four floats feeding the
+  view-state setter via a debug-command path — what the keys denote
+  is UNKNOWN (command strings are obfuscated).
+- DTI s2 `+0x0c` scalar: stored at runtime `+0x462`; role UNKNOWN.
+- DTI sub-record types 1, 3, 5, 7, 8, 9: OBSERVED, semantics UNKNOWN
+  (render-side consumers walk them but no per-type diagnostic names
+  them; only 2/4/6 are proven).
+- DTI s3 `count` when < 256: only `count` entries are uploaded — the
+  remaining palette entries' provenance is UNKNOWN.
+- The expansion of "DTI"/"DAT": UNKNOWN — no original string names it.
 
 ## Families that do NOT share the SNI layout
 
@@ -661,28 +854,34 @@ Checked for "same count+stride+field order" against the SNI mechanism:
 - **CMI**: variable-length records (`u8 len + name[len] + u32`), four
   chained counted tables then a data region → different; proven
   separately in Phase 3F (above).
-- **DTI**: binary records, no names in the directory region → different.
+- **DTI**: five image-relative TOC offsets @0x14 → heterogeneous
+  sections (params / keyed records / arena table / palette / grid) →
+  different; proven separately in Phase 3G (above).
 
-So each tagged family needs its own statics+bytes pass; SNI, MTI, MTO
-and CMI are proven, the DTI interior remains undecoded.
+So each tagged family needed its own statics+bytes pass; SNI, MTI,
+MTO, CMI and DTI interiors are all proven now.
 
 ## Unsupported payload semantics
 
 Per the phase briefs, no semantics are assigned to SNI payloads (the
 RIFF/WAVE observation is byte-level only), to MTI payload data past
 its proven u16 header, to MTO block contents past the proven region
-boundaries, or to the CMI data region past its proven target-head
-shape; nothing in DTI/FTI/BNI interiors is decoded. The parsers
+boundaries, to the CMI data region past its proven target-head shape,
+or to DTI sub-record payload fields past the proven type dispatch
+(the renderer-side field meanings for types 1/3/5/7/8/9 are not
+decoded); nothing in FTI/BNI interiors is decoded. The parsers
 enumerate boundaries — they never interpret or dump payload bytes.
 
-## Next targets (Phase 3G candidates, not started)
+## Next targets (Phase 3H candidates, not started)
 
-1. `.DTI` binary-record interior (no name table) — the bundle loader
-   already provably derives the arena-record array from it.
-2. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
-3. CMI data-region organization — how records inside the region are
+1. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
+2. CMI data-region organization — how records inside the region are
    delimited/iterated, and what table[0]/table[2] targets are
    (consumer-side tracing beyond the proven directory structure).
+3. DTI payload type semantics — renderer-side decode of sub-record
+   types 1/3/5/7/8/9 (geometry/portals/props roles are UNKNOWN; the
+   `draw_arena` walker `FUN_00431300` and `FUN_00435178` are the entry
+   points), plus the s1 key space.
 4. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
    data blocks).
 5. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.

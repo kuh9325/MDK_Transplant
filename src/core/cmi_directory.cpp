@@ -164,7 +164,7 @@ CmiDirectory inspectCmiDirectory(std::span<const std::byte> file) {
   result.dataRegionEnd = trailerStart;
 
   // Second pass: flag the OBSERVED corpus property "nonzero value
-  // lands in the data region" (818/818 in BUILD_A). Reported, never
+  // lands in the data region" (762/762 in BUILD_A). Reported, never
   // load-bearing.
   for (auto& tab : result.tables) {
     for (auto& rec : tab.records) {

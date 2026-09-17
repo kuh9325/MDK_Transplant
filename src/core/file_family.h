@@ -33,8 +33,8 @@ enum class MdkFileFamily {
           //      (name[8] + 4 fields, 24-byte stride — Phase 3D)
   kCmi,   // .CMI — tagged-name envelope; interior counted
           //      variable-length tables PROVEN (Phase 3F)
-  kDti,   // .DTI — tagged-name envelope (interior: binary, not a
-          //      name directory)
+  kDti,   // .DTI — tagged-name envelope; interior five-section table
+          //      of contents PROVEN (Phase 3G)
   kFti,   // .FTI — length envelope only (non-ASCII field at +4)
   kBni,   // .BNI — length envelope only (non-ASCII field at +4)
   kLbb,   // .LBB — no u32 envelope observed (raw structure)
@@ -71,7 +71,7 @@ std::string_view fileFamilyName(MdkFileFamily f);
 
 // Current parser support for a family. kDirectoryMetadata implies a
 // concrete parser exists (SNI Phase 3C; MTI Phase 3D; MTO Phase 3E;
-// CMI Phase 3F).
+// CMI Phase 3F; DTI Phase 3G).
 FamilySupport fileFamilySupport(MdkFileFamily f);
 std::string_view familySupportName(FamilySupport s);
 

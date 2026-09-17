@@ -12,11 +12,13 @@
 #include "core/cmi_directory.h"
 #include "core/container.h"
 #include "core/data_root.h"
+#include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/sni_directory.h"
 
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -331,6 +333,108 @@ int selftest() {
        cdir.dataRegionEnd == sizeof(cmi) - 12 &&
        cdir.trailerPresent && cdir.secondaryEqualsTrailerOffset;
   std::fprintf(stderr, "selftest cmi-directory: %s\n",
+               ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic DTI-like fixture (no original data): tagged envelope +
+  // the five-entry image-relative TOC + one of each section:
+  //   s0  29 u32s (grid 8x4 -> plane (8+4)*4 = 48 bytes; altFillA=-1
+  //       -> single plane)
+  //   s1  count=1 {word0=1,key=0,f=(1.5,2.5,3.5,4.5)}
+  //   s2  count=1 {"TST_1\0\0\0", imgOff->payload, f32} payload:
+  //       count=2 -> type6 "connect" + type2 "HotGen" with name@0x18
+  //   s3  count=0x10 + 768 palette bytes
+  //   s4  48 grid bytes, then name trailer
+  std::byte dti[0x460] = {};
+  const auto dput32 = [&](std::size_t off, std::uint32_t v) {
+    dti[off + 0] = static_cast<std::byte>(v & 0xff);
+    dti[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    dti[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    dti[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  };
+  const auto dputf = [&](std::size_t off, float f) {
+    dput32(off, std::bit_cast<std::uint32_t>(f));
+  };
+  const auto dputName = [&](std::size_t off, const char* s) {
+    for (std::size_t i = 0; s[i] && off + i < sizeof(dti); ++i) {
+      dti[off + i] = static_cast<std::byte>(s[i]);
+    }
+  };
+  // Layout (file offsets; TOC stores image offsets = file - 4):
+  //   s0 0x28..0x9c  s1 0x9c..0xb8  s2 0xb8..0x118  s3 0x118..0x41c
+  //   s4 0x41c..0x44c  trailer 0x44c..0x458
+  const std::uint64_t dSize = 0x458;
+  dput32(0x00, static_cast<std::uint32_t>(dSize - 4));
+  dputName(0x04, "TEST.DAT");
+  dput32(0x10, static_cast<std::uint32_t>(dSize - 12));
+  dput32(0x14, 0x24);    // s0 @img 0x24 -> file 0x28
+  dput32(0x18, 0x98);    // s1 -> file 0x9c
+  dput32(0x1c, 0xb4);    // s2 -> file 0xb8
+  dput32(0x20, 0x114);   // s3 -> file 0x118
+  dput32(0x24, 0x418);   // s4 -> file 0x41c
+  // s0 words: only the proven-consumed fields need sane values
+  dputf(0x2c, -4.0f); dputf(0x30, 0.0f); dputf(0x34, 190.0f);
+  dputf(0x38, 96.0f);
+  dput32(0x3c, 0xf0); dput32(0x40, 0xe7);            // fill bytes
+  dput32(0x44, 0xf0); dput32(0x48, 0x12c);           // scroll bases
+  dput32(0x4c, 8); dput32(0x50, 4);                  // grid 8x4
+  dput32(0x54, 0xffffffff); dput32(0x58, 0xffffffff);// altFillA/B
+  // s1: count=1 {word0=1, key=0, f32 x4}
+  dput32(0x9c, 1);
+  dput32(0xa0, 1); dput32(0xa4, 0);
+  dputf(0xa8, 1.5f); dputf(0xac, 2.5f);
+  dputf(0xb0, 3.5f); dputf(0xb4, 4.5f);
+  // s2: count=1, record {"TST_1\0\0\0", imgOff=0xc8->file 0xcc, 4.0f}
+  dput32(0xb8, 1);
+  dputName(0xbc, "TST_1");
+  dput32(0xc4, 0xc8);          // image offset -> file 0xcc
+  dputf(0xc8, 4.0f);
+  // payload @0xcc: count=2; sub[0] type6 connect; sub[1] type2 HotGen
+  dput32(0xcc, 2);
+  dput32(0xd0, 6); dput32(0xd4, 1000); dput32(0xd8, 1);
+  dputf(0xdc, 1.0f); dputf(0xe0, 2.0f); dputf(0xe4, 3.0f);
+  dputf(0xe8, 4.0f); dputf(0xec, 5.0f); dputf(0xf0, 6.0f);
+  dput32(0xf4, 2); dput32(0xf8, 9); dput32(0xfc, 0);
+  dputf(0x100, -1.0f); dputf(0x104, -2.0f); dputf(0x108, -3.0f);
+  dputName(0x10c, "XGS");      // name @+0x18 of sub[1]
+  // s3 @0x118: count + 768-byte palette
+  dput32(0x118, 0x10);
+  // s4 @0x41c: 48 bytes (grid (8+4)*4)
+  dputName(dSize - 12, "TEST.DAT");
+
+  const auto dst = mdk::inspectDtiStructure(
+      std::span<const std::byte>(dti, dSize));
+  ok = dst.status == mdk::DtiStructureStatus::kOk &&
+       dst.tocImageOffsets[0] == 0x24 &&
+       dst.tocImageOffsets[4] == 0x418 &&
+       dst.sections[0].fileStart == 0x28 &&
+       dst.sections[0].fileEnd == 0x9c &&
+       dst.sections[2].fileStart == 0xb8 &&
+       dst.sections[2].fileEnd == 0x118 &&
+       dst.params[9] == 8 && dst.params[10] == 4 &&
+       dst.keyedRecords.size() == 1 &&
+       dst.keyedRecords[0].key == 0 &&
+       dst.keyedRecords[0].floatAt(0) == 1.5f &&
+       dst.arenas.size() == 1 &&
+       dst.arenas[0].name() == "TST_1" &&
+       dst.arenas[0].nameEndsWithTerminator &&
+       dst.arenas[0].payloadFileOffset == 0xcc &&
+       dst.arenas[0].scalar() == 4.0f &&
+       dst.arenas[0].subRecords.size() == 2 &&
+       dst.arenas[0].subRecords[0].type == 6 &&
+       dst.arenas[0].subRecords[0].fields[0] == 1000 &&
+       dst.arenas[0].subRecords[0].fieldAsFloat(2) == 1.0f &&
+       dst.arenas[0].subRecords[1].type == 2 &&
+       dst.arenas[0].subRecords[1].name18() == "XGS" &&
+       dst.s2PayloadRegionStart == 0xcc &&
+       dst.paletteCount == 0x10 &&
+       dst.paletteBytes.size() == 768 &&
+       dst.gridPlaneSize == 48 && dst.gridPlaneCount == 1 &&
+       dst.sections[4].fileEnd == dSize - 12 &&
+       dst.trailerPresent && dst.secondaryEqualsTrailerOffset;
+  std::fprintf(stderr, "selftest dti-structure: %s\n",
                ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
@@ -706,6 +810,130 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(dir.dataRegionEnd),
                 static_cast<unsigned long long>(dir.dataRegionEnd -
                                                 dir.dataRegionOffset));
+    return 0;
+  }
+
+  if (family == mdk::MdkFileFamily::kDti) {
+    const auto st = mdk::inspectDtiStructure(
+        std::span<const std::byte>(file->data(), file->size()));
+    std::printf("entries:   DTI structure (five image-relative TOC "
+                "offsets @0x14: params / keyed records / arena table "
+                "/ palette / grid)\n");
+    std::printf("status:    %s%s%s\n",
+                std::string(mdk::dtiStructureStatusName(st.status))
+                    .c_str(),
+                st.detail.empty() ? "" : " — ",
+                st.detail.empty() ? "" : st.detail.c_str());
+    if (st.status != mdk::DtiStructureStatus::kOk) {
+      return 1;
+    }
+    std::printf("trailer:   name[12] @ size-12 %s\n",
+                st.trailerPresent ? "present" : "ABSENT");
+    std::printf("u32@0x10:  %u — %s trailer offset\n",
+                st.secondaryLength,
+                st.secondaryEqualsTrailerOffset ? "equals"
+                                                : "does not equal");
+    std::printf("toc:       [");
+    for (std::size_t i = 0; i < mdk::kDtiTocEntries; ++i) {
+      std::printf("%s0x%08x", i ? " " : "", st.tocImageOffsets[i]);
+    }
+    std::printf("] (image-relative; file = value + 4)\n");
+
+    const auto& s0 = st.sections[mdk::kDtiSecParams];
+    std::printf("  s0 params:   [0x%llx, 0x%llx) — %llu bytes; "
+                "startArena=%u view=(%g %g %g %g) fill=(0x%x,0x%x) "
+                "scroll=(0x%x,0x%x) grid=%ux%u altFill=(0x%x,0x%x)\n",
+                static_cast<unsigned long long>(s0.fileStart),
+                static_cast<unsigned long long>(s0.fileEnd),
+                static_cast<unsigned long long>(s0.size()),
+                st.params[0], std::bit_cast<float>(st.params[1]),
+                std::bit_cast<float>(st.params[2]),
+                std::bit_cast<float>(st.params[3]),
+                std::bit_cast<float>(st.params[4]), st.params[5],
+                st.params[6], st.params[7], st.params[8], st.params[9],
+                st.params[10], st.params[0x0b], st.params[0x0c]);
+    std::printf("             matrix[16] =");
+    for (std::size_t i = 13; i < mdk::kDtiParamWords; ++i) {
+      std::printf("%s0x%x", i == 13 ? " " : ",", st.params[i]);
+    }
+    std::printf("\n");
+
+    const auto& s1 = st.sections[mdk::kDtiSecKeyed];
+    std::printf("  s1 keyed:    [0x%llx, 0x%llx) count=%zu "
+                "stride=24%s\n",
+                static_cast<unsigned long long>(s1.fileStart),
+                static_cast<unsigned long long>(s1.fileEnd),
+                st.keyedRecords.size(),
+                st.s1TrailingBytes ? " (trailing bytes)" : "");
+    for (std::size_t i = 0; i < st.keyedRecords.size(); ++i) {
+      const auto& e = st.keyedRecords[i];
+      std::printf("    [%3zu] @0x%06llx word0=%u key=%u f=(%g %g %g "
+                  "%g)\n", i,
+                  static_cast<unsigned long long>(e.fileOffset),
+                  e.word0, e.key, e.floatAt(0), e.floatAt(1),
+                  e.floatAt(2), e.floatAt(3));
+    }
+
+    const auto& s2 = st.sections[mdk::kDtiSecArenas];
+    std::printf("  s2 arenas:   [0x%llx, 0x%llx) count=%zu "
+                "payloads@0x%llx\n",
+                static_cast<unsigned long long>(s2.fileStart),
+                static_cast<unsigned long long>(s2.fileEnd),
+                st.arenas.size(),
+                static_cast<unsigned long long>(
+                    st.s2PayloadRegionStart));
+    for (std::size_t i = 0; i < st.arenas.size(); ++i) {
+      const auto& a = st.arenas[i];
+      std::printf("    [%3zu] @0x%06llx %-9s imgOff=0x%08x "
+                  "->file=0x%08llx scalar=%g subs=%u%s\n", i,
+                  static_cast<unsigned long long>(a.fileOffset),
+                  a.name().c_str(), a.payloadImageOffset,
+                  static_cast<unsigned long long>(a.payloadFileOffset),
+                  a.scalar(), a.subRecordCount,
+                  a.nameEndsWithTerminator ? "" : " [no NUL]");
+      for (std::size_t j = 0; j < a.subRecords.size(); ++j) {
+        const auto& sub = a.subRecords[j];
+        const char* tag = sub.type == 2   ? " HotGen"
+                          : sub.type == 4 ? " HotPick"
+                          : sub.type == 6 ? " connect"
+                                          : "";
+        std::printf("         sub[%3zu] @0x%06llx type=%u%s "
+                    "f1=0x%08x f2=0x%08x tail=[%08x %08x %08x %08x "
+                    "%08x %08x]%s\n",
+                    j,
+                    static_cast<unsigned long long>(sub.fileOffset),
+                    sub.type, tag, sub.fields[0], sub.fields[1],
+                    sub.fields[2], sub.fields[3], sub.fields[4],
+                    sub.fields[5], sub.fields[6], sub.fields[7],
+                    (sub.type == 2 || sub.type == 4)
+                        ? (std::string(" name=\"") + sub.name18() +
+                           "\"")
+                              .c_str()
+                        : "");
+      }
+    }
+
+    const auto& s3 = st.sections[mdk::kDtiSecPalette];
+    std::printf("  s3 palette:  [0x%llx, 0x%llx) count=%u "
+                "rgb=[0x%llx, 0x%llx)%s\n",
+                static_cast<unsigned long long>(s3.fileStart),
+                static_cast<unsigned long long>(s3.fileEnd),
+                st.paletteCount,
+                static_cast<unsigned long long>(
+                    st.paletteBytes.fileStart),
+                static_cast<unsigned long long>(
+                    st.paletteBytes.fileEnd),
+                st.s3TrailingBytes ? " (trailing bytes)" : "");
+
+    const auto& s4 = st.sections[mdk::kDtiSecGrid];
+    std::printf("  s4 grid:     [0x%llx, 0x%llx) — %llu bytes = %u "
+                "plane(s) x 0x%llx%s\n",
+                static_cast<unsigned long long>(s4.fileStart),
+                static_cast<unsigned long long>(s4.fileEnd),
+                static_cast<unsigned long long>(s4.size()),
+                st.gridPlaneCount,
+                static_cast<unsigned long long>(st.gridPlaneSize),
+                st.s4TrailingBytes ? " (trailing bytes)" : "");
     return 0;
   }
 

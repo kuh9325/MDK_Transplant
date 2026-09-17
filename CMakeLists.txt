@@ -29,6 +29,7 @@ add_library(mdk_core STATIC
   src/core/cmi_directory.cpp
   src/core/container.cpp
   src/core/data_root.cpp
+  src/core/dti_structure.cpp
   src/core/file_family.cpp
   src/core/framebuffer.cpp
   src/core/mode_dispatch.cpp
