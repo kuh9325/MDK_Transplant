@@ -133,6 +133,8 @@ bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
 | .MTO overlay directory | `FUN_0041a84c` (dir load), `FUN_0041a910` (max-block scan → scratch alloc), `FUN_0041a9d8` (name lookup → fseek + len read), `FUN_0041aad0`/`FUN_0041ab44` (≤0x8000-chunk stream + accessor), `FUN_00432534` (block consumer → `FUN_0041a820`→`FUN_0041a1e0` on buf+0x10), `FUN_00419ee0` (region-C walk), `FUN_00403720` (overlay-alien resolve), `FUN_004287cc`/`FUN_00402e2c` (overlay sounds), `FUN_004387ec`/`FUN_00403498` (region-A lookups), `FUN_0041b7b4` (`LEVEL%dO.MTO` path) | STRONG_ | count u32@0x14, N×12-byte records `{name[8], fileOff@+0x08}` (fseek SEEK_SET, name compare bound 8); block u32 = self-inclusive byte len, streamed from off+4; each block embeds a tagged `.MAT` image at +0x10 (parsed by the shared MTI parser) + region A `{ca,cb,cc}` (overlay-alien/overlay-sound records, cc≤0x10 → `"Too many overlay sounds"`) + fixed 0x150-byte region B + nested region C ({10,44,36,12}-stride counted arrays, 2-byte pad iff c1 odd); strings `overlay`, `No overlay data for %s`, `Failed to resolve overlay alien %s` — Phase 3E, see `../DATA_FORMATS.md` |
 | .CMI table directory | `FUN_00425d18` (whole-blob load into `DAT_0054c6bc`, length → `DAT_0054c680`), `FUN_0045840c`/`FUN_0045843c`/`FUN_0045846c` (table-end walkers), `FUN_0045849c`/`FUN_00458550` (table-3 name lookups + indirection), `FUN_004286c8` (table-1 → `DAT_004edcc0` 0x88-stride array, cap 0x50), `FUN_004566f0` (table-2 lookup in object init), `FUN_00426f34`/`FUN_00426738` (load/save pointer relocation vs the image base) | STRONG_ | four counted variable-length tables `{u8 len, name[len incl NUL], u32 imgOff}` @0x14 then a data region to the trailer; values are image-relative offsets (image = file+4); `"Overflowed enemy table"` caps table 1; table-3 targets begin `{lenStr, lenStr, u32}` — Phase 3F, see `../DATA_FORMATS.md`. **Note:** the pre-3F "collision/map" guess below was wrong — no arena/BSP structure is proven for `.CMI` |
 | .DTI sectioned bundle | `FUN_00425c8c` (whole-blob load → `_DAT_0054c67c`), `FUN_00433d40` (traversal loader — consumes s0 params, expands s2 arena records into 0x466-stride runtime records, resolves HotGen/HotPick names, calls CMI table-3 lookup `FUN_00458550` per arena → `+0x220`), `FUN_00423bf0`/`FUN_0043490c` (s1 keyed-record lookup → view-state globals; called only from the debug-command dispatcher `FUN_00423ca0`), `FUN_00434e54` (connect pairing: matches type-6 records by connect-ID + endpoint floats + side codes 0↔1/2↔3/4↔5/6↔7, rewrites field[1] to partner arena index), `FUN_00432ec4`/`FUN_00432e2c` (arena-name lookups), `FUN_004346e8`/`FUN_0046d490` (s3 palette: `count×3`-byte RGB → 4-byte entries `DAT_0054d7b8`, entry 0 forced black), `FUN_0046ec60`/`FUN_0047a770` (s4 grid sampling into the framebuffer, horizontal wrap, optional second plane) | STRONG_ | five image-relative TOC offsets @0x14 (image = file+4) tiling s0..s4: 0x74-byte params / `{count, count×24B}` keyed records / `{count, count×16B {name[8], imgOff, f32}}` arena table + `{count, count×36B}` typed payloads (2=HotGen, 4=HotPick, 6=connect per original diagnostics; types 1/3/5/7/8/9 UNKNOWN) / `{count, 768B RGB}` palette / `(cols+4)×rows` grid, 1–2 planes — Phase 3G, see `../DATA_FORMATS.md` |
+| .FTI resource directory | `FUN_00425b34` (whole-blob load into `DAT_0049ff50` — `MISC\MDKFONT.FTI` default / `MISC\FONT%c.FTI` language variant via `FUN_0047d2e9`; `MISC\FONTG.FTI` via `FUN_0041b004`), `FUN_00414890` (name lookup — 41 static callers), `FUN_0047da70` (`"Font table not initialized!"`), `FUN_00408fac` (`"Error finding %s"`) | STRONG_ | length-only envelope (no tag/trailer); count u32 @img+0, N×12-byte records `{name[8], u32 imgOff}` @img+4; name compared as exact two-u32 equality (query zero-padded); lookup returns `img + rec[+0x08]`; payloads tile to EOF — Phase 3H, see `../DATA_FORMATS.md` |
+| .BNI resource directory | `FUN_004038f0`/`FUN_0040390c`/`FUN_00403928` (load wrappers — `MOV EDX,0x4a1e38` → `FUN_00425a80`/`FUN_00425b34`/`FUN_00425bfc`), `FUN_00403944` (slot clear), `FUN_00403958` (name lookup), `FUN_004039a4`→`FUN_00408fac` (`"Error finding %s"`), `FUN_004039c8`/`FUN_004039d8`/`FUN_004039ec`/`FUN_00403a00` (lookup variants incl. payload-head u16 readers), `FUN_0047b0fc` (FINISH.BNI stream load → 5 name resolutions) | STRONG_ | length-only envelope (no tag/trailer); count u32 @img+0, N×16-byte records `{name[12], u32 imgOff}` @img+4; name via unbounded `FUN_0042fa50` strcmp; lookup returns `img + rec[+0x0c]`; single global slot `DAT_004a1e38` (one live BNI at a time — per-context bundles); payloads tile to EOF — Phase 3H, see `../DATA_FORMATS.md` |
 | Traversal load | `FUN_00433d40` | STRONG_ | `MISC\LOAD_%d.LBB`, `TLEVEL.*`, level families |
 | FALL3D/freefall | `FUN_0040ef28` (+init `FUN_0041e070`-equiv) | STRONG_ | `fall_3d.c` string, `FALL3D_%d.MTI`, `FALLP_%d/LEVEL_%d/POD_%d` |
 | Renderer (3D) | `FUN_00431300` draw_arena, `FUN_00432e2c` BSPShow, `FUN_0040bd40/…` poly sort | STRONG_ | `Overflowed MaxObjects in draw_arena`, `BSPShow %s not found`, `arena %s not found`, `Too many polygons for current sort list`, `3 Cooridors not allowed for arena` |
@@ -183,7 +185,12 @@ bounded data region, consumed at traversal load for the original's
 interior — a five-section image-relative TOC (params / keyed records /
 the original's "arena" table with typed 36-byte payloads / palette /
 backdrop grid), and the proven link that the CMI table-3 lookup runs
-once per DTI arena record;
+once per DTI arena record; Phase 3H adds the two length-envelope
+directories — `.FTI` = `{name[8], u32 imgOff}` ×12-byte records into
+the engine-wide `DAT_0049ff50` resource table ("font table"
+diagnostic), `.BNI` = `{name[12], u32 imgOff}` ×16-byte records into
+the per-context `DAT_004a1e38` slot — distinct record layouts proven
+by their separate original lookups;
 see `../DATA_FORMATS.md`.)
 
 ## DOS ↔ Win95 shared code — CORROBORATED
@@ -245,8 +252,8 @@ DSOUND).
   boundaries, file-family loaders, save packet skeleton, video players,
   DOS↔Win95 shared-core architecture.
 - TENTATIVE: enemy/AI module boundaries, object setup, corridor/arena
-  topology rules, exact CRT↔game seam, `.BNI` semantics, freefall control
-  model.
+  topology rules, exact CRT↔game seam, `.BNI` payload semantics,
+  freefall control model.
 - UNKNOWN: per-packet save fields, AI command opcode set, camera/sniper
   internals, physics constants, renderer inner loop (rasterizer texturing),
   hardware-variant renderer internals, `.MVE` decoder details.

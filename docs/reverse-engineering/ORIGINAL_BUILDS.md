@@ -155,11 +155,13 @@ and force feedback (DirectX 5 required).
 
 Most proprietary families begin with a u32 LE length field (file size − 4)
 followed by a 4-char ASCII tag equal to the file stem (verified for .MTI,
-.SNI, .CMI, .DTI, .MTO, .FTI). Semantics beyond the tag were UNKNOWN at
+.SNI, .CMI, .DTI, .MTO — `.FTI` was on this list at the early survey but
+its second field is a non-ASCII u32 count, not a tag: corrected Phase 3B).
+Semantics beyond the tag were UNKNOWN at
 this survey; interior directories have since been proven for `.SNI`
-(Phase 3C), `.MTI` (3D), `.MTO` (3E), `.CMI` (3F) and `.DTI` (3G) —
-see `../DATA_FORMATS.md`; `.FTI`/`.BNI` interiors remain UNKNOWN.
-.BNI carries a similar u32 length but a non-ASCII second field. .LBB files
+(Phase 3C), `.MTI` (3D), `.MTO` (3E), `.CMI` (3F), `.DTI` (3G), and the
+two length-envelope families `.FTI`/`.BNI` (3H — distinct record layouts,
+see `../DATA_FORMATS.md`). .LBB files
 (6 × 40,772 bytes, `LOAD_*`) look like raw data — format UNKNOWN.
 
 | Family | Count | Total bytes | Notes |
@@ -167,12 +169,12 @@ see `../DATA_FORMATS.md`; `.FTI`/`.BNI` interiors remain UNKNOWN.
 | .MTO | 6 | 45,561,671 | `LEVEL{3..8}O.MTO`, tag `LEVE` |
 | .SNI | 15 | 27,304,832 | incl. `MDKSOUND.SNI`; tags `FALL`/`LEVE`/`MDKS` |
 | .MTI | 13 | 23,043,544 | `FALL3D_{1..5}.MTI`, `LEVEL*S.MTI`, `STATS.MTI`, `STREAM.MTI` |
-| .BNI | 6 | 9,143,457 | `FALL3D`, `FINISH`, `OPTIONS`, `STATS`, `STREAM`, `TRAVSPRT` |
+| .BNI | 6 | 9,143,457 | per-context resource directories `FALL3D`, `FINISH`, `OPTIONS`, `STATS`, `STREAM`, `TRAVSPRT` |
 | .CMI | 6 | 8,323,957 | `LEVEL{3..8}.CMI`, tag `LEVE` |
 | .DTI | 6 | 3,931,716 | `LEVEL{3..8}.DTI`, tag `LEVE` |
 | .FLC | 2 | 8,459,481 | FLIC animation 600x360x8 (`MDK12`, `MDKEND`) |
 | .MVE | 1 | 29,813,692 | Interplay MVE bonus FMV |
-| .FTI | 5 | 804,165 | font data |
+| .FTI | 5 | 804,165 | engine-wide resource directory ("font table" diagnostic); `MDKFONT` + `FONT{F,I,P,S}` variants |
 | .LBB | 6 | 244,632 | `LOAD_{3..8}` loading data, format UNKNOWN |
 | .FRC | 13 | 3,744 | RIFF `FORC` force-effect files |
 | .GIF | 10 | 912,107 | `MDKS_001..010` screenshots 600x360 |

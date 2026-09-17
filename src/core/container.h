@@ -22,7 +22,8 @@
 //
 //   Length-only family (.FTI/.BNI — 11/11 files):
 //     u32le @0 == fileSize - 4, but bytes [4,8) are a small non-ASCII
-//     u32 (count-like) followed by 8-byte entry names. A different
+//     u32 (the record count — Phase 3H) followed by fixed-stride
+//     {name, image-offset} records. A different
 //     structure — it must NOT be parsed as the tag envelope.
 //
 //   .LBB (6/6): no envelope — does not satisfy u32@0 == size-4.

@@ -35,8 +35,10 @@ enum class MdkFileFamily {
           //      variable-length tables PROVEN (Phase 3F)
   kDti,   // .DTI — tagged-name envelope; interior five-section table
           //      of contents PROVEN (Phase 3G)
-  kFti,   // .FTI — length envelope only (non-ASCII field at +4)
-  kBni,   // .BNI — length envelope only (non-ASCII field at +4)
+  kFti,   // .FTI — length envelope; interior directory PROVEN
+          //      (name[8] + img-offset, 12-byte stride — Phase 3H)
+  kBni,   // .BNI — length envelope; interior directory PROVEN
+          //      (name[12] + img-offset, 16-byte stride — Phase 3H)
   kLbb,   // .LBB — no u32 envelope observed (raw structure)
   kSav,   // .SAV — proprietary save-game format (packet skeleton
           //      observed in loader strings; no envelope)

@@ -82,7 +82,7 @@ families in BUILD_A, cross-checked against loader code:
 | u32 @16 = fileSize − 12 | OBSERVED (46/46 tag family) | semantics UNKNOWN — possibly an inner section/chunk length covering `[12, size)`; not interpreted |
 | end of envelope | OBSERVED | declared length ends exactly at EOF (single envelope per file) |
 | name-field trailer | OBSERVED (46/46 tag family) | last 12 bytes of every tagged file repeat the name field; u32@16 = size−12 == that trailer's file offset |
-| interior structure | OBSERVED for `.SNI`, `.MTI`, `.MTO`, `.CMI` | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory; `.MTI` = count@0x14 + 24-byte `{name[8], flags, u32, u32, blobOff}` directory with index/payload record classes; `.MTO` = count@0x14 + 12-byte `{name[8], fileOff}` overlay directory; `.CMI` = four counted variable-length tables `{u8 len, name[len], u32 imgOff}` + bounded data region — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
+| interior structure | OBSERVED for `.SNI`, `.MTI`, `.MTO`, `.CMI`, `.DTI` | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory; `.MTI` = count@0x14 + 24-byte `{name[8], flags, u32, u32, blobOff}` directory with index/payload record classes; `.MTO` = count@0x14 + 12-byte `{name[8], fileOff}` overlay directory; `.CMI` = four counted variable-length tables `{u8 len, name[len], u32 imgOff}` + bounded data region; `.DTI` = five-section image-relative TOC + sections — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
 | padding/alignment | OBSERVED | name field NUL-padded to 12; `.SNI` payloads 4-byte aligned (gaps 0 or 2) |
 | malformed handling | OBSERVED (code) | tag≠stem → treated as stale HD copy → re-copied from CD root (`FUN_0041ae50`) |
 
@@ -117,7 +117,7 @@ envelope grouping stays consistent.
 | Family | Extensions | Envelope | Status |
 |---|---|---|---|
 | tag envelope | `.MTO .SNI .MTI .CMI .DTI` | u32 len + 12-byte name | parsed (`kTaggedName`) |
-| length envelope only | `.FTI .BNI` | u32 len only; field@4 non-ASCII | classified, not interpreted |
+| length envelope only | `.FTI .BNI` | u32 len only; field@4 non-ASCII | parsed (`kLengthEnvelope` + directory) |
 | other / non-container | `.LBB` (raw), `.SAV`, standard `.FLC .MVE .GIF .FRC`, text/executables | none claimed | rejected by probe |
 | unknown | everything else | — | reported as unknown |
 
@@ -140,7 +140,8 @@ logical name, stem-match, and the raw second u32 @16 (uninterpreted).
 `mdk-inspect --data-path DIR --entries <rel-path>` additionally reads
 the whole file (bounded) and enumerates the interior directory where a
 proven parser exists — `.SNI` (Phase 3C), `.MTI` (Phase 3D), `.MTO`
-(Phase 3E), `.CMI` (Phase 3F) and `.DTI` (Phase 3G):
+(Phase 3E), `.CMI` (Phase 3F), `.DTI` (Phase 3G), `.FTI` and `.BNI`
+(Phase 3H):
 entry count, directory end, trailer status, and per-record metadata.
 For `.SNI`: name/raw field/blob offset/resolved file offset/size;
 sentinel records (`field==size==0xffffffff`) are reported as position
@@ -162,10 +163,17 @@ the s2 arena table (name[8], payload offset, scalar, and the
 enumerated 36-byte typed sub-records), the s3 palette count/span, and
 the s4 grid plane geometry — `--entries` is the generic
 metadata-inspection verb here even though `.DTI` is a sectioned
-bundle rather than a flat name directory. Families without a proven
-interior parser are rejected with the support level — never guessed.
+bundle rather than a flat name directory. For `.FTI`/`.BNI` (the
+length-only envelope families): record count, directory end, offset
+ordering flags, and per-record name/imgOff/resolved file offset/
+payload span — `.FTI` records are `{name[8], u32}` at 12-byte stride,
+`.BNI` records `{name[12], u32}` at 16-byte stride; payload spans are
+derived from the next stored offset (no stored sizes). Families
+without a proven interior parser are rejected with the support level —
+never guessed.
 `--selftest` runs synthetic envelope + SNI- + MTI- + MTO- +
-CMI-directory + DTI-structure checks. Links `mdk_core` — the same
+CMI-directory + DTI-structure + FTI- + BNI-directory checks. Links
+`mdk_core` — the same
 code the app uses. Never prints payload bytes; never writes into the
 data root.
 
@@ -242,6 +250,23 @@ Phase 3G additions (all via `mdk-inspect --entries`, read-only):
   parsers.
 - Manifest re-verified after Phase 3G inspection: 141/141 unchanged.
 
+Phase 3H additions (all via `mdk-inspect --entries`, read-only):
+
+- All 5 `.FTI` files enumerate `ok` — 315 records each (1,575 total):
+  `u32 count @0x04` + 12-byte `{name[8], u32 imgOff}` records @0x08,
+  image = file+4. Stored offsets sorted+unique in all five; the first
+  payload always begins exactly at the directory end; payloads tile
+  to EOF (no trailer). 81/315 names per file fill all 8 bytes with no
+  NUL — legal under the original's exact two-u32 compare.
+- All 6 `.BNI` files enumerate `ok` — counts 3–67 (178 records):
+  `u32 count @0x04` + 16-byte `{name[12], u32 imgOff}` records @0x08.
+  All names NUL-terminated within 12 bytes (longest 9 — `BONESANIM`);
+  offsets sorted+unique; payloads tile to EOF. One structural class
+  across all six despite heterogeneous payload content.
+- `.LBB` correctly remains `unsupported` and rejects `--entries`;
+  `.SNI/.MTI/.MTO/.CMI/.DTI` keep their own parsers.
+- Manifest re-verified after Phase 3H inspection: 141/141 unchanged.
+
 ## Explicit unknowns (not implemented)
 
 - `.CMI` data-region interior (≈99.9% of each file): the record
@@ -264,8 +289,9 @@ Phase 3G additions (all via `mdk-inspect --entries`, read-only):
 - Semantics of the u32@16 field (equals size−12 == trailer offset in
   all tagged files; never read by the SNI loader) and the 12-byte
   trailer itself.
-- `.FTI`/`.BNI` directory layout (count-like u32 + 8-byte names is a
-  shape observation only).
+- `.FTI`/`.BNI` payload interiors — the directories are proven and
+  enumerable; per-payload structure and any per-payload typing remain
+  UNKNOWN (bounded only — see DATA_FORMATS.md).
 - `.LBB`, `.SAV`, `.386` formats.
 - Compression/encryption (none observed anywhere).
 - Whether a retail/GOG dump matches BUILD_A bytes.

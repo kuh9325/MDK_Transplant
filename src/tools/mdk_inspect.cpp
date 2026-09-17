@@ -9,11 +9,13 @@
 //   mdk-inspect --selftest        (synthetic in-memory checks)
 
 #include "core/binary_reader.h"
+#include "core/bni_directory.h"
 #include "core/cmi_directory.h"
 #include "core/container.h"
 #include "core/data_root.h"
 #include "core/dti_structure.h"
 #include "core/file_family.h"
+#include "core/fti_directory.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/sni_directory.h"
@@ -436,6 +438,94 @@ int selftest() {
        dst.trailerPresent && dst.secondaryEqualsTrailerOffset;
   std::fprintf(stderr, "selftest dti-structure: %s\n",
                ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic FTI-like fixture (no original data): length-only
+  // envelope + count=2 + two 12-byte records {name[8], imgOff}. One
+  // name fills all 8 bytes (no NUL — OBSERVED legal form).
+  //   0x00 len=size-4, 0x04 count=2, 0x08..0x20 records,
+  //   payloads 0x20..0x38.
+  std::byte fti[0x38] = {};
+  const auto fput32 = [&](std::size_t off, std::uint32_t v) {
+    fti[off + 0] = static_cast<std::byte>(v & 0xff);
+    fti[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    fti[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    fti[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  };
+  const auto fputName = [&](std::size_t off, const char* s) {
+    for (std::size_t i = 0; s[i] && off + i < sizeof(fti); ++i) {
+      fti[off + i] = static_cast<std::byte>(s[i]);
+    }
+  };
+  fput32(0x00, sizeof(fti) - 4);
+  fput32(0x04, 2);
+  fputName(0x08, "EIGHTCHR");        // fills name[8] — no NUL
+  fput32(0x10, 0x20 - 4);            // imgOff -> file 0x20
+  fputName(0x14, "TWO");
+  fput32(0x1c, 0x30 - 4);            // imgOff -> file 0x30
+
+  const auto fdir = mdk::inspectFtiDirectory(
+      std::span<const std::byte>(fti, sizeof(fti)));
+  ok = fdir.status == mdk::FtiDirectoryStatus::kOk &&
+       fdir.count == 2 && fdir.records.size() == 2 &&
+       fdir.directoryEnd == 0x20 &&
+       fdir.records[0].name() == "EIGHTCHR" &&
+       !fdir.records[0].nameHasTerminator &&
+       fdir.records[0].payloadFileOffset == 0x20 &&
+       fdir.records[0].payloadEnd == 0x30 &&
+       fdir.records[1].name() == "TWO" &&
+       fdir.records[1].nameHasTerminator &&
+       fdir.records[1].payloadFileOffset == 0x30 &&
+       fdir.records[1].payloadEnd == sizeof(fti) &&
+       fdir.offsetsSortedAscending && fdir.offsetsUnique &&
+       fdir.firstPayloadAtDirectoryEnd;
+  std::fprintf(stderr, "selftest fti-directory: %s\n",
+               ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic BNI-like fixture (no original data): length-only
+  // envelope + count=2 + two 16-byte records {name[12], imgOff};
+  // one 9-char name (OBSERVED legal form: "BONESANIM").
+  //   0x00 len, 0x04 count=2, 0x08..0x28 records, payloads 0x28..0x40.
+  std::byte bni[0x40] = {};
+  const auto bput32 = [&](std::size_t off, std::uint32_t v) {
+    bni[off + 0] = static_cast<std::byte>(v & 0xff);
+    bni[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    bni[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    bni[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  };
+  const auto bputName = [&](std::size_t off, const char* s) {
+    for (std::size_t i = 0; s[i] && off + i < sizeof(bni); ++i) {
+      bni[off + i] = static_cast<std::byte>(s[i]);
+    }
+  };
+  bput32(0x00, sizeof(bni) - 4);
+  bput32(0x04, 2);
+  bputName(0x08, "BONESANIM");       // 9 chars in name[12]
+  bput32(0x08 + 0x0c, 0x28 - 4);     // imgOff -> file 0x28
+  bputName(0x18, "RES2");
+  bput32(0x18 + 0x0c, 0x38 - 4);     // imgOff -> file 0x38
+
+  const auto bdir = mdk::inspectBniDirectory(
+      std::span<const std::byte>(bni, sizeof(bni)));
+  ok = bdir.status == mdk::BniDirectoryStatus::kOk &&
+       bdir.count == 2 && bdir.records.size() == 2 &&
+       bdir.directoryEnd == 0x28 &&
+       bdir.records[0].name() == "BONESANIM" &&
+       bdir.records[0].nameHasTerminator &&
+       bdir.records[0].payloadFileOffset == 0x28 &&
+       bdir.records[0].payloadEnd == 0x38 &&
+       bdir.records[1].name() == "RES2" &&
+       bdir.records[1].payloadFileOffset == 0x38 &&
+       bdir.records[1].payloadEnd == sizeof(bni) &&
+       bdir.offsetsSortedAscending && bdir.offsetsUnique &&
+       bdir.firstPayloadAtDirectoryEnd;
+  std::fprintf(stderr, "selftest bni-directory: %s\n",
+               ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 
@@ -581,7 +671,8 @@ int main(int argc, char** argv) {
 
   // --entries: enumerate interior directory metadata where a proven
   // parser exists (SNI Phase 3C; MTI Phase 3D; MTO Phase 3E; CMI
-  // Phase 3F). Never prints payload bytes.
+  // Phase 3F; DTI Phase 3G; FTI/BNI Phase 3H). Never prints payload
+  // bytes.
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
     std::printf("entries:   unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
@@ -934,6 +1025,80 @@ int main(int argc, char** argv) {
                 st.gridPlaneCount,
                 static_cast<unsigned long long>(st.gridPlaneSize),
                 st.s4TrailingBytes ? " (trailing bytes)" : "");
+    return 0;
+  }
+
+  if (family == mdk::MdkFileFamily::kFti) {
+    const auto dir = mdk::inspectFtiDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    std::printf("entries:   FTI directory (length envelope; count u32 "
+                "@0x04, records 12 bytes @0x08: name[8] + imgOff)\n");
+    std::printf("status:    %s%s%s\n",
+                std::string(mdk::ftiDirectoryStatusName(dir.status))
+                    .c_str(),
+                dir.detail.empty() ? "" : " — ",
+                dir.detail.empty() ? "" : dir.detail.c_str());
+    if (dir.status != mdk::FtiDirectoryStatus::kOk) {
+      return 1;
+    }
+    std::printf("count:     %u\n", dir.count);
+    std::printf("dir-end:   0x%llx\n",
+                static_cast<unsigned long long>(dir.directoryEnd));
+    std::printf("offsets:   sorted=%s unique=%s first-at-dir-end=%s\n",
+                dir.offsetsSortedAscending ? "yes" : "NO",
+                dir.offsetsUnique ? "yes" : "NO",
+                dir.firstPayloadAtDirectoryEnd ? "yes" : "NO");
+
+    for (std::size_t i = 0; i < dir.records.size(); ++i) {
+      const auto& e = dir.records[i];
+      std::printf("  [%3zu] @0x%06llx %-8s imgOff=0x%08x "
+                  "->file=0x%08llx span=[0x%08llx,0x%08llx) %lluB%s\n",
+                  i,
+                  static_cast<unsigned long long>(e.recordFileOffset),
+                  e.name().c_str(), e.imageOffset,
+                  static_cast<unsigned long long>(e.payloadFileOffset),
+                  static_cast<unsigned long long>(e.payloadFileOffset),
+                  static_cast<unsigned long long>(e.payloadEnd),
+                  static_cast<unsigned long long>(e.payloadSize()),
+                  e.nameHasTerminator ? "" : " [no NUL]");
+    }
+    return 0;
+  }
+
+  if (family == mdk::MdkFileFamily::kBni) {
+    const auto dir = mdk::inspectBniDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    std::printf("entries:   BNI directory (length envelope; count u32 "
+                "@0x04, records 16 bytes @0x08: name[12] + imgOff)\n");
+    std::printf("status:    %s%s%s\n",
+                std::string(mdk::bniDirectoryStatusName(dir.status))
+                    .c_str(),
+                dir.detail.empty() ? "" : " — ",
+                dir.detail.empty() ? "" : dir.detail.c_str());
+    if (dir.status != mdk::BniDirectoryStatus::kOk) {
+      return 1;
+    }
+    std::printf("count:     %u\n", dir.count);
+    std::printf("dir-end:   0x%llx\n",
+                static_cast<unsigned long long>(dir.directoryEnd));
+    std::printf("offsets:   sorted=%s unique=%s first-at-dir-end=%s\n",
+                dir.offsetsSortedAscending ? "yes" : "NO",
+                dir.offsetsUnique ? "yes" : "NO",
+                dir.firstPayloadAtDirectoryEnd ? "yes" : "NO");
+
+    for (std::size_t i = 0; i < dir.records.size(); ++i) {
+      const auto& e = dir.records[i];
+      std::printf("  [%3zu] @0x%06llx %-12s imgOff=0x%08x "
+                  "->file=0x%08llx span=[0x%08llx,0x%08llx) %lluB%s\n",
+                  i,
+                  static_cast<unsigned long long>(e.recordFileOffset),
+                  e.name().c_str(), e.imageOffset,
+                  static_cast<unsigned long long>(e.payloadFileOffset),
+                  static_cast<unsigned long long>(e.payloadFileOffset),
+                  static_cast<unsigned long long>(e.payloadEnd),
+                  static_cast<unsigned long long>(e.payloadSize()),
+                  e.nameHasTerminator ? "" : " [no NUL]");
+    }
     return 0;
   }
 

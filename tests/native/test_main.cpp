@@ -2,6 +2,7 @@
 // those paths are exercised by the runtime smoke test instead.
 
 #include "core/binary_reader.h"
+#include "core/bni_directory.h"
 #include "core/cmi_directory.h"
 #include "core/compat.h"
 #include "core/container.h"
@@ -9,6 +10,7 @@
 #include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/fti_directory.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
@@ -287,7 +289,7 @@ void test_file_family() {
   CHECK(fileFamilyForPath("a.SNI.bak") == MdkFileFamily::kUnknown);
 
   // Support levels (Phase 3C: SNI; Phase 3D: MTI; Phase 3E: MTO;
-  // Phase 3F: CMI; Phase 3G: DTI).
+  // Phase 3F: CMI; Phase 3G: DTI; Phase 3H: FTI/BNI).
   CHECK(fileFamilySupport(MdkFileFamily::kSni) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kMti) ==
@@ -299,9 +301,9 @@ void test_file_family() {
   CHECK(fileFamilySupport(MdkFileFamily::kDti) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kFti) ==
-        FamilySupport::kEnvelopeOnly);
+        FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kBni) ==
-        FamilySupport::kEnvelopeOnly);
+        FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kFlic) ==
         FamilySupport::kStandardExternalFormat);
   CHECK(fileFamilySupport(MdkFileFamily::kMve) ==
@@ -1982,6 +1984,351 @@ void test_dti_structure() {
   }
 }
 
+// Synthetic FTI file builder (no original data). Layout mirrors the
+// CODE-CORROBORATED structure: [u32 size-4][u32 count]
+// [count x 12B {name[8], imgOff}][payloads to EOF].
+struct SyntheticFti {
+  std::vector<std::byte> buf;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 8) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+  void putBytes(std::size_t off, std::initializer_list<int> bytes) {
+    std::size_t i = 0;
+    for (int b : bytes)
+      buf[off + i++] = static_cast<std::byte>(b & 0xff);
+  }
+
+  // entries: {name, payloadSize}; payloads laid out contiguously from
+  // directory end (the OBSERVED corpus packing).
+  static SyntheticFti
+  build(std::initializer_list<
+        std::pair<const char*, std::uint32_t>> entries) {
+    SyntheticFti s;
+    const std::uint32_t count = static_cast<std::uint32_t>(entries.size());
+    const std::uint64_t dirEnd = 0x08 + std::uint64_t(count) * 12;
+    std::uint64_t total = dirEnd;
+    for (const auto& [n, sz] : entries)
+      total += sz;
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.put32(0x04, count);
+    std::uint64_t payloadAt = dirEnd;
+    std::uint32_t i = 0;
+    for (const auto& [n, sz] : entries) {
+      const std::uint64_t rec = 0x08 + std::uint64_t(i) * 12;
+      s.putName(rec, n);
+      s.put32(rec + 0x08,
+              static_cast<std::uint32_t>(payloadAt - 4)); // img-relative
+      payloadAt += sz;
+      ++i;
+    }
+    return s;
+  }
+};
+
+void test_fti_directory() {
+  using mdk::FtiDirectoryStatus;
+  using mdk::inspectFtiDirectory;
+
+  // Valid three-entry directory: offsets tile from dirEnd to EOF.
+  {
+    auto s = SyntheticFti::build({{"FIRST", 10}, {"SECOND", 6},
+                                  {"EIGHTCHR", 4}});
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOk);
+    CHECK(d.count == 3);
+    CHECK(d.directoryEnd == 0x2c);
+    CHECK(d.records.size() == 3);
+    CHECK(d.records[0].name() == "FIRST");
+    CHECK(d.records[0].payloadFileOffset == 0x2c);
+    CHECK(d.records[0].payloadEnd == 0x36);
+    CHECK(d.records[0].payloadSize() == 10);
+    CHECK(d.records[1].payloadFileOffset == 0x36);
+    CHECK(d.records[1].payloadSize() == 6);
+    CHECK(d.records[2].name() == "EIGHTCHR");
+    CHECK(!d.records[2].nameHasTerminator);   // full 8 bytes, no NUL
+    CHECK(d.records[2].payloadEnd == s.buf.size());
+    CHECK(d.offsetsSortedAscending);
+    CHECK(d.offsetsUnique);
+    CHECK(d.firstPayloadAtDirectoryEnd);
+  }
+
+  // Zero-record directory: count=0; payload region [0x08, size).
+  {
+    auto s = SyntheticFti::build({});
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOk);
+    CHECK(d.count == 0);
+    CHECK(d.directoryEnd == 0x08);
+    CHECK(d.records.empty());
+    CHECK(!d.firstPayloadAtDirectoryEnd);
+  }
+
+  // Names with no NUL in the 8-byte field are legal (exact two-u32
+  // compare) — preserved raw, decoded for display.
+  {
+    auto s = SyntheticFti::build({{"ABCDEFGH", 4}});
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOk);
+    CHECK(d.records[0].name() == "ABCDEFGH");
+    CHECK(!d.records[0].nameHasTerminator);
+  }
+
+  // Non-ASCII bytes inside the name field are preserved raw; the
+  // decoded name escapes them (display only).
+  {
+    auto s = SyntheticFti::build({{"AB", 4}});
+    s.putBytes(0x08, {0x80, 0x41, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00});
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOk);
+    CHECK(d.records[0].nameField[0] == std::byte{0x80});
+    CHECK(d.records[0].name() == "\\x80" "A");
+    CHECK(d.records[0].nameHasTerminator);
+  }
+
+  // Tagged-name envelope → not this family.
+  {
+    auto sni = SyntheticSni::build("X.SND", {});
+    const auto d = inspectFtiDirectory(sni.buf);
+    CHECK(d.status == FtiDirectoryStatus::kNotLengthEnvelope);
+  }
+
+  // Bad declared length → not this envelope.
+  {
+    auto s = SyntheticFti::build({{"A", 4}});
+    s.put32(0x00, 0xdeadbeef);
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kNotLengthEnvelope);
+  }
+
+  // Truncated file (< 8 bytes) → header bound fails.
+  {
+    const std::array<std::byte, 6> tiny = {
+        std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{1}, std::byte{0}};
+    const auto d = inspectFtiDirectory(tiny);
+    CHECK(d.status == FtiDirectoryStatus::kTruncatedHeader);
+  }
+
+  // Impossible count → directory bound fails (division-first math).
+  {
+    auto s = SyntheticFti::build({{"A", 4}});
+    s.put32(0x04, 0x00ffffff);
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kDirectoryOutOfBounds);
+  }
+
+  // Stored offset pointing into the directory → rejected.
+  {
+    auto s = SyntheticFti::build({{"A", 8}, {"B", 4}});
+    s.put32(0x08 + 0x08, 0x04);  // img 0x04 -> file 0x08 (inside dir)
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOffsetOutOfBounds);
+    CHECK(d.badRecordIndex == 0);
+  }
+
+  // Stored offset past EOF → rejected.
+  {
+    auto s = SyntheticFti::build({{"A", 4}});
+    s.put32(0x08 + 0x08, static_cast<std::uint32_t>(s.buf.size()));
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOffsetOutOfBounds);
+  }
+
+  // Offset exactly at EOF is a legal empty-tail form.
+  {
+    auto s = SyntheticFti::build({{"A", 4}, {"Z", 0}});
+    s.put32(0x08 + 0x0c + 0x08,
+            static_cast<std::uint32_t>(s.buf.size() - 4));
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOk);
+    CHECK(d.records[1].payloadFileOffset == s.buf.size());
+    CHECK(d.records[1].payloadSize() == 0);
+  }
+
+  // Unsorted offsets: still enumerated (spans follow sorted order),
+  // reported via the flag — corpus files are all sorted.
+  {
+    auto s = SyntheticFti::build({{"A", 8}, {"B", 4}});
+    // Swap the two offsets: A -> second payload, B -> first.
+    const std::uint64_t dirEnd = 0x08 + 2 * 12;
+    s.put32(0x08 + 0x08,
+            static_cast<std::uint32_t>(dirEnd + 8 - 4)); // A -> dirEnd+8
+    s.put32(0x14 + 0x08,
+            static_cast<std::uint32_t>(dirEnd - 4));     // B -> dirEnd
+    const auto d = inspectFtiDirectory(s.buf);
+    CHECK(d.status == FtiDirectoryStatus::kOk);
+    CHECK(!d.offsetsSortedAscending);
+    CHECK(d.records[0].payloadFileOffset == dirEnd + 8);
+    CHECK(d.records[0].payloadEnd == s.buf.size());  // last in sort order
+    CHECK(d.records[1].payloadFileOffset == dirEnd);
+    CHECK(d.records[1].payloadEnd == dirEnd + 8);
+  }
+}
+
+// Synthetic BNI file builder (no original data). Layout mirrors the
+// CODE-CORROBORATED structure: [u32 size-4][u32 count]
+// [count x 16B {name[12], imgOff}][payloads to EOF].
+struct SyntheticBni {
+  std::vector<std::byte> buf;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 12) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+
+  // entries: {name, payloadSize}; payloads laid out contiguously from
+  // directory end (the OBSERVED corpus packing).
+  static SyntheticBni
+  build(std::initializer_list<
+        std::pair<const char*, std::uint32_t>> entries) {
+    SyntheticBni s;
+    const std::uint32_t count = static_cast<std::uint32_t>(entries.size());
+    const std::uint64_t dirEnd = 0x08 + std::uint64_t(count) * 16;
+    std::uint64_t total = dirEnd;
+    for (const auto& [n, sz] : entries)
+      total += sz;
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.put32(0x04, count);
+    std::uint64_t payloadAt = dirEnd;
+    std::uint32_t i = 0;
+    for (const auto& [n, sz] : entries) {
+      const std::uint64_t rec = 0x08 + std::uint64_t(i) * 16;
+      s.putName(rec, n);
+      s.put32(rec + 0x0c,
+              static_cast<std::uint32_t>(payloadAt - 4)); // img-relative
+      payloadAt += sz;
+      ++i;
+    }
+    return s;
+  }
+};
+
+void test_bni_directory() {
+  using mdk::BniDirectoryStatus;
+  using mdk::inspectBniDirectory;
+
+  // Valid three-entry directory, including a 9-char name (OBSERVED
+  // "BONESANIM" — names are not limited to 8 chars).
+  {
+    auto s = SyntheticBni::build({{"KURT", 10}, {"BONESANIM", 6},
+                                  {"RES3", 4}});
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kOk);
+    CHECK(d.count == 3);
+    CHECK(d.directoryEnd == 0x38);
+    CHECK(d.records.size() == 3);
+    CHECK(d.records[0].name() == "KURT");
+    CHECK(d.records[0].payloadFileOffset == 0x38);
+    CHECK(d.records[0].payloadSize() == 10);
+    CHECK(d.records[1].name() == "BONESANIM");
+    CHECK(d.records[1].nameHasTerminator);
+    CHECK(d.records[1].payloadFileOffset == 0x42);
+    CHECK(d.records[2].payloadEnd == s.buf.size());
+    CHECK(d.offsetsSortedAscending);
+    CHECK(d.offsetsUnique);
+    CHECK(d.firstPayloadAtDirectoryEnd);
+  }
+
+  // Zero-record directory: count=0 is legal.
+  {
+    auto s = SyntheticBni::build({});
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kOk);
+    CHECK(d.count == 0);
+    CHECK(d.directoryEnd == 0x08);
+    CHECK(d.records.empty());
+  }
+
+  // A name without a NUL inside the 12-byte field is an anomaly (the
+  // original's unbounded compare would read into the offset word) —
+  // still structurally valid; reported via the flag.
+  {
+    auto s = SyntheticBni::build({{"TWELVECHARS!", 4}});
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kOk);
+    CHECK(d.records[0].name() == "TWELVECHARS!");
+    CHECK(!d.records[0].nameHasTerminator);
+  }
+
+  // Tagged-name envelope → not this family.
+  {
+    auto sni = SyntheticSni::build("X.SND", {});
+    const auto d = inspectBniDirectory(sni.buf);
+    CHECK(d.status == BniDirectoryStatus::kNotLengthEnvelope);
+  }
+
+  // Bad declared length → not this envelope.
+  {
+    auto s = SyntheticBni::build({{"A", 4}});
+    s.put32(0x00, 0xdeadbeef);
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kNotLengthEnvelope);
+  }
+
+  // Truncated file (< 8 bytes) → header bound fails.
+  {
+    const std::array<std::byte, 6> tiny = {
+        std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{1}, std::byte{0}};
+    const auto d = inspectBniDirectory(tiny);
+    CHECK(d.status == BniDirectoryStatus::kTruncatedHeader);
+  }
+
+  // Impossible count → directory bound fails.
+  {
+    auto s = SyntheticBni::build({{"A", 4}});
+    s.put32(0x04, 0x00ffffff);
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kDirectoryOutOfBounds);
+  }
+
+  // Stored offset pointing into the directory → rejected.
+  {
+    auto s = SyntheticBni::build({{"A", 8}, {"B", 4}});
+    s.put32(0x08 + 0x0c, 0x04);  // img 0x04 -> file 0x08 (inside dir)
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kOffsetOutOfBounds);
+    CHECK(d.badRecordIndex == 0);
+  }
+
+  // Stored offset past EOF → rejected.
+  {
+    auto s = SyntheticBni::build({{"A", 4}});
+    s.put32(0x08 + 0x0c, static_cast<std::uint32_t>(s.buf.size()));
+    const auto d = inspectBniDirectory(s.buf);
+    CHECK(d.status == BniDirectoryStatus::kOffsetOutOfBounds);
+  }
+
+  // Cross-family byte check: a BNI-shaped file fed to the FTI parser
+  // (and vice versa) must not be accepted — different record layouts.
+  {
+    auto b = SyntheticBni::build({{"KURT", 8}, {"EXPLODE", 4}});
+    const auto d = mdk::inspectFtiDirectory(b.buf);
+    CHECK(d.status != mdk::FtiDirectoryStatus::kOk);
+    auto f = SyntheticFti::build({{"FONTSML", 8}, {"SND_PUSH", 4}});
+    const auto d2 = inspectBniDirectory(f.buf);
+    CHECK(d2.status != BniDirectoryStatus::kOk);
+  }
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
@@ -2179,6 +2526,8 @@ int main() {
   test_mto_directory();
   test_cmi_directory();
   test_dti_structure();
+  test_fti_directory();
+  test_bni_directory();
   test_data_root();
   test_mode_dispatch();
   test_input_state();

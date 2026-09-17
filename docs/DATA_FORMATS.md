@@ -36,8 +36,8 @@ delegates to it — no duplicated extension tables.
 | MTI | `.MTI` | tagged-name | **directory-metadata** | count + 24-byte records `{name[8], u32 flags, u32, u32, u32 off}` proven (below) |
 | CMI | `.CMI` | tagged-name | **directory-metadata** | four counted variable-length tables `{u8 len, name[len], u32 imgOff}` + bounded data region (below) |
 | DTI | `.DTI` | tagged-name | **directory-metadata** | five-section image-relative TOC: params / keyed records / arena table (+typed 36-byte payloads) / RGB table / byte grid (below) |
-| FTI | `.FTI` | length only | envelope-only | count-like u32 + 8-byte names (shape observation only) |
-| BNI | `.BNI` | length only | envelope-only | same shape as FTI |
+| FTI | `.FTI` | length only | **directory-metadata** | count + 12-byte `{name[8], u32 imgOff}` records → payloads tiling to EOF (below) |
+| BNI | `.BNI` | length only | **directory-metadata** | count + 16-byte `{name[12], u32 imgOff}` records → payloads tiling to EOF (below) |
 | LBB | `.LBB` | none observed | unsupported | raw structure; fails u32@0 envelope |
 | SAV | `.SAV` | none observed | unsupported | save-game packet skeleton (per loader strings); no envelope |
 | FLIC | `.FLC` | — | standard-external-format | Autodesk FLIC (magic 0xAF12 observed) |
@@ -782,6 +782,170 @@ lookup keys are the arena names. PROVEN end to end.
 | `FUN_0046ec60` / `FUN_0047a770` | s4 samplers: column/span copies into framebuffer rows with horizontal wrap; second plane at `s4 + planeSize` when `_DAT_0054ec98` |
 | `FUN_00435178` | Arena payload walker (portal/crossing tests on type-6 endpoint floats) |
 
+## Proven interior directory: FTI
+
+Phase 3H. `.FTI` was the first of the two length-only envelope
+families — same `u32 @0 == size-4` outer rule as the tagged family but
+NO logical-name field at +4 and NO name trailer (bytes [4,8) are a
+small u32 count; `inspectContainer` reports `kLengthEnvelope`).
+
+### Naming note (what is and is not proven)
+
+The disk extension `.FTI` has no proven expansion. The resident image
+global `DAT_0049ff50` belongs to the subsystem that emits
+**"Font table not initialized!"** (`FUN_0047da70` path when the image
+is absent) and two record names are `FONTSML`/`FONTBIG` — the original
+treats this bundle as its font resource table among other things. But
+the 315 payloads per file are heterogeneous: `SND_PUSH` is a RIFF/WAVE
+file, `SYS_PAL` is a 192-byte palette-like table, others carry
+image-like or animation-like data. So "FTI" is documented as a named
+resource directory only — no semantic name is assigned to the format
+or to individual payloads.
+
+### Layout (CODE-CORROBORATED)
+
+```
+file offset
+0x00  u32le    fileSize - 4                 (envelope length)
+0x04  u32le    record count N               (img+0; N=315 in all 5)
+0x08  N x 12   directory records            (img+4):
+  +0x00 name[8]   compared as an EXACT two-u32 equality
+                  (local_24 == rec[0] && local_20 == rec[1] in
+                  FUN_00414890; the query is zero-padded into a
+                  12-byte stack buffer). NOT NUL-terminated when the
+                  name fills the field — 81/315 records per file use
+                  all 8 bytes. Bytes after a NUL still participate in
+                  the original compare.
+  +0x08 u32       image-relative payload offset — the lookup returns
+                  image + value (DAT_0049ff50 + piVar4[2])
+dirEnd  payloads [dirEnd, size): OBSERVED 5/5 — stored offsets unique
+        and sorted ascending in record order; smallest resolves to the
+        directory end exactly; each payload spans to the next stored
+        offset, the last to EOF. No stored sizes.
+```
+
+The not-found path is the shared `"Error finding %s"` fatal
+(`FUN_00408fac`).
+
+### Original loader/lookup functions (static evidence)
+
+| Address | Role (observed behavior) |
+|---|---|
+| `FUN_00425b34` | Whole-blob loader: fread u32@0, alloc, fread remaining → image = file+4; called with `EDX = &DAT_0049ff50` and the path in EAX (disasm of `FUN_00401abc`) |
+| `FUN_00401abc` | Startup: loads `MISC\MDKFONT.FTI` into `DAT_0049ff50`; if `DAT_00541530 != 0`, builds `MISC\FONT%c.FTI` via `FUN_0047d2e9` and reloads into the same slot; `MISC\FONTG.FTI` loads via `FUN_0041b004` |
+| `FUN_00414890` | THE resource lookup — 41 static callers engine-wide: walks `img+4` records with `piVar4 += 3` (12-byte stride), two-u32 name compare, returns `img + rec[+0x08]` |
+| `FUN_0047da70` | Emits `"Font table not initialized!"` when `DAT_0049ff50 == 0` |
+| `FUN_004149c4` | Font-record consumer (resolves `FONTSML`/`FONTBIG`) |
+| `FUN_0040163c` | `SYS_PAL` consumer |
+| `FUN_004236fc` / `FUN_00423734` | `SND_PUSH` consumers |
+
+### BUILD_A FTI inventory (all 5 parse `ok`)
+
+| File | Size | Records | Notes |
+|---|---|---|---|
+| `MISC/MDKFONT.FTI` | 159,954 | 315 | default bundle loaded at startup |
+| `MISC/FONTF.FTI` | 161,319 | 315 | `FONT%c` language variant |
+| `MISC/FONTI.FTI` | 161,055 | 315 | language variant |
+| `MISC/FONTP.FTI` | 160,395 | 315 | language variant |
+| `MISC/FONTS.FTI` | 161,442 | 315 | language variant |
+
+One structural class across the corpus: same count, same record names
+(the five files differ only in localized payload content), offsets
+sorted+unique, first payload at dirEnd, payloads tile to EOF.
+
+## Proven interior directory: BNI
+
+Phase 3H. `.BNI` shares the length-only envelope with FTI but has a
+DIFFERENT record layout — the two families are parallel named-resource
+directories, not one format (evidence: different stride, different
+name width, different compare, different image global).
+
+### Naming note (what is and is not proven)
+
+`.BNI` has no proven expansion. The six files are per-context bundles
+(STATS/OPTIONS/FINISH screens, FALL3D, TRAVSPRT, STREAM) loaded into a
+single global slot `DAT_004a1e38` — one BNI image is live at a time.
+Payloads are heterogeneous (RIFF/WAVE in FINISH/STATS, a 768-byte
+palette-shaped `PAL` record in STREAM, image/animation structures in
+FALL3D/TRAVSPRT). No semantic name is assigned.
+
+### Layout (CODE-CORROBORATED — instruction level)
+
+```
+file offset
+0x00  u32le    fileSize - 4                 (envelope length)
+0x04  u32le    record count N               (img+0; MOV EBX,[img])
+0x08  N x 16   directory records            (img+4; ADD ECX,0x10):
+  +0x00 name[12]  compared by the shared unbounded C-string
+                  comparator FUN_0042fa50 — a well-formed name must
+                  contain a NUL within the field (OBSERVED 178/178:
+                  all NUL-terminated within 12 bytes; longest 9 chars,
+                  "BONESANIM"). A non-terminated field would read the
+                  compare into the offset word — anomaly, reported.
+  +0x0c u32       image-relative payload offset — the lookup returns
+                  image + value (MOV EAX,[img]; ADD EAX,[rec+0xc])
+dirEnd  payloads [dirEnd, size): OBSERVED 6/6 — stored offsets unique
+        and sorted ascending in record order; smallest resolves to the
+        directory end exactly; each payload spans to the next stored
+        offset, the last to EOF. No stored sizes.
+```
+
+The not-found path is the shared `"Error finding %s"` fatal
+(`FUN_004039a4` → `FUN_00408fac`).
+
+### Original loader/lookup functions (static evidence)
+
+| Address | Role (observed behavior) |
+|---|---|
+| `FUN_004038f0` | BNI load wrapper: `MOV EDX,0x4a1e38; CALL FUN_00425a80` |
+| `FUN_0040390c` | BNI load wrapper: `MOV EDX,0x4a1e38; CALL FUN_00425b34` |
+| `FUN_00403928` | BNI load wrapper: `MOV EDX,0x4a1e38; CALL FUN_00425bfc` |
+| `FUN_00403944` | Clears `DAT_004a1e38` (unload) |
+| `FUN_00403958` | THE BNI lookup: count `[img]`, records `img+4`, stride `0x10`, `FUN_0042fa50` name compare, return `img + rec[+0x0c]` |
+| `FUN_004039a4` | Lookup + `"Error finding %s"` fatal on miss |
+| `FUN_004039c8` | Lookup storing the resolved pointer into a caller global — 14 call sites |
+| `FUN_004039d8` / `FUN_004039ec` / `FUN_00403a00` | Lookup variants returning payload+4 / reading u16 fields at the payload head (consumers treat payload heads as structures) |
+| `FUN_0040ef28` | FALL3D.BNI load site (`KURTANIM` resolver) |
+| `FUN_0041b7b4` | Level-bundle loader: builds `FALL3D\FALL3D.BNI`, `%s\TRAVSPRT.BNI`, `STREAM\STREAM.BNI` paths |
+| `FUN_0041d81c` | OPTIONS.BNI load site |
+| `FUN_00429200` | STATS.BNI load site |
+| `FUN_0042b270` | STREAM.BNI load site (`SWH150` resolver) |
+| `FUN_00433d40` | TRAVSPRT.BNI load site (`H150_I` resolver) |
+| `FUN_0047b0fc` | FINISH.BNI load site: streams the image chunked, resolves 5 names into 5 globals |
+
+### BUILD_A BNI inventory (all 6 parse `ok`)
+
+| File | Size | Records | Context |
+|---|---|---|---|
+| `FALL3D/FALL3D.BNI` | 2,481,256 | 67 | fall intro sequence |
+| `MISC/FINISH.BNI` | 273,852 | 5 | finish screen (all payloads RIFF/WAVE-observed) |
+| `MISC/OPTIONS.BNI` | 1,161,192 | 3 | options screen |
+| `MISC/STATS.BNI` | 1,386,068 | 17 | stats screen |
+| `STREAM/STREAM.BNI` | 1,507,653 | 29 | stream sequence (`BONESANIM` 9-char name) |
+| `TRAVERSE/TRAVSPRT.BNI` | 2,333,436 | 57 | traversal sprites/resources |
+
+One structural class across the corpus (same record layout, varying
+counts); no subtypes — the heterogeneity is in payload content only.
+
+### Shared shape vs. FTI — evaluated (Phase 3H requirement)
+
+| Property | FTI | BNI | Same? |
+|---|---|---|---|
+| Envelope | u32@0 = size-4 | u32@0 = size-4 | yes (length-only) |
+| Count location | img+0 | img+0 | yes |
+| Directory start | img+4 | img+4 | yes |
+| Record stride | 12 | 16 | **no** |
+| Name field | 8 bytes, exact two-u32 compare | 12 bytes, unbounded strcmp | **no** |
+| Offset position | +0x08 | +0x0c | no (different field) |
+| Offset base | image-relative | image-relative | yes |
+| Payload framing | sorted tiling to EOF | sorted tiling to EOF | yes |
+| Image global | `DAT_0049ff50` | `DAT_004a1e38` | **no** |
+| Lookup | `FUN_00414890` | `FUN_00403958` | **no** |
+
+Verdict: **shared outer envelope + shared addressing convention only**;
+the interior layouts are distinct and implemented as two separate
+parsers (`src/core/fti_directory.*`, `src/core/bni_directory.*`).
+
 ## Unknown fields
 
 ## Unknown fields
@@ -840,6 +1004,21 @@ lookup keys are the arena names. PROVEN end to end.
 - DTI s3 `count` when < 256: only `count` entries are uploaded — the
   remaining palette entries' provenance is UNKNOWN.
 - The expansion of "DTI"/"DAT": UNKNOWN — no original string names it.
+- FTI payload interiors (all 315 per file): UNKNOWN — bounded only;
+  a few are self-identifying (RIFF/WAVE headers) but no per-record
+  type field exists.
+- FTI post-NUL name bytes: OBSERVED nonzero in some records (the
+  original's two-u32 compare treats them as significant); what they
+  encode beyond name matching is UNKNOWN.
+- The expansion of "FTI": UNKNOWN — the subsystem diagnostic says
+  "Font table", which describes the bundle's role, not the acronym.
+- BNI payload interiors (all records): UNKNOWN — bounded only;
+  payload-head u16 fields are read by FUN_004039d8/9ec/a00 lookup
+  variants but their semantics are UNKNOWN.
+- The expansion of "BNI": UNKNOWN — no original string names it.
+- Whether FTI/BNI payloads carry trailing slack inside their spans:
+  UNKNOWN — spans are inferred from the next stored offset; no stored
+  per-payload sizes exist.
 
 ## Families that do NOT share the SNI layout
 
@@ -857,9 +1036,15 @@ Checked for "same count+stride+field order" against the SNI mechanism:
 - **DTI**: five image-relative TOC offsets @0x14 → heterogeneous
   sections (params / keyed records / arena table / palette / grid) →
   different; proven separately in Phase 3G (above).
+- **FTI**: different envelope entirely (length-only, no tag); count
+  @img+0 + 12-byte `{name[8], imgOff}` records; proven separately in
+  Phase 3H (above).
+- **BNI**: same length-only envelope as FTI but 16-byte
+  `{name[12], imgOff}` records and an unbounded name compare →
+  different; proven separately in Phase 3H (above).
 
-So each tagged family needed its own statics+bytes pass; SNI, MTI,
-MTO, CMI and DTI interiors are all proven now.
+So each family needed its own statics+bytes pass; SNI, MTI, MTO, CMI,
+DTI, FTI and BNI interiors are all proven now.
 
 ## Unsupported payload semantics
 
@@ -869,25 +1054,30 @@ its proven u16 header, to MTO block contents past the proven region
 boundaries, to the CMI data region past its proven target-head shape,
 or to DTI sub-record payload fields past the proven type dispatch
 (the renderer-side field meanings for types 1/3/5/7/8/9 are not
-decoded); nothing in FTI/BNI interiors is decoded. The parsers
+decoded); nothing in FTI/BNI payload interiors is decoded. The parsers
 enumerate boundaries — they never interpret or dump payload bytes.
 
-## Next targets (Phase 3H candidates, not started)
+## Next targets (Phase 4 candidates, not started)
 
-1. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
-2. CMI data-region organization — how records inside the region are
+1. CMI data-region organization — how records inside the region are
    delimited/iterated, and what table[0]/table[2] targets are
    (consumer-side tracing beyond the proven directory structure).
-3. DTI payload type semantics — renderer-side decode of sub-record
+2. DTI payload type semantics — renderer-side decode of sub-record
    types 1/3/5/7/8/9 (geometry/portals/props roles are UNKNOWN; the
    `draw_arena` walker `FUN_00431300` and `FUN_00435178` are the entry
    points), plus the s1 key space.
-4. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
+3. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
    data blocks).
-5. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.
-6. MTI payload data interpretation past the proven header (the
+4. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.
+5. MTI payload data interpretation past the proven header (the
    descriptor's derived shift/mask fields hint at bit-packed data;
    consumer functions needed).
-7. MTO region semantics — what the embedded `.MAT` images, region-A
+6. MTO region semantics — what the embedded `.MAT` images, region-A
    arrays, and region-C arrays drive at load time (consumer-side
    tracing beyond the proven directory structure).
+7. FTI/BNI payload interiors — the directories are enumerable but
+   payload organization is UNKNOWN (candidate entry points: the
+   `FONTSML`/`FONTBIG` font consumers for FTI; `FUN_004039d8`-family
+   payload-head readers for BNI).
+8. `.LBB` structure — the only BUILD_A data family with no proven
+   envelope (separate later analysis).
