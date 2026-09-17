@@ -142,6 +142,100 @@ bool SdlHost::verifySelfTestInput(const InputState& input) const {
          input.wheelY() == 1.0f && input.wheelTicksY() == 1;
 }
 
+// Sentinel device ID stamped on injected selftest events so the
+// isolation filter can distinguish them from real hardware input.
+static constexpr SDL_MouseID kSelftestMouseID = 0xFEEDC0DE;
+static constexpr SDL_KeyboardID kSelftestKeyboardID = 0xFEEDC0DE;
+
+// Event filter for the scripted frontend selftest: keeps injected
+// (sentinel-tagged) events, drops all real key/button/motion input so
+// the physical devices cannot perturb the deterministic script.
+static bool SDLCALL frontendSelftestFilter(void* /*userdata*/,
+                                           SDL_Event* e) {
+  switch (e->type) {
+  case SDL_EVENT_MOUSE_MOTION:
+    return e->motion.which == kSelftestMouseID;
+  case SDL_EVENT_MOUSE_BUTTON_DOWN:
+  case SDL_EVENT_MOUSE_BUTTON_UP:
+    return e->button.which == kSelftestMouseID;
+  case SDL_EVENT_KEY_DOWN:
+  case SDL_EVENT_KEY_UP:
+    return e->key.which == kSelftestKeyboardID;
+  default:
+    return true;
+  }
+}
+
+void SdlHost::isolateHardwareInputForSelftest() {
+  SDL_SetEventFilter(frontendSelftestFilter, nullptr);
+  // The filter only covers events added from now on — discard real
+  // hardware input already queued during window/setup.
+  SDL_FlushEvent(SDL_EVENT_KEY_DOWN);
+  SDL_FlushEvent(SDL_EVENT_KEY_UP);
+  SDL_FlushEvent(SDL_EVENT_MOUSE_MOTION);
+  SDL_FlushEvent(SDL_EVENT_MOUSE_BUTTON_DOWN);
+  SDL_FlushEvent(SDL_EVENT_MOUSE_BUTTON_UP);
+  SDL_FlushEvent(SDL_EVENT_MOUSE_WHEEL);
+}
+
+void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex) {
+  if (!window_ || frameIndex > 3) {
+    return;
+  }
+  const SDL_WindowID id = SDL_GetWindowID(window_);
+  SDL_Event e{};
+  switch (frameIndex) {
+  case 0:  // DOWN-arrow tap: press+release inside one frame.
+    e.type = SDL_EVENT_KEY_DOWN;
+    e.key.windowID = id;
+    e.key.which = kSelftestKeyboardID;
+    e.key.scancode = SDL_SCANCODE_DOWN;
+    e.key.key = SDLK_DOWN;
+    e.key.down = true;
+    SDL_PushEvent(&e);
+    e = SDL_Event{};
+    e.type = SDL_EVENT_KEY_UP;
+    e.key.windowID = id;
+    e.key.which = kSelftestKeyboardID;
+    e.key.scancode = SDL_SCANCODE_DOWN;
+    e.key.key = SDLK_DOWN;
+    e.key.down = false;
+    SDL_PushEvent(&e);
+    break;
+  case 1:  // Arrow from (300,180) to y=139 — inside item-3's band.
+    e.type = SDL_EVENT_MOUSE_MOTION;
+    e.motion.windowID = id;
+    e.motion.which = kSelftestMouseID;
+    e.motion.x = 300.0f;
+    e.motion.y = 139.0f;
+    e.motion.xrel = 0.0f;
+    e.motion.yrel = -41.0f;
+    if (!SDL_PushEvent(&e)) {
+      log::warn(kTag, "frontend selftest: motion push rejected: %s",
+                SDL_GetError());
+    }
+    break;
+  case 2:  // Button down: hit-test then activate (same frame).
+    e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+    e.button.windowID = id;
+    e.button.which = kSelftestMouseID;
+    e.button.button = SDL_BUTTON_LEFT;
+    e.button.down = true;
+    SDL_PushEvent(&e);
+    break;
+  case 3:  // Release: re-arms the original's button latch.
+    e.type = SDL_EVENT_MOUSE_BUTTON_UP;
+    e.button.windowID = id;
+    e.button.which = kSelftestMouseID;
+    e.button.button = SDL_BUTTON_LEFT;
+    e.button.down = false;
+    SDL_PushEvent(&e);
+    break;
+  default:
+    break;
+  }
+}
+
 void SdlHost::windowSizeInPixels(int* w, int* h) const {
   if (window_) {
     SDL_GetWindowSizeInPixels(window_, w, h);

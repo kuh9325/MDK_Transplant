@@ -20,7 +20,8 @@
 #include "platform/sdl_host.h"
 #include "renderer/presenter.h"
 
-#include <SDL3/SDL_scancode.h> // SDL_SCANCODE_ESCAPE for the shell quit key
+#include <SDL3/SDL_mouse.h>    // SDL_BUTTON_* for the button nibble map
+#include <SDL3/SDL_scancode.h> // SDL_SCANCODE_* key translation
 
 #include <cstdio>
 #include <cstdlib>
@@ -348,30 +349,38 @@ static bool loadSpritePreview(DataRoot& root, const std::string& relFile,
   return true;
 }
 
-// Phase 4D options/front-end preview: compose the one proven static
-// front-end frame (FUN_0041dc90 stable entry state) — MDKOPT backdrop
-// + OPT0..OPT4 FONTBIG scaled centered labels + ARROW at the reset
-// mouse position. All bindings resolve through the proven original
-// paths; nothing is user-selectable. Fills `err` -> false on failure.
-static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
-                               Palette& palette, std::string* err) {
+// The decoded original resources the front-end root menu needs —
+// shared by the static Phase 4D preview and the Phase 4E interactive
+// controller. All bindings resolve through the proven original paths.
+struct FrontendResources {
+  IndexedImage backdrop;            // MISC/OPTIONS.BNI record MDKOPT
+  FtiFont fontBig;                  // MISC/MDKFONT.FTI record FONTBIG
+  FtiSprite arrow;                  // record ARROW (frame 0 used)
+  std::vector<std::string> optStrings;  // OPT0..OPT4 C strings
+  bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
+};
+
+// Load and decode every front-end resource. Fills `err` -> false on
+// failure (missing files/records, decode errors).
+static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
+                                  std::string* err) {
   // Backdrop: MISC/OPTIONS.BNI record MDKOPT (Phase 4A decoder).
   const auto bni = root.readFile("MISC/OPTIONS.BNI", kPreviewMaxBytes, err);
   if (!bni) {
-    *err = "options preview: cannot read MISC/OPTIONS.BNI — " + *err;
+    *err = "front-end: cannot read MISC/OPTIONS.BNI — " + *err;
     return false;
   }
   const auto bdir = inspectBniDirectory(
       std::span<const std::byte>(bni->data(), bni->size()));
   if (bdir.status != BniDirectoryStatus::kOk) {
-    *err = "options preview: OPTIONS.BNI directory — " +
+    *err = "front-end: OPTIONS.BNI directory — " +
            std::string(bniDirectoryStatusName(bdir.status)) + " — " +
            bdir.detail;
     return false;
   }
   const BniRecord* mdkopt = findBniRecord(bdir, "MDKOPT");
   if (!mdkopt) {
-    *err = "options preview: record MDKOPT not found in OPTIONS.BNI";
+    *err = "front-end: record MDKOPT not found in OPTIONS.BNI";
     return false;
   }
   const std::span<const std::byte> optPayload(
@@ -379,20 +388,20 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
   std::string derr;
   const auto backdrop = decodeBniPalettedImage(optPayload, &derr);
   if (!backdrop) {
-    *err = "options preview: MDKOPT decode — " + derr;
+    *err = "front-end: MDKOPT decode — " + derr;
     return false;
   }
 
   // FTI resources: FONTBIG font, ARROW sprite, OPT0..OPT4 strings.
   const auto fti = root.readFile("MISC/MDKFONT.FTI", kPreviewMaxBytes, err);
   if (!fti) {
-    *err = "options preview: cannot read MISC/MDKFONT.FTI — " + *err;
+    *err = "front-end: cannot read MISC/MDKFONT.FTI — " + *err;
     return false;
   }
   const auto fdir = inspectFtiDirectory(
       std::span<const std::byte>(fti->data(), fti->size()));
   if (fdir.status != FtiDirectoryStatus::kOk) {
-    *err = "options preview: MDKFONT.FTI directory — " +
+    *err = "front-end: MDKFONT.FTI directory — " +
            std::string(ftiDirectoryStatusName(fdir.status)) + " — " +
            fdir.detail;
     return false;
@@ -401,7 +410,7 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
                         std::span<const std::byte>& out) -> bool {
     recOut = findFtiRecord(fdir, name);
     if (!recOut) {
-      *err = std::string("options preview: record ") + name +
+      *err = std::string("front-end: record ") + name +
              " not found in MDKFONT.FTI";
       return false;
     }
@@ -416,18 +425,17 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
   if (!ftiPayload("FONTBIG", rec, payload)) return false;
   const auto fontBig = decodeFtiFont(payload, &derr);
   if (!fontBig) {
-    *err = "options preview: FONTBIG decode — " + derr;
+    *err = "front-end: FONTBIG decode — " + derr;
     return false;
   }
   if (!ftiPayload("ARROW", rec, payload)) return false;
   const auto arrow = decodeFtiSprite(payload, &derr);
   if (!arrow) {
-    *err = "options preview: ARROW decode — " + derr;
+    *err = "front-end: ARROW decode — " + derr;
     return false;
   }
-  const FtiSpriteFrame* arrowFrame = arrow->frame(0);
-  if (!arrowFrame) {
-    *err = "options preview: ARROW has no frame 0";
+  if (!arrow->frame(0)) {
+    *err = "front-end: ARROW has no frame 0";
     return false;
   }
 
@@ -441,7 +449,7 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
     const std::span<const std::byte> span = payload;
     const void* nul = std::memchr(span.data(), 0, span.size());
     if (!nul) {
-      *err = std::string("options preview: ") + name +
+      *err = std::string("front-end: ") + name +
              " payload is not a NUL-terminated string";
       return false;
     }
@@ -467,19 +475,23 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
     }
   }
 
-  const FrontendMenuSpec spec = frontendMenuSpec(savesExist);
-  std::vector<std::string_view> views(optStrings.begin(),
-                                      optStrings.end());
-  if (!renderFrontendMenuFrame(fb, palette, *backdrop, *fontBig,
-                               *arrowFrame, views, spec, &derr)) {
-    *err = "options preview: compose — " + derr;
-    return false;
-  }
+  res.backdrop = std::move(*backdrop);
+  res.fontBig = std::move(*fontBig);
+  res.arrow = std::move(*arrow);
+  res.optStrings = std::move(optStrings);
+  res.savesExist = savesExist;
+  return true;
+}
 
-  // Deterministic digests (decoded representations, not the PPM).
-  const std::uint64_t fbDigest = fnv1a64(std::span<const std::byte>(
-      reinterpret_cast<const std::byte*>(fb.pixels()),
-      fb.pixelCount()));
+// Deterministic digests of a composed indexed frame — the indexed
+// pixel payload and the RGBA palette, matching the Phase 4D static
+// preview's digest domains.
+static std::uint64_t digestIndexedFb(const IndexedFramebuffer& fb) {
+  return fnv1a64(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(fb.pixels()), fb.pixelCount()));
+}
+
+static std::uint64_t digestPalette(const Palette& palette) {
   std::vector<std::byte> palBytes(palette.size() * 4);
   for (int i = 0; i < palette.size(); ++i) {
     const auto c = palette.get(i);
@@ -488,19 +500,92 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
     palBytes[i * 4 + 2] = static_cast<std::byte>(c.b);
     palBytes[i * 4 + 3] = static_cast<std::byte>(c.a);
   }
-  const std::uint64_t palDigest = fnv1a64(palBytes);
+  return fnv1a64(palBytes);
+}
+
+// Phase 4D options/front-end preview: compose the one proven static
+// front-end frame (FUN_0041dc90 stable entry state) — MDKOPT backdrop
+// + OPT0..OPT4 FONTBIG scaled centered labels + ARROW at the reset
+// mouse position. Fills `err` -> false on failure.
+static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
+                               Palette& palette, std::string* err) {
+  FrontendResources res;
+  if (!loadFrontendResources(root, res, err)) {
+    return false;
+  }
+  const FrontendMenuSpec spec = frontendMenuSpec(res.savesExist);
+  std::vector<std::string_view> views(res.optStrings.begin(),
+                                      res.optStrings.end());
+  std::string derr;
+  if (!renderFrontendMenuFrame(fb, palette, res.backdrop, res.fontBig,
+                               *res.arrow.frame(0), views, spec, &derr)) {
+    *err = "options preview: compose — " + derr;
+    return false;
+  }
+
+  // Deterministic digests (decoded representations, not the PPM).
+  const std::uint64_t fbDigest = digestIndexedFb(fb);
+  const std::uint64_t palDigest = digestPalette(palette);
   log::info(kTag,
             "options preview: MDKOPT %dx%d digest=%016llx | FONTBIG "
             "digest=%016llx | ARROW digest=%016llx | saves=%d sel=%d | "
             "composed fb=%016llx palette=%016llx",
-            backdrop->width, backdrop->height,
-            static_cast<unsigned long long>(imageDigest(*backdrop)),
-            static_cast<unsigned long long>(ftiFontDigest(*fontBig)),
-            static_cast<unsigned long long>(ftiSpriteDigest(*arrow)),
-            savesExist ? 1 : 0, savesExist ? 0 : 1,
+            res.backdrop.width, res.backdrop.height,
+            static_cast<unsigned long long>(imageDigest(res.backdrop)),
+            static_cast<unsigned long long>(ftiFontDigest(res.fontBig)),
+            static_cast<unsigned long long>(ftiSpriteDigest(res.arrow)),
+            res.savesExist ? 1 : 0, res.savesExist ? 0 : 1,
             static_cast<unsigned long long>(fbDigest),
             static_cast<unsigned long long>(palDigest));
   return true;
+}
+
+// Phase 4E — translate the platform InputState into the controller's
+// semantic per-frame input. Original reference points:
+//   prevHeld/nextHeld : DIK_UP/DIK_DOWN with the original keymap's
+//     "held OR pressed during this poll" semantics (mapA bits 103/108).
+//   confirmEdge       : DIK_RETURN non-repeat press edge (bit 28).
+//   attractEdge       : DIK_RIGHT non-repeat press edge (bit 106).
+//   mouseDx/Dy        : integer device deltas — SDL's float pixel
+//     deltas truncate toward zero (nearest integer-domain model).
+//   mouseButtons      : 4-bit nibble bit i = button i+1 held.
+static FrontendMenuInput frontendInputFromSdl(const InputState& input) {
+  FrontendMenuInput fi;
+  bool prevPress = false, nextPress = false;
+  for (const KeyEvent& e : input.keyEvents()) {
+    if (!e.down || e.repeat) {
+      continue;
+    }
+    switch (e.scancode) {
+    case SDL_SCANCODE_UP: prevPress = true; break;
+    case SDL_SCANCODE_DOWN: nextPress = true; break;
+    case SDL_SCANCODE_RETURN: fi.confirmEdge = true; break;
+    case SDL_SCANCODE_RIGHT: fi.attractEdge = true; break;
+    default: break;
+    }
+  }
+  fi.prevHeld = input.keyDown(SDL_SCANCODE_UP) || prevPress;
+  fi.nextHeld = input.keyDown(SDL_SCANCODE_DOWN) || nextPress;
+  fi.mouseDx = static_cast<int>(input.mouseDx());
+  fi.mouseDy = static_cast<int>(input.mouseDy());
+  fi.mouseButtons = static_cast<std::uint8_t>(
+      (input.mouseButtonDown(SDL_BUTTON_LEFT) ? 0x1 : 0) |
+      (input.mouseButtonDown(SDL_BUTTON_RIGHT) ? 0x2 : 0) |
+      (input.mouseButtonDown(SDL_BUTTON_MIDDLE) ? 0x4 : 0) |
+      (input.mouseButtonDown(SDL_BUTTON_X1) ? 0x8 : 0));
+  return fi;
+}
+
+static const char* frontendActionName(FrontendAction a) {
+  switch (a) {
+  case FrontendAction::ContinueGame: return "ContinueGame";
+  case FrontendAction::NewGame: return "NewGame";
+  case FrontendAction::SavedGame: return "SavedGame";
+  case FrontendAction::OpenOptions: return "OpenOptions";
+  case FrontendAction::Quit: return "Quit";
+  case FrontendAction::EnterAttract: return "EnterAttract";
+  default: return "None";
+  }
 }
 
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
@@ -552,6 +637,14 @@ int Application::run() {
   Palette palette;
   DiagnosticScene scene;
 
+  // Phase 4E interactive front-end state (set up only for
+  // --interactive-frontend). The resources and controller persist for
+  // the whole run; `frontendViews` aliases res.optStrings.
+  std::optional<FrontendResources> frontendRes;
+  std::optional<FrontendMenuController> frontendCtl;
+  std::vector<std::string_view> frontendViews;
+  FrontendAction frontendLastAction = FrontendAction::None;
+
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
   // every frame. The synthetic diagnostic scene stays the default
@@ -559,7 +652,8 @@ int Application::run() {
   const bool previewMode = cfg_.previewFile.has_value() ||
                            cfg_.fontPreviewFile.has_value() ||
                            cfg_.spritePreviewFile.has_value() ||
-                           cfg_.optionsPreview;
+                           cfg_.optionsPreview ||
+                           cfg_.interactiveFrontend;
   if (cfg_.previewFile) {
     if (!dataRoot) {
       log::error(kTag, "--preview-resource requires --data-path");
@@ -608,6 +702,28 @@ int Application::run() {
       log::error(kTag, "options preview failed: %s", perr.c_str());
       return 2;
     }
+  } else if (cfg_.interactiveFrontend) {
+    if (!dataRoot) {
+      log::error(kTag, "--interactive-frontend requires --data-path");
+      return 2;
+    }
+    FrontendResources res;
+    std::string perr;
+    if (!loadFrontendResources(*dataRoot, res, &perr)) {
+      log::error(kTag, "interactive front-end load failed: %s",
+                 perr.c_str());
+      return 2;
+    }
+    frontendViews.assign(res.optStrings.begin(), res.optStrings.end());
+    frontendCtl.emplace(res.savesExist);
+    frontendRes.emplace(std::move(res));
+    log::info(kTag,
+              "interactive front-end: saves=%d sel=%d mouse=(%d,%d) — "
+              "UP/DOWN select, RETURN or button activates (semantic "
+              "actions only; downstream systems deferred)",
+              frontendCtl->savesExist() ? 1 : 0,
+              frontendCtl->selection(), frontendCtl->mouseX(),
+              frontendCtl->mouseY());
   } else {
     scene.buildPalette(palette);
   }
@@ -630,7 +746,13 @@ int Application::run() {
   });
 
   if (cfg_.selftest) {
-    host.injectSelfTestEvents();
+    if (frontendCtl) {
+      // Deterministic script: drop all real device input so only the
+      // injected events reach the controller.
+      host.isolateHardwareInputForSelftest();
+    } else {
+      host.injectSelfTestEvents();
+    }
     if (cfg_.frames == 0) {
       cfg_.frames = 10;
     }
@@ -638,10 +760,15 @@ int Application::run() {
 
   while (!dispatcher.quitRequested()) {
     input.beginFrame();
+    if (cfg_.selftest && frontendCtl) {
+      // Scripted interactive selftest: one step per frame (see
+      // SdlHost::pushFrontendSelfTestStep).
+      host.pushFrontendSelfTestStep(clock.frameCount());
+    }
     host.pumpEvents(input);
     const FrameTick t = clock.tick();
 
-    if (cfg_.selftest && t.index == 0) {
+    if (cfg_.selftest && t.index == 0 && !frontendCtl) {
       selftestOk_ = host.verifySelfTestInput(input);
       log::info(kTag, "input selftest: %s",
                 selftestOk_ ? "PASS" : "FAIL");
@@ -649,9 +776,39 @@ int Application::run() {
 
     dispatcher.dispatch({t.index, t.dtSeconds, t.elapsedSeconds});
 
-    // Preview frames are static: the decoded image was blitted once
-    // before the loop; the diagnostic scene owns rendering otherwise.
-    if (!previewMode) {
+    if (frontendCtl) {
+      // Original frame order: poll -> controller update -> draw ->
+      // timing update. renderFrontendMenuDynamic drives the ramp via
+      // per-item itemScale calls in draw order.
+      const FrontendMenuInput fi = frontendInputFromSdl(input);
+      frontendCtl->update(fi);
+      std::string rerr;
+      if (!renderFrontendMenuDynamic(fb, palette,
+                                     frontendRes->backdrop,
+                                     frontendRes->fontBig,
+                                     *frontendRes->arrow.frame(0),
+                                     frontendViews, *frontendCtl,
+                                     &rerr)) {
+        log::error(kTag, "interactive front-end render failed: %s",
+                   rerr.c_str());
+        selftestOk_ = false;
+        dispatcher.requestQuit();
+      }
+      frontendCtl->endFrame(t.dtSeconds * 1000.0);
+      const FrontendAction a = frontendCtl->consumeAction();
+      if (a != FrontendAction::None) {
+        frontendLastAction = a;
+        // Semantic event only — downstream systems deferred. Quit is
+        // proven to close the native preview (maps the original's
+        // DAT_0054148e quit-flag write).
+        log::info(kTag, "frontend action: %s (sel=%d mouse=%d,%d)",
+                  frontendActionName(a), frontendCtl->selection(),
+                  frontendCtl->mouseX(), frontendCtl->mouseY());
+        if (a == FrontendAction::Quit) {
+          dispatcher.requestQuit();
+        }
+      }
+    } else if (!previewMode) {
       scene.render(fb, palette);
     }
     if (!presenter->present(fb, palette)) {
@@ -668,6 +825,32 @@ int Application::run() {
     if (cfg_.frames != 0 && t.index + 1 >= cfg_.frames) {
       dispatcher.requestQuit();
     }
+  }
+
+  // Deterministic dynamic-frame digests for the snapshot record —
+  // same domains as the Phase 4D static preview.
+  if (frontendCtl) {
+    log::info(kTag,
+              "interactive front-end last frame: fb=%016llx "
+              "palette=%016llx",
+              static_cast<unsigned long long>(digestIndexedFb(fb)),
+              static_cast<unsigned long long>(digestPalette(palette)));
+  }
+
+  // Interactive selftest verdict: the scripted sequence must leave
+  // selection 3 (Options) chosen, OpenOptions emitted, and the arrow
+  // at (300,139).
+  if (cfg_.selftest && frontendCtl) {
+    selftestOk_ = selftestOk_ &&
+                  frontendCtl->selection() == 3 &&
+                  frontendLastAction == FrontendAction::OpenOptions &&
+                  frontendCtl->mouseX() == 300 &&
+                  frontendCtl->mouseY() == 139;
+    log::info(kTag,
+              "frontend selftest: %s (sel=%d mouse=%d,%d last=%s)",
+              selftestOk_ ? "PASS" : "FAIL", frontendCtl->selection(),
+              frontendCtl->mouseX(), frontendCtl->mouseY(),
+              frontendActionName(frontendLastAction));
   }
 
   if (cfg_.dumpPpm) {
@@ -752,6 +935,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.spritePreviewRecord = r;
     } else if (!std::strcmp(a, "--preview-options")) {
       cfg.optionsPreview = true;
+    } else if (!std::strcmp(a, "--interactive-frontend")) {
+      cfg.interactiveFrontend = true;
     } else if (!std::strcmp(a, "--selftest")) {
       cfg.selftest = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {

@@ -701,3 +701,234 @@ payload bytes.
    (cleared buffer + OM_* labels + arrow) as a second proven
    composition target.
 3. **`F8` color provenance** — the 1bpp mask font's caller colors.
+
+# Phase 4E — interactive front-end root menu
+
+Phase 4E reconstructs the interactive state of `FUN_0041dc90` — the
+front-end root menu's selection, keyboard/mouse input, hit-test,
+scale ramp, and activation dispatch — and drives the Phase 4D
+composition with it. Everything below is OBSERVED at instruction
+level in `MDK95.EXE` (BUILD_A); private disassembly/decompile notes
+live in `analysis-private/logs/phase4e-evidence.md`.
+
+## Frame protocol (main loop `FUN_0040103c`, OBSERVED)
+
+Each frame runs, in order:
+
+1. `FUN_004187e0` — input poll: keyboard poll `FUN_00419370` builds
+   the logical key bitmap, then `FUN_0046bc18` returns per-frame
+   mouse deltas and the packed 4-button nibble.
+2. `DAT_00541518 += DAT_0049b6e8` — tick advances by the frame step.
+3. `FUN_0041dc90` — the mode handler: input queries, selection
+   updates, idle timer, then the draw pass (labels + arrow) which
+   lazily drives the scale ramp.
+4. `FUN_0042fb68`/`FUN_0042fcd0` — frame timing update.
+
+`FrontendMenuController::update` covers steps 2+3's input half,
+`itemScale` is the draw-pass ramp query, `endFrame` is step 4.
+
+## State (OBSERVED globals → controller fields)
+
+| Original | Meaning |
+|---|---|
+| `DAT_0049aa78` | selection index 0..4 (entry: `!savesExist` → 0 with saves, 1 without) |
+| `DAT_0054bc98` | saves-exist flag (FUN_00428290 SAVES/*.SAV probe) |
+| `DAT_0054b634`/`b638` | logical mouse x/y — reset (300,180) by FUN_00418798 |
+| `DAT_0054b644`/`b648` | per-frame mouse dx/dy (zero → accumulate skipped) |
+| `DAT_0054b64c` | dz (wheel-like) — read by the gate, unused otherwise |
+| `DAT_0054b640` | packed 4-button nibble (bit i = button i+1 held) |
+| `DAT_0054b568`/`b56c` | UP / DOWN held level (keymap bits 103/108) |
+| `DAT_0054b574` | Enter press edge (keymap bit 28 new-press) |
+| `DAT_0054b554` | RIGHT press edge — attract trigger |
+| `DAT_0054b570` | Esc edge — handled by the main loop, not the menu |
+| `DAT_00541518` | tick counter (key-repeat clock) |
+| `DAT_0049b6e8` | frame step 1..4 added to the tick each frame |
+| `DAT_0049aaa4` | idle/attract timer (seconds; reset on selection change) |
+| `DAT_0049ac84`/`ac88` | prev/next repeat deadlines |
+| `DAT_0049ac80` | mouse-button edge latch (re-arms when nibble==0) |
+| `DAT_0054bdc8`..`bdd8` | scale-ramp machine: cur key, prev key, acc |
+| `DAT_0049aa98` | item-list state (0 = stable root list) |
+
+## Keyboard navigation (OBSERVED)
+
+UP (`prev`) and DOWN (`next`) are queried through `FUN_004237b4` /
+`FUN_00423838` — identical bodies with per-key deadline state:
+
+```
+fired = held && tick > deadline
+if (!held)                    deadline = 0
+else if (deadline == 0)       deadline = tick + 30   // first delay
+else if (tick > deadline)     deadline = tick + 3    // repeat period
+else if (tick + 100 < deadline) deadline = 0         // anomalous reset
+if (fired) FUN_00423734()  // SND_PUSH blip — audio deferred
+```
+
+So a press fires immediately, repeats first at tick+31, then every
+~4 ticks (≈133 ms at the paced ~30 fps regime). On fire:
+
+- UP: `sel--; if (sel<0 || (sel==0 && !saves)) sel = 4`
+- DOWN: `sel++; if (sel>=5) sel = saves ? 0 : 1`
+
+Both reset `DAT_0049aaa4` to 0 (999.0 when list state is 1 — a
+transition state unreachable in the stable list). prev runs before
+next within one frame — simultaneous UP+DOWN resolves prev-then-next.
+
+## Mouse update + hit-test (OBSERVED)
+
+`FUN_004187e0` accumulates raw deltas with no sensitivity scaling and
+clamps to the work surface `x∈[0,599]`, `y∈[0,359]` — zero deltas
+skip the accumulate entirely.
+
+Inside `FUN_0041dc90` the hit-test block is gated on
+`dx | dy | buttons` — any mouse input this frame. Inside the gate a
+**second, tighter clamp** applies to the persistent position:
+`x≤590` (`0x24e`), `y≤350` (`0x15e`). Then:
+
+```
+band = trunc((mouseY - 5) / 36)     // x86 IDIV, toward zero
+if (!saves) band += 1               // hidden OPT0 keeps index 0
+if (band in [saves?0:1, 4] && band != sel) { sel = band; idle = 0 }
+```
+
+x is never consulted. Valid bands (saves): y∈[-30,184] → 0..4 since
+negative offsets > -36 truncate to 0; y≥185 → band≥5 invalid.
+No-saves shifts computed bands to indices 1..4. No mouse input →
+gate closed → resting position never selects (OBSERVED: mouse rests
+at (300,180), band 4, yet entry selection is 0).
+
+## Activation (OBSERVED)
+
+`FUN_00423764`: fires on Enter edge (`DAT_0054b574`) OR on
+`latch && buttons != 0` — a button **down-edge** for any of the four
+buttons. The latch (`DAT_0049ac80`) re-arms only when the nibble is
+0. Held buttons do not refire. Enter ignores the latch and fires
+regardless of button state. Hit-test runs before the activation
+query, so a click both selects and activates in the same frame.
+
+Dispatch (`0x41de77` branch block) — emitted as semantic
+`FrontendAction` events only:
+
+| sel | saves | action | original target |
+|---|---|---|---|
+| 0 | yes | `ContinueGame` | save-load path (FUN_00415658) |
+| 0 | no  | `Quit` | unreachable guard — shares the quit branch |
+| 1 | — | `NewGame` | FUN_0041dbd4 + FUN_0041b630 |
+| 2 | — | `SavedGame` | FUN_0041dbd4 + FUN_004202cc |
+| 3 | — | `OpenOptions` | FUN_00420cf0 — sub-menu is Phase 4F |
+| 4 | — | `Quit` | `DAT_0054148e = 1` + FUN_0041dbd4 |
+
+RIGHT edge (`DAT_0054b554`) with list state ≥ 0 forces the attract
+trigger (`EnterAttract`) — the slideshow path (FUN_0041ef74) itself
+is deferred. An activation dispatched earlier in the same frame
+already leaves the menu, so activation wins.
+
+## Scale ramp (FUN_00423a24, OBSERVED)
+
+One machine (`DAT_0054bdc8`..`bdd8`) serves all items, keyed by the
+item's `(centerX, itemY)` pair — the draw call's identity:
+
+```
+if (selFlag):
+  if key != cur: prev = cur; acc = 0; cur = key   // selection moved
+  else:          acc += DAT_0049b6f0              // once per frame
+return cur  : acc>=5 ? 1.0  : 0.65 + acc*0.07
+       prev : acc>=5 ? 0.65 : 1.0  - acc*0.07
+       other: 0.65
+```
+
+`0.07 = 0.35 × 0.2` (d[0x49601c]×d[0x496024]); limit 5.0
+(d[0x496018]). `DAT_0049b6f0` is the smoothed frame-unit value
+(EMA ≈1.0 at the paced regime), so acc advances ≈1/frame → ~5
+frames ≈165 ms per transition, framerate-independent. Quirk
+(reproduced): a mid-ramp reversal makes the interrupted item the
+`prev` key, whose formula assumes a completed 1.0 — it snaps UP to
+1.0 before decaying, instead of freezing mid-ramp.
+
+## Timing (FUN_0042fcd0/FUN_0042fdc8, OBSERVED)
+
+The raw delta is measured against a virtual clock `DAT_0049b700`
+that chases real time at `rawDelta × 25/3 ms` per frame (integer-ms
+domain; `25/3 = 8.3333`, d[0x4971e0]):
+
+```
+rawDelta   = (nowMs - virtualMs) * 120 / 1000   // integer
+frameUnits = rawDelta * 0.25
+smoothed   = smoothed*0.75 + frameUnits*0.25    // DAT_0049b6f0
+deltaSec   = smoothed / 30                       // DAT_0049b6f4
+stepAccum += rawDelta; step = stepAccum>>2; stepAccum &= 3
+step = clamp(step, 1, 4); smoothed capped at 4.0 on clamp
+tick += step                                     // DAT_0049b6e8
+virtualMs += rawDelta * 25/3
+```
+
+At dtMs=100/3 (≈30 fps) rawDelta settles to 4 → step 1 → one tick
+per frame, matching the observed paced regime.
+
+## Item layout (OBSERVED — indices preserved)
+
+- saves: items 0..4 at y = 31 + 36·i (31,67,103,139,175)
+- no saves: items 1..4 at y = 31 + 36·(i−1) — OPT0 omitted visually
+  but indices stay 1..4 (never compacted)
+
+## Interactive CLI + deterministic validation
+
+`--interactive-frontend` (requires `--data-path`) loads the shared
+front-end resources (MDKOPT, FONTBIG, ARROW, OPT0..4, SAVES probe)
+and runs the controller each frame: SDL input → `FrontendMenuInput`
+(platform layer translates UP/DOWN/RETURN/RIGHT, integer mouse
+deltas, 4-button nibble) → `update` → `renderFrontendMenuDynamic`
+(draw order: backdrop → scaled labels → arrow at the logical mouse
+position) → `endFrame`. Semantic actions are logged
+(`frontend action: NAME (sel=N mouse=X,Y)`); `Quit` also closes the
+native preview — matching the original quit-flag write.
+`--preview-options` remains the static Phase 4D frame.
+
+`--selftest` runs a deterministic script (one injected SDL event
+step per frame: DOWN tap → motion (0,−41) → button down → release)
+which must end at selection 3 with `OpenOptions` emitted and the
+arrow at (300,139). Real device input is isolated during the script
+— injected events carry a sentinel device ID; an SDL event filter
+drops all real key/button/motion events and the pre-filter queue is
+flushed, so physical input cannot perturb the script (observed
+nondeterminism without it: real motion deltas coalesce against or
+replace the injected motion).
+
+## Digests and verification
+
+- Dynamic snapshot `/tmp/mdk-phase4e-menu.ppm` after the scripted
+  sequence + ramp completion (40 frames):
+  fb `cf09ecdad5b0808f`, palette `6a3cbda3822c5525`.
+- Static `--preview-options` unchanged: `debd84b7f6e158dc` /
+  `6a3cbda3822c5525`; all Phase 4A–4D digests intact.
+- Agent-side PPM check: Options enlarged to 1.0, other four items
+  at 0.65, arrow at the logical mouse position over the Options
+  row, backdrop/palette unchanged.
+- Controller unit tests: entry state, keyboard walk/wrap both
+  branches, repeat schedule, accumulate + both clamps, hit-test
+  boundaries both branches, activation latch/edge semantics,
+  per-item dispatch, attract priority, idle timer, tick advance,
+  ramp growth/decay/reversal, dynamic render contract.
+- Interactive selftest: 15/15 deterministic PASS.
+
+## Explicit non-goals (Phase 4E)
+
+- No gameplay, level launch, save load/parse, or FALL3D boot.
+- No options sub-menu (`FUN_00420eac` — Phase 4F target), no
+  settings mutation.
+- No audio (SND_PUSH push-sound and confirm sounds documented,
+  deferred).
+- No attract slideshow (`FUN_0041ef74`) — the RIGHT-edge trigger is
+  emitted as `EnterAttract` only.
+- No Esc/cancel binding inside the controller (the original menu
+  has none; Esc is a main-loop concern).
+
+## Phase 4F candidate directions
+
+1. **Root → options sub-menu transition** — consume `OpenOptions`
+   and enter `FUN_00420eac`: the black-background OM_* list with its
+   own selection/hit-test/scale behavior (labels already traced:
+   OM_HELP/OM_SOUND/OM_JOY/OM_MOUSE/OM_KEY/OM_PERF, skill, display,
+   quit). Still no settings mutation.
+2. **Attract slideshow** — `FUN_0041ef74` + the timeout chain
+   (30/5/4/2 s thresholds on `DAT_0049aaa4`).
+3. **Frontend sound** — SND_* records behind `FUN_00423734`.

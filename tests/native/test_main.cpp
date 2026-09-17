@@ -3602,6 +3602,436 @@ void test_frontend_menu() {
   }
 }
 
+// Phase 4E — FUN_0041dc90 interactive root-menu controller.
+void test_frontend_controller() {
+  // Entry state (FUN_0041d85c + FUN_00418798): saves -> sel 0,
+  // no saves -> sel 1; mouse resets to (300,180); no pending action.
+  {
+    mdk::FrontendMenuController ctl(true);
+    CHECK(ctl.savesExist() && ctl.selection() == 0);
+    CHECK(ctl.mouseX() == 300 && ctl.mouseY() == 180);
+    CHECK(ctl.pendingAction() == mdk::FrontendAction::None);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::None);
+    mdk::FrontendMenuController c2(false);
+    CHECK(!c2.savesExist() && c2.selection() == 1);
+  }
+
+  // Keyboard walk + wrap, saves branch. DOWN: 0->1->2->3->4->0->1.
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    const int want[6] = {1, 2, 3, 4, 0, 1};
+    for (int i = 0; i < 6; ++i) {
+      in = {};
+      in.nextHeld = true;
+      ctl.update(in);           // press fires immediately
+      in = {};
+      ctl.update(in);           // release resets the deadline
+      ctl.endFrame(34.0);
+      CHECK(ctl.selection() == want[i]);
+    }
+    // UP wraps 0 -> 4.
+    mdk::FrontendMenuController c2(true);
+    mdk::FrontendMenuInput in2;
+    in2.prevHeld = true;
+    c2.update(in2);
+    CHECK(c2.selection() == 4);
+    // UP+DOWN in one frame: prev runs first (0->4), next second
+    // (4->5 -> wrap 0) — observed order in FUN_0041dc90.
+    mdk::FrontendMenuController c3(true);
+    mdk::FrontendMenuInput in3;
+    in3.prevHeld = true;
+    in3.nextHeld = true;
+    c3.update(in3);
+    CHECK(c3.selection() == 0);
+  }
+
+  // No-saves keyboard: index 0 unreachable. UP 1->4; DOWN 4->1.
+  {
+    mdk::FrontendMenuController ctl(false);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 4);
+    in = {};
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);
+    // DOWN walk: 1->2->3->4->1->2 (index 0 skipped).
+    in = {};
+    ctl.update(in);  // release
+    const int want[5] = {2, 3, 4, 1, 2};
+    for (int i = 0; i < 5; ++i) {
+      in = {};
+      in.nextHeld = true;
+      ctl.update(in);
+      in = {};
+      ctl.update(in);
+      CHECK(ctl.selection() == want[i]);
+    }
+  }
+
+  // Key repeat (FUN_004237b4): at dtMs=100/3 (~30fps, the original's
+  // paced regime) rawDelta settles at 4 -> step=1 -> tick advances 1
+  // per update. Press fires at tick 1 (deadline tick+30), then fires
+  // at tick 32,36,40,44 (deadline tick+3).
+  {
+    mdk::FrontendMenuController ctl(true);
+    const double kDt = 100.0 / 3.0;
+    ctl.endFrame(kDt);  // seeds the virtual clock; no delta yet
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    // fires at updates {1,32,36,40,44}: sel 0->4->3->2->1->0
+    const int fireAt[5] = {1, 32, 36, 40, 44};
+    int exp = 0, fi = 0;
+    for (int f = 1; f <= 44; ++f) {
+      if (fi < 5 && f == fireAt[fi]) {
+        exp -= 1;
+        if (exp < 0) {
+          exp = 4;
+        }
+        ++fi;
+      }
+      ctl.update(in);
+      ctl.endFrame(kDt);
+      CHECK(ctl.selection() == exp);
+    }
+    // Release resets the deadline: re-press fires immediately again.
+    in = {};
+    for (int f = 0; f < 3; ++f) {
+      ctl.update(in);
+    }
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 4);  // 0->4 wrap on immediate press fire
+  }
+
+  // Mouse accumulate + clamps (FUN_004187e0) and the tighter gate
+  // clamps (FUN_0041dc90: 590/350).
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    in.mouseDx = 400;
+    in.mouseDy = 400;
+    ctl.update(in);
+    // accumulate clamps to 599/359, then the gate clamps to 590/350.
+    CHECK(ctl.mouseX() == 590 && ctl.mouseY() == 350);
+    CHECK(ctl.selection() == 0);  // y=350 -> band 9 -> invalid
+    in = {};
+    in.mouseDx = -1000;
+    in.mouseDy = -1000;
+    ctl.update(in);
+    CHECK(ctl.mouseX() == 0 && ctl.mouseY() == 0);
+    CHECK(ctl.selection() == 0);
+  }
+
+  // Mouse hit-test: gate + bands + boundaries + x-irrelevance.
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    // Zero mouse input: gate closed — resting y=180 is band 4, yet
+    // selection stays 0.
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+    in.mouseDy = 1;  // gate opens; y=181 -> band trunc(176/36)=4
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 181 && ctl.selection() == 4);
+    // Band boundaries (saves): [0,40]->0 [41,76]->1 [77,112]->2
+    // [113,148]->3 [149,184]->4, >=185 invalid.
+    const int ys[9] = {-141, 1, 35, 1, 35, 1, 35, 1, 35};
+    const int wantY[9] = {40, 41, 76, 77, 112, 113, 148, 149, 184};
+    const int wantSel[9] = {0, 1, 1, 2, 2, 3, 3, 4, 4};
+    for (int i = 0; i < 9; ++i) {
+      in = {};
+      in.mouseDy = ys[i];
+      ctl.update(in);
+      CHECK(ctl.mouseY() == wantY[i] && ctl.selection() == wantSel[i]);
+    }
+    // y=185: band 5 -> invalid, selection holds.
+    in = {};
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 185 && ctl.selection() == 4);
+    // y=0: trunc(-5/36)=0 -> band 0; x position never consulted.
+    in = {};
+    in.mouseDx = -590;
+    in.mouseDy = -185;
+    ctl.update(in);
+    CHECK(ctl.mouseX() == 0 && ctl.mouseY() == 0 &&
+          ctl.selection() == 0);
+    // band == selection -> no change (y=31 is band 0, sel already 0).
+    in = {};
+    in.mouseDy = 31;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+  }
+
+  // No-saves hit-test: computed band +1, valid range 1..4. Last valid
+  // y is 148 (band 3 -> index 4); y>=149 computes index 5 -> invalid.
+  {
+    mdk::FrontendMenuController ctl(false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -160;  // 180 -> 20: band 0 -> index 1
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 20 && ctl.selection() == 1);
+    in = {};
+    in.mouseDy = 21;    // 41: band 1 -> index 2
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    in = {};
+    in.mouseDy = 107;   // 148: band 3 -> index 4
+    ctl.update(in);
+    CHECK(ctl.selection() == 4);
+    in = {};
+    in.mouseDy = 1;     // 149: band 4 -> index 5 -> invalid
+    ctl.update(in);
+    CHECK(ctl.selection() == 4);
+  }
+
+  // Activation — Enter edge uses current selection; no mouse input
+  // means no hit-test that frame.
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::ContinueGame);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::None);
+  }
+
+  // Activation — mouse button down-edge: same-frame hit-test first,
+  // then dispatch. Latch: hold does not refire; release re-arms.
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;  // 180 -> 139: band 3 -> Options
+    ctl.update(in);
+    CHECK(ctl.selection() == 3);
+    in = {};
+    in.mouseButtons = 0x1;
+    ctl.update(in);  // gate: band 3 -> sel stays; latch fires
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::OpenOptions);
+    // held: no refire
+    ctl.update(in);
+    CHECK(ctl.pendingAction() == mdk::FrontendAction::None);
+    // release re-arms; press fires again
+    in.mouseButtons = 0;
+    ctl.update(in);
+    in.mouseButtons = 0x1;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::OpenOptions);
+    // Any of the 4 nibble bits activates (bit3 = button 4).
+    in.mouseButtons = 0;
+    ctl.update(in);
+    in.mouseButtons = 0x8;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::OpenOptions);
+  }
+
+  // Per-item action mapping, saves branch. Nominal item rows sit
+  // inside their bands; clicking selects then activates same frame.
+  {
+    const int bandY[5] = {31, 67, 103, 139, 175};
+    const mdk::FrontendAction want[5] = {
+        mdk::FrontendAction::ContinueGame, mdk::FrontendAction::NewGame,
+        mdk::FrontendAction::SavedGame, mdk::FrontendAction::OpenOptions,
+        mdk::FrontendAction::Quit};
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    int curY = 180;
+    for (int i = 0; i < 5; ++i) {
+      in = {};
+      in.mouseDy = bandY[i] - curY;
+      ctl.update(in);
+      curY = bandY[i];
+      CHECK(ctl.selection() == i);
+      in = {};
+      in.mouseButtons = 0x1;
+      ctl.update(in);
+      in = {};
+      in.mouseButtons = 0;
+      ctl.update(in);
+      CHECK(ctl.consumeAction() == want[i]);
+    }
+  }
+
+  // Same mapping, no-saves branch — only indices 1..4 reachable.
+  {
+    const int bandY[4] = {31, 67, 103, 139};
+    const mdk::FrontendAction want[4] = {
+        mdk::FrontendAction::NewGame, mdk::FrontendAction::SavedGame,
+        mdk::FrontendAction::OpenOptions, mdk::FrontendAction::Quit};
+    mdk::FrontendMenuController ctl(false);
+    mdk::FrontendMenuInput in;
+    int curY = 180;
+    for (int i = 0; i < 4; ++i) {
+      in = {};
+      in.mouseDy = bandY[i] - curY;
+      ctl.update(in);
+      curY = bandY[i];
+      CHECK(ctl.selection() == i + 1);
+      in = {};
+      in.mouseButtons = 0x1;
+      ctl.update(in);
+      in = {};
+      in.mouseButtons = 0;
+      ctl.update(in);
+      CHECK(ctl.consumeAction() == want[i]);
+    }
+  }
+
+  // Enter edge fires regardless of button state and activation beats
+  // the attract edge in one frame.
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    in.attractEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::ContinueGame);
+    in = {};
+    in.attractEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::FrontendAction::EnterAttract);
+  }
+
+  // Idle timer (DAT_0049aaa4): += deltaSec every frame, reset to 0
+  // (then += same frame) on selection change.
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    ctl.update(in);
+    CHECK(near(ctl.idleSeconds(), 1.0 / 30.0, 1e-5));
+    ctl.update(in);
+    CHECK(near(ctl.idleSeconds(), 2.0 / 30.0, 1e-5));
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1 &&
+          near(ctl.idleSeconds(), 1.0 / 30.0, 1e-5));
+  }
+
+  // Tick advance: init step 1; dtMs=34 -> rawDelta 4 -> step 1;
+  // dtMs=100 -> rawDelta 12 -> step 3; dtMs=200 -> rawDelta 24 ->
+  // step 6 clamped to 4 (accum reset, smoothed pinned to 4.0).
+  {
+    mdk::FrontendMenuController ctl(true);
+    mdk::FrontendMenuInput in;
+    ctl.update(in);
+    CHECK(ctl.tick() == 1);
+    ctl.endFrame(34.0);  // virtual-clock seed only
+    ctl.update(in);
+    CHECK(ctl.tick() == 2);
+    ctl.endFrame(34.0);  // first real delta
+    ctl.update(in);
+    CHECK(ctl.tick() == 3);
+    ctl.endFrame(100.0);
+    ctl.update(in);
+    CHECK(ctl.tick() == 6);
+    ctl.endFrame(100.0);
+    ctl.update(in);
+    CHECK(ctl.tick() == 9);
+    ctl.endFrame(200.0);
+    ctl.update(in);
+    CHECK(ctl.tick() == 13);  // step clamped to 4
+  }
+
+  // Scale ramp (FUN_00423a24): cold-boot transition, growth to 1.0,
+  // previous-item decay, and the mid-ramp reversal quirk. The ramp
+  // adds the smoothed frame-unit value once per selected-item draw;
+  // without endFrame calls it stays at the FUN_0042fb30 power-on
+  // value 1.0, so acc advances exactly 1.0 per draw.
+  {
+    mdk::FrontendMenuController ctl(true);
+    const int cx = 100;  // shared x_arg stand-in (same for all items)
+    // cold boot: first selected draw transitions (0,0)->(cx,31)
+    CHECK(near(ctl.itemScale(cx, 31, true), 0.65));
+    CHECK(ctl.rampAccumulator() == 0.0f);
+    // acc -> 1,2,3,4,5 => scales 0.72,0.79,0.86,0.93,1.0
+    const float grow[5] = {0.72f, 0.79f, 0.86f, 0.93f, 1.0f};
+    for (int f = 0; f < 5; ++f) {
+      CHECK(near(ctl.itemScale(cx, 31, true), grow[f], 1e-5));
+    }
+    // Non-selected items: 0.65 — including the (0,0) non-key.
+    CHECK(near(ctl.itemScale(cx, 67, false), 0.65));
+    CHECK(near(ctl.itemScale(999, 200, false), 0.65));
+    // Selection moves to item 1: on this pass item0 (still cur key)
+    // returns 1.0, then item1's selFlag triggers the transition.
+    CHECK(near(ctl.itemScale(cx, 31, false), 1.0));
+    CHECK(near(ctl.itemScale(cx, 67, true), 0.65));
+    // Next pass: item0==prev returns 1.0-0*0.07 = 1.0 (one extra
+    // frame at full scale); item1==cur: acc 0->1 -> 0.72.
+    CHECK(near(ctl.itemScale(cx, 31, false), 1.0));
+    CHECK(near(ctl.itemScale(cx, 67, true), 0.72f, 1e-5));
+    // Then prev decays 0.93->0.65 while cur grows to 1.0.
+    const float dec[5] = {0.93f, 0.86f, 0.79f, 0.72f, 0.65f};
+    const float inc[5] = {0.79f, 0.86f, 0.93f, 1.0f, 1.0f};
+    for (int f = 0; f < 5; ++f) {
+      CHECK(near(ctl.itemScale(cx, 31, false), dec[f], 1e-5));
+      CHECK(near(ctl.itemScale(cx, 67, true), inc[f], 1e-5));
+    }
+    // Mid-ramp reversal: switch back to item0. item1 becomes prev;
+    // its formula assumes a completed 1.0 state, so it snaps UP to
+    // 1.0 (observed quirk) instead of freezing mid-ramp.
+    CHECK(near(ctl.itemScale(cx, 31, true), 0.65));
+    CHECK(near(ctl.itemScale(cx, 67, false), 1.0));
+  }
+
+  // Dynamic render uses the same composition with live scales and
+  // the controller's logical mouse position for the arrow.
+  {
+    std::string err;
+    mdk::IndexedImage backdrop;
+    backdrop.width = 600;
+    backdrop.height = 360;
+    backdrop.stride = 600;
+    backdrop.pixels.assign(600 * 360, 0x55);
+    backdrop.hasPalette = true;
+    for (int i = 0; i < 256; ++i) {
+      backdrop.palette[i] = {std::uint8_t(i), std::uint8_t(255 - i),
+                             std::uint8_t(i)};
+    }
+    auto f = SyntheticFont::make();
+    const char* needed = "ContinueNew GamSavdpQitlOs";
+    for (const char* c = needed; *c; ++c) {
+      f.put32(static_cast<std::uint8_t>(*c) * 4,
+              f.addGlyph(1, 0, 2, {9, 9, 9, 9}));
+    }
+    const auto font = mdk::decodeFtiFont(f.buf, &err);
+    CHECK(font);
+    auto arrowS = SyntheticSprite::make1(
+        2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+    const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+    CHECK(arrow && arrow->frame(0));
+    const std::string_view opts[5] = {"Continue", "New Game",
+                                      "Saved Game", "Options", "Quit"};
+
+    mdk::FrontendMenuController ctl(true);
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    CHECK(mdk::renderFrontendMenuDynamic(fb, palette, backdrop, *font,
+                                         *arrow->frame(0), opts, ctl,
+                                         &err));
+    // First frame: the selected label draws through the live ramp
+    // (acc=0 -> 0.65), so glyph pixels land in its label band.
+    bool found9 = false;
+    for (int y = 28; y < 34 && !found9; ++y) {
+      for (int x = 0; x < 24 && !found9; ++x) {
+        found9 = fb.at(x, y) == 9;
+      }
+    }
+    CHECK(found9);
+    // Arrow at the reset mouse position.
+    CHECK(fb.at(300, 180) == 77 && fb.at(301, 181) == 77);
+    // Contract checks reuse the static path's validation.
+    mdk::IndexedImage small;
+    small.width = small.height = small.stride = 4;
+    small.pixels.assign(16, 0);
+    CHECK(!mdk::renderFrontendMenuDynamic(fb, palette, small, *font,
+                                          *arrow->frame(0), opts, ctl,
+                                          &err));
+  }
+}
+
 } // namespace
 
 int main() {
@@ -3624,6 +4054,7 @@ int main() {
   test_fti_font();
   test_fti_sprite();
   test_frontend_menu();
+  test_frontend_controller();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

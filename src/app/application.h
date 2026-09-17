@@ -40,6 +40,12 @@ struct AppConfig {
   // ARROW at the reset mouse position, all from original resources.
   // Requires --data-path. Static — no input, animation, or audio.
   bool optionsPreview = false;
+  // --interactive-frontend: run the reconstructed FUN_0041dc90
+  // root-menu controller (Phase 4E) over the same composition —
+  // original-style keyboard/mouse selection, hit-test, scale ramp,
+  // and semantic activation events. Requires --data-path. Downstream
+  // actions (gameplay, saves, options sub-menu, audio) stay deferred.
+  bool interactiveFrontend = false;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
   bool relativeMouse = true;  // --no-relative-mouse to disable

@@ -55,6 +55,13 @@ diagnostic checkerboard; requires `--data-path`),
 front-end frame — `MDKOPT` backdrop + `OPT0..OPT4` scaled centered
 FONTBIG labels + `ARROW` at the reset mouse position; resolves all
 resources itself; requires `--data-path`),
+`--interactive-frontend` (Phase 4E: run the reconstructed
+FUN_0041dc90 root-menu controller over the same composition —
+original-style UP/DOWN selection with key repeat, gated mouse
+hit-test, scale ramp, semantic activation actions; requires
+`--data-path`). With `--selftest`, the interactive mode runs a
+deterministic injected-event script (real device input is filtered
+out for the duration) and reports PASS/FAIL.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -191,8 +198,8 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- Runtime original-data use is limited to the Phase 4A/4B/4C/4D
-  previews:
+- Runtime original-data use is limited to the Phase 4A/4B/4C/4D/4E
+  front-end paths:
   one named record from one BNI file (`--preview-resource`), decoded by
   the proven paletted-bitmap layout or — for `STREAM/STREAM.BNI BG`
   only — the proven external-palette binding (`SYS_PAL` head + `PAL`
@@ -200,9 +207,12 @@ uploaded to Metal).
   (`--preview-font`, `FONTSML`/`FONTBIG` glyph layout) drawn into the
   indexed framebuffer through the SYS_PAL palette head; one FTI sprite
   record (`--preview-sprite`, the `ARROW` frame-table + command-stream
-  format) over a diagnostic checkerboard; and the composed static
+  format) over a diagnostic checkerboard; the composed static
   front-end frame (`--preview-options`, `MDKOPT` + `OPT0..OPT4` +
-  `ARROW` in the proven draw order)
+  `ARROW` in the proven draw order); and the interactive root-menu
+  controller (`--interactive-frontend`, same composition driven by the
+  reconstructed FUN_0041dc90 selection/scale/activation state —
+  semantic actions only, downstream systems deferred)
   — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.
