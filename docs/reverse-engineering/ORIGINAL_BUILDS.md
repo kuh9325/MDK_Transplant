@@ -155,7 +155,10 @@ and force feedback (DirectX 5 required).
 
 Most proprietary families begin with a u32 LE length field (file size − 4)
 followed by a 4-char ASCII tag equal to the file stem (verified for .MTI,
-.SNI, .CMI, .DTI, .MTO, .FTI). Semantics beyond the tag remain UNKNOWN.
+.SNI, .CMI, .DTI, .MTO, .FTI). Semantics beyond the tag were UNKNOWN at
+this survey; interior directories have since been proven for `.SNI`
+(Phase 3C), `.MTI` (3D), `.MTO` (3E) and `.CMI` (3F) — see
+`../DATA_FORMATS.md`; `.DTI`/`.FTI`/`.BNI` interiors remain UNKNOWN.
 .BNI carries a similar u32 length but a non-ASCII second field. .LBB files
 (6 × 40,772 bytes, `LOAD_*`) look like raw data — format UNKNOWN.
 

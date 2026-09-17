@@ -95,8 +95,8 @@ FamilySupport fileFamilySupport(MdkFileFamily f) {
   case MdkFileFamily::kSni:
   case MdkFileFamily::kMti:
   case MdkFileFamily::kMto:
-    return FamilySupport::kDirectoryMetadata;
   case MdkFileFamily::kCmi:
+    return FamilySupport::kDirectoryMetadata;
   case MdkFileFamily::kDti:
   case MdkFileFamily::kFti:
   case MdkFileFamily::kBni:

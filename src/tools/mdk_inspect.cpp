@@ -9,6 +9,7 @@
 //   mdk-inspect --selftest        (synthetic in-memory checks)
 
 #include "core/binary_reader.h"
+#include "core/cmi_directory.h"
 #include "core/container.h"
 #include "core/data_root.h"
 #include "core/file_family.h"
@@ -250,6 +251,87 @@ int selftest() {
        odir.trailerPresent && odir.secondaryEqualsTrailerOffset;
   std::fprintf(stderr, "selftest mto-directory: %s\n",
                ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic CMI-like fixture (no original data): tagged envelope +
+  // the four counted variable-length tables + a small data region +
+  // name trailer. Table 0 uses the zero-count variant (OBSERVED in
+  // LEVEL4/5/7); records are {u8 len, name[len] incl NUL, u32 value}
+  // with values that are image-relative offsets (image = file+4).
+  //
+  //   0x14 T0 count=0 → T1 count @0x18
+  //   T1: {3,"E1\0",v} T2: {6,"FIRST\0",v}{7,"SECOND\0",0}
+  //   T3: {2,"L\0",v} → data region [0x4a, 0x74)
+  // Built byte-exact below; every nonzero value points into the data
+  // region [dataStart, size-12).
+  std::byte cmi[0x80] = {};
+  const auto cput32 = [&](std::size_t off, std::uint32_t v) {
+    cmi[off + 0] = static_cast<std::byte>(v & 0xff);
+    cmi[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    cmi[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    cmi[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  };
+  const auto cputName = [&](std::size_t off, const char* s) {
+    for (std::size_t i = 0; s[i] && off + i < sizeof(cmi); ++i) {
+      cmi[off + i] = static_cast<std::byte>(s[i]);
+    }
+  };
+  // Record writer: {u8 len, bytes, u32 value}; len includes the NUL.
+  const auto cputRec = [&](std::size_t off, const char* n,
+                           std::uint32_t v) {
+    const std::size_t len = std::strlen(n) + 1;  // counted incl NUL
+    cmi[off] = static_cast<std::byte>(len);
+    for (std::size_t i = 0; i < len; ++i) {
+      cmi[off + 1 + i] = static_cast<std::byte>(n[i]);  // copies NUL
+    }
+    cput32(off + 1 + len, v);
+    return off + 1 + len + 4;
+  };
+  cput32(0x00, sizeof(cmi) - 4);
+  cputName(0x04, "TEST.CMD");
+  cput32(0x10, sizeof(cmi) - 12);
+  cput32(0x14, 0);                          // T0: zero count
+  std::size_t q = 0x18;
+  cput32(q, 1); q += 4;                     // T1: one record
+  q = cputRec(q, "E1", 0x50 - 4);           // value -> file 0x50
+  cput32(q, 2); q += 4;                     // T2: two records
+  q = cputRec(q, "FIRST", 0x50 - 4);
+  q = cputRec(q, "SECOND", 0);              // null value (T1 form)
+  cput32(q, 1); q += 4;                     // T3: one record
+  q = cputRec(q, "L", 0x60 - 4);            // value -> file 0x60
+  // q == 0x4a: data region [0x4a, 0x74). Two length-prefixed strings
+  // then a u32 (the CODE-CORROBORATED T3-target head shape) at 0x60.
+  cmi[0x60] = std::byte{4}; cputName(0x61, "AB"); // {len4 "AB\0?"}
+  cmi[0x65] = std::byte{2}; cmi[0x66] = std::byte{'Z'};
+  cmi[0x67] = std::byte{0};
+  cput32(0x68, 0x6c - 4);                   // second-level offset
+  cputName(sizeof(cmi) - 12, "TEST.CMD");   // trailer at 0x74
+
+  const auto cdir = mdk::inspectCmiDirectory(
+      std::span<const std::byte>(cmi, sizeof(cmi)));
+  ok = cdir.status == mdk::CmiDirectoryStatus::kOk &&
+       cdir.tables.size() == 4 &&
+       cdir.tables[0].count == 0 && cdir.tables[0].records.empty() &&
+       cdir.tables[0].endFileOffset == 0x18 &&
+       cdir.tables[1].count == 1 &&
+       cdir.tables[1].records[0].name() == "E1" &&
+       cdir.tables[1].records[0].nameLength == 3 &&
+       cdir.tables[1].records[0].nameEndsWithTerminator &&
+       cdir.tables[1].records[0].value == 0x4c &&
+       cdir.tables[1].records[0].valueFileOffset() ==
+           std::optional<std::uint64_t>(0x50) &&
+       cdir.tables[2].count == 2 &&
+       cdir.tables[2].records[1].value == 0 &&
+       !cdir.tables[2].records[1].valueFileOffset().has_value() &&
+       cdir.tables[3].records[0].valueFileOffset() ==
+           std::optional<std::uint64_t>(0x60) &&
+       cdir.dataRegionOffset == q &&
+       cdir.dataRegionEnd == sizeof(cmi) - 12 &&
+       cdir.trailerPresent && cdir.secondaryEqualsTrailerOffset;
+  std::fprintf(stderr, "selftest cmi-directory: %s\n",
+               ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 
@@ -394,8 +476,8 @@ int main(int argc, char** argv) {
   }
 
   // --entries: enumerate interior directory metadata where a proven
-  // parser exists (SNI Phase 3C; MTI Phase 3D; MTO Phase 3E). Never
-  // prints payload bytes.
+  // parser exists (SNI Phase 3C; MTI Phase 3D; MTO Phase 3E; CMI
+  // Phase 3F). Never prints payload bytes.
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
     std::printf("entries:   unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
@@ -569,6 +651,61 @@ int main(int argc, char** argv) {
                     j, b.regionCNames[j].name().c_str());
       }
     }
+    return 0;
+  }
+
+  if (family == mdk::MdkFileFamily::kCmi) {
+    const auto dir = mdk::inspectCmiDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    std::printf("entries:   CMI directory (four counted variable-"
+                "length tables @0x14: u8 len + name[len] + u32 value; "
+                "then data region)\n");
+    std::printf("status:    %s%s%s\n",
+                std::string(mdk::cmiDirectoryStatusName(dir.status)).c_str(),
+                dir.detail.empty() ? "" : " — ",
+                dir.detail.empty() ? "" : dir.detail.c_str());
+    if (dir.status != mdk::CmiDirectoryStatus::kOk) {
+      return 1;
+    }
+    std::printf("trailer:   name[12] @ size-12 %s\n",
+                dir.trailerPresent ? "present" : "ABSENT");
+    std::printf("u32@0x10:  %u — %s trailer offset\n",
+                dir.secondaryLength,
+                dir.secondaryEqualsTrailerOffset ? "equals"
+                                                 : "does not equal");
+
+    for (std::size_t t = 0; t < dir.tables.size(); ++t) {
+      const auto& tab = dir.tables[t];
+      std::printf("  table[%zu] count=%u count@0x%llx recs@0x%llx "
+                  "end=0x%llx\n", t, tab.count,
+                  static_cast<unsigned long long>(tab.countFileOffset),
+                  static_cast<unsigned long long>(tab.recordsFileOffset),
+                  static_cast<unsigned long long>(tab.endFileOffset));
+      for (std::size_t i = 0; i < tab.records.size(); ++i) {
+        const auto& e = tab.records[i];
+        std::printf("    [%3zu] @0x%06llx len=%-3u %-18s value=0x%08x",
+                    i, static_cast<unsigned long long>(e.fileOffset),
+                    e.nameLength, e.name().c_str(), e.value);
+        if (const auto tgt = e.valueFileOffset()) {
+          std::printf(" ->file=0x%08llx%s",
+                      static_cast<unsigned long long>(*tgt),
+                      e.valueReachesDataRegion ? "" : " (outside data "
+                                                     "region)");
+        } else {
+          std::printf(" (null)");
+        }
+        if (!e.nameEndsWithTerminator) {
+          std::printf(" [no NUL in counted bytes]");
+        }
+        std::printf("\n");
+      }
+    }
+    std::printf("  data region: [0x%llx, 0x%llx) — %llu bytes, "
+                "structure not enumerated\n",
+                static_cast<unsigned long long>(dir.dataRegionOffset),
+                static_cast<unsigned long long>(dir.dataRegionEnd),
+                static_cast<unsigned long long>(dir.dataRegionEnd -
+                                                dir.dataRegionOffset));
     return 0;
   }
 

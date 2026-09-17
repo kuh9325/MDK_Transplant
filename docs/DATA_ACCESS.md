@@ -1,12 +1,12 @@
-# Data Access Layer — Phase 3B/3C/3D
+# Data Access Layer — Phase 3B/3C/3D/3E/3F
 
 Status: implemented and validated. This layer provides
 read-only, confined, case-insensitive access to a user-supplied MDK
 data root, a bounded binary reader, the evidence-backed
-container-envelope parser, an explicit file-family dispatch, and two
-proven interior directory maps (`.SNI` Phase 3C, `.MTI` Phase 3D —
-metadata only). No gameplay, no level parsing, no graphics/audio
-decode.
+container-envelope parser, an explicit file-family dispatch, and four
+proven interior directory maps (`.SNI` Phase 3C, `.MTI` Phase 3D,
+`.MTO` Phase 3E, `.CMI` Phase 3F — metadata only). No gameplay, no
+level parsing, no graphics/audio decode.
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`.
 Throughout: "BUILD_A" = `original/installed/` (the NoCD-repack tree;
@@ -82,7 +82,7 @@ families in BUILD_A, cross-checked against loader code:
 | u32 @16 = fileSize − 12 | OBSERVED (46/46 tag family) | semantics UNKNOWN — possibly an inner section/chunk length covering `[12, size)`; not interpreted |
 | end of envelope | OBSERVED | declared length ends exactly at EOF (single envelope per file) |
 | name-field trailer | OBSERVED (46/46 tag family) | last 12 bytes of every tagged file repeat the name field; u32@16 = size−12 == that trailer's file offset |
-| interior structure | OBSERVED for `.SNI` and `.MTI` | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory; `.MTI` = count@0x14 + 24-byte `{name[8], flags, u32, u32, blobOff}` directory with index/payload record classes — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
+| interior structure | OBSERVED for `.SNI`, `.MTI`, `.MTO`, `.CMI` | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory; `.MTI` = count@0x14 + 24-byte `{name[8], flags, u32, u32, blobOff}` directory with index/payload record classes; `.MTO` = count@0x14 + 12-byte `{name[8], fileOff}` overlay directory; `.CMI` = four counted variable-length tables `{u8 len, name[len], u32 imgOff}` + bounded data region — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
 | padding/alignment | OBSERVED | name field NUL-padded to 12; `.SNI` payloads 4-byte aligned (gaps 0 or 2) |
 | malformed handling | OBSERVED (code) | tag≠stem → treated as stale HD copy → re-copied from CD root (`FUN_0041ae50`) |
 
@@ -139,8 +139,8 @@ logical name, stem-match, and the raw second u32 @16 (uninterpreted).
 
 `mdk-inspect --data-path DIR --entries <rel-path>` additionally reads
 the whole file (bounded) and enumerates the interior directory where a
-proven parser exists — `.SNI` (Phase 3C), `.MTI` (Phase 3D) and
-`.MTO` (Phase 3E):
+proven parser exists — `.SNI` (Phase 3C), `.MTI` (Phase 3D), `.MTO`
+(Phase 3E) and `.CMI` (Phase 3F):
 entry count, directory end, trailer status, and per-record metadata.
 For `.SNI`: name/raw field/blob offset/resolved file offset/size;
 sentinel records (`field==size==0xffffffff`) are reported as position
@@ -152,11 +152,15 @@ extended variant) and the data start offset. For `.MTO`: per-entry
 name[8], block file offset/length, the embedded `.MAT` name and
 record metadata, and region A/B/C counts and spans (region A's
 array-B and array-C are the original's overlay-alien and
-overlay-sound records). Families without a proven interior parser are
-rejected with the support level — never guessed.
-`--selftest` runs synthetic envelope + SNI- + MTI- + MTO-directory
-checks. Links `mdk_core` — the same code the app uses. Never prints
-payload bytes; never writes into the data root.
+overlay-sound records). For `.CMI`: the four counted variable-length
+tables (count field offset, records range, per-record offset/name/
+raw value/resolved file offset), and the bounded data-region span —
+record values are reported as image-relative offsets (image = file+4)
+without interpreting their targets. Families without a proven
+interior parser are rejected with the support level — never guessed.
+`--selftest` runs synthetic envelope + SNI- + MTI- + MTO- +
+CMI-directory checks. Links `mdk_core` — the same code the app uses.
+Never prints payload bytes; never writes into the data root.
 
 ## Validation performed (BUILD_A, read-only)
 
@@ -204,10 +208,28 @@ Phase 3E additions (all via `mdk-inspect --entries`, read-only):
   `envelope-only`/`unsupported` and reject `--entries`.
 - Manifest re-verified after Phase 3E inspection: 141/141 unchanged.
 
+Phase 3F additions (all via `mdk-inspect --entries`, read-only):
+
+- All 6 `.CMI` files in BUILD_A enumerate `ok` — four counted
+  variable-length tables each (record = `u8 len + name[len incl NUL] +
+  u32 image-relative value`), then a bounded data region to the name
+  trailer. 884 records total; every stored name ends in NUL inside the
+  counted length; every nonzero value (762) lands inside the data
+  region; 122 zero values, all in table[1] (the table the original's
+  "Overflowed enemy table" diagnostic covers). table[0] count is 0 in
+  LEVEL4/5/7 — a valid variant, not an empty file.
+- `.DTI/.FTI/.BNI/.LBB` correctly remain `envelope-only`/`unsupported`
+  and reject `--entries`; `.SNI/.MTI/.MTO` keep their own parsers.
+- Manifest re-verified after Phase 3F inspection: 141/141 unchanged.
+
 ## Explicit unknowns (not implemented)
 
-- Interior structures of `.CMI/.DTI` (shape observations
-  recorded in `DATA_FORMATS.md`; none decoded).
+- Interior structure of `.DTI` (shape observations
+  recorded in `DATA_FORMATS.md`; not decoded).
+- `.CMI` data-region interior (≈99.9% of each file): the record
+  values' targets and the region's own organization — bounded only.
+  CMI table[0]'s consumer and the semantic role of each table past
+  table[1]'s "enemy table" diagnostic remain UNKNOWN.
 - `.MTO` region semantics: what region A's array-A records name, the
   region-C arrays' roles, and all payload contents past the proven
   boundaries (UNKNOWN — see DATA_FORMATS.md).

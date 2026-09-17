@@ -26,6 +26,7 @@ find_package(SDL3 REQUIRED CONFIG)
 # --- core library: platform-neutral, unit-testable, no SDL/Metal headers ----
 add_library(mdk_core STATIC
   src/core/clock.cpp
+  src/core/cmi_directory.cpp
   src/core/container.cpp
   src/core/data_root.cpp
   src/core/file_family.cpp

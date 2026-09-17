@@ -1,13 +1,14 @@
-# Data Formats — Phase 3E
+# Data Formats — Phase 3F
 
-Status: third interior directory mapped. This document records
+Status: fourth interior directory mapped. This document records
 evidence-backed file-format structure for the proprietary families
 found under the data root. Phase 3B established the top-level
 envelope; Phase 3C added explicit file-family dispatch and the first
 proven interior directory (`.SNI`); Phase 3D added the second proven
-interior directory (`.MTI`, metadata only); Phase 3E adds the third
+interior directory (`.MTI`, metadata only); Phase 3E added the third
 proven interior directory (`.MTO`, metadata only — the original's
-"overlay" subsystem).
+"overlay" subsystem); Phase 3F adds the fourth proven interior
+directory (`.CMI`, metadata only — counted variable-length tables).
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`.
 "BUILD_A" = `original/installed/` — the NoCD repack; data integrity vs
@@ -33,7 +34,7 @@ delegates to it — no duplicated extension tables.
 | MTO | `.MTO` | tagged-name | **directory-metadata** | count + 12-byte `{name[8], u32 fileOff}` records → overlay blocks containing an embedded `.MAT`/MTI image + regions A/B/C (below) |
 | SNI | `.SNI` | tagged-name | **directory-metadata** | count + 24-byte directory records proven (below) |
 | MTI | `.MTI` | tagged-name | **directory-metadata** | count + 24-byte records `{name[8], u32 flags, u32, u32, u32 off}` proven (below) |
-| CMI | `.CMI` | tagged-name | envelope-only | length-prefixed name records + u32 (OBSERVED, not decoded) |
+| CMI | `.CMI` | tagged-name | **directory-metadata** | four counted variable-length tables `{u8 len, name[len], u32 imgOff}` + bounded data region (below) |
 | DTI | `.DTI` | tagged-name | envelope-only | binary records, no name table (OBSERVED, not decoded) |
 | FTI | `.FTI` | length only | envelope-only | count-like u32 + 8-byte names (shape observation only) |
 | BNI | `.BNI` | length only | envelope-only | same shape as FTI |
@@ -452,6 +453,156 @@ u32le;     trailing data to block end
 | `FUN_0041b7b4` | `"%s\LEVEL%d\LEVEL%dO.MTO"` path builder |
 | `FUN_00433d40` | Level-bundle loader; `"TLEVEL.mto"` path |
 
+## Proven interior directory: CMI
+
+Evidence class: OBSERVED (6/6 `.CMI` files in BUILD_A, 884 records)
++ CODE-CORROBORATED (MDK95.EXE whole-blob loader `FUN_00425d18`,
+the walker chain `FUN_0045840c`/`FUN_0045843c`/`FUN_0045846c`, the
+name lookups `FUN_0045849c`/`FUN_00458550`, the table-1 consumer
+`FUN_004286c8`, and the load/save relocators `FUN_00426f34`/
+`FUN_00426738`).
+
+### Naming note (what is and is not proven)
+
+`.CMI` files carry the internal logical name `"LEVELn.CMD"` — the
+disk extension and the internal extension disagree, as in every
+tagged family. **No original string, source path, or consumer traced
+so far expands "CMI"/"CMD" or names the format.** Earlier working
+notes (and `EXECUTABLE_MAP.md` before Phase 3F) floated
+collision/map/arena/BSP guesses — those labels are NOT supported by
+evidence and are withdrawn. The only original-diagnostic vocabulary
+established is that table 1's output feeds the destination array the
+original calls the **"enemy table"** (`"Overflowed enemy table"`,
+see below). Table indices and `record`/`value` stay deliberately
+neutral.
+
+### Layout
+
+```
+file offset
+0x00  u32le        blob length = fileSize - 4          (envelope)
+0x04  char[12]     logical name "<stem>.CMD"           (envelope)
+0x10  u32le        = fileSize - 12 (envelope; equals the trailer's
+                   file offset, OBSERVED 6/6)
+0x14  table[0]     u32le count, then count x variable records
+      table[1]     same form, starting at table[0]'s end
+      table[2]     same form
+      table[3]     same form
+      data region  [table[3] end, size-12) — bounded only (below)
+size-12  char[12]  trailer = name field repeat
+```
+
+Record form (CODE-CORROBORATED — identical stride math in all five
+table functions):
+
+```
++0x00     u8       nameLength
++0x01     byte[nameLength]  name bytes. OBSERVED 884/884: the counted
+                          bytes end with exactly one trailing NUL and
+                          the length INCLUDES it (e.g. len 11 =
+                          "HMO_1$XD_0\0"); the original compares the
+                          name as a C string at +0x01 (FUN_0042fa50),
+                          so the length is the record's stride input,
+                          not a bounded-compare bound
++0x01+len u32le    value — image-relative offset: the loaded image is
+                          file bytes [4, size), so the target file
+                          offset is 4 + value (CODE-CORROBORATED:
+                          FUN_0045849c / FUN_00458550 / FUN_004286c8
+                          all form blob+value and dereference it).
+                          value == 0 is the null form for the table-1
+                          consumer (TEST EDX,EDX in FUN_004286c8).
+record stride = nameLength + 5
+```
+
+### Table chain (CODE-CORROBORATED)
+
+The original locates the four table headers with three nested
+walkers; each walker repeats "read count, advance `len+5` per
+record":
+
+- `FUN_0045840c`: count at `img+0x10` (= file 0x14), records at
+  `img+0x14` → returns table[1]'s count field.
+- `FUN_0045843c`: calls `FUN_0045840c`, repeats the walk → returns
+  table[2]'s count field.
+- `FUN_0045846c`: calls `FUN_0045843c`, repeats → returns table[3]'s
+  count field.
+- `FUN_004583fc`: returns `img+0x10` (table[0] header) — no static
+  caller in this build; table[0]'s consumer path is UNKNOWN.
+
+The data region follows table[3] and runs to the name trailer; the
+next u32 after table[3] is data content, not a fifth count (OBSERVED
+6/6 — interpreting it as a count fails immediately).
+
+### Consumers (what each table feeds — observed call sites)
+
+| Table | Consumer (static evidence) | Role evidence |
+|---|---|---|
+| table[0] | none traced (`FUN_004583fc` uncalled) | names look like `OBJ$ANIM` composites; UNKNOWN |
+| table[1] | `FUN_00433d40` → `FUN_004286c8`: walks it into a 0x88-stride array at `DAT_004edcc0`, cap 0x50 | the cap diagnostic is the original string `"Overflowed enemy table"` — table 1 is therefore CODE-CORROBORATED as the enemy-name table's source. value==0 → dest flag + null pointer |
+| table[2] | `FUN_004566f0` (object init): formats a name via sprintf, searches table[2], stores `blob+value` at `obj+0x108`, calls `FUN_004388d8` (tr_alcmd.c region), then clears it | per-object init-time lookup; semantics UNKNOWN |
+| table[3] | `FUN_0045849c` (callers `FUN_00431fbc`, `FUN_0043394c`) and `FUN_00458550` (called once per arena record in `FUN_00433d40`, result stored at `arena+0x220`) | name → target structure in the data region |
+
+### Data-region target head (CODE-CORROBORATED for table[3])
+
+`FUN_0045849c` follows a table-3 record's `value` to `blob+value` and
+copies TWO consecutive NUL-terminated strings there, each preceded by
+its own u8 length (the second at `target+1+len1`). `FUN_00458550`
+skips the first the same way, then reads the u32 after the second —
+if nonzero it returns `blob+that`, else 0. So the table[3] target
+head is `{u8 len, chars incl NUL} {u8 len, chars incl NUL} {u32
+image-relative off}` — verified against real bytes (e.g. table[3]
+`"HMO_1"` → `{"NONE"} {"H1"} {->…}`). Everything past that head —
+record iteration, payload fields, region organization — is UNKNOWN
+and is not enumerated.
+
+### Load/save relocation (CODE-CORROBORATED)
+
+`FUN_00426f34`/`FUN_00426738` add/subtract the CMI image base
+(`DAT_0054c6bc`) across a large fixed field list of an in-memory
+object record (`+0xec`, `+0x108`, `+0x10c`, … `+0x322`), preserving
+`0xffffffff` as the in-memory null (`FUN_004262b0`/`FUN_004262c8`).
+This corroborates that CMI content is offset-serialized into the
+image and re-pointed at load — and that `0xffffffff` is a *memory*
+convention, not a file-format value (none observed in the corpus).
+
+### Field-by-field evidence matrix
+
+| Element | BUILD_A bytes | Original code | Status |
+|---|---|---|---|
+| count chain @0x14… | 6/6 files, exactly 4 tables | walker chain `FUN_0045840c`→`43c`→`46c`; lookups read `img+0x10` count | CODE-CORROBORATED |
+| record = len+name+u32 | 884 records, all walk sane | `len+5` stride in 5 functions; u32 read at `+1+len` | CODE-CORROBORATED |
+| name length includes NUL | 884/884 trailing NUL, 0 inner NULs, all printable | names compared as C strings | OBSERVED + consumer-consistent |
+| value = img-relative offset | 762/762 nonzero values land in the data region (6/6 files); 122 zeros, all in table[1] | `blob+value` dereferenced in `FUN_004286c8`/`49c`/`58550`; 0=null in table-1 path | CODE-CORROBORATED |
+| data region = [t3 end, trailer) | 6/6 | T3 lookups land inside it | OBSERVED |
+| image base = file+4 | implied by every target | `FUN_00425d18` freads u32@0 then reads `size-4` bytes into the image | CODE-CORROBORATED |
+
+### Structural variants / anomalies
+
+- table[0] count is 0 in LEVEL4/5/7 (records simply absent; the next
+  count follows at 0x18) — a valid structural variant, not an empty
+  file. 3/6 files exercise it.
+- No other variants: one structural class across the corpus; every
+  file has all four tables plus a large data region
+  (0.94–1.67 MB, ≈99.9% of file size).
+- Counts: table[0] 0–24, table[1] 51–76, table[2] 15–73,
+  table[3] 11–19. Record name lengths 2–17.
+
+### Original loader/consumer functions (static evidence)
+
+| Address | Role (observed behavior) |
+|---|---|
+| `FUN_00433d40` | Level-bundle loader; builds `"%s\LEVEL%d\LEVEL%d.CMI"` (sprintf fmt `0x4975c0`), calls `FUN_00425d18` → `*DAT_0054c6bc` = image, `*DAT_0054c680` = declared length; then walks table[1] into the "enemy table" array and resolves table[3] per arena record |
+| `FUN_00425d18` | Whole-blob loader: open (`FUN_0041b300`), fread u32@0, alloc via callback (`FUN_0041c884`), fread `size-4` bytes → image = file+4 |
+| `FUN_0045840c`/`43c`/`46c` | Table-end walkers: read count, advance `len+5` per record |
+| `FUN_004583fc` | Returns `img+0x10` (table[0] header); no static caller found |
+| `FUN_004286c8` | Table-1 → "enemy table" copy: name→dest+0, flag at +0xa when value==0, `blob+value`-derived pointer at +0x20; cap 0x50 → `"Overflowed enemy table"` |
+| `FUN_0045849c` | Table-3 lookup → copies the target's two length-prefixed strings |
+| `FUN_00458550` | Table-3 lookup → follows the target's second-level u32; returns `blob+off` or 0 |
+| `FUN_004566f0` | Object init: sprintf-name → table-2 lookup → `blob+value` to `obj+0x108`, consumed by `FUN_004388d8` |
+| `FUN_00426f34`/`FUN_00426738` | Load/save pointer relocation over object fields vs `DAT_0054c6bc`; `0xffffffff` null convention via `FUN_004262b0`/`FUN_004262c8` |
+| `FUN_0042fa50` | Unbounded C-string compare (name lookups) |
+| `FUN_0041c884` | 8-byte-aligned pool allocator (image allocation callback) |
+
 ## Unknown fields
 
 - `u32 @0x10` (envelope): equals `fileSize - 12` in all tagged files and
@@ -484,6 +635,18 @@ u32le;     trailing data to block end
 - MTO region C record internals (44/36/12-byte arrays, the c1 name
   table's role, the trailing data): UNKNOWN.
 - MTO embedded ".MAT" payloads: same UNKNOWN level as MTI payloads.
+- CMI table[0] consumer path: UNKNOWN (`FUN_004583fc` has no static
+  caller; the `OBJ$ANIM`-shaped names suggest a per-object animation
+  role — HYPOTHESIS only).
+- CMI record `value` semantics beyond "image-relative offset": what
+  each table's targets ARE is UNKNOWN (table[3] targets provably begin
+  with two length-prefixed strings + a second-level offset; deeper
+  structure undecoded).
+- CMI data region interior (≈99.9% of each file): UNKNOWN — bounded
+  only. Contains the offset targets plus further structure.
+- CMI "enemy table" table-1 destination record fields (0x88-stride
+  array): only +0x00 name / +0x0a flag / +0x20 pointer are proven.
+- The expansion of "CMI"/"CMD": UNKNOWN — no original string names it.
 
 ## Families that do NOT share the SNI layout
 
@@ -495,27 +658,31 @@ Checked for "same count+stride+field order" against the SNI mechanism:
 - **MTO**: `count @0x14` + `{name[8], u32 fileOff}` 12-byte records →
   self-contained overlay blocks each embedding a full tagged `.MAT`
   file plus regions A/B/C; proven separately in Phase 3E (above).
-- **CMI**: length-prefixed strings (`len byte + chars + u32`), count at
-  0x14 can be 0 with a second count following → different.
+- **CMI**: variable-length records (`u8 len + name[len] + u32`), four
+  chained counted tables then a data region → different; proven
+  separately in Phase 3F (above).
 - **DTI**: binary records, no names in the directory region → different.
 
-So each tagged family needs its own statics+bytes pass; SNI, MTI and
-MTO are proven, CMI/DTI interiors remain undecoded.
+So each tagged family needs its own statics+bytes pass; SNI, MTI, MTO
+and CMI are proven, the DTI interior remains undecoded.
 
 ## Unsupported payload semantics
 
-Per the phase brief, no semantics are assigned to SNI payloads (the
+Per the phase briefs, no semantics are assigned to SNI payloads (the
 RIFF/WAVE observation is byte-level only), to MTI payload data past
-its proven u16 header, or to MTO block contents past the proven
-region boundaries; nothing in CMI/DTI/FTI/BNI interiors is decoded.
-The parsers enumerate boundaries — they never interpret or dump
-payload bytes.
+its proven u16 header, to MTO block contents past the proven region
+boundaries, or to the CMI data region past its proven target-head
+shape; nothing in DTI/FTI/BNI interiors is decoded. The parsers
+enumerate boundaries — they never interpret or dump payload bytes.
 
-## Next targets (Phase 3F candidates, not started)
+## Next targets (Phase 3G candidates, not started)
 
-1. `.CMI` length-prefixed record stream (script/opcode stream?).
+1. `.DTI` binary-record interior (no name table) — the bundle loader
+   already provably derives the arena-record array from it.
 2. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
-3. `.DTI` binary-record interior (no name table).
+3. CMI data-region organization — how records inside the region are
+   delimited/iterated, and what table[0]/table[2] targets are
+   (consumer-side tracing beyond the proven directory structure).
 4. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
    data blocks).
 5. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.

@@ -131,6 +131,7 @@ bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
 | .SNI directory | `FUN_00428a0c` (stream loader), `FUN_004259a8` (whole-blob loader), `FUN_00428c90`/`FUN_00429014` (entry lookup + payload read), `FUN_00428be8`/`FUN_00428828` (iterate) | STRONG_ | count u32@0x14, N×24-byte records `{name[12], u32@+0x0c, blobOff@+0x10, size@+0x14}`; seek `stored+4` SEEK_SET; name compare ≤12 (`MOV EBX,0xc`→`FUN_0042fa80`); blob image = file+4 — Phase 3C, see `../DATA_FORMATS.md` |
 | .MTI directory (material table, `loadmats.c`) | `FUN_0041a1e0` (table parser — shared), `FUN_0041a4d0` (level `LEVEL%dS.MTI` path via `FUN_00425c8c`), `FUN_0041a480` (`STATS/STREAM/FALL3D_%d.MTI` via `FUN_00425bfc`), `FUN_0041a820` (second table `DAT_0054b730`), `FUN_0041a590`/`FUN_0041a5ec`/`FUN_0041a694` (name lookups, 0x34-stride in-memory records, name at +0x28) | STRONG_ | count u32@0x14, N×24-byte records `{name[8], flags@+0x08, u32@+0x0c, u32@+0x10, blobOff@+0x14}`; `+0x08==0xffffffff` = index record (only `+0x0c` read); else `+0x14` dereferenced blob-relative (file pos = stored+4); flags `&0x30000` select 4- vs 8-byte payload u16 header; strings `matdef`/`matlkup`/`Texture %s not in material list` — Phase 3D, see `../DATA_FORMATS.md` |
 | .MTO overlay directory | `FUN_0041a84c` (dir load), `FUN_0041a910` (max-block scan → scratch alloc), `FUN_0041a9d8` (name lookup → fseek + len read), `FUN_0041aad0`/`FUN_0041ab44` (≤0x8000-chunk stream + accessor), `FUN_00432534` (block consumer → `FUN_0041a820`→`FUN_0041a1e0` on buf+0x10), `FUN_00419ee0` (region-C walk), `FUN_00403720` (overlay-alien resolve), `FUN_004287cc`/`FUN_00402e2c` (overlay sounds), `FUN_004387ec`/`FUN_00403498` (region-A lookups), `FUN_0041b7b4` (`LEVEL%dO.MTO` path) | STRONG_ | count u32@0x14, N×12-byte records `{name[8], fileOff@+0x08}` (fseek SEEK_SET, name compare bound 8); block u32 = self-inclusive byte len, streamed from off+4; each block embeds a tagged `.MAT` image at +0x10 (parsed by the shared MTI parser) + region A `{ca,cb,cc}` (overlay-alien/overlay-sound records, cc≤0x10 → `"Too many overlay sounds"`) + fixed 0x150-byte region B + nested region C ({10,44,36,12}-stride counted arrays, 2-byte pad iff c1 odd); strings `overlay`, `No overlay data for %s`, `Failed to resolve overlay alien %s` — Phase 3E, see `../DATA_FORMATS.md` |
+| .CMI table directory | `FUN_00425d18` (whole-blob load into `DAT_0054c6bc`, length → `DAT_0054c680`), `FUN_0045840c`/`FUN_0045843c`/`FUN_0045846c` (table-end walkers), `FUN_0045849c`/`FUN_00458550` (table-3 name lookups + indirection), `FUN_004286c8` (table-1 → `DAT_004edcc0` 0x88-stride array, cap 0x50), `FUN_004566f0` (table-2 lookup in object init), `FUN_00426f34`/`FUN_00426738` (load/save pointer relocation vs the image base) | STRONG_ | four counted variable-length tables `{u8 len, name[len incl NUL], u32 imgOff}` @0x14 then a data region to the trailer; values are image-relative offsets (image = file+4); `"Overflowed enemy table"` caps table 1; table-3 targets begin `{lenStr, lenStr, u32}` — Phase 3F, see `../DATA_FORMATS.md`. **Note:** the pre-3F "collision/map" guess below was wrong — no arena/BSP structure is proven for `.CMI` |
 | Traversal load | `FUN_00433d40` | STRONG_ | `MISC\LOAD_%d.LBB`, `TLEVEL.*`, level families |
 | FALL3D/freefall | `FUN_0040ef28` (+init `FUN_0041e070`-equiv) | STRONG_ | `fall_3d.c` string, `FALL3D_%d.MTI`, `FALLP_%d/LEVEL_%d/POD_%d` |
 | Renderer (3D) | `FUN_00431300` draw_arena, `FUN_00432e2c` BSPShow, `FUN_0040bd40/…` poly sort | STRONG_ | `Overflowed MaxObjects in draw_arena`, `BSPShow %s not found`, `arena %s not found`, `Too many polygons for current sort list`, `3 Cooridors not allowed for arena` |
@@ -159,7 +160,10 @@ found`) — OBSERVED format skeleton, semantics UNKNOWN.
 All path strings are `.\`-relative or `C:\MDK.CFG`-absolute; `mdkfopen`
 resolves `cddata`/`hddata` roots (BUILD_A ships both as `.\`). Coordinated
 per-level families `%s\LEVEL%d\…`: `.MTO` overlay data, `O.SNI`/`S.SNI`
-sound, `S.MTI` imagery, `.CMI` collision/map, `.DTI` data.
+sound, `S.MTI` imagery, `.CMI` counted name→offset tables + data
+region (Phase 3F — interior proven; the earlier "collision/map" label
+was a guess and is withdrawn: nothing in `.CMI` is proven to be
+collision, map, arena or BSP data), `.DTI` data.
 `FALL3D\FALL3D_%d.MTI`
 + `.SNI` + `.BNI` for freefall; `STREAM\` for mid-level streams;
 `MISC\` for fonts/config/movies/slideshow/sound set; `demo\` for input
@@ -169,7 +173,10 @@ first proven interior format; Phase 3D adds the `.MTI` material-table
 directory — count + 24-byte name[8]/flags/params/blob-offset records;
 Phase 3E adds the `.MTO` overlay directory — count + 12-byte
 name[8]/file-offset records indexing overlay blocks that each embed a
-`.MAT` image plus three bounded data regions;
+`.MAT` image plus three bounded data regions; Phase 3F adds the `.CMI`
+interior — four counted `{u8 len, name, u32 imgOff}` tables plus a
+bounded data region, consumed at traversal load for the original's
+"enemy table" and per-arena name lookups;
 see `../DATA_FORMATS.md`.)
 
 ## DOS ↔ Win95 shared code — CORROBORATED
@@ -242,9 +249,10 @@ DSOUND).
 1. Semantic decode of the mode values 0–8 and sub-modes 1–11 (runtime
    correlation in DOS oracle).
 2. `.SAV` packet field map (correlate `SAVE CORRUPT` tags with live saves).
-3. Arena/BSP structure of `.CMI` (loader entry points known); `.MTI`
-   interior proven as the material table in Phase 3D — payload data
-   interpretation past the u16 header remains open.
+3. `.CMI` data-region organization and per-table target semantics
+   (directory structure proven in Phase 3F — it is NOT an arena/BSP
+   structure as once guessed); `.MTI` payload data interpretation
+   past the u16 header remains open.
 4. Alien command interpreter (`tr_alcmd.c` region) — opcode inventory.
 5. FLIC/MVE decoder boundaries for future video playback.
 6. Win95 runtime lane (blocked on licensed Windows 95) to validate the

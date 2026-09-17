@@ -164,8 +164,10 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- No original-format parsing (`.MTO/.SNI/.MTI/.CMI/.DTI/.FTI/.BNI/.LBB/
-  .SAV/.FLC/.MVE` all unimplemented — Phase 3B+).
+- The app loads no original data at runtime; metadata-only interior
+  parsers for `.SNI/.MTI/.MTO/.CMI` exist in `mdk_core`/`mdk-inspect`
+  (Phases 3C–3F) but the skeleton scene does not consume them.
+  `.DTI/.FTI/.BNI/.LBB/.SAV/.FLC/.MVE` remain unparsed.
 - Original 600x360→640x480 image offset UNKNOWN (currently centered).
 - Window-close quit and resize were code-verified; physical
   keyboard/mouse input could not be host-injected on this machine (TCC),

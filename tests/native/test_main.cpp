@@ -2,6 +2,7 @@
 // those paths are exercised by the runtime smoke test instead.
 
 #include "core/binary_reader.h"
+#include "core/cmi_directory.h"
 #include "core/compat.h"
 #include "core/container.h"
 #include "core/data_root.h"
@@ -282,7 +283,8 @@ void test_file_family() {
   CHECK(fileFamilyForPath(".SNI") == MdkFileFamily::kSni); // ext-only name
   CHECK(fileFamilyForPath("a.SNI.bak") == MdkFileFamily::kUnknown);
 
-  // Support levels (Phase 3C: SNI; Phase 3D: MTI; Phase 3E: MTO).
+  // Support levels (Phase 3C: SNI; Phase 3D: MTI; Phase 3E: MTO;
+  // Phase 3F: CMI).
   CHECK(fileFamilySupport(MdkFileFamily::kSni) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kMti) ==
@@ -290,7 +292,7 @@ void test_file_family() {
   CHECK(fileFamilySupport(MdkFileFamily::kMto) ==
         FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kCmi) ==
-        FamilySupport::kEnvelopeOnly);
+        FamilySupport::kDirectoryMetadata);
   CHECK(fileFamilySupport(MdkFileFamily::kDti) ==
         FamilySupport::kEnvelopeOnly);
   CHECK(fileFamilySupport(MdkFileFamily::kFti) ==
@@ -1265,6 +1267,329 @@ void test_mto_directory() {
   }
 }
 
+// Synthetic CMI file builder (no original data). Layout mirrors the
+// CODE-CORROBORATED structure: [u32 size-4][name12][u32 size-12]
+// [table x N: u32 count, then count x {u8 len, name[len], u32 value}]
+// [data region bytes] [name12 trailer]. Stored name length INCLUDES
+// the NUL terminator (the OBSERVED convention); a nullptr name builds
+// a len-0 record (u8 0 + u32 value only).
+struct SyntheticCmi {
+  std::vector<std::byte> buf;
+  std::vector<std::uint64_t> tableEnds;      // per given table
+  std::vector<std::uint64_t> recStarts;      // flat, table-major
+  std::vector<std::uint64_t> recValueOffs;   // u32 field offsets
+  std::uint64_t dataStart = 0;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 12) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+
+  using Rec = std::tuple<const char*, std::uint32_t>;  // name, raw u32
+  using Table = std::initializer_list<Rec>;
+
+  static std::uint64_t tablesEnd(
+      std::initializer_list<Table> tables) {
+    std::uint64_t pos = 0x14;
+    for (const auto& t : tables) {
+      pos += 4;
+      for (const auto& [n, v] : t)
+        pos += (n ? std::strlen(n) + 1 : 0) + 5;
+    }
+    return pos;
+  }
+
+  static SyntheticCmi build(const char* logicalName,
+                            std::initializer_list<Table> tables,
+                            std::uint32_t dataBytes = 16) {
+    SyntheticCmi s;
+    const std::uint64_t dStart = tablesEnd(tables);
+    const std::uint64_t total = dStart + dataBytes + 12;
+    s.dataStart = dStart;
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.putName(0x04, logicalName);
+    s.put32(0x10, static_cast<std::uint32_t>(total - 12));
+
+    std::uint64_t pos = 0x14;
+    for (const auto& t : tables) {
+      s.put32(static_cast<std::size_t>(pos),
+              static_cast<std::uint32_t>(t.size()));
+      pos += 4;
+      for (const auto& [n, v] : t) {
+        const std::size_t len = n ? std::strlen(n) + 1 : 0;
+        s.recStarts.push_back(pos);
+        s.recValueOffs.push_back(pos + 1 + len);
+        s.buf[pos] = static_cast<std::byte>(len);
+        for (std::size_t i = 0; i < len; ++i)
+          s.buf[pos + 1 + i] = static_cast<std::byte>(n[i]);
+        s.put32(pos + 1 + len, v);
+        pos += len + 5;
+      }
+      s.tableEnds.push_back(pos);
+    }
+    s.putName(static_cast<std::size_t>(total - 12), logicalName);
+    return s;
+  }
+};
+
+void test_cmi_directory() {
+  using mdk::CmiDirectoryStatus;
+  using mdk::inspectCmiDirectory;
+
+  // Valid file: all four tables populated; every nonzero value points
+  // into the data region (the OBSERVED corpus property).
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{{"OBJ$ANIM0", 0}, {"OBJ$ANIM1", 0}},
+         {{"ALPHA", 0}, {"BETA", 0}},
+         {{"LONGERNAME", 0}},
+         {{"X", 0}, {"YY", 0}, {"ZZZ", 0}}},
+        32);
+    const std::uint32_t imgOff =
+        static_cast<std::uint32_t>(s.dataStart - 4);  // -> file dataStart
+    for (std::size_t i = 0; i < s.recValueOffs.size(); ++i)
+      s.put32(static_cast<std::size_t>(s.recValueOffs[i]), imgOff);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables.size() == 4);
+    CHECK(d.tables[0].count == 2 && d.tables[1].count == 2 &&
+          d.tables[2].count == 1 && d.tables[3].count == 3);
+    CHECK(d.tables[0].countFileOffset == 0x14);
+    CHECK(d.tables[0].recordsFileOffset == 0x18);
+    CHECK(d.tables[0].endFileOffset == s.tableEnds[0]);
+    CHECK(d.dataRegionOffset == s.dataStart);
+    CHECK(d.dataRegionEnd == s.buf.size() - 12);
+    CHECK(d.trailerPresent && d.secondaryEqualsTrailerOffset);
+
+    const auto& r0 = d.tables[0].records[0];
+    CHECK(r0.name() == "OBJ$ANIM0");
+    CHECK(r0.nameLength == 10);          // strlen + NUL
+    CHECK(r0.nameBytes.size() == 10);
+    CHECK(r0.nameBytes.back() == std::byte{0});
+    CHECK(r0.nameEndsWithTerminator);
+    CHECK(r0.fileOffset == s.recStarts[0]);
+    CHECK(r0.value == imgOff);
+    CHECK(r0.valueFileOffset() ==
+          std::optional<std::uint64_t>(s.dataStart));
+    CHECK(r0.valueReachesDataRegion);
+  }
+
+  // Zero-count first table (OBSERVED in LEVEL4/5/7): the next count
+  // immediately follows at 0x18.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"E1", 0}}, {{"N1", 0}, {"N2", 0}}, {{"T", 0}}}, 8);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables[0].count == 0 && d.tables[0].records.empty());
+    CHECK(d.tables[0].endFileOffset == 0x18);
+    CHECK(d.tables[1].countFileOffset == 0x18);
+    CHECK(d.tables[1].records[0].name() == "E1");
+    CHECK(d.dataRegionOffset == s.dataStart);
+  }
+
+  // All four tables empty: minimum valid interior, data region starts
+  // right after the fourth count field (0x14 + 4*4 = 0x24).
+  {
+    auto s = SyntheticCmi::build("EMPTY.CMD", {{}, {}, {}, {}}, 8);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables.size() == 4);
+    CHECK(d.dataRegionOffset == 0x24);
+  }
+
+  // Null record value (the table-1 consumer's tested null form):
+  // preserved raw; valueFileOffset() reports no target.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"NULLABLE", 0}}, {}, {}}, 8);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables[1].records[0].value == 0);
+    CHECK(!d.tables[1].records[0].valueFileOffset().has_value());
+    CHECK(!d.tables[1].records[0].valueReachesDataRegion);
+  }
+
+  // Value pointing into the table area instead of the data region:
+  // in-bounds for the original's unconditional dereference, so the
+  // file still parses; valueReachesDataRegion reports the deviation.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"A", 0x10}} , {}, {}}, 8);   // -> file 0x14
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables[1].records[0].valueFileOffset() ==
+          std::optional<std::uint64_t>(0x14));
+    CHECK(!d.tables[1].records[0].valueReachesDataRegion);
+  }
+
+  // Record value escaping the file entirely → rejected (native
+  // hardening; the original dereferences unconditionally).
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"A", 0}}, {}, {}}, 8);
+    s.put32(static_cast<std::size_t>(s.recValueOffs[0]),
+            static_cast<std::uint32_t>(s.buf.size()));  // -> past EOF
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kValueOutOfBounds);
+    CHECK(d.badTableIndex == 1 && d.badRecordIndex == 0);
+  }
+
+  // 0xffffffff is not a file-format sentinel here: it is an
+  // image-relative offset far past EOF → rejected like any other
+  // out-of-range value.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"A", 0xffffffff}}, {}, {}}, 8);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kValueOutOfBounds);
+  }
+
+  // len-0 record: legal stride-5 record with an empty name.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{nullptr, 0}, {"B", 0}}, {}, {}}, 8);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables[1].count == 2);
+    CHECK(d.tables[1].records[0].nameLength == 0);
+    CHECK(d.tables[1].records[0].nameBytes.empty());
+    CHECK(d.tables[1].records[0].name().empty());
+    CHECK(d.tables[1].records[1].name() == "B");
+    CHECK(d.tables[1].records[1].fileOffset == s.recStarts[1]);
+  }
+
+  // Name without an internal NUL: stored length does not include a
+  // terminator; structurally walkable, flag reports the deviation.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"ABC", 0}}, {}, {}}, 8);
+    // "ABC\0" stored as len 4; overwrite the NUL so no terminator is
+    // counted. Record still parses (the original would over-read, our
+    // walk is length-driven).
+    s.buf[s.recStarts[0] + 1 + 3] = std::byte{'!'};
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(!d.tables[1].records[0].nameEndsWithTerminator);
+    CHECK(d.tables[1].records[0].name() == "ABC!");
+  }
+
+  // Non-printable byte inside a name: preserved raw, escaped for
+  // display.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"A\x80", 0}}, {}, {}}, 8);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(d.tables[1].records[0].nameBytes[1] == std::byte{0x80});
+    CHECK(d.tables[1].records[0].name() == "A\\x80");
+  }
+
+  // Inflated first count → records escape the interior region.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{{"A", 0}}, {}, {}, {}}, 8);
+    s.put32(0x14, 0xffffffff);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kTableOutOfBounds);
+    CHECK(d.badTableIndex == 0);
+  }
+
+  // Inflated mid-chain count: the walk consumes the following tables'
+  // bytes as "records"; the first such record's value field reads as
+  // an out-of-file offset → value bound fires before the walk escapes.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{{"A", 0}}, {{"B", 0}}, {{"C", 0}}, {{"D", 0}}}, 8);
+    s.put32(static_cast<std::size_t>(s.tableEnds[0]), 0x4000); // T1 count
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kValueOutOfBounds);
+    CHECK(d.badTableIndex == 1);
+  }
+
+  // Inflated last-table count: zeroed data bytes walk as len-0/value-0
+  // records until the record stride escapes the trailer bound.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{{"A", 0}}, {{"B", 0}}, {{"C", 0}}, {{"D", 0}}}, 8);
+    s.put32(static_cast<std::size_t>(s.tableEnds[2]), 0x4000); // T3 count
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kTableOutOfBounds);
+    CHECK(d.badTableIndex == 3);
+  }
+
+  // Inflated length byte: the record's own len+5 stride escapes.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{}, {{"A", 0}}, {}, {}}, 8);
+    s.buf[s.recStarts[0]] = std::byte{0xff};
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kTableOutOfBounds);
+    CHECK(d.badTableIndex == 1 && d.badRecordIndex == 0);
+  }
+
+  // File that physically ends after three tables: the fourth count
+  // field lands on/past the trailer → table bound fails.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD",
+        {{{"A", 0}}, {}, {}}, 0);  // 3 tables, then trailer
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kTableOutOfBounds);
+    CHECK(d.badTableIndex == 3);
+    CHECK(d.badRecordIndex == static_cast<std::size_t>(-1));
+  }
+
+  // Truncated header: envelope fine but file ends before the count.
+  {
+    std::byte t[20] = {};
+    t[0] = std::byte{16};
+    std::memcpy(t + 4, "T.CMD", 5);
+    const auto d = inspectCmiDirectory(t);
+    CHECK(d.status == CmiDirectoryStatus::kTruncatedHeader);
+  }
+
+  // Not a tagged envelope → "not this format", not "malformed".
+  {
+    std::byte raw[64] = {};
+    const auto d = inspectCmiDirectory(raw);
+    CHECK(d.status == CmiDirectoryStatus::kNotTaggedEnvelope);
+
+    std::byte fti[32] = {};
+    fti[0] = std::byte{28};
+    fti[4] = std::byte{0x03};
+    const auto d2 = inspectCmiDirectory(fti);
+    CHECK(d2.status == CmiDirectoryStatus::kNotTaggedEnvelope);
+  }
+
+  // u32@0 length mismatch → envelope invalid → not this format.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD", {{}, {}, {}, {}}, 8);
+    s.put32(0x00, 0);
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kNotTaggedEnvelope);
+  }
+
+  // Missing trailer → the data region extends to EOF; still parses.
+  {
+    auto s = SyntheticCmi::build("TEST.CMD", {{}, {}, {}, {}}, 8);
+    for (std::size_t i = s.buf.size() - 12; i < s.buf.size(); ++i)
+      s.buf[i] = std::byte{'X'};
+    const auto d = inspectCmiDirectory(s.buf);
+    CHECK(d.status == CmiDirectoryStatus::kOk);
+    CHECK(!d.trailerPresent);
+    CHECK(d.dataRegionEnd == s.buf.size());
+    CHECK(d.secondaryEqualsTrailerOffset);
+  }
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
@@ -1460,6 +1785,7 @@ int main() {
   test_sni_directory();
   test_mti_directory();
   test_mto_directory();
+  test_cmi_directory();
   test_data_root();
   test_mode_dispatch();
   test_input_state();
