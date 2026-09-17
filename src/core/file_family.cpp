@@ -93,9 +93,9 @@ std::string_view fileFamilyName(MdkFileFamily f) {
 FamilySupport fileFamilySupport(MdkFileFamily f) {
   switch (f) {
   case MdkFileFamily::kSni:
+  case MdkFileFamily::kMti:
     return FamilySupport::kDirectoryMetadata;
   case MdkFileFamily::kMto:
-  case MdkFileFamily::kMti:
   case MdkFileFamily::kCmi:
   case MdkFileFamily::kDti:
   case MdkFileFamily::kFti:

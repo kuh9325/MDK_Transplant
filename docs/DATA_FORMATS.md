@@ -1,10 +1,11 @@
-# Data Formats — Phase 3C
+# Data Formats — Phase 3D
 
-Status: first interior directory mapped (2026-09-17). This document
-records evidence-backed file-format structure for the proprietary
-families found under the data root. Phase 3B established the top-level
-envelope; Phase 3C adds explicit file-family dispatch and the first
-**proven interior directory** (`.SNI`, metadata only).
+Status: second interior directory mapped. This document records
+evidence-backed file-format structure for the proprietary families
+found under the data root. Phase 3B established the top-level
+envelope; Phase 3C added explicit file-family dispatch and the first
+proven interior directory (`.SNI`); Phase 3D adds the second proven
+interior directory (`.MTI`, metadata only).
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`.
 "BUILD_A" = `original/installed/` — the NoCD repack; data integrity vs
@@ -29,7 +30,7 @@ delegates to it — no duplicated extension tables.
 |---|---|---|---|---|
 | MTO | `.MTO` | tagged-name | envelope-only | interior ≠ SNI: `u32 count @0x14` then `{name[8], u32}` pairs (12-stride) + a second table (OBSERVED, not decoded) |
 | SNI | `.SNI` | tagged-name | **directory-metadata** | count + 24-byte directory records proven (below) |
-| MTI | `.MTI` | tagged-name | envelope-only | count @0x14 + 24-byte records `{name[8], u32, u32, u32, u32}`; non-monotonic offsets, zero/0xffffffff placeholders (OBSERVED, not decoded) |
+| MTI | `.MTI` | tagged-name | **directory-metadata** | count + 24-byte records `{name[8], u32 flags, u32, u32, u32 off}` proven (below) |
 | CMI | `.CMI` | tagged-name | envelope-only | length-prefixed name records + u32 (OBSERVED, not decoded) |
 | DTI | `.DTI` | tagged-name | envelope-only | binary records, no name table (OBSERVED, not decoded) |
 | FTI | `.FTI` | length only | envelope-only | count-like u32 + 8-byte names (shape observation only) |
@@ -151,6 +152,142 @@ for this phase).
 | `FUN_0041c884` | 8-byte-aligned pool allocator |
 | `FUN_0047e086`/`FUN_0047e1ef` | fseek/fread wrappers (Watcom calling convention) |
 
+## Proven interior directory: MTI
+
+Evidence class: OBSERVED (13/13 `.MTI` files in BUILD_A) +
+CODE-CORROBORATED (MDK95.EXE `FUN_0041a1e0` table parser +
+`FUN_00425c8c`/`FUN_00425bfc` blob loaders + `FUN_0041a590`/
+`FUN_0041a5ec`/`FUN_0041a694` lookup consumers).
+
+### Layout
+
+```
+file offset
+0x00  u32le        blob length = fileSize - 4          (envelope)
+0x04  char[12]     logical name "<stem>.MTI"/".MAT"    (envelope)
+0x10  u32le        = fileSize - 12 (envelope; not read by the parser)
+0x14  u32le        entry count N      (img+0x10 in the original —
+                   img = content blob loaded from file offset 4)
+0x18  record[N]    24-byte records (img+0x14; the original advances
+                   the source pointer by 6 u32s per record):
+  +0x00  char[8]   entry name, NUL-padded (copied as 2 u32s to
+                   in-memory +0x28; looked up by C-string compare via
+                   FUN_0042fa50; may fill the field — no terminator
+                   inside it in that case)
+  +0x08  u32le     class/flag word. == 0xffffffff marks an INDEX
+                   record (CODE-CORROBORATED compare). Otherwise the
+                   original tests bits 0x00030000 to select the
+                   extended payload header and preserves the low 16
+                   bits. OBSERVED values: 0x00000000 (556 recs),
+                   0xffffffff (579), 0x00010001 (59), 0x00010000 (11),
+                   0x00000002 (1).
+  +0x0c  u32le     INDEX records: the index value (CODE-CORROBORATED —
+                   copied to in-memory +0x08; the original reads no
+                   other field of index records). PAYLOAD records:
+                   copied verbatim to in-memory +0x1c; semantics
+                   UNKNOWN (observed 0; four records carry
+                   0x469c4000 — a float bit pattern).
+  +0x10  u32le     INDEX records: ignored by the original (OBSERVED 0
+                   in all 579). PAYLOAD records: copied verbatim to
+                   in-memory +0x20; semantics UNKNOWN (only
+                   0x40600000 = 3.5f and 0x40c00000 = 6.0f bit
+                   patterns observed — float-typed usage is plausible
+                   but NOT proven).
+  +0x14  u32le     INDEX records: ignored by the original (OBSERVED 0
+                   in all 579). PAYLOAD records: stored payload offset
+                   RELATIVE TO THE CONTENT BLOB — file position =
+                   stored + 4 (CODE-CORROBORATED: the original
+                   dereferences img + stored directly).
+…     payloads     [4+off, next payload's 4+off) each
+size-12  char[12]  trailer = name field repeat
+```
+
+### Record classes (CODE-CORROBORATED)
+
+- **Index records** (`+0x08 == 0xffffffff`): name + `+0x0c` index only.
+  The original stores `index` and a `-1` marker in the in-memory
+  descriptor. `+0x10`/`+0x14` are ignored — our parser preserves them
+  raw and never bounds-checks them. OBSERVED examples: `PEN_1`…
+  `PEN_216` (index follows the name's digits), `NONE` (index 256),
+  `BLACK` (index 0), `GREY*` — the name→index correlation is OBSERVED
+  byte-level fact; its semantics are UNKNOWN.
+- **Payload records** (any other `+0x08`): name + flags + two raw
+  params + blob offset to a payload whose first bytes form a header
+  (below).
+
+### Payload header (CODE-CORROBORATED — read by FUN_0041a1e0)
+
+The record stores no byte count; the original reads the payload's own
+header to bound it:
+
+```
+flags & 0x00030000 == 0  ("plain"):
+  u16 @payload+0   header field A
+  u16 @payload+2   header field B
+  data             starts at payload+4
+flags & 0x00030000 != 0  ("extended"):
+  u16 @payload+0   header count (merged into the in-memory flags
+                   high word by the original)
+  u16 @payload+4   header field A
+  u16 @payload+6   header field B
+  data             starts at payload+8
+```
+
+The original derives a shift count from field A (smallest k with
+`2^k >= A`, capped at 12 iterations) and a family of masks from A and
+B — consistent with A/B being dimensions — but no semantic name is
+proven; they are reported raw as `headerFieldA`/`headerFieldB`.
+
+### OBSERVED invariants (validated by the parser)
+
+- Payload records' stored offsets are ascending in record order and
+  their `[4+off, …)` payloads tile `[dirEnd, size-12)` exactly —
+  first payload at `dirEnd`, last ends at the trailer.
+- Index records interleave freely among payload records.
+- Every payload header lies inside `[dirEnd, size-12)`.
+- Record `count` may be 0 (the original branches on count==0 and
+  produces an empty table).
+
+### BUILD_A MTI inventory (all 13 parse `ok`)
+
+| File | Records | Payload | Index |
+|---|---:|---:|---:|
+| `FALL3D/FALL3D_1..5.MTI` | 56 | 34 | 22 |
+| `MISC/STATS.MTI` | 40 | 2 | 38 |
+| `STREAM/STREAM.MTI` | 55 | 12 | 43 |
+| `TRAVERSE/LEVEL3/LEVEL3S.MTI` | 198 | 71 | 127 |
+| `TRAVERSE/LEVEL4/LEVEL4S.MTI` | 138 | 95 | 43 |
+| `TRAVERSE/LEVEL5/LEVEL5S.MTI` | 111 | 67 | 44 |
+| `TRAVERSE/LEVEL6/LEVEL6S.MTI` | 123 | 58 | 65 |
+| `TRAVERSE/LEVEL7/LEVEL7S.MTI` | 132 | 82 | 50 |
+| `TRAVERSE/LEVEL8/LEVEL8S.MTI` | 129 | 70 | 59 |
+
+One structural class across the corpus; no level-specific variants,
+no malformed/outlier files. Record counts 40–198.
+
+### Original loader functions (static evidence)
+
+| Address | Role (observed behavior) |
+|---|---|
+| `FUN_0041a1e0` | MTI table parser: `count = *(img+0x10)`; records at `img+0x14`, source stride 24; per record copies name[8] to in-memory +0x28; `+0x08 == 0xffffffff` → index path (dest+0x08 = `+0x0c`, dest+0x0c = -1); else dest+0x1c = `+0x0c`, dest+0x20 = `+0x10`, payload ptr = `img + +0x14`; flags `& 0x30000` select the 4- vs 8-byte payload header; dest stride 0x34 |
+| `FUN_0041a4d0` | Level-MTI load path: `LEVEL%dS.MTI`/`TLEVEL.MTI` → `FUN_00425c8c` (whole-blob) → `FUN_0041a1e0` into `DAT_0054b72c` |
+| `FUN_0041a480` | Shared load path (`STATS.MTI` via `FUN_00429200`, `STREAM.MTI` via `FUN_0042b270`, `FALL3D_%d.MTI` via `FUN_0040ef28`): `FUN_00425bfc` (whole-blob) → `FUN_0041a1e0` into `DAT_0054b72c` |
+| `FUN_0041a820` | Parses a second MTI image into the second table `DAT_0054b730`/`DAT_0054b734` (default "matdef" allocator); called from `FUN_00432534` |
+| `FUN_00425c8c`/`FUN_00425bfc` | Whole-blob loaders: open via `FUN_0041b300`/`FUN_0041b148` (tag-checked path), fread u32@0, alloc, fread `size-4` → img = content blob at file+4 |
+| `FUN_0041a590`/`FUN_0041a5ec`/`FUN_0041a694` | Name lookups: iterate `DAT_0054b728` (+ second table) with 0x34 stride, compare name at +0x28 via `FUN_0042fa50`; failure message `Texture %s not in material list` |
+| `FUN_0041a548` | Second-table teardown; asserts against `...\mdksrc\share\loadmats.c` — the original's own name for this subsystem |
+| `FUN_0042fa50` | Unbounded C-string compare used for name lookups |
+| `FUN_00433d40` | Level-bundle loader: sequences `.MTI` (FUN_0041a4d0), `.BNI`, `.CMI`, `.DTI`, `.MTO` loads |
+
+### Naming note (CODE-CORROBORATED)
+
+The original's own strings call this the **material/texture table**:
+allocation tag `"matdef"`, lookup tag `"matlkup"`, failure message
+`"Texture %s not in material list"`, teardown assert path
+`...\mdksrc\share\loadmats.c`. Record/field names in the parser still
+use offsets (`fieldAt0x08` etc.) because per-field semantics beyond
+the proven behavior remain UNKNOWN.
+
 ## Unknown fields
 
 - `u32 @0x10` (envelope): equals `fileSize - 12` in all tagged files and
@@ -159,39 +296,51 @@ for this phase).
 - SNI record `+0x0c`: small flag-like value set; a u16 read exists in
   one path. UNKNOWN.
 - SNI sentinel `+0x10` region contents: structured binary, UNKNOWN.
-- All payload contents: UNKNOWN (later phases).
+- MTI record `+0x0c` (payload records): observed 0 or 0x469c4000;
+  copied verbatim to in-memory +0x1c. UNKNOWN.
+- MTI record `+0x10` (payload records): only 0x40600000 (3.5f) and
+  0x40c00000 (6.0f) bit patterns observed; copied verbatim to
+  in-memory +0x20. UNKNOWN (float-typed consumption not proven).
+- MTI `+0x08` low-16 semantics (0/1/2 observed) and the payload
+  header u16 fields' semantics: UNKNOWN.
+- MTI index-record `+0x0c` values: name-correlated small integers;
+  what they index is UNKNOWN.
+- All payload contents past the proven header u16s: UNKNOWN (later
+  phases).
 
 ## Families that do NOT share the SNI layout
 
 Checked for "same count+stride+field order" against the SNI mechanism:
 
-- **MTI**: `name[8]` (not 12) + four u32s; `+0x10`-class fields hold
-  small indices and float-looking values (0x40600000 = 3.5f), offsets
-  non-monotonic with zero/0xffffffff placeholders → different table.
+- **MTI**: shares count@0x14 + 24-byte records + blob-relative offsets,
+  but the record is `name[8]` + four u32s and `+0x14` is the offset
+  (not `+0x10`); proven separately in Phase 3D (above).
 - **MTO**: `count @0x14` then `{name[8], u32}` 12-byte pairs followed by
   a second table with name references (`DANT_1.MAT`) → different.
 - **CMI**: length-prefixed strings (`len byte + chars + u32`), count at
   0x14 can be 0 with a second count following → different.
 - **DTI**: binary records, no names in the directory region → different.
 
-So no second family shares the exact SNI directory mechanism as of
-BUILD_A evidence; each family needs its own statics+bytes pass.
+So each tagged family needs its own statics+bytes pass; SNI and MTI
+are proven, MTO/CMI/DTI interiors remain undecoded.
 
 ## Unsupported payload semantics
 
 Per the phase brief, no semantics are assigned to SNI payloads (the
-RIFF/WAVE observation is byte-level only), and nothing in MTO/MTI/CMI/
-DTI/FTI/BNI interiors is decoded. The parsers enumerate boundaries —
-they never interpret or dump payload bytes.
+RIFF/WAVE observation is byte-level only) or to MTI payload data past
+its proven u16 header; nothing in MTO/CMI/DTI/FTI/BNI interiors is
+decoded. The parsers enumerate boundaries — they never interpret or
+dump payload bytes.
 
-## Next targets (Phase 3D candidates, not started)
+## Next targets (Phase 3E candidates, not started)
 
-1. `.MTI` directory formalization (name[8] + 4 fields; correlate the
-   index/offset fields with its consumer functions).
-2. `.MTO` two-table interior (count + `{name8, off}` pairs + second
+1. `.MTO` two-table interior (count + `{name8, off}` pairs + second
    table) — object-bundle map.
-3. `.CMI` length-prefixed record stream (script/opcode stream?).
-4. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
-5. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
+2. `.CMI` length-prefixed record stream (script/opcode stream?).
+3. `.FTI`/`.BNI` length-envelope interior (count + 8-byte names).
+4. Sentinel-record semantics in `.SNI` (`K_*` markers and the pointed-to
    data blocks).
-6. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.
+5. SNI payload semantics — RIFF/WAVE vs. others; the `+0x0c` field.
+6. MTI payload data interpretation past the proven header (the
+   descriptor's derived shift/mask fields hint at bit-packed data;
+   consumer functions needed).

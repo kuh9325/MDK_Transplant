@@ -12,6 +12,7 @@
 #include "core/container.h"
 #include "core/data_root.h"
 #include "core/file_family.h"
+#include "core/mti_directory.h"
 #include "core/sni_directory.h"
 
 #include <cstdio>
@@ -102,6 +103,67 @@ int selftest() {
        dir.entries[0].payloadSize == 4 && dir.trailerPresent &&
        dir.secondaryEqualsTrailerOffset;
   std::fprintf(stderr, "selftest sni-directory: %s\n",
+               ok ? "PASS" : "FAIL");
+  if (!ok) {
+    return 1;
+  }
+
+  // Synthetic MTI-like fixture: envelope + count=2 + two 24-byte
+  // records: one extended-header payload record and one index record.
+  // Layout: 0x18 + 2*24 = 0x48 dir end; payload at 0x48 (8-byte ext
+  // header: n=2,a=64,b=32 + 4 data bytes) then name trailer.
+  // Total = 0x48 + 12 + 12 = 0x60 = 96 bytes.
+  std::byte mti[96] = {};
+  const auto mput32 = [&](std::size_t off, std::uint32_t v) {
+    mti[off + 0] = static_cast<std::byte>(v & 0xff);
+    mti[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    mti[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    mti[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  };
+  const auto mput16 = [&](std::size_t off, std::uint16_t v) {
+    mti[off + 0] = static_cast<std::byte>(v & 0xff);
+    mti[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+  };
+  const auto mputName = [&](std::size_t off, const char* s) {
+    for (std::size_t i = 0; s[i] && off + i < sizeof(mti); ++i) {
+      mti[off + i] = static_cast<std::byte>(s[i]);
+    }
+  };
+  mput32(0x00, sizeof(mti) - 4);
+  mputName(0x04, "TEST.MTI");
+  mput32(0x10, sizeof(mti) - 12);
+  mput32(0x14, 2);                    // count
+  mputName(0x18, "MAT0");             // record 0: payload (ext header)
+  mput32(0x18 + 0x08, 0x00010001);    // flags: extended header
+  mput32(0x18 + 0x0c, 0);             // raw param
+  mput32(0x18 + 0x10, 0x40600000);    // raw param (float-looking)
+  mput32(0x18 + 0x14, 0x48 - 4);      // blobOffset -> file 0x48
+  mputName(0x30, "IDX0");             // record 1: index record
+  mput32(0x30 + 0x08, 0xffffffff);    // index discriminator
+  mput32(0x30 + 0x0c, 7);             // index value
+  mput32(0x30 + 0x10, 0);
+  mput32(0x30 + 0x14, 0);
+  mput16(0x48, 2);                    // payload header: u16 @+0 (n)
+  mput16(0x4c, 64);                   // u16 @+4 (fieldA)
+  mput16(0x4e, 32);                   // u16 @+6 (fieldB)
+  mputName(sizeof(mti) - 12, "TEST.MTI");
+
+  const auto mdir = mdk::inspectMtiDirectory(
+      std::span<const std::byte>(mti, sizeof(mti)));
+  ok = mdir.status == mdk::MtiDirectoryStatus::kOk &&
+       mdir.count == 2 && mdir.entries.size() == 2 &&
+       mdir.entries[0].name() == "MAT0" &&
+       !mdir.entries[0].isIndexRecord() &&
+       mdir.entries[0].hasExtendedHeader() &&
+       mdir.entries[0].payloadFileOffset() == 0x48 &&
+       mdir.entries[0].headerCount == 2 &&
+       mdir.entries[0].headerFieldA == 64 &&
+       mdir.entries[0].headerFieldB == 32 &&
+       mdir.entries[0].payloadDataFileOffset == 0x50 &&
+       mdir.entries[1].isIndexRecord() &&
+       mdir.entries[1].fieldAt0x0C == 7 &&
+       mdir.trailerPresent && mdir.secondaryEqualsTrailerOffset;
+  std::fprintf(stderr, "selftest mti-directory: %s\n",
                ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
@@ -247,7 +309,8 @@ int main(int argc, char** argv) {
   }
 
   // --entries: enumerate interior directory metadata where a proven
-  // parser exists (SNI only in Phase 3C). Never prints payload bytes.
+  // parser exists (SNI Phase 3C; MTI Phase 3D). Never prints payload
+  // bytes.
   if (support != mdk::FamilySupport::kDirectoryMetadata) {
     std::printf("entries:   unsupported for family %s (support: %s) — "
                 "no evidence-backed interior parser\n",
@@ -260,6 +323,61 @@ int main(int argc, char** argv) {
   if (!file) {
     std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
     return 1;
+  }
+
+  if (family == mdk::MdkFileFamily::kMti) {
+    const auto dir = mdk::inspectMtiDirectory(
+        std::span<const std::byte>(file->data(), file->size()));
+    std::printf("entries:   MTI directory (count u32 @0x14, records "
+                "24 bytes @0x18, name[8])\n");
+    std::printf("status:    %s%s%s\n",
+                std::string(mdk::mtiDirectoryStatusName(dir.status)).c_str(),
+                dir.detail.empty() ? "" : " — ",
+                dir.detail.empty() ? "" : dir.detail.c_str());
+    if (dir.status != mdk::MtiDirectoryStatus::kOk) {
+      return 1;
+    }
+    std::printf("count:     %u\n", dir.count);
+    std::printf("dir-end:   0x%llx\n",
+                static_cast<unsigned long long>(dir.directoryEnd));
+    std::printf("trailer:   name[12] @ size-12 %s\n",
+                dir.trailerPresent ? "present" : "ABSENT");
+    std::printf("u32@0x10:  %u — %s trailer offset\n",
+                dir.secondaryLength,
+                dir.secondaryEqualsTrailerOffset ? "equals"
+                                                 : "does not equal");
+
+    for (std::size_t i = 0; i < dir.entries.size(); ++i) {
+      const auto& e = dir.entries[i];
+      if (e.isIndexRecord()) {
+        std::printf("  [%3zu] %-8s INDEX (field0x08=0xffffffff) "
+                    "index=%u (0x%08x) field0x10=0x%08x "
+                    "field0x14=0x%08x\n",
+                    i, e.name().c_str(), e.fieldAt0x0C, e.fieldAt0x0C,
+                    e.fieldAt0x10, e.fieldAt0x14);
+      } else if (e.headerCount) {
+        std::printf("  [%3zu] %-8s field0x08=0x%08x field0x0c=0x%08x "
+                    "field0x10=0x%08x blobOff=0x%08x fileOff=0x%08llx "
+                    "hdr{n=%u,a=%u,b=%u} dataOff=0x%08llx\n",
+                    i, e.name().c_str(), e.fieldAt0x08, e.fieldAt0x0C,
+                    e.fieldAt0x10, e.fieldAt0x14,
+                    static_cast<unsigned long long>(e.payloadFileOffset()),
+                    *e.headerCount, e.headerFieldA, e.headerFieldB,
+                    static_cast<unsigned long long>(
+                        e.payloadDataFileOffset));
+      } else {
+        std::printf("  [%3zu] %-8s field0x08=0x%08x field0x0c=0x%08x "
+                    "field0x10=0x%08x blobOff=0x%08x fileOff=0x%08llx "
+                    "hdr{a=%u,b=%u} dataOff=0x%08llx\n",
+                    i, e.name().c_str(), e.fieldAt0x08, e.fieldAt0x0C,
+                    e.fieldAt0x10, e.fieldAt0x14,
+                    static_cast<unsigned long long>(e.payloadFileOffset()),
+                    e.headerFieldA, e.headerFieldB,
+                    static_cast<unsigned long long>(
+                        e.payloadDataFileOffset));
+      }
+    }
+    return 0;
   }
 
   const auto dir = mdk::inspectSniDirectory(

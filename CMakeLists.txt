@@ -31,6 +31,7 @@ add_library(mdk_core STATIC
   src/core/file_family.cpp
   src/core/framebuffer.cpp
   src/core/mode_dispatch.cpp
+  src/core/mti_directory.cpp
   src/core/sni_directory.cpp
   src/core/viewport.cpp
   src/input/input_state.cpp

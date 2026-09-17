@@ -129,6 +129,7 @@ bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
 | File I/O wrapper | `FUN_0041ae50` (`mdkfopen.c`) | STRONG_ | source-path string; used by all loaders |
 | Level bundle load | `FUN_0041b7b4` | STRONG_ | `LEVEL%dO.MTO/SNI`, `LEVEL%dS.MTI`, `.CMI/.DTI`, `FALL3D.*`, `TRAVERSE.SNI`, `TRAVSPRT.BNI`, `STREAM.*`, `TLEVEL.*`, `LOAD_CPY` |
 | .SNI directory | `FUN_00428a0c` (stream loader), `FUN_004259a8` (whole-blob loader), `FUN_00428c90`/`FUN_00429014` (entry lookup + payload read), `FUN_00428be8`/`FUN_00428828` (iterate) | STRONG_ | count u32@0x14, N×24-byte records `{name[12], u32@+0x0c, blobOff@+0x10, size@+0x14}`; seek `stored+4` SEEK_SET; name compare ≤12 (`MOV EBX,0xc`→`FUN_0042fa80`); blob image = file+4 — Phase 3C, see `../DATA_FORMATS.md` |
+| .MTI directory (material table, `loadmats.c`) | `FUN_0041a1e0` (table parser — shared), `FUN_0041a4d0` (level `LEVEL%dS.MTI` path via `FUN_00425c8c`), `FUN_0041a480` (`STATS/STREAM/FALL3D_%d.MTI` via `FUN_00425bfc`), `FUN_0041a820` (second table `DAT_0054b730`), `FUN_0041a590`/`FUN_0041a5ec`/`FUN_0041a694` (name lookups, 0x34-stride in-memory records, name at +0x28) | STRONG_ | count u32@0x14, N×24-byte records `{name[8], flags@+0x08, u32@+0x0c, u32@+0x10, blobOff@+0x14}`; `+0x08==0xffffffff` = index record (only `+0x0c` read); else `+0x14` dereferenced blob-relative (file pos = stored+4); flags `&0x30000` select 4- vs 8-byte payload u16 header; strings `matdef`/`matlkup`/`Texture %s not in material list` — Phase 3D, see `../DATA_FORMATS.md` |
 | Traversal load | `FUN_00433d40` | STRONG_ | `MISC\LOAD_%d.LBB`, `TLEVEL.*`, level families |
 | FALL3D/freefall | `FUN_0040ef28` (+init `FUN_0041e070`-equiv) | STRONG_ | `fall_3d.c` string, `FALL3D_%d.MTI`, `FALLP_%d/LEVEL_%d/POD_%d` |
 | Renderer (3D) | `FUN_00431300` draw_arena, `FUN_00432e2c` BSPShow, `FUN_0040bd40/…` poly sort | STRONG_ | `Overflowed MaxObjects in draw_arena`, `BSPShow %s not found`, `arena %s not found`, `Too many polygons for current sort list`, `3 Cooridors not allowed for arena` |
@@ -161,8 +162,10 @@ per-level families `%s\LEVEL%d\…`: `.MTO` objects, `O.SNI`/`S.SNI` sound,
 + `.SNI` + `.BNI` for freefall; `STREAM\` for mid-level streams;
 `MISC\` for fonts/config/movies/slideshow/sound set; `demo\` for input
 recordings; `SAVES\%.SAV` + `LASTGAME` for saves. (Phase 3C: the `.SNI`
-interior directory — count + 24-byte name/offset/size records — is the
-first proven interior format; see `../DATA_FORMATS.md`.)
+interior directory — count + 24-byte name/offset/size records — was the
+first proven interior format; Phase 3D adds the `.MTI` material-table
+directory — count + 24-byte name[8]/flags/params/blob-offset records;
+see `../DATA_FORMATS.md`.)
 
 ## DOS ↔ Win95 shared code — CORROBORATED
 
@@ -234,7 +237,9 @@ DSOUND).
 1. Semantic decode of the mode values 0–8 and sub-modes 1–11 (runtime
    correlation in DOS oracle).
 2. `.SAV` packet field map (correlate `SAVE CORRUPT` tags with live saves).
-3. Arena/BSP structure of `.CMI`/`.MTI` (loader entry points known).
+3. Arena/BSP structure of `.CMI` (loader entry points known); `.MTI`
+   interior proven as the material table in Phase 3D — payload data
+   interpretation past the u16 header remains open.
 4. Alien command interpreter (`tr_alcmd.c` region) — opcode inventory.
 5. FLIC/MVE decoder boundaries for future video playback.
 6. Win95 runtime lane (blocked on licensed Windows 95) to validate the

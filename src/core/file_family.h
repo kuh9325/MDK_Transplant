@@ -29,8 +29,8 @@ namespace mdk {
 enum class MdkFileFamily {
   kMto,   // .MTO — tagged-name envelope (interior: NOT the SNI layout)
   kSni,   // .SNI — tagged-name envelope; interior directory PROVEN
-  kMti,   // .MTI — tagged-name envelope (interior: count + 24-byte
-          //      records observed, field semantics differ from SNI)
+  kMti,   // .MTI — tagged-name envelope; interior directory PROVEN
+          //      (name[8] + 4 fields, 24-byte stride — Phase 3D)
   kCmi,   // .CMI — tagged-name envelope (interior: length-prefixed
           //      name records; differs from SNI)
   kDti,   // .DTI — tagged-name envelope (interior: binary, not a
@@ -70,7 +70,7 @@ MdkFileFamily fileFamilyForPath(std::string_view relPath);
 std::string_view fileFamilyName(MdkFileFamily f);
 
 // Current parser support for a family. kDirectoryMetadata implies a
-// concrete parser exists (SNI only, Phase 3C).
+// concrete parser exists (SNI Phase 3C; MTI Phase 3D).
 FamilySupport fileFamilySupport(MdkFileFamily f);
 std::string_view familySupportName(FamilySupport s);
 

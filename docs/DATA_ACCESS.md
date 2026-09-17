@@ -1,11 +1,12 @@
-# Data Access Layer — Phase 3B/3C
+# Data Access Layer — Phase 3B/3C/3D
 
-Status: implemented and validated (2026-09-17). This layer provides
+Status: implemented and validated. This layer provides
 read-only, confined, case-insensitive access to a user-supplied MDK
 data root, a bounded binary reader, the evidence-backed
-container-envelope parser, an explicit file-family dispatch, and the
-first proven interior directory map (`.SNI`, metadata only). No
-gameplay, no level parsing, no graphics/audio decode.
+container-envelope parser, an explicit file-family dispatch, and two
+proven interior directory maps (`.SNI` Phase 3C, `.MTI` Phase 3D —
+metadata only). No gameplay, no level parsing, no graphics/audio
+decode.
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`.
 Throughout: "BUILD_A" = `original/installed/` (the NoCD-repack tree;
@@ -61,7 +62,7 @@ All open strictly read-only.
 ## Binary reader (`BinaryReader`)
 
 Bounds-checked cursor over `std::span<const std::byte>`:
-`u8`, `u16le`, `u32le`, `peekU32le`, `bytes(n)` (zero-copy span),
+`u8`, `u16le`, `u32le`, `peekU16le`, `peekU32le`, `bytes(n)` (zero-copy span),
 `subReader(n)` (checked slice), `seek`/`skip`/`position`/`remaining`.
 Every read returns `std::optional`; truncation yields `nullopt`, never
 UB. All bounds math is `n <= remaining()` form — no overflow. No
@@ -81,7 +82,7 @@ families in BUILD_A, cross-checked against loader code:
 | u32 @16 = fileSize − 12 | OBSERVED (46/46 tag family) | semantics UNKNOWN — possibly an inner section/chunk length covering `[12, size)`; not interpreted |
 | end of envelope | OBSERVED | declared length ends exactly at EOF (single envelope per file) |
 | name-field trailer | OBSERVED (46/46 tag family) | last 12 bytes of every tagged file repeat the name field; u32@16 = size−12 == that trailer's file offset |
-| interior structure | OBSERVED for `.SNI` only | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
+| interior structure | OBSERVED for `.SNI` and `.MTI` | `.SNI` = count@0x14 + 24-byte `{name[12], u32, blobOff, size}` directory; `.MTI` = count@0x14 + 24-byte `{name[8], flags, u32, u32, blobOff}` directory with index/payload record classes — see `DATA_FORMATS.md`; other families' interiors remain UNKNOWN |
 | padding/alignment | OBSERVED | name field NUL-padded to 12; `.SNI` payloads 4-byte aligned (gaps 0 or 2) |
 | malformed handling | OBSERVED (code) | tag≠stem → treated as stale HD copy → re-copied from CD root (`FUN_0041ae50`) |
 
@@ -138,12 +139,18 @@ logical name, stem-match, and the raw second u32 @16 (uninterpreted).
 
 `mdk-inspect --data-path DIR --entries <rel-path>` additionally reads
 the whole file (bounded) and enumerates the interior directory where a
-proven parser exists — `.SNI` only in Phase 3C: entry count, directory
-end, trailer status, and per-record name/raw field/blob offset/
-resolved file offset/size; sentinel records (`field==size==0xffffffff`)
-are reported as position markers. Families without a proven interior
-parser are rejected with the support level — never guessed.
-`--selftest` runs synthetic envelope + SNI-directory checks.
+proven parser exists — `.SNI` (Phase 3C) and `.MTI` (Phase 3D):
+entry count, directory end, trailer status, and per-record metadata.
+For `.SNI`: name/raw field/blob offset/resolved file offset/size;
+sentinel records (`field==size==0xffffffff`) are reported as position
+markers. For `.MTI`: name[8]/raw fields `+0x08 +0x0c +0x10 +0x14`/
+resolved payload file offset; index records (`+0x08==0xffffffff`) are
+marked and their ignored fields reported raw; payload records show
+the proven payload-header u16s (`hdr{a,b}` or `hdr{n,a,b}` for the
+extended variant) and the data start offset. Families without a
+proven interior parser are rejected with the support level — never
+guessed.
+`--selftest` runs synthetic envelope + SNI- + MTI-directory checks.
 Links `mdk_core` — the same code the app uses. Never prints payload
 bytes; never writes into the data root.
 
@@ -172,10 +179,23 @@ Phase 3C additions (all via `mdk-inspect --entries`, read-only):
   `standard-external-format` and reject `--entries`.
 - Manifest re-verified after Phase 3C inspection: 141/141 unchanged.
 
+Phase 3D additions (all via `mdk-inspect --entries`, read-only):
+
+- All 13 `.MTI` files in BUILD_A enumerate `ok` — record counts
+  40–198; every file mixes index records (`+0x08==0xffffffff`;
+  `PEN_*`/`GREY*`/`NONE`/`BLACK`-style names) with payload records
+  whose blob offsets tile `[dirEnd, size-12)` exactly.
+- `.MTO/.CMI/.DTI/.FTI/.BNI/.LBB` correctly remain
+  `envelope-only`/`unsupported` and reject `--entries`.
+- Manifest re-verified after Phase 3D inspection: 141/141 unchanged.
+
 ## Explicit unknowns (not implemented)
 
-- Interior structures of `.MTO/.MTI/.CMI/.DTI` (shape observations
+- Interior structures of `.MTO/.CMI/.DTI` (shape observations
   recorded in `DATA_FORMATS.md`; none decoded).
+- `.MTI` payload data past the proven u16 header, the `+0x08` low-16
+  flag semantics, the `+0x0c`/`+0x10` param semantics, and what index
+  records' `+0x0c` values index (all UNKNOWN — see DATA_FORMATS.md).
 - `.SNI` payload contents (mostly RIFF/WAVE by byte inspection — not
   decoded), the record `+0x0c` field, and the `K_*` sentinel records'
   marked regions.

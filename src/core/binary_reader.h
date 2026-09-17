@@ -76,8 +76,17 @@ public:
     return v;
   }
 
-  // Non-advancing variant, used by header probes that inspect before
+  // Non-advancing variants, used by header probes that inspect before
   // committing the cursor.
+  std::optional<std::uint16_t> peekU16le(std::size_t offset) const {
+    if (offset > data_.size() || data_.size() - offset < 2) {
+      return std::nullopt;
+    }
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(data_[offset]) |
+        static_cast<std::uint16_t>(data_[offset + 1]) << 8);
+  }
+
   std::optional<std::uint32_t> peekU32le(std::size_t offset) const {
     if (offset > data_.size() || data_.size() - offset < 4) {
       return std::nullopt;

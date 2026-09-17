@@ -8,6 +8,7 @@
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/mode_dispatch.h"
+#include "core/mti_directory.h"
 #include "core/sni_directory.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
@@ -280,12 +281,12 @@ void test_file_family() {
   CHECK(fileFamilyForPath(".SNI") == MdkFileFamily::kSni); // ext-only name
   CHECK(fileFamilyForPath("a.SNI.bak") == MdkFileFamily::kUnknown);
 
-  // Support levels (Phase 3C).
+  // Support levels (Phase 3C: SNI; Phase 3D: MTI).
   CHECK(fileFamilySupport(MdkFileFamily::kSni) ==
         FamilySupport::kDirectoryMetadata);
-  CHECK(fileFamilySupport(MdkFileFamily::kMto) ==
-        FamilySupport::kEnvelopeOnly);
   CHECK(fileFamilySupport(MdkFileFamily::kMti) ==
+        FamilySupport::kDirectoryMetadata);
+  CHECK(fileFamilySupport(MdkFileFamily::kMto) ==
         FamilySupport::kEnvelopeOnly);
   CHECK(fileFamilySupport(MdkFileFamily::kCmi) ==
         FamilySupport::kEnvelopeOnly);
@@ -545,6 +546,269 @@ void test_sni_directory() {
   }
 }
 
+// Synthetic MTI file builder (no original data). Layout mirrors the
+// CODE-CORROBORATED structure: [u32 size-4][name12][u32 size-12]
+// [u32 count][count x 24B records {name[8],f8,fc,f10,f14}][payloads]
+// [name12 trailer].
+struct SyntheticMti {
+  std::vector<std::byte> buf;
+
+  void put32(std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+    buf[off + 2] = static_cast<std::byte>((v >> 16) & 0xff);
+    buf[off + 3] = static_cast<std::byte>((v >> 24) & 0xff);
+  }
+  void put16(std::size_t off, std::uint16_t v) {
+    buf[off + 0] = static_cast<std::byte>(v & 0xff);
+    buf[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+  }
+  void putName(std::size_t off, const char* s, std::size_t width = 12) {
+    for (std::size_t i = 0; s[i] && i < width; ++i)
+      buf[off + i] = static_cast<std::byte>(s[i]);
+  }
+
+  // entries: {name, field0x08, field0x0c, field0x10, payloadBytes}.
+  // field0x08 == 0xffffffff builds an index record (no payload);
+  // otherwise a payload record whose payload of payloadBytes is laid
+  // out contiguously from the directory end (zero-filled unless the
+  // test pokes header bytes itself).
+  static SyntheticMti build(const char* logicalName,
+                            std::initializer_list<
+                                std::tuple<const char*, std::uint32_t,
+                                           std::uint32_t, std::uint32_t,
+                                           std::uint32_t>> entries) {
+    SyntheticMti s;
+    const std::uint32_t count = static_cast<std::uint32_t>(entries.size());
+    const std::uint64_t dirEnd = 0x18 + std::uint64_t(count) * 24;
+    std::uint64_t total = dirEnd;
+    for (const auto& [n, f8, fc, f10, sz] : entries)
+      if (f8 != 0xffffffffu)
+        total += sz;
+    total += 12; // trailer
+    s.buf.assign(static_cast<std::size_t>(total), std::byte{0});
+
+    s.put32(0x00, static_cast<std::uint32_t>(total - 4));
+    s.putName(0x04, logicalName);
+    s.put32(0x10, static_cast<std::uint32_t>(total - 12));
+    s.put32(0x14, count);
+    std::uint64_t payloadAt = dirEnd;
+    std::uint32_t i = 0;
+    for (const auto& [n, f8, fc, f10, sz] : entries) {
+      const std::uint64_t rec = 0x18 + std::uint64_t(i) * 24;
+      s.putName(rec, n, 8);
+      s.put32(rec + 0x08, f8);
+      s.put32(rec + 0x0c, fc);
+      s.put32(rec + 0x10, f10);
+      if (f8 == 0xffffffffu) {
+        s.put32(rec + 0x14, 0); // ignored field, observed 0
+      } else {
+        s.put32(rec + 0x14,
+                static_cast<std::uint32_t>(payloadAt - 4)); // blob-rel
+        payloadAt += sz;
+      }
+      ++i;
+    }
+    s.putName(static_cast<std::size_t>(total - 12), logicalName);
+    return s;
+  }
+};
+
+void test_mti_directory() {
+  using mdk::MtiDirectoryStatus;
+  using mdk::inspectMtiDirectory;
+
+  // Valid mixed directory: plain-header payload, extended-header
+  // payload, index record — all three proven record forms.
+  {
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"MAT_A", 0x00000000, 0, 0x40600000, 24},
+         {"MAT_B", 0x00010001, 0, 0x40c00000, 20},
+         {"IDX_C", 0xffffffff, 7, 0, 0}});
+    // dirEnd = 0x18 + 3*24 = 0x60; payloads [0x60,0x78) and
+    // [0x78,0x8c); trailer at size-12.
+    // MAT_A plain header: u16 @0x60=64, u16 @0x62=32.
+    s.put16(0x60, 64);
+    s.put16(0x62, 32);
+    // MAT_B extended header: u16 @0x78=2, u16 @0x7c=128, u16 @0x7e=128.
+    s.put16(0x78, 2);
+    s.put16(0x7c, 128);
+    s.put16(0x7e, 128);
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    CHECK(d.count == 3 && d.entries.size() == 3);
+    CHECK(d.directoryEnd == 0x60);
+    CHECK(d.trailerPresent && d.secondaryEqualsTrailerOffset);
+
+    CHECK(d.entries[0].name() == "MAT_A");
+    CHECK(!d.entries[0].isIndexRecord());
+    CHECK(!d.entries[0].hasExtendedHeader());
+    CHECK(d.entries[0].fieldAt0x08 == 0x00000000u);
+    CHECK(d.entries[0].fieldAt0x10 == 0x40600000u);
+    CHECK(d.entries[0].fieldAt0x14 == 0x60 - 4);
+    CHECK(d.entries[0].payloadFileOffset() == 0x60);
+    CHECK(!d.entries[0].headerCount.has_value());
+    CHECK(d.entries[0].headerFieldA == 64 && d.entries[0].headerFieldB == 32);
+    CHECK(d.entries[0].payloadDataFileOffset == 0x64);
+
+    CHECK(d.entries[1].name() == "MAT_B");
+    CHECK(d.entries[1].hasExtendedHeader());
+    CHECK(d.entries[1].payloadFileOffset() == 0x78);
+    CHECK(d.entries[1].headerCount == 2);
+    CHECK(d.entries[1].headerFieldA == 128 && d.entries[1].headerFieldB == 128);
+    CHECK(d.entries[1].payloadDataFileOffset == 0x80);
+
+    CHECK(d.entries[2].name() == "IDX_C");
+    CHECK(d.entries[2].isIndexRecord());
+    CHECK(d.entries[2].fieldAt0x0C == 7);
+  }
+
+  // Zero-record directory: count=0 is legal (the original branches on
+  // count==0 and produces an empty table).
+  {
+    auto s = SyntheticMti::build("EMPTY.MTI", {});
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    CHECK(d.count == 0 && d.entries.empty());
+    CHECK(d.directoryEnd == 0x18);
+  }
+
+  // Name at exactly 8 bytes (fills the field, no NUL inside it).
+  {
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"EXPLODEX", 0, 0, 0x40600000, 8}});
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    CHECK(d.entries[0].name() == "EXPLODEX");
+    CHECK(d.entries[0].nameField[7] == std::byte{'X'});
+  }
+
+  // Index record with nonzero +0x10/+0x14: the original ignores those
+  // fields for this class — preserved raw, never validated.
+  {
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"IDX", 0xffffffff, 0x1234, 0, 0}});
+    s.put32(0x18 + 0x10, 0xdeadbeef);
+    s.put32(0x18 + 0x14, 0xcafef00d); // would be out-of-bounds if read
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    CHECK(d.entries[0].isIndexRecord());
+    CHECK(d.entries[0].fieldAt0x10 == 0xdeadbeefu);
+    CHECK(d.entries[0].fieldAt0x14 == 0xcafef00du);
+  }
+
+  // Payload record pointing before the directory end → rejected.
+  {
+    auto s = SyntheticMti::build("TEST.MTI", {{"A", 0, 0, 0, 8}});
+    s.put32(0x18 + 0x14, 0); // blobOff=0 → file offset 4 < dirEnd
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Payload header escaping the payload region (offset lands on the
+  // trailer itself) → rejected.
+  {
+    auto s = SyntheticMti::build("TEST.MTI", {{"A", 0, 0, 0, 8}});
+    s.put32(0x18 + 0x14,
+            static_cast<std::uint32_t>(s.buf.size() - 12 - 4)); // → file size-12
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Extended-header payload needs 8 bytes before the trailer: a 6-byte
+  // tail is too small for the variant the flags select.
+  {
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"A", 0x00010000, 0, 0, 8}, {"B", 0, 0, 0, 6}});
+    // dirEnd = 0x48; A payload [0x48,0x50) ok (8B ext hdr); B payload
+    // [0x50,0x56), trailer at 0x56 — B needs a 4B header, exactly fits.
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    // Same layout but B flagged extended: needs 8B in [0x50,0x56)=6 →
+    // entry bounds fail on B.
+    auto s2 = SyntheticMti::build("TEST.MTI",
+        {{"A", 0x00010000, 0, 0, 8}, {"B", 0x00010000, 0, 0, 6}});
+    const auto d2 = inspectMtiDirectory(s2.buf);
+    CHECK(d2.status == MtiDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d2.badEntryIndex == 1);
+  }
+
+  // Impossible count → directory bound fails.
+  {
+    auto s = SyntheticMti::build("TEST.MTI", {{"A", 0, 0, 0, 8}});
+    s.put32(0x14, 0xffffffff);
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kDirectoryOutOfBounds);
+  }
+
+  // Inflated count that still "fits" physically but pushes dirEnd past
+  // the real payloads → entry bounds catch the invalidated record.
+  {
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"A", 0, 0, 0, 40}, {"B", 0, 0, 0, 40}});
+    s.put32(0x14, 3); // dirEnd 0x60 > A payload start 0x48
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kEntryOutOfBounds);
+    CHECK(d.badEntryIndex == 0);
+  }
+
+  // Truncated header: envelope fine but file ends before count.
+  {
+    std::byte t[20] = {};
+    t[0] = std::byte{16};
+    std::memcpy(t + 4, "T.MTI", 5);
+    const auto d = inspectMtiDirectory(t);
+    CHECK(d.status == MtiDirectoryStatus::kTruncatedHeader);
+  }
+
+  // Not a tagged envelope → "not this format", not "malformed".
+  {
+    std::byte raw[64] = {};
+    const auto d = inspectMtiDirectory(raw);
+    CHECK(d.status == MtiDirectoryStatus::kNotTaggedEnvelope);
+
+    std::byte fti[32] = {};
+    fti[0] = std::byte{28};
+    fti[4] = std::byte{0x03};
+    const auto d2 = inspectMtiDirectory(fti);
+    CHECK(d2.status == MtiDirectoryStatus::kNotTaggedEnvelope);
+  }
+
+  // Missing trailer → payload region extends to EOF; still parses.
+  {
+    auto s = SyntheticMti::build("TEST.MTI", {{"A", 0, 0, 0, 8}});
+    for (std::size_t i = s.buf.size() - 12; i < s.buf.size(); ++i)
+      s.buf[i] = std::byte{'X'};
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    CHECK(!d.trailerPresent);
+    CHECK(d.secondaryEqualsTrailerOffset);
+  }
+
+  // Unknown +0x08 values are preserved raw and treated as payload
+  // records (any value other than 0xffffffff follows that path in the
+  // original); a lone 0x00000002 flag is observed in BUILD_A.
+  {
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"A", 0x00000002, 0, 0x40600000, 8}});
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kOk);
+    CHECK(d.entries[0].fieldAt0x08 == 0x00000002u);
+    CHECK(!d.entries[0].isIndexRecord());
+    CHECK(!d.entries[0].hasExtendedHeader());
+  }
+
+  // u32@0 length mismatch → envelope invalid → not this format.
+  {
+    auto s = SyntheticMti::build("TEST.MTI", {{"A", 0, 0, 0, 8}});
+    s.put32(0x00, 0);
+    const auto d = inspectMtiDirectory(s.buf);
+    CHECK(d.status == MtiDirectoryStatus::kNotTaggedEnvelope);
+  }
+}
+
 void test_data_root() {
   namespace fs = std::filesystem;
   const fs::path tmp =
@@ -738,6 +1002,7 @@ int main() {
   test_container();
   test_file_family();
   test_sni_directory();
+  test_mti_directory();
   test_data_root();
   test_mode_dispatch();
   test_input_state();
