@@ -58,7 +58,7 @@ with their evidence level and a pointer to the supporting document.
 - [UNKNOWN] Fog/atmospheric effects implementation
 - [UNKNOWN] Texture handling — filtering, mip selection, palette management
 - [UNKNOWN] Resolution and aspect handling per build
-- [UNKNOWN] HUD/menus rendering path vs 3D path
+- [OBSERVED, partial] HUD/menus rendering path vs 3D path — the front-end menu path is now proven end-to-end: 8bpp indexed back buffer `DAT_00541650`, `MDKOPT` backdrop memcpy (root) vs `FUN_0047d20a` zero-fill (options), FONTBIG scaled labels via `FUN_00414f64`/`FUN_0041518c`, `ARROW` stream-command sprite, `FUN_00423a24` selection scale ramp, `FUN_0042fcd0` frame timing, palette via `FUN_00413b40`/`FUN_0046d208` (`svlut` save/restore across the options screen) — see ENGINE_RECONSTRUCTION.md Phases 4A–4F. HUD and 3D path internals remain UNKNOWN.
 
 ## Platform / IO
 

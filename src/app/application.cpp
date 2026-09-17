@@ -8,6 +8,7 @@
 #include "core/data_root.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
@@ -15,6 +16,7 @@
 #include "core/indexed_image.h"
 #include "core/log.h"
 #include "core/mode_dispatch.h"
+#include "core/options_menu.h"
 #include "core/stream_context.h"
 #include "input/input_state.h"
 #include "platform/sdl_host.h"
@@ -23,6 +25,7 @@
 #include <SDL3/SDL_mouse.h>    // SDL_BUTTON_* for the button nibble map
 #include <SDL3/SDL_scancode.h> // SDL_SCANCODE_* key translation
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -357,6 +360,12 @@ struct FrontendResources {
   FtiFont fontBig;                  // MISC/MDKFONT.FTI record FONTBIG
   FtiSprite arrow;                  // record ARROW (frame 0 used)
   std::vector<std::string> optStrings;  // OPT0..OPT4 C strings
+  // Phase 4F options sub-menu (FUN_00420eac): the OM_* row labels
+  // (records ARE NUL-terminated strings — OBSERVED) and the resident
+  // system-palette head the options palette upload uses.
+  std::array<std::string, kOptionsItemCount> omStrings;
+  std::array<std::string, 3> omSkill;    // OM_SK_0/1/2 skill variants
+  std::array<std::byte, 192> sysPalHead{};  // SYS_PAL record head
   bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
 };
 
@@ -459,6 +468,46 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
             reinterpret_cast<const char*>(span.data()));
   }
 
+  // Phase 4F: OM_* records are the same NUL-terminated string shape
+  // (OBSERVED — the payloads ARE C strings drawn verbatim). Row 6's
+  // record is dynamic: OM_SK_0/1/2 by DAT_0054147a.
+  auto loadCStr = [&](const char* name, std::string& out) -> bool {
+    if (!ftiPayload(name, rec, payload)) return false;
+    const void* nul2 =
+        std::memchr(payload.data(), 0, payload.size());
+    if (!nul2) {
+      *err = std::string("front-end: ") + name +
+             " payload is not a NUL-terminated string";
+      return false;
+    }
+    out.assign(
+        reinterpret_cast<const char*>(payload.data()),
+        static_cast<const char*>(nul2) -
+            reinterpret_cast<const char*>(payload.data()));
+    return true;
+  };
+  for (int i = 0; i < kOptionsItemCount; ++i) {
+    if (!loadCStr(kOptionsRecordNames[i], res.omStrings[i])) {
+      return false;
+    }
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (!loadCStr(kOptionsSkillRecords[i], res.omSkill[i])) {
+      return false;
+    }
+  }
+
+  // SYS_PAL head — the resident system palette whose head fills
+  // DAT_00540820[0:192]; the options screen uploads that buffer
+  // (FUN_0046d208) on entry.
+  const FtiRecord* palRec = findFtiRecord(fdir, "SYS_PAL");
+  if (!palRec || palRec->payloadSize() < 192) {
+    *err = "front-end: SYS_PAL record missing/short in MDKFONT.FTI";
+    return false;
+  }
+  std::memcpy(res.sysPalHead.data(),
+              fti->data() + palRec->payloadFileOffset, 192);
+
   // FUN_00428290 checks the SAVES directory for <name>.SAV files;
   // BUILD_A has 1.SAV + 2.SAV -> the five-item "Continue" menu.
   bool savesExist = false;
@@ -540,6 +589,49 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
   return true;
 }
 
+// Phase 4F options sub-menu preview: compose the proven static
+// FUN_00420eac frame — cleared framebuffer + OM_* labels (selection 8
+// at scale 1.0, the rest 0.65, canonical skill "Skill - Easy") +
+// ARROW at the (unchanged) logical mouse position, under the resident
+// system palette (SYS_PAL head + zeroed tail — see options_menu.h).
+// Fills `err` -> false on failure.
+static bool loadOptionsSubmenuPreview(DataRoot& root,
+                                      IndexedFramebuffer& fb,
+                                      Palette& palette,
+                                      std::string* err) {
+  FrontendResources res;
+  if (!loadFrontendResources(root, res, err)) {
+    return false;
+  }
+  const OptionsMenuSpec spec;  // canonical entry state
+  OptionsMenuLabels labels;
+  for (int i = 0; i < kOptionsItemCount; ++i) {
+    labels.items[i] = res.omStrings[i];
+  }
+  labels.items[kOptionsSkillRow] = res.omSkill[spec.skill];
+  std::string derr;
+  if (!renderOptionsMenuFrame(fb, palette, res.fontBig,
+                              *res.arrow.frame(0), labels,
+                              res.sysPalHead, spec, &derr)) {
+    *err = "options sub-menu preview: compose — " + derr;
+    return false;
+  }
+
+  const std::uint64_t fbDigest = digestIndexedFb(fb);
+  const std::uint64_t palDigest = digestPalette(palette);
+  log::info(kTag,
+            "options sub-menu preview: OM_* %dx%d sel=%d skill=%d "
+            "hidden=%d | FONTBIG digest=%016llx | ARROW digest=%016llx "
+            "| composed fb=%016llx palette=%016llx",
+            fb.width(), fb.height(), spec.selection, spec.skill,
+            spec.devHidden ? 1 : 0,
+            static_cast<unsigned long long>(ftiFontDigest(res.fontBig)),
+            static_cast<unsigned long long>(ftiSpriteDigest(res.arrow)),
+            static_cast<unsigned long long>(fbDigest),
+            static_cast<unsigned long long>(palDigest));
+  return true;
+}
+
 // Phase 4E — translate the platform InputState into the controller's
 // semantic per-frame input. Original reference points:
 //   prevHeld/nextHeld : DIK_UP/DIK_DOWN with the original keymap's
@@ -552,6 +644,7 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
 static FrontendMenuInput frontendInputFromSdl(const InputState& input) {
   FrontendMenuInput fi;
   bool prevPress = false, nextPress = false;
+  bool leftPress = false, rightPress = false;
   for (const KeyEvent& e : input.keyEvents()) {
     if (!e.down || e.repeat) {
       continue;
@@ -559,13 +652,17 @@ static FrontendMenuInput frontendInputFromSdl(const InputState& input) {
     switch (e.scancode) {
     case SDL_SCANCODE_UP: prevPress = true; break;
     case SDL_SCANCODE_DOWN: nextPress = true; break;
+    case SDL_SCANCODE_LEFT: leftPress = true; break;
+    case SDL_SCANCODE_RIGHT: rightPress = true; fi.attractEdge = true; break;
     case SDL_SCANCODE_RETURN: fi.confirmEdge = true; break;
-    case SDL_SCANCODE_RIGHT: fi.attractEdge = true; break;
+    case SDL_SCANCODE_ESCAPE: fi.cancelEdge = true; break;
     default: break;
     }
   }
   fi.prevHeld = input.keyDown(SDL_SCANCODE_UP) || prevPress;
   fi.nextHeld = input.keyDown(SDL_SCANCODE_DOWN) || nextPress;
+  fi.leftHeld = input.keyDown(SDL_SCANCODE_LEFT) || leftPress;
+  fi.rightHeld = input.keyDown(SDL_SCANCODE_RIGHT) || rightPress;
   fi.mouseDx = static_cast<int>(input.mouseDx());
   fi.mouseDy = static_cast<int>(input.mouseDy());
   fi.mouseButtons = static_cast<std::uint8_t>(
@@ -584,6 +681,22 @@ static const char* frontendActionName(FrontendAction a) {
   case FrontendAction::OpenOptions: return "OpenOptions";
   case FrontendAction::Quit: return "Quit";
   case FrontendAction::EnterAttract: return "EnterAttract";
+  default: return "None";
+  }
+}
+
+static const char* optionsActionName(OptionsAction a) {
+  switch (a) {
+  case OptionsAction::Help: return "Help";
+  case OptionsAction::Sound: return "Sound";
+  case OptionsAction::Joystick: return "Joystick";
+  case OptionsAction::Mouse: return "Mouse";
+  case OptionsAction::Keyboard: return "Keyboard";
+  case OptionsAction::Performance: return "Performance";
+  case OptionsAction::SkillCyclePrev: return "SkillCyclePrev";
+  case OptionsAction::SkillCycleNext: return "SkillCycleNext";
+  case OptionsAction::Display: return "Display";
+  case OptionsAction::Back: return "Back";
   default: return "None";
   }
 }
@@ -637,13 +750,19 @@ int Application::run() {
   Palette palette;
   DiagnosticScene scene;
 
-  // Phase 4E interactive front-end state (set up only for
+  // Phase 4E/4F interactive front-end state (set up only for
   // --interactive-frontend). The resources and controller persist for
-  // the whole run; `frontendViews` aliases res.optStrings.
+  // the whole run; `frontendViews` aliases res.optStrings. Phase 4F
+  // drives the two-screen flow controller; --frontend-root-only keeps
+  // the Phase 4E root controller for the regression snapshot.
   std::optional<FrontendResources> frontendRes;
   std::optional<FrontendMenuController> frontendCtl;
+  std::optional<FrontendFlowController> frontendFlow;
   std::vector<std::string_view> frontendViews;
   FrontendAction frontendLastAction = FrontendAction::None;
+  OptionsAction frontendLastOptionsAction = OptionsAction::None;
+  bool frontendEnteredOptions = false;
+  bool frontendReturnedToRoot = false;
 
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
@@ -653,6 +772,7 @@ int Application::run() {
                            cfg_.fontPreviewFile.has_value() ||
                            cfg_.spritePreviewFile.has_value() ||
                            cfg_.optionsPreview ||
+                           cfg_.optionsSubmenuPreview ||
                            cfg_.interactiveFrontend;
   if (cfg_.previewFile) {
     if (!dataRoot) {
@@ -702,6 +822,18 @@ int Application::run() {
       log::error(kTag, "options preview failed: %s", perr.c_str());
       return 2;
     }
+  } else if (cfg_.optionsSubmenuPreview) {
+    if (!dataRoot) {
+      log::error(kTag,
+                 "--preview-options-submenu requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadOptionsSubmenuPreview(*dataRoot, fb, palette, &perr)) {
+      log::error(kTag, "options sub-menu preview failed: %s",
+                 perr.c_str());
+      return 2;
+    }
   } else if (cfg_.interactiveFrontend) {
     if (!dataRoot) {
       log::error(kTag, "--interactive-frontend requires --data-path");
@@ -715,15 +847,26 @@ int Application::run() {
       return 2;
     }
     frontendViews.assign(res.optStrings.begin(), res.optStrings.end());
-    frontendCtl.emplace(res.savesExist);
+    if (cfg_.frontendRootOnly) {
+      // Phase 4E regression path: the root controller alone, so
+      // OpenOptions stays a deferred semantic action.
+      frontendCtl.emplace(res.savesExist);
+    } else {
+      frontendFlow.emplace(res.savesExist);
+    }
     frontendRes.emplace(std::move(res));
     log::info(kTag,
-              "interactive front-end: saves=%d sel=%d mouse=(%d,%d) — "
+              "interactive front-end: saves=%d sel=%d mouse=(%d,%d)%s — "
               "UP/DOWN select, RETURN or button activates (semantic "
               "actions only; downstream systems deferred)",
-              frontendCtl->savesExist() ? 1 : 0,
-              frontendCtl->selection(), frontendCtl->mouseX(),
-              frontendCtl->mouseY());
+              res.savesExist ? 1 : 0,
+              frontendCtl ? frontendCtl->selection()
+                          : frontendFlow->root().selection(),
+              frontendCtl ? frontendCtl->mouseX()
+                          : frontendFlow->root().mouseX(),
+              frontendCtl ? frontendCtl->mouseY()
+                          : frontendFlow->root().mouseY(),
+              frontendCtl ? " [root-only]" : "");
   } else {
     scene.buildPalette(palette);
   }
@@ -738,7 +881,12 @@ int Application::run() {
     dispatcher.setPrimary(mode::nativeShell);
   });
   dispatcher.on(mode::nativeShell, [&](const FrameContext& ctx) {
-    if (input.keyDown(SDL_SCANCODE_ESCAPE)) {
+    // While the options sub-menu owns Esc (FUN_00420eac cancel edge ->
+    // Back), the native diagnostic-shell Esc-to-quit convenience is
+    // suspended; at the root screen it keeps its Phase 4E behavior.
+    const bool escRoutesToOptions =
+        frontendFlow && frontendFlow->inOptions();
+    if (input.keyDown(SDL_SCANCODE_ESCAPE) && !escRoutesToOptions) {
       dispatcher.requestQuit();
       return;
     }
@@ -746,7 +894,7 @@ int Application::run() {
   });
 
   if (cfg_.selftest) {
-    if (frontendCtl) {
+    if (frontendCtl || frontendFlow) {
       // Deterministic script: drop all real device input so only the
       // injected events reach the controller.
       host.isolateHardwareInputForSelftest();
@@ -754,21 +902,22 @@ int Application::run() {
       host.injectSelfTestEvents();
     }
     if (cfg_.frames == 0) {
-      cfg_.frames = 10;
+      cfg_.frames = frontendFlow ? 12 : 10;
     }
   }
 
   while (!dispatcher.quitRequested()) {
     input.beginFrame();
-    if (cfg_.selftest && frontendCtl) {
+    if (cfg_.selftest && (frontendCtl || frontendFlow)) {
       // Scripted interactive selftest: one step per frame (see
       // SdlHost::pushFrontendSelfTestStep).
-      host.pushFrontendSelfTestStep(clock.frameCount());
+      host.pushFrontendSelfTestStep(clock.frameCount(),
+                                  cfg_.frontendRootOnly);
     }
     host.pumpEvents(input);
     const FrameTick t = clock.tick();
 
-    if (cfg_.selftest && t.index == 0 && !frontendCtl) {
+    if (cfg_.selftest && t.index == 0 && !frontendCtl && !frontendFlow) {
       selftestOk_ = host.verifySelfTestInput(input);
       log::info(kTag, "input selftest: %s",
                 selftestOk_ ? "PASS" : "FAIL");
@@ -776,36 +925,121 @@ int Application::run() {
 
     dispatcher.dispatch({t.index, t.dtSeconds, t.elapsedSeconds});
 
-    if (frontendCtl) {
+    if (frontendCtl || frontendFlow) {
       // Original frame order: poll -> controller update -> draw ->
-      // timing update. renderFrontendMenuDynamic drives the ramp via
+      // timing update. The dynamic renderers drive the ramp via
       // per-item itemScale calls in draw order.
       const FrontendMenuInput fi = frontendInputFromSdl(input);
-      frontendCtl->update(fi);
-      std::string rerr;
-      if (!renderFrontendMenuDynamic(fb, palette,
-                                     frontendRes->backdrop,
-                                     frontendRes->fontBig,
-                                     *frontendRes->arrow.frame(0),
-                                     frontendViews, *frontendCtl,
-                                     &rerr)) {
-        log::error(kTag, "interactive front-end render failed: %s",
-                   rerr.c_str());
-        selftestOk_ = false;
-        dispatcher.requestQuit();
+      bool endedEarly = false;
+      if (frontendCtl) {
+        // Phase 4E root-only regression path.
+        frontendCtl->update(fi);
+        endedEarly = frontendCtl->frameEndedEarly();
+      } else {
+        frontendFlow->update(fi);
+        endedEarly = frontendFlow->inOptions()
+                         ? frontendFlow->options().frameEndedEarly()
+                         : frontendFlow->root().frameEndedEarly();
       }
-      frontendCtl->endFrame(t.dtSeconds * 1000.0);
-      const FrontendAction a = frontendCtl->consumeAction();
-      if (a != FrontendAction::None) {
-        frontendLastAction = a;
-        // Semantic event only — downstream systems deferred. Quit is
-        // proven to close the native preview (maps the original's
-        // DAT_0054148e quit-flag write).
-        log::info(kTag, "frontend action: %s (sel=%d mouse=%d,%d)",
-                  frontendActionName(a), frontendCtl->selection(),
-                  frontendCtl->mouseX(), frontendCtl->mouseY());
-        if (a == FrontendAction::Quit) {
+      // OBSERVED: every activation-dispatch branch RETs before the
+      // draw block and the timing update — a dispatched frame draws
+      // nothing and does not advance the timing machine. Skill cycles
+      // and the attract trigger fall through to the draw.
+      if (!endedEarly) {
+        std::string rerr;
+        bool rok = false;
+        if (frontendFlow && frontendFlow->inOptions()) {
+          // Phase 4F options frame: cleared buffer + OM_* labels +
+          // ARROW under the system palette (FUN_00420eac draw block).
+          OptionsMenuLabels labels;
+          for (int i = 0; i < kOptionsItemCount; ++i) {
+            labels.items[i] = frontendRes->omStrings[i];
+          }
+          labels.items[kOptionsSkillRow] =
+              frontendRes->omSkill[frontendFlow->options().skill()];
+          rok = renderOptionsMenuDynamic(
+              fb, palette, frontendRes->fontBig,
+              *frontendRes->arrow.frame(0), labels,
+              frontendRes->sysPalHead, frontendFlow->options(), &rerr);
+        } else {
+          rok = renderFrontendMenuDynamic(
+              fb, palette, frontendRes->backdrop, frontendRes->fontBig,
+              *frontendRes->arrow.frame(0), frontendViews,
+              frontendCtl ? *frontendCtl : frontendFlow->root(), &rerr);
+        }
+        if (!rok) {
+          log::error(kTag, "interactive front-end render failed: %s",
+                     rerr.c_str());
+          selftestOk_ = false;
           dispatcher.requestQuit();
+        }
+        // FUN_0042fe78/FUN_0042fb68 timing update — the tail of the
+        // drawn frame only. --selftest feeds the original's paced
+        // regime (100/3 ms per frame — rawDelta 4, step 1) so the
+        // injected-input run is deterministic across machines; the
+        // live path keeps real wall-clock deltas like the original.
+        const double frontDtMs =
+            cfg_.selftest ? (100.0 / 3.0) : (t.dtSeconds * 1000.0);
+        if (frontendCtl) {
+          frontendCtl->endFrame(frontDtMs);
+        } else if (frontendFlow->inOptions()) {
+          frontendFlow->options().endFrame(frontDtMs);
+        } else {
+          frontendFlow->root().endFrame(frontDtMs);
+        }
+      }
+      if (frontendCtl) {
+        const FrontendAction a = frontendCtl->consumeAction();
+        if (a != FrontendAction::None) {
+          frontendLastAction = a;
+          log::info(kTag, "frontend action: %s (sel=%d mouse=%d,%d)",
+                    frontendActionName(a), frontendCtl->selection(),
+                    frontendCtl->mouseX(), frontendCtl->mouseY());
+          if (a == FrontendAction::Quit) {
+            dispatcher.requestQuit();
+          }
+        }
+      } else if (frontendFlow->inOptions()) {
+        const OptionsAction a = frontendFlow->consumeOptionsAction();
+        if (a != OptionsAction::None) {
+          frontendLastOptionsAction = a;
+          log::info(kTag, "options action: %s (sel=%d mouse=%d,%d)",
+                    optionsActionName(a),
+                    frontendFlow->options().selection(),
+                    frontendFlow->options().mouseX(),
+                    frontendFlow->options().mouseY());
+        }
+        if (!frontendFlow->inOptions()) {
+          // Back/Esc consumed -> FUN_00420d68 -> root restored.
+          frontendReturnedToRoot = true;
+          log::info(kTag, "front-end flow: options -> root (sel=%d "
+                    "mouse=%d,%d)", frontendFlow->root().selection(),
+                    frontendFlow->root().mouseX(),
+                    frontendFlow->root().mouseY());
+        }
+      } else {
+        const FrontendAction a = frontendFlow->consumeRootAction();
+        if (a != FrontendAction::None) {
+          frontendLastAction = a;
+          // Semantic event only — downstream systems deferred. Quit is
+          // proven to close the native preview (maps the original's
+          // DAT_0054148e quit-flag write).
+          log::info(kTag, "frontend action: %s (sel=%d mouse=%d,%d)",
+                    frontendActionName(a), frontendFlow->root().selection(),
+                    frontendFlow->root().mouseX(),
+                    frontendFlow->root().mouseY());
+          if (a == FrontendAction::Quit) {
+            dispatcher.requestQuit();
+          }
+        }
+        if (frontendFlow->inOptions()) {
+          // OpenOptions consumed -> FUN_00420cf0 -> options entered.
+          frontendEnteredOptions = true;
+          log::info(kTag, "front-end flow: root -> options "
+                    "(entry sel=%d mouse=%d,%d)",
+                    frontendFlow->options().selection(),
+                    frontendFlow->options().mouseX(),
+                    frontendFlow->options().mouseY());
         }
       }
     } else if (!previewMode) {
@@ -829,28 +1063,57 @@ int Application::run() {
 
   // Deterministic dynamic-frame digests for the snapshot record —
   // same domains as the Phase 4D static preview.
-  if (frontendCtl) {
+  if (frontendCtl || frontendFlow) {
     log::info(kTag,
               "interactive front-end last frame: fb=%016llx "
-              "palette=%016llx",
+              "palette=%016llx screen=%s",
               static_cast<unsigned long long>(digestIndexedFb(fb)),
-              static_cast<unsigned long long>(digestPalette(palette)));
+              static_cast<unsigned long long>(digestPalette(palette)),
+              (frontendFlow && frontendFlow->inOptions()) ? "options"
+                                                          : "root");
   }
 
-  // Interactive selftest verdict: the scripted sequence must leave
-  // selection 3 (Options) chosen, OpenOptions emitted, and the arrow
-  // at (300,139).
+  // Interactive selftest verdicts.
   if (cfg_.selftest && frontendCtl) {
+    // Phase 4E root-only regression: the scripted sequence must leave
+    // selection 3 (Options) chosen, OpenOptions emitted, and the
+    // arrow at (300,139).
     selftestOk_ = selftestOk_ &&
                   frontendCtl->selection() == 3 &&
                   frontendLastAction == FrontendAction::OpenOptions &&
                   frontendCtl->mouseX() == 300 &&
                   frontendCtl->mouseY() == 139;
     log::info(kTag,
-              "frontend selftest: %s (sel=%d mouse=%d,%d last=%s)",
+              "frontend selftest (root-only): %s (sel=%d mouse=%d,%d "
+              "last=%s)",
               selftestOk_ ? "PASS" : "FAIL", frontendCtl->selection(),
               frontendCtl->mouseX(), frontendCtl->mouseY(),
               frontendActionName(frontendLastAction));
+  }
+  if (cfg_.selftest && frontendFlow) {
+    // Phase 4F two-screen flow: OpenOptions must have entered the
+    // options sub-menu, the scripted Display activation emitted, and
+    // Esc must have returned to the root with selection 3 still
+    // chosen and the mouse carried back at (300,301).
+    selftestOk_ = selftestOk_ && frontendEnteredOptions &&
+                  frontendReturnedToRoot &&
+                  frontendFlow->screen() == FrontendScreen::Root &&
+                  frontendLastOptionsAction == OptionsAction::Display &&
+                  frontendFlow->root().selection() == 3 &&
+                  frontendFlow->root().mouseX() == 300 &&
+                  frontendFlow->root().mouseY() == 301;
+    log::info(kTag,
+              "frontend selftest (two-screen): %s (entered=%d "
+              "returned=%d root sel=%d mouse=%d,%d last-root=%s "
+              "last-options=%s)",
+              selftestOk_ ? "PASS" : "FAIL",
+              frontendEnteredOptions ? 1 : 0,
+              frontendReturnedToRoot ? 1 : 0,
+              frontendFlow->root().selection(),
+              frontendFlow->root().mouseX(),
+              frontendFlow->root().mouseY(),
+              frontendActionName(frontendLastAction),
+              optionsActionName(frontendLastOptionsAction));
   }
 
   if (cfg_.dumpPpm) {
@@ -935,8 +1198,12 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.spritePreviewRecord = r;
     } else if (!std::strcmp(a, "--preview-options")) {
       cfg.optionsPreview = true;
+    } else if (!std::strcmp(a, "--preview-options-submenu")) {
+      cfg.optionsSubmenuPreview = true;
     } else if (!std::strcmp(a, "--interactive-frontend")) {
       cfg.interactiveFrontend = true;
+    } else if (!std::strcmp(a, "--frontend-root-only")) {
+      cfg.frontendRootOnly = true;
     } else if (!std::strcmp(a, "--selftest")) {
       cfg.selftest = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {

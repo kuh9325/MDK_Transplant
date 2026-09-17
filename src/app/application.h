@@ -40,12 +40,21 @@ struct AppConfig {
   // ARROW at the reset mouse position, all from original resources.
   // Requires --data-path. Static — no input, animation, or audio.
   bool optionsPreview = false;
-  // --interactive-frontend: run the reconstructed FUN_0041dc90
-  // root-menu controller (Phase 4E) over the same composition —
-  // original-style keyboard/mouse selection, hit-test, scale ramp,
-  // and semantic activation events. Requires --data-path. Downstream
-  // actions (gameplay, saves, options sub-menu, audio) stay deferred.
+  // --preview-options-submenu: compose the static options sub-menu
+  // frame (Phase 4F): cleared framebuffer + OM_* scaled centered
+  // labels (selection 8) + ARROW at the entry mouse position, under
+  // the resident system palette. Requires --data-path.
+  bool optionsSubmenuPreview = false;
+  // --interactive-frontend: run the reconstructed front-end flow —
+  // Phase 4E root menu plus the Phase 4F options sub-menu transition
+  // (OpenOptions enters the real OM_* screen; Back/Esc returns).
+  // Requires --data-path. Downstream actions (gameplay, saves, child
+  // options screens, settings mutations, audio) stay deferred.
   bool interactiveFrontend = false;
+  // --frontend-root-only (test-only): run the Phase 4E root controller
+  // alone so OpenOptions stays a deferred semantic action — keeps the
+  // pre-transition regression snapshot reproducible.
+  bool frontendRootOnly = false;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
   bool relativeMouse = true;  // --no-relative-mouse to disable

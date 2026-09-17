@@ -34,6 +34,7 @@ add_library(mdk_core STATIC
   src/core/dti_structure.cpp
   src/core/file_family.cpp
   src/core/framebuffer.cpp
+  src/core/frontend_flow.cpp
   src/core/frontend_menu.cpp
   src/core/fti_directory.cpp
   src/core/fti_font.cpp
@@ -42,6 +43,7 @@ add_library(mdk_core STATIC
   src/core/mode_dispatch.cpp
   src/core/mti_directory.cpp
   src/core/mto_directory.cpp
+  src/core/options_menu.cpp
   src/core/sni_directory.cpp
   src/core/stream_context.cpp
   src/core/viewport.cpp

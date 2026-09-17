@@ -11,6 +11,7 @@
 #include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
@@ -19,6 +20,7 @@
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
+#include "core/options_menu.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
 #include "core/viewport.h"
@@ -4032,6 +4034,498 @@ void test_frontend_controller() {
   }
 }
 
+// Phase 4F — options sub-menu controller (FUN_00420eac).
+void test_options_controller() {
+  // Entry state (FUN_00420cf0): selection 8 (OM_QUIT); the shared
+  // machine state carries over untouched — mouse, tick, deadlines,
+  // latch, ramp, timing.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 123;
+    s.mouseY = 45;
+    s.tick = 77;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    CHECK(ctl.selection() == 8);
+    CHECK(ctl.mouseX() == 123 && ctl.mouseY() == 45);
+    CHECK(ctl.tick() == 77);
+    CHECK(!ctl.devHidden() && ctl.skill() == 0);
+    CHECK(ctl.pendingAction() == mdk::OptionsAction::None);
+  }
+
+  // Keyboard vertical walk: prev 8->7, next wraps 8->0, prev wraps
+  // 0->8. Same repeat machine as the root (tick+30 then tick+3).
+  {
+    mdk::FrontendMachineState s;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 7);
+    mdk::OptionsMenuController c2(s, false, 0);
+    in = {};
+    in.nextHeld = true;
+    c2.update(in);
+    CHECK(c2.selection() == 0);   // 8->9 wraps to 0
+    in = {};
+    c2.update(in);
+    in.prevHeld = true;
+    c2.update(in);
+    CHECK(c2.selection() == 8);   // 0->-1 wraps to 8
+  }
+
+  // Hidden-row skipping (DAT_005414f4): DOWN 1->5, UP 5->1; the index
+  // space is not compacted (rows 2,3,4 unreachable).
+  {
+    mdk::FrontendMachineState s;
+    mdk::OptionsMenuController ctl(s, true, 0);
+    mdk::FrontendMenuInput in;
+    // Walk DOWN from entry: 8->0->1->5 (2-4 skipped).
+    in = {};
+    in.nextHeld = true;
+    ctl.update(in);       // 8 -> 0
+    CHECK(ctl.selection() == 0);
+    in = {};
+    ctl.update(in);
+    in.nextHeld = true;
+    ctl.update(in);       // 0 -> 1
+    CHECK(ctl.selection() == 1);
+    in = {};
+    ctl.update(in);
+    in.nextHeld = true;
+    ctl.update(in);       // 1 -> 5 (hidden 2-4 skipped)
+    CHECK(ctl.selection() == 5);
+    in = {};
+    ctl.update(in);
+    in.prevHeld = true;
+    ctl.update(in);       // 5 -> 1 (hidden 4-2 skipped upward)
+    CHECK(ctl.selection() == 1);
+  }
+
+  // Mouse hit-test: band = trunc((y - 23) / 36), x never consulted.
+  // Band boundaries: row i covers [23+36i, 58+36i]; y>=347 is band 9
+  // (invalid, selection holds). The trunc-toward-zero quirk maps
+  // y in [0,22] to band 0 (Help) — observed IDIV semantics.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 200;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    // Gate closed with no mouse input.
+    ctl.update(in);
+    CHECK(ctl.selection() == 8);
+    // y=200 -> band trunc(177/36)=4 -> Keyboard.
+    in.mouseDy = 1;   // 200 -> 201: band trunc(178/36)=4 still
+    in.mouseDx = -300;
+    ctl.update(in);
+    CHECK(ctl.mouseX() == 0 && ctl.mouseY() == 201 &&
+          ctl.selection() == 4);
+    // Exact band boundaries, walking upward.
+    const int wantY[10] = {346, 311, 275, 239, 203, 167, 131, 95, 59, 23};
+    const int wantSel[10] = {8, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+    for (int i = 0; i < 10; ++i) {
+      in = {};
+      in.mouseDy = wantY[i] - ctl.mouseY();
+      ctl.update(in);
+      CHECK(ctl.mouseY() == wantY[i] && ctl.selection() == wantSel[i]);
+    }
+    // y=22 -> trunc(-1/36)=0 -> Help (quirk); y=0 -> band 0 too.
+    in = {};
+    in.mouseDy = 22 - ctl.mouseY();
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 22 && ctl.selection() == 0);
+    in = {};
+    in.mouseDy = -22;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 0 && ctl.selection() == 0);
+    // y=347 -> band 9 invalid; selection holds at 0.
+    in = {};
+    in.mouseDy = 347;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 347 && ctl.selection() == 0);
+    // y=350 (gate clamp ceiling) -> band 9 invalid as well.
+    in = {};
+    in.mouseDy = 400;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 350 && ctl.selection() == 0);
+  }
+
+  // Hidden-mode hit-test: bands 2,3,4 are guarded — the selection
+  // keeps its current value (the "1 < band < 5" clause reverts).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 250;   // band trunc(227/36)=6 -> Skill
+    mdk::OptionsMenuController ctl(s, true, 0);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // gate opens at y=251 -> band 6
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    in = {};
+    in.mouseDy = -100;  // 151 -> band trunc(128/36)=3 -> hidden: hold
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 151 && ctl.selection() == 6);
+    in = {};
+    in.mouseDy = -30;   // 121 -> band trunc(98/36)=2 -> hidden: hold
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    in = {};
+    in.mouseDy = 100;   // 221 -> band trunc(198/36)=5 -> Performance
+    ctl.update(in);
+    CHECK(ctl.selection() == 5);
+  }
+
+  // Activation dispatch — every row maps to its semantic action.
+  {
+    const mdk::OptionsAction want[9] = {
+        mdk::OptionsAction::Help,        mdk::OptionsAction::Sound,
+        mdk::OptionsAction::Joystick,    mdk::OptionsAction::Mouse,
+        mdk::OptionsAction::Keyboard,    mdk::OptionsAction::Performance,
+        mdk::OptionsAction::SkillCycleNext, mdk::OptionsAction::Display,
+        mdk::OptionsAction::Back};
+    for (int sel = 0; sel < 9; ++sel) {
+      mdk::FrontendMachineState s;
+      // Park the mouse inside row `sel`'s band, then click: the same-
+      // frame hit-test selects, the latch fires the dispatch. One
+      // button-free update arms the latch first (DAT_0049ac80).
+      s.mouseY = 40 + 36 * sel;   // inside band sel (23+36i..58+36i)
+      mdk::OptionsMenuController ctl(s, false, 0);
+      mdk::FrontendMenuInput in;
+      ctl.update(in);
+      in.mouseButtons = 0x1;
+      ctl.update(in);
+      CHECK(ctl.selection() == sel);
+      CHECK(ctl.consumeAction() == want[sel]);
+      CHECK(ctl.consumeAction() == mdk::OptionsAction::None);
+    }
+  }
+
+  // confirmEdge (Enter) activates the current selection without any
+  // mouse input.
+  {
+    mdk::FrontendMachineState s;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;   // sel 8 -> Back
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::Back);
+  }
+
+  // Esc edge -> Back regardless of selection (FUN_00420d68 path).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 40;   // band 0
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+    in = {};
+    in.cancelEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::Back);
+  }
+
+  // LEFT/RIGHT on the skill row emit the cycle actions but do NOT
+  // mutate the value (deferred) and do NOT move the selection; the
+  // frame falls through to the next query.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 256;   // band trunc(233/36)=6 -> Skill
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::SkillCyclePrev);
+    CHECK(ctl.selection() == 6 && ctl.skill() == 0);  // unchanged
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::SkillCycleNext);
+    CHECK(ctl.selection() == 6 && ctl.skill() == 0);
+    // Enter on skill row is a forward cycle.
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::SkillCycleNext);
+  }
+
+  // LEFT/RIGHT on a non-skill row dispatch that row's action (the
+  // original ends the frame right after the branch call).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 40;    // band 0 -> Help
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::Help);
+  }
+
+  // Input order (OBSERVED): prev query runs before next in one frame.
+  {
+    mdk::FrontendMachineState s;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    in.nextHeld = true;
+    ctl.update(in);
+    // prev: 8->7, next: 7->8.
+    CHECK(ctl.selection() == 8);
+  }
+
+  // Button latch: held buttons don't refire; release re-arms.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 40;   // Help band
+    mdk::OptionsMenuController ctl(s, false, 0);
+    mdk::FrontendMenuInput in;
+    ctl.update(in);   // buttons released -> latch arms
+    in.mouseButtons = 0x1;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::Help);
+    ctl.update(in);   // still held -> no refire
+    CHECK(ctl.pendingAction() == mdk::OptionsAction::None);
+    in.mouseButtons = 0;
+    ctl.update(in);   // re-arm
+    in.mouseButtons = 0x1;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::Help);
+  }
+
+  // Scale ramp: keyed (-1, y). Cold boot -> first selected draw
+  // 0.65, then acc advances once per selected draw at the FUN_0042fb30
+  // power-on smoothed of 1.0: 0.72..1.0; prev-key decay and the
+  // mid-ramp snap-up quirk behave exactly like the root's.
+  {
+    mdk::FrontendMachineState s;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    const int y8 = 49 + 36 * 8;   // OM_QUIT row (entry selection)
+    CHECK(near(ctl.itemScale(y8, true), 0.65));
+    const float grow[5] = {0.72f, 0.79f, 0.86f, 0.93f, 1.0f};
+    for (int f = 0; f < 5; ++f) {
+      CHECK(near(ctl.itemScale(y8, true), grow[f], 1e-5));
+    }
+    CHECK(near(ctl.itemScale(49, false), 0.65));
+    // Move selection to row 0: row 8 holds 1.0 one extra frame, then
+    // decays; row 0 grows.
+    const int y0 = 49;
+    CHECK(near(ctl.itemScale(y8, false), 1.0));
+    CHECK(near(ctl.itemScale(y0, true), 0.65));
+    CHECK(near(ctl.itemScale(y8, false), 1.0));
+    CHECK(near(ctl.itemScale(y0, true), 0.72f, 1e-5));
+    const float dec[5] = {0.93f, 0.86f, 0.79f, 0.72f, 0.65f};
+    const float inc[5] = {0.79f, 0.86f, 0.93f, 1.0f, 1.0f};
+    for (int f = 0; f < 5; ++f) {
+      CHECK(near(ctl.itemScale(y8, false), dec[f], 1e-5));
+      CHECK(near(ctl.itemScale(y0, true), inc[f], 1e-5));
+    }
+  }
+}
+
+// Phase 4F — root <-> options flow (FUN_00420cf0 / FUN_00420d68).
+void test_frontend_flow() {
+  // Root -> Options: OpenOptions is consumed internally; the options
+  // controller starts at selection 8 with the root's machine state.
+  {
+    mdk::FrontendFlowController flow(true);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;   // 180 -> 139: root band 3 -> Options
+    flow.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    flow.update(in);
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(flow.consumeRootAction() == mdk::FrontendAction::None);
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.options().selection() == 8);
+    // Shared state carried over: logical mouse at the clicked point.
+    CHECK(flow.options().mouseX() == 300 &&
+          flow.options().mouseY() == 139);
+  }
+
+  // Options -> Root: activating row 8 (or Esc) returns to the root
+  // screen; the machine state (incl. logical mouse) carries back and
+  // the root selection is where it was left.
+  {
+    mdk::FrontendFlowController flow(true);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;
+    flow.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    flow.update(in);
+    flow.consumeRootAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    // Move the mouse into the Display band and release the button.
+    in = {};
+    in.mouseButtons = 0;
+    in.mouseDy = 162;   // 139 -> 301: band trunc(278/36)=7 -> Display
+    flow.update(in);
+    CHECK(flow.options().selection() == 7);
+    // Esc -> Back -> flow returns to root.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    CHECK(flow.consumeOptionsAction() == mdk::OptionsAction::None);
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(flow.root().selection() == 3);   // root selection untouched
+    CHECK(flow.root().mouseX() == 300 && flow.root().mouseY() == 301);
+  }
+
+  // Non-transition options actions pass through to the caller.
+  {
+    mdk::FrontendFlowController flow(true);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;
+    flow.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    flow.update(in);
+    flow.consumeRootAction();
+    in = {};
+    in.mouseButtons = 0;
+    in.mouseDy = 162;   // Display band
+    flow.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    flow.update(in);    // click -> activate Display
+    CHECK(flow.consumeOptionsAction() == mdk::OptionsAction::Display);
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+  }
+
+  // Non-transition root actions pass through unchanged.
+  {
+    mdk::FrontendFlowController flow(true);
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;   // sel 0 -> ContinueGame
+    flow.update(in);
+    CHECK(flow.consumeRootAction() == mdk::FrontendAction::ContinueGame);
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+  }
+}
+
+// Phase 4F — options sub-menu renderers.
+void test_options_render() {
+  std::string err;
+  auto f = SyntheticFont::make();
+  const char* labels[9] = {"Help",      "Sound",    "Joystick",
+                           "Mouse",     "Keyboard", "Performance",
+                           "Skill - Easy", "Display", "Quit"};
+  for (const char* l : labels) {
+    for (const char* c = l; *c; ++c) {
+      f.put32(static_cast<std::uint8_t>(*c) * 4,
+              f.addGlyph(1, 0, 2, {9, 9, 9, 9}));
+    }
+  }
+  const auto font = mdk::decodeFtiFont(f.buf, &err);
+  CHECK(font);
+  auto arrowS = SyntheticSprite::make1(
+      2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+  const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+  CHECK(arrow && arrow->frame(0));
+
+  mdk::OptionsMenuLabels lbl;
+  for (int i = 0; i < 9; ++i) {
+    lbl.items[i] = labels[i];
+  }
+  std::array<std::byte, 192> sysPal{};
+  for (int i = 0; i < 64; ++i) {
+    sysPal[i * 3 + 0] = std::byte(i);
+    sysPal[i * 3 + 1] = std::byte(200 - i);
+    sysPal[i * 3 + 2] = std::byte(i);
+  }
+
+  // Static spec frame: clear(0), 9 centered rows (sel 8 at 1.0, the
+  // rest 0.65), ARROW at the carried mouse, SYS_PAL head bound.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::OptionsMenuSpec spec;
+    spec.arrowX = 300;
+    spec.arrowY = 139;
+    CHECK(mdk::renderOptionsMenuFrame(fb, palette, *font,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      spec, &err));
+    // Arrow at the spec position.
+    CHECK(fb.at(300, 139) == 77 && fb.at(301, 140) == 77);
+    // Glyph pixels land inside the Quit band (row 8, y 337..~360 clip).
+    bool found9 = false;
+    for (int y = 337; y < 342 && !found9; ++y) {
+      for (int x = 280; x < 320 && !found9; ++x) {
+        found9 = fb.at(x, y) == 9;
+      }
+    }
+    CHECK(found9);
+    // Corners stay cleared (no backdrop).
+    CHECK(fb.at(0, 0) == 0 && fb.at(599, 0) == 0 &&
+          fb.at(0, 359) == 0);
+    // Palette: SYS_PAL head bound, tail zeroed.
+    CHECK(palette.get(1).r == 1 && palette.get(1).g == 199);
+    CHECK(palette.get(200).r == 0 && palette.get(200).a == 255);
+    // Contracts: wrong fb size, empty label, short palette head.
+    mdk::IndexedFramebuffer small(64, 64);
+    CHECK(!mdk::renderOptionsMenuFrame(small, palette, *font,
+                                     *arrow->frame(0), lbl, sysPal,
+                                     spec, &err));
+    mdk::OptionsMenuLabels bad;
+    CHECK(!mdk::renderOptionsMenuFrame(fb, palette, *font,
+                                     *arrow->frame(0), bad, sysPal,
+                                     spec, &err));
+    std::array<std::byte, 64> shortPal{};
+    CHECK(!mdk::renderOptionsMenuFrame(fb, palette, *font,
+                                     *arrow->frame(0), lbl, shortPal,
+                                     spec, &err));
+  }
+
+  // Hidden mode: rows 2,3,4 skipped; indices not compacted.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::OptionsMenuSpec spec;
+    spec.devHidden = true;
+    CHECK(mdk::renderOptionsMenuFrame(fb, palette, *font,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      spec, &err));
+    // Rows 2,3,4 (y 121..202) must have no glyph pixels.
+    bool any9 = false;
+    for (int y = 121; y < 203 && !any9; ++y) {
+      for (int x = 0; x < 600 && !any9; ++x) {
+        any9 = fb.at(x, y) == 9;
+      }
+    }
+    CHECK(!any9);
+  }
+
+  // Dynamic frame: live ramp drives row scales; ARROW follows the
+  // controller's logical mouse.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 139;
+    mdk::OptionsMenuController ctl(s, false, 0);
+    CHECK(mdk::renderOptionsMenuDynamic(fb, palette, *font,
+                                        *arrow->frame(0), lbl, sysPal,
+                                        ctl, &err));
+    CHECK(fb.at(300, 139) == 77);
+    // First draw: the ramp keyed (-1, y) performs the transition —
+    // the accumulator restarts at 0 and advances from the next pass.
+    CHECK(ctl.rampAccumulator() == 0.0f);
+    CHECK(mdk::renderOptionsMenuDynamic(fb, palette, *font,
+                                        *arrow->frame(0), lbl, sysPal,
+                                        ctl, &err));
+    CHECK(ctl.rampAccumulator() > 0.0f);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -4055,6 +4549,9 @@ int main() {
   test_fti_sprite();
   test_frontend_menu();
   test_frontend_controller();
+  test_options_controller();
+  test_frontend_flow();
+  test_options_render();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

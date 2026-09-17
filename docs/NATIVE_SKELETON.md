@@ -55,13 +55,21 @@ diagnostic checkerboard; requires `--data-path`),
 front-end frame — `MDKOPT` backdrop + `OPT0..OPT4` scaled centered
 FONTBIG labels + `ARROW` at the reset mouse position; resolves all
 resources itself; requires `--data-path`),
-`--interactive-frontend` (Phase 4E: run the reconstructed
-FUN_0041dc90 root-menu controller over the same composition —
-original-style UP/DOWN selection with key repeat, gated mouse
-hit-test, scale ramp, semantic activation actions; requires
-`--data-path`). With `--selftest`, the interactive mode runs a
-deterministic injected-event script (real device input is filtered
-out for the duration) and reports PASS/FAIL.
+`--preview-options-submenu` (Phase 4F: compose the static options
+sub-menu frame — framebuffer clear + `OM_*` centered FONTBIG labels
++ `ARROW` under the system palette head; requires `--data-path`),
+`--interactive-frontend` (Phase 4E/4F: run the reconstructed
+FUN_0041dc90 root-menu controller, now flowing into the FUN_00420eac
+options sub-menu on `OpenOptions` — original-style UP/DOWN/LEFT/
+RIGHT selection with key repeat, gated mouse hit-test, scale ramp,
+semantic activation actions, Esc/Quit return to root; requires
+`--data-path`). `--frontend-root-only` is a test-only switch that
+keeps `OpenOptions` deferred so the Phase 4E single-screen
+regression snapshot stays reproducible. With `--selftest`, the
+interactive mode runs a deterministic injected-event script (real
+device input is filtered out for the duration; the timing machine
+is fed the original's paced regime — dt = 100/3 ms per frame — so
+runs and digests are machine-independent) and reports PASS/FAIL.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -87,6 +95,17 @@ src/
                                   (ARROW format, FUN_00415ff0 mirror, 4D)
              frontend_menu.*    — static front-end frame composition
                                   (FUN_0041dc90 stable state, 4D)
+                                  + interactive root controller (4E)
+             frontend_machines.h — shared input-machine primitives:
+                                  mouse accumulate, repeat queries,
+                                  scale ramp, frame timing, the
+                                  serialized FrontendMachineState (4F)
+             options_menu.*     — options sub-menu controller +
+                                  static/dynamic renderers
+                                  (FUN_00420eac, 4F)
+             frontend_flow.*    — two-screen flow controller:
+                                  FUN_00420cf0 enter options,
+                                  FUN_00420d68 return to root (4F)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface

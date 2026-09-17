@@ -56,12 +56,22 @@ public:
 
   // --interactive-frontend --selftest support: one scripted input step
   // per call, invoked before pumpEvents with the current frame index.
-  // Frames outside the script push nothing. Script (Phase 4E):
+  // Frames outside the script push nothing. `rootOnly` keeps the
+  // Phase 4E root-only script so the pre-transition regression
+  // snapshot stays reproducible.
+  // Root script (Phase 4E, also frames 0-3 of the full script):
   //   0: DOWN-arrow tap (down+up same frame)  -> next item once
   //   1: mouse motion (0,-41)                 -> arrow to y=139 band 3
   //   2: left button down                     -> hit-test + activate
   //   3: left button up                       -> re-arm the latch
-  void pushFrontendSelfTestStep(std::uint64_t frameIndex);
+  // Phase 4F two-screen continuation:
+  //   4: DOWN tap      -> options sel 8->0 wrap
+  //   5: DOWN tap      -> options sel 0->1
+  //   6: motion +162   -> arrow to y=301 band 7 (Display)
+  //   7: button down   -> hit-test + activate -> Display action
+  //   8: button up     -> re-arm the latch
+  //   9: ESC tap       -> Back -> return to root (FUN_00420d68)
+  void pushFrontendSelfTestStep(std::uint64_t frameIndex, bool rootOnly);
 
   // Install an SDL event filter that drops all REAL key/button/motion
   // events — injected events carry a sentinel device ID and pass

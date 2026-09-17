@@ -178,58 +178,84 @@ void SdlHost::isolateHardwareInputForSelftest() {
   SDL_FlushEvent(SDL_EVENT_MOUSE_WHEEL);
 }
 
-void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex) {
-  if (!window_ || frameIndex > 3) {
+void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
+                                       bool rootOnly) {
+  const std::uint64_t lastStep = rootOnly ? 3 : 9;
+  if (!window_ || frameIndex > lastStep) {
     return;
   }
   const SDL_WindowID id = SDL_GetWindowID(window_);
   SDL_Event e{};
-  switch (frameIndex) {
-  case 0:  // DOWN-arrow tap: press+release inside one frame.
+  auto keyTap = [&](SDL_Scancode sc, SDL_Keycode kc) {
+    e = SDL_Event{};
     e.type = SDL_EVENT_KEY_DOWN;
     e.key.windowID = id;
     e.key.which = kSelftestKeyboardID;
-    e.key.scancode = SDL_SCANCODE_DOWN;
-    e.key.key = SDLK_DOWN;
+    e.key.scancode = sc;
+    e.key.key = kc;
     e.key.down = true;
     SDL_PushEvent(&e);
     e = SDL_Event{};
     e.type = SDL_EVENT_KEY_UP;
     e.key.windowID = id;
     e.key.which = kSelftestKeyboardID;
-    e.key.scancode = SDL_SCANCODE_DOWN;
-    e.key.key = SDLK_DOWN;
+    e.key.scancode = sc;
+    e.key.key = kc;
     e.key.down = false;
     SDL_PushEvent(&e);
-    break;
-  case 1:  // Arrow from (300,180) to y=139 — inside item-3's band.
+  };
+  auto motion = [&](float yrel) {
+    e = SDL_Event{};
     e.type = SDL_EVENT_MOUSE_MOTION;
     e.motion.windowID = id;
     e.motion.which = kSelftestMouseID;
-    e.motion.x = 300.0f;
-    e.motion.y = 139.0f;
     e.motion.xrel = 0.0f;
-    e.motion.yrel = -41.0f;
+    e.motion.yrel = yrel;
     if (!SDL_PushEvent(&e)) {
       log::warn(kTag, "frontend selftest: motion push rejected: %s",
                 SDL_GetError());
     }
-    break;
-  case 2:  // Button down: hit-test then activate (same frame).
-    e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+  };
+  auto button = [&](bool down) {
+    e = SDL_Event{};
+    e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN
+                  : SDL_EVENT_MOUSE_BUTTON_UP;
     e.button.windowID = id;
     e.button.which = kSelftestMouseID;
     e.button.button = SDL_BUTTON_LEFT;
-    e.button.down = true;
+    e.button.down = down;
     SDL_PushEvent(&e);
+  };
+  switch (frameIndex) {
+  case 0:  // DOWN tap: root sel 0 -> 1.
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
     break;
-  case 3:  // Release: re-arms the original's button latch.
-    e.type = SDL_EVENT_MOUSE_BUTTON_UP;
-    e.button.windowID = id;
-    e.button.which = kSelftestMouseID;
-    e.button.button = SDL_BUTTON_LEFT;
-    e.button.down = false;
-    SDL_PushEvent(&e);
+  case 1:  // Arrow (300,180) -> y=139: inside root item-3's band.
+    motion(-41.0f);
+    break;
+  case 2:  // Button down: hit-test then activate -> OpenOptions.
+    button(true);
+    break;
+  case 3:  // Release: re-arms the latch (first options frame).
+    button(false);
+    break;
+  case 4:  // DOWN tap: options sel 8 -> 0 wrap (Help).
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+    break;
+  case 5:  // DOWN tap: options sel 0 -> 1 (Sound).
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+    break;
+  case 6:  // Arrow y=139 -> 301: options band 7 (Display).
+    motion(162.0f);
+    break;
+  case 7:  // Button down: hit-test + activate -> Display action.
+    button(true);
+    break;
+  case 8:  // Release: re-arm the latch.
+    button(false);
+    break;
+  case 9:  // ESC tap: Back -> FUN_00420d68 -> return to root.
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   default:
     break;

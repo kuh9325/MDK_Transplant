@@ -891,13 +891,22 @@ arrow at (300,139). Real device input is isolated during the script
 drops all real key/button/motion events and the pre-filter queue is
 flushed, so physical input cannot perturb the script (observed
 nondeterminism without it: real motion deltas coalesce against or
-replace the injected motion).
+replace the injected motion). Since Phase 4F the script also feeds
+the original's paced regime (`dt = 100/3 ms` per frame) to the
+timing machine, so injected runs and their framebuffer digests are
+deterministic across machines; the live path keeps real wall-clock
+deltas, where `FUN_0042fcd0` makes the ramp pacing-dependent by
+design (very fast frames truncate `rawDelta` to 0 and the ramp
+crawls — faithful, not a bug).
 
 ## Digests and verification
 
-- Dynamic snapshot `/tmp/mdk-phase4e-menu.ppm` after the scripted
-  sequence + ramp completion (40 frames):
-  fb `cf09ecdad5b0808f`, palette `6a3cbda3822c5525`.
+- Dynamic snapshot `/tmp/mdk-phase4e-menu.ppm` at the end of the
+  scripted sequence under the paced regime (10 frames):
+  fb `cf09ecdad5b0808f`, palette `6a3cbda3822c5525`. (The digest is
+  identical at 40+ frames once the ramp completes under the paced
+  feed; runs driven by real wall-clock deltas are pacing-dependent
+  by original design and need not reproduce it bit-for-bit.)
 - Static `--preview-options` unchanged: `debd84b7f6e158dc` /
   `6a3cbda3822c5525`; all Phase 4A–4D digests intact.
 - Agent-side PPM check: Options enlarged to 1.0, other four items
@@ -922,13 +931,238 @@ replace the injected motion).
 - No Esc/cancel binding inside the controller (the original menu
   has none; Esc is a main-loop concern).
 
-## Phase 4F candidate directions
+# Phase 4F — interactive options sub-menu
 
-1. **Root → options sub-menu transition** — consume `OpenOptions`
-   and enter `FUN_00420eac`: the black-background OM_* list with its
-   own selection/hit-test/scale behavior (labels already traced:
-   OM_HELP/OM_SOUND/OM_JOY/OM_MOUSE/OM_KEY/OM_PERF, skill, display,
-   quit). Still no settings mutation.
+Phase 4F connects the root menu's `OpenOptions` dispatch to the real
+options sub-menu `FUN_00420eac` (front-end mode `0x0b`) and
+reconstructs its visual and interactive state: the black-background
+`OM_*` list, navigation, mouse hit-test, scale ramp, and semantic
+action dispatch — plus the proven return to the root menu
+(`FUN_00420d68`). Settings mutation stays deferred. Everything below
+is OBSERVED at instruction level in `MDK95.EXE` (BUILD_A) unless
+marked otherwise; private notes live in `analysis-private/logs/`
+(`decomp_20eac.txt`, `disasm_optitems.txt`, the `FUN_00420cf0`/
+`FUN_00420d68` disassemblies).
+
+## Root → options transition (`FUN_00420cf0`, OBSERVED)
+
+The root selection-3 dispatch (`CALL 0x00420cf0` at `0x41de77`,
+followed by RET — see the dispatch-frame note below) runs:
+
+1. `DAT_00541493 = 0x0b` — front-end mode becomes the options
+   sub-menu handler `FUN_00420eac`.
+2. `_DAT_0054bd34 = 8` — options selection starts at row 8 (OM_QUIT).
+3. `FUN_0046d614(svlut)` — flattens the active (MDKOPT) palette into
+   the 768-byte scratch buffer `DAT_0049ac60`.
+4. `FUN_0046d208(0, 0x100, DAT_00540820)` — uploads the resident
+   system-palette array.
+
+No mouse, tick, repeat-deadline, button-latch, ramp, or timing state
+is reset — the shared globals continue on the new screen. The two
+menu handlers literally run over the same global block, so the
+native `FrontendMachineState` is serialized verbatim between the
+root and options controllers (`frontend_machines.h`).
+
+## Options → root return (`FUN_00420d68`, OBSERVED)
+
+Activating row 8 or pressing Esc runs `FUN_00420d68`:
+
+1. If the settings-dirty flag `DAT_00541486 != 0`, persist settings
+   via `FUN_004260ac` — Phase 4F never mutates, so this never runs.
+2. `FUN_00402590` — re-enter the front-end list path.
+3. `FUN_0046d208(0, 0x100, svlut)` — restores the palette saved at
+   entry, then releases `svlut`.
+4. `DAT_00541493 = 0` — mode back to the root handler.
+
+Again no input-state reset: root selection, logical mouse, ramp and
+timing all carry back.
+
+## Item table (OBSERVED — record names at `0x495ca8`..`0x495d04`)
+
+Nine rows, drawn by `FUN_00420df8` → FTI lookup `FUN_00414890` →
+`FUN_00423b88` → centered scaled text `FUN_0041518c`:
+
+| sel | FTI record | resolved string (BUILD_A) | activation target |
+|---|---|---|---|
+| 0 | `OM_HELP`  | "Help"         | `FUN_0041d540` (mode 0x0a help screen) |
+| 1 | `OM_SOUND` | "Sound"        | `FUN_0042322c` (mode 2 sound screen) |
+| 2 | `OM_JOY`   | "Joystick"     | `FUN_0041fa24` (mode 3) — `DAT_005414f4`-gated |
+| 3 | `OM_MOUSE` | "Mouse"        | `FUN_00421664` (mode 4) — `DAT_005414f4`-gated |
+| 4 | `OM_KEY`   | "Keyboard"     | `FUN_0041f030` (mode 5) — `DAT_005414f4`-gated |
+| 5 | `OM_PERF`  | "Performance"  | `FUN_00421e70` (mode 6 perf screen) |
+| 6 | `OM_SK_0/1/2` | "Skill - Easy/Normal/Hard" | LEFT/RIGHT/Enter cycle `DAT_0054147a` ±1 (wraps) + `DAT_00541486=1` |
+| 7 | `OM_DISPL` | "Display"      | `FUN_0041d020` (mode 7 display screen) |
+| 8 | `OM_QUIT`  | "Quit"         | `FUN_00420d68` (leave options → root) |
+
+Row 6's record is dynamic: `OM_SK_0`/`OM_SK_1`/`OM_SK_2` by the skill
+global `DAT_0054147a` (0/1/2). Canonical value is **0** ("Skill -
+Easy") — no MDK.CFG entry or other startup writer sets it.
+
+`DAT_005414f4` (the `-mapok` command-line dev flag, canonical 0)
+hides rows 2,3,4 **without compacting the index space**: keyboard
+wraps 1↔5 around them, and the mouse hit-test clause
+`1 < band < 5` reverts to the current selection. With the flag set,
+activating a hidden index (still reachable only via carried state)
+is a no-op in the original.
+
+## Background + palette (OBSERVED)
+
+`FUN_00420eac`'s draw block starts with `FUN_00415658` →
+`FUN_0047d20a(…, 0)` — a zero-fill of the whole framebuffer to index
+0. No backdrop image is drawn on this screen; MDKOPT does not leak
+in. Draw order: clear → nine OM labels → ARROW → present.
+
+The active palette is the resident system array `DAT_00540820`
+uploaded at entry: entries 0–63 are the proven `SYS_PAL` head; the
+tail 64–255 is filled at front-end entry by `FUN_004346e8` from the
+palette record `DAT_0054c678` (resolved by `FUN_00433d40` from a
+`TLEVEL`/`LEVEL%d`-family file — the exact tail bytes are
+**unresolved** in BUILD_A). No drawn options pixel references
+entries ≥64, so the native renderer binds `SYS_PAL[0:64]` and
+zero-fills the tail — documented, not guessed. On return the saved
+MDKOPT palette is restored (`FUN_0046d208` of `svlut`).
+
+## Geometry + font (OBSERVED)
+
+Row `i` draws at `y = 49 + 36·i` (0x31 + 0x24·i) — rows 49..337.
+`FUN_0041518c` centers on the 600-wide framebuffer:
+`x = trunc((600 − measure·scale) × 0.5)` — x87 truncation toward
+zero; the measure is `FUN_00414be8` with missing-glyph advance 6
+(FONTBIG path, marker flag 0 — same draw helper as the root menu).
+Unlike the root's `maxW/2` anchor, options centering is per-row on
+the framebuffer width.
+
+## Selection + input (OBSERVED)
+
+The selection global is `DAT_0054bd34` (entry value 8). Per frame
+the handler runs, in order: prev query (`FUN_004237b4`, UP) → next
+query (`FUN_00423838`, DOWN) → mouse hit-test → Esc edge check
+(`DAT_0054b570`) → LEFT query (`FUN_004238bc`) → RIGHT query
+(`FUN_00423940`) → activate query (`FUN_00423764`) → draw. All four
+direction queries share the root's repeat machine (press fire,
+deadline tick+30, repeat tick+3, staleness window +100); the
+activate query shares the Enter-edge / button-latch semantics.
+
+- UP: `sel−−`; `<0 → 8`; hidden mode `==4 → 1`.
+- DOWN: `sel++`; `>=9 → 0`; hidden mode `==2 → 5`.
+- Mouse (gated on `dx|dy|buttons`, in-gate clamp `x≤590,y≤350`):
+  `band = trunc((mouseY − 23) / 36)` — row `i` covers
+  `[23+36i, 58+36i]`; `band∈[0,8]` selects, `y≥347 → band 9`
+  invalid; the `1<band<5` guard applies only in hidden mode.
+  x is never consulted. (The `y−23` numerator differs from the
+  root's `y−5` — proven, not assumed.)
+- Esc edge: jumps to the row-8 case — `Back` (`FUN_00420d68`).
+- LEFT on row 6: `SkillCyclePrev` (skill −1, wraps 0→2) then falls
+  through to the RIGHT query; on any other row it dispatches that
+  row's action and the frame ends.
+- RIGHT on row 6: `SkillCycleNext` (+1, wraps 2→0) then falls
+  through to the activate query; otherwise dispatches.
+- Enter/button click on row 6: forward cycle; on rows 0–5,7,8:
+  dispatch. A click selects (same-frame hit-test) then activates.
+
+`DAT_00541538 != 0` would delegate the whole frame to the sound
+screen — canonical 0, child screens deferred.
+
+## Dispatch-frame semantics (OBSERVED — refined in 4F)
+
+Every activation-dispatch branch of `FUN_00420eac` — and of the
+root `FUN_0041dc90`, verified at `0x41de77`: `CALL target` then
+`LEA ESP,[EBP-0x14]; POP…; RET` — returns **before** the draw
+block and the `FUN_0042fe78`/`FUN_0042fb68` timing update. A
+dispatched frame therefore draws nothing and does not advance the
+timing machine; the previous frame persists until the next mode's
+first draw. Skill cycles (fall-through to draw) and the root's
+attract trigger (`FUN_0041ef74` runs, then the draw still executes)
+are the exceptions. Both controllers expose this as
+`frameEndedEarly()`; the application loop skips render + `endFrame`
+on those frames.
+
+## Semantic actions (`OptionsAction`, emitted only)
+
+`None, Help, Sound, Joystick, Mouse, Keyboard, Performance,
+SkillCyclePrev, SkillCycleNext, Display, Back` — the original
+targets are the mode-changing child-screen entries and the skill
+mutation listed in the item table. Phase 4F emits the events and
+performs the proven `Back` transition; settings mutation
+(`DAT_0054147a`, volumes, bindings, display mode, `DAT_00541486`
+dirty flag, `FUN_004260ac` persistence) is deferred.
+
+## Front-end flow controller
+
+`FrontendFlowController` (`frontend_flow.h`) owns exactly the two
+reconstructed screens — `Root` (`FUN_0041dc90`) and `Options`
+(`FUN_00420eac`) — routes the neutral input to the active
+controller, and consumes the transition-driving actions internally:
+root `OpenOptions` → `enterOptions` (`FUN_00420cf0`), options
+`Back` → `returnToRoot` (`FUN_00420d68`). The shared
+`FrontendMachineState` is serialized across both directions. It is
+deliberately not a generic UI router.
+
+## Interactive CLI + deterministic validation
+
+- `--preview-options-submenu` (needs `--data-path`): static entry
+  frame — clear, nine OM labels (sel 8 at 1.0, others 0.65), ARROW
+  at the carried mouse, `SYS_PAL` head bound.
+- `--interactive-frontend`: root `Options` now transitions into the
+  live options sub-menu; Esc/Quit returns to root. Other root and
+  options actions log semantic events only.
+- `--frontend-root-only` (test-only): keeps `OpenOptions` deferred
+  so the Phase 4E single-screen snapshot stays reproducible.
+- `--selftest` injects the two-screen script (root DOWN/motion/
+  click → options entry at sel 8 → DOWN×2 → motion to Display band
+  → click → release → Esc → root) and now feeds the original's
+  paced regime — `dt = 100/3 ms` per frame — to the timing machine,
+  making injected-input runs and their digests deterministic across
+  machines. The live path keeps real wall-clock deltas like the
+  original (`FUN_0042fcd0` ties the ramp to real pacing: on very
+  fast frames `rawDelta` truncates to 0 and the ramp crawls —
+  faithful, not a bug).
+
+## Digests and verification
+
+- Static options preview: fb `3150a8a305ad9de8`, palette
+  `08e372297e745a06` (SYS_PAL head + zero tail).
+- Dynamic options snapshot `/tmp/mdk-phase4f-options.ppm` (script
+  frame 8 — sel 7 mid-ramp, Quit decaying, ARROW at 300,301):
+  fb `f00c540a40d8543d`, palette `08e372297e745a06`.
+- Two-screen selftest end frame (script end, back at root, sel 3
+  mid-regrowth — the shared ramp's item key changed domain across
+  the transition, so the root selection visibly regrows on return):
+  fb `8d4eda7a8488bf02`, palette `6a3cbda3822c5525`; settled at
+  40+ frames: fb `b6ffd4b319dedf51` — the saved MDKOPT palette
+  restored in both.
+- Phase 4E root-only regression at the paced regime:
+  `cf09ecdad5b0808f` / `6a3cbda3822c5525` — reproduces exactly (the
+  earlier real-time-feed variant `12226ebe0e32b479` was the same
+  machine state under uncapped pacing; baseline `a1b231a` produces
+  identical digests to this build at every frame count tested).
+- Unit tests: options entry/walk/wrap, hidden-row skip + hidden
+  hit-test guard, exact band boundaries, Esc, LEFT/RIGHT skill
+  cycles vs row dispatch, latch semantics, ramp keyed `(−1, y)`,
+  flow state carry-over both directions, static/dynamic renderer
+  contracts.
+- Interactive selftests: root-only PASS, two-screen PASS
+  (entered=1 returned=1, `Display` emitted, root sel 3 restored).
+
+## Explicit non-goals (Phase 4F)
+
+- No settings mutation — skill, sound, controls, performance,
+  display values never change; `DAT_00541486`/`FUN_004260ac`
+  persistence path documented but unused.
+- No child screens — Help/Sound/Joystick/Mouse/Keyboard/
+  Performance/Display sub-screens are semantic dispatches only.
+- No attract slideshow, no audio (the `SND_PUSH` hook on repeat
+  fires is still deferred).
+- The options palette tail (`DAT_0054c678` ← level palette record)
+  is unresolved in BUILD_A; the renderer binds the proven head and
+  documents the gap rather than guessing.
+
+## Phase 4G candidate directions
+
+1. **One real options mutation/child screen** — pick the smallest
+   evidence-complete target from the action table (Display, Sound,
+   Mouse, Keyboard, or the Skill cycle's `DAT_0054147a` write +
+   `OM_SK_*` relabel + dirty-flag/persist path).
 2. **Attract slideshow** — `FUN_0041ef74` + the timeout chain
    (30/5/4/2 s thresholds on `DAT_0049aaa4`).
 3. **Frontend sound** — SND_* records behind `FUN_00423734`.

@@ -51,6 +51,8 @@
 #ifndef MDK_CORE_FRONTEND_MENU_H
 #define MDK_CORE_FRONTEND_MENU_H
 
+#include "core/frontend_machines.h"
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -70,31 +72,12 @@ struct IndexedImage;
 inline constexpr int kFrontendItemY0 = 31;      // 0x1f
 inline constexpr int kFrontendItemStep = 36;    // 0x24
 inline constexpr int kFrontendOptCount = 5;     // OPT0..OPT4
-// OBSERVED stable scale endpoints (FUN_00423a24).
-inline constexpr float kFrontendScaleSelected = 1.0f;
-inline constexpr float kFrontendScaleUnselected = 0.65f;
 // OBSERVED mouse reset (FUN_00418798 — startup, before front-end).
 inline constexpr int kFrontendMouseResetX = 300;
 inline constexpr int kFrontendMouseResetY = 180;
-// OBSERVED coordinate clamps (FUN_004187e0 accumulate / FUN_0041dc90
-// hit-test gate).
-inline constexpr int kFrontendMouseMaxX = 599;     // 0x257
-inline constexpr int kFrontendMouseMaxY = 359;     // 0x167
-inline constexpr int kFrontendHitClampX = 590;     // 0x24e
-inline constexpr int kFrontendHitClampY = 350;     // 0x15e
 // OBSERVED hit-test constants (FUN_0041dc90: band = trunc((y-5)/36)).
 inline constexpr int kFrontendHitBandBase = 5;
 inline constexpr int kFrontendHitBandSize = 36;    // 0x24
-// OBSERVED scale-ramp constants (FUN_00423a24 + dumped data):
-//   endpoints 1.0 / 0.65; acc in [0,5]; slope = 0.35*0.2 = 0.07.
-inline constexpr float kFrontendRampLimit = 5.0f;    // d[0x496018]
-inline constexpr float kFrontendRampSlopeA = 0.35f;  // d[0x49601c]
-inline constexpr float kFrontendRampSlopeB = 0.2f;   // d[0x496024]
-// OBSERVED key-repeat timing (FUN_004237b4/838, DAT_00541518 units):
-// first deadline tick+30, repeat deadline tick+3, staleness window +100.
-inline constexpr int kFrontendRepeatFirstDelay = 30;  // 0x1e
-inline constexpr int kFrontendRepeatPeriod = 3;
-inline constexpr int kFrontendRepeatWindow = 100;     // 0x64
 
 struct FrontendMenuItem {
   int optIndex = 0;   // which OPT record (0..4)
@@ -161,6 +144,12 @@ enum class FrontendAction {
 //   confirmEdge         : DIK_RETURN press *edge* (keymap bit 28 new-
 //                         press); fires once per physical press.
 //   attractEdge         : DIK_RIGHT press edge (keymap bit 106).
+//                         Root menu only.
+//   leftHeld / rightHeld: DIK_LEFT / DIK_RIGHT levels (keymap bits
+//                         100 / 102). Options sub-menu only — the root
+//                         menu never queries them.
+//   cancelEdge          : DIK_ESCAPE press edge (keymap bit 1,
+//                         DAT_0054b570). Options sub-menu only.
 //   mouseDx / mouseDy   : raw per-frame mouse deltas (DAT_0054b644/48;
 //                         no sensitivity scaling in the original).
 //   mouseButtons        : 4-bit nibble, bit i = button i+1 held
@@ -172,6 +161,9 @@ struct FrontendMenuInput {
   bool nextHeld = false;
   bool confirmEdge = false;
   bool attractEdge = false;
+  bool leftHeld = false;
+  bool rightHeld = false;
+  bool cancelEdge = false;
   int mouseDx = 0;
   int mouseDy = 0;
   std::uint8_t mouseButtons = 0;
@@ -201,9 +193,18 @@ public:
   int tick() const { return tick_; }                   // DAT_00541518
   float idleSeconds() const { return idleSeconds_; }   // DAT_0049aaa4
   int listState() const { return 0; }                  // DAT_0049aa98
-  float rampAccumulator() const { return rampAcc_; }   // DAT_0054bdd8
-  float smoothedDelta() const { return smoothed_; }    // DAT_0049b6f0
-  float deltaSeconds() const { return deltaSec_; }     // DAT_0049b6f4
+  float rampAccumulator() const { return ramp_.acc; }  // DAT_0054bdd8
+  float smoothedDelta() const { return timing_.smoothed; }  // DAT_0049b6f0
+  float deltaSeconds() const { return timing_.deltaSec; }   // DAT_0049b6f4
+
+  // The shared input-machine block (Phase 4F): mouse position, tick,
+  // repeat deadlines, button latch, ramp machine, timing struct — the
+  // globals that persist unchanged across the root -> options
+  // (FUN_00420cf0) and options -> root (FUN_00420d68) transitions.
+  // `left/rightDeadline` are serialized but never queried at root
+  // (the root menu has no LEFT/RIGHT handler).
+  FrontendMachineState machineState() const;
+  void setMachineState(const FrontendMachineState& s);
 
   // Per-frame update: mouse accumulate (FUN_004187e0), tick advance,
   // then the FUN_0041dc90 input block in original order:
@@ -226,9 +227,16 @@ public:
   FrontendAction pendingAction() const { return action_; }
   FrontendAction consumeAction();
 
-private:
-  bool repeatQuery(bool held, int& deadline) const;  // FUN_004237b4/838
+  // OBSERVED frame-termination flag: every activation-dispatch branch
+  // of FUN_0041dc90 ends in RET before the idle-accumulate, attract
+  // check, draw block, and timing update — a dispatched frame draws
+  // nothing and does not advance the timing machine. The attract
+  // trigger is NOT a dispatch: FUN_0041ef74 runs, then the draw block
+  // still executes. True only for the frame in which update() hit an
+  // activation branch.
+  bool frameEndedEarly() const { return endedEarly_; }
 
+private:
   bool savesExist_;
   int selection_;        // DAT_0049aa78
   int mouseX_;           // DAT_0054b634
@@ -238,21 +246,21 @@ private:
   // Repeat deadlines (DAT_0049ac84 up, DAT_0049ac88 down).
   int prevDeadline_ = 0;
   int nextDeadline_ = 0;
+  // LEFT/RIGHT repeat deadlines (DAT_0049ac8c/90) — serialized members
+  // of the shared global block; the root menu never queries them, but
+  // they must survive the options round-trip unchanged.
+  int leftDeadline_ = 0;
+  int rightDeadline_ = 0;
   // Mouse-button edge latch (DAT_0049ac80).
   bool buttonLatch_ = false;
   // Ramp machine (DAT_0054bdc8..bdd8): current/prev item keys + acc.
-  int rampCurX_ = 0, rampCurY_ = 0;
-  int rampPrevX_ = 0, rampPrevY_ = 0;
-  float rampAcc_ = 0.0f;
+  FrontendRampState ramp_;
   // Timing struct fields (FUN_0042fb30 init values).
-  int frameStep_ = 1;        // DAT_0049b6e8
-  int stepAccum_ = 0;        // DAT_0049b6f8
-  float smoothed_ = 1.0f;    // DAT_0049b6f0
-  float deltaSec_ = 1.0f / 30.0f; // DAT_0049b6f4
-  int virtualMs_ = 0;        // DAT_0049b700 (integer-ms virtual clock)
-  double realMs_ = 0.0;      // accumulated real clock (integer-ms domain)
-  bool timingStarted_ = false;
+  FrontendTimingState timing_;
   FrontendAction action_ = FrontendAction::None;
+  // Whether the last update() hit an activation-dispatch RET — see
+  // frameEndedEarly().
+  bool endedEarly_ = false;
 };
 
 // Compose one live frame from the controller state — identical

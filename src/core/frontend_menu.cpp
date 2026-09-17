@@ -118,43 +118,45 @@ FrontendAction FrontendMenuController::consumeAction() {
   return a;
 }
 
-// FUN_004237b4 / FUN_00423838 — the repeat-aware direction queries.
-// Identical bodies with per-key deadline state (DAT_0049ac84/88).
-// `tick_` is DAT_00541518 (advanced once per frame before the queries).
-bool FrontendMenuController::repeatQuery(bool held,
-                                         int& deadline) const {
-  const int old = deadline;
-  const bool fired = held && tick_ > old;
-  if (!held) {
-    deadline = 0;
-  } else if (old == 0) {
-    deadline = tick_ + kFrontendRepeatFirstDelay;  // press: tick+30
-  } else if (tick_ > old) {
-    deadline = tick_ + kFrontendRepeatPeriod;      // repeat: tick+3
-  } else if (tick_ + kFrontendRepeatWindow < old) {
-    deadline = 0;  // deadline anomalously far ahead -> reset state
-  }
-  // (On fire the original also calls FUN_00423734 -> SND_PUSH; audio
-  // deferred — recorded in ENGINE_RECONSTRUCTION Phase 4E.)
-  return fired;
+FrontendMachineState FrontendMenuController::machineState() const {
+  FrontendMachineState s;
+  s.mouseX = mouseX_;
+  s.mouseY = mouseY_;
+  s.tick = tick_;
+  s.prevDeadline = prevDeadline_;
+  s.nextDeadline = nextDeadline_;
+  s.leftDeadline = leftDeadline_;
+  s.rightDeadline = rightDeadline_;
+  s.buttonLatch = buttonLatch_;
+  s.ramp = ramp_;
+  s.timing = timing_;
+  return s;
+}
+
+void FrontendMenuController::setMachineState(
+    const FrontendMachineState& s) {
+  mouseX_ = s.mouseX;
+  mouseY_ = s.mouseY;
+  tick_ = s.tick;
+  prevDeadline_ = s.prevDeadline;
+  nextDeadline_ = s.nextDeadline;
+  leftDeadline_ = s.leftDeadline;
+  rightDeadline_ = s.rightDeadline;
+  buttonLatch_ = s.buttonLatch;
+  ramp_ = s.ramp;
+  timing_ = s.timing;
 }
 
 void FrontendMenuController::update(const FrontendMenuInput& in) {
+  endedEarly_ = false;
+
   // FUN_004187e0: accumulate raw deltas and clamp to the 600x360 work
   // surface. The accumulate is skipped when the delta is zero.
-  if (in.mouseDx != 0) {
-    mouseX_ += in.mouseDx;
-    if (mouseX_ > kFrontendMouseMaxX) mouseX_ = kFrontendMouseMaxX;
-    if (mouseX_ < 0) mouseX_ = 0;
-  }
-  if (in.mouseDy != 0) {
-    mouseY_ += in.mouseDy;
-    if (mouseY_ > kFrontendMouseMaxY) mouseY_ = kFrontendMouseMaxY;
-    if (mouseY_ < 0) mouseY_ = 0;
-  }
+  frontendMouseAccumulate(mouseX_, in.mouseDx, kFrontendMouseMaxX);
+  frontendMouseAccumulate(mouseY_, in.mouseDy, kFrontendMouseMaxY);
 
   // Main loop: DAT_00541518 += DAT_0049b6e8 before the mode handler.
-  tick_ += frameStep_;
+  tick_ += timing_.frameStep;
 
   // DAT_0049aa98 is the item-list state; the stable root list is 0.
   // On any selection change the original resets DAT_0049aaa4 to 0, or
@@ -162,7 +164,7 @@ void FrontendMenuController::update(const FrontendMenuInput& in) {
   const float idleReset = (listState() == 1) ? 999.0f : 0.0f;
 
   // 1. prev query (FUN_004237b4 — DIK_UP held).
-  if (repeatQuery(in.prevHeld, prevDeadline_)) {
+  if (frontendRepeatQuery(tick_, in.prevHeld, prevDeadline_)) {
     idleSeconds_ = idleReset;
     selection_ -= 1;
     if (selection_ < 0 || (selection_ == 0 && !savesExist_)) {
@@ -171,7 +173,7 @@ void FrontendMenuController::update(const FrontendMenuInput& in) {
   }
 
   // 2. next query (FUN_00423838 — DIK_DOWN held).
-  if (repeatQuery(in.nextHeld, nextDeadline_)) {
+  if (frontendRepeatQuery(tick_, in.nextHeld, nextDeadline_)) {
     idleSeconds_ = idleReset;
     selection_ += 1;
     if (selection_ >= kFrontendOptCount) {
@@ -215,6 +217,9 @@ void FrontendMenuController::update(const FrontendMenuInput& in) {
     // Dispatch (FUN_0041dc90 branch block) — semantic actions only;
     // every branch but Options also runs FUN_0041dbd4 cleanup and the
     // quit branch sets DAT_0054148e. Downstream systems are deferred.
+    // OBSERVED: every branch RETs immediately — the idle accumulate,
+    // attract check, draw block, and timing update are all skipped on
+    // the dispatch frame.
     switch (selection_) {
     case 0:
       action_ = savesExist_ ? FrontendAction::ContinueGame
@@ -233,10 +238,12 @@ void FrontendMenuController::update(const FrontendMenuInput& in) {
       action_ = FrontendAction::Quit;
       break;
     }
+    endedEarly_ = true;
+    return;
   }
 
   // 5. Idle/attract timer: DAT_0049aaa4 += DAT_0049b6f4 each frame.
-  idleSeconds_ += deltaSec_;
+  idleSeconds_ += timing_.deltaSec;
 
   // 6. DIK_RIGHT press edge (DAT_0054b554) with list state >= 0 forces
   // the attract trigger (FUN_0041ef74 path) — emitted as a semantic
@@ -250,77 +257,16 @@ void FrontendMenuController::update(const FrontendMenuInput& in) {
 
 float FrontendMenuController::itemScale(int centerX, int itemY,
                                         bool selFlag) {
-  // FUN_00423a24 verbatim. The (centerX,itemY) pair is the item key.
-  if (selFlag) {
-    if (centerX != rampCurX_ || itemY != rampCurY_) {
-      // Selection moved: previous key <- old current, acc restarts.
-      rampPrevX_ = rampCurX_;
-      rampPrevY_ = rampCurY_;
-      rampAcc_ = 0.0f;
-      rampCurX_ = centerX;
-      rampCurY_ = itemY;
-    } else {
-      rampAcc_ += smoothed_;  // += DAT_0049b6f0 once per frame
-    }
-  }
-  const float slope = kFrontendRampSlopeA * kFrontendRampSlopeB;  // 0.07
-  if (centerX == rampCurX_ && itemY == rampCurY_) {
-    if (rampAcc_ >= kFrontendRampLimit) {
-      return kFrontendScaleSelected;   // 1.0
-    }
-    return kFrontendScaleUnselected + rampAcc_ * slope;  // 0.65 + acc*0.07
-  }
-  if (centerX == rampPrevX_ && itemY == rampPrevY_) {
-    if (rampAcc_ >= kFrontendRampLimit) {
-      return kFrontendScaleUnselected; // 0.65
-    }
-    return kFrontendScaleSelected - rampAcc_ * slope;    // 1.0 - acc*0.07
-  }
-  return kFrontendScaleUnselected;
+  // FUN_00423a24 verbatim (shared with the options sub-menu — see
+  // frontend_machines.h). The (centerX,itemY) pair is the item key.
+  return frontendRampScale(ramp_, centerX, itemY, selFlag,
+                           timing_.smoothed);
 }
 
 void FrontendMenuController::endFrame(double dtMs) {
-  // FUN_0042fcd0 — the raw delta is measured between the real
-  // millisecond clock and the virtual clock DAT_0049b700, which chases
-  // real time at rawDelta*(25/3) ms per frame. The original domain is
-  // integer milliseconds throughout.
-  realMs_ += dtMs;
-  const int nowMs = static_cast<int>(realMs_);
-  if (!timingStarted_) {
-    // First call (DAT_0049b700 == 0): FUN_0042fb30 inits the struct
-    // and the virtual clock is set to now — no delta is computed.
-    virtualMs_ = nowMs;
-    timingStarted_ = true;
-    return;
-  }
-  if (nowMs < virtualMs_) {
-    virtualMs_ = nowMs;  // 0x42fd55 — clock-backwards resync
-  }
-  // rawDelta = (nowMs - virtualMs) * 120 / 1000 — integer math,
-  // truncating division (delta*8*16 - delta*8 = delta*120, DIV 1000).
-  const int rawDelta = (nowMs - virtualMs_) * 120 / 1000;
-
-  // FUN_0042fdc8 — timing struct @0x49b6e4.
-  const float frameUnits = static_cast<float>(rawDelta) * 0.25f;
-  smoothed_ = smoothed_ * 0.75f + frameUnits * 0.25f;
-  deltaSec_ = smoothed_ * (1.0f / 30.0f);
-  stepAccum_ += rawDelta;
-  int step = stepAccum_ >> 2;
-  stepAccum_ &= 3;
-  if (step < 1) {
-    step = 1;
-    stepAccum_ = 0;
-  } else if (smoothed_ > 4.0f || step > 4) {
-    step = 4;
-    smoothed_ = 4.0f;
-    deltaSec_ = smoothed_ * (1.0f / 30.0f);
-    stepAccum_ = 0;
-  }
-  frameStep_ = step;
-
-  // virtual = trunc(virtual + rawDelta * 25/3)  [d[0x4971e0] = 8.3333]
-  virtualMs_ =
-      static_cast<int>(virtualMs_ + rawDelta * (25.0 / 3.0));
+  // FUN_0042fb68/FUN_0042fcd0 timing update (shared helper — see
+  // frontend_machines.h).
+  frontendTimingUpdate(timing_, dtMs);
 }
 
 bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,

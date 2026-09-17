@@ -81,6 +81,16 @@ Boundary notes (intentions, not commitments):
 > command-stream format) drawn in the original order by
 > `renderFrontendMenuFrame` — one static evidence-backed state only,
 > no interaction.
+> Phase 4E makes the root menu interactive: `FrontendMenuController`
+> reproduces `FUN_0041dc90`'s selection, key-repeat, gated mouse
+> hit-test, scale ramp, and activation dispatch.
+> Phase 4F adds the second reconstructed screen and the first
+> inter-screen flow: `OptionsMenuController` reproduces
+> `FUN_00420eac` (black-background `OM_*` list, system-palette
+> binding, LEFT/RIGHT skill cycle, Esc return), and
+> `FrontendFlowController` performs the proven `FUN_00420cf0` entry /
+> `FUN_00420d68` exit transitions, carrying the shared input-machine
+> state verbatim between screens. Settings mutation stays deferred.
 > See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
