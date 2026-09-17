@@ -47,19 +47,23 @@ Boundary notes (intentions, not commitments):
 
 | Decision | Status |
 |---|---|
-| Implementation language | PROJECT DECISION (tentative): modern C++ (C++20) with a portable platform layer |
-| Platform/windowing lib | PROJECT DECISION (open): SDL3 is available via Homebrew; not yet chosen |
-| GPU backend | PROJECT DECISION (open): Metal is the obvious native fit; not yet chosen |
-| Build system | PROJECT DECISION (tentative): CMake (installed: 4.4.3) |
-| Audio backend | PROJECT DECISION (open) |
+| Implementation language | IMPLEMENTED (Phase 3A): C++20, Objective-C++ at the Metal seam |
+| Platform/windowing lib | IMPLEMENTED (Phase 3A): SDL3 3.4.16 via Homebrew (`SDL3::SDL3`) |
+| GPU backend | IMPLEMENTED (Phase 3A): Metal presentation of the software framebuffer |
+| Build system | IMPLEMENTED (Phase 3A): CMake ≥3.24, out-of-tree `build/` |
+| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A |
+
+> Phase 3A implements the bottom two layers (`platform`, `renderer`
+> presentation boundary) plus a neutral input seam and a mode-dispatch
+> scaffold. See `NATIVE_SKELETON.md` for the realized structure.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.
 
 ## Non-goals for now
 
-- No engine source tree yet (no src/ is created in Phase 0).
-- No renderer, no gameplay, no decoders.
+- No gameplay, no level/enemy/collision systems, no original-format
+  parsers, no audio — all deferred past Phase 3A.
 - Subsystem boundaries will be revised once the original builds' actual
   module organization is observed.
 

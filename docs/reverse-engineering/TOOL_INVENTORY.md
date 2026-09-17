@@ -41,7 +41,7 @@ toolchain (OpenJDK 21 + Ghidra 12.1.3, below).
 
 ## Other potentially relevant installed software (via Homebrew)
 
-- SDL3 and sdl2-compat (candidate platform-layer dependency — PROJECT DECISION, not yet chosen)
+- SDL3 **3.4.16** (IN USE — Phase 3A native platform layer, `SDL3::SDL3` CMake target) and sdl2-compat
 - ffmpeg, SDL-adjacent media libraries
 - Blender (cask), codex, copilot-cli (casks)
 - git-lfs
