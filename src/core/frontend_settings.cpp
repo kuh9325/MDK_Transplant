@@ -10,7 +10,8 @@ namespace mdk {
 std::string serializeFrontendSettings(const FrontendSettings& s) {
   // FUN_004260ac (OBSERVED): header + blank line, then one
   // `name = value` line per NON-default table value, in table
-  // order — Skill (entry 88, int), Brightness (entry 89, int),
+  // order — SoundFX (entry 8, int), SoundMusic (entry 9, int),
+  // Skill (entry 88, int), Brightness (entry 89, int),
   // ForcePCorrect (entry 90, type-2 bool `%s = TRUE`; the mirror
   // compare means a non-default bool is always TRUE).
   // CRLF terminators — the original's "wt" mode text file.
@@ -18,6 +19,15 @@ std::string serializeFrontendSettings(const FrontendSettings& s) {
   out += kFrontendSettingsHeader;
   out += "\r\n\r\n";
   char line[40];
+  if (s.soundFx != kFrontendSoundFxDefault) {
+    std::snprintf(line, sizeof(line), "SoundFX = %d\r\n", s.soundFx);
+    out += line;
+  }
+  if (s.soundMusic != kFrontendSoundMusicDefault) {
+    std::snprintf(line, sizeof(line), "SoundMusic = %d\r\n",
+                  s.soundMusic);
+    out += line;
+  }
   if (s.skill != kFrontendSkillDefault) {
     std::snprintf(line, sizeof(line), "Skill = %d\r\n", s.skill);
     out += line;
@@ -111,7 +121,23 @@ FrontendSettingsParse parseFrontendSettings(std::string_view text) {
     if (semi != std::string_view::npos) {
       value = value.substr(0, semi);
     }
-    if (keyEquals(key, "Skill")) {
+    if (keyEquals(key, "SoundFX")) {
+      int v = 0;
+      if (!parseLeadingInt(value, &v) ||
+          v < kFrontendSoundVolumeMin || v > kFrontendSoundVolumeMax) {
+        ++r.ignoredSoundFxLines;   // NATIVE hardening — see header
+        continue;
+      }
+      r.settings.soundFx = v;
+    } else if (keyEquals(key, "SoundMusic")) {
+      int v = 0;
+      if (!parseLeadingInt(value, &v) ||
+          v < kFrontendSoundVolumeMin || v > kFrontendSoundVolumeMax) {
+        ++r.ignoredSoundMusicLines;   // NATIVE hardening — see header
+        continue;
+      }
+      r.settings.soundMusic = v;
+    } else if (keyEquals(key, "Skill")) {
       int v = 0;
       if (!parseLeadingInt(value, &v) || v < kFrontendSkillMin ||
           v > kFrontendSkillMax) {

@@ -8,6 +8,8 @@ FrontendFlowController::FrontendFlowController(
     : root_(savesExist), skill_(initial.skill),
       brightness_(initial.brightness),
       forcePCorrect_(initial.forcePCorrect),
+      soundFx_(initial.soundFx),
+      soundMusic_(initial.soundMusic),
       persistSink_(std::move(sink)) {}
 
 void FrontendFlowController::update(const FrontendMenuInput& in) {
@@ -15,6 +17,8 @@ void FrontendFlowController::update(const FrontendMenuInput& in) {
     options_->update(in);
   } else if (screen_ == FrontendScreen::Display) {
     display_->update(in);
+  } else if (screen_ == FrontendScreen::Sound) {
+    sound_->update(in);
   } else {
     root_.update(in);
   }
@@ -44,6 +48,11 @@ OptionsAction FrontendFlowController::consumeOptionsAction() {
     enterDisplay();
     return OptionsAction::None;  // consumed by the transition
   }
+  if (options_->pendingAction() == OptionsAction::Sound) {
+    options_->consumeAction();
+    enterSound();
+    return OptionsAction::None;  // consumed by the transition
+  }
   return options_->consumeAction();
 }
 
@@ -57,6 +66,28 @@ DisplayAction FrontendFlowController::consumeDisplayAction() {
     return DisplayAction::None;  // consumed by the transition
   }
   return display_->consumeAction();
+}
+
+SoundAction FrontendFlowController::consumeSoundAction() {
+  if (!sound_ || screen_ != FrontendScreen::Sound) {
+    return SoundAction::None;
+  }
+  if (sound_->pendingAction() == SoundAction::Back) {
+    sound_->consumeAction();
+    returnToOptionsFromSound();
+    return SoundAction::None;  // consumed by the transition
+  }
+  return sound_->consumeAction();
+}
+
+std::vector<SoundAudioEvent> FrontendFlowController::drainAudioEvents() {
+  std::vector<SoundAudioEvent> out = std::move(audioEvents_);
+  audioEvents_.clear();
+  if (sound_) {
+    auto ev = sound_->drainAudioEvents();
+    out.insert(out.end(), ev.begin(), ev.end());
+  }
+  return out;
 }
 
 // FUN_00420cf0 (OBSERVED): mode 0x0b, _DAT_0054bd34 = 8 — plus the
@@ -90,6 +121,8 @@ void FrontendFlowController::returnToRoot() {
       s.skill = skill_;
       s.brightness = brightness_;
       s.forcePCorrect = forcePCorrect_;
+      s.soundFx = soundFx_;
+      s.soundMusic = soundMusic_;
       persistSink_(s);
     }
     settingsDirty_ = false;
@@ -126,6 +159,43 @@ void FrontendFlowController::returnToOptions() {
   options_->setMachineState(display_->machineState());
   options_->setSettingsDirty(display_->settingsDirty());
   display_.reset();
+  screen_ = FrontendScreen::Options;
+}
+
+// FUN_0042322c (OBSERVED, decomp_snd.txt / disasm_42322c.txt):
+// DAT_00541493 = 2; FUN_0041d774 stops the ambient MAINSONG; the
+// MISC\MDKSOUND.SNI blob loads and OPTSONG/OPTBUTT resolve;
+// FUN_00402388(OPTSONG, 0) starts the screen's song;
+// DAT_0054bdb8 = 3. DAT_0054bdbc is NOT written — the sound
+// selection is a process global (BSS 0 on the first entry,
+// retained later). The shared input-machine globals carry over
+// untouched, and the options controller stays alive underneath
+// exactly like the Display entry.
+void FrontendFlowController::enterSound() {
+  sound_.emplace(options_->machineState(), soundSelection_, soundFx_,
+                 soundMusic_, options_->settingsDirty());
+  screen_ = FrontendScreen::Sound;
+}
+
+// FUN_00423280 (OBSERVED, decomp_snd3.txt): DAT_00541493 = 0x0b —
+// the options screen resumes with _DAT_0054bd34 still 1 (the
+// Sound row). FUN_0040210c stops OPTSONG; FUN_00428b34 releases
+// the SNI records; DAT_00541492 == 0 in the front-end, so
+// FUN_0041d720 restarts the ambient MAINSONG. The child's machine
+// state, its selection (the process global DAT_0054bdbc), the
+// volume globals, and the shared dirty flag all carry back; the
+// exit frame's audio events move to the flow queue before the
+// controller dies. NO persist here — FUN_00420d68 handles it on
+// the options exit.
+void FrontendFlowController::returnToOptionsFromSound() {
+  soundSelection_ = sound_->selection();
+  soundFx_ = sound_->soundFx();
+  soundMusic_ = sound_->soundMusic();
+  options_->setMachineState(sound_->machineState());
+  options_->setSettingsDirty(sound_->settingsDirty());
+  auto ev = sound_->drainAudioEvents();
+  audioEvents_.insert(audioEvents_.end(), ev.begin(), ev.end());
+  sound_.reset();
   screen_ = FrontendScreen::Options;
 }
 

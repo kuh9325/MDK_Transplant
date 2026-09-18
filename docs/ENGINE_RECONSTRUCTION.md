@@ -1682,19 +1682,337 @@ counter (`[0,7]` domain) as `Skill`.
 - No persistence of unproven fields — only the three mapped
   entries serialize.
 
-## Phase 4I candidate directions
+# Phase 4I — Sound options child screen
 
-1. **Sound options screen** — `FUN_0042322c`/`FUN_004233d8`
-   are already mapped (4 rows, volume globals
-   `DAT_00541308`/`0c` ±10 clamp [0,100], settings idx 8/9
-   `SoundFX`/`SoundMusic` defaults 70/100); its blip playback
-   (`OPTSONG`/`OPTBUTT`, `MDKSOUND.SNI`) can stay deferred or
-   become the first audio seam.
-2. **Attract slideshow** — `FUN_0041ef74` + the timeout chain
+Phase 4I reconstructs the second real child screen of the
+options sub-menu: the **Sound** screen entered from options
+row 1. The screen's state machine, volume mutations,
+persistence, and audio-trigger semantics are reconstructed
+from instruction-level evidence; actual DirectSound/CoreAudio
+playback stays deferred — the proven triggers are emitted as
+semantic events through a narrow seam instead.
+
+## Entry transition (`FUN_0042322c`, OBSERVED —
+`disasm_42322c.txt` / `decomp_snd.txt`)
+
+Reached from options row 1 under the LEFT, RIGHT, or activate
+query — all three dispatch tables bind row 1 to the same
+`0x420fdd` block:
+
+- `DAT_00541493 = 2` — sound mode; the mode dispatcher
+  (`FUN_0040103c`, table `0x401010` indexed `mode-1`) routes
+  it to `FUN_004233d8`.
+- `FUN_0041d774` — stops and releases the ambient menu song
+  (MAINSONG handle `DAT_0049aa94`).
+- `FUN_00428828("MISC\MDKSOUND.SNI")` — loads the sound
+  module blob; `OPTSONG → DAT_0054bdc0` and
+  `OPTBUTT → DAT_0054bdc4` resolve inside it via
+  `FUN_00402fe8`.
+- `FUN_00402388(OPTSONG, 0)` — starts the screen's song
+  (EDX=0 = play-if-not-playing).
+- `DAT_0054bdb8 = 3` — item count (two volume rows + Done).
+- `DAT_0054bdbc` **untouched** — the selection is a process
+  global the entry never resets: BSS-zero on the first entry,
+  retained on every later one (unlike the Display child's
+  fixed entry selection).
+- **No reset** of mouse (`DAT_0054b634/38`), tick
+  (`DAT_00541518`), repeat deadlines, button latch, ramp, or
+  timing — the shared globals continue on the child screen.
+- The options screen stays alive underneath: its selection
+  `_DAT_0054bd34` keeps 1.
+
+## Screen state globals
+
+- `DAT_0054bdbc` — selection, 0..2 (process global; retained
+  across entries — `FUN_0042322c` never writes it).
+- `DAT_00541308` — SoundFX volume, int domain [0,100], step
+  10 (settings-table entry 8, `SoundFX`, type 0, factory 70 —
+  mirror `@0x49b0fc`).
+- `DAT_0054130c` — SoundMusic volume, same domain/step (entry
+  9, `SoundMusic`, factory 100 — mirror `@0x49b100`).
+- `DAT_00541486` — the shared settings-dirty flag.
+- `DAT_0054bdc0`/`DAT_0054bdc4` — the resolved OPTSONG /
+  OPTBUTT sound handles (entry-resident; released on exit).
+- `DAT_00541538` — delegation flag checked at frame top
+  (`cmp !=0 → write 0` then continue the normal flow);
+  OBSERVED dead in BUILD_A — no nonzero writer exists
+  (`xref_4i_b.txt`), not modeled.
+
+## Frame handler (`FUN_004233d8`, OBSERVED —
+`disasm_4233d8.txt` / `show_4233d8.txt`)
+
+Same prologue and the same query helpers in the same order as
+the options screen, with ONE asymmetry: **every fired
+repeat/activate query plays `OPTBUTT` first**
+(`FUN_00402388(DAT_0054bdc4, 1)` — restart) — except Esc,
+which is a raw key check that jumps straight to the exit.
+
+1. `FUN_004187e0` mouse accumulate + `DAT_00541518 +=
+   DAT_0049b6e8`.
+2. `DAT_00541538` check — `!=0 → write 0` and continue (dead
+   in BUILD_A).
+3. prev query (`FUN_004237b4`): OPTBUTT, `sel -= 1`, wraps
+   `<0 → DAT_0054bdb8-1` (= 2).
+4. next query (`FUN_00423838`): OPTBUTT, `sel += 1`, wraps
+   `>=3 → 0`.
+5. Mouse hit-test gate (the three-global check, clamp to
+   `(590,350)` inside): `band = trunc((mouseY - 61) / 46)` —
+   x86 IDIV truncation (y in [15,60] truncates to band 0 —
+   reproduced); valid bands 0–2 assign unconditionally.
+6. `DAT_0054b570` Esc raw level → `FUN_00423280` + RET — the
+   ONLY exit path with **no OPTBUTT**; the frame ends before
+   the draw block.
+7. LEFT query (`FUN_004238bc`): OPTBUTT, then row 0 →
+   `SoundFX -= 10`, row 1 → `SoundMusic -= 10`, both clamp
+   `<0 → 0` (the clamp writes the provably-0 Esc state ESI —
+   reproduced as 0); row 2 → `jnz` skips the block. A
+   mutation latches `DAT_00541486` then calls
+   `FUN_004024c4` (push scaled volumes to live voices) —
+   **even when the clamp kept the boundary value**.
+   Falls through to the RIGHT query.
+8. RIGHT query (`FUN_00423940`): OPTBUTT, same rows `+10`
+   clamping `>100 → 100`. Falls through to activate.
+9. Activate query (`FUN_00423764`): OPTBUTT **before** the row
+   check; `sel==0 → draw`, `sel!=1 → FUN_00423280 + RET` —
+   rows 0/1 fall through with no mutation, row 2 exits.
+10. Draw block (below), `FUN_0046c86c` present, then
+    `FUN_0042fe78` timing update.
+
+## Draw block (OBSERVED — `show_sndhelpers.txt` /
+`show_sndhelpers2.txt` / `dump_sndstrings.txt`)
+
+1. `FUN_00415658` → zero-fill `clear(0)` — no backdrop.
+2. `FUN_00414d2c(SND_TITL, y=31)` and `(SND_INFO, y=350)` —
+   centered on 600: FONTBIG while the measure stays < 600,
+   else the FONTSML centered path `FUN_00414f1c` (advance 4).
+   BUILD_A texts: `"Sound Settings"` /
+   `"Left/Right to Change Volumes"`.
+3. `FUN_004232b0` per volume row `i` at `rowY = 87 + 46*i`:
+   - label via `FUN_00423b10` — ramp key `(4, rowY)`, FONTBIG
+     scaled (`FUN_00414f64`) left-aligned at x=4 (the ramp
+     key x IS the pen x);
+   - bar via `FUN_00416aa8` **inclusive** rectfill —
+     `x = 210 .. 210+trunc(vol*280/100)`,
+     `y = rowY-12 .. rowY-1`, color index 4 (at vol=0 a
+     single 1px column still draws);
+   - `"100%"` (`SND_100`) FONTSML at x=498 and `"0%"` (`SND_0`)
+     at x=175, both at `y=rowY` via `FUN_00414dd4` (missing
+     advance 4).
+4. `FUN_00423384` row 2 — `SND_DONE` (`"Done"`) centered at
+   y=179 via `FUN_00423b88` (ramp key `(-1,179)` — the
+   options-row helper).
+5. `ARROW` at the raw logical mouse (`FUN_004236c0`).
+
+`SND_SET` (`"Setup Device"`) exists in `MDKFONT.FTI` but is
+never resolved by the proven frame — vestigial, not loaded.
+
+## Palette contract (OBSERVED)
+
+- The screen performs **no palette upload of its own** — no
+  palette work in the entry, frame handler, or exit beyond
+  the ambient inherits. The bound palette is the options
+  screen's composition (SYS_PAL head `DAT_00540820` entries
+  0–63 + zeroed tail), which the port rebinds per frame.
+- The `FUN_0046d208` staging lift (`min(c + level*16, 255)`,
+  `level = DAT_0054147e`) therefore applies on this screen
+  exactly like the others — uniformly, index 0 included. The
+  interactive selftest confirms it: with brightness left at
+  2 by the Display leg, the Sound frame's palette digest
+  shifts `08e372297e745a06 → 75a1d38a3e02b12e` (the lifted
+  composition, dark-gray clear included).
+
+## Mutations (OBSERVED)
+
+| row | label | LEFT | RIGHT | activate |
+|---|---|---|---|---|
+| 0 | `SND_FX` + bar | SoundFX −10, clamp <0→0 | +10, clamp >100→100 | no-op (falls to draw) |
+| 1 | `SND_MUSI` + bar | SoundMusic −10, clamp <0→0 | +10, clamp >100→100 | no-op (falls to draw) |
+| 2 | `SND_DONE` | no-op | no-op | `FUN_00423280` + RET |
+
+Every volume mutation latches `DAT_00541486` and calls
+`FUN_004024c4` — including clamp-boundary mutations. Every
+fired repeat/activate query plays OPTBUTT first; Esc exits
+silently. LEFT/RIGHT never end the frame; Esc and row-2
+activate RET before draw+timing.
+
+## Audio triggers (OBSERVED — modeled semantically)
+
+- `FUN_0041d774` at entry — stop+release the ambient
+  MAINSONG (`DAT_0049aa94`; the root/front-end entry started
+  it via `FUN_0041d720`).
+- `FUN_00402388(OPTSONG, 0)` at entry — start the screen's
+  song (play-if-not-playing).
+- `FUN_00402388(OPTBUTT, 1)` on every fired repeat/activate
+  query — restart blip. NOT on Esc.
+- `FUN_004024c4` after every volume mutation — pushes the
+  scaled volumes to live voices; `FUN_0040202c` routes the
+  scale by voice flag bit `0x2` (music channel) — OPTSONG is
+  the only music-flagged record in `MDKSOUND.SNI` (flags
+  `0x0003`; `OPTBUTT` is `0x0000`).
+- `FUN_0040210c(OPTSONG)` + `FUN_00428b34` (release SNI) +
+  `FUN_0041d720` (restart MAINSONG — `DAT_00541492 == 0` in
+  the front-end) at exit.
+
+`MDKSOUND.SNI` holds exactly three records — `OPTBUTT`
+(flags `0x0000`), `SNDTEST`, `OPTSONG` (`0x0003`) — verified
+through the existing SNI directory parser (structural parse
+only; no PCM decode in this phase).
+
+## Exit transition (`FUN_00423280`, OBSERVED —
+`decomp_snd3.txt`)
+
+- `DAT_00541493 = 0x0b` — back to the options handler.
+- `FUN_0040210c` stops OPTSONG; `FUN_00428b34` releases the
+  SNI module's records; `FUN_0041d720` restarts the ambient
+  MAINSONG (`DAT_00541492 == 0` in the front-end — the
+  game-in-progress gate never fires here).
+- `_DAT_0054bd34` untouched → options resumes at selection 1.
+- `DAT_0054bdbc`, the machine state, the volume globals, and
+  the shared dirty flag all carry back; **no persist here** —
+  the eventual `FUN_00420d68` options exit persists the dirty
+  flag exactly like Phases 4G/4H.
+
+## Settings-table mapping (OBSERVED — `dump_set4i.txt`)
+
+9-byte `{name*, type u8, value*}` records at
+`0x49acf0`/`0x49acf9`:
+
+| idx | key | type | global | factory (mirror) |
+|---|---|---|---|---|
+| 8 | `SoundFX` | int | `DAT_00541308` | 70 `@0x49b0fc` |
+| 9 | `SoundMusic` | int | `DAT_0054130c` | 100 `@0x49b100` |
+
+`FrontendSettings` gains `soundFx`/`soundMusic` alongside the
+4G/4H fields — same serializer/parser contract, with the
+emission order now the proven table order **SoundFX (8) →
+SoundMusic (9) → Skill (88) → Brightness (89) → ForcePCorrect
+(90)** — the sound lines precede Skill in a dirty file. Each
+int gets the native `[0,100]` hardening counter
+(`ignoredSoundFxLines`/`ignoredSoundMusicLines`).
+
+## Native port decisions (NATIVE PORT)
+
+- `SoundMenuController` (`core/sound_menu.h`) mirrors
+  `FUN_004233d8`: constructor takes the process-global
+  selection (caller-owned `DAT_0054bdbc`), the two volumes,
+  and the carried dirty flag; `update()` runs the proven
+  query order; `itemScale(keyX,keyY)` is the shared ramp
+  keyed `(4,y)` per volume row and `(-1,179)` for Done;
+  `frameEndedEarly()` marks the Esc/row-2 RET paths.
+- `SoundAudioEvent` is the narrow semantic seam for the
+  proven audio triggers — `AmbientSongStop`, `SongStart`,
+  `Button`, `VolumesApplied`, `SongStop`, `AmbientSongStart`
+  — queued in original call order and drained through the
+  flow (`drainAudioEvents`), so the exit frame's
+  `SongStop`/`AmbientSongStart` survive the controller's
+  destruction. **No DirectSound/CoreAudio backend is
+  initialized — actual playback stays deferred.**
+- The flow owns `soundFx_`/`soundMusic_`/`soundSelection_` as
+  process globals (seeded from `--settings-file` like
+  `skill_`); the child borrows them on `FUN_0042322c` and
+  writes them back on `FUN_00423280`.
+- `FrontendScreen::Sound` joins the flow; the options row-1
+  action is consumed by `enterSound()`, `SoundAction::Back`
+  by `returnToOptionsFromSound()`.
+- `MDKSOUND.SNI` is verified structurally at load (directory
+  parses; `OPTSONG`/`OPTBUTT` records present) — the resolve
+  contract is real even though no payload is decoded.
+- `DAT_00541538` NOT modeled — dead in BUILD_A.
+
+## CLI + deterministic validation
+
+- `--preview-sound-submenu` (needs `--data-path`): composes
+  the entry-state static frame — `DAT_0054bdbc=0` (BSS-zero),
+  factory volumes 70/100, ARROW at the carried mouse — and
+  logs fb/palette digests.
+- `--interactive-frontend`: the options row-1 action now
+  enters the real child; Esc or Done-activate returns to
+  options at selection 1; the sound screen's frame is skipped
+  (not drawn) on both the entry-dispatch and exit-dispatch
+  frames exactly like the original's RET.
+- The injected selftest extends to frames 25–35: options
+  band-1 motion → Enter (`FUN_0042322c`, entry sel 0 —
+  BSS-zero) → RIGHT (SoundFX 70→80) → DOWN (sel 1) → LEFT
+  (SoundMusic 100→90) → DOWN (sel 2) → Enter (`FUN_00423280`
+  → options resumes sel 1) → Esc (`FUN_00420d68` → persist
+  #3 writes all five settings) → Enter (entry 5 proves
+  process-lifetime retention) → Esc (clean exit). Default
+  selftest frames: 36.
+- The semantic audio events are logged per frame and the
+  verdict compares the whole sequence against the proven
+  order — playback is NOT part of PASS criteria.
+
+## Digests and verification
+
+- Static sound preview (sel 0, fx 70, mus 100, brightness 0):
+  fb `68c0552907eb4fe1`, palette `08e372297e745a06` — the
+  inherited options composition (SYS_PAL head + zeroed tail,
+  lift 0). `/tmp/mdk-phase4i-sound.ppm` — agent-inspected:
+  centered "Sound Settings" title, "Effects" at 1.0 with a
+  196px bar (x 210–406), "Music" at 0.65 with a full 281px
+  bar, centered "Done", "Left/Right to Change Volumes"
+  footer, ARROW.
+- Dynamic child snapshot (script frame 31 — sel 2, fx 80,
+  mus 90, brightness 2): fb `4d5c0eed048e0532`, palette
+  `75a1d38a3e02b12e`. `/tmp/mdk-phase4i-dynamic.ppm` —
+  agent-inspected: bars at 224px (80%) / 252px (90%), "Done"
+  selected at 1.0, the whole palette lifted (background
+  included — the same index-0 lift parity as Display).
+- Semantic event sequence over the script's sound leg
+  (verified by the selftest verdict): `AmbientSongStop` →
+  `SongStart(OPTSONG)` → `Button` → `VolumesApplied` →
+  `Button` → `Button` → `VolumesApplied` → `Button` →
+  `Button` → `SongStop(OPTSONG)` → `AmbientSongStart
+  (MAINSONG)` — 11 events in exact original call order.
+- Four-screen selftest end state: `PASS` — entries=5 (skills
+  1,2,2,2,2), exit-dirty 1,1,0,1,0, persists=3 (final file
+  holds `SoundFX = 80`, `SoundMusic = 90`, `Skill = 2`,
+  `Brightness = 2`, `ForcePCorrect = TRUE` in table order),
+  sound-entry sel 0 → options resume sel 1, sound frames
+  drawn 4 (dispatch frames draw nothing, matching the
+  original's RET).
+- Rebaselined: none — every Phase 4A–4H digest is preserved
+  exactly (MDKOPT `6017f4c4bd57c479`, root static
+  `debd84b7f6e158dc`, root palette `6a3cbda3822c5525`,
+  root-only interactive `cf09ecdad5b0808f`, static options
+  `0183fdb78c53a700`, options palette `08e372297e745a06`,
+  Easy/Normal/Hard row-6 frames `780cfeb3a26c7390`/
+  `01e229facdededd1`/`11ec77782b5ce37c`, static display
+  `e8c31e4839c0e1d4`/`64ce160e2384e256`, dynamic display
+  `5bfe84dc4fc7a023`/`514f0c9fb5abcb26` — the last two
+  re-confirmed inside the extended selftest's display leg).
+
+## Explicit non-goals (Phase 4I)
+
+- No actual audio playback — no DirectSound emulation, no
+  CoreAudio backend, no PCM decode. The `SND_PUSH`-family
+  audio engine remains deferred; the semantic events are the
+  complete Phase 4I contract.
+- No `DAT_00541538` delegated path — OBSERVED dead in
+  BUILD_A (no nonzero writer); documented, not implemented.
+- No `SND_SET` ("Setup Device") — the record exists but is
+  never resolved by the proven frame.
+- No persistence of unproven fields — only the five mapped
+  entries serialize.
+- No new asset formats — `SND_*` are existing FTI string
+  records; `MDKSOUND.SNI` parses through the proven SNI
+  directory code (structure verified, payload undecoded).
+
+## Phase 4J candidate directions
+
+1. **Attract slideshow** — `FUN_0041ef74` + the timeout chain
    (30/5/4/2 s thresholds on `DAT_0049aaa4`).
-3. **Frontend sound** — `SND_PUSH` (`FUN_00423734`) fires on
-   every repeat/activate edge; records pending.
-4. **More settings-table entries** — 89 remain unmapped; all
+2. **Frontend sound playback** — the `FUN_00402388`/
+   `FUN_0040210c`/`FUN_004024c4` family is now mapped
+   semantically; an actual backend would decode the
+   RIFF/WAVE payloads already proven inside `MDKSOUND.SNI`
+   records (flags bit `0x2` = music channel for the
+   `FUN_0040202c` volume split).
+3. **Frontend sound events on other screens** —
+   `SND_PUSH` (`FUN_00423734`) fires on every
+   repeat/activate edge on the root/options screens too;
+   records pending.
+4. **More settings-table entries** — 87 remain unmapped; all
    `name`/type/pointer triples dumped at `0x49aca8`, each
    needs its own semantics proven before joining
    `FrontendSettings`.

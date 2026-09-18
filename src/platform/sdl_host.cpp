@@ -180,7 +180,7 @@ void SdlHost::isolateHardwareInputForSelftest() {
 
 void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
                                        bool rootOnly) {
-  const std::uint64_t lastStep = rootOnly ? 3 : 24;
+  const std::uint64_t lastStep = rootOnly ? 3 : 35;
   if (!window_ || frameIndex > lastStep) {
     return;
   }
@@ -309,6 +309,50 @@ void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
     break;
   case 24: // ESC tap: options Back -> root; dirty was cleared by
           // persist #2, no mutation since -> no persist call.
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  // ---- Phase 4I sound leg (frames 25..35) ----
+  case 25: // Enter tap: root sel 3 -> options entry 4 (mouse
+          // 300,89 -> options sel 8).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 26: // Arrow y=89 -> 90: options band 1 — the Sound row
+          // (trunc((90-23)/36) = 1).
+    motion(1.0f);
+    break;
+  case 27: // Enter tap: activate row 1 -> FUN_0042322c -> sound
+          // child entered (entry sel 0 — DAT_0054bdbc is BSS-zero;
+          // MAINSONG stops, OPTSONG starts — semantic events).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 28: // RIGHT tap: row 0 -> SoundFX +10 (70 -> 80), dirty —
+          // OPTBUTT + volume-apply events.
+    keyTap(SDL_SCANCODE_RIGHT, SDLK_RIGHT);
+    break;
+  case 29: // DOWN tap: selection 0 -> 1 (OPTBUTT).
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+    break;
+  case 30: // LEFT tap: row 1 -> SoundMusic -10 (100 -> 90), dirty.
+    keyTap(SDL_SCANCODE_LEFT, SDLK_LEFT);
+    break;
+  case 31: // DOWN tap: selection 1 -> 2 (the Done row).
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+    break;
+  case 32: // Enter tap: activate row 2 -> OPTBUTT then
+          // FUN_00423280 (OPTSONG stops, MAINSONG restarts) ->
+          // options resumes with selection 1.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 33: // ESC tap: options Back -> FUN_00420d68 -> dirty persist
+          // fires (persist #3: all five settings).
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 34: // Enter tap: root sel 3 -> options entry 5 — proves the
+          // five-tuple survives process-lifetime.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 35: // ESC tap: options Back -> root; dirty cleared by
+          // persist #3 -> no persist call.
     keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   default:

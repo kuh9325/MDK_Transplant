@@ -19,6 +19,8 @@
 #include "core/log.h"
 #include "core/mode_dispatch.h"
 #include "core/options_menu.h"
+#include "core/sni_directory.h"
+#include "core/sound_menu.h"
 #include "core/stream_context.h"
 #include "input/input_state.h"
 #include "platform/sdl_host.h"
@@ -27,6 +29,7 @@
 #include <SDL3/SDL_mouse.h>    // SDL_BUTTON_* for the button nibble map
 #include <SDL3/SDL_scancode.h> // SDL_SCANCODE_* key translation
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -360,6 +363,7 @@ static bool loadSpritePreview(DataRoot& root, const std::string& relFile,
 struct FrontendResources {
   IndexedImage backdrop;            // MISC/OPTIONS.BNI record MDKOPT
   FtiFont fontBig;                  // MISC/MDKFONT.FTI record FONTBIG
+  FtiFont fontSml;                  // record FONTSML (sound end labels)
   FtiSprite arrow;                  // record ARROW (frame 0 used)
   std::vector<std::string> optStrings;  // OPT0..OPT4 C strings
   // Phase 4F options sub-menu (FUN_00420eac): the OM_* row labels
@@ -374,6 +378,17 @@ struct FrontendResources {
   std::string dspDetailHigh;             // DSP_DETH
   std::string dspDetailLow;              // DSP_DETL
   std::string dspQuit;                   // DSP_QUIT
+  // Phase 4I sound child (FUN_004233d8): the SND_* records — same
+  // NUL-terminated string shape. SND_SET ("Setup Device") exists in
+  // the FTI but is never resolved by the proven frame (vestigial —
+  // not loaded).
+  std::string sndTitle;                  // SND_TITL
+  std::string sndInfo;                   // SND_INFO
+  std::string sndEffects;                // SND_FX
+  std::string sndMusic;                  // SND_MUSI
+  std::string sndDone;                   // SND_DONE
+  std::string sndEnd100;                 // SND_100
+  std::string sndEnd0;                   // SND_0
   std::array<std::byte, 192> sysPalHead{};  // SYS_PAL record head
   bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
 };
@@ -456,6 +471,16 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
     *err = "front-end: ARROW has no frame 0";
     return false;
   }
+  // Phase 4I: the sound screen's volume endpoint labels ("0%"/"100%")
+  // are FONTSML (FUN_00414dd4) and its title/info rows fall back to
+  // FONTSML when the FONTBIG measure reaches 600 (FUN_00414d2c ->
+  // FUN_00414f1c).
+  if (!ftiPayload("FONTSML", rec, payload)) return false;
+  const auto fontSml = decodeFtiFont(payload, &derr);
+  if (!fontSml) {
+    *err = "front-end: FONTSML decode — " + derr;
+    return false;
+  }
 
   // OPTi payloads are the NUL-terminated label strings themselves
   // (OBSERVED — the records ARE C strings drawn verbatim).
@@ -515,6 +540,19 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
     return false;
   }
 
+  // Phase 4I: SND_* records — same NUL-terminated string shape.
+  // Only the seven records the proven frame resolves; SND_SET stays
+  // unloaded (never referenced by FUN_004233d8's draw block).
+  if (!loadCStr(kSoundTitleRecord, res.sndTitle) ||
+      !loadCStr(kSoundInfoRecord, res.sndInfo) ||
+      !loadCStr(kSoundFxRecord, res.sndEffects) ||
+      !loadCStr(kSoundMusicRecord, res.sndMusic) ||
+      !loadCStr(kSoundDoneRecord, res.sndDone) ||
+      !loadCStr(kSoundEnd100Record, res.sndEnd100) ||
+      !loadCStr(kSoundEnd0Record, res.sndEnd0)) {
+    return false;
+  }
+
   // SYS_PAL head — the resident system palette whose head fills
   // DAT_00540820[0:192]; the options screen uploads that buffer
   // (FUN_0046d208) on entry.
@@ -525,6 +563,40 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
   }
   std::memcpy(res.sysPalHead.data(),
               fti->data() + palRec->payloadFileOffset, 192);
+
+  // Phase 4I: the sound entry (FUN_0042322c) loads MISC\MDKSOUND.SNI
+  // via FUN_00428828 and resolves OPTSONG/OPTBUTT inside it
+  // (FUN_00402fe8). The port models the audio triggers semantically
+  // — no payload decode — but the resolve contract is real: the
+  // directory must parse and both records must be present.
+  const auto sni =
+      root.readFile(kSoundSniFile, kPreviewMaxBytes, err);
+  if (!sni) {
+    *err = "front-end: cannot read MISC/MDKSOUND.SNI — " + *err;
+    return false;
+  }
+  const auto sdir = inspectSniDirectory(
+      std::span<const std::byte>(sni->data(), sni->size()));
+  if (sdir.status != SniDirectoryStatus::kOk) {
+    *err = "front-end: MDKSOUND.SNI directory — " +
+           std::string(sniDirectoryStatusName(sdir.status)) + " — " +
+           sdir.detail;
+    return false;
+  }
+  auto sniRecord = [&](const char* name) {
+    for (const auto& e : sdir.entries) {
+      if (e.name() == name) return true;
+    }
+    return false;
+  };
+  if (!sniRecord(kSoundSongRecord)) {
+    *err = "front-end: record OPTSONG not found in MDKSOUND.SNI";
+    return false;
+  }
+  if (!sniRecord(kSoundButtonRecord)) {
+    *err = "front-end: record OPTBUTT not found in MDKSOUND.SNI";
+    return false;
+  }
 
   // FUN_00428290 checks the SAVES directory for <name>.SAV files;
   // BUILD_A has 1.SAV + 2.SAV -> the five-item "Continue" menu.
@@ -544,6 +616,7 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
 
   res.backdrop = std::move(*backdrop);
   res.fontBig = std::move(*fontBig);
+  res.fontSml = std::move(*fontSml);
   res.arrow = std::move(*arrow);
   res.optStrings = std::move(optStrings);
   res.savesExist = savesExist;
@@ -694,6 +767,53 @@ static bool loadDisplaySubmenuPreview(DataRoot& root,
   return true;
 }
 
+// Phase 4I sound child preview: compose the proven static
+// FUN_004233d8 entry frame — cleared framebuffer + SND_TITL/SND_INFO
+// centered rows + the two volume rows (left-aligned scaled labels,
+// inclusive bars at the factory volumes 70/100, FONTSML "0%"/"100%"
+// endpoints) + SND_DONE centered + ARROW at the (unchanged) logical
+// mouse position, under the inherited options palette (SYS_PAL head
+// + zeroed tail — the screen uploads no palette of its own).
+// First-entry selection 0 — DAT_0054bdbc is BSS-zeroed and never
+// written at entry. Fills `err` -> false on failure.
+static bool loadSoundSubmenuPreview(DataRoot& root,
+                                    IndexedFramebuffer& fb,
+                                    Palette& palette,
+                                    std::string* err) {
+  FrontendResources res;
+  if (!loadFrontendResources(root, res, err)) {
+    return false;
+  }
+  const SoundMenuSpec spec;  // canonical entry state
+  const SoundMenuLabels labels{res.sndTitle, res.sndInfo,
+                               res.sndEffects, res.sndMusic,
+                               res.sndEnd100, res.sndEnd0,
+                               res.sndDone};
+  std::string derr;
+  if (!renderSoundMenuFrame(fb, palette, res.fontBig, res.fontSml,
+                            *res.arrow.frame(0), labels,
+                            res.sysPalHead, spec, &derr)) {
+    *err = "sound sub-menu preview: compose — " + derr;
+    return false;
+  }
+
+  const std::uint64_t fbDigest = digestIndexedFb(fb);
+  const std::uint64_t palDigest = digestPalette(palette);
+  log::info(kTag,
+            "sound sub-menu preview: SND_* %dx%d sel=%d fx=%d mus=%d "
+            "| FONTBIG digest=%016llx | FONTSML digest=%016llx | "
+            "ARROW digest=%016llx | composed fb=%016llx "
+            "palette=%016llx",
+            fb.width(), fb.height(), spec.selection, spec.soundFx,
+            spec.soundMusic,
+            static_cast<unsigned long long>(ftiFontDigest(res.fontBig)),
+            static_cast<unsigned long long>(ftiFontDigest(res.fontSml)),
+            static_cast<unsigned long long>(ftiSpriteDigest(res.arrow)),
+            static_cast<unsigned long long>(fbDigest),
+            static_cast<unsigned long long>(palDigest));
+  return true;
+}
+
 // Phase 4E — translate the platform InputState into the controller's
 // semantic per-frame input. Original reference points:
 //   prevHeld/nextHeld : DIK_UP/DIK_DOWN with the original keymap's
@@ -770,6 +890,28 @@ static const char* displayActionName(DisplayAction a) {
   }
 }
 
+static const char* soundActionName(SoundAction a) {
+  switch (a) {
+  case SoundAction::Back: return "Back";
+  default: return "None";
+  }
+}
+
+// Phase 4I semantic audio events — logged for observability; no
+// audio backend consumes them (DirectSound playback deferred).
+static const char* soundAudioEventName(SoundAudioEvent e) {
+  switch (e) {
+  case SoundAudioEvent::AmbientSongStop: return "AmbientSongStop";
+  case SoundAudioEvent::SongStart: return "SongStart(OPTSONG)";
+  case SoundAudioEvent::Button: return "Button(OPTBUTT)";
+  case SoundAudioEvent::VolumesApplied: return "VolumesApplied";
+  case SoundAudioEvent::SongStop: return "SongStop(OPTSONG)";
+  case SoundAudioEvent::AmbientSongStart:
+    return "AmbientSongStart(MAINSONG)";
+  default: return "?";
+  }
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -843,13 +985,30 @@ int Application::run() {
   int settingsPersistedSkill = -1;
   int settingsPersistedBrightness = -1;
   int settingsPersistedForcePCorrect = -1;
+  int settingsPersistedSoundFx = -1;
+  int settingsPersistedSoundMusic = -1;
   int settingsInitialSkill = 1;  // post-config startup value
+  int settingsInitialSoundFx = kSoundFxFactory;      // post-config
+  int settingsInitialSoundMusic = kSoundMusicFactory;//   volumes
+  int settingsInitialBrightness = 0;   // post-config
+  int settingsInitialPcorrect = 0;     //   display settings
   bool displayEntered = false;
   int displayEntrySelection = -1;    // DAT_0054b834 seen at entry
   int optionsResumeSelection = -1;   // _DAT_0054bd34 after FUN_0041d144
   int displayFramesDrawn = 0;
   std::uint64_t displayLastFbDigest = 0;
   std::uint64_t displayLastPalDigest = 0;
+  // Phase 4I sound child observability: entry state (DAT_0054bdbc is
+  // a process global — first entry 0), the options selection on
+  // resume, drawn-frame digests, and the semantic audio events the
+  // proven FUN_00402388/FUN_004024c4/ambient-song triggers emit.
+  bool soundEntered = false;
+  int soundEntrySelection = -1;      // DAT_0054bdbc seen at entry
+  int soundResumeSelection = -1;     // _DAT_0054bd34 after FUN_00423280
+  int soundFramesDrawn = 0;
+  std::uint64_t soundLastFbDigest = 0;
+  std::uint64_t soundLastPalDigest = 0;
+  std::vector<SoundAudioEvent> audioEventLog;
 
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
@@ -861,6 +1020,7 @@ int Application::run() {
                            cfg_.optionsPreview ||
                            cfg_.optionsSubmenuPreview ||
                            cfg_.displaySubmenuPreview ||
+                           cfg_.soundSubmenuPreview ||
                            cfg_.interactiveFrontend;
   if (cfg_.previewFile) {
     if (!dataRoot) {
@@ -934,6 +1094,18 @@ int Application::run() {
                  perr.c_str());
       return 2;
     }
+  } else if (cfg_.soundSubmenuPreview) {
+    if (!dataRoot) {
+      log::error(kTag,
+                 "--preview-sound-submenu requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadSoundSubmenuPreview(*dataRoot, fb, palette, &perr)) {
+      log::error(kTag, "sound sub-menu preview failed: %s",
+                 perr.c_str());
+      return 2;
+    }
   } else if (cfg_.interactiveFrontend) {
     if (!dataRoot) {
       log::error(kTag, "--interactive-frontend requires --data-path");
@@ -965,14 +1137,22 @@ int Application::run() {
         if (loaded) {
           initialSettings = loaded->settings;
           settingsInitialSkill = initialSettings.skill;
+          settingsInitialSoundFx = initialSettings.soundFx;
+          settingsInitialSoundMusic = initialSettings.soundMusic;
+          settingsInitialBrightness = initialSettings.brightness;
+          settingsInitialPcorrect =
+              initialSettings.forcePCorrect ? 1 : 0;
           log::info(kTag,
                     "settings: loaded %s (skill=%d brightness=%d "
-                    "pcorrect=%d ignored=%d,%d)",
+                    "pcorrect=%d fx=%d mus=%d ignored=%d,%d,%d,%d)",
                     cfg_.settingsFile->string().c_str(),
                     initialSettings.skill, initialSettings.brightness,
                     initialSettings.forcePCorrect ? 1 : 0,
+                    initialSettings.soundFx, initialSettings.soundMusic,
                     loaded->ignoredSkillLines,
-                    loaded->ignoredBrightnessLines);
+                    loaded->ignoredBrightnessLines,
+                    loaded->ignoredSoundFxLines,
+                    loaded->ignoredSoundMusicLines);
         } else {
           log::warn(kTag, "settings: %s — %s; factory defaults",
                     cfg_.settingsFile->string().c_str(),
@@ -985,13 +1165,17 @@ int Application::run() {
         settingsPersistedSkill = s.skill;
         settingsPersistedBrightness = s.brightness;
         settingsPersistedForcePCorrect = s.forcePCorrect ? 1 : 0;
+        settingsPersistedSoundFx = s.soundFx;
+        settingsPersistedSoundMusic = s.soundMusic;
         if (!cfg_.settingsFile) {
           // No writable location configured — the FUN_004260ac
           // silent-failure analogue: process-lifetime only.
           log::warn(kTag,
                     "settings persist skipped — no --settings-file "
-                    "(skill=%d brightness=%d pcorrect=%d)", s.skill,
-                    s.brightness, s.forcePCorrect ? 1 : 0);
+                    "(skill=%d brightness=%d pcorrect=%d fx=%d "
+                    "mus=%d)", s.skill,
+                    s.brightness, s.forcePCorrect ? 1 : 0, s.soundFx,
+                    s.soundMusic);
           return false;
         }
         std::string perr;
@@ -1002,9 +1186,10 @@ int Application::run() {
         }
         log::info(kTag,
                   "settings persisted: %s (skill=%d brightness=%d "
-                  "pcorrect=%d)",
+                  "pcorrect=%d fx=%d mus=%d)",
                   cfg_.settingsFile->string().c_str(), s.skill,
-                  s.brightness, s.forcePCorrect ? 1 : 0);
+                  s.brightness, s.forcePCorrect ? 1 : 0, s.soundFx,
+                  s.soundMusic);
         return true;
       };
       frontendFlow.emplace(res.savesExist, initialSettings,
@@ -1061,9 +1246,9 @@ int Application::run() {
       host.injectSelfTestEvents();
     }
     if (cfg_.frames == 0) {
-      // Phase 4H three-screen script: 24 steps (0..23) + one
-      // settled post-return root frame.
-      cfg_.frames = frontendFlow ? 25 : 10;
+      // Phase 4I four-screen script: 36 steps (0..35) — the run
+      // quits right after the last injected step.
+      cfg_.frames = frontendFlow ? 36 : 10;
     }
   }
 
@@ -1101,6 +1286,8 @@ int Application::run() {
         endedEarly =
             frontendFlow->screen() == FrontendScreen::Display
                 ? frontendFlow->display().frameEndedEarly()
+            : frontendFlow->screen() == FrontendScreen::Sound
+                ? frontendFlow->sound().frameEndedEarly()
             : frontendFlow->inOptions()
                 ? frontendFlow->options().frameEndedEarly()
                 : frontendFlow->root().frameEndedEarly();
@@ -1124,6 +1311,22 @@ int Application::run() {
               fb, palette, frontendRes->fontBig,
               *frontendRes->arrow.frame(0), labels,
               frontendRes->sysPalHead, frontendFlow->display(), &rerr);
+        } else if (frontendFlow &&
+                   frontendFlow->screen() == FrontendScreen::Sound) {
+          // Phase 4I sound frame: cleared buffer + centered
+          // SND_TITL/SND_INFO + volume rows (scaled labels, inclusive
+          // bars, FONTSML endpoints) + SND_DONE + ARROW under the
+          // inherited options palette (FUN_004233d8 draw block).
+          const SoundMenuLabels labels{
+              frontendRes->sndTitle, frontendRes->sndInfo,
+              frontendRes->sndEffects, frontendRes->sndMusic,
+              frontendRes->sndEnd100, frontendRes->sndEnd0,
+              frontendRes->sndDone};
+          rok = renderSoundMenuDynamic(
+              fb, palette, frontendRes->fontBig, frontendRes->fontSml,
+              *frontendRes->arrow.frame(0), labels,
+              frontendRes->sysPalHead, frontendFlow->sound(),
+              frontendFlow->brightness(), &rerr);
         } else if (frontendFlow && frontendFlow->inOptions()) {
           // Phase 4F options frame: cleared buffer + OM_* labels +
           // ARROW under the system palette (FUN_00420eac draw block).
@@ -1161,6 +1364,13 @@ int Application::run() {
           displayLastPalDigest = digestPalette(palette);
           ++displayFramesDrawn;
         }
+        if (cfg_.selftest && frontendFlow &&
+            frontendFlow->screen() == FrontendScreen::Sound) {
+          // Same for the sound child — the post-mutation snapshot.
+          soundLastFbDigest = digestIndexedFb(fb);
+          soundLastPalDigest = digestPalette(palette);
+          ++soundFramesDrawn;
+        }
         // FUN_0042fe78/FUN_0042fb68 timing update — the tail of the
         // drawn frame only. --selftest feeds the original's paced
         // regime (100/3 ms per frame — rawDelta 4, step 1) so the
@@ -1173,10 +1383,24 @@ int Application::run() {
         } else if (frontendFlow->screen() ==
                    FrontendScreen::Display) {
           frontendFlow->display().endFrame(frontDtMs);
+        } else if (frontendFlow->screen() == FrontendScreen::Sound) {
+          frontendFlow->sound().endFrame(frontDtMs);
         } else if (frontendFlow->inOptions()) {
           frontendFlow->options().endFrame(frontDtMs);
         } else {
           frontendFlow->root().endFrame(frontDtMs);
+        }
+      }
+      // Phase 4I semantic audio drain — the sound child's proven
+      // triggers (OPTSONG/OPTBUTT/volume-apply/ambient song) land on
+      // the flow queue; logged for observability, no audio backend
+      // consumes them in this phase.
+      if (frontendFlow) {
+        for (const SoundAudioEvent ev :
+             frontendFlow->drainAudioEvents()) {
+          audioEventLog.push_back(ev);
+          log::info(kTag, "sound audio event: %s",
+                    soundAudioEventName(ev));
         }
       }
       if (frontendCtl) {
@@ -1210,6 +1434,29 @@ int Application::run() {
                     frontendFlow->options().mouseY(),
                     frontendFlow->options().settingsDirty() ? 1 : 0);
         }
+      } else if (frontendFlow->screen() == FrontendScreen::Sound) {
+        const SoundAction a = frontendFlow->consumeSoundAction();
+        if (a != SoundAction::None) {
+          log::info(kTag, "sound action: %s (sel=%d mouse=%d,%d)",
+                    soundActionName(a),
+                    frontendFlow->sound().selection(),
+                    frontendFlow->sound().mouseX(),
+                    frontendFlow->sound().mouseY());
+        }
+        if (frontendFlow->screen() == FrontendScreen::Options) {
+          // Back/Esc/row-2 consumed -> FUN_00423280 -> options
+          // resumed at the Sound row (sel 1).
+          soundResumeSelection = frontendFlow->options().selection();
+          log::info(kTag,
+                    "front-end flow: sound -> options (resume "
+                    "sel=%d mouse=%d,%d dirty=%d fx=%d mus=%d)",
+                    soundResumeSelection,
+                    frontendFlow->options().mouseX(),
+                    frontendFlow->options().mouseY(),
+                    frontendFlow->options().settingsDirty() ? 1 : 0,
+                    frontendFlow->soundFx(),
+                    frontendFlow->soundMusic());
+        }
       } else if (frontendFlow->inOptions()) {
         // Record the dirty flag consumed by FUN_00420d68 before the
         // transition eats it — the persist gate for this exit.
@@ -1239,6 +1486,21 @@ int Application::run() {
                     frontendFlow->display().mouseY(),
                     frontendFlow->display().brightness(),
                     frontendFlow->display().forcePCorrect() ? 1 : 0);
+        } else if (frontendFlow->screen() == FrontendScreen::Sound) {
+          // Sound consumed -> FUN_0042322c -> child entered.
+          // DAT_0054bdbc is a process global — first entry 0, later
+          // entries resume it (FUN_0042322c never writes it).
+          soundEntered = true;
+          soundEntrySelection = frontendFlow->sound().selection();
+          log::info(kTag,
+                    "front-end flow: options -> sound (entry "
+                    "sel=%d mouse=%d,%d fx=%d mus=%d dirty=%d)",
+                    soundEntrySelection,
+                    frontendFlow->sound().mouseX(),
+                    frontendFlow->sound().mouseY(),
+                    frontendFlow->sound().soundFx(),
+                    frontendFlow->sound().soundMusic(),
+                    frontendFlow->sound().settingsDirty() ? 1 : 0);
         } else if (frontendFlow->screen() == FrontendScreen::Root) {
           // Back/Esc consumed -> FUN_00420d68 -> root restored.
           frontendReturnedToRoot = true;
@@ -1301,20 +1563,26 @@ int Application::run() {
     const bool inDisp =
         frontendFlow &&
         frontendFlow->screen() == FrontendScreen::Display;
+    const bool inSnd =
+        frontendFlow &&
+        frontendFlow->screen() == FrontendScreen::Sound;
     log::info(kTag,
               "interactive front-end last frame: fb=%016llx "
               "palette=%016llx screen=%s sel=%d skill=%d "
               "brightness=%d rampAcc=%.2f",
               static_cast<unsigned long long>(digestIndexedFb(fb)),
               static_cast<unsigned long long>(digestPalette(palette)),
-              inDisp ? "display" : inOpts ? "options" : "root",
+              inDisp ? "display" : inSnd ? "sound"
+                     : inOpts ? "options" : "root",
               inDisp ? frontendFlow->display().selection()
+              : inSnd ? frontendFlow->sound().selection()
               : inOpts ? frontendFlow->options().selection()
                      : (frontendCtl ? frontendCtl->selection()
                                     : frontendFlow->root().selection()),
               inOpts ? frontendFlow->options().skill() : -1,
               frontendFlow ? frontendFlow->brightness() : 0,
               inDisp ? frontendFlow->display().rampAccumulator()
+              : inSnd ? frontendFlow->sound().rampAccumulator()
               : inOpts ? frontendFlow->options().rampAccumulator()
                      : (frontendCtl
                             ? frontendCtl->rampAccumulator()
@@ -1339,7 +1607,7 @@ int Application::run() {
               frontendActionName(frontendLastAction));
   }
   if (cfg_.selftest && frontendFlow) {
-    // Phase 4H three-screen + persistence script:
+    // Phase 4I four-screen + persistence script:
     //   root nav -> options entry (sel 8) -> skill band -> RIGHT ->
     //   Enter -> LEFT -> LEFT -> RIGHT -> Esc (persist #1: Skill
     //   only) -> Enter (re-entry; skill retained process-lifetime)
@@ -1350,7 +1618,13 @@ int Application::run() {
     //   options resumes sel 7) -> Esc (FUN_00420d68 -> persist #2:
     //   Skill + Brightness + ForcePCorrect) -> Enter (entry 3 — the
     //   triple survives process-lifetime) -> Esc (clean exit, no
-    //   persist) -> settled root frame.
+    //   persist) -> Enter (entry 4) -> motion to the Sound row ->
+    //   Enter (FUN_0042322c, entry sel 0 — DAT_0054bdbc is BSS-zero)
+    //   -> RIGHT (SoundFX +10) -> DOWN (sel 1) -> LEFT (SoundMusic
+    //   -10) -> DOWN (sel 2) -> Enter (FUN_00423280 -> options
+    //   resumes sel 1) -> Esc (FUN_00420d68 -> persist #3: all five
+    //   settings) -> Enter (entry 5) -> Esc (clean exit) -> settled
+    //   root frame.
     auto wrapUp = [](int s) { return s >= 2 ? 0 : s + 1; };
     auto wrapDn = [](int s) { return s <= 0 ? 2 : s - 1; };
     int expected = settingsInitialSkill;
@@ -1359,31 +1633,66 @@ int Application::run() {
     expected = wrapDn(expected);   // LEFT
     expected = wrapDn(expected);   // LEFT
     expected = wrapUp(expected);   // RIGHT — final persisted value
-    // Three options entries: initial config, post-persist-#1, and
-    // post-display — the skill and the display triple both survive
-    // process-lifetime.
+    // Volumes: one RIGHT on row 0 (+10 clamp 100), one LEFT on
+    // row 1 (-10 clamp 0) — the final persisted pair.
+    const int expectedFx =
+        std::min(settingsInitialSoundFx + 10, kSoundVolumeMax);
+    const int expectedMus =
+        std::max(settingsInitialSoundMusic - 10, kSoundVolumeMin);
+    // Display leg: RIGHT + Enter on row 0 (+1 wrap >=8->0 each),
+    // one toggle on row 1 — computed from the loaded start.
+    const int expectedBright = (settingsInitialBrightness + 2) % 8;
+    const int expectedPcorrect = settingsInitialPcorrect ? 0 : 1;
+    // Five options entries: initial config, post-persist-#1,
+    // post-display, post-sound-entry, and post-persist-#3 — the
+    // settings survive process-lifetime.
     const bool entrySkillsOk =
-        optionsEntrySkills.size() == 3 &&
+        optionsEntrySkills.size() == 5 &&
         optionsEntrySkills[0] == settingsInitialSkill &&
         optionsEntrySkills[1] == expected &&
-        optionsEntrySkills[2] == expected;
-    // Exits 1 and 2 are dirty (skill mutations, then the display
-    // child's mutations carried back through the shared
-    // DAT_00541486); exit 3 is clean — persist #2 cleared the flag
-    // and nothing mutated since.
+        optionsEntrySkills[2] == expected &&
+        optionsEntrySkills[3] == expected &&
+        optionsEntrySkills[4] == expected;
+    // Exits 1, 2, 4 are dirty (skill mutations, then the display
+    // child's, then the sound child's — all carried back through
+    // the shared DAT_00541486); exits 3 and 5 are clean — the
+    // preceding persists cleared the flag.
     const bool exitsOk =
-        optionsExitDirty.size() == 3 && optionsExitDirty[0] &&
-        optionsExitDirty[1] && !optionsExitDirty[2];
+        optionsExitDirty.size() == 5 && optionsExitDirty[0] &&
+        optionsExitDirty[1] && !optionsExitDirty[2] &&
+        optionsExitDirty[3] && !optionsExitDirty[4];
+    // The proven audio-trigger sequence for the whole run — entry
+    // (ambient stop + OPTSONG start), per-query OPTBUTT + the two
+    // FUN_004024c4 volume applies, exit (OPTSONG stop + ambient
+    // restart). Esc on the sound screen emits no OPTBUTT — the
+    // script exits via row-2 activate instead.
+    const std::vector<SoundAudioEvent> expectedAudio{
+        SoundAudioEvent::AmbientSongStop,
+        SoundAudioEvent::SongStart,
+        SoundAudioEvent::Button,           // RIGHT row 0
+        SoundAudioEvent::VolumesApplied,
+        SoundAudioEvent::Button,           // DOWN
+        SoundAudioEvent::Button,           // LEFT row 1
+        SoundAudioEvent::VolumesApplied,
+        SoundAudioEvent::Button,           // DOWN
+        SoundAudioEvent::Button,           // activate row 2
+        SoundAudioEvent::SongStop,
+        SoundAudioEvent::AmbientSongStart,
+    };
+    const bool audioOk = audioEventLog == expectedAudio;
     // With --settings-file the persisted file must hold the final
-    // triple — re-read here for the verdict.
+    // five-tuple — re-read here for the verdict.
     bool fileOk = true;
     if (cfg_.settingsFile) {
       std::string ferr;
       const auto disk =
           loadFrontendSettingsFile(*cfg_.settingsFile, &ferr);
       fileOk = disk && disk->settings.skill == expected &&
-               disk->settings.brightness == 2 &&
-               disk->settings.forcePCorrect;
+               disk->settings.brightness == expectedBright &&
+               disk->settings.forcePCorrect ==
+                   (expectedPcorrect != 0) &&
+               disk->settings.soundFx == expectedFx &&
+               disk->settings.soundMusic == expectedMus;
     }
     selftestOk_ = selftestOk_ && frontendEnteredOptions &&
                   frontendReturnedToRoot &&
@@ -1392,28 +1701,40 @@ int Application::run() {
                       OptionsAction::SkillCycleNext &&
                   frontendFlow->root().selection() == 3 &&
                   frontendFlow->root().mouseX() == 300 &&
-                  frontendFlow->root().mouseY() == 89 &&
+                  frontendFlow->root().mouseY() == 90 &&
                   entrySkillsOk && exitsOk &&
                   displayEntered &&
                   displayEntrySelection == kDisplayEntrySelection &&
                   optionsResumeSelection == 7 &&
                   displayFramesDrawn > 0 &&
-                  frontendFlow->brightness() == 2 &&
-                  frontendFlow->forcePCorrect() &&
-                  settingsPersistCalls == 2 &&
+                  frontendFlow->brightness() == expectedBright &&
+                  frontendFlow->forcePCorrect() ==
+                      (expectedPcorrect != 0) &&
+                  soundEntered &&
+                  soundEntrySelection == 0 &&
+                  soundResumeSelection == 1 &&
+                  soundFramesDrawn == 4 &&
+                  frontendFlow->soundFx() == expectedFx &&
+                  frontendFlow->soundMusic() == expectedMus &&
+                  audioOk &&
+                  settingsPersistCalls == 3 &&
                   settingsPersistedSkill == expected &&
-                  settingsPersistedBrightness == 2 &&
-                  settingsPersistedForcePCorrect == 1 &&
+                  settingsPersistedBrightness == expectedBright &&
+                  settingsPersistedForcePCorrect == expectedPcorrect &&
+                  settingsPersistedSoundFx == expectedFx &&
+                  settingsPersistedSoundMusic == expectedMus &&
                   frontendFlow->skill() == expected &&
                   !frontendFlow->settingsDirty() && fileOk;
     log::info(kTag,
-              "frontend selftest (three-screen): %s (entries=%d "
-              "entry-skills=%d,%d,%d exit-dirty=%d,%d,%d persists=%d "
-              "persisted=%d,%d,%d skill=%d bright=%d pcorr=%d "
-              "dirty=%d display-entry=%d resume-sel=%d "
-              "display-frames=%d display-fb=%016llx "
-              "display-pal=%016llx root sel=%d mouse=%d,%d "
-              "last-options=%s)",
+              "frontend selftest (four-screen): %s (entries=%d "
+              "entry-skills=%d,%d,%d,%d,%d exit-dirty=%d,%d,%d,%d,%d "
+              "persists=%d persisted=%d,%d,%d,%d,%d skill=%d "
+              "bright=%d pcorr=%d fx=%d mus=%d dirty=%d "
+              "display-entry=%d resume-sel=%d display-frames=%d "
+              "display-fb=%016llx display-pal=%016llx "
+              "sound-entry=%d sound-resume=%d sound-frames=%d "
+              "sound-fb=%016llx sound-pal=%016llx audio-events=%d "
+              "root sel=%d mouse=%d,%d last-options=%s)",
               selftestOk_ ? "PASS" : "FAIL",
               static_cast<int>(optionsEntrySkills.size()),
               optionsEntrySkills.size() > 0 ? optionsEntrySkills[0]
@@ -1422,22 +1743,38 @@ int Application::run() {
                                             : -1,
               optionsEntrySkills.size() > 2 ? optionsEntrySkills[2]
                                             : -1,
+              optionsEntrySkills.size() > 3 ? optionsEntrySkills[3]
+                                            : -1,
+              optionsEntrySkills.size() > 4 ? optionsEntrySkills[4]
+                                            : -1,
               optionsExitDirty.size() > 0 ? optionsExitDirty[0] ? 1 : 0
                                           : -1,
               optionsExitDirty.size() > 1 ? optionsExitDirty[1] ? 1 : 0
                                           : -1,
               optionsExitDirty.size() > 2 ? optionsExitDirty[2] ? 1 : 0
                                           : -1,
+              optionsExitDirty.size() > 3 ? optionsExitDirty[3] ? 1 : 0
+                                          : -1,
+              optionsExitDirty.size() > 4 ? optionsExitDirty[4] ? 1 : 0
+                                          : -1,
               settingsPersistCalls, settingsPersistedSkill,
               settingsPersistedBrightness,
-              settingsPersistedForcePCorrect, frontendFlow->skill(),
+              settingsPersistedForcePCorrect,
+              settingsPersistedSoundFx, settingsPersistedSoundMusic,
+              frontendFlow->skill(),
               frontendFlow->brightness(),
               frontendFlow->forcePCorrect() ? 1 : 0,
+              frontendFlow->soundFx(), frontendFlow->soundMusic(),
               frontendFlow->settingsDirty() ? 1 : 0,
               displayEntrySelection, optionsResumeSelection,
               displayFramesDrawn,
               static_cast<unsigned long long>(displayLastFbDigest),
               static_cast<unsigned long long>(displayLastPalDigest),
+              soundEntrySelection, soundResumeSelection,
+              soundFramesDrawn,
+              static_cast<unsigned long long>(soundLastFbDigest),
+              static_cast<unsigned long long>(soundLastPalDigest),
+              static_cast<int>(audioEventLog.size()),
               frontendFlow->root().selection(),
               frontendFlow->root().mouseX(),
               frontendFlow->root().mouseY(),
@@ -1530,6 +1867,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.optionsSubmenuPreview = true;
     } else if (!std::strcmp(a, "--preview-display-submenu")) {
       cfg.displaySubmenuPreview = true;
+    } else if (!std::strcmp(a, "--preview-sound-submenu")) {
+      cfg.soundSubmenuPreview = true;
     } else if (!std::strcmp(a, "--interactive-frontend")) {
       cfg.interactiveFrontend = true;
     } else if (!std::strcmp(a, "--frontend-root-only")) {

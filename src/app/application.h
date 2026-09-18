@@ -51,12 +51,20 @@ struct AppConfig {
   // + ARROW, under the composed display palette (SYS_PAL head +
   // ramps). Requires --data-path.
   bool displaySubmenuPreview = false;
+  // --preview-sound-submenu: compose the static Sound child screen
+  // frame (Phase 4I): cleared framebuffer + SND_TITL/SND_INFO
+  // centered rows + the two volume rows (scaled labels, inclusive
+  // bars at factory 70/100, FONTSML endpoints) + SND_DONE + ARROW
+  // under the inherited options palette. Requires --data-path.
+  bool soundSubmenuPreview = false;
   // --interactive-frontend: run the reconstructed front-end flow —
   // Phase 4E root menu plus the Phase 4F options sub-menu transition
   // (OpenOptions enters the real OM_* screen; Back/Esc returns) plus
   // the Phase 4H Display child (options row 7 enters it; Esc/Quit
-  // returns to options). Requires --data-path. Downstream actions
-  // (gameplay, saves, other child screens, audio) stay deferred.
+  // returns to options) and the Phase 4I Sound child (options row 1
+  // enters it; Esc/Done returns to options at row 1). Requires
+  // --data-path. Downstream actions (gameplay, saves, other child
+  // screens, real audio playback) stay deferred.
   bool interactiveFrontend = false;
   // --frontend-root-only (test-only): run the Phase 4E root controller
   // alone so OpenOptions stays a deferred semantic action — keeps the

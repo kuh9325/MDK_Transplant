@@ -24,6 +24,7 @@
 #include "core/mto_directory.h"
 #include "core/options_menu.h"
 #include "core/sni_directory.h"
+#include "core/sound_menu.h"
 #include "core/stream_context.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
@@ -4655,17 +4656,319 @@ void test_display_controller() {
   }
 }
 
-// Phase 4G/4H — native-owned frontend settings persistence (Skill,
-// Brightness, ForcePCorrect): the FUN_004260ac/FUN_00425de4 contract
-// reimplemented against caller-supplied paths outside the read-only
-// DataRoot.
+// Phase 4I — sound child controller (FUN_004233d8): the same shared
+// query helpers as the options screen in the same order, with one
+// asymmetry — every FIRED repeat/activate query plays OPTBUTT first
+// except Esc; LEFT/RIGHT mutate SoundFX (row 0) / SoundMusic (row 1)
+// by 10 clamped [0,100] then call FUN_004024c4; row-2 activate and
+// Esc dispatch FUN_00423280 + RET (frame ends early, no draw).
+void test_sound_controller() {
+  // Entry (FUN_0042322c): the constructor carries the process
+  // globals — selection (DAT_0054bdbc, caller-supplied; BSS 0 on the
+  // first entry, retained later), volumes, dirty — and queues the
+  // entry audio events (ambient stop, OPTSONG start).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 90;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    CHECK(ctl.selection() == 0);
+    CHECK(ctl.soundFx() == 70 && ctl.soundMusic() == 100);
+    CHECK(!ctl.settingsDirty());
+    CHECK(ctl.mouseX() == 300 && ctl.mouseY() == 90);
+    const auto ev = ctl.drainAudioEvents();
+    CHECK(ev.size() == 2 &&
+          ev[0] == mdk::SoundAudioEvent::AmbientSongStop &&
+          ev[1] == mdk::SoundAudioEvent::SongStart);
+    CHECK(ctl.drainAudioEvents().empty());   // drained
+  }
+
+  // Same repeat machine as the other screens: UP/DOWN wrap among
+  // the three rows (sel-1 <0 -> 2; sel+1 >=3 -> 0), each fired
+  // query emitting OPTBUTT before the row logic.
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);   // 0-1 wraps
+    in = {};
+    ctl.update(in);                // release — deadline resets
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);
+    in = {};
+    ctl.update(in);
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    in = {};
+    ctl.update(in);
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);   // 2+1 wraps
+    const auto ev = ctl.drainAudioEvents();
+    CHECK(ev.size() == 4);
+    for (const auto e : ev) {
+      CHECK(e == mdk::SoundAudioEvent::Button);
+    }
+  }
+
+  // Mouse hit-test (OBSERVED): band = trunc((y - 61) / 46) inside
+  // the gate; valid bands 0..2 assign unconditionally, invalid
+  // bands hold. Row i covers [61+46i, 106+46i]; y>=199 is band>=3
+  // (invalid). The trunc-toward-zero quirk maps y in [15,60] to
+  // band 0 (negative/positive fractions both truncate to 0).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 200;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    mdk::FrontendMenuInput in;
+    ctl.update(in);   // gate closed — no mouse input
+    CHECK(ctl.selection() == 0);
+    // y=107 -> band 1; y=153 -> band 2; y=198 -> band 2 still;
+    // y=199 -> band 3 invalid (holds).
+    in.mouseDy = 107 - 200;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 107 && ctl.selection() == 1);
+    in = {};
+    in.mouseDy = 153 - 107;
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    in = {};
+    in.mouseDy = 198 - 153;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 198 && ctl.selection() == 2);
+    in = {};
+    in.mouseDy = 1;   // 199 -> band 3 -> holds
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 199 && ctl.selection() == 2);
+    // y=60 -> trunc(-1/46)=0 -> row 0 (quirk); y=14 -> trunc(-47/46)
+    // = -1 invalid -> holds.
+    in = {};
+    in.mouseDy = 60 - 199;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 60 && ctl.selection() == 0);
+    in = {};
+    in.mouseDy = 14 - 60;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 14 && ctl.selection() == 0);
+    // Gate clamp: y>350 clamps to 350 inside the gate -> band 6
+    // invalid, selection holds.
+    in = {};
+    in.mouseDy = 400;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 350 && ctl.selection() == 0);
+  }
+
+  // Row 0 SoundFX (DAT_00541308): RIGHT +10 / LEFT -10, clamped
+  // [0,100] never wrapping; every mutation latches DAT_00541486
+  // and emits OPTBUTT + VolumesApplied (FUN_004024c4) — even at
+  // the clamp boundary (OBSERVED: the <0 clamp still latches and
+  // calls the apply). Mutations never end the frame early.
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.soundFx() == 80 && ctl.settingsDirty());
+    CHECK(!ctl.frameEndedEarly());
+    in = {};
+    ctl.update(in);                // release
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.soundFx() == 90);
+    // Drive to the boundary: 90 -> 100 -> clamp 100.
+    for (int i = 0; i < 2; ++i) {
+      in = {};
+      ctl.update(in);
+      in.rightHeld = true;
+      ctl.update(in);
+    }
+    CHECK(ctl.soundFx() == 100);
+    // LEFT from 0 clamps at 0 with the full side-effect set.
+    mdk::SoundMenuController c2(s, 0, 0, 100);
+    c2.drainAudioEvents();
+    in = {};
+    in.leftHeld = true;
+    c2.update(in);
+    CHECK(c2.soundFx() == 0 && c2.settingsDirty());
+    const auto ev = c2.drainAudioEvents();
+    CHECK(ev.size() == 2 &&
+          ev[0] == mdk::SoundAudioEvent::Button &&
+          ev[1] == mdk::SoundAudioEvent::VolumesApplied);
+    CHECK(!c2.frameEndedEarly());
+  }
+
+  // Row 1 SoundMusic (DAT_0054130c): independent domain — same
+  // ±10 clamp; its own mutations do not touch SoundFX.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 107;   // band 1
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.soundMusic() == 90 && ctl.soundFx() == 70);
+    CHECK(ctl.settingsDirty() && !ctl.frameEndedEarly());
+    // Drive to the floor: 90 -> ... -> 0 -> clamp 0.
+    for (int i = 0; i < 10; ++i) {
+      in = {};
+      ctl.update(in);
+      in.leftHeld = true;
+      ctl.update(in);
+    }
+    CHECK(ctl.soundMusic() == 0);
+  }
+
+  // Row 2 (SND_DONE): LEFT/RIGHT fall through with no mutation and
+  // no VolumesApplied — but the fired query still plays OPTBUTT
+  // (OBSERVED: the sound plays at query-fire time, before the
+  // row's `jnz` skips both mutation blocks).
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 2, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.soundFx() == 70 && ctl.soundMusic() == 100);
+    CHECK(!ctl.settingsDirty() && !ctl.frameEndedEarly());
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.soundFx() == 70 && ctl.soundMusic() == 100);
+    CHECK(!ctl.settingsDirty());
+    const auto ev = ctl.drainAudioEvents();
+    CHECK(ev.size() == 2 &&
+          ev[0] == mdk::SoundAudioEvent::Button &&
+          ev[1] == mdk::SoundAudioEvent::Button);
+  }
+
+  // Activate on rows 0/1: OPTBUTT plays, the frame falls through
+  // to the draw — no mutation, no exit (OBSERVED: sel==0 -> draw,
+  // sel!=1 -> exit; rows 0 and 1 both survive).
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.soundFx() == 70 && !ctl.settingsDirty());
+    CHECK(ctl.pendingAction() == mdk::SoundAction::None);
+    CHECK(!ctl.frameEndedEarly());
+    const auto ev = ctl.drainAudioEvents();
+    CHECK(ev.size() == 1 && ev[0] == mdk::SoundAudioEvent::Button);
+    mdk::SoundMenuController c2(s, 1, 70, 100);
+    c2.drainAudioEvents();
+    c2.update(in);
+    CHECK(c2.soundMusic() == 100 &&
+          c2.pendingAction() == mdk::SoundAction::None);
+  }
+
+  // Activate on row 2: OPTBUTT first, then FUN_00423280 — SongStop
+  // + AmbientSongStart queue in order, Back dispatches, and the
+  // frame ends early (RET before the draw).
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 2, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::SoundAction::Back);
+    CHECK(ctl.frameEndedEarly());
+    const auto ev = ctl.drainAudioEvents();
+    CHECK(ev.size() == 3 &&
+          ev[0] == mdk::SoundAudioEvent::Button &&
+          ev[1] == mdk::SoundAudioEvent::SongStop &&
+          ev[2] == mdk::SoundAudioEvent::AmbientSongStart);
+  }
+
+  // Esc -> FUN_00423280 regardless of selection — the ONLY exit
+  // path with no OPTBUTT (OBSERVED: the raw key check jumps
+  // straight to the exit; no FUN_00402388 runs).
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 1, 70, 100);
+    ctl.drainAudioEvents();
+    mdk::FrontendMenuInput in;
+    in.cancelEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::SoundAction::Back);
+    CHECK(ctl.frameEndedEarly());
+    const auto ev = ctl.drainAudioEvents();
+    CHECK(ev.size() == 2 &&
+          ev[0] == mdk::SoundAudioEvent::SongStop &&
+          ev[1] == mdk::SoundAudioEvent::AmbientSongStart);
+  }
+
+  // Input order (OBSERVED): prev runs before next in one frame —
+  // the original queries them sequentially.
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 1, 70, 100);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);   // 1-1=0 then 0+1=1
+  }
+
+  // Mutate-back-to-default: the dirty latch STAYS set (OBSERVED
+  // latch semantics — same as Skill/Brightness); the serializer
+  // decides what to emit, not the latch.
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    mdk::FrontendMenuInput in;
+    in.rightHeld = true;
+    ctl.update(in);                // 70 -> 80
+    in = {};
+    ctl.update(in);
+    in.leftHeld = true;
+    ctl.update(in);                // 80 -> 70
+    CHECK(ctl.soundFx() == 70 && ctl.settingsDirty());
+  }
+
+  // Scale ramp: volume rows key (4, rowY), Done keys (-1,179) —
+  // cold boot first selected draw 0.65, then acc advances.
+  {
+    mdk::FrontendMachineState s;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    CHECK(near(ctl.itemScale(4, 87, true), 0.65));
+    const float grow[5] = {0.72f, 0.79f, 0.86f, 0.93f, 1.0f};
+    for (int f = 0; f < 5; ++f) {
+      CHECK(near(ctl.itemScale(4, 87, true), grow[f], 1e-5));
+    }
+    CHECK(near(ctl.itemScale(4, 133, false), 0.65));
+  }
+}
+
+// Phase 4G/4H/4I — native-owned frontend settings persistence
+// (Skill, Brightness, ForcePCorrect, SoundFX, SoundMusic): the
+// FUN_004260ac/FUN_00425de4 contract reimplemented against
+// caller-supplied paths outside the read-only DataRoot.
 void test_frontend_settings() {
   // Factory defaults — the FUN_00425de4 defaults-copy result for
-  // BUILD_A (none of the three proven keys appear in its MDK.CFG):
-  // skill 1 (Normal), brightness 0, ForcePCorrect FALSE.
+  // BUILD_A (none of the five proven keys appear in its MDK.CFG):
+  // skill 1 (Normal), brightness 0, ForcePCorrect FALSE, SoundFX
+  // 70, SoundMusic 100.
   {
     const mdk::FrontendSettings s;
     CHECK(s.skill == 1 && s.brightness == 0 && !s.forcePCorrect);
+    CHECK(s.soundFx == 70 && s.soundMusic == 100);
   }
 
   // Delta serialization (FUN_004260ac, OBSERVED): header + blank
@@ -4717,6 +5020,42 @@ void test_frontend_settings() {
           std::string::npos);
     CHECK(onlyOut.find("Skill") == std::string::npos &&
           onlyOut.find("Brightness") == std::string::npos);
+  }
+
+  // Phase 4I entries (OBSERVED): `SoundFX = %d` iff != factory 70,
+  // `SoundMusic = %d` iff != factory 100 — settings-table entries
+  // 8/9, so the full five-entry file emits them BEFORE Skill.
+  {
+    mdk::FrontendSettings s;
+    s.soundFx = 80;
+    s.soundMusic = 90;
+    s.skill = 2;
+    s.brightness = 5;
+    s.forcePCorrect = true;
+    const std::string out = mdk::serializeFrontendSettings(s);
+    const auto pFx = out.find("SoundFX = 80\r\n");
+    const auto pMus = out.find("SoundMusic = 90\r\n");
+    const auto pSkill = out.find("Skill = 2\r\n");
+    const auto pBright = out.find("Brightness = 5\r\n");
+    const auto pFpc = out.find("ForcePCorrect = TRUE\r\n");
+    CHECK(pFx != std::string::npos && pMus != std::string::npos &&
+          pSkill != std::string::npos &&
+          pBright != std::string::npos && pFpc != std::string::npos);
+    // Table order: 8 -> 9 -> 88 -> 89 -> 90.
+    CHECK(pFx < pMus && pMus < pSkill && pSkill < pBright &&
+          pBright < pFpc);
+    // Defaults emit nothing for the new keys.
+    const std::string def = mdk::serializeFrontendSettings(
+        mdk::FrontendSettings{});
+    CHECK(def.find("SoundFX") == std::string::npos &&
+          def.find("SoundMusic") == std::string::npos);
+    // A non-default SoundFX alone emits just its own line.
+    mdk::FrontendSettings only;
+    only.soundFx = 0;
+    const std::string onlyOut = mdk::serializeFrontendSettings(only);
+    CHECK(onlyOut.find("SoundFX = 0\r\n") != std::string::npos);
+    CHECK(onlyOut.find("SoundMusic") == std::string::npos &&
+          onlyOut.find("Skill") == std::string::npos);
   }
 
   // Parser (FUN_00425de4 apply loop, OBSERVED shape): defaults
@@ -4790,6 +5129,41 @@ void test_frontend_settings() {
           rt.settings.forcePCorrect);
   }
 
+  // Phase 4I parser entries: SoundFX/SoundMusic are type-0 ints —
+  // the same strtol-family leading parse, case-insensitive key,
+  // last valid line wins; [0,100] domain under the NATIVE
+  // hardening (each key counts its own ignored lines).
+  {
+    CHECK(mdk::parseFrontendSettings("SoundFX = 0")
+              .settings.soundFx == 0);
+    CHECK(mdk::parseFrontendSettings("SoundFX = 100")
+              .settings.soundFx == 100);
+    CHECK(mdk::parseFrontendSettings("SOUNDFX = 55")
+              .settings.soundFx == 55);
+    CHECK(mdk::parseFrontendSettings("soundmusic=30")
+              .settings.soundMusic == 30);
+    CHECK(mdk::parseFrontendSettings("SoundMusic = 99")
+              .settings.soundMusic == 99);
+    // Leading-integer semantics like the original's strtol family.
+    CHECK(mdk::parseFrontendSettings("SoundFX = 42px")
+              .settings.soundFx == 42);
+    // Last valid line wins (sequential apply).
+    CHECK(mdk::parseFrontendSettings("SoundFX = 10\nSoundFX = 60\n")
+              .settings.soundFx == 60);
+    // A serialized five-tuple round-trips through the parser.
+    mdk::FrontendSettings five;
+    five.soundFx = 10;
+    five.soundMusic = 20;
+    five.skill = 0;
+    five.brightness = 4;
+    five.forcePCorrect = true;
+    const auto rt = mdk::parseFrontendSettings(
+        mdk::serializeFrontendSettings(five));
+    CHECK(rt.settings.soundFx == 10 && rt.settings.soundMusic == 20 &&
+          rt.settings.skill == 0 && rt.settings.brightness == 4 &&
+          rt.settings.forcePCorrect);
+  }
+
   // NATIVE hardening (not an original-behavior claim): malformed
   // or out-of-range Skill lines are ignored and counted — the
   // running value is kept.
@@ -4818,6 +5192,31 @@ void test_frontend_settings() {
     p = mdk::parseFrontendSettings("Brightness = 3\nBrightness = 9\n");
     CHECK(p.settings.brightness == 3 &&
           p.ignoredBrightnessLines == 1);
+    // SoundFX / SoundMusic carry their own ignored counters
+    // ([0,100] domain each — a bad line never clobbers a good one
+    // and never spills into a sibling counter).
+    p = mdk::parseFrontendSettings("SoundFX = abc");
+    CHECK(p.settings.soundFx == 70 && p.ignoredSoundFxLines == 1);
+    p = mdk::parseFrontendSettings("SoundFX = 101");
+    CHECK(p.settings.soundFx == 70 && p.ignoredSoundFxLines == 1);
+    p = mdk::parseFrontendSettings("SoundFX = -1");
+    CHECK(p.settings.soundFx == 70 && p.ignoredSoundFxLines == 1);
+    p = mdk::parseFrontendSettings("SoundFX = ");
+    CHECK(p.settings.soundFx == 70 && p.ignoredSoundFxLines == 1);
+    p = mdk::parseFrontendSettings("SoundFX = 30\nSoundFX = 999\n");
+    CHECK(p.settings.soundFx == 30 && p.ignoredSoundFxLines == 1);
+    p = mdk::parseFrontendSettings("SoundMusic = xyz");
+    CHECK(p.settings.soundMusic == 100 &&
+          p.ignoredSoundMusicLines == 1 && p.ignoredSoundFxLines == 0);
+    p = mdk::parseFrontendSettings("SoundMusic = 200");
+    CHECK(p.settings.soundMusic == 100 &&
+          p.ignoredSoundMusicLines == 1);
+    p = mdk::parseFrontendSettings("SoundMusic = -5");
+    CHECK(p.settings.soundMusic == 100 &&
+          p.ignoredSoundMusicLines == 1);
+    p = mdk::parseFrontendSettings("SoundMusic = 40\nSoundMusic = -9\n");
+    CHECK(p.settings.soundMusic == 40 &&
+          p.ignoredSoundMusicLines == 1);
   }
 
   // Temp-file round trips — Easy / Normal / Hard through the real
@@ -5077,6 +5476,155 @@ void test_frontend_flow() {
     CHECK(flow.display().selection() == 2);      // entry reset
     CHECK(flow.display().brightness() == 1);     // process global
     CHECK(flow.display().settingsDirty());       // flag carried
+  }
+
+  // Options -> Sound (Phase 4I): activating row 1 is consumed by
+  // the transition — FUN_0042322c enters the child with the
+  // process-global selection DAT_0054bdbc (BSS 0 on the first
+  // entry) and the shared machine state intact; the options
+  // controller stays alive underneath.
+  auto enterSound = [](mdk::FrontendFlowController& f) {
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;            // 180 -> 139: root band 3
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);
+    f.consumeRootAction();
+    in = {};
+    in.mouseButtons = 0;
+    in.mouseDy = 90 - 139;       // 139 -> 90: options band 1
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);                // click -> FUN_0042322c
+    f.consumeOptionsAction();
+  };
+
+  {
+    mdk::FrontendFlowController flow(true);
+    enterSound(flow);
+    CHECK(flow.screen() == mdk::FrontendScreen::Sound);
+    CHECK(flow.sound().selection() == 0);   // DAT_0054bdbc BSS 0
+    CHECK(flow.sound().mouseX() == 300 &&
+          flow.sound().mouseY() == 90);
+    CHECK(flow.sound().soundFx() == 70 &&
+          flow.sound().soundMusic() == 100);
+  }
+
+  // Sound -> Options (Phase 4I): FUN_00423280 restores mode 0x0b
+  // with _DAT_0054bd34 still 1 — options resumes the Sound row;
+  // machine state, volumes, and the shared dirty flag carry back.
+  {
+    mdk::FrontendFlowController flow(true);
+    enterSound(flow);
+    // RIGHT on row 0: SoundFX 70 -> 80, dirty latches.
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.rightHeld = true;
+    flow.update(in);
+    CHECK(flow.sound().soundFx() == 80 &&
+          flow.sound().settingsDirty());
+    // Esc -> Back -> options resumes at selection 1.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    CHECK(flow.consumeSoundAction() == mdk::SoundAction::None);
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.options().selection() == 1);
+    CHECK(flow.soundFx() == 80 &&
+          flow.options().settingsDirty());
+  }
+
+  // Sound exit does NOT persist — FUN_00420d68 owns the write;
+  // the dirty the child latched persists the full five-tuple on
+  // the eventual options exit.
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    enterSound(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.rightHeld = true;
+    flow.update(in);             // SoundFX 70 -> 80
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeSoundAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(calls == 0);           // no persist on the child exit
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(calls == 1);
+    CHECK(persisted.soundFx == 80 && persisted.soundMusic == 100 &&
+          persisted.skill == 1 && persisted.brightness == 0 &&
+          !persisted.forcePCorrect);
+    CHECK(!flow.settingsDirty());
+    const std::string ser = mdk::serializeFrontendSettings(persisted);
+    CHECK(ser.find("SoundFX = 80\r\n") != std::string::npos);
+    CHECK(ser.find("SoundMusic") == std::string::npos);
+    CHECK(ser.find("Skill") == std::string::npos);
+  }
+
+  // DAT_0054bdbc is a process global: FUN_0042322c does not reset
+  // it — a later Sound entry resumes wherever the frame handler
+  // left it (unlike the Display child's fixed entry selection).
+  {
+    mdk::FrontendFlowController flow(true);
+    enterSound(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.nextHeld = true;
+    flow.update(in);             // sel 0 -> 1
+    in = {};
+    flow.update(in);             // release — deadline resets
+    in.nextHeld = true;
+    flow.update(in);             // sel 1 -> 2
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeSoundAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    // Re-enter (options sel still 1 -> activate).
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Sound);
+    CHECK(flow.sound().selection() == 2);   // retained, not reset
+    CHECK(flow.sound().soundFx() == 70);    // volumes are globals
+  }
+
+  // The semantic audio events survive the controller's
+  // destruction: the flow-level queue holds the whole proven
+  // sequence — entry (ambient stop + OPTSONG start), the exit
+  // frame's OPTSONG stop + ambient restart — for the caller to
+  // drain once the child is gone.
+  {
+    mdk::FrontendFlowController flow(true);
+    enterSound(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.cancelEdge = true;
+    flow.update(in);             // Esc -> FUN_00423280
+    flow.consumeSoundAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    const auto ev = flow.drainAudioEvents();
+    CHECK(ev.size() == 4 &&
+          ev[0] == mdk::SoundAudioEvent::AmbientSongStop &&
+          ev[1] == mdk::SoundAudioEvent::SongStart &&
+          ev[2] == mdk::SoundAudioEvent::SongStop &&
+          ev[3] == mdk::SoundAudioEvent::AmbientSongStart);
+    CHECK(flow.drainAudioEvents().empty());
   }
 
   // Non-transition root actions pass through unchanged.
@@ -5584,6 +6132,150 @@ void test_display_render() {
   }
 }
 
+// Phase 4I — sound child renderers (FUN_004233d8 draw block +
+// FUN_004232b0 volume rows + FUN_00423384 Done row).
+void test_sound_render() {
+  std::string err;
+  auto fBig = SyntheticFont::make();
+  auto fSml = SyntheticFont::make();
+  const char* labels[7] = {"Sound Settings",
+                           "Left/Right to Change Volumes",
+                           "Effects", "Music", "100%", "0%", "Done"};
+  for (const char* l : labels) {
+    for (const char* c = l; *c; ++c) {
+      const std::uint8_t ch = static_cast<std::uint8_t>(*c);
+      fBig.put32(ch * 4, fBig.addGlyph(1, 0, 2, {9, 9, 9, 9}));
+      fSml.put32(ch * 4, fSml.addGlyph(1, 0, 1, {7, 7}));
+    }
+  }
+  const auto fontBig = mdk::decodeFtiFont(fBig.buf, &err);
+  const auto fontSml = mdk::decodeFtiFont(fSml.buf, &err);
+  CHECK(fontBig && fontSml);
+  auto arrowS = SyntheticSprite::make1(
+      2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+  const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+  CHECK(arrow && arrow->frame(0));
+
+  const mdk::SoundMenuLabels lbl{"Sound Settings",
+                                 "Left/Right to Change Volumes",
+                                 "Effects", "Music",
+                                 "100%", "0%", "Done"};
+  std::array<std::byte, 192> sysPal{};
+  for (int i = 0; i < 64; ++i) {
+    sysPal[i * 3 + 0] = std::byte(i);
+    sysPal[i * 3 + 1] = std::byte(200 - i);
+    sysPal[i * 3 + 2] = std::byte(i);
+  }
+
+  // Static spec frame (OBSERVED entry state): clear(0), centered
+  // title y=31 / info y=350, two volume rows at y=87/133 (FONTBIG
+  // label x=4 at the selection scale, inclusive bar
+  // x=210..210+trunc(vol*280/100), y=rowY-12..rowY-1, color 4,
+  // FONTSML "0%" @175 / "100%" @498), Done centered y=179, ARROW
+  // at the carried mouse, SYS_PAL head bound.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::SoundMenuSpec spec;
+    spec.arrowX = 300;
+    spec.arrowY = 90;
+    CHECK(mdk::renderSoundMenuFrame(fb, palette, *fontBig, *fontSml,
+                                    *arrow->frame(0), lbl, sysPal,
+                                    spec, &err));
+    // Arrow at the spec position.
+    CHECK(fb.at(300, 90) == 77 && fb.at(301, 91) == 77);
+    // Corners stay cleared (no backdrop).
+    CHECK(fb.at(0, 0) == 0 && fb.at(599, 0) == 0 &&
+          fb.at(0, 359) == 0);
+    // SoundFX bar: vol 70 -> w = trunc(70*280/100) = 196 —
+    // x 210..406 inclusive, y 75..86, color 4.
+    CHECK(fb.at(210, 80) == 4 && fb.at(406, 80) == 4);
+    CHECK(fb.at(407, 80) == 0);           // just past the fill
+    CHECK(fb.at(209, 80) == 0);           // left of the fill
+    CHECK(fb.at(210, 74) == 0);           // above rowY-12
+    CHECK(fb.at(210, 87) == 0);           // below rowY-1
+    // SoundMusic bar: vol 100 -> w = 280 — x 210..490.
+    CHECK(fb.at(210, 128) == 4 && fb.at(490, 128) == 4);
+    CHECK(fb.at(491, 128) == 0);
+    // Palette: SYS_PAL head bound, tail zeroed.
+    CHECK(palette.get(1).r == 1 && palette.get(1).g == 199);
+    CHECK(palette.get(200).r == 0 && palette.get(200).a == 255);
+    // Contracts: wrong fb size, empty label, short palette head.
+    mdk::IndexedFramebuffer small(64, 64);
+    CHECK(!mdk::renderSoundMenuFrame(small, palette, *fontBig,
+                                     *fontSml, *arrow->frame(0), lbl,
+                                     sysPal, spec, &err));
+    mdk::SoundMenuLabels bad;
+    CHECK(!mdk::renderSoundMenuFrame(fb, palette, *fontBig, *fontSml,
+                                     *arrow->frame(0), bad, sysPal,
+                                     spec, &err));
+    std::array<std::byte, 64> shortPal{};
+    CHECK(!mdk::renderSoundMenuFrame(fb, palette, *fontBig, *fontSml,
+                                     *arrow->frame(0), lbl, shortPal,
+                                     spec, &err));
+  }
+
+  // The vol=0 edge (OBSERVED): the inclusive rectfill still draws
+  // its single 1px column at x=210 — w truncates to 0, x0==x1.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::SoundMenuSpec spec;
+    spec.soundFx = 0;
+    CHECK(mdk::renderSoundMenuFrame(fb, palette, *fontBig, *fontSml,
+                                    *arrow->frame(0), lbl, sysPal,
+                                    spec, &err));
+    CHECK(fb.at(210, 80) == 4 && fb.at(211, 80) == 0);
+  }
+
+  // Brightness lift (Phase 4H staging semantics): the bound
+  // options palette lifts with DAT_0054147e — head AND zeroed
+  // tail, exactly like the other screens (the Sound screen
+  // performs no palette upload of its own).
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::SoundMenuSpec spec;
+    spec.brightness = 2;
+    CHECK(mdk::renderSoundMenuFrame(fb, palette, *fontBig, *fontSml,
+                                    *arrow->frame(0), lbl, sysPal,
+                                    spec, &err));
+    CHECK(palette.get(1).r == 33 && palette.get(1).g == 231);
+    CHECK(palette.get(200).r == 32 && palette.get(200).b == 32);
+  }
+
+  // Dynamic frame: the live ramp drives row scales (volume rows
+  // keyed (4,y), Done (-1,179)); the controller's volumes and
+  // logical mouse drive the bars and ARROW.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 90;
+    mdk::SoundMenuController ctl(s, 0, 70, 100);
+    CHECK(mdk::renderSoundMenuDynamic(fb, palette, *fontBig,
+                                      *fontSml, *arrow->frame(0), lbl,
+                                      sysPal, ctl, 0, &err));
+    CHECK(fb.at(300, 90) == 77);
+    CHECK(ctl.rampAccumulator() == 0.0f);
+    CHECK(mdk::renderSoundMenuDynamic(fb, palette, *fontBig,
+                                      *fontSml, *arrow->frame(0), lbl,
+                                      sysPal, ctl, 0, &err));
+    CHECK(ctl.rampAccumulator() > 0.0f);
+    // Controller state drives the bar: mutate SoundFX and the fill
+    // shrinks on the next frame.
+    mdk::FrontendMenuInput in;
+    in.leftHeld = true;
+    ctl.update(in);             // 70 -> 60 -> w = 168
+    CHECK(ctl.soundFx() == 60);
+    CHECK(mdk::renderSoundMenuDynamic(fb, palette, *fontBig,
+                                      *fontSml, *arrow->frame(0), lbl,
+                                      sysPal, ctl, 0, &err));
+    CHECK(fb.at(210 + 168, 80) == 4 && fb.at(210 + 169, 80) == 0);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -5609,10 +6301,12 @@ int main() {
   test_frontend_controller();
   test_options_controller();
   test_display_controller();
+  test_sound_controller();
   test_frontend_settings();
   test_frontend_flow();
   test_options_render();
   test_display_render();
+  test_sound_render();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

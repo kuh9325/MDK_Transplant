@@ -53,7 +53,7 @@ Boundary notes (intentions, not commitments):
 | Build system | IMPLEMENTED (Phase 3A): CMake ≥3.24, out-of-tree `build/` |
 | Data access | IMPLEMENTED (Phase 3B): `DataRoot` read-only resolver + `BinaryReader` + container envelope — see `DATA_ACCESS.md` |
 | Resource decoding | STARTED (Phase 4A/4B/4C/4D): `IndexedImage` + four proven decoders (BNI paletted bitmap; BNI indexed-only bitmap with the STREAM context palette; FTI FONTSML/FONTBIG glyph table; FTI ARROW sprite table) + the first static front-end composition — see `ENGINE_RECONSTRUCTION.md` |
-| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B/4A |
+| Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B/4A–4I; the Sound screen emits proven trigger semantics (`SoundAudioEvent`) but no playback backend exists yet |
 
 > Phase 3A implements the bottom two layers (`platform`, `renderer`
 > presentation boundary) plus a neutral input seam and a mode-dispatch
@@ -103,10 +103,22 @@ Boundary notes (intentions, not commitments):
 > `Quit`), the SYS_PAL-head-plus-4×48-ramp palette composition
 > with the `FUN_0046d208` `min(c+level·16,255)` upload lift
 > (`frontend_palette.h`), the `FUN_0041cf80` swatch grid, and the
-> `FUN_0041d144` return that resumes options at selection 7 —
-> the flow is now Root → Options → Display → Options → Root and
-> the settings seam persists all three proven entries on the
-> options exit. See `ENGINE_RECONSTRUCTION.md`.
+> `FUN_0041d144` return that resumes options at selection 7.
+> Phase 4I adds the second real child screen:
+> `SoundMenuController` (`sound_menu.*`) reproduces
+> `FUN_004233d8` entered via `FUN_0042322c` from options row 1 —
+> three rows (`SoundFX`/`SoundMusic` ±10 clamp [0,100],
+> `Done`), the inherited options palette (no upload of its
+> own), the proven volume-bar geometry (`FUN_00416aa8`
+> inclusive rectfill, `x = 210..210+vol·280/100`), and the
+> `FUN_00423280` return that resumes options at selection 1 —
+> with the proven `OPTSONG`/`OPTBUTT`/ambient-song triggers
+> emitted as semantic `SoundAudioEvent`s (actual playback
+> deferred). The flow is now Root → Options → {Display|Sound}
+> → Options → Root and the settings seam persists all five
+> proven entries (SoundFX, SoundMusic, Skill, Brightness,
+> ForcePCorrect — table order) on the options exit.
+> See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.
