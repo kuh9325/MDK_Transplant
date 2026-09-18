@@ -10,6 +10,7 @@
 #include "core/framebuffer.h"
 #include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
+#include "core/frontend_settings.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
@@ -591,9 +592,10 @@ static bool loadOptionsPreview(DataRoot& root, IndexedFramebuffer& fb,
 
 // Phase 4F options sub-menu preview: compose the proven static
 // FUN_00420eac frame — cleared framebuffer + OM_* labels (selection 8
-// at scale 1.0, the rest 0.65, canonical skill "Skill - Easy") +
-// ARROW at the (unchanged) logical mouse position, under the resident
-// system palette (SYS_PAL head + zeroed tail — see options_menu.h).
+// at scale 1.0, the rest 0.65, canonical skill 1 -> "Skill - Normal")
+// + ARROW at the (unchanged) logical mouse position, under the
+// resident system palette (SYS_PAL head + zeroed tail — see
+// options_menu.h).
 // Fills `err` -> false on failure.
 static bool loadOptionsSubmenuPreview(DataRoot& root,
                                       IndexedFramebuffer& fb,
@@ -608,7 +610,8 @@ static bool loadOptionsSubmenuPreview(DataRoot& root,
   for (int i = 0; i < kOptionsItemCount; ++i) {
     labels.items[i] = res.omStrings[i];
   }
-  labels.items[kOptionsSkillRow] = res.omSkill[spec.skill];
+  labels.items[kOptionsSkillRow] =
+      res.omSkill[optionsSkillRecordIndex(spec.skill)];
   std::string derr;
   if (!renderOptionsMenuFrame(fb, palette, res.fontBig,
                               *res.arrow.frame(0), labels,
@@ -763,6 +766,15 @@ int Application::run() {
   OptionsAction frontendLastOptionsAction = OptionsAction::None;
   bool frontendEnteredOptions = false;
   bool frontendReturnedToRoot = false;
+  // Phase 4G observability for the scripted selftest verdict:
+  // the skill value seen at each options entry (process-lifetime
+  // retention), the dirty flag seen at each options exit, and the
+  // persistence-sink invocation count.
+  std::vector<int> optionsEntrySkills;
+  std::vector<bool> optionsExitDirty;
+  int settingsPersistCalls = 0;
+  int settingsPersistedSkill = -1;
+  int settingsInitialSkill = 1;  // post-config startup value
 
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
@@ -852,7 +864,53 @@ int Application::run() {
       // OpenOptions stays a deferred semantic action.
       frontendCtl.emplace(res.savesExist);
     } else {
-      frontendFlow.emplace(res.savesExist);
+      // Phase 4G native-owned persistence seam: --settings-file is
+      // the ONLY settings location the port touches — always outside
+      // the read-only DataRoot. Startup load mirrors FUN_00425de4
+      // (defaults first, config overrides); a dirty options exit
+      // mirrors FUN_004260ac through the flow's sink.
+      FrontendSettings initialSettings;
+      if (cfg_.settingsFile) {
+        std::string serr;
+        auto loaded =
+            loadFrontendSettingsFile(*cfg_.settingsFile, &serr);
+        if (loaded) {
+          initialSettings = loaded->settings;
+          settingsInitialSkill = initialSettings.skill;
+          log::info(kTag,
+                    "settings: loaded %s (skill=%d ignored=%d)",
+                    cfg_.settingsFile->string().c_str(),
+                    initialSettings.skill, loaded->ignoredSkillLines);
+        } else {
+          log::warn(kTag, "settings: %s — %s; factory defaults",
+                    cfg_.settingsFile->string().c_str(),
+                    serr.empty() ? "absent (fresh boot)"
+                                 : serr.c_str());
+        }
+      }
+      auto sink = [&](const FrontendSettings& s) {
+        ++settingsPersistCalls;
+        settingsPersistedSkill = s.skill;
+        if (!cfg_.settingsFile) {
+          // No writable location configured — the FUN_004260ac
+          // silent-failure analogue: process-lifetime only.
+          log::warn(kTag,
+                    "settings persist skipped — no --settings-file "
+                    "(skill=%d)", s.skill);
+          return false;
+        }
+        std::string perr;
+        if (!saveFrontendSettingsFile(*cfg_.settingsFile, s, &perr)) {
+          log::warn(kTag, "settings persist failed: %s",
+                    perr.c_str());
+          return false;
+        }
+        log::info(kTag, "settings persisted: %s (skill=%d)",
+                  cfg_.settingsFile->string().c_str(), s.skill);
+        return true;
+      };
+      frontendFlow.emplace(res.savesExist, initialSettings,
+                           std::move(sink));
     }
     frontendRes.emplace(std::move(res));
     log::info(kTag,
@@ -902,7 +960,9 @@ int Application::run() {
       host.injectSelfTestEvents();
     }
     if (cfg_.frames == 0) {
-      cfg_.frames = frontendFlow ? 12 : 10;
+      // Phase 4G two-screen script: 14 steps (0..13) + one settled
+      // post-return root frame.
+      cfg_.frames = frontendFlow ? 15 : 10;
     }
   }
 
@@ -955,8 +1015,10 @@ int Application::run() {
           for (int i = 0; i < kOptionsItemCount; ++i) {
             labels.items[i] = frontendRes->omStrings[i];
           }
-          labels.items[kOptionsSkillRow] =
-              frontendRes->omSkill[frontendFlow->options().skill()];
+          // Row 6 record = OM_SK_<skill> — the same 0x421254 3-way
+          // branch as the original draw block.
+          labels.items[kOptionsSkillRow] = frontendRes->omSkill[
+              optionsSkillRecordIndex(frontendFlow->options().skill())];
           rok = renderOptionsMenuDynamic(
               fb, palette, frontendRes->fontBig,
               *frontendRes->arrow.frame(0), labels,
@@ -1000,6 +1062,13 @@ int Application::run() {
           }
         }
       } else if (frontendFlow->inOptions()) {
+        // Record the dirty flag consumed by FUN_00420d68 before the
+        // transition eats it — the persist gate for this exit.
+        if (frontendFlow->options().pendingAction() ==
+            OptionsAction::Back) {
+          optionsExitDirty.push_back(
+              frontendFlow->options().settingsDirty());
+        }
         const OptionsAction a = frontendFlow->consumeOptionsAction();
         if (a != OptionsAction::None) {
           frontendLastOptionsAction = a;
@@ -1035,11 +1104,14 @@ int Application::run() {
         if (frontendFlow->inOptions()) {
           // OpenOptions consumed -> FUN_00420cf0 -> options entered.
           frontendEnteredOptions = true;
+          optionsEntrySkills.push_back(
+              frontendFlow->options().skill());
           log::info(kTag, "front-end flow: root -> options "
-                    "(entry sel=%d mouse=%d,%d)",
+                    "(entry sel=%d mouse=%d,%d skill=%d)",
                     frontendFlow->options().selection(),
                     frontendFlow->options().mouseX(),
-                    frontendFlow->options().mouseY());
+                    frontendFlow->options().mouseY(),
+                    frontendFlow->options().skill());
         }
       }
     } else if (!previewMode) {
@@ -1064,13 +1136,21 @@ int Application::run() {
   // Deterministic dynamic-frame digests for the snapshot record —
   // same domains as the Phase 4D static preview.
   if (frontendCtl || frontendFlow) {
+    const bool inOpts = frontendFlow && frontendFlow->inOptions();
     log::info(kTag,
               "interactive front-end last frame: fb=%016llx "
-              "palette=%016llx screen=%s",
+              "palette=%016llx screen=%s sel=%d skill=%d rampAcc=%.2f",
               static_cast<unsigned long long>(digestIndexedFb(fb)),
               static_cast<unsigned long long>(digestPalette(palette)),
-              (frontendFlow && frontendFlow->inOptions()) ? "options"
-                                                          : "root");
+              inOpts ? "options" : "root",
+              inOpts ? frontendFlow->options().selection()
+                     : (frontendCtl ? frontendCtl->selection()
+                                    : frontendFlow->root().selection()),
+              inOpts ? frontendFlow->options().skill() : -1,
+              inOpts ? frontendFlow->options().rampAccumulator()
+                     : (frontendCtl
+                            ? frontendCtl->rampAccumulator()
+                            : frontendFlow->root().rampAccumulator()));
   }
 
   // Interactive selftest verdicts.
@@ -1091,28 +1171,72 @@ int Application::run() {
               frontendActionName(frontendLastAction));
   }
   if (cfg_.selftest && frontendFlow) {
-    // Phase 4F two-screen flow: OpenOptions must have entered the
-    // options sub-menu, the scripted Display activation emitted, and
-    // Esc must have returned to the root with selection 3 still
-    // chosen and the mouse carried back at (300,301).
+    // Phase 4G two-screen + persistence script:
+    //   root nav -> options entry (sel 8) -> motion to the skill
+    //   band -> RIGHT -> Enter -> LEFT -> LEFT -> RIGHT -> Esc
+    //   (dirty persist fires) -> Enter (re-entry; skill retained
+    //   process-lifetime) -> Esc (no mutation -> no persist).
+    // From the canonical startup (Normal): Hard -> Easy -> Hard ->
+    // Normal -> Hard — the persisted final value is Hard, a
+    // non-default that proves the round trip.
+    auto wrapUp = [](int s) { return s >= 2 ? 0 : s + 1; };
+    auto wrapDn = [](int s) { return s <= 0 ? 2 : s - 1; };
+    int expected = settingsInitialSkill;
+    expected = wrapUp(expected);   // RIGHT
+    expected = wrapUp(expected);   // Enter
+    expected = wrapDn(expected);   // LEFT
+    expected = wrapDn(expected);   // LEFT
+    expected = wrapUp(expected);   // RIGHT — final persisted value
+    const bool entrySkillsOk =
+        optionsEntrySkills.size() == 2 &&
+        optionsEntrySkills[0] == settingsInitialSkill &&
+        optionsEntrySkills[1] == expected;
+    const bool exitsOk =
+        optionsExitDirty.size() == 2 && optionsExitDirty[0] &&
+        !optionsExitDirty[1];
+    // With --settings-file the persisted file must hold the final
+    // skill — re-read here for the verdict.
+    bool fileOk = true;
+    if (cfg_.settingsFile) {
+      std::string ferr;
+      const auto disk =
+          loadFrontendSettingsFile(*cfg_.settingsFile, &ferr);
+      fileOk = disk && disk->settings.skill == expected;
+    }
     selftestOk_ = selftestOk_ && frontendEnteredOptions &&
                   frontendReturnedToRoot &&
                   frontendFlow->screen() == FrontendScreen::Root &&
-                  frontendLastOptionsAction == OptionsAction::Display &&
+                  frontendLastOptionsAction ==
+                      OptionsAction::SkillCycleNext &&
                   frontendFlow->root().selection() == 3 &&
                   frontendFlow->root().mouseX() == 300 &&
-                  frontendFlow->root().mouseY() == 301;
+                  frontendFlow->root().mouseY() == 259 &&
+                  entrySkillsOk && exitsOk &&
+                  settingsPersistCalls == 1 &&
+                  settingsPersistedSkill == expected &&
+                  frontendFlow->skill() == expected &&
+                  !frontendFlow->settingsDirty() && fileOk;
     log::info(kTag,
-              "frontend selftest (two-screen): %s (entered=%d "
-              "returned=%d root sel=%d mouse=%d,%d last-root=%s "
-              "last-options=%s)",
+              "frontend selftest (two-screen): %s (entries=%d "
+              "entry-skills=%d,%d exit-dirty=%d,%d persists=%d "
+              "persisted-skill=%d skill=%d dirty=%d root sel=%d "
+              "mouse=%d,%d last-options=%s)",
               selftestOk_ ? "PASS" : "FAIL",
-              frontendEnteredOptions ? 1 : 0,
-              frontendReturnedToRoot ? 1 : 0,
+              static_cast<int>(optionsEntrySkills.size()),
+              optionsEntrySkills.size() > 0 ? optionsEntrySkills[0]
+                                            : -1,
+              optionsEntrySkills.size() > 1 ? optionsEntrySkills[1]
+                                            : -1,
+              optionsExitDirty.size() > 0 ? optionsExitDirty[0] ? 1 : 0
+                                          : -1,
+              optionsExitDirty.size() > 1 ? optionsExitDirty[1] ? 1 : 0
+                                          : -1,
+              settingsPersistCalls, settingsPersistedSkill,
+              frontendFlow->skill(),
+              frontendFlow->settingsDirty() ? 1 : 0,
               frontendFlow->root().selection(),
               frontendFlow->root().mouseX(),
               frontendFlow->root().mouseY(),
-              frontendActionName(frontendLastAction),
               optionsActionName(frontendLastOptionsAction));
   }
 
@@ -1204,6 +1328,10 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.interactiveFrontend = true;
     } else if (!std::strcmp(a, "--frontend-root-only")) {
       cfg.frontendRootOnly = true;
+    } else if (!std::strcmp(a, "--settings-file")) {
+      const char* v = needValue(a);
+      if (!v) return false;
+      cfg.settingsFile = v;
     } else if (!std::strcmp(a, "--selftest")) {
       cfg.selftest = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {

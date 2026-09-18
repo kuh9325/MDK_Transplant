@@ -90,8 +90,13 @@ Boundary notes (intentions, not commitments):
 > binding, LEFT/RIGHT skill cycle, Esc return), and
 > `FrontendFlowController` performs the proven `FUN_00420cf0` entry /
 > `FUN_00420d68` exit transitions, carrying the shared input-machine
-> state verbatim between screens. Settings mutation stays deferred.
-> See `ENGINE_RECONSTRUCTION.md`.
+> state verbatim between screens. Phase 4G adds the first real
+> settings mutation + persistence: the Skill row's ±1 wrap latches
+> the `DAT_00541486` dirty flag, and `FrontendSettings`
+> (`frontend_settings.*`) reproduces the `FUN_004260ac` delta-write
+> contract — `Skill = %d` emitted iff != factory default 1 — behind
+> a caller-supplied path that never touches the read-only
+> `DataRoot`. See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

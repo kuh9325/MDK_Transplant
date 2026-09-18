@@ -180,7 +180,7 @@ void SdlHost::isolateHardwareInputForSelftest() {
 
 void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
                                        bool rootOnly) {
-  const std::uint64_t lastStep = rootOnly ? 3 : 9;
+  const std::uint64_t lastStep = rootOnly ? 3 : 13;
   if (!window_ || frameIndex > lastStep) {
     return;
   }
@@ -236,25 +236,38 @@ void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
   case 2:  // Button down: hit-test then activate -> OpenOptions.
     button(true);
     break;
-  case 3:  // Release: re-arms the latch (first options frame).
+  case 3:  // Release: re-arms the latch (first options frame, sel 8).
     button(false);
     break;
-  case 4:  // DOWN tap: options sel 8 -> 0 wrap (Help).
-    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+  case 4:  // Arrow y=139 -> 259: options band 6 (Skill) — Phase 4G.
+    motion(120.0f);
     break;
-  case 5:  // DOWN tap: options sel 0 -> 1 (Sound).
-    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+  case 5:  // RIGHT tap: skill +1 (canonical Normal -> Hard), dirty.
+    keyTap(SDL_SCANCODE_RIGHT, SDLK_RIGHT);
     break;
-  case 6:  // Arrow y=139 -> 301: options band 7 (Display).
-    motion(162.0f);
+  case 6:  // Enter tap: activate cycles skill +1 (Hard -> Easy).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
     break;
-  case 7:  // Button down: hit-test + activate -> Display action.
-    button(true);
+  case 7:  // LEFT tap: skill -1 (Easy -> Hard).
+    keyTap(SDL_SCANCODE_LEFT, SDLK_LEFT);
     break;
-  case 8:  // Release: re-arm the latch.
-    button(false);
+  case 8:  // Idle frame: LEFT must be sampled released before the
+         // next tap — the repeat deadline (tick+30) only resets on
+         // a not-held frame, like the original.
     break;
-  case 9:  // ESC tap: Back -> FUN_00420d68 -> return to root.
+  case 9:  // LEFT tap: skill -1 (Hard -> Normal); dirty stays set.
+    keyTap(SDL_SCANCODE_LEFT, SDLK_LEFT);
+    break;
+  case 10: // RIGHT tap: skill +1 (Normal -> Hard) — persisted value.
+    keyTap(SDL_SCANCODE_RIGHT, SDLK_RIGHT);
+    break;
+  case 11: // ESC tap: Back -> FUN_00420d68 -> dirty persist fires.
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 12: // Enter tap: root sel 3 -> re-enter options (skill held).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 13: // ESC tap: Back -> root; no mutation -> no persist call.
     keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   default:

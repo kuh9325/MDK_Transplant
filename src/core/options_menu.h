@@ -82,7 +82,9 @@ struct OptionsMenuLabels {
 
 // Semantic activation outputs of FUN_00420eac — emitted only; the
 // original dispatch targets are child screens/settings mutations and
-// are deferred (documented per case below).
+// are deferred (documented per case below). The skill mutation itself
+// is NOT deferred: it is applied to the controller's skill state in
+// the same dispatch that emits the cycle event.
 enum class OptionsAction {
   None = 0,
   Help,           // sel 0 -> FUN_0041d540 (mode 0x0a help screen)
@@ -92,12 +94,17 @@ enum class OptionsAction {
   Keyboard,       // sel 4 -> FUN_0041f030 (mode 5) — f4-flag gated
   Performance,    // sel 5 -> FUN_00421e70 (mode 6 perf screen)
   SkillCyclePrev, // sel 6 LEFT   -> DAT_0054147a -1 (wraps 0->2) +
-                  //               DAT_00541486=1 dirty — mutation deferred
+                  //               DAT_00541486=1 dirty (0x421085)
   SkillCycleNext, // sel 6 RIGHT/activate -> DAT_0054147a +1 (wraps 2->0)
-                  //               + dirty — mutation deferred
+                  //               + dirty (0x421131 / 0x4211cb)
   Display,        // sel 7 -> FUN_0041d020 (mode 7 display screen)
-  Back,           // sel 8 OR DIK_ESCAPE -> FUN_00420d68 (mode 0 ->
-                  // restore saved palette, re-enter front-end root)
+  Back,           // sel 8 activate OR DIK_ESCAPE -> FUN_00420d68
+                  // (mode 0 -> restore saved palette, re-enter root).
+                  // OBSERVED quirk: LEFT/RIGHT on row 8 do NOT reach
+                  // this — both dispatch tables bound at `cmp eax,7;
+                  // ja`, so the QUIT row falls through to the next
+                  // query (0x420fbe/0x4210b2 vs activate's 0x421167
+                  // `cmp eax,8; ja`).
 };
 
 // The frozen frame state for the static preview (OBSERVED entry
@@ -105,11 +112,20 @@ enum class OptionsAction {
 // the (unchanged) logical mouse position.
 struct OptionsMenuSpec {
   int selection = kOptionsEntrySelection;
-  int skill = 0;          // DAT_0054147a canonical (no config entry)
+  int skill = 1;          // DAT_0054147a canonical 1 — the factory
+                          // default (mirror byte @0x49b26e = 1) loaded
+                          // by FUN_00425de4 at startup; BUILD_A's
+                          // MDK.CFG carries no Skill override
   bool devHidden = false; // DAT_005414f4 ("-mapok") canonical 0
   int arrowX = 300;       // logical mouse — NOT reset on entry
   int arrowY = 180;
 };
+
+// OBSERVED skill-record pick (0x421254..0x4212bf): `test eax,eax` ->
+// OM_SK_0, `cmp eax,1` -> OM_SK_1, anything else -> OM_SK_2.
+inline int optionsSkillRecordIndex(int skill) {
+  return skill == 0 ? 0 : skill == 1 ? 1 : 2;
+}
 
 // The reconstructed controller — FUN_00420eac input/selection block.
 // Frame protocol mirrors the original main loop exactly as the root
@@ -124,13 +140,17 @@ public:
   // Mirrors FUN_00420cf0: selection 8; everything else carries over
   // from the shared machine state `s` (mouse, tick, deadlines, latch,
   // ramp, timing). `devHidden` is DAT_005414f4 (canonical 0); `skill`
-  // is DAT_0054147a (canonical 0 -> "Skill - Easy").
+  // is DAT_0054147a (canonical 1 -> "Skill - Normal"); `settingsDirty`
+  // is DAT_00541486 (0 unless an earlier settings screen latched it).
   OptionsMenuController(const FrontendMachineState& s, bool devHidden,
-                        int skill);
+                        int skill, bool settingsDirty = false);
 
   int selection() const { return selection_; }   // _DAT_0054bd34
   int skill() const { return skill_; }           // DAT_0054147a
   bool devHidden() const { return devHidden_; }  // DAT_005414f4
+  // DAT_00541486 — latched 1 by every skill mutation, consumed by
+  // FUN_00420d68 on exit (gated FUN_004260ac persist, then cleared).
+  bool settingsDirty() const { return settingsDirty_; }
   int mouseX() const { return m_.mouseX; }
   int mouseY() const { return m_.mouseY; }
   int tick() const { return m_.tick; }
@@ -141,9 +161,9 @@ public:
 
   // Per-frame update in the original order:
   //   prev query -> next query -> mouse hit-test -> Esc -> LEFT ->
-  //   RIGHT -> activate. Non-skill dispatches end the frame early
-  //   (the original returns immediately on mode-change branches);
-  //   skill cycles fall through to the next query.
+  //   RIGHT -> activate. Terminal dispatches end the frame early (the
+  //   original RETs before the draw block); row 6 mutations and row 8
+  //   under LEFT/RIGHT fall through to the next query.
   void update(const FrontendMenuInput& in);
 
   // FUN_00423a24 keyed (-1, itemY) — called per drawn row in draw
@@ -165,15 +185,20 @@ public:
   bool frameEndedEarly() const { return endedEarly_; }
 
 private:
-  // The shared dispatch: returns true when the selection maps to a
-  // non-skill action (the original returns right after the call).
-  // Skill cycles record their action and return false so the caller
-  // continues into the next query.
-  bool dispatch(bool next);
+  // Which query is dispatching — the three dispatch tables
+  // (0x420e48/0x420e68/0x420e88) differ on rows 6 and 8.
+  enum class Query { Left, Right, Activate };
+  // The shared dispatch: returns true when the original's branch ends
+  // the frame (RET before the draw block — terminal rows 0,1,5,7, the
+  // hidden-row no-op, and activate-8's FUN_00420d68). Returns false
+  // when control falls through: row 6 after its in-place mutation, and
+  // row 8 under LEFT/RIGHT (`cmp eax,7; ja` — OBSERVED bound quirk).
+  bool dispatch(Query q);
 
   FrontendMachineState m_;   // the shared globals block
   int selection_;            // _DAT_0054bd34
-  int skill_;                // DAT_0054147a (read-only in Phase 4F)
+  int skill_;                // DAT_0054147a — mutated by row 6
+  bool settingsDirty_;       // DAT_00541486
   bool devHidden_;           // DAT_005414f4 ("-mapok")
   OptionsAction action_ = OptionsAction::None;
   // Whether the last update() hit a dispatch-branch RET — see

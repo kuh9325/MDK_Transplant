@@ -8,9 +8,10 @@
 namespace mdk {
 
 OptionsMenuController::OptionsMenuController(const FrontendMachineState& s,
-                                             bool devHidden, int skill)
+                                             bool devHidden, int skill,
+                                             bool settingsDirty)
     : m_(s), selection_(kOptionsEntrySelection), skill_(skill),
-      devHidden_(devHidden) {}
+      settingsDirty_(settingsDirty), devHidden_(devHidden) {}
 
 OptionsAction OptionsMenuController::consumeAction() {
   const OptionsAction a = action_;
@@ -18,13 +19,16 @@ OptionsAction OptionsMenuController::consumeAction() {
   return a;
 }
 
-// The shared FUN_00420eac dispatch. `next` selects the skill-cycle
-// direction (LEFT -> -1, RIGHT/activate -> +1). Every non-skill item
-// emits its semantic action and returns true (the original's branch
-// calls the child-screen entry and returns immediately). Rows 2,3,4
+// The shared FUN_00420eac dispatch, once per direction query. Every
+// terminal item emits its semantic action and returns true (the
+// original's branch calls the child-screen entry and RETs). Rows 2,3,4
 // activated while DAT_005414f4 is set are a no-op in the original —
-// they still return true here (frame ends, no action).
-bool OptionsMenuController::dispatch(bool next) {
+// they still return true here (bare epilogue at 0x420fd3: frame ends,
+// no draw). Row 6 mutates DAT_0054147a in place and latches the dirty
+// flag, then falls through (returns false). Row 8 dispatches only
+// under the activate query — the LEFT/RIGHT tables bound at
+// `cmp eax,7; ja`, so LEFT/RIGHT on OM_QUIT fall through too.
+bool OptionsMenuController::dispatch(Query q) {
   switch (selection_) {
   case 0: action_ = OptionsAction::Help; return true;
   case 1: action_ = OptionsAction::Sound; return true;
@@ -39,14 +43,29 @@ bool OptionsMenuController::dispatch(bool next) {
     return true;
   case 5: action_ = OptionsAction::Performance; return true;
   case 6:
-    // DAT_0054147a -1/+1 with wrap + DAT_00541486=1 — the original
-    // mutates the skill setting and falls through to the draw block.
-    // Phase 4F emits the semantic event only; the value is unchanged.
-    action_ = next ? OptionsAction::SkillCycleNext
-                   : OptionsAction::SkillCyclePrev;
+    // 0x421085 (LEFT): `dec; jl -> =2`. 0x421131 (RIGHT) / 0x4211cb
+    // (activate): `inc; cmp 3; jge -> =0`. All three set
+    // DAT_00541486=1 and fall through.
+    if (q == Query::Left) {
+      skill_ -= 1;
+      if (skill_ < 0) skill_ = 2;
+    } else {
+      skill_ += 1;
+      if (skill_ > 2) skill_ = 0;
+    }
+    settingsDirty_ = true;
+    action_ = q == Query::Left ? OptionsAction::SkillCyclePrev
+                               : OptionsAction::SkillCycleNext;
     return false;
   case 7: action_ = OptionsAction::Display; return true;
-  default: action_ = OptionsAction::Back; return true;  // sel 8
+  case 8:
+    if (q == Query::Activate) {
+      action_ = OptionsAction::Back;  // 0x42101b -> FUN_00420d68
+      return true;
+    }
+    return false;  // LEFT/RIGHT bound >7 -> next query (OBSERVED)
+  default:
+    return false;  // out of range: `ja` -> next query / draw
   }
 }
 
@@ -115,19 +134,21 @@ void OptionsMenuController::update(const FrontendMenuInput& in) {
 
   // 5. LEFT query (FUN_004238bc — DIK_LEFT held). On skill row 6 this
   // cycles the skill DOWN (DAT_0054147a -1, wraps 0->2) and falls
-  // through to the RIGHT query; on any other row it dispatches the
-  // item's action and the frame ends.
+  // through to the RIGHT query; on row 8 it is a silent fall-through
+  // (`cmp eax,7; ja` at 0x420fbe); on rows 0-5,7 it dispatches and the
+  // frame ends.
   if (frontendRepeatQuery(m_.tick, in.leftHeld, m_.leftDeadline) &&
-      dispatch(false)) {
+      dispatch(Query::Left)) {
     endedEarly_ = true;
     return;
   }
 
   // 6. RIGHT query (FUN_00423940 — DIK_RIGHT held). On row 6 this
   // cycles the skill UP (+1, wraps 2->0) and falls through to the
-  // activate query; otherwise it dispatches and ends the frame.
+  // activate query; row 8 falls through as well (`ja` at 0x4210b2);
+  // otherwise it dispatches and ends the frame.
   if (frontendRepeatQuery(m_.tick, in.rightHeld, m_.rightDeadline) &&
-      dispatch(true)) {
+      dispatch(Query::Right)) {
     endedEarly_ = true;
     return;
   }
@@ -146,8 +167,8 @@ void OptionsMenuController::update(const FrontendMenuInput& in) {
   if (fire) {
     m_.buttonLatch = false;
     // OBSERVED: a terminal dispatch RETs before the draw block; the
-    // skill-cycle case falls through to the draw instead.
-    endedEarly_ = dispatch(true);
+    // row-6 skill cycle falls through to the draw instead.
+    endedEarly_ = dispatch(Query::Activate);
   }
 
   // 8. Draw: handled by the renderer (clear -> labels -> ARROW ->

@@ -13,6 +13,7 @@
 #include "core/framebuffer.h"
 #include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
+#include "core/frontend_settings.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <sstream>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -4225,9 +4227,11 @@ void test_options_controller() {
     CHECK(ctl.consumeAction() == mdk::OptionsAction::Back);
   }
 
-  // LEFT/RIGHT on the skill row emit the cycle actions but do NOT
-  // mutate the value (deferred) and do NOT move the selection; the
-  // frame falls through to the next query.
+  // LEFT/RIGHT/Enter on the skill row mutate DAT_0054147a in place —
+  // LEFT -1 wraps <0 -> 2 (0x421085), RIGHT/activate +1 wraps >2 -> 0
+  // (0x421131/0x4211cb) — latch DAT_00541486, emit the cycle event,
+  // and fall through: the selection never moves and the frame still
+  // reaches the draw block.
   {
     mdk::FrontendMachineState s;
     s.mouseY = 256;   // band trunc(233/36)=6 -> Skill
@@ -4235,22 +4239,49 @@ void test_options_controller() {
     mdk::FrontendMenuInput in;
     in.mouseDy = 1;
     ctl.update(in);
-    CHECK(ctl.selection() == 6);
+    CHECK(ctl.selection() == 6 && ctl.skill() == 0);
+    CHECK(!ctl.settingsDirty());
     in = {};
     in.leftHeld = true;
     ctl.update(in);
     CHECK(ctl.consumeAction() == mdk::OptionsAction::SkillCyclePrev);
-    CHECK(ctl.selection() == 6 && ctl.skill() == 0);  // unchanged
+    CHECK(ctl.selection() == 6 && ctl.skill() == 2);   // 0-1 wraps
+    CHECK(ctl.settingsDirty() && !ctl.frameEndedEarly());
     in = {};
     in.rightHeld = true;
     ctl.update(in);
     CHECK(ctl.consumeAction() == mdk::OptionsAction::SkillCycleNext);
-    CHECK(ctl.selection() == 6 && ctl.skill() == 0);
+    CHECK(ctl.selection() == 6 && ctl.skill() == 0);   // 2+1 wraps
     // Enter on skill row is a forward cycle.
     in = {};
     in.confirmEdge = true;
     ctl.update(in);
     CHECK(ctl.consumeAction() == mdk::OptionsAction::SkillCycleNext);
+    CHECK(ctl.skill() == 1 && !ctl.frameEndedEarly());
+  }
+
+  // OBSERVED bound quirk: the LEFT/RIGHT dispatch tables gate at
+  // `cmp eax,7; ja` — on row 8 (OM_QUIT) both are silent fall-throughs
+  // to the next query. Only the activate query (bound 8) or Esc
+  // reaches FUN_00420d68.
+  {
+    mdk::FrontendMachineState s;
+    mdk::OptionsMenuController ctl(s, false, 1);  // entry sel = 8
+    mdk::FrontendMenuInput in;
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.pendingAction() == mdk::OptionsAction::None);
+    CHECK(ctl.selection() == 8 && !ctl.frameEndedEarly());
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.pendingAction() == mdk::OptionsAction::None);
+    CHECK(ctl.selection() == 8 && !ctl.frameEndedEarly());
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::OptionsAction::Back);
+    CHECK(ctl.frameEndedEarly());
   }
 
   // LEFT/RIGHT on a non-skill row dispatch that row's action (the
@@ -4326,6 +4357,163 @@ void test_options_controller() {
       CHECK(near(ctl.itemScale(y8, false), dec[f], 1e-5));
       CHECK(near(ctl.itemScale(y0, true), inc[f], 1e-5));
     }
+  }
+
+  // Phase 4G label-width consequence: mutating skill on row 6 swaps
+  // the drawn record ("Skill - Easy/Normal/Hard" — different
+  // measured widths, so the centered x shifts) but the FUN_00423a24
+  // item key is positional — (-1, y) — and never sees the label.
+  // OBSERVED structure: no cur/prev key swap, no accumulator reset,
+  // no snap — the selected scale keeps ramping from its acc.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 256;   // band trunc(233/36)=6 -> Skill
+    mdk::OptionsMenuController ctl(s, false, 1);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    const int y6 = 49 + 36 * 6;
+    CHECK(near(ctl.itemScale(y6, true), 0.65));  // first draw: acc 0
+    CHECK(near(ctl.itemScale(y6, true), 0.72f, 1e-5));  // acc 1
+    // RIGHT mutates the label (Normal -> Hard, narrower text).
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.skill() == 2);
+    const auto& ramp = ctl.machineState().ramp;
+    CHECK(ramp.curX == -1 && ramp.curY == y6);   // keys untouched
+    // The next selected draw continues the ramp (acc 2 -> 0.79) —
+    // NOT a 0.65 restart and no 1.0-acc decay of a "previous" key.
+    CHECK(near(ctl.itemScale(y6, true), 0.79f, 1e-5));
+    // LEFT mutates again (Hard -> Normal): still the same key state.
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.skill() == 1);
+    CHECK(ramp.curX == -1 && ramp.curY == y6);
+    CHECK(near(ctl.itemScale(y6, true), 0.86f, 1e-5));  // acc 3
+  }
+}
+
+// Phase 4G — native-owned frontend settings persistence (Skill
+// only): the FUN_004260ac/FUN_00425de4 contract reimplemented
+// against caller-supplied paths outside the read-only DataRoot.
+void test_frontend_settings() {
+  // Factory default: skill 1 (Normal) — the FUN_00425de4 defaults
+  // copy result for BUILD_A (no Skill line in its MDK.CFG).
+  {
+    const mdk::FrontendSettings s;
+    CHECK(s.skill == 1);
+  }
+
+  // Delta serialization (FUN_004260ac, OBSERVED): header + blank
+  // line always; `Skill = %d` iff != factory 1. CRLF lines like
+  // BUILD_A's on-disk MDK.CFG.
+  {
+    const std::string easy =
+        mdk::serializeFrontendSettings(mdk::FrontendSettings{0});
+    const std::string normal =
+        mdk::serializeFrontendSettings(mdk::FrontendSettings{1});
+    const std::string hard =
+        mdk::serializeFrontendSettings(mdk::FrontendSettings{2});
+    CHECK(easy.find("; MDK Configuration file automatically "
+                    "generated by MDK") == 0);
+    CHECK(easy.find("Skill = 0\r\n") != std::string::npos);
+    CHECK(normal.find("; MDK Configuration file") == 0);
+    CHECK(normal.find("Skill") == std::string::npos);
+    CHECK(hard.find("Skill = 2\r\n") != std::string::npos);
+  }
+
+  // Parser (FUN_00425de4 apply loop, OBSERVED shape): defaults
+  // first, `name = value` lines applied in order — the last valid
+  // Skill line wins; keys match case-insensitively (FUN_0042fab4's
+  // `and 0xdf` fold).
+  {
+    CHECK(mdk::parseFrontendSettings("").settings.skill == 1);
+    CHECK(mdk::parseFrontendSettings("Skill = 0").settings.skill == 0);
+    CHECK(mdk::parseFrontendSettings("Skill = 1").settings.skill == 1);
+    CHECK(mdk::parseFrontendSettings("Skill = 2").settings.skill == 2);
+    CHECK(mdk::parseFrontendSettings("SKILL = 2").settings.skill == 2);
+    CHECK(mdk::parseFrontendSettings("skill=0").settings.skill == 0);
+    // Comments, blank lines, and unknown keys are skipped — the
+    // original's apply loop only touches table entries it knows.
+    const auto p = mdk::parseFrontendSettings(
+        "; MDK Configuration file automatically generated by MDK\r\n"
+        "\r\nSoundIDX = 7\r\nSkill = 0 ; easy\r\n");
+    CHECK(p.settings.skill == 0 && p.ignoredSkillLines == 0);
+    // Last valid line wins (sequential apply, like the original).
+    CHECK(mdk::parseFrontendSettings("Skill = 0\nSkill = 2\n")
+              .settings.skill == 2);
+    // A serialized file round-trips through the parser.
+    CHECK(mdk::parseFrontendSettings(
+              mdk::serializeFrontendSettings(mdk::FrontendSettings{0}))
+              .settings.skill == 0);
+    CHECK(mdk::parseFrontendSettings(
+              mdk::serializeFrontendSettings(mdk::FrontendSettings{2}))
+              .settings.skill == 2);
+  }
+
+  // NATIVE hardening (not an original-behavior claim): malformed
+  // or out-of-range Skill lines are ignored and counted — the
+  // running value is kept.
+  {
+    auto p = mdk::parseFrontendSettings("Skill = abc");
+    CHECK(p.settings.skill == 1 && p.ignoredSkillLines == 1);
+    p = mdk::parseFrontendSettings("Skill = 7");
+    CHECK(p.settings.skill == 1 && p.ignoredSkillLines == 1);
+    p = mdk::parseFrontendSettings("Skill = -1");
+    CHECK(p.settings.skill == 1 && p.ignoredSkillLines == 1);
+    p = mdk::parseFrontendSettings("Skill = ");
+    CHECK(p.settings.skill == 1 && p.ignoredSkillLines == 1);
+    // A bad line does not clobber an earlier good one.
+    p = mdk::parseFrontendSettings("Skill = 0\nSkill = 9\n");
+    CHECK(p.settings.skill == 0 && p.ignoredSkillLines == 1);
+  }
+
+  // Temp-file round trips — Easy / Normal / Hard through the real
+  // native-owned file seam (never near the data root).
+  {
+    std::string err;
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto cfg = dir / "mdk_p4g_settings_test.cfg";
+    for (const int skill : {0, 1, 2}) {
+      CHECK(mdk::saveFrontendSettingsFile(
+          cfg, mdk::FrontendSettings{skill}, &err));
+      auto disk = mdk::loadFrontendSettingsFile(cfg, &err);
+      CHECK(disk && disk->settings.skill == skill &&
+            disk->ignoredSkillLines == 0);
+      // The on-disk text matches the serializer exactly.
+      std::ifstream in(cfg, std::ios::binary);
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      CHECK(ss.str() ==
+            mdk::serializeFrontendSettings(
+                mdk::FrontendSettings{skill}));
+    }
+    std::filesystem::remove(cfg);
+  }
+
+  // Fresh-boot: an absent file loads nothing (defaults stand) and
+  // is not an error.
+  {
+    std::string err;
+    const auto cfg = std::filesystem::temp_directory_path() /
+                     "mdk_p4g_absent_test.cfg";
+    std::filesystem::remove(cfg);
+    const auto disk = mdk::loadFrontendSettingsFile(cfg, &err);
+    CHECK(!disk && err.empty());
+  }
+
+  // Write failure is reported, not fatal — the caller decides the
+  // policy (the flow mirrors the original's unconditional clear).
+  {
+    std::string err;
+    const auto bad = std::filesystem::temp_directory_path() /
+                     "mdk_p4g_no_such_dir_xyz" / "cfg";
+    CHECK(!mdk::saveFrontendSettingsFile(
+        bad, mdk::FrontendSettings{0}, &err));
+    CHECK(!err.empty());
   }
 }
 
@@ -4409,6 +4597,217 @@ void test_frontend_flow() {
     CHECK(flow.consumeRootAction() == mdk::FrontendAction::ContinueGame);
     CHECK(flow.screen() == mdk::FrontendScreen::Root);
   }
+
+  // DAT_0054147a is a process global: a skill mutation inside the
+  // options screen persists across the return to root and the next
+  // entry; DAT_00541486 is consumed (cleared) by FUN_00420d68.
+  {
+    mdk::FrontendFlowController flow(true);
+    CHECK(flow.skill() == 1);   // canonical factory default (Normal)
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;           // 180 -> 139: root band 3 -> Options
+    flow.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    flow.update(in);
+    flow.consumeRootAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    // Release the button and move into the skill band (y 239..274).
+    in = {};
+    in.mouseDy = 120;   // 139 -> 259 -> band trunc(236/36)=6
+    flow.update(in);
+    CHECK(flow.options().selection() == 6 &&
+          flow.options().skill() == 1);
+    // RIGHT on the skill row: 1 -> 2, dirty latches.
+    in = {};
+    in.rightHeld = true;
+    flow.update(in);
+    CHECK(flow.options().skill() == 2 &&
+          flow.options().settingsDirty());
+    // Esc -> FUN_00420d68 -> root: skill keeps its value, the dirty
+    // flag is consumed.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(flow.skill() == 2 && !flow.settingsDirty());
+    // Re-enter: the mutated skill persists.
+    in = {};
+    in.confirmEdge = true;   // root sel still 3 -> OpenOptions
+    flow.update(in);
+    flow.consumeRootAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.options().skill() == 2 &&
+          !flow.options().settingsDirty());
+  }
+
+  // Phase 4G persistence seam — the FUN_004260ac sink fires only
+  // behind the dirty gate, then the flag clears unconditionally.
+  auto enterAndSelectSkill = [](mdk::FrontendFlowController& f) {
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;            // 180 -> 139: root band 3
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);
+    f.consumeRootAction();
+    in = {};
+    in.mouseDy = 120;            // 139 -> 259: options band 6
+    f.update(in);
+  };
+
+  // No mutation -> clean exit -> the sink is never invoked (the
+  // original's TEST DAT_00541486 skips the writer entirely).
+  {
+    int calls = 0;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings&) {
+          ++calls;
+          return true;
+        });
+    enterAndSelectSkill(flow);
+    CHECK(flow.options().selection() == 6 &&
+          !flow.options().settingsDirty());
+    mdk::FrontendMenuInput in;
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(calls == 0 && !flow.settingsDirty());
+  }
+
+  // Mutation -> exit -> sink fires once with the mutated settings;
+  // the flag clears after the attempt. Re-entry keeps the process
+  // global — Normal -> Hard retained without any reload.
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    enterAndSelectSkill(flow);
+    mdk::FrontendMenuInput in;
+    in.rightHeld = true;         // Normal -> Hard
+    flow.update(in);
+    CHECK(flow.options().skill() == 2 &&
+          flow.options().settingsDirty());
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(calls == 1 && persisted.skill == 2);
+    CHECK(flow.skill() == 2 && !flow.settingsDirty());
+    // Process-lifetime: re-entry sees Hard, no persist machinery.
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    flow.consumeRootAction();
+    CHECK(flow.options().skill() == 2 &&
+          !flow.options().settingsDirty());
+  }
+
+  // Normal -> Hard -> Normal: the dirty latch stays set through the
+  // return to the default — the sink STILL fires at exit (dirty
+  // gate), but the serialized settings carry no Skill line
+  // (default-delta). The two mechanisms are independent.
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    enterAndSelectSkill(flow);
+    mdk::FrontendMenuInput in;
+    in.rightHeld = true;
+    flow.update(in);             // 1 -> 2
+    in = {};
+    in.leftHeld = true;
+    flow.update(in);             // 2 -> 1
+    CHECK(flow.options().skill() == 1 &&
+          flow.options().settingsDirty());
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(calls == 1 && persisted.skill == 1);
+    CHECK(mdk::serializeFrontendSettings(persisted).find("Skill") ==
+          std::string::npos);
+    CHECK(!flow.settingsDirty());
+  }
+
+  // Write failure: the sink reports failure, the flag still clears
+  // (0x420dbc — the original clears unconditionally after the
+  // FUN_004260ac call, whose fopen-failure path returns silently),
+  // and nothing crashes. The mutation remains process-lifetime.
+  {
+    int calls = 0;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings&) {
+          ++calls;
+          return false;   // simulated write failure
+        });
+    enterAndSelectSkill(flow);
+    mdk::FrontendMenuInput in;
+    in.rightHeld = true;
+    flow.update(in);
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(calls == 1);
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(flow.skill() == 2 && !flow.settingsDirty());
+  }
+
+  // Process-restart round trip: instance A mutates and persists
+  // through the real file seam; instance B loads the same file at
+  // construction — Easy and Hard both restore.
+  {
+    std::string err;
+    const auto cfg = std::filesystem::temp_directory_path() /
+                     "mdk_p4g_flow_restart.cfg";
+    for (const int cycles : {1, 2}) {   // RIGHT x1 -> Hard, x2 -> Easy
+      int calls = 0;
+      {
+        mdk::FrontendFlowController flowA(
+            true, {}, [&](const mdk::FrontendSettings& s) {
+              ++calls;
+              std::string e;
+              return mdk::saveFrontendSettingsFile(cfg, s, &e);
+            });
+        enterAndSelectSkill(flowA);
+        mdk::FrontendMenuInput in;
+        for (int i = 0; i < cycles; ++i) {
+          in = {};
+          in.rightHeld = true;
+          flowA.update(in);
+          in = {};   // release — the repeat deadline resets
+          flowA.update(in);
+        }
+        in = {};
+        in.cancelEdge = true;
+        flowA.update(in);
+        flowA.consumeOptionsAction();
+      }
+      CHECK(calls == 1);
+      const auto disk = mdk::loadFrontendSettingsFile(cfg, &err);
+      const int want = cycles == 1 ? 2 : 0;
+      CHECK(disk && disk->settings.skill == want);
+      // Instance B: fresh controller seeded from the loaded file.
+      mdk::FrontendFlowController flowB(true, disk->settings, {});
+      CHECK(flowB.skill() == want);
+      enterAndSelectSkill(flowB);
+      CHECK(flowB.options().skill() == want);
+    }
+    std::filesystem::remove(cfg);
+  }
 }
 
 // Phase 4F — options sub-menu renderers.
@@ -4417,7 +4816,7 @@ void test_options_render() {
   auto f = SyntheticFont::make();
   const char* labels[9] = {"Help",      "Sound",    "Joystick",
                            "Mouse",     "Keyboard", "Performance",
-                           "Skill - Easy", "Display", "Quit"};
+                           "Skill - Normal", "Display", "Quit"};
   for (const char* l : labels) {
     for (const char* c = l; *c; ++c) {
       f.put32(static_cast<std::uint8_t>(*c) * 4,
@@ -4550,6 +4949,7 @@ int main() {
   test_frontend_menu();
   test_frontend_controller();
   test_options_controller();
+  test_frontend_settings();
   test_frontend_flow();
   test_options_render();
   test_indexed_image_blit();

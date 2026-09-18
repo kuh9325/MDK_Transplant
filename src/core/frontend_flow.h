@@ -9,12 +9,16 @@
 //     uploads DAT_00540820 (FUN_0046d208). No mouse/tick/ramp reset —
 //     the shared globals continue on the new screen.
 //
-//   Options -> Root (FUN_00420eac selection 8 / DIK_ESCAPE):
-//     FUN_00420d68 — persists settings when the dirty flag
-//     (DAT_00541486) is set (FUN_004260ac — deferred), calls
-//     FUN_00402590 to resume the front-end list, restores the saved
-//     palette (FUN_0046d208 of svlut), releases svlut, and writes
-//     DAT_00541493 = 0 (root mode). Again no input-state reset.
+//   Options -> Root (FUN_00420eac selection 8 activate / DIK_ESCAPE —
+//   LEFT/RIGHT on row 8 are bound-gated no-ops):
+//     FUN_00420d68 — writes DAT_00541493 = 0 (root mode), persists
+//     settings when the dirty flag (DAT_00541486) is set — Phase 4G
+//     routes that FUN_004260ac call through the native-owned
+//     SettingsPersistSink seam below (frontend_settings.h), never
+//     into the data root — runs the DAT_00541492-gated
+//     FUN_00402590/FUN_004348d4 calls, restores the saved palette
+//     (FUN_0046d208 of svlut), and releases svlut. Again no
+//     input-state reset.
 //
 //   This controller owns the two reconstructed screens and performs
 //   exactly those two transitions. It is deliberately NOT a generic
@@ -24,8 +28,10 @@
 #define MDK_CORE_FRONTEND_FLOW_H
 
 #include "core/frontend_menu.h"
+#include "core/frontend_settings.h"
 #include "core/options_menu.h"
 
+#include <functional>
 #include <optional>
 
 namespace mdk {
@@ -35,12 +41,29 @@ enum class FrontendScreen {
   Options,  // FUN_00420eac — mode 0x0b
 };
 
+// Phase 4G persistence seam — the native-owned counterpart of
+// FUN_004260ac. Invoked by returnToRoot() ONLY when the dirty flag
+// (DAT_00541486) was latched, mirroring the original's TEST/JNZ
+// gate; the flag then clears unconditionally (0x420dbc — the
+// original clears after the call regardless of the write's
+// success, and FUN_004260ac itself returns silently when its fopen
+// fails). Return value: whether the write succeeded — observable
+// by the caller for diagnostics; the flow does not branch on it.
+using SettingsPersistSink = std::function<bool(const FrontendSettings&)>;
+
 class FrontendFlowController {
 public:
   // Mirrors the front-end entry (FUN_0041d85c): the root controller
-  // starts in its proven entry state; the options global display
-  // fields start at their canonical values (skill 0, -mapok clear).
-  explicit FrontendFlowController(bool savesExist);
+  // starts in its proven entry state; the options globals start at
+  // the post-config values `initial` carries (the FUN_00425de4
+  // defaults copy + config application — canonical BUILD_A result:
+  // skill 1, dirty clear; the native -mapok flag is not yet modeled
+  // and stays clear). `sink` is the Phase 4G persistence seam; with
+  // no sink installed the dirty-flag lifecycle still runs but no
+  // write is attempted (like FUN_004260ac's silent fopen failure).
+  explicit FrontendFlowController(bool savesExist,
+                                  const FrontendSettings& initial = {},
+                                  SettingsPersistSink sink = {});
 
   FrontendScreen screen() const { return screen_; }
   bool inOptions() const { return screen_ == FrontendScreen::Options; }
@@ -67,6 +90,8 @@ public:
   // across entries — they belong to the flow, not one controller.
   int skill() const { return skill_; }
   bool devHidden() const { return devHidden_; }
+  // DAT_00541486 — the shared settings-dirty flag (see returnToRoot).
+  bool settingsDirty() const { return settingsDirty_; }
 
 private:
   void enterOptions();   // FUN_00420cf0
@@ -75,8 +100,16 @@ private:
   FrontendMenuController root_;
   std::optional<OptionsMenuController> options_;
   FrontendScreen screen_ = FrontendScreen::Root;
-  int skill_ = 0;          // DAT_0054147a — canonical 0 ("Skill - Easy")
-  bool devHidden_ = false; // DAT_005414f4 — canonical 0 (no -mapok)
+  // DAT_0054147a — the post-config startup value (`initial`): the
+  // FUN_00425de4 defaults copy yields factory 1 ("Skill - Normal"),
+  // then the config applies `Skill = n` overrides. Mutations inside
+  // the options screen write back here — it is a process global,
+  // not per-screen state.
+  int skill_;
+  bool devHidden_ = false;      // DAT_005414f4 — canonical 0 (no -mapok)
+  bool settingsDirty_ = false;  // DAT_00541486 — canonical 0 (inside
+                                // the factory-defaults copy block)
+  SettingsPersistSink persistSink_;  // FUN_004260ac seam — see above
 };
 
 } // namespace mdk

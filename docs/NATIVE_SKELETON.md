@@ -58,18 +58,23 @@ resources itself; requires `--data-path`),
 `--preview-options-submenu` (Phase 4F: compose the static options
 sub-menu frame — framebuffer clear + `OM_*` centered FONTBIG labels
 + `ARROW` under the system palette head; requires `--data-path`),
-`--interactive-frontend` (Phase 4E/4F: run the reconstructed
+`--interactive-frontend` (Phase 4E/4F/4G: run the reconstructed
 FUN_0041dc90 root-menu controller, now flowing into the FUN_00420eac
 options sub-menu on `OpenOptions` — original-style UP/DOWN/LEFT/
 RIGHT selection with key repeat, gated mouse hit-test, scale ramp,
-semantic activation actions, Esc/Quit return to root; requires
+Skill row mutation + dirty latch, Esc/Quit return to root; requires
 `--data-path`). `--frontend-root-only` is a test-only switch that
 keeps `OpenOptions` deferred so the Phase 4E single-screen
-regression snapshot stays reproducible. With `--selftest`, the
-interactive mode runs a deterministic injected-event script (real
-device input is filtered out for the duration; the timing machine
-is fed the original's paced regime — dt = 100/3 ms per frame — so
-runs and digests are machine-independent) and reports PASS/FAIL.
+regression snapshot stays reproducible. `--settings-file FILE`
+(Phase 4G) gives the native-owned Skill persistence seam its path
+(load at startup if present, write on the options-exit dirty gate;
+always outside `--data-path` — the original's `C:\MDK.CFG`/
+relative-file resolution is deliberately not reproduced). With
+`--selftest`, the interactive mode runs a deterministic
+injected-event script (real device input is filtered out for the
+duration; the timing machine is fed the original's paced regime —
+dt = 100/3 ms per frame — so runs and digests are
+machine-independent) and reports PASS/FAIL.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -105,7 +110,12 @@ src/
                                   (FUN_00420eac, 4F)
              frontend_flow.*    — two-screen flow controller:
                                   FUN_00420cf0 enter options,
-                                  FUN_00420d68 return to root (4F)
+                                  FUN_00420d68 return to root +
+                                  dirty-gated persist sink (4F/4G)
+             frontend_settings.*— native-owned Skill persistence:
+                                  FrontendSettings + serialize/
+                                  parse/file seam — caller-supplied
+                                  path, never under --data-path (4G)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -230,8 +240,9 @@ uploaded to Metal).
   front-end frame (`--preview-options`, `MDKOPT` + `OPT0..OPT4` +
   `ARROW` in the proven draw order); and the interactive root-menu
   controller (`--interactive-frontend`, same composition driven by the
-  reconstructed FUN_0041dc90 selection/scale/activation state —
-  semantic actions only, downstream systems deferred)
+  reconstructed FUN_0041dc90 selection/scale/activation state, flowing
+  into the FUN_00420eac options sub-menu with the Skill row's real
+  mutation + native-owned persistence seam — child screens deferred)
   — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.

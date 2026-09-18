@@ -36,6 +36,7 @@ add_library(mdk_core STATIC
   src/core/framebuffer.cpp
   src/core/frontend_flow.cpp
   src/core/frontend_menu.cpp
+  src/core/frontend_settings.cpp
   src/core/fti_directory.cpp
   src/core/fti_font.cpp
   src/core/fti_sprite.cpp

@@ -55,6 +55,12 @@ struct AppConfig {
   // alone so OpenOptions stays a deferred semantic action — keeps the
   // pre-transition regression snapshot reproducible.
   bool frontendRootOnly = false;
+  // --settings-file FILE (Phase 4G): the native-owned frontend
+  // settings location — loaded at startup (FUN_00425de4 analogue)
+  // and written when the options exit persists a dirty Skill
+  // (FUN_004260ac analogue). MUST be outside the read-only
+  // DataRoot — the port never writes into original data.
+  std::optional<std::filesystem::path> settingsFile;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
   bool relativeMouse = true;  // --no-relative-mouse to disable
