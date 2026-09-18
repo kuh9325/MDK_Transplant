@@ -128,10 +128,24 @@ Boundary notes (intentions, not commitments):
 > through raw integer bits (denormal `1.4013e-45` emission
 > preserved), the W-set axis/button maps — while the flow
 > overlays them on `baseSettings_` so the D-set/scales round-
-> trip untouched. The flow is now Root → Options →
-> {Display|Sound|Mouse} → Options → Root and the settings
-> seam persists all proven entries in table order on the
-> options exit.
+> trip untouched. Phase 4K adds the fourth real child screen:
+> `KeyboardMenuController` (`keyboard_menu.*`) reproduces
+> `FUN_0041f18c` entered via `FUN_0041f030` from options row 4 —
+> the 21-row machine (19 binding rows in two columns +
+> `KM_RESET` + `KM_QUIT`), the corrected entry selection 20,
+> the raw-key capture FSM over the DirectInput-derived 0..127
+> internal key domain (lowest-set-bit edge pick via the
+> `FUN_00419168` contract, `FUN_0041925c` right-modifier fold,
+> Esc-cancel before poll, duplicates allowed, same-key no-op
+> leaves dirty alone), and `FUN_00425db0`'s full 29-dword
+> reset — all 19 visible bindings plus the 10 hidden
+> weapon-hotkey globals — that always latches dirty. Keyboard
+> mutates settings-table entries 69–87 only; the hidden 10
+> live in the flow's `keyGlobals_` block for Phase 5 without
+> becoming fake `MDK.CFG` entries. The flow is now Root →
+> Options → {Display|Sound|Mouse|Keyboard} → Options → Root
+> and the settings seam persists all proven entries in table
+> order on the options exit.
 > See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they

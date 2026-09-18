@@ -182,6 +182,29 @@ std::string serializeFrontendSettings(const FrontendSettings& s) {
     emitFloat(out, "MouseYReversed",
               std::bit_cast<float>(s.mouseYReversed));
   }
+  // Entries 69-87: the keyboard block — type-0 dword slots in
+  // ORIGINAL internal key codes, emit iff != the 0x49b1f2 mirror
+  // (BUILD_A emits none — all bindings sit at factory).
+  const struct {
+    const char* key;
+    int value;
+    int factory;
+  } keyEntries[19] = {
+      {"KeyLeft", s.keyLeft, 105},       {"KeyRight", s.keyRight, 106},
+      {"KeyUp", s.keyUp, 103},           {"KeyDown", s.keyDown, 108},
+      {"KeyJump", s.keyJump, 56},        {"KeySide", s.keySide, 45},
+      {"KeyFire", s.keyFire, 29},        {"KeySniper", s.keySniper, 57},
+      {"KeyTurbo", s.keyTurbo, 42},      {"KeySturbo", s.keySturbo, 58},
+      {"KeyLookUp", s.keyLookUp, 30},    {"KeyLookDown", s.keyLookDown, 44},
+      {"KeyZoomIn", s.keyZoomIn, 30},    {"KeyZoomOut", s.keyZoomOut, 44},
+      {"KeyItemNext", s.keyItemNext, 27},{"KeyItemPrev", s.keyItemPrev, 26},
+      {"KeyItemUse", s.keyItemUse, 28},  {"KeySideL", s.keySideL, 51},
+      {"KeySideR", s.keySideR, 52}};
+  for (const auto& e : keyEntries) {
+    if (e.value != e.factory) {
+      emitInt(out, e.key, static_cast<std::uint32_t>(e.value));
+    }
+  }
   if (s.skill != kFrontendSkillDefault) {
     std::snprintf(line, sizeof(line), "Skill = %d\r\n", s.skill);
     out += line;
@@ -345,6 +368,49 @@ FrontendSettingsParse parseFrontendSettings(std::string_view text) {
         continue;
       }
       r.settings.mouseYReversed = std::bit_cast<std::uint32_t>(v);
+    } else if (keyEquals(key, "KeyLeft") || keyEquals(key, "KeyRight") ||
+               keyEquals(key, "KeyUp") || keyEquals(key, "KeyDown") ||
+               keyEquals(key, "KeyJump") || keyEquals(key, "KeySide") ||
+               keyEquals(key, "KeyFire") || keyEquals(key, "KeySniper") ||
+               keyEquals(key, "KeyTurbo") || keyEquals(key, "KeySturbo") ||
+               keyEquals(key, "KeyLookUp") || keyEquals(key, "KeyLookDown") ||
+               keyEquals(key, "KeyZoomIn") || keyEquals(key, "KeyZoomOut") ||
+               keyEquals(key, "KeyItemNext") || keyEquals(key, "KeyItemPrev") ||
+               keyEquals(key, "KeyItemUse") || keyEquals(key, "KeySideL") ||
+               keyEquals(key, "KeySideR")) {
+      // Type-0 (OBSERVED): leading int stored as the ORIGINAL
+      // internal key code 0..127 — NOT translated to/from SDL
+      // scancodes (the domain is preserved end to end). NATIVE
+      // hardening: failed parse or out-of-domain values are ignored
+      // and counted (the original stores whatever strtol yields —
+      // that edge is UNKNOWN and deliberately not reproduced).
+      int v = 0;
+      if (!parseLeadingInt(value, &v) || v < 0 ||
+          v > kFrontendKeyCodeMax) {
+        ++r.ignoredKeyLines;
+        continue;
+      }
+      int* slot = nullptr;
+      if (keyEquals(key, "KeyLeft")) slot = &r.settings.keyLeft;
+      else if (keyEquals(key, "KeyRight")) slot = &r.settings.keyRight;
+      else if (keyEquals(key, "KeyUp")) slot = &r.settings.keyUp;
+      else if (keyEquals(key, "KeyDown")) slot = &r.settings.keyDown;
+      else if (keyEquals(key, "KeyJump")) slot = &r.settings.keyJump;
+      else if (keyEquals(key, "KeySide")) slot = &r.settings.keySide;
+      else if (keyEquals(key, "KeyFire")) slot = &r.settings.keyFire;
+      else if (keyEquals(key, "KeySniper")) slot = &r.settings.keySniper;
+      else if (keyEquals(key, "KeyTurbo")) slot = &r.settings.keyTurbo;
+      else if (keyEquals(key, "KeySturbo")) slot = &r.settings.keySturbo;
+      else if (keyEquals(key, "KeyLookUp")) slot = &r.settings.keyLookUp;
+      else if (keyEquals(key, "KeyLookDown")) slot = &r.settings.keyLookDown;
+      else if (keyEquals(key, "KeyZoomIn")) slot = &r.settings.keyZoomIn;
+      else if (keyEquals(key, "KeyZoomOut")) slot = &r.settings.keyZoomOut;
+      else if (keyEquals(key, "KeyItemNext")) slot = &r.settings.keyItemNext;
+      else if (keyEquals(key, "KeyItemPrev")) slot = &r.settings.keyItemPrev;
+      else if (keyEquals(key, "KeyItemUse")) slot = &r.settings.keyItemUse;
+      else if (keyEquals(key, "KeySideL")) slot = &r.settings.keySideL;
+      else slot = &r.settings.keySideR;
+      *slot = v;
     }
     // Unknown keys are skipped — the original's apply loop only
     // touches table entries it knows.

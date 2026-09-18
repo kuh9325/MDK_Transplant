@@ -61,6 +61,37 @@
 //   NOT reproduced: `original/installed/MDK.CFG` and anything under
 //   the data root stay untouched).
 //
+//   Phase 4K adds the proven Keyboard block — settings-table
+//   entries 69-87, all type-0 dword slots holding ORIGINAL internal
+//   key codes (0..127, NOT SDL scancodes — the domain is preserved,
+//   not translated):
+//     69 KeyLeft      DAT_005413fe  factory 105 (UP-arrow ext code)
+//     70 KeyRight     DAT_00541402  factory 106
+//     71 KeyUp        DAT_00541406  factory 103
+//     72 KeyDown      DAT_0054140a  factory 108
+//     73 KeyJump      DAT_0054140e  factory 56  (LALT)
+//     74 KeySide      DAT_00541412  factory 45  ('X')
+//     75 KeyFire      DAT_00541416  factory 29  (LCTRL)
+//     76 KeySniper    DAT_0054141a  factory 57  (SPACE)
+//     77 KeyTurbo     DAT_0054141e  factory 42  (LSHIFT)
+//     78 KeySturbo    DAT_00541422  factory 58  (CAPS)
+//     79 KeyLookUp    DAT_00541426  factory 30  ('A')
+//     80 KeyLookDown  DAT_0054142a  factory 44  ('Z')
+//     81 KeyZoomIn    DAT_0054142e  factory 30  ('A' — factory dup)
+//     82 KeyZoomOut   DAT_00541432  factory 44  ('Z' — factory dup)
+//     83 KeyItemNext  DAT_0054145e  factory 27  (']')
+//     84 KeyItemPrev  DAT_00541462  factory 26  ('[')
+//     85 KeyItemUse   DAT_00541466  factory 28  (RETURN)
+//     86 KeySideL     DAT_0054146a  factory 51  (',')
+//     87 KeySideR     DAT_0054146e  factory 52  ('.')
+//   Entries 69-87 emit between MouseYReversed (68) and Skill (88) —
+//   each iff its value differs from the mirror (BUILD_A's MDK.CFG
+//   carries no Key* lines: all bindings sit at factory defaults).
+//   The ten hidden hotkey globals between KeyZoomOut (0x541432) and
+//   KeyItemNext (0x54145e) — 0x541436..0x54145a, factory 2..11 —
+//   share the same reset block but are NOT table entries: never
+//   read, never written, never shown.
+//
 #ifndef MDK_CORE_FRONTEND_SETTINGS_H
 #define MDK_CORE_FRONTEND_SETTINGS_H
 
@@ -120,7 +151,33 @@ struct FrontendSettings {
   float mouseDZScale = 50.0f;
   bool mouseOn = true;
   std::uint32_t mouseYReversed = 0;
+  // Phase-4K Keyboard block (entries 69-87, type-0 dword slots) —
+  // ORIGINAL internal key codes 0..127, factory values from the
+  // 0x49b1f2 mirror. 'A'(30)/'Z'(44) legitimately bind two actions
+  // each (LookUp+ZoomIn, LookDown+ZoomOut — OBSERVED factory dup).
+  int keyLeft = 105;      // 69  UP-arrow extended code 0x69
+  int keyRight = 106;     // 70  0x6a
+  int keyUp = 103;        // 71  0x67
+  int keyDown = 108;      // 72  0x6c
+  int keyJump = 56;       // 73  LALT 0x38
+  int keySide = 45;       // 74  'X' 0x2d
+  int keyFire = 29;       // 75  LCTRL 0x1d
+  int keySniper = 57;     // 76  SPACE 0x39
+  int keyTurbo = 42;      // 77  LSHIFT 0x2a
+  int keySturbo = 58;     // 78  CAPS 0x3a
+  int keyLookUp = 30;     // 79  'A' 0x1e
+  int keyLookDown = 44;   // 80  'Z' 0x2c
+  int keyZoomIn = 30;     // 81  'A' (factory dup of LookUp)
+  int keyZoomOut = 44;    // 82  'Z' (factory dup of LookDown)
+  int keyItemNext = 27;   // 83  ']' 0x1b
+  int keyItemPrev = 26;   // 84  '[' 0x1a
+  int keyItemUse = 28;    // 85  RETURN 0x1c
+  int keySideL = 51;      // 86  ',' 0x33
+  int keySideR = 52;      // 87  '.' 0x34
 };
+
+// OBSERVED domain for a Key* type-0 slot: internal codes 0..127.
+inline constexpr int kFrontendKeyCodeMax = 127;
 
 inline constexpr int kFrontendSkillDefault = 1;       // @0x49b26e
 inline constexpr int kFrontendSkillMin = 0;           // OBSERVED domain
@@ -191,6 +248,12 @@ std::string serializeFrontendSettings(const FrontendSettings& s);
 // hand edit) parses to float 1.0f, `1.4013e-45` parses to the
 // denormal; a failed scale/mask parse is ignored and counted in
 // `ignoredMouseLines` (NATIVE hardening).
+//
+// Phase-4K Keyboard block (OBSERVED type-0 read): the 19 Key* lines
+// parse a leading int into the internal-code slot. NATIVE
+// hardening: failed parse or a value outside the proven 0..127
+// domain is ignored and counted in `ignoredKeyLines` (the
+// original's strtol-store edge is UNKNOWN, not reproduced).
 struct FrontendSettingsParse {
   FrontendSettings settings;
   int ignoredSkillLines = 0;
@@ -198,6 +261,7 @@ struct FrontendSettingsParse {
   int ignoredSoundFxLines = 0;
   int ignoredSoundMusicLines = 0;
   int ignoredMouseLines = 0;
+  int ignoredKeyLines = 0;
 };
 FrontendSettingsParse parseFrontendSettings(std::string_view text);
 

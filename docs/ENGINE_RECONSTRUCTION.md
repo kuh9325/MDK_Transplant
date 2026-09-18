@@ -2333,16 +2333,263 @@ rewrite (verified by the flow tests with a loaded
 - No persistence of unproven fields — the D set and scales
   parse/round-trip but the screen never mutates them.
 
-## Phase 4K candidate directions
+# Phase 4K — Keyboard options child screen
 
-1. **Help child** (`FUN_0041d540`/`FUN_0041d630`) — the
-   smallest remaining: static page + any-key exit; needs
-   its `HELP_%02d` record set proven.
-2. **Keyboard child** (`FUN_0041f030`/`FUN_0041f18c`) — 19
-   bindings + capture mode + raw-key poll; the largest
-   bounded candidate, feeds the input path like Mouse.
-3. **Gameplay-input consumption** — the now-persisted
-   Mouse/Keyboard maps + scales reach the real input path.
+Phase 4K reconstructs the fourth real child screen of the
+Options menu — the Keyboard binding screen — as a native
+controller + renderer pair backed by the original's raw
+DirectInput-derived key-code domain. This is the last
+input-mapping child Phase 5 gameplay reconstruction needs.
+
+## Entry transition (`FUN_0041f030`, OBSERVED —
+`disasm_4k_keyboard.txt`)
+
+Options row 4 dispatches to `FUN_0041f030` under canonical
+`DAT_005414f4 == 0` (the same gate as every child). It
+writes:
+
+- `DAT_00541493 = 5` — sub-mode 5 routes to
+  `FUN_0041f18c` in the main sub-mode dispatcher.
+- `DAT_0054bca8 = 0` — capture flag cleared.
+- `DAT_0054bcac = 0x14` — **selection initialized to 20
+  (`KM_QUIT`), not row 0.**
+
+The 0x14 entry selection is a late correction to an
+earlier working assumption of 0; the disassembly is
+unambiguous. Every re-entry re-runs this initializer, so
+the child always opens on Quit with capture off, while
+the live key globals persist (they live in the shared
+29-dword block, not in the screen's transient state).
+
+## Screen state globals (OBSERVED)
+
+| global        | role                                    |
+|---------------|-----------------------------------------|
+| `DAT_00541493`| sub-mode = 5                            |
+| `DAT_0054bca8`| capture flag (0 normal / 1 capturing)   |
+| `DAT_0054bcac`| selection 0..20                         |
+| `DAT_00541486`| dirty latch (set on rebind and reset)   |
+
+The 29-dword live keyboard block begins at `0x5413fe`;
+the screen exposes 19 of them as binding rows.
+
+## Frame handler (`FUN_0041f18c`, OBSERVED —
+`disasm_4k_keyboard.txt` / `disasm_4k_input.txt`)
+
+One frame's logic, in original order:
+
+1. **Capture branch** (`DAT_0054bca8 == 1`):
+   - Escape is checked **before** the raw-key poll —
+     Escape cancels capture and can never itself be
+     captured.
+   - Otherwise `FUN_00419168` scans the 128-bit new-press
+     edge bitmap and returns the **lowest set** internal
+     key code (0 doubles as the no-key sentinel).
+   - No edge → stay in capture, redraw.
+   - Edge found → `FUN_0041925c` normalizes right
+     modifiers (`0x36→0x2a`, `0x61→0x1d`, `0x65→0x38`)
+     **after** the lowest-set-bit winner is chosen; the
+     normalized code is written to the row's backing
+     global. If `new == old` neither the write nor the
+     dirty latch happens; on a real change
+     `DAT_00541486 = 1`. Capture clears either way a key
+     commits, then the frame draws.
+2. **Normal branch**:
+   - Escape exits to Options **before** any draw/timing.
+   - Previous = UP-or-LEFT held query; next =
+     DOWN-or-RIGHT; selection wraps 20→0 and 0→20 through
+     the shared repeat machine.
+   - Mouse hit-test selects only (bands below); button
+     activation is a separate query.
+   - Activate on rows 0..18 enters capture
+     (`DAT_0054bca8 = 1`). Activate on row 19 runs the
+     reset path; on row 20 it exits to Options.
+3. Draw runs every frame that did not early-exit.
+
+There is **no duplicate-key rejection, no swap, and no
+auto-unbind** — duplicates coexist, corroborated by the
+factory defaults themselves (Look/Zoom share A/Z).
+
+## Row space and hit-test (OBSERVED)
+
+Index space is 0..20: 19 binding rows, `KM_RESET` at 19,
+`KM_QUIT` at 20. The binding-row → global map comes from
+the original pointer table, not settings order:
+
+| row | action (KM_*) | global idx |
+|-----|---------------|-----------|
+| 0   | LEFT          | 0         |
+| 1   | RIGHT         | 1         |
+| 2   | UP            | 2         |
+| 3   | DOWN          | 3         |
+| 4   | JUMP          | 4         |
+| 5   | SIDEL         | 27        |
+| 6   | SIDE          | 5         |
+| 7   | SIDER         | 28        |
+| 8   | SNIPE         | 7         |
+| 9   | FIRE          | 6         |
+| 10  | TURBO         | 8         |
+| 11  | STURB         | 9         |
+| 12  | LKUP          | 10        |
+| 13  | LKDWN         | 11        |
+| 14  | ZOOMI         | 12        |
+| 15  | ZOOMO         | 13        |
+| 16  | INEXT         | 24        |
+| 17  | IPREV         | 25        |
+| 18  | IUSE          | 26        |
+
+Mouse hit-test: binding bands start at `y ≥ 64` (30px
+pitch, column by `x`), reset band `[2,18)`, quit band
+`[18,34)`; the remaining top region selects nothing.
+
+## Key-code domain (OBSERVED — `disasm_4k_dinput.txt`,
+`dump_keytab.txt`)
+
+Bindings store the original's **internal 0..127 key
+codes**, derived in `FUN_0046b688` from DirectInput
+offsets:
+
+- DIK `≤ 0x7f` → internal code = DIK.
+- DIK `> 0x7f` → table `0x49bbf0[DIK & 0x7f]`; unmapped
+  entries resolve to 0x7f.
+- Observed extended examples: `0xc8→103` (Up),
+  `0xcb→105` (Left), `0xcd→106` (Right), `0xd0→108`
+  (Down), `0xd3→111` (Del), `0xef→112`; `0x9c→96`,
+  `0x9d→97`, `0xb5→99`, `0xb7→100`, `0xb8→101`,
+  `0xc7→102`, `0xc9→104`, `0xcf→107`, `0xd1→109`,
+  `0xd2→110`.
+
+SDL scancodes never enter `mdk_core` — the application
+layer maps `SDL_Scancode` → DIK offset, then the
+original-domain helper maps DIK → internal.
+
+## Edge-bitmap semantics (OBSERVED — `disasm_4k_poll*.txt`)
+
+The DirectInput layer keeps a pure-level bitmap plus a
+latched-press bitmap; a press sets both, a release clears
+only the level bit. The per-frame poll derives new-press
+edges and reseeds the latch from the level at frame end.
+Visible consequences reproduced by the port:
+
+- a press+release inside one poll interval still produces
+  a capture edge;
+- held keys do not re-fire capture;
+- normal UP/DOWN repeat still uses the held-query
+  machinery — only capture consumes the edge bitmap.
+
+`FrontendMenuInput::rawKeyEdge` carries the 128-bit edge
+bitmap (4×u32) from the platform layer into the core.
+
+## Reset path (`FUN_00425db0`, OBSERVED — two corrections)
+
+- Copies **29 dwords** from the default mirror at
+  `0x49b1f2` into the live block at `0x5413fe` — all 19
+  visible bindings **plus 10 hidden gameplay hotkey
+  globals** (direct-weapon slots read by the gameplay
+  input consumer). The port models the full 29-dword
+  block in `FrontendFlowController::keyGlobals_`; the 19
+  config-backed fields overlay it for persistence.
+- Preserves incoming `ECX = 1` and therefore writes
+  `DAT_00541486 = 1`: **Reset always latches dirty**, even
+  when the visible bindings were already at defaults.
+  Dirty gating and delta serialization are independent —
+  a no-op reset still marks the session dirty while the
+  serializer emits no `Key*` lines.
+
+## LANG + key-glyph tables (OBSERVED — `dump_4k_keynames.txt`)
+
+Three 128-byte glyph tables select by first byte of the
+`LANG` record: `'F'` → French (`0x49ab28`), `'G'` →
+German (`0x49aba8`), other/missing → English
+(`0x49aaa8`). BUILD_A resolves `"E"` → English. The
+renderer draws the one-byte glyph through FONTSML — these
+are not OS key names.
+
+## Draw block (OBSERVED)
+
+- `KM_RESET` centered y=16, `KM_QUIT` centered y=32 via
+  the trunc-halving `FUN_00414f1c` path (C `/2`, not SAR).
+- 19 rows, two columns: `labelX = 310·(row/10)+10`,
+  `keyX = 310·(row/10)+210`, `y = 30·(row%10)+64`.
+- Normal mode flags the selected **label**; capture flags
+  the selected **key glyph** and draws centered `KM_DOIT`
+  ("Type New Key…") at y=354.
+- `FUN_00414dd4`/`FUN_00414b28` blink brackets drive the
+  shared `markerAcc`; every flagged draw advances it once.
+- ARROW at logical mouse. **No `FUN_0041f700` capture box**
+  — that routine belongs to the Joystick screen.
+
+## Settings-table mapping (OBSERVED — `dump_4k_settings.txt`)
+
+Entries **69–87** serialize between Mouse entry 68
+(`MouseYReversed`) and Skill entry 88, in settings-table
+order. All integer form. BUILD_A `MDK.CFG` carries **no
+`Key*` overrides**, so canonical startup equals factory
+defaults (arrows 103/105/106/108, Jump=56 LALT, Side=45
+X, SideL=51 `,`, SideR=52 `.`, Sniper=57 Space, Fire=29
+LCTRL, Turbo=42 LSHIFT, STurbo=58 Caps, Look/Zoom A/Z
+30/44, ItemNext=27 `]`, ItemPrev=26 `[`, ItemUse=28
+Return).
+
+The native parser rejects `Key*` values outside the proven
+`[0,127]` domain into `ignoredKeyLines` — **NATIVE
+POLICY**, not original behavior.
+
+## Persistence + lifetime (Phase 4G seam extended)
+
+- Writes happen only at the Options-exit seam — never
+  directly from the child.
+- Re-entering the child resets selection to 20 and
+  capture to false; key globals and dirty survive.
+- Escape from Keyboard returns to Options with
+  `resumeSelection = 4`.
+
+## Native port decisions (NATIVE PORT)
+
+- `KeyboardMenuController` owns the 0..20 state machine;
+  `renderKeyboardMenuFrame`/`renderKeyboardMenuDynamic`
+  own drawing; both live in `src/core/keyboard_menu.*`.
+- SDL→DIK translation lives in `src/app/application.cpp`;
+  the core receives only the internal-code edge bitmap.
+- `--preview-keyboard-submenu` renders the canonical
+  static state (sel=20, capture off, LANG=English).
+- The selftest exercises the same SDL→DIK→internal seam
+  as real input — a synthetic `keyTap` (press+release in
+  one frame) must produce a capture edge.
+
+## Digests and verification
+
+- Static preview fb `edf2fa8f30469913`, palette
+  `08e372297e745a06` (inherited Options palette).
+- Six-screen selftest: `kb-entry=20 kb-resume=4
+  kb-frames=8 kb-cap=1 keySnipe=45 hidden14=2` — X tap
+  → DIK 0x2d → internal 45 → `KeySniper = 45` persisted;
+  reset restored hidden slot 14 to 2.
+- Capture-state frame fb `ad867c594b5637f0`; post-rebind
+  frame shows `X` glyph on Sniper with label highlight
+  restored.
+- Restart run reloads `keySniper=45` into the child.
+- Rebaselined: none — every Phase 4A–4J digest is
+  preserved.
+
+## Explicit non-goals (Phase 4K)
+
+- No gameplay-input consumption — the 29-globals block is
+  staged for Phase 5, nothing reads it as actions yet.
+- No duplicate-key UX (no conflicts, swaps, or unbinds) —
+  matches the original.
+- No `FUN_0041f700`-style capture visuals.
+- No `Key*` synthesis for the hidden 10 — the original
+  settings table does not expose them.
+
+## Phase 5 candidate directions
+
+1. **Gameplay-input consumption** — keyboard globals
+   (incl. hidden weapon hotkeys), Mouse mappings/scales,
+   and wheel/Z-axis feed the real input path.
+2. **Help child** (`FUN_0041d540`) — smallest remaining
+   screen; not a gameplay blocker.
+3. **Joystick child** — calibration path; not a gameplay
+   blocker for keyboard+mouse play.
 4. **Frontend sound events on other screens** — `SND_PUSH`
-   fires on repeat/activate edges engine-wide; records
-   pending.
+   edges engine-wide; cosmetic.

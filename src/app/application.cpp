@@ -402,6 +402,15 @@ struct FrontendResources {
   std::array<std::string, kMouseGridRows> mouseActions;   // JOY_BA..BP
   std::array<std::string, 9> mouseAxisNames; // JOY_A0 + JOY_AA..AH
   std::array<std::string, kMouseAxisCount> mouseAxisCaps; // JOY_AX0..2
+  // Phase 4K keyboard child (FUN_0041f18c): the KM_* records —
+  // same NUL-terminated string shape, all drawn FONTSML — plus the
+  // LANG record's first byte (the glyph-table selector; a missing
+  // LANG soft-resolves to English exactly like FUN_00414930's 0).
+  std::array<std::string, kKeyboardBindingRows> kbRows;   // KM_* rows
+  std::string kbReset;                 // KM_RESET
+  std::string kbQuit;                  // KM_QUIT
+  std::string kbDoit;                  // KM_DOIT
+  char kbLangTag = 0;                  // LANG record first byte
   std::array<std::byte, 192> sysPalHead{};  // SYS_PAL record head
   bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
 };
@@ -595,6 +604,30 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
     char name[8];
     std::snprintf(name, sizeof(name), "JOY_AX%d", i);
     if (!loadCStr(name, res.mouseAxisCaps[i])) return false;
+  }
+
+  // Phase 4K: the KM_* records — same NUL-terminated string shape,
+  // resolved in the proven draw order (the record-pointer table in
+  // FUN_0041f18c), NOT settings-table order.
+  for (int r = 0; r < kKeyboardBindingRows; ++r) {
+    if (!loadCStr(kKeyboardRowRecords[r], res.kbRows[r])) {
+      return false;
+    }
+  }
+  if (!loadCStr(kKeyboardResetRecord, res.kbReset) ||
+      !loadCStr(kKeyboardQuitRecord, res.kbQuit) ||
+      !loadCStr(kKeyboardDoitRecord, res.kbDoit)) {
+    return false;
+  }
+  // LANG — FUN_00414930's soft resolve: a missing record yields 0,
+  // and FUN_0041f068 reads only the payload's first byte ('F' ->
+  // French, 'G' -> German, else English).
+  if (const FtiRecord* lang =
+          findFtiRecord(fdir, kKeyboardLangRecord)) {
+    if (lang->payloadSize() > 0) {
+      res.kbLangTag = static_cast<char>(
+          fti->data()[lang->payloadFileOffset]);
+    }
   }
 
   // SYS_PAL head — the resident system palette whose head fills
@@ -917,6 +950,249 @@ static bool loadMouseSubmenuPreview(DataRoot& root,
   return true;
 }
 
+// Phase 4K keyboard child preview: compose the proven static
+// FUN_0041f030/FUN_0041f18c entry frame — cleared framebuffer + the
+// two-column 19-row KM_* grid (factory bindings, LANG-selected
+// glyphs) + centered KM_RESET/KM_QUIT (entry selection 20 — the
+// KM_QUIT row flagged) + ARROW at the carried logical mouse — all
+// FONTSML under the inherited options palette (SYS_PAL head +
+// zeroed tail; the screen uploads no palette of its own). No
+// KM_DOIT — capture is clear at entry. Fills `err` -> false on
+// failure.
+static bool loadKeyboardSubmenuPreview(DataRoot& root,
+                                       IndexedFramebuffer& fb,
+                                       Palette& palette,
+                                       std::string* err) {
+  FrontendResources res;
+  if (!loadFrontendResources(root, res, err)) {
+    return false;
+  }
+  KeyboardMenuSpec spec;  // canonical entry state + resolved LANG
+  spec.langTag = res.kbLangTag;
+  KeyboardMenuLabels labels;
+  for (int r = 0; r < kKeyboardBindingRows; ++r) {
+    labels.rows[r] = res.kbRows[r];
+  }
+  labels.reset = res.kbReset;
+  labels.quit = res.kbQuit;
+  labels.doit = res.kbDoit;
+  labels.langTag = res.kbLangTag;
+  std::string derr;
+  if (!renderKeyboardMenuFrame(fb, palette, res.fontSml,
+                               *res.arrow.frame(0), labels,
+                               res.sysPalHead, spec, &derr)) {
+    *err = "keyboard sub-menu preview: compose — " + derr;
+    return false;
+  }
+
+  const std::uint64_t fbDigest = digestIndexedFb(fb);
+  const std::uint64_t palDigest = digestPalette(palette);
+  log::info(kTag,
+            "keyboard sub-menu preview: KM_* %dx%d sel=%d cap=%d "
+            "lang=%c | FONTSML digest=%016llx | ARROW "
+            "digest=%016llx | composed fb=%016llx palette=%016llx",
+            fb.width(), fb.height(), spec.selection,
+            spec.capture ? 1 : 0,
+            spec.langTag ? spec.langTag : '0',
+            static_cast<unsigned long long>(ftiFontDigest(res.fontSml)),
+            static_cast<unsigned long long>(ftiSpriteDigest(res.arrow)),
+            static_cast<unsigned long long>(fbDigest),
+            static_cast<unsigned long long>(palDigest));
+  return true;
+}
+
+// Phase 4K platform seam — SDL scancode -> the DirectInput offset the
+// original's keyboard device would have produced (FUN_0046b688's
+// dwOfs). Keys with no DIK equivalent return -1: the original's
+// device never reports them, so they produce no bitmap bit. This
+// lives in the application layer on purpose — mdk_core stays
+// platform-neutral; the DIK -> internal-code rule it maps into is
+// the original-domain helper in keyboard_menu.h. Note the faithful
+// aliasing: F13-F15 map to DIK 0x64-0x66 (base domain), whose
+// internal codes 100/101/102 alias SYSRQ/RALT/HOME exactly as the
+// original's own table produces.
+static int dikFromSdlScancode(SDL_Scancode sc) {
+  switch (sc) {
+  // Letters -> DIK layout order.
+  case SDL_SCANCODE_A: return 0x1e;
+  case SDL_SCANCODE_B: return 0x30;
+  case SDL_SCANCODE_C: return 0x2e;
+  case SDL_SCANCODE_D: return 0x20;
+  case SDL_SCANCODE_E: return 0x12;
+  case SDL_SCANCODE_F: return 0x21;
+  case SDL_SCANCODE_G: return 0x22;
+  case SDL_SCANCODE_H: return 0x23;
+  case SDL_SCANCODE_I: return 0x17;
+  case SDL_SCANCODE_J: return 0x24;
+  case SDL_SCANCODE_K: return 0x25;
+  case SDL_SCANCODE_L: return 0x26;
+  case SDL_SCANCODE_M: return 0x32;
+  case SDL_SCANCODE_N: return 0x31;
+  case SDL_SCANCODE_O: return 0x18;
+  case SDL_SCANCODE_P: return 0x19;
+  case SDL_SCANCODE_Q: return 0x10;
+  case SDL_SCANCODE_R: return 0x13;
+  case SDL_SCANCODE_S: return 0x1f;
+  case SDL_SCANCODE_T: return 0x14;
+  case SDL_SCANCODE_U: return 0x16;
+  case SDL_SCANCODE_V: return 0x2f;
+  case SDL_SCANCODE_W: return 0x11;
+  case SDL_SCANCODE_X: return 0x2d;
+  case SDL_SCANCODE_Y: return 0x15;
+  case SDL_SCANCODE_Z: return 0x2c;
+  // Digit row '1'..'0' -> DIK 0x02..0x0b.
+  case SDL_SCANCODE_1: return 0x02;
+  case SDL_SCANCODE_2: return 0x03;
+  case SDL_SCANCODE_3: return 0x04;
+  case SDL_SCANCODE_4: return 0x05;
+  case SDL_SCANCODE_5: return 0x06;
+  case SDL_SCANCODE_6: return 0x07;
+  case SDL_SCANCODE_7: return 0x08;
+  case SDL_SCANCODE_8: return 0x09;
+  case SDL_SCANCODE_9: return 0x0a;
+  case SDL_SCANCODE_0: return 0x0b;
+  // Punctuation / whitespace.
+  case SDL_SCANCODE_RETURN: return 0x1c;
+  case SDL_SCANCODE_ESCAPE: return 0x01;
+  case SDL_SCANCODE_BACKSPACE: return 0x0e;
+  case SDL_SCANCODE_TAB: return 0x0f;
+  case SDL_SCANCODE_SPACE: return 0x39;
+  case SDL_SCANCODE_MINUS: return 0x0c;
+  case SDL_SCANCODE_EQUALS: return 0x0d;
+  case SDL_SCANCODE_LEFTBRACKET: return 0x1a;
+  case SDL_SCANCODE_RIGHTBRACKET: return 0x1b;
+  case SDL_SCANCODE_BACKSLASH: return 0x2b;
+  case SDL_SCANCODE_NONUSHASH: return 0x2b;  // same 0x2b position
+  case SDL_SCANCODE_SEMICOLON: return 0x27;
+  case SDL_SCANCODE_APOSTROPHE: return 0x28;
+  case SDL_SCANCODE_GRAVE: return 0x29;
+  case SDL_SCANCODE_COMMA: return 0x33;
+  case SDL_SCANCODE_PERIOD: return 0x34;
+  case SDL_SCANCODE_SLASH: return 0x35;
+  case SDL_SCANCODE_CAPSLOCK: return 0x3a;   // DIK_CAPITAL
+  // Function keys F1..F12.
+  case SDL_SCANCODE_F1: return 0x3b;
+  case SDL_SCANCODE_F2: return 0x3c;
+  case SDL_SCANCODE_F3: return 0x3d;
+  case SDL_SCANCODE_F4: return 0x3e;
+  case SDL_SCANCODE_F5: return 0x3f;
+  case SDL_SCANCODE_F6: return 0x40;
+  case SDL_SCANCODE_F7: return 0x41;
+  case SDL_SCANCODE_F8: return 0x42;
+  case SDL_SCANCODE_F9: return 0x43;
+  case SDL_SCANCODE_F10: return 0x44;
+  case SDL_SCANCODE_F11: return 0x57;
+  case SDL_SCANCODE_F12: return 0x58;
+  case SDL_SCANCODE_F13: return 0x64;  // aliases internal 100 (SYSRQ)
+  case SDL_SCANCODE_F14: return 0x65;  // aliases internal 101 (RALT)
+  case SDL_SCANCODE_F15: return 0x66;  // aliases internal 102 (HOME)
+  // (F16-F24 have no DIK — unmappable.)
+  // Nav cluster — extended DIKs through the 0x49bbf0 table.
+  case SDL_SCANCODE_PRINTSCREEN: return 0xb7;  // SYSRQ -> 100
+  case SDL_SCANCODE_SCROLLLOCK: return 0x46;   // DIK_SCROLL (base)
+  case SDL_SCANCODE_PAUSE: return 0xc5;        // table -> 0x7f
+  case SDL_SCANCODE_INSERT: return 0xd2;       // -> 110
+  case SDL_SCANCODE_HOME: return 0xc7;         // -> 102
+  case SDL_SCANCODE_PAGEUP: return 0xc9;       // -> 104
+  case SDL_SCANCODE_DELETE: return 0xd3;       // -> 111
+  case SDL_SCANCODE_END: return 0xcf;          // -> 107
+  case SDL_SCANCODE_PAGEDOWN: return 0xd1;     // -> 109
+  case SDL_SCANCODE_RIGHT: return 0xcd;        // -> 106
+  case SDL_SCANCODE_LEFT: return 0xcb;         // -> 105
+  case SDL_SCANCODE_DOWN: return 0xd0;         // -> 108
+  case SDL_SCANCODE_UP: return 0xc8;           // -> 103
+  // Keypad.
+  case SDL_SCANCODE_NUMLOCKCLEAR: return 0x45; // DIK_NUMLOCK
+  case SDL_SCANCODE_KP_DIVIDE: return 0xb5;    // -> 99
+  case SDL_SCANCODE_KP_MULTIPLY: return 0x37;  // base
+  case SDL_SCANCODE_KP_MINUS: return 0x4a;     // DIK_SUBTRACT
+  case SDL_SCANCODE_KP_PLUS: return 0x4e;      // DIK_ADD
+  case SDL_SCANCODE_KP_ENTER: return 0x9c;     // -> 96
+  case SDL_SCANCODE_KP_1: return 0x4f;
+  case SDL_SCANCODE_KP_2: return 0x50;
+  case SDL_SCANCODE_KP_3: return 0x51;
+  case SDL_SCANCODE_KP_4: return 0x4b;
+  case SDL_SCANCODE_KP_5: return 0x4c;
+  case SDL_SCANCODE_KP_6: return 0x4d;
+  case SDL_SCANCODE_KP_7: return 0x47;
+  case SDL_SCANCODE_KP_8: return 0x48;
+  case SDL_SCANCODE_KP_9: return 0x49;
+  case SDL_SCANCODE_KP_0: return 0x52;
+  case SDL_SCANCODE_KP_PERIOD: return 0x53;    // DIK_DECIMAL
+  case SDL_SCANCODE_NONUSBACKSLASH: return 0x56; // DIK_OEM_102
+  case SDL_SCANCODE_APPLICATION: return 0xdd;  // DIK_APPS -> 0x7f
+  case SDL_SCANCODE_POWER: return 0xde;        // -> 0x7f
+  case SDL_SCANCODE_KP_EQUALS: return 0x8d;    // -> 0x7f
+  case SDL_SCANCODE_KP_COMMA: return 0xb3;     // -> 0x7f
+  // Modifiers.
+  case SDL_SCANCODE_LCTRL: return 0x1d;        // DIK_LCONTROL
+  case SDL_SCANCODE_LSHIFT: return 0x2a;
+  case SDL_SCANCODE_LALT: return 0x38;         // DIK_LMENU
+  case SDL_SCANCODE_LGUI: return 0xdb;         // DIK_LWIN -> 0x7f
+  case SDL_SCANCODE_RCTRL: return 0x9d;        // -> 97, poll folds 29
+  case SDL_SCANCODE_RSHIFT: return 0x36;       // -> 54, poll folds 42
+  case SDL_SCANCODE_RALT: return 0xb8;         // -> 101, poll folds 56
+  case SDL_SCANCODE_RGUI: return 0xdc;         // DIK_RWIN -> 0x7f
+  // Media/system keys with standard DIK equivalents (all -> 0x7f).
+  case SDL_SCANCODE_MUTE: return 0xa0;
+  case SDL_SCANCODE_VOLUMEUP: return 0xb0;
+  case SDL_SCANCODE_VOLUMEDOWN: return 0xae;
+  default: return -1;
+  }
+}
+
+// Phase 4K raw-key edge machine — the FUN_0046b688 / FUN_00419370
+// pair reconstructed in the original's internal key-code domain
+// (NOT SDL scancodes, NOT persisted values):
+//   level : the pure level bitmap (+0x10 in the original) — press
+//           sets, release clears.
+//   latch : the sticky bitmap (+0x00) — press sets; cleared only by
+//           the frame-end reseed from `level`.
+//   prev  : the previous poll's pre-reseed latch.
+// Per poll the original computes edge = latch & ~prev, then
+// prev = latch, then latch = level — so a press+release wholly
+// inside one poll interval still lands in the edge bitmap (the
+// latch saw it) while a held key never repeats as a fresh edge.
+// Process lifetime: the bitmaps are device state, not screen state
+// — they persist across screen transitions exactly like the
+// original's globals.
+struct FrontendRawKeyState {
+  KeyboardEdgeBitmap level{};
+  KeyboardEdgeBitmap latch{};
+  KeyboardEdgeBitmap prev{};
+};
+
+// One frame of device events -> the four internal edge dwords
+// (DAT_0049a8e8..f4 analogue). Repeat events are not device edges —
+// the original's device reports a press once.
+static void frontendRawKeyPoll(FrontendRawKeyState& st,
+                               const InputState& input,
+                               KeyboardEdgeBitmap& edgeOut) {
+  for (const KeyEvent& e : input.keyEvents()) {
+    if (e.repeat) {
+      continue;
+    }
+    const int dik =
+        dikFromSdlScancode(static_cast<SDL_Scancode>(e.scancode));
+    if (dik < 0) {
+      continue;
+    }
+    const int code = internalKeyFromDik(dik);
+    const std::uint32_t bit = 1u << (code & 31);
+    if (e.down) {
+      st.latch[code >> 5] |= bit;   // press sets BOTH bitmaps
+      st.level[code >> 5] |= bit;
+    } else {
+      st.level[code >> 5] &= ~bit;  // release clears only the level
+    }
+  }
+  for (int w = 0; w < 4; ++w) {
+    edgeOut[w] = st.latch[w] & ~st.prev[w];
+    st.prev[w] = st.latch[w];
+    st.latch[w] = st.level[w];      // the frame-end reseed
+  }
+}
+
 // Phase 4E — translate the platform InputState into the controller's
 // semantic per-frame input. Original reference points:
 //   prevHeld/nextHeld : DIK_UP/DIK_DOWN with the original keymap's
@@ -926,7 +1202,11 @@ static bool loadMouseSubmenuPreview(DataRoot& root,
 //   mouseDx/Dy        : integer device deltas — SDL's float pixel
 //     deltas truncate toward zero (nearest integer-domain model).
 //   mouseButtons      : 4-bit nibble bit i = button i+1 held.
-static FrontendMenuInput frontendInputFromSdl(const InputState& input) {
+//   rawKeyEdge        : FUN_0046b688/FUN_00419370 edge bitmap in the
+//     original's internal 0..127 key-code domain (Phase 4K) — see
+//     FrontendRawKeyState above.
+static FrontendMenuInput frontendInputFromSdl(
+    const InputState& input, FrontendRawKeyState& rawKeys) {
   FrontendMenuInput fi;
   bool prevPress = false, nextPress = false;
   bool leftPress = false, rightPress = false;
@@ -960,6 +1240,10 @@ static FrontendMenuInput frontendInputFromSdl(const InputState& input) {
       (input.mouseButtonDown(SDL_BUTTON_RIGHT) ? 0x2 : 0) |
       (input.mouseButtonDown(SDL_BUTTON_MIDDLE) ? 0x4 : 0) |
       (input.mouseButtonDown(SDL_BUTTON_X1) ? 0x8 : 0));
+  // Phase 4K: the raw internal-domain edge bitmap (only the
+  // Keyboard child's capture path consumes it — everything else
+  // reads the semantic fields above, unchanged).
+  frontendRawKeyPoll(rawKeys, input, fi.rawKeyEdge);
   return fi;
 }
 
@@ -1008,6 +1292,13 @@ static const char* soundActionName(SoundAction a) {
 static const char* mouseActionName(MouseAction a) {
   switch (a) {
   case MouseAction::Back: return "Back";
+  default: return "None";
+  }
+}
+
+static const char* keyboardActionName(KeyboardAction a) {
+  switch (a) {
+  case KeyboardAction::Back: return "Back";
   default: return "None";
   }
 }
@@ -1085,6 +1376,9 @@ int Application::run() {
   std::optional<FrontendMenuController> frontendCtl;
   std::optional<FrontendFlowController> frontendFlow;
   std::vector<std::string_view> frontendViews;
+  // Phase 4K: the raw-key edge machine (level/latch/prev bitmaps —
+  // device state, not screen state; persists across transitions).
+  FrontendRawKeyState frontendRawKeys;
   FrontendAction frontendLastAction = FrontendAction::None;
   OptionsAction frontendLastOptionsAction = OptionsAction::None;
   bool frontendEnteredOptions = false;
@@ -1142,6 +1436,24 @@ int Application::run() {
   std::uint32_t settingsPersistedMouseYRev = 0;
   std::string settingsPersistedAxesMap;
   std::uint32_t settingsPersistedButtA = 0;
+  // Phase 4K keyboard child observability: entry state
+  // (DAT_0054bcac = 0x14 — always the KM_QUIT row), the options
+  // selection on resume (row 4), drawn-frame digests, the capture
+  // flag for the script's KM_DOIT frame, and the loaded/persisted
+  // Key* values the verdict checks (KeySniper = g7 is the row the
+  // script rebinds).
+  bool keyboardEntered = false;
+  int keyboardEntrySelection = -1;   // DAT_0054bcac seen at entry
+  int keyboardResumeSelection = -1;  // _DAT_0054bd34 after the exit
+  int keyboardFramesDrawn = 0;
+  bool keyboardCaptureSeen = false;  // capture==1 on a drawn frame
+  std::uint64_t keyboardLastFbDigest = 0;
+  std::uint64_t keyboardLastPalDigest = 0;
+  int settingsInitialKeySniper = 57;  // post-config (factory SPACE)
+  int settingsPersistedKeySniper = -1;
+  int keyboardEntryKeySniper = -1;   // kg[7] seen at child entry —
+                                     // proves the loaded binding
+                                     // reached the screen's globals
 
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
@@ -1155,6 +1467,7 @@ int Application::run() {
                            cfg_.displaySubmenuPreview ||
                            cfg_.soundSubmenuPreview ||
                            cfg_.mouseSubmenuPreview ||
+                           cfg_.keyboardSubmenuPreview ||
                            cfg_.interactiveFrontend;
   if (cfg_.previewFile) {
     if (!dataRoot) {
@@ -1252,6 +1565,18 @@ int Application::run() {
                  perr.c_str());
       return 2;
     }
+  } else if (cfg_.keyboardSubmenuPreview) {
+    if (!dataRoot) {
+      log::error(kTag,
+                 "--preview-keyboard-submenu requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadKeyboardSubmenuPreview(*dataRoot, fb, palette, &perr)) {
+      log::error(kTag, "keyboard sub-menu preview failed: %s",
+                 perr.c_str());
+      return 2;
+    }
   } else if (cfg_.interactiveFrontend) {
     if (!dataRoot) {
       log::error(kTag, "--interactive-frontend requires --data-path");
@@ -1292,10 +1617,12 @@ int Application::run() {
           settingsInitialMouseYRev = initialSettings.mouseYReversed;
           settingsInitialAxesMap = initialSettings.mouseWAxesMap;
           settingsInitialButtA = initialSettings.mouseWButtMapA;
+          settingsInitialKeySniper = initialSettings.keySniper;
           log::info(kTag,
                     "settings: loaded %s (skill=%d brightness=%d "
                     "pcorrect=%d fx=%d mus=%d mouseOn=%d yrev=%u "
-                    "axes=%s buttA=%u ignored=%d,%d,%d,%d,%d)",
+                    "axes=%s buttA=%u keySniper=%d "
+                    "ignored=%d,%d,%d,%d,%d,%d)",
                     cfg_.settingsFile->string().c_str(),
                     initialSettings.skill, initialSettings.brightness,
                     initialSettings.forcePCorrect ? 1 : 0,
@@ -1304,11 +1631,13 @@ int Application::run() {
                     initialSettings.mouseYReversed,
                     initialSettings.mouseWAxesMap.c_str(),
                     initialSettings.mouseWButtMapA,
+                    initialSettings.keySniper,
                     loaded->ignoredSkillLines,
                     loaded->ignoredBrightnessLines,
                     loaded->ignoredSoundFxLines,
                     loaded->ignoredSoundMusicLines,
-                    loaded->ignoredMouseLines);
+                    loaded->ignoredMouseLines,
+                    loaded->ignoredKeyLines);
         } else {
           log::warn(kTag, "settings: %s — %s; factory defaults",
                     cfg_.settingsFile->string().c_str(),
@@ -1327,6 +1656,7 @@ int Application::run() {
         settingsPersistedMouseYRev = s.mouseYReversed;
         settingsPersistedAxesMap = s.mouseWAxesMap;
         settingsPersistedButtA = s.mouseWButtMapA;
+        settingsPersistedKeySniper = s.keySniper;
         if (!cfg_.settingsFile) {
           // No writable location configured — the FUN_004260ac
           // silent-failure analogue: process-lifetime only.
@@ -1406,9 +1736,9 @@ int Application::run() {
       host.injectSelfTestEvents();
     }
     if (cfg_.frames == 0) {
-      // Phase 4J five-screen script: 49 steps (0..48) — the run
+      // Phase 4K six-screen script: 64 steps (0..63) — the run
       // quits right after the last injected step.
-      cfg_.frames = frontendFlow ? 49 : 10;
+      cfg_.frames = frontendFlow ? 64 : 10;
     }
   }
 
@@ -1435,7 +1765,8 @@ int Application::run() {
       // Original frame order: poll -> controller update -> draw ->
       // timing update. The dynamic renderers drive the ramp via
       // per-item itemScale calls in draw order.
-      const FrontendMenuInput fi = frontendInputFromSdl(input);
+      const FrontendMenuInput fi =
+          frontendInputFromSdl(input, frontendRawKeys);
       bool endedEarly = false;
       if (frontendCtl) {
         // Phase 4E root-only regression path.
@@ -1450,6 +1781,8 @@ int Application::run() {
                 ? frontendFlow->sound().frameEndedEarly()
             : frontendFlow->screen() == FrontendScreen::Mouse
                 ? frontendFlow->mouse().frameEndedEarly()
+            : frontendFlow->screen() == FrontendScreen::Keyboard
+                ? frontendFlow->keyboard().frameEndedEarly()
             : frontendFlow->inOptions()
                 ? frontendFlow->options().frameEndedEarly()
                 : frontendFlow->root().frameEndedEarly();
@@ -1518,6 +1851,27 @@ int Application::run() {
               *frontendRes->arrow.frame(0), labels,
               frontendRes->sysPalHead, frontendFlow->mouse(),
               frontendFlow->brightness(), &rerr);
+        } else if (frontendFlow &&
+                   frontendFlow->screen() == FrontendScreen::Keyboard) {
+          // Phase 4K keyboard frame: cleared buffer + the two-column
+          // KM_* row grid (labels + LANG-selected key glyphs) +
+          // centered KM_RESET/KM_QUIT (+ KM_DOIT while capturing) +
+          // ARROW — all FONTSML under the inherited options palette
+          // (the FUN_0041f18c draw block; the blink bracket advances
+          // DAT_0049a770 once per flagged draw).
+          KeyboardMenuLabels labels;
+          for (int r = 0; r < kKeyboardBindingRows; ++r) {
+            labels.rows[r] = frontendRes->kbRows[r];
+          }
+          labels.reset = frontendRes->kbReset;
+          labels.quit = frontendRes->kbQuit;
+          labels.doit = frontendRes->kbDoit;
+          labels.langTag = frontendRes->kbLangTag;
+          rok = renderKeyboardMenuDynamic(
+              fb, palette, frontendRes->fontSml,
+              *frontendRes->arrow.frame(0), labels,
+              frontendRes->sysPalHead, frontendFlow->keyboard(),
+              frontendFlow->brightness(), &rerr);
         } else if (frontendFlow && frontendFlow->inOptions()) {
           // Phase 4F options frame: cleared buffer + OM_* labels +
           // ARROW under the system palette (FUN_00420eac draw block).
@@ -1569,6 +1923,18 @@ int Application::run() {
           mouseLastPalDigest = digestPalette(palette);
           ++mouseFramesDrawn;
         }
+        if (cfg_.selftest && frontendFlow &&
+            frontendFlow->screen() == FrontendScreen::Keyboard) {
+          // Same for the keyboard child — the post-mutation
+          // snapshot; the capture flag and marker accumulator are
+          // recorded for the verdict.
+          keyboardLastFbDigest = digestIndexedFb(fb);
+          keyboardLastPalDigest = digestPalette(palette);
+          ++keyboardFramesDrawn;
+          if (frontendFlow->keyboard().capture()) {
+            keyboardCaptureSeen = true;
+          }
+        }
         // FUN_0042fe78/FUN_0042fb68 timing update — the tail of the
         // drawn frame only. --selftest feeds the original's paced
         // regime (100/3 ms per frame — rawDelta 4, step 1) so the
@@ -1585,6 +1951,9 @@ int Application::run() {
           frontendFlow->sound().endFrame(frontDtMs);
         } else if (frontendFlow->screen() == FrontendScreen::Mouse) {
           frontendFlow->mouse().endFrame(frontDtMs);
+        } else if (frontendFlow->screen() ==
+                   FrontendScreen::Keyboard) {
+          frontendFlow->keyboard().endFrame(frontDtMs);
         } else if (frontendFlow->inOptions()) {
           frontendFlow->options().endFrame(frontDtMs);
         } else {
@@ -1684,6 +2053,33 @@ int Application::run() {
                     frontendFlow->mouseAxesMap().c_str(),
                     frontendFlow->mouseButtMap()[0]);
         }
+      } else if (frontendFlow->screen() == FrontendScreen::Keyboard) {
+        const KeyboardAction a = frontendFlow->consumeKeyboardAction();
+        if (a != KeyboardAction::None) {
+          log::info(kTag,
+                    "keyboard action: %s (sel=%d cap=%d mouse=%d,%d)",
+                    keyboardActionName(a),
+                    frontendFlow->keyboard().selection(),
+                    frontendFlow->keyboard().capture() ? 1 : 0,
+                    frontendFlow->keyboard().mouseX(),
+                    frontendFlow->keyboard().mouseY());
+        }
+        if (frontendFlow->screen() == FrontendScreen::Options) {
+          // Esc/KM_QUIT consumed -> mode 0x0b -> options resumed at
+          // the Keyboard row (sel 4 — _DAT_0054bd34 untouched).
+          keyboardResumeSelection =
+              frontendFlow->options().selection();
+          const auto& kg = frontendFlow->keyGlobals();
+          log::info(kTag,
+                    "front-end flow: keyboard -> options (resume "
+                    "sel=%d mouse=%d,%d dirty=%d snipe=%d fire=%d "
+                    "use=%d hidden14=%d)",
+                    keyboardResumeSelection,
+                    frontendFlow->options().mouseX(),
+                    frontendFlow->options().mouseY(),
+                    frontendFlow->options().settingsDirty() ? 1 : 0,
+                    kg[7], kg[6], kg[26], kg[14]);
+        }
       } else if (frontendFlow->inOptions()) {
         // Record the dirty flag consumed by FUN_00420d68 before the
         // transition eats it — the persist gate for this exit.
@@ -1744,6 +2140,26 @@ int Application::run() {
                     frontendFlow->mouseOn() ? 1 : 0,
                     frontendFlow->mouseYReversedBits(),
                     frontendFlow->mouseAxesMap().c_str(),
+                    frontendFlow->options().settingsDirty() ? 1 : 0);
+        } else if (frontendFlow->screen() ==
+                   FrontendScreen::Keyboard) {
+          // Keyboard consumed -> FUN_0041f030 -> child entered.
+          // DAT_0054bcac = 0x14 — the entry selection is always the
+          // KM_QUIT row; the 29-dword block is the flow's process
+          // global (mutations persist across re-entries).
+          keyboardEntered = true;
+          keyboardEntrySelection =
+              frontendFlow->keyboard().selection();
+          const auto& kg = frontendFlow->keyGlobals();
+          keyboardEntryKeySniper = kg[7];
+          log::info(kTag,
+                    "front-end flow: options -> keyboard (entry "
+                    "sel=%d mouse=%d,%d left=%d snipe=%d use=%d "
+                    "hidden14=%d dirty=%d)",
+                    keyboardEntrySelection,
+                    frontendFlow->keyboard().mouseX(),
+                    frontendFlow->keyboard().mouseY(),
+                    kg[0], kg[7], kg[26], kg[14],
                     frontendFlow->options().settingsDirty() ? 1 : 0);
         } else if (frontendFlow->screen() == FrontendScreen::Root) {
           // Back/Esc consumed -> FUN_00420d68 -> root restored.
@@ -1813,6 +2229,9 @@ int Application::run() {
     const bool inMse =
         frontendFlow &&
         frontendFlow->screen() == FrontendScreen::Mouse;
+    const bool inKbd =
+        frontendFlow &&
+        frontendFlow->screen() == FrontendScreen::Keyboard;
     log::info(kTag,
               "interactive front-end last frame: fb=%016llx "
               "palette=%016llx screen=%s sel=%d skill=%d "
@@ -1821,10 +2240,12 @@ int Application::run() {
               static_cast<unsigned long long>(digestPalette(palette)),
               inDisp ? "display" : inSnd ? "sound"
                      : inMse ? "mouse"
+                     : inKbd ? "keyboard"
                      : inOpts ? "options" : "root",
               inDisp ? frontendFlow->display().selection()
               : inSnd ? frontendFlow->sound().selection()
               : inMse ? frontendFlow->mouse().selection()
+              : inKbd ? frontendFlow->keyboard().selection()
               : inOpts ? frontendFlow->options().selection()
                      : (frontendCtl ? frontendCtl->selection()
                                     : frontendFlow->root().selection()),
@@ -1904,28 +2325,31 @@ int Application::run() {
         (settingsInitialButtA & 1u)
             ? (settingsInitialButtA & ~1u)
             : ((settingsInitialButtA & ~0x2u) | 1u);
-    // Seven options entries: initial config, post-persist-#1,
+    // Nine options entries: initial config, post-persist-#1,
     // post-display, post-sound-entry, post-persist-#3, post-mouse-
-    // entry, and post-persist-#4 — the settings survive
-    // process-lifetime.
+    // entry, post-persist-#4, post-keyboard-entry, and
+    // post-persist-#5 — the settings survive process-lifetime.
     const bool entrySkillsOk =
-        optionsEntrySkills.size() == 7 &&
+        optionsEntrySkills.size() == 9 &&
         optionsEntrySkills[0] == settingsInitialSkill &&
         optionsEntrySkills[1] == expected &&
         optionsEntrySkills[2] == expected &&
         optionsEntrySkills[3] == expected &&
         optionsEntrySkills[4] == expected &&
         optionsEntrySkills[5] == expected &&
-        optionsEntrySkills[6] == expected;
-    // Exits 1, 2, 4, 6 are dirty (skill mutations, then the display
-    // child's, then the sound child's, then the mouse child's — all
-    // carried back through the shared DAT_00541486); exits 3, 5, 7
-    // are clean — the preceding persists cleared the flag.
+        optionsEntrySkills[6] == expected &&
+        optionsEntrySkills[7] == expected &&
+        optionsEntrySkills[8] == expected;
+    // Exits 1, 2, 4, 6, 8 are dirty (skill mutations, then each
+    // child's — all carried back through the shared DAT_00541486);
+    // exits 3, 5, 7, 9 are clean — the preceding persists cleared
+    // the flag.
     const bool exitsOk =
-        optionsExitDirty.size() == 7 && optionsExitDirty[0] &&
+        optionsExitDirty.size() == 9 && optionsExitDirty[0] &&
         optionsExitDirty[1] && !optionsExitDirty[2] &&
         optionsExitDirty[3] && !optionsExitDirty[4] &&
-        optionsExitDirty[5] && !optionsExitDirty[6];
+        optionsExitDirty[5] && !optionsExitDirty[6] &&
+        optionsExitDirty[7] && !optionsExitDirty[8];
     // The proven audio-trigger sequence for the whole run — entry
     // (ambient stop + OPTSONG start), per-query OPTBUTT + the two
     // FUN_004024c4 volume applies, exit (OPTSONG stop + ambient
@@ -1945,6 +2369,12 @@ int Application::run() {
         SoundAudioEvent::AmbientSongStart,
     };
     const bool audioOk = audioEventLog == expectedAudio;
+    // Keyboard leg (Phase 4K): reset on row 19 (dirty latches even
+    // though every visible value was already factory), then one
+    // deterministic rebind — the injected SDL X tap lands internal
+    // code 45 through the scancode->DIK->internal seam, exactly the
+    // device path the original's capture poll sees.
+    const int expectedKeySniper = 45;  // DIK 0x2d -> internal 45
     // With --settings-file the persisted file must hold the final
     // settings tuple — re-read here for the verdict.
     bool fileOk = true;
@@ -1961,7 +2391,9 @@ int Application::run() {
                disk->settings.mouseOn == (expectedMouseOn != 0) &&
                disk->settings.mouseYReversed == expectedMouseYRev &&
                disk->settings.mouseWButtMapA == expectedButtA &&
-               disk->settings.mouseWAxesMap == settingsInitialAxesMap;
+               disk->settings.mouseWAxesMap ==
+                   settingsInitialAxesMap &&
+               disk->settings.keySniper == expectedKeySniper;
     }
     selftestOk_ = selftestOk_ && frontendEnteredOptions &&
                   frontendReturnedToRoot &&
@@ -1970,7 +2402,7 @@ int Application::run() {
                       OptionsAction::SkillCycleNext &&
                   frontendFlow->root().selection() == 3 &&
                   frontendFlow->root().mouseX() == 300 &&
-                  frontendFlow->root().mouseY() == 45 &&
+                  frontendFlow->root().mouseY() == 20 &&
                   entrySkillsOk && exitsOk &&
                   displayEntered &&
                   displayEntrySelection == kDisplayEntrySelection &&
@@ -1996,7 +2428,15 @@ int Application::run() {
                   frontendFlow->mouseButtMap()[0] == expectedButtA &&
                   frontendFlow->mouseAxesMap() ==
                       settingsInitialAxesMap &&
-                  settingsPersistCalls == 4 &&
+                  keyboardEntered &&
+                  keyboardEntrySelection == kKeyboardEntrySelection &&
+                  keyboardResumeSelection == 4 &&
+                  keyboardFramesDrawn == 8 &&
+                  keyboardCaptureSeen &&
+                  keyboardEntryKeySniper == settingsInitialKeySniper &&
+                  frontendFlow->keyGlobals()[7] == expectedKeySniper &&
+                  frontendFlow->keyGlobals()[14] == 2 &&
+                  settingsPersistCalls == 5 &&
                   settingsPersistedSkill == expected &&
                   settingsPersistedBrightness == expectedBright &&
                   settingsPersistedForcePCorrect == expectedPcorrect &&
@@ -2006,14 +2446,15 @@ int Application::run() {
                   settingsPersistedMouseYRev == expectedMouseYRev &&
                   settingsPersistedButtA == expectedButtA &&
                   settingsPersistedAxesMap == settingsInitialAxesMap &&
+                  settingsPersistedKeySniper == expectedKeySniper &&
                   frontendFlow->skill() == expected &&
                   !frontendFlow->settingsDirty() && fileOk;
     log::info(kTag,
-              "frontend selftest (five-screen): %s (entries=%d "
-              "entry-skills=%d,%d,%d,%d,%d,%d,%d "
-              "exit-dirty=%d,%d,%d,%d,%d,%d,%d "
-              "persists=%d persisted=%d,%d,%d,%d,%d skill=%d "
-              "bright=%d pcorr=%d fx=%d mus=%d dirty=%d "
+              "frontend selftest (six-screen): %s (entries=%d "
+              "entry-skills=%d,%d,%d,%d,%d,%d,%d,%d,%d "
+              "exit-dirty=%d,%d,%d,%d,%d,%d,%d,%d,%d "
+              "persists=%d persisted=%d,%d,%d,%d,%d keySniper=%d "
+              "skill=%d bright=%d pcorr=%d fx=%d mus=%d dirty=%d "
               "display-entry=%d resume-sel=%d display-frames=%d "
               "display-fb=%016llx display-pal=%016llx "
               "sound-entry=%d sound-resume=%d sound-frames=%d "
@@ -2021,6 +2462,8 @@ int Application::run() {
               "mouse-entry=%d mouse-resume=%d mouse-frames=%d "
               "mouse-fb=%016llx mouse-pal=%016llx "
               "mouseOn=%d yrev=%u axes=%s buttA=%u "
+              "kb-entry=%d kb-resume=%d kb-frames=%d kb-cap=%d "
+              "kb-fb=%016llx kb-pal=%016llx keySnipe=%d hidden14=%d "
               "root sel=%d mouse=%d,%d last-options=%s)",
               selftestOk_ ? "PASS" : "FAIL",
               static_cast<int>(optionsEntrySkills.size()),
@@ -2038,6 +2481,10 @@ int Application::run() {
                                             : -1,
               optionsEntrySkills.size() > 6 ? optionsEntrySkills[6]
                                             : -1,
+              optionsEntrySkills.size() > 7 ? optionsEntrySkills[7]
+                                            : -1,
+              optionsEntrySkills.size() > 8 ? optionsEntrySkills[8]
+                                            : -1,
               optionsExitDirty.size() > 0 ? optionsExitDirty[0] ? 1 : 0
                                           : -1,
               optionsExitDirty.size() > 1 ? optionsExitDirty[1] ? 1 : 0
@@ -2052,10 +2499,15 @@ int Application::run() {
                                           : -1,
               optionsExitDirty.size() > 6 ? optionsExitDirty[6] ? 1 : 0
                                           : -1,
+              optionsExitDirty.size() > 7 ? optionsExitDirty[7] ? 1 : 0
+                                          : -1,
+              optionsExitDirty.size() > 8 ? optionsExitDirty[8] ? 1 : 0
+                                          : -1,
               settingsPersistCalls, settingsPersistedSkill,
               settingsPersistedBrightness,
               settingsPersistedForcePCorrect,
               settingsPersistedSoundFx, settingsPersistedSoundMusic,
+              settingsPersistedKeySniper,
               frontendFlow->skill(),
               frontendFlow->brightness(),
               frontendFlow->forcePCorrect() ? 1 : 0,
@@ -2078,6 +2530,12 @@ int Application::run() {
               frontendFlow->mouseYReversedBits(),
               frontendFlow->mouseAxesMap().c_str(),
               frontendFlow->mouseButtMap()[0],
+              keyboardEntrySelection, keyboardResumeSelection,
+              keyboardFramesDrawn, keyboardCaptureSeen ? 1 : 0,
+              static_cast<unsigned long long>(keyboardLastFbDigest),
+              static_cast<unsigned long long>(keyboardLastPalDigest),
+              frontendFlow->keyGlobals()[7],
+              frontendFlow->keyGlobals()[14],
               frontendFlow->root().selection(),
               frontendFlow->root().mouseX(),
               frontendFlow->root().mouseY(),
@@ -2174,6 +2632,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.soundSubmenuPreview = true;
     } else if (!std::strcmp(a, "--preview-mouse-submenu")) {
       cfg.mouseSubmenuPreview = true;
+    } else if (!std::strcmp(a, "--preview-keyboard-submenu")) {
+      cfg.keyboardSubmenuPreview = true;
     } else if (!std::strcmp(a, "--interactive-frontend")) {
       cfg.interactiveFrontend = true;
     } else if (!std::strcmp(a, "--frontend-root-only")) {

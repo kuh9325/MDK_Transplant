@@ -19,6 +19,7 @@
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 #include "core/indexed_image.h"
+#include "core/keyboard_menu.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
@@ -5477,6 +5478,533 @@ void test_mouse_controller() {
   }
 }
 
+// Phase 4K — Keyboard child screen (FUN_0041f030 entry /
+// FUN_0041f18c frame) plus the internal key-code domain helpers.
+void test_keyboard_controller() {
+  // FUN_0046b688's DIK -> internal rule: offsets <= 0x7f are the
+  // code itself; > 0x7f translate through table_49bbf0[DIK & 0x7f],
+  // unmapped entries yielding 0x7f — itself a capturable code.
+  {
+    CHECK(mdk::internalKeyFromDik(0x01) == 0x01);   // base domain
+    CHECK(mdk::internalKeyFromDik(0x1c) == 0x1c);   // RETURN
+    CHECK(mdk::internalKeyFromDik(0x2d) == 0x2d);   // 'X'
+    CHECK(mdk::internalKeyFromDik(0x7f) == 0x7f);
+    // The proven extended mappings.
+    CHECK(mdk::internalKeyFromDik(0x9c) == 96);     // KP_ENTER
+    CHECK(mdk::internalKeyFromDik(0x9d) == 97);     // RCTRL
+    CHECK(mdk::internalKeyFromDik(0xb5) == 99);     // KP_/
+    CHECK(mdk::internalKeyFromDik(0xb7) == 100);    // SYSRQ
+    CHECK(mdk::internalKeyFromDik(0xb8) == 101);    // RALT
+    CHECK(mdk::internalKeyFromDik(0xc7) == 102);    // HOME
+    CHECK(mdk::internalKeyFromDik(0xc8) == 103);    // UP
+    CHECK(mdk::internalKeyFromDik(0xc9) == 104);    // PGUP
+    CHECK(mdk::internalKeyFromDik(0xcb) == 105);    // LEFT
+    CHECK(mdk::internalKeyFromDik(0xcd) == 106);    // RIGHT
+    CHECK(mdk::internalKeyFromDik(0xcf) == 107);    // END
+    CHECK(mdk::internalKeyFromDik(0xd0) == 108);    // DOWN
+    CHECK(mdk::internalKeyFromDik(0xd1) == 109);    // PGDN
+    CHECK(mdk::internalKeyFromDik(0xd2) == 110);    // INS
+    CHECK(mdk::internalKeyFromDik(0xd3) == 111);    // DEL
+    CHECK(mdk::internalKeyFromDik(0xef) == 112);    // last mapped
+    // Unmapped extended entries resolve to 0x7f.
+    CHECK(mdk::internalKeyFromDik(0x80) == 0x7f);
+    CHECK(mdk::internalKeyFromDik(0xc5) == 0x7f);   // PAUSE
+    CHECK(mdk::internalKeyFromDik(0xdb) == 0x7f);   // LWIN
+    // The mask is applied BEFORE the table index — 0x1ff & 0x7f.
+    CHECK(mdk::internalKeyFromDik(0x1ff) == 0x7f);
+    // NATIVE hardening: a negative offset is rejected outright.
+    CHECK(mdk::internalKeyFromDik(-1) == -1);
+  }
+
+  // FUN_00419168 — the lowest set bit across the four 32-bit edge
+  // dwords; an empty bitmap returns the 0 sentinel.
+  {
+    mdk::KeyboardEdgeBitmap e{};
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 0);
+    e[0] = 0x8;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 3);
+    e = {};
+    e[0] = 0x80000000u;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 31);
+    e = {};
+    e[1] = 0x1;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 32);
+    e = {};
+    e[2] = 0x10000u;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 80);
+    e = {};
+    e[3] = 0x80000000u;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 127);
+    // Word order wins over bit position in a later word.
+    e = {};
+    e[0] = 0x80000000u;
+    e[3] = 0x1;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 31);
+    e = {};
+    e[0] = 0x10;
+    e[3] = 0x1;
+    CHECK(mdk::keyboardFirstEdgeBit(e) == 4);
+  }
+
+  // FUN_0041925c — lowest bit first, THEN the right-modifier folds:
+  // 0x36->0x2a (RSHIFT->LSHIFT), 0x61->0x1d (RCTRL->LCTRL),
+  // 0x65->0x38 (RALT->LALT). The fold applies to the winner only —
+  // a lower un-folded bit still wins over a right-modifier bit.
+  {
+    mdk::KeyboardEdgeBitmap e{};
+    CHECK(mdk::keyboardPollCapture(e) == 0);
+    e[1] = 1u << (0x36 - 32);                       // code 54 RSHIFT
+    CHECK(mdk::keyboardPollCapture(e) == 0x2a);   // RSHIFT -> LSHIFT
+    e = {};
+    e[3] = 1u << (0x61 - 96);                       // code 97 RCTRL
+    CHECK(mdk::keyboardPollCapture(e) == 0x1d);   // RCTRL -> LCTRL
+    e = {};
+    e[3] = 1u << (0x65 - 96);                       // code 101 RALT
+    CHECK(mdk::keyboardPollCapture(e) == 0x38);   // RALT -> LALT
+    e = {};
+    e[1] = 1u << (0x2d - 32);                       // code 45 'X'
+    CHECK(mdk::keyboardPollCapture(e) == 45);     // 'X' untouched
+    // Selection before fold: bit 20 < 0x36 wins unfolded.
+    e = {};
+    e[0] = 1u << 20;
+    e[1] = 1u << (0x36 - 32);
+    CHECK(mdk::keyboardPollCapture(e) == 20);
+    // Bit 0x36 alone still folds even with a LATER bit present.
+    e = {};
+    e[1] = 1u << (0x36 - 32);
+    e[3] = 0x1;
+    CHECK(mdk::keyboardPollCapture(e) == 0x2a);
+  }
+
+  // The three 128-byte glyph tables + the LANG selector — EN is
+  // QWERTY, FR is AZERTY (Q->A, W->Z, M->',' positions), DE is
+  // QWERTZ (Y<->Z). Anything but 'F'/'G' — including the soft
+  // resolver's 0 — selects English.
+  {
+    const auto& en = mdk::keyboardGlyphTableEn();
+    const auto& fr = mdk::keyboardGlyphTableFr();
+    const auto& de = mdk::keyboardGlyphTableDe();
+    CHECK(&mdk::keyboardGlyphTable('E') == &en);
+    CHECK(&mdk::keyboardGlyphTable('F') == &fr);
+    CHECK(&mdk::keyboardGlyphTable('G') == &de);
+    CHECK(&mdk::keyboardGlyphTable(0) == &en);    // missing LANG
+    CHECK(&mdk::keyboardGlyphTable('x') == &en);
+    // English: letters/digits verbatim, icon bytes for controls.
+    CHECK(en[0x1e] == 'A' && en[0x2d] == 'X' && en[0x02] == '1');
+    CHECK(en[0x1c] == 0x04);    // RETURN icon
+    CHECK(en[0x39] == 0x08);    // SPACE icon
+    CHECK(en[0x2a] == 0x06);    // LSHIFT icon
+    CHECK(en[0x1d] == 0x05);    // LCTRL icon
+    CHECK(en[0x38] == 0x07);    // LALT icon
+    CHECK(en[0x3a] == 0x09);    // CAPS icon
+    CHECK(en[0x33] == ',' && en[0x34] == '.');
+    CHECK(en[0x1a] == '[' && en[0x1b] == ']');
+    // The extended nav cluster -> icon glyphs 0x88..0x92.
+    CHECK(en[103] == 0x89);     // UP arrow
+    CHECK(en[105] == 0x8b);     // LEFT arrow
+    CHECK(en[106] == 0x8c);     // RIGHT arrow
+    CHECK(en[108] == 0x8e);     // DOWN arrow
+    CHECK(en[0x7f] == 0x00);    // internal 127 draws blank
+    // AZERTY differences (OBSERVED bytes).
+    CHECK(fr[0x10] == 'A');     // QWERTY Q position -> A
+    CHECK(fr[0x11] == 'Z');     // W position -> Z
+    CHECK(fr[0x1e] == 'Q');     // A position -> Q
+    CHECK(fr[0x32] == ',');     // M position -> ','
+    CHECK(fr[0x27] == 'M');     // ';' position -> M
+    // QWERTZ differences.
+    CHECK(de[0x15] == 'Z');     // Y position -> Z
+    CHECK(de[0x2c] == 'Y');     // Z position -> Y
+    // All three share the icon rows and the extended cluster.
+    CHECK(fr[103] == 0x89 && de[103] == 0x89);
+    CHECK(fr[0x39] == 0x08 && de[0x39] == 0x08);
+  }
+
+  // Settings <-> 29-dword block mapping: the 19 persisted slots
+  // overlay the factory block; the ten hidden hotkey slots
+  // (g14..g23) always boot at factory 2..11 and never serialize.
+  {
+    mdk::FrontendSettings s;
+    const auto g = mdk::keyboardGlobalsFromSettings(s);
+    CHECK(g == mdk::kKeyboardDefaults);
+    s.keyLeft = 30;      // slot 69 -> g0
+    s.keySniper = 45;    // slot 76 -> g7
+    s.keySideL = 20;     // slot 86 -> g27
+    s.keySideR = 21;     // slot 87 -> g28
+    const auto g2 = mdk::keyboardGlobalsFromSettings(s);
+    CHECK(g2[0] == 30 && g2[7] == 45 && g2[27] == 20 &&
+          g2[28] == 21);
+    CHECK(g2[14] == 2 && g2[23] == 11);   // hidden slots factory
+    mdk::FrontendSettings back;
+    mdk::keyboardSettingsFromGlobals(back, g2);
+    CHECK(back.keyLeft == 30 && back.keySniper == 45 &&
+          back.keySideL == 20 && back.keySideR == 21);
+    CHECK(back.keyFire == 29);            // untouched round-trips
+    // The proven row->global draw-order map (NOT settings order).
+    CHECK(mdk::kKeyboardRowToGlobal[0] == 0);
+    CHECK(mdk::kKeyboardRowToGlobal[5] == 27);   // KM_SIDEL
+    CHECK(mdk::kKeyboardRowToGlobal[6] == 5);    // KM_SIDE
+    CHECK(mdk::kKeyboardRowToGlobal[7] == 28);   // KM_SIDER
+    CHECK(mdk::kKeyboardRowToGlobal[8] == 7);    // KM_SNIPE
+    CHECK(mdk::kKeyboardRowToGlobal[9] == 6);    // KM_FIRE
+    CHECK(mdk::kKeyboardRowToGlobal[16] == 24);  // KM_INEXT
+    CHECK(mdk::kKeyboardRowToGlobal[17] == 25);  // KM_IPREV
+    CHECK(mdk::kKeyboardRowToGlobal[18] == 26);  // KM_IUSE
+  }
+
+  // Entry (FUN_0041f030): capture clear, selection = 0x14 — the
+  // KM_QUIT row, NOT 0 — the 29-dword block borrowed verbatim, and
+  // the shared machine state carried over untouched.
+  {
+    mdk::FrontendMachineState ms;
+    ms.mouseX = 123;
+    ms.mouseY = 45;
+    ms.tick = 9;
+    ms.markerAcc = 7;
+    mdk::KeyboardMenuController kb(ms, mdk::kKeyboardDefaults, true);
+    CHECK(kb.selection() == 20);
+    CHECK(!kb.capture());
+    CHECK(kb.keyGlobals() == mdk::kKeyboardDefaults);
+    CHECK(kb.settingsDirty());            // the carried flag
+    CHECK(kb.mouseX() == 123 && kb.mouseY() == 45);
+    CHECK(kb.tick() == 9 && kb.markerAccumulator() == 7);
+    CHECK(kb.pendingAction() == mdk::KeyboardAction::None);
+  }
+
+  // Normal navigation: UP|LEFT -> sel-1 (wrap <0 -> 20);
+  // DOWN|RIGHT -> sel+1 (wrap >=21 -> 0). LEFT/RIGHT are the second
+  // query in each pair — they only run when UP/DOWN didn't fire.
+  // A held-key tap is press + release-update (the repeat deadline
+  // only resets on a released frame).
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    kb.update(in);
+    in = {};
+    kb.update(in);
+    CHECK(kb.selection() == 19);          // 20 -> 19
+    in.nextHeld = true;
+    kb.update(in);
+    in = {};
+    kb.update(in);
+    CHECK(kb.selection() == 20);          // 19 -> 20
+    in.nextHeld = true;
+    kb.update(in);
+    in = {};
+    kb.update(in);
+    CHECK(kb.selection() == 0);           // wraps >=21 -> 0
+    in.prevHeld = true;
+    kb.update(in);
+    in = {};
+    kb.update(in);
+    CHECK(kb.selection() == 20);          // wraps <0 -> 20
+    in.leftHeld = true;
+    kb.update(in);
+    in = {};
+    kb.update(in);
+    CHECK(kb.selection() == 19);          // LEFT = prev
+    in.rightHeld = true;
+    kb.update(in);
+    in = {};
+    kb.update(in);
+    CHECK(kb.selection() == 20);          // RIGHT = next
+  }
+
+  // Mouse hit-test (OBSERVED, inside the dx||dy||buttons gate):
+  // y>=64 -> band trunc((y-50)/30), x>=320 adds 10, 0<=band<19;
+  // y<64 -> [2,18) = row 19, [18,34) = row 20; the other bands
+  // select nothing. Selection only — never activates.
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 64 - 180;                // -> (300,64): band 0
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 0);
+    // y=350 x<320 -> band trunc(300/30)=10 <=10 -> row 10 — the
+    // OBSERVED quirk: the left column's band domain reaches into
+    // the right column's row range.
+    in.mouseDy = 350 - 64;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 10);
+    // Same y at x>=320 -> band 10+10=20 -> >=19 -> no select.
+    in.mouseDx = 400 - 300;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 10);
+    // Right column mid-band: y=94 -> band trunc(44/30)=1 -> row 11.
+    in.mouseDy = 94 - 350;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 11);
+    // Reset band [2,18) -> 19; Quit band [18,34) -> 20.
+    in.mouseDy = 8 - 94;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 19);
+    in.mouseDy = 20 - 8;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 20);
+    // y<2 selects nothing (stays 20); [34,64) selects nothing.
+    in.mouseDy = 1 - 20;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 20);
+    in.mouseDy = 40 - 1;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 20);
+    // (A buttons!=0 frame also opens the gate — but it fires the
+    // activate query in the same frame; see the click-activate
+    // test below.)
+  }
+
+  // Capture entry: activate on a binding row sets DAT_0054bca8 and
+  // the frame still draws (no early end).
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;               // -> band 8 (KM_SNIPE)
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 8);
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    CHECK(kb.capture());
+    CHECK(!kb.frameEndedEarly());
+    CHECK(kb.pendingAction() == mdk::KeyboardAction::None);
+    // A raw-key edge commits through row 8 -> g7 (KeySniper).
+    in.rawKeyEdge[1] = 1u << (45 - 32);   // internal 45 = 'X'
+    kb.update(in);
+    in = {};
+    CHECK(!kb.capture());
+    CHECK(kb.keyAt(7) == 45);
+    CHECK(kb.settingsDirty());
+    CHECK(!kb.frameEndedEarly());         // commit still draws
+  }
+
+  // Capture Esc-cancel: the Esc edge is checked BEFORE the raw-key
+  // poll, so a simultaneous key edge never commits; Escape can
+  // never become a binding and the cancel is NOT an exit.
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    kb.update(in);
+    in = {};
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    CHECK(kb.capture());
+    // The physical ESC event sets both the semantic flag and the
+    // raw bit — the cancel path wins, the poll never runs.
+    in.cancelEdge = true;
+    in.rawKeyEdge[0] = 0x2;               // internal 1 = ESCAPE
+    kb.update(in);
+    in = {};
+    CHECK(!kb.capture());
+    CHECK(kb.keyAt(7) == 57);             // binding untouched
+    CHECK(!kb.settingsDirty());
+    CHECK(kb.pendingAction() == mdk::KeyboardAction::None);
+    CHECK(!kb.frameEndedEarly());         // cancel still draws
+  }
+
+  // A nav key captured as a binding: the physical UP event feeds
+  // both prevHeld and the raw edge — capture owns the input, the
+  // row does not move, and the extended code stores verbatim.
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    kb.update(in);
+    in = {};
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    CHECK(kb.capture());
+    in.prevHeld = true;                   // the physical UP held
+    in.rawKeyEdge[3] = 1u << (103 - 96);  // ext UP -> internal 103
+    kb.update(in);
+    in = {};
+    CHECK(!kb.capture());
+    CHECK(kb.keyAt(7) == 103);
+    CHECK(kb.selection() == 8);           // no nav happened
+    // RETURN captured likewise — internal 28 binds, it does NOT
+    // re-activate (capture returns before the activate query).
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    CHECK(kb.capture());
+    in.confirmEdge = true;                // the physical RETURN edge
+    in.rawKeyEdge[0] = 1u << 28;
+    kb.update(in);
+    in = {};
+    CHECK(!kb.capture());
+    CHECK(kb.keyAt(7) == 28);
+    CHECK(kb.pendingAction() == mdk::KeyboardAction::None);
+  }
+
+  // Same-value rebind: the commit is skipped entirely — no write,
+  // no new dirty latch (OBSERVED FUN_0041f18c).
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    kb.update(in);
+    in = {};
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    CHECK(kb.capture());
+    in.rawKeyEdge[1] = 1u << (57 - 32);   // SPACE = current g7
+    kb.update(in);
+    in = {};
+    CHECK(!kb.capture());
+    CHECK(kb.keyAt(7) == 57);
+    CHECK(!kb.settingsDirty());
+  }
+
+  // Duplicate binding: the captured code stores verbatim even when
+  // already bound elsewhere — no swap, no reject, no unbind (the
+  // factory defaults themselves share 'A' and 'Z' pairs).
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;               // row 8 KeySniper (g7)
+    kb.update(in);
+    in = {};
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    in.rawKeyEdge[1] = 1u << (45 - 32);   // 'X' — already g5/g6? no:
+    kb.update(in);                        // g5 KeySide = 45
+    in = {};
+    CHECK(kb.keyAt(7) == 45);             // Sniper = 'X'
+    CHECK(kb.keyAt(5) == 45);             // Side keeps 'X' — both bind
+    CHECK(kb.settingsDirty());
+  }
+
+  // Right-modifier capture normalizes to the left/base code —
+  // through the edge bitmap (the physical RSHIFT event sets bit
+  // 0x36; the poll folds to 0x2a before the store).
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    kb.update(in);
+    in = {};
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    in.rawKeyEdge[1] = 1u << (0x36 - 32); // RSHIFT bit
+    kb.update(in);
+    in = {};
+    CHECK(kb.keyAt(7) == 0x2a);           // stored as LSHIFT
+  }
+
+  // KM_RESET (row 19): FUN_00425db0's 29-dword mirror copy restores
+  // ALL slots — the 19 visible bindings AND the ten hidden hotkey
+  // slots — and ECX=1 is preserved so dirty latches even when the
+  // visible values were already factory.
+  {
+    auto keys = mdk::kKeyboardDefaults;
+    keys[7] = 45;                          // a mutated visible slot
+    keys[14] = 99;                         // a mutated hidden hotkey
+    keys[23] = 0;                          // ...and the last hidden
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   keys, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 8 - 180;                  // [2,18) band -> row 19
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 19);
+    in.confirmEdge = true;
+    kb.update(in);
+    in = {};
+    CHECK(kb.selection() == 19);           // reset keeps the row
+    CHECK(!kb.capture());
+    CHECK(kb.keyGlobals() == mdk::kKeyboardDefaults);   // ALL 29
+    CHECK(kb.keyAt(7) == 57 && kb.keyAt(14) == 2 &&
+          kb.keyAt(23) == 11);
+    CHECK(kb.settingsDirty());             // ECX=1 preserved
+    CHECK(!kb.frameEndedEarly());          // reset still draws
+    // Dirty latches even when nothing visible changed.
+    mdk::KeyboardMenuController kb2(mdk::FrontendMachineState{},
+                                    mdk::kKeyboardDefaults, false);
+    in = {};
+    in.mouseDy = 8 - 180;
+    kb2.update(in);
+    in = {};
+    in.confirmEdge = true;
+    kb2.update(in);
+    CHECK(kb2.settingsDirty());
+  }
+
+  // KM_QUIT (row 20 — the entry row): activate -> Back + endedEarly
+  // (the original RETs before the draw). Esc in NORMAL state takes
+  // the same exit — distinct from the capture-mode cancel.
+  {
+    mdk::KeyboardMenuController kb(mdk::FrontendMachineState{},
+                                   mdk::kKeyboardDefaults, false);
+    mdk::FrontendMenuInput in;
+    CHECK(kb.selection() == 20);           // entry IS the quit row
+    in.confirmEdge = true;
+    kb.update(in);
+    CHECK(kb.pendingAction() == mdk::KeyboardAction::Back);
+    CHECK(kb.frameEndedEarly());
+    CHECK(kb.consumeAction() == mdk::KeyboardAction::Back);
+    CHECK(kb.consumeAction() == mdk::KeyboardAction::None);
+    // Esc in normal mode: same exit, same early end.
+    mdk::KeyboardMenuController kb2(mdk::FrontendMachineState{},
+                                    mdk::kKeyboardDefaults, false);
+    in = {};
+    in.cancelEdge = true;
+    kb2.update(in);
+    CHECK(kb2.pendingAction() == mdk::KeyboardAction::Back);
+    CHECK(kb2.frameEndedEarly());
+    // A mouse-click activate works too (button-latch path): the
+    // same event opens the hit-test gate — a click in the [18,34)
+    // band selects the Quit row and fires it in one frame.
+    mdk::FrontendMachineState ms3;
+    ms3.mouseX = 300;
+    ms3.mouseY = 20;
+    mdk::KeyboardMenuController kb3(ms3, mdk::kKeyboardDefaults,
+                                    false);
+    in = {};
+    kb3.update(in);                        // buttons=0 arms the latch
+    in.mouseButtons = 0x1;
+    kb3.update(in);                        // click: gate + activate
+    CHECK(kb3.pendingAction() == mdk::KeyboardAction::Back);
+    CHECK(kb3.frameEndedEarly());
+  }
+
+  // FUN_00414b28 — markerAcc advances by floor(acc + smoothed) per
+  // flagged draw; the return is the post-advance bit-3 blink phase.
+  {
+    mdk::FrontendMachineState ms;
+    ms.markerAcc = 0;
+    ms.timing.smoothed = 4.0f;
+    mdk::KeyboardMenuController kb(ms, mdk::kKeyboardDefaults, false);
+    CHECK(kb.advanceBlink() == false);     // 0 -> 4: bit3 clear
+    CHECK(kb.markerAccumulator() == 4);
+    CHECK(kb.advanceBlink() == true);      // 4 -> 8: bit3 set
+    CHECK(kb.advanceBlink() == true);      // 8 -> 12: bit3 set
+    CHECK(kb.advanceBlink() == false);     // 12 -> 16: bit3 clear
+    CHECK(kb.markerAccumulator() == 16);
+  }
+}
+
 // Phase 4G/4H/4I — native-owned frontend settings persistence
 // (Skill, Brightness, ForcePCorrect, SoundFX, SoundMusic): the
 // FUN_004260ac/FUN_00425de4 contract reimplemented against
@@ -5800,6 +6328,118 @@ void test_frontend_settings() {
     // Untouched D-set fields survive a round-trip.
     CHECK(rt.settings.mouseDButtMapA == 1 &&
           rt.settings.mouseDAxesMap == "ABG");
+  }
+
+  // Phase 4K keyboard entries (OBSERVED — settings table 69-87):
+  // 19 type-0 int slots in the internal 0..127 key-code domain,
+  // serialized between MouseYReversed (68) and Skill (88) — the
+  // table order, not the screen's draw order.
+  {
+    mdk::FrontendSettings s;
+    CHECK(s.keyLeft == 105 && s.keyRight == 106 &&
+          s.keyUp == 103 && s.keyDown == 108);
+    CHECK(s.keyJump == 56 && s.keySide == 45 && s.keyFire == 29 &&
+          s.keySniper == 57);
+    CHECK(s.keyTurbo == 42 && s.keySturbo == 58);
+    CHECK(s.keyLookUp == 30 && s.keyLookDown == 44 &&
+          s.keyZoomIn == 30 && s.keyZoomOut == 44);   // factory dups
+    CHECK(s.keyItemNext == 27 && s.keyItemPrev == 26 &&
+          s.keyItemUse == 28);
+    CHECK(s.keySideL == 51 && s.keySideR == 52);
+    // Defaults emit none of the Key* lines.
+    const std::string def = mdk::serializeFrontendSettings(s);
+    CHECK(def.find("Key") == std::string::npos);
+    // Every dirty Key* entry emits in table order 69..87 — all
+    // after the mouse block, all before Skill.
+    s.keyLeft = 0;        // 69
+    s.keyRight = 1;       // 70
+    s.keyUp = 2;          // 71
+    s.keyDown = 3;        // 72
+    s.keyJump = 4;        // 73
+    s.keySide = 5;        // 74
+    s.keyFire = 6;        // 75
+    s.keySniper = 7;      // 76
+    s.keyTurbo = 8;       // 77
+    s.keySturbo = 9;      // 78
+    s.keyLookUp = 10;     // 79
+    s.keyLookDown = 11;   // 80
+    s.keyZoomIn = 12;     // 81
+    s.keyZoomOut = 13;    // 82
+    s.keyItemNext = 14;   // 83
+    s.keyItemPrev = 15;   // 84
+    s.keyItemUse = 16;    // 85
+    s.keySideL = 17;      // 86
+    s.keySideR = 18;      // 87
+    s.skill = 2;
+    const std::string out = mdk::serializeFrontendSettings(s);
+    const char* keys[] = {
+        "KeyLeft = 0",     "KeyRight = 1",   "KeyUp = 2",
+        "KeyDown = 3",     "KeyJump = 4",    "KeySide = 5",
+        "KeyFire = 6",     "KeySniper = 7",  "KeyTurbo = 8",
+        "KeySturbo = 9",   "KeyLookUp = 10", "KeyLookDown = 11",
+        "KeyZoomIn = 12",  "KeyZoomOut = 13","KeyItemNext = 14",
+        "KeyItemPrev = 15","KeyItemUse = 16","KeySideL = 17",
+        "KeySideR = 18"};
+    std::size_t prev = 0;
+    for (const char* k : keys) {
+      const auto p = out.find(k);
+      CHECK(p != std::string::npos);
+      CHECK(p > prev || p == 0);
+      prev = p;
+    }
+    CHECK(out.find("Skill = 2") > out.find("KeySideR"));
+    // A lone rebind emits just its own line.
+    mdk::FrontendSettings lone;
+    lone.keySniper = 45;
+    const std::string only = mdk::serializeFrontendSettings(lone);
+    CHECK(only.find("KeySniper = 45\r\n") != std::string::npos);
+    CHECK(only.find("KeyLeft") == std::string::npos &&
+          only.find("KeyFire") == std::string::npos);
+  }
+
+  // Phase 4K parser entries: Key* take the leading integer like
+  // the other type-0 slots, match case-insensitively, and the
+  // NATIVE [0,127] hardening rejects out-of-domain lines into
+  // their own ignored counter (never an original-behavior claim).
+  {
+    CHECK(mdk::parseFrontendSettings("KeySniper = 45")
+              .settings.keySniper == 45);
+    CHECK(mdk::parseFrontendSettings("KEYLEFT = 0")
+              .settings.keyLeft == 0);
+    CHECK(mdk::parseFrontendSettings("KeyItemUse = 127")
+              .settings.keyItemUse == 127);
+    auto p = mdk::parseFrontendSettings("KeySniper = 128");
+    CHECK(p.settings.keySniper == 57 && p.ignoredKeyLines == 1);
+    p = mdk::parseFrontendSettings("KeySniper = -1");
+    CHECK(p.settings.keySniper == 57 && p.ignoredKeyLines == 1);
+    p = mdk::parseFrontendSettings("KeySniper = abc");
+    CHECK(p.settings.keySniper == 57 && p.ignoredKeyLines == 1);
+    p = mdk::parseFrontendSettings("KeySniper = ");
+    CHECK(p.settings.keySniper == 57 && p.ignoredKeyLines == 1);
+    // A bad line never clobbers a good one; the counter is its own.
+    p = mdk::parseFrontendSettings("KeyLeft = 30\nKeyLeft = 999\n");
+    CHECK(p.settings.keyLeft == 30 && p.ignoredKeyLines == 1 &&
+          p.ignoredSkillLines == 0);
+    // A serialized keyboard block round-trips.
+    mdk::FrontendSettings k;
+    k.keySniper = 45;
+    k.keyLeft = 30;
+    k.keyItemUse = 127;
+    const auto rt = mdk::parseFrontendSettings(
+        mdk::serializeFrontendSettings(k));
+    CHECK(rt.settings.keySniper == 45 && rt.settings.keyLeft == 30 &&
+          rt.settings.keyItemUse == 127);
+    // A full real-file layout keeps the block's position: mouse
+    // lines, then Key* lines, then Skill.
+    const auto disk = mdk::parseFrontendSettings(
+        "MouseOn = FALSE\r\n"
+        "KeySniper = 45\r\n"
+        "KeyFire = 97\r\n"
+        "Skill = 2\r\n"
+        "Brightness = 2\r\n");
+    CHECK(!disk.settings.mouseOn && disk.settings.keySniper == 45 &&
+          disk.settings.keyFire == 97 && disk.settings.skill == 2 &&
+          disk.settings.brightness == 2);
   }
 
   // NATIVE hardening (not an original-behavior claim): malformed
@@ -6439,6 +7079,210 @@ void test_frontend_flow() {
           flow.mouse().column() == 0);       // reset at entry
     CHECK(!flow.mouse().mouseOn());          // global retained
     CHECK(flow.mouse().settingsDirty());     // flag carried back
+  }
+
+  // Options -> Keyboard (Phase 4K): activating row 4 runs
+  // FUN_0041f030 — mode 0x05, capture clear, selection = 0x14 (the
+  // KM_QUIT row), the 29-dword key block borrowed from the loaded
+  // settings, machine state carried over.
+  auto enterKeyboard = [](mdk::FrontendFlowController& f) {
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;            // 180 -> 139: root band 3
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);
+    f.consumeRootAction();
+    in = {};
+    in.mouseButtons = 0;
+    in.mouseDy = 180 - 139;      // 139 -> 180: options band 4
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);                // click -> FUN_0041f030
+    f.consumeOptionsAction();
+  };
+
+  {
+    mdk::FrontendFlowController flow(true);
+    enterKeyboard(flow);
+    CHECK(flow.screen() == mdk::FrontendScreen::Keyboard);
+    CHECK(flow.keyboard().selection() == 20);   // DAT_0054bcac=0x14
+    CHECK(!flow.keyboard().capture());          // DAT_0054bca8 = 0
+    CHECK(flow.keyboard().mouseX() == 300 &&
+          flow.keyboard().mouseY() == 180);
+    CHECK(flow.keyGlobals() == mdk::kKeyboardDefaults);
+  }
+
+  // Keyboard -> Options (Phase 4K): the inline exit writes mode
+  // 0x0b with _DAT_0054bd34 still 4 — options resumes the Keyboard
+  // row; the rebound binding, machine state, and the shared dirty
+  // flag carry back.
+  {
+    mdk::FrontendFlowController flow(true);
+    enterKeyboard(flow);
+    mdk::FrontendMenuInput in;
+    // Hit-test to row 8 (KM_SNIPE), capture, bind internal 45.
+    in.mouseDy = 304 - 180;
+    flow.update(in);
+    in = {};
+    CHECK(flow.keyboard().selection() == 8);
+    in.confirmEdge = true;
+    flow.update(in);
+    in = {};
+    CHECK(flow.keyboard().capture());
+    in.rawKeyEdge[1] = 1u << (45 - 32);   // 'X'
+    flow.update(in);
+    in = {};
+    CHECK(!flow.keyboard().capture());
+    CHECK(flow.keyboard().keyAt(7) == 45);
+    // Esc (normal mode) -> Back -> options resumes sel 4.
+    in.cancelEdge = true;
+    flow.update(in);
+    CHECK(flow.consumeKeyboardAction() == mdk::KeyboardAction::None);
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.options().selection() == 4);
+    CHECK(flow.keyGlobals()[7] == 45);    // the block carried back
+    CHECK(flow.options().settingsDirty());
+    CHECK(flow.options().mouseX() == 300 &&
+          flow.options().mouseY() == 304);
+  }
+
+  // Re-entering Keyboard re-runs FUN_0041f030: selection resets to
+  // 0x14 and capture clears, but the 29-dword block is a process
+  // global — the rebound key survives (unlike the Mouse child's
+  // sel-0 reset, Keyboard entry always lands on KM_QUIT).
+  {
+    mdk::FrontendFlowController flow(true);
+    enterKeyboard(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    flow.update(in);
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    in = {};
+    in.rawKeyEdge[1] = 1u << (45 - 32);
+    flow.update(in);
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeKeyboardAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    // Re-enter (options sel still 4 -> activate).
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Keyboard);
+    CHECK(flow.keyboard().selection() == 20);   // reset to QUIT
+    CHECK(!flow.keyboard().capture());
+    CHECK(flow.keyboard().keyAt(7) == 45);      // block retained
+    CHECK(flow.keyboard().settingsDirty());     // flag carried back
+  }
+
+  // Keyboard exit does NOT persist — FUN_00420d68 owns the write.
+  // The overlay emits the rebound Key* entries while untouched
+  // fields round-trip from the loaded base; the hidden hotkey
+  // slots never serialize.
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendSettings initial;
+    initial.mouseDButtMapD = 32768;   // BUILD_A's real D-set dword
+    initial.keyItemUse = 99;          // a loaded non-factory key
+    mdk::FrontendFlowController flow(
+        true, initial, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    CHECK(flow.keyGlobals()[26] == 99);   // loaded overlay at boot
+    enterKeyboard(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    flow.update(in);
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    in = {};
+    in.rawKeyEdge[1] = 1u << (45 - 32);   // KeySniper -> 'X'
+    flow.update(in);
+    in = {};
+    // Esc -> options: no persist call yet.
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeKeyboardAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(calls == 0);
+    // Options exit -> FUN_00420d68 -> persist with the overlays.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(calls == 1);
+    CHECK(persisted.keySniper == 45 && persisted.keyItemUse == 99);
+    CHECK(persisted.mouseDButtMapD == 32768);   // untouched D set
+    CHECK(!flow.settingsDirty());
+    const std::string ser = mdk::serializeFrontendSettings(persisted);
+    CHECK(ser.find("KeySniper = 45\r\n") != std::string::npos);
+    CHECK(ser.find("KeyItemUse = 99\r\n") != std::string::npos);
+    CHECK(ser.find("KeyLeft") == std::string::npos);
+    // The Key* block sits between the mouse entries and Skill.
+    CHECK(ser.find("MouseDButtMapD = 32768") <
+          ser.find("KeySniper = 45"));
+  }
+
+  // The reset row inside the flow: mutating a binding plus
+  // activating KM_RESET restores all 29 globals — including the
+  // hidden hotkey slots — and latches the shared dirty flag that
+  // reaches the options persist gate (even though the visible
+  // values serialize as factory).
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    enterKeyboard(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 180;
+    flow.update(in);
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    in = {};
+    in.rawKeyEdge[1] = 1u << (45 - 32);   // KeySniper -> 'X'
+    flow.update(in);
+    in = {};
+    // Navigate to row 19 (KM_RESET) via the hit band, activate.
+    in.mouseDy = 8 - 304;
+    flow.update(in);
+    in = {};
+    CHECK(flow.keyboard().selection() == 19);
+    in.confirmEdge = true;
+    flow.update(in);
+    in = {};
+    CHECK(flow.keyGlobals() == mdk::kKeyboardDefaults);   // ALL 29
+    CHECK(flow.keyboard().settingsDirty());
+    // Quit -> options -> exit -> persist fires (dirty latched)
+    // even though the emitted file has no Key* lines.
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeKeyboardAction();
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(calls == 1);
+    CHECK(persisted.keySniper == 57);      // factory again
+    CHECK(mdk::serializeFrontendSettings(persisted)
+              .find("Key") == std::string::npos);
   }
 
   // Non-transition root actions pass through unchanged.
@@ -7300,6 +8144,202 @@ void test_mouse_render() {
   }
 }
 
+// Phase 4K — the keyboard frame (FUN_0041f068 rows + frame tail).
+void test_keyboard_render() {
+  std::string err;
+  // Every byte 1..255 maps to a 1x1 pixel glyph — labels and all
+  // key-glyph table bytes draw deterministically; byte 0 stays
+  // unmapped (the blank/unbound glyph case).
+  auto fSml = SyntheticFont::make();
+  for (int c = 1; c < 256; ++c) {
+    fSml.put32(c * 4, fSml.addGlyph(0, 0, 1, {7}));
+  }
+  const auto fontSml = mdk::decodeFtiFont(fSml.buf, &err);
+  CHECK(fontSml);
+  auto arrowS = SyntheticSprite::make1(
+      2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+  const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+  CHECK(arrow && arrow->frame(0));
+
+  static const char* rowText[19] = {
+      "Move Left",  "Move Right", "Move Up",    "Move Down",
+      "Jump",       "Step Left",  "Side Step",  "Step Right",
+      "Sniper",     "Fire",       "Turbo",      "Super Turbo",
+      "Look Up",    "Look Down",  "Zoom In",    "Zoom Out",
+      "Item Next",  "Item Prev",  "Item Use"};
+  mdk::KeyboardMenuLabels lbl{};
+  for (int i = 0; i < 19; ++i) lbl.rows[i] = rowText[i];
+  lbl.reset = "Set Defaults";
+  lbl.quit = "Quit";
+  lbl.doit = "Press A Key";
+  lbl.langTag = 'E';
+
+  std::array<std::byte, 192> sysPal{};
+  for (int i = 0; i < 64; ++i) {
+    sysPal[i * 3 + 0] = std::byte(i);
+    sysPal[i * 3 + 1] = std::byte(200 - i);
+    sysPal[i * 3 + 2] = std::byte(i);
+  }
+
+  // Static spec frame (OBSERVED entry state): clear(0), 19 rows in
+  // two columns (label x = 310*col+10, glyph x = 310*col+210,
+  // y = 30*(row%10)+64), KM_RESET at y=16, KM_QUIT at y=32 with the
+  // entry selection's blink bracket, no KM_DOIT, ARROW at the
+  // carried mouse, SYS_PAL head bound + tail zeroed.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::KeyboardMenuSpec spec;
+    spec.arrowX = 300;
+    spec.arrowY = 45;
+    CHECK(mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                       *arrow->frame(0), lbl, sysPal,
+                                       spec, &err));
+    // Row 0: label at (10,64), key glyph (en[105]=0x8b) at (210,64).
+    CHECK(fb.at(10, 64) == 7 && fb.at(210, 64) == 7);
+    // Row 10 — the right column: label (320,64), glyph (520,64).
+    CHECK(fb.at(320, 64) == 7 && fb.at(520, 64) == 7);
+    // Row 18 — last binding, right column y=304.
+    CHECK(fb.at(320, 304) == 7 && fb.at(520, 304) == 7);
+    // "Set Defaults" (12 px) centered: x = (600-12)/2 = 294 @y16.
+    CHECK(fb.at(294, 16) == 7);
+    // "Quit" (4 px) centered: x = (600-4)/2 = 298 @y32 — selected
+    // at entry, so the blink bracket rings it. Outer top edge at
+    // y = 32-14 = 18 (multi-char default top=14), inner at 19.
+    CHECK(fb.at(298, 32) == 7);
+    bool bracket = false;
+    for (int x = 295; x <= 305 && !bracket; ++x) {
+      if (fb.at(x, 18) == 1 || fb.at(x, 18) == 2 ||
+          fb.at(x, 19) == 1 || fb.at(x, 19) == 2) {
+        bracket = true;
+      }
+    }
+    CHECK(bracket);
+    // No capture prompt at entry.
+    CHECK(fb.at(294, 354) == 0 && fb.at(300, 354) == 0);
+    // ARROW at the spec position; corners stay cleared.
+    CHECK(fb.at(300, 45) == 77 && fb.at(301, 46) == 77);
+    CHECK(fb.at(0, 0) == 0 && fb.at(599, 0) == 0 &&
+          fb.at(0, 359) == 0);
+    // Palette: SYS_PAL head bound, tail zeroed.
+    CHECK(palette.get(1).r == 1 && palette.get(1).g == 199);
+    CHECK(palette.get(200).r == 0 && palette.get(200).a == 255);
+    // Contracts: wrong fb size, short palette head, empty labels.
+    mdk::IndexedFramebuffer small(64, 64);
+    CHECK(!mdk::renderKeyboardMenuFrame(small, palette, *fontSml,
+                                        *arrow->frame(0), lbl, sysPal,
+                                        spec, &err));
+    std::array<std::byte, 64> shortPal{};
+    CHECK(!mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                        *arrow->frame(0), lbl,
+                                        shortPal, spec, &err));
+    mdk::KeyboardMenuLabels bad = lbl;
+    bad.rows[3] = "";
+    CHECK(!mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                        *arrow->frame(0), bad, sysPal,
+                                        spec, &err));
+    bad = lbl;
+    bad.doit = "";
+    CHECK(!mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                        *arrow->frame(0), bad, sysPal,
+                                        spec, &err));
+  }
+
+  // A binding whose glyph byte is 0 (the unmapped/blank case —
+  // internal 127's EN entry) draws nothing at the glyph position.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::KeyboardMenuSpec spec;
+    spec.keys[0] = 127;   // en[127] = 0 -> blank glyph
+    spec.arrowX = 300;
+    spec.arrowY = 45;
+    CHECK(mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                       *arrow->frame(0), lbl, sysPal,
+                                       spec, &err));
+    CHECK(fb.at(210, 64) == 0);      // blank glyph
+    CHECK(fb.at(10, 64) == 7);       // label still draws
+  }
+
+  // The FR/DE tables change the drawn glyph bytes — AZERTY's 'M'
+  // position (0x32) shows ',', QWERTZ's 'Z' position (0x2c) shows
+  // 'Y'. A rebound value selects a different glyph byte.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::KeyboardMenuSpec spec;
+    spec.langTag = 'F';
+    spec.keys[0] = 0x32;             // en 'M' vs fr ','
+    CHECK(mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                       *arrow->frame(0), lbl, sysPal,
+                                       spec, &err));
+    CHECK(fb.at(210, 64) == 7);      // FR ',' glyph drawn
+    spec.langTag = 'x';              // unknown tag -> English
+    spec.keys[0] = 0x7f;             // en[127] = 0 -> blank
+    CHECK(mdk::renderKeyboardMenuFrame(fb, palette, *fontSml,
+                                       *arrow->frame(0), lbl, sysPal,
+                                       spec, &err));
+    CHECK(fb.at(210, 64) == 0);
+  }
+
+  // Dynamic frame: the controller drives the draw — the blink
+  // accumulator advances once per FLAGGED draw. Entry selection 20
+  // flags KM_QUIT only: +1 per frame.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 45;
+    mdk::KeyboardMenuController ctl(s, mdk::kKeyboardDefaults, false);
+    CHECK(mdk::renderKeyboardMenuDynamic(fb, palette, *fontSml,
+                                         *arrow->frame(0), lbl,
+                                         sysPal, ctl, 0, &err));
+    CHECK(ctl.markerAccumulator() == 1);   // QUIT flagged once
+    CHECK(fb.at(300, 45) == 77);
+    // Navigate to row 8: normal mode flags the LABEL — still one
+    // flagged draw.
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 304 - 45;
+    ctl.update(in);
+    in = {};
+    CHECK(ctl.selection() == 8);
+    int acc = ctl.markerAccumulator();
+    CHECK(mdk::renderKeyboardMenuDynamic(fb, palette, *fontSml,
+                                         *arrow->frame(0), lbl,
+                                         sysPal, ctl, 0, &err));
+    CHECK(ctl.markerAccumulator() == acc + 1);
+    // Capture mode flags the selected row's GLYPH instead and draws
+    // KM_DOIT unflagged — still exactly one flagged draw.
+    in.confirmEdge = true;
+    ctl.update(in);
+    in = {};
+    CHECK(ctl.capture());
+    acc = ctl.markerAccumulator();
+    fb.clear(0);
+    CHECK(mdk::renderKeyboardMenuDynamic(fb, palette, *fontSml,
+                                         *arrow->frame(0), lbl,
+                                         sysPal, ctl, 0, &err));
+    CHECK(ctl.markerAccumulator() == acc + 1);
+    // "Press A Key" (11 px) centered: x = (600-11)/2 = 294 @y354.
+    CHECK(fb.at(294, 354) == 7);
+    CHECK(fb.at(10, 304) == 7);      // the unflagged row-8 label
+    // ARROW still draws in capture mode.
+    CHECK(fb.at(300, 304) == 77);
+    // After the commit the new glyph byte renders on the row.
+    in.rawKeyEdge[1] = 1u << (45 - 32);   // 'X'
+    ctl.update(in);
+    in = {};
+    CHECK(!ctl.capture() && ctl.keyAt(7) == 45);
+    fb.clear(0);
+    CHECK(mdk::renderKeyboardMenuDynamic(fb, palette, *fontSml,
+                                         *arrow->frame(0), lbl,
+                                         sysPal, ctl, 0, &err));
+    CHECK(fb.at(210, 304) == 7);     // en[45]='X' glyph on row 8
+    CHECK(fb.at(294, 354) == 0);     // capture prompt gone
+  }
+}
+
 } // namespace
 
 int main() {
@@ -7327,12 +8367,14 @@ int main() {
   test_display_controller();
   test_sound_controller();
   test_mouse_controller();
+  test_keyboard_controller();
   test_frontend_settings();
   test_frontend_flow();
   test_options_render();
   test_display_render();
   test_sound_render();
   test_mouse_render();
+  test_keyboard_render();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

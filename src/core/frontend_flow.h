@@ -52,7 +52,22 @@
 //     dirty flag carries the volume mutations back. No persist
 //     happens here either.
 //
-//   This controller owns the four reconstructed screens and
+//   Options -> Keyboard (FUN_00420eac row 4 — all three dispatch
+//   tables bind it to 0x420fbe, OBSERVED):
+//     FUN_0041f030 — writes DAT_00541493 = 5, DAT_0054bca8 = 0
+//     (capture clear), DAT_0054bcac = 0x14 (selection = the KM_QUIT
+//     row — NOT a row count, NOT a zero reset). No palette work, no
+//     input-state reset; the 29-dword key block DAT_005413fe..
+//     0x54146e is a process global the child mutates in place.
+//
+//   Keyboard -> Options (FUN_0041f18c Esc / KM_QUIT-row activate):
+//     inline — writes DAT_00541493 = 0x0b and RETs (FUN_0041f058 is
+//     the same write as a callable helper). Options resumes with
+//     _DAT_0054bd34 still 4. No resource release, no persist here —
+//     FUN_00420d68 handles it on the options exit; the shared
+//     DAT_00541486 dirty flag carries the child's mutations back.
+//
+//   This controller owns the five reconstructed screens and
 //   performs exactly those transitions. It is deliberately NOT a
 //   generic UI router — no hierarchy, no widget system.
 //
@@ -62,6 +77,7 @@
 #include "core/display_menu.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
+#include "core/keyboard_menu.h"
 #include "core/mouse_menu.h"
 #include "core/options_menu.h"
 #include "core/sound_menu.h"
@@ -78,6 +94,7 @@ enum class FrontendScreen {
   Display,  // FUN_0041d1e0 — mode 7 (Phase 4H)
   Sound,    // FUN_004233d8 — mode 2 (Phase 4I)
   Mouse,    // FUN_004217e8 — mode 4 (Phase 4J)
+  Keyboard, // FUN_0041f18c — mode 5 (Phase 4K)
 };
 
 // Phase 4G persistence seam — the native-owned counterpart of
@@ -124,6 +141,9 @@ public:
   // Valid only while screen() == Mouse.
   MouseMenuController& mouse() { return *mouse_; }
   const MouseMenuController& mouse() const { return *mouse_; }
+  // Valid only while screen() == Keyboard.
+  KeyboardMenuController& keyboard() { return *keyboard_; }
+  const KeyboardMenuController& keyboard() const { return *keyboard_; }
 
   // One frame: route the neutral input to the active controller.
   void update(const FrontendMenuInput& in);
@@ -139,6 +159,10 @@ public:
   //   options Mouse       -> FUN_00421664 (enters the mouse child)
   //   mouse   Back        -> FUN_004217e8 inline (mode 0x0b —
   //                          returns to options, selection 3)
+  //   options Keyboard    -> FUN_0041f030 (enters the keyboard
+  //                          child — selection lands on KM_QUIT)
+  //   keyboard Back       -> FUN_0041f18c inline (mode 0x0b —
+  //                          returns to options, selection 4)
   // All other actions pass through to the caller unchanged (semantic
   // events only — downstream systems deferred).
   FrontendAction consumeRootAction();
@@ -146,6 +170,7 @@ public:
   DisplayAction consumeDisplayAction();
   SoundAction consumeSoundAction();
   MouseAction consumeMouseAction();
+  KeyboardAction consumeKeyboardAction();
 
   // The front-end settings globals (DAT_0054147a / DAT_005414f4 /
   // DAT_0054147e / DAT_00541482 / DAT_00541308 / DAT_0054130c) live
@@ -165,6 +190,15 @@ public:
       const { return mouseButtMap_; }
   const std::array<float, kMouseAxisCount>& mouseScales() const {
     return mouseScales_;
+  }
+  // Phase-4K keyboard settings globals — the 29-dword block
+  // DAT_005413fe..0x54146e (19 settings slots + 10 hidden hotkey
+  // slots). The Keyboard screen mutates the block in place; the
+  // flow owns it as a process global and the persist overlays the
+  // 19 Key* entries from it. Consumers read bindings through
+  // kKeyboardRowToGlobal / kKeyboardSlotToGlobal.
+  const std::array<int, kKeyboardGlobalCount>& keyGlobals() const {
+    return keyGlobals_;
   }
   // DAT_00541486 — the shared settings-dirty flag (see returnToRoot).
   bool settingsDirty() const { return settingsDirty_; }
@@ -186,12 +220,15 @@ private:
   void returnToOptionsFromSound();  // FUN_00423280
   void enterMouse();        // FUN_00421664
   void returnToOptionsFromMouse();  // FUN_004217e8 inline (mode 0x0b)
+  void enterKeyboard();     // FUN_0041f030
+  void returnToOptionsFromKeyboard();  // FUN_0041f18c inline (mode 0x0b)
 
   FrontendMenuController root_;
   std::optional<OptionsMenuController> options_;
   std::optional<DisplayMenuController> display_;
   std::optional<SoundMenuController> sound_;
   std::optional<MouseMenuController> mouse_;
+  std::optional<KeyboardMenuController> keyboard_;
   FrontendScreen screen_ = FrontendScreen::Root;
   // DAT_0054147a — the post-config startup value (`initial`): the
   // FUN_00425de4 defaults copy yields factory 1 ("Skill - Normal"),
@@ -230,6 +267,13 @@ private:
   std::string axesMap_;
   std::array<std::uint32_t, kMouseButtonCount> mouseButtMap_;
   std::array<float, kMouseAxisCount> mouseScales_;
+  // Phase-4K keyboard block — the 29-dword global array
+  // DAT_005413fe..0x54146e. Boot value = factory block + the 19
+  // persisted slots (keyboardGlobalsFromSettings); the hidden slots
+  // always hold their factory 2..11. Same process-global lifetime
+  // as skill_/mouseOn_: the child borrows it on FUN_0041f030 and
+  // the mutated block flows back on the mode-0x0b return.
+  std::array<int, kKeyboardGlobalCount> keyGlobals_;
   bool settingsDirty_ = false;  // DAT_00541486 — canonical 0 (inside
                                 // the factory-defaults copy block)
   // The full post-config settings — the persist emit starts from

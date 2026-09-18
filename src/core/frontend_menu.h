@@ -53,6 +53,7 @@
 
 #include "core/frontend_machines.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -163,6 +164,13 @@ enum class FrontendAction {
 //                         (bit0 left, bit1 right, bit2 middle, bit3 btn4;
 //                         the original polls a DIMOUSESTATE and packs
 //                         (b&0x80)>>7|6|5|4).
+//   rawKeyEdge          : the four 32-bit new-press edge dwords
+//                         (DAT_0049a8e8..f4) in the ORIGINAL internal
+//                         key-code domain — bit i = internal code i
+//                         saw a press edge this poll (FUN_00419370's
+//                         `edge = latch & ~prev`). Only the keyboard
+//                         child's capture poll (FUN_0041925c) reads
+//                         it; every other screen ignores it.
 struct FrontendMenuInput {
   bool prevHeld = false;
   bool nextHeld = false;
@@ -175,6 +183,7 @@ struct FrontendMenuInput {
   int mouseDy = 0;
   int mouseDz = 0;
   std::uint8_t mouseButtons = 0;
+  std::array<std::uint32_t, 4> rawKeyEdge{};
 };
 
 // The reconstructed controller. Frame protocol mirrors the original

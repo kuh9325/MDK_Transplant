@@ -64,12 +64,21 @@ struct AppConfig {
   // test indicator + ARROW — all FONTSML, under the inherited
   // options palette. Requires --data-path.
   bool mouseSubmenuPreview = false;
+  // --preview-keyboard-submenu: compose the static Keyboard child
+  // screen frame (Phase 4K): cleared framebuffer + the two-column
+  // 19-row KM_* grid (factory bindings, LANG-selected glyphs) +
+  // centered KM_RESET/KM_QUIT (entry selection 20 = the KM_QUIT
+  // row) + ARROW — all FONTSML under the inherited options
+  // palette. Requires --data-path.
+  bool keyboardSubmenuPreview = false;
   // --interactive-frontend: run the reconstructed front-end flow —
   // Phase 4E root menu plus the Phase 4F options sub-menu transition
   // (OpenOptions enters the real OM_* screen; Back/Esc returns) plus
   // the Phase 4H Display child (options row 7 enters it; Esc/Quit
-  // returns to options) and the Phase 4I Sound child (options row 1
-  // enters it; Esc/Done returns to options at row 1). Requires
+  // returns to options), the Phase 4I Sound child (options row 1,
+  // Esc/Done resumes at row 1), the Phase 4J Mouse child (options
+  // row 3, Esc/Quit resumes at row 3), and the Phase 4K Keyboard
+  // child (options row 4, Esc/KM_QUIT resumes at row 4). Requires
   // --data-path. Downstream actions (gameplay, saves, other child
   // screens, real audio playback) stay deferred.
   bool interactiveFrontend = false;

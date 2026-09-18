@@ -180,7 +180,7 @@ void SdlHost::isolateHardwareInputForSelftest() {
 
 void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
                                        bool rootOnly) {
-  const std::uint64_t lastStep = rootOnly ? 3 : 48;
+  const std::uint64_t lastStep = rootOnly ? 3 : 63;
   if (!window_ || frameIndex > lastStep) {
     return;
   }
@@ -406,6 +406,70 @@ void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
     break;
   case 48: // ESC tap: options Back -> root; dirty cleared by
           // persist #4 -> no persist call.
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  // ---- Phase 4K keyboard leg (frames 49..63) ----
+  case 49: // Enter tap: root sel 3 -> options entry 8 (mouse
+          // 300,45 -> options sel 8).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 50: // Arrow y=45 -> 180: options band 4 — the Keyboard row
+          // (trunc((180-23)/36) = 4).
+    motion(135.0f);
+    break;
+  case 51: // Enter tap: activate row 4 -> FUN_0041f030 -> keyboard
+          // child entered (DAT_0054bcac = 0x14 — sel 20, the
+          // KM_QUIT row).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 52: // Arrow (300,180) -> (300,8): y in [2,18) -> sel 19 —
+          // the KM_RESET row.
+    motion(-172.0f);
+    break;
+  case 53: // Enter tap: activate sel 19 -> FUN_00425db0 — the
+          // 29-dword mirror copy resets all bindings AND the ten
+          // hidden hotkey slots, then dirty = ECX = 1.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 54: // Arrow (300,8) -> (300,304): band trunc((304-50)/30) =
+          // 8, x<320 -> sel 8 — the KM_SNIPE row.
+    motion(296.0f);
+    break;
+  case 55: // Enter tap: activate binding row 8 -> DAT_0054bca8 = 1
+          // — capture begins (KM_DOIT prompt frame).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 56: // X tap: down+up inside one poll interval — the latch
+          // still lands bit 45 in the edge bitmap -> capture
+          // commits KeySniper = 45 ('X'), dirty stays latched.
+    keyTap(SDL_SCANCODE_X, SDLK_X);
+    break;
+  case 57: // Enter tap: capture on row 8 again.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 58: // ESC tap INSIDE capture -> DAT_0054bca8 = 0 — cancel
+          // only (NOT the normal-state exit; the binding is
+          // untouched).
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 59: // Arrow (300,304) -> (300,20): y in [18,34) -> sel 20 —
+          // the KM_QUIT row.
+    motion(-284.0f);
+    break;
+  case 60: // Enter tap: activate sel 20 -> mode 0x0b + RET —
+          // options resumes with selection 4 (the Keyboard row).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 61: // ESC tap: options Back -> FUN_00420d68 -> dirty persist
+          // fires (persist #5: all settings incl. KeySniper = 45).
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 62: // Enter tap: root sel 3 -> options entry 9 — proves the
+          // rebound key survives process-lifetime.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 63: // ESC tap: options Back -> root; dirty cleared by
+          // persist #5 -> no persist call.
     keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   default:

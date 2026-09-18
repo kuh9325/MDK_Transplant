@@ -17,6 +17,7 @@ FrontendFlowController::FrontendFlowController(
                     initial.mouseWButtMapC, initial.mouseWButtMapD},
       mouseScales_{initial.mouseWXScale, initial.mouseWYScale,
                    initial.mouseWZScale},
+      keyGlobals_(keyboardGlobalsFromSettings(initial)),
       baseSettings_(initial),
       persistSink_(std::move(sink)) {}
 
@@ -29,6 +30,8 @@ void FrontendFlowController::update(const FrontendMenuInput& in) {
     sound_->update(in);
   } else if (screen_ == FrontendScreen::Mouse) {
     mouse_->update(in);
+  } else if (screen_ == FrontendScreen::Keyboard) {
+    keyboard_->update(in);
   } else {
     root_.update(in);
   }
@@ -68,6 +71,11 @@ OptionsAction FrontendFlowController::consumeOptionsAction() {
     enterMouse();
     return OptionsAction::None;  // consumed by the transition
   }
+  if (options_->pendingAction() == OptionsAction::Keyboard) {
+    options_->consumeAction();
+    enterKeyboard();
+    return OptionsAction::None;  // consumed by the transition
+  }
   return options_->consumeAction();
 }
 
@@ -105,6 +113,18 @@ MouseAction FrontendFlowController::consumeMouseAction() {
     return MouseAction::None;  // consumed by the transition
   }
   return mouse_->consumeAction();
+}
+
+KeyboardAction FrontendFlowController::consumeKeyboardAction() {
+  if (!keyboard_ || screen_ != FrontendScreen::Keyboard) {
+    return KeyboardAction::None;
+  }
+  if (keyboard_->pendingAction() == KeyboardAction::Back) {
+    keyboard_->consumeAction();
+    returnToOptionsFromKeyboard();
+    return KeyboardAction::None;  // consumed by the transition
+  }
+  return keyboard_->consumeAction();
 }
 
 std::vector<SoundAudioEvent> FrontendFlowController::drainAudioEvents() {
@@ -163,6 +183,10 @@ void FrontendFlowController::returnToRoot() {
       s.mouseWXScale = mouseScales_[0];
       s.mouseWYScale = mouseScales_[1];
       s.mouseWZScale = mouseScales_[2];
+      // Phase 4K: overlay the 19 Key* entries from the 29-dword
+      // block (the hidden hotkey slots never persist — they are
+      // not settings-table entries).
+      keyboardSettingsFromGlobals(s, keyGlobals_);
       persistSink_(s);
     }
     settingsDirty_ = false;
@@ -269,6 +293,36 @@ void FrontendFlowController::returnToOptionsFromMouse() {
   options_->setMachineState(mouse_->machineState());
   options_->setSettingsDirty(mouse_->settingsDirty());
   mouse_.reset();
+  screen_ = FrontendScreen::Options;
+}
+
+// FUN_0041f030 (OBSERVED, disasm_4k_keyboard.txt): DAT_00541493 = 5,
+// DAT_0054bca8 = 0 (capture flag cleared), DAT_0054bcac = 0x14 —
+// the selection lands on the KM_QUIT row, NOT a row count and NOT a
+// zero reset. No palette work — the screen inherits the options
+// composition. The options controller stays alive underneath
+// exactly like the other children; the shared input-machine globals
+// carry over untouched, and the 29-dword key block is the flow's
+// process global the child borrows.
+void FrontendFlowController::enterKeyboard() {
+  keyboard_.emplace(options_->machineState(), keyGlobals_,
+                    options_->settingsDirty());
+  screen_ = FrontendScreen::Keyboard;
+}
+
+// FUN_0041f18c inline exit (OBSERVED): Esc (normal state only —
+// inside capture it just cancels) or the KM_QUIT-row activate
+// writes DAT_00541493 = 0x0b and RETs (FUN_0041f058 is the same
+// write as a callable helper) — the options screen resumes with
+// _DAT_0054bd34 still 4 (the Keyboard row). No resource release,
+// no palette restore. The child's machine state, the mutated
+// 29-dword key block, and the shared dirty flag all carry back.
+// NO persist here — FUN_00420d68 handles it on the options exit.
+void FrontendFlowController::returnToOptionsFromKeyboard() {
+  keyGlobals_ = keyboard_->keyGlobals();
+  options_->setMachineState(keyboard_->machineState());
+  options_->setSettingsDirty(keyboard_->settingsDirty());
+  keyboard_.reset();
   screen_ = FrontendScreen::Options;
 }
 

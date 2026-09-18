@@ -73,22 +73,27 @@ child frame — framebuffer clear + the four `JOY_*`/`M_*` left
 rows + the `JOY_B` 4×16 button-binding grid + three axis bars +
 the test indicator + `ARROW`, all FONTSML under the inherited
 options palette head; requires `--data-path`),
-`--interactive-frontend` (Phase 4E/4F/4G/4H/4I/4J: run the reconstructed
+`--interactive-frontend` (Phase 4E/4F/4G/4H/4I/4J/4K: run the reconstructed
 FUN_0041dc90 root-menu controller, flowing into the FUN_00420eac
 options sub-menu on `OpenOptions`, into the FUN_0041d1e0
 Display child on the row-7 action, into the FUN_004233d8
-Sound child on the row-1 action, and into the FUN_004217e8
-Mouse child on the row-3 action — original-style UP/DOWN/LEFT/
+Sound child on the row-1 action, into the FUN_004217e8
+Mouse child on the row-3 action, and into the FUN_0041f18c
+Keyboard child on the row-4 action — original-style UP/DOWN/LEFT/
 RIGHT selection with key repeat, gated mouse hit-test, scale ramp,
 Skill row mutation, Brightness/ForcePCorrect child mutations,
 SoundFX/SoundMusic child mutations + dirty latch, semantic
 audio-trigger events (no playback), Mouse axis-letter cycling +
-button-binding exclusivity + blink bracket, Esc/Quit/Done unwind
-Display/Sound/Mouse → Options → Root; requires
+button-binding exclusivity + blink bracket, Keyboard raw-key
+capture over the DirectInput-derived 0..127 internal domain
+(SDL scancode → DIK → internal at the app seam; lowest-set-bit
+edge pick + right-modifier fold; Esc cancels capture; 29-dword
+reset incl. the 10 hidden weapon hotkeys), Esc/Quit/Done unwind
+Display/Sound/Mouse/Keyboard → Options → Root; requires
 `--data-path`). `--frontend-root-only` is a test-only switch that
 keeps `OpenOptions` deferred so the Phase 4E single-screen
 regression snapshot stays reproducible. `--settings-file FILE`
-(Phase 4G/4H/4I) gives the native-owned settings persistence seam
+(Phase 4G/4H/4I/4J/4K) gives the native-owned settings persistence seam
 its path (load at startup if present, write on the options-exit
 dirty gate; always outside `--data-path` — the original's
 `C:\MDK.CFG`/relative-file resolution is deliberately not
@@ -147,27 +152,38 @@ src/
                                   (FUN_00421664/FUN_004217e8 +
                                   FUN_004216a0/FUN_00421774/
                                   FUN_00414b28, 4J)
+             keyboard_menu.*    — Keyboard child controller +
+                                  static/dynamic renderers +
+                                  DIK→internal translation +
+                                  lowest-set-bit edge scan +
+                                  right-modifier fold + E/F/G
+                                  glyph tables (FUN_0041f030/
+                                  FUN_0041f18c + FUN_00419168/
+                                  FUN_0041925c/FUN_00425db0,
+                                  4K)
              frontend_palette.h — shared FUN_0046d208 upload
                                   brightness lift (4H)
-             frontend_flow.*    — five-screen flow controller:
+             frontend_flow.*    — six-screen flow controller:
                                   FUN_00420cf0 enter options,
                                   FUN_0041d020 enter display,
                                   FUN_0042322c enter sound,
                                   FUN_00421664 enter mouse,
+                                  FUN_0041f030 enter keyboard,
                                   FUN_0041d144/FUN_00423280/mode-0x0b
                                   back to options, FUN_00420d68 return
                                   to root + dirty-gated persist
-                                  sink (4F/4G/4H/4I/4J)
+                                  sink (4F/4G/4H/4I/4J/4K)
              frontend_settings.*— native-owned settings persistence:
                                   FrontendSettings (SoundFX/
                                   SoundMusic/Skill/Brightness/
                                   ForcePCorrect + the Mouse block —
                                   axis maps, button masks, scales,
-                                  MouseOn, MouseYReversed raw bits)
+                                  MouseOn, MouseYReversed raw bits —
+                                  + the 19 Key* entries 69–87)
                                   + serialize/parse/
                                   file seam — caller-supplied
                                   path, never under --data-path
-                                  (4G/4H/4I/4J)
+                                  (4G/4H/4I/4J/4K)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -279,7 +295,7 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- Runtime original-data use is limited to the Phase 4A–4J
+- Runtime original-data use is limited to the Phase 4A–4K
   front-end paths:
   one named record from one BNI file (`--preview-resource`), decoded by
   the proven paletted-bitmap layout or — for `STREAM/STREAM.BNI BG`
@@ -301,8 +317,13 @@ uploaded to Metal).
   (structure-verified `MISC/MDKSOUND.SNI`, no playback), and into
   the FUN_004217e8 Mouse child on the row-3 action with its
   axis-letter cycling / button-binding exclusivity / MouseOn /
-  MouseYReversed-raw-bits mutations + the native-owned
-  persistence seam — the other child screens deferred)
+  MouseYReversed-raw-bits mutations, and into the FUN_0041f18c
+  Keyboard child on the row-4 action with its raw-key capture
+  over the internal 0..127 domain (SDL→DIK→internal at the app
+  seam; lowest-set-bit pick + right-modifier fold; Esc-cancel;
+  29-dword reset incl. the 10 hidden weapon hotkeys) + the
+  native-owned persistence seam — the other child screens
+  deferred)
   — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.
