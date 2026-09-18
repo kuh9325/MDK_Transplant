@@ -147,6 +147,18 @@ Boundary notes (intentions, not commitments):
 > and the settings seam persists all proven entries in table
 > order on the options exit.
 > See `ENGINE_RECONSTRUCTION.md`.
+>
+> Phase 5A adds the first gameplay-side layer: `gameplay_input.*`
+> reproduces the `FUN_00419370` configured-binding → action-flag
+> translation plus the `FUN_00406f14` per-frame merge (button masks,
+> W-set axis letters/scales, SideStep reroute, turbo/set-turbo, zoom
+> accumulator, OBSERVED rate constants) into a platform-neutral
+> `GameplayInputFrame` — the semantic control block the original
+> writes to `0x4ce6e0..0x4ce7ac`. Bindings arrive via
+> `gameplayBindingsFromSettings(FrontendSettings)`; the layer has no
+> SDL/frontend/renderer/filesystem dependency and produces no world
+> mutation. `--selftest-gameplay-input` drives it through the real
+> SDL→DIK→internal seam. See `GAMEPLAY_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

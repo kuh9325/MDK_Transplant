@@ -41,6 +41,7 @@ add_library(mdk_core STATIC
   src/core/fti_directory.cpp
   src/core/fti_font.cpp
   src/core/fti_sprite.cpp
+  src/core/gameplay_input.cpp
   src/core/indexed_image.cpp
   src/core/keyboard_menu.cpp
   src/core/mode_dispatch.cpp

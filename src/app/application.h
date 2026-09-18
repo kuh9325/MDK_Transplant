@@ -94,6 +94,11 @@ struct AppConfig {
   std::optional<std::filesystem::path> settingsFile;
   std::uint64_t frames = 0;   // --frames N: quit after N frames (0 = run)
   bool selftest = false;      // --selftest: inject synthetic input events
+  // --selftest-gameplay-input (Phase 5A): inject the deterministic
+  // gameplay-input script through the real SDL seam and verify
+  // consumeGameplayInput's semantic output each frame. Exits
+  // non-zero on mismatch. No front-end or --data-path required.
+  bool selftestGameplayInput = false;
   bool relativeMouse = true;  // --no-relative-mouse to disable
   int windowWidth = 960;      // logical points; drawable may be 2x (Retina)
   int windowHeight = 720;     // 4:3 default

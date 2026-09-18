@@ -1,5 +1,15 @@
 # Engine Reconstruction — Phase 4 status
 
+> **Phase 4 CLOSED at Phase 4K.** Root + Options reconstructed;
+> Skill mutation reconstructed; Display child reconstructed; Sound
+> child reconstructed semantically; Mouse input configuration
+> reconstructed; Keyboard input configuration reconstructed —
+> keyboard/mouse configuration is sufficient for keyboard+mouse
+> gameplay reconstruction. Remaining Help / Joystick / Performance /
+> frontend-audio work is deferred compatibility/polish and does not
+> block it. Phase 5 begins in `docs/GAMEPLAY_RECONSTRUCTION.md`.
+> (Historical Phase 4 sections below are unchanged.)
+
 Phase 3 (file-format structure) is CLOSED: all seven families have
 evidence-backed structural parsers (SNI, MTI, MTO, CMI, DTI, FTI, BNI)
 — see `DATA_FORMATS.md`. Phase 4 begins engine reconstruction:

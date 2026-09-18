@@ -18,6 +18,7 @@
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
+#include "core/gameplay_input.h"
 #include "core/indexed_image.h"
 #include "core/keyboard_menu.h"
 #include "core/mode_dispatch.h"
@@ -8340,6 +8341,486 @@ void test_keyboard_render() {
   }
 }
 
+// Phase 5A — gameplay input consumption. Values below are
+// hand-computed from the reconstructed FUN_00419370 + FUN_00406f14
+// semantics (OBSERVED constants; frameStep = 100/3, frameDt = 33
+// unless the test overrides them).
+void test_gameplay_input() {
+  auto setBit = [](std::array<std::uint32_t, 4>& bm, int code) {
+    bm[code >> 5] |= 1u << (code & 31);
+  };
+  auto press = [&](mdk::RawGameplayInput& r, int code) {
+    setBit(r.keyLevel, code);
+    setBit(r.keyEdge, code);
+  };
+  auto hold = [&](mdk::RawGameplayInput& r, int code) {
+    setBit(r.keyLevel, code);
+  };
+  mdk::GameplayInputBindings bind;      // factory block + W set
+  mdk::GameplayInputEnvironment env;    // step 33.333, dt 33
+  mdk::GameplayInputState st;
+
+  // ---- key level/edge queries + right-modifier fold ---------------
+  {
+    mdk::RawGameplayInput r;
+    press(r, 103);
+    CHECK(mdk::gameplayKeyLevel(r, 103) != 0);
+    CHECK(mdk::gameplayKeyEdge(r, 103) != 0);
+    mdk::RawGameplayInput r2;
+    hold(r2, 103);   // level only — no fresh edge
+    CHECK(mdk::gameplayKeyLevel(r2, 103) != 0);
+    CHECK(mdk::gameplayKeyEdge(r2, 103) == 0);
+    // Fold: query 0x2a (LSHIFT) sees key 0x36 (RSHIFT) — raw mask.
+    mdk::RawGameplayInput r3;
+    hold(r3, 0x36);
+    CHECK(mdk::gameplayKeyLevel(r3, 0x2a) == (1u << 22));
+    // 0x1d (LCTRL) fold sees 0x61 (RCTRL) on the edge bitmap.
+    setBit(r3.keyEdge, 0x61);
+    CHECK(mdk::gameplayKeyEdge(r3, 0x1d) == (1u << 1));
+    // 0x38 (LALT) fold sees 0x65 (RALT).
+    hold(r3, 0x65);
+    CHECK(mdk::gameplayKeyLevel(r3, 0x38) == (1u << 5));
+    // A non-modifier code is a plain bit test.
+    CHECK(mdk::gameplayKeyLevel(r3, 0x36) == (1u << 22));
+  }
+
+  // ---- 19 visible action semantics --------------------------------
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 105);  // KeyLeft — level
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.turnAxis == -1.0f && f.yawAxis == -1.0f);
+    CHECK(near(f.turnNorm, -0.9) && near(f.turnFast, -4.0));
+    CHECK(near(f.turnNorm75, -0.675) && near(f.turnFast75, -3.0));
+    CHECK(near(f.yawNorm, -0.4) && near(f.yawFast, -4.0));
+    CHECK(near(f.yawNeg45, 45.0) && near(f.yaw4, -4.0));
+    CHECK(near(f.yawThird, -1.0 / 3.0) && near(f.yaw10, -10.0));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 106);  // KeyRight
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.turnAxis == 1.0f && near(f.turnNorm, 0.9));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 103);  // KeyUp — move forward = -1 axis
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.moveAxis == -1.0f && f.moveDigital == -1.0f);
+    CHECK(near(f.moveNorm, -0.4) && near(f.moveFast, -4.0));
+    CHECK(near(f.moveVel, 1.0 / 22.5));
+    CHECK(near(f.moveVelBoosted, 2.0 / 3.0));
+    CHECK(near(f.moveHalfSlow, 0.5 / 22.5));
+    CHECK(near(f.moveHalfFast, 1.0 / 3.0));
+    CHECK(near(f.move5pct, 0.05));
+    CHECK(near(f.moveThird, -1.0 / 3.0) && near(f.move10, -10.0));
+    // Forward (axis < 0) selects the 15.0 rate constant.
+    CHECK(near(f.moveSpeed, 15.0));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 108);  // KeyDown — backward selects the 35.0 constant.
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.moveAxis == 1.0f && near(f.moveSpeed, -35.0));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 56);   // KeyJump — level flag, raw bit value kept.
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.jump == (1u << 24));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 45);   // KeySide — the strafe MODIFIER.
+    hold(r, 105);  // + KeyLeft -> strafe, not turn.
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.sideStepHeld);
+    CHECK(f.turnAxis == 0.0f && f.strafeAxis == -1.0f);
+    CHECK(f.yawAxis == -1.0f);   // strafe feeds the yaw combined axis
+    CHECK(near(f.strafeNorm, -1.0 / 22.5));
+    CHECK(near(f.strafeFast, -2.0 / 3.0));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 29);   // KeyFire — level (LCTRL).
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.fire == (1u << 29));
+    mdk::RawGameplayInput r2;
+    hold(r2, 97);  // RCTRL also fires via the query fold.
+    st = {};
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(f.fire == (1u << 1));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    press(r, 57);  // KeySniper — EDGE queried.
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.sniperPulse == (1u << 25));
+    mdk::RawGameplayInput r2;
+    hold(r2, 57);  // held — the edge does not repeat
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(f.sniperPulse == 0);
+    press(r2, 57); // a fresh edge pulses again
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(f.sniperPulse != 0);
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 42);   // KeyTurbo — level; modifies rate constants.
+    hold(r, 105);
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(near(f.turnNorm, -1.3) && near(f.turnFast, -6.0));
+    // OBSERVED: the 0.75-scaled pair keeps the non-turbo constants.
+    CHECK(near(f.turnNorm75, -0.675) && near(f.turnFast75, -3.0));
+    CHECK(near(f.yawNorm, -0.6) && near(f.yawFast, -6.0));
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    press(r, 58);  // KeySturbo — edge toggles the latch.
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.turboLatched && st.setTurboLatch == 1);
+    // While latched the turbo rates apply without the key held.
+    mdk::RawGameplayInput r2;
+    hold(r2, 105);
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(near(f.turnNorm, -1.3));
+    press(r2, 58);  // second edge unlatches
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(!f.turboLatched && st.setTurboLatch == 0);
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 51);   // KeySideL — level strafe.
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.strafeAxis == -1.0f && !f.sideStepHeld);
+    mdk::RawGameplayInput r2;
+    hold(r2, 52);  // KeySideR
+    st = {};
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(f.strafeAxis == 1.0f);
+  }
+  st = {};
+  {
+    // INEXT/IPREV/IUSE — edge-queried item actions.
+    mdk::RawGameplayInput r;
+    press(r, 27); press(r, 26); press(r, 28);
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.itemNext == (1u << 27));
+    CHECK(f.itemPrev == (1u << 26));
+    CHECK(f.itemUse == (1u << 28));
+    mdk::RawGameplayInput r2;
+    hold(r2, 27); hold(r2, 26); hold(r2, 28);
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(f.itemNext == 0 && f.itemPrev == 0 && f.itemUse == 0);
+  }
+
+  // ---- hidden 10 weapon hotkeys (slots 14..23, edge) ---------------
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    press(r, 2);   // '1' -> weapon slot 0
+    press(r, 11);  // '0' -> weapon slot 9
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.weaponSelect[0] == (1u << 2));
+    CHECK(f.weaponSelect[9] == (1u << 11));
+    // Multiple simultaneous hotkey edges all land — no flattening.
+    mdk::RawGameplayInput r2;
+    press(r2, 3); press(r2, 5); press(r2, 7);
+    f = mdk::consumeGameplayInput(r2, bind, env, st);
+    CHECK(f.weaponSelect[1] != 0 && f.weaponSelect[3] != 0 &&
+          f.weaponSelect[5] != 0);
+    // Held without a fresh edge produces nothing.
+    mdk::RawGameplayInput r3;
+    hold(r3, 4);
+    f = mdk::consumeGameplayInput(r3, bind, env, st);
+    CHECK(f.weaponSelect[2] == 0);
+  }
+
+  // ---- duplicate bindings (factory LKUP + ZOOMI share 'A'=30) ------
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 30);   // one physical key drives BOTH actions
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.lookUp != 0);
+    // ZoomIn level charged the accumulator (+1, then the tail emits
+    // the zoom velocities and the dt decay drains the charge).
+    CHECK(near(f.zoomVel, -0.01) && near(f.zoomVelFast, -0.15));
+    CHECK(f.zoomAccumulator == 0);  // 1 - 33 -> clamped to 0
+  }
+
+  // ---- mouse axis letters A..F --------------------------------------
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    r.mouseDx = 320;   // 'A' on axis 0 -> turn
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    // 320/16 = 20; /33.333 -> 0.6
+    CHECK(near(f.turnFast, 0.6 * 6.0 * 0.5));
+    CHECK(near(f.turnNorm, 0.6 * 6.0 * 0.5 / (100.0 / 3.0)));
+    CHECK(near(f.yaw4, 0.6 * 4.0) && near(f.yawNeg45, -27.0, 1e-4));
+    CHECK(f.mouseTurnActive == 1);
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    r.mouseDy = 160;   // 'B' on axis 1 -> move
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    // 160/16 = 10; /33.333 -> 0.3
+    CHECK(near(f.moveVelBoosted, -0.3 * (4.0 / 3.0) * 0.5));
+    CHECK(near(f.moveVel, -0.3 * (4.0 / 3.0) * 0.5 * (3.0 / 100.0)));
+    CHECK(near(f.moveHalfFast, -0.3 * (2.0 / 3.0) * 0.25));
+    CHECK(near(f.move5pct, -0.3 * 0.05 * 0.5));
+    CHECK(f.moveSpeed == 0.0f);   // digital move is 0 (mouse-only)
+  }
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    r.mouseDz = 120;   // 'G' on axis 2 -> sniper zoom charge
+    env.frameDt = 0;   // isolate the accumulator from decay
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    // rint(120/50 + 1) = rint(3.4) = 3 ticks, sign + for 'G'.
+    CHECK(f.zoomAccumulator == 3);
+    CHECK(near(f.zoomVel, -0.01));
+    env.frameDt = 33;
+  }
+  st = {};
+  {
+    // 'D' negates the turn axis.
+    mdk::GameplayInputBindings b2 = bind;
+    b2.mouseAxesMap = "DBG";
+    mdk::RawGameplayInput r;
+    r.mouseDx = 320;
+    auto f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.turnFast, -1.8));
+    // 'E' negates move — the letter position selects the axis, so
+    // 'E' on axis 0 consumes mouseDx (not dy).
+    b2.mouseAxesMap = "EBG";
+    r.mouseDx = 160;
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.moveVelBoosted, 0.3 * (4.0 / 3.0) * 0.5));
+    // 'C' routes to strafe; 'F' negates it.
+    b2.mouseAxesMap = "C0G";
+    r = {};
+    r.mouseDx = 160;
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.strafeFast, 0.3 * (4.0 / 3.0) * 0.5));
+    b2.mouseAxesMap = "F0G";
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.strafeFast, -0.3 * (4.0 / 3.0) * 0.5));
+    // 'H' is negative sniper zoom.
+    b2.mouseAxesMap = "ABH";
+    r = {};
+    r.mouseDz = 120;
+    env.frameDt = 0;
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.zoomAccumulator == -3);
+    env.frameDt = 33;
+    // '0' is inert.
+    b2.mouseAxesMap = "0BG";
+    r = {};
+    r.mouseDx = 320;
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.turnFast == 0.0f && f.mouseTurnActive == 0);
+  }
+  st = {};
+  {
+    // SideStep modifier reroutes mouse 'A'/'D' to strafe.
+    mdk::RawGameplayInput r;
+    hold(r, 45);
+    r.mouseDx = 160;
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.mouseTurnActive == 0 && f.strafeFast != 0.0f);
+  }
+  st = {};
+  {
+    // First-G/H-wins early-out: 'G' on axis 0 consumes dx and ends
+    // the scan — the 'H' on axis 2 never processes dz.
+    mdk::GameplayInputBindings b2 = bind;
+    b2.mouseAxesMap = "G0H";
+    env.frameDt = 0;
+    mdk::RawGameplayInput r;
+    r.mouseDx = 50;    // rint(50/16+1) = 4
+    r.mouseDz = 50;    // would be -4 if 'H' were reached
+    auto f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.zoomAccumulator == 4);
+    env.frameDt = 33;
+  }
+
+  // ---- scale math / deadzone / clamp --------------------------------
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    r.mouseDx = 3;     // 3/16 = 0.1875 < 0.2 deadzone -> 0
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.turnFast == 0.0f && f.mouseTurnActive == 0);
+    r.mouseDx = 4;     // 4/16 = 0.25 -> passes
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.mouseTurnActive == 1);
+    mdk::GameplayInputBindings b2 = bind;
+    b2.mouseScale = {8.0f, 16.0f, 50.0f};
+    r.mouseDx = 80;    // 80/8 = 10 -> v 0.3
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.turnFast, 0.9));
+    // dt-normalized clamp: 16000/8 = 2000 -> /33.333 = 60 -> clamp 4
+    r.mouseDx = 16000;
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.turnFast, 4.0 * 6.0 * 0.5));
+    b2.mouseScale = {0.0f, 16.0f, 50.0f};   // zero scale -> inf -> clamp
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.turnFast, 12.0));
+  }
+
+  // ---- MouseOn gate (axes only — buttons still decode) --------------
+  st = {};
+  {
+    mdk::GameplayInputBindings b2 = bind;
+    b2.mouseOn = false;
+    mdk::RawGameplayInput r;
+    r.mouseDx = 320;
+    r.mouseDz = 120;
+    r.mouseButtons = 0x1;    // button A mask = bit0 Fire
+    auto f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.turnFast == 0.0f && f.zoomAccumulator == 0);
+    CHECK(f.mouseTurnActive == 0);
+    CHECK(f.fire == 1);      // OBSERVED: MouseOn does NOT gate buttons
+  }
+
+  // ---- mouse button masks (A..D physical order) ----------------------
+  st = {};
+  {
+    // Factory {1,4,2,0}: btn0 Fire, btn1 Jump, btn2 Sniper, btn3 off.
+    mdk::RawGameplayInput r;
+    r.mouseButtons = 0x1;
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.fire == 1 && f.jump == 0);
+    r.mouseButtons = 0x2;
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.jump == 1);
+    // Sniper is a button LEVEL -> synthetic edge: pulse once, then
+    // silence while held, re-arms on release.
+    r.mouseButtons = 0x4;
+    st = {};
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.sniperPulse == 1);
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.sniperPulse == 0);
+    r.mouseButtons = 0;
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    r.mouseButtons = 0x4;
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(f.sniperPulse == 1);
+    // A multi-bit mask produces several actions from one button.
+    mdk::GameplayInputBindings b2 = bind;
+    b2.mouseButtMask = {mdk::kBtnFire | mdk::kBtnJump, 0, 0, 0};
+    r.mouseButtons = 0x1;
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.fire == 1 && f.jump == 1);
+    // The SideStep button bit reroutes the turn axis like the key.
+    b2.mouseButtMask = {mdk::kBtnSideStep, 0, 0, 0};
+    r.mouseButtons = 0x1;
+    hold(r, 105);
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.sideStepHeld && f.strafeAxis == -1.0f);
+    // Move/strafe button bits pre-seed the digital axes.
+    b2.mouseButtMask = {mdk::kBtnMoveFwd, 0, 0, 0};
+    r = {};
+    r.mouseButtons = 0x1;
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.moveDigital == -1.0f);
+    b2.mouseButtMask = {0, mdk::kBtnStrafeRight | mdk::kBtnTurbo, 0, 0};
+    r.mouseButtons = 0x2;
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(near(f.strafeFast, 4.0 / 3.0));   // strafe + turbo mask bit
+  }
+
+  // ---- combined keyboard + mouse --------------------------------------
+  st = {};
+  {
+    mdk::RawGameplayInput r;
+    hold(r, 105);          // kbd LEFT: turn -1
+    r.mouseDx = 320;       // mouse 'A': normalized 0.6
+    auto f = mdk::consumeGameplayInput(r, bind, env, st);
+    // OBSERVED priority: a nonzero mouse axis OVERWRITES the shared
+    // rate fields (0.6*3 = 1.8, not the keyboard -4).
+    CHECK(near(f.turnFast, 1.8));
+    CHECK(f.mouseTurnActive == 1);
+    // Keyboard-only fields (item/action flags) are unaffected.
+    r.mouseDx = 0;
+    f = mdk::consumeGameplayInput(r, bind, env, st);
+    CHECK(near(f.turnFast, -4.0));   // falls back to the kbd rate
+  }
+
+  // ---- settings-derived bindings ---------------------------------------
+  st = {};
+  {
+    mdk::FrontendSettings s;
+    s.keySniper = 45;               // X instead of Space
+    s.mouseWAxesMap = "HBG";        // dz -> NegSniperZoom, dy -> Move
+    s.mouseWButtMapA = 0x8001;      // btn A = Fire | Turbo
+    s.mouseWXScale = 8.0f;
+    s.mouseYReversed = 1;           // raw bits -> semantic flag
+    auto b2 = mdk::gameplayBindingsFromSettings(s);
+    CHECK(b2.keys[7] == 45);
+    // Hidden hotkeys come from the factory block, not settings.
+    CHECK(b2.keys[14] == 2 && b2.keys[23] == 11);
+    CHECK(b2.mouseOn && b2.mouseYReversedBits == 1);
+    mdk::RawGameplayInput r;
+    press(r, 45);
+    auto f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.sniperPulse != 0);
+    r = {};
+    r.mouseDx = 8;               // 'H' sits on axis 0 -> consumes dx;
+    env.frameDt = 0;             // 8/8=1 -> +1 bias -> 2 ticks, '-'
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.zoomAccumulator == -2);        // 'H' route honored
+    env.frameDt = 33;
+    CHECK(f.mouseYReversed);               // pass-through flag set
+    r = {};
+    r.mouseButtons = 0x1;
+    hold(r, 105);
+    st = {};
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.fire == 1 && near(f.turnNorm, -1.3));  // turbo mask bit
+  }
+
+  // ---- hidden-hotkey reset round-trip ----------------------------------
+  {
+    // A modified hidden slot drives weaponSelect; the factory block
+    // (what Keyboard Reset restores) puts back '1'..'0'.
+    mdk::GameplayInputBindings b2 = bind;
+    b2.keys[14] = 50;                // rebind weapon 1 to 'M'
+    mdk::RawGameplayInput r;
+    press(r, 50);
+    st = {};
+    auto f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.weaponSelect[0] != 0);
+    b2.keys = mdk::kKeyboardDefaults;      // the Reset mirror copy
+    r = {};
+    press(r, 2);
+    f = mdk::consumeGameplayInput(r, b2, env, st);
+    CHECK(f.weaponSelect[0] != 0 && f.weaponSelect[9] == 0);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -8379,6 +8860,7 @@ int main() {
   test_data_root();
   test_mode_dispatch();
   test_input_state();
+  test_gameplay_input();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

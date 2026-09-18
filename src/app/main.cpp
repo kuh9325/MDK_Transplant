@@ -52,6 +52,11 @@ void usage(const char* argv0) {
       "  --dump-ppm FILE       write last presented frame as PPM (debug)\n"
       "  --frames N            quit after N frames (smoke-test hook)\n"
       "  --selftest            inject synthetic input events and verify\n"
+      "  --selftest-gameplay-input\n"
+      "                        inject the deterministic Phase 5A\n"
+      "                        keyboard/mouse script and verify the\n"
+      "                        semantic gameplay-input frame each frame\n"
+      "                        (optionally honors --settings-file)\n"
       "  --no-relative-mouse   do not capture the mouse\n"
       "  -h, --help            this message\n",
       argv0);

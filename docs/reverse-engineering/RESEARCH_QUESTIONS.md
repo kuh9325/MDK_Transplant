@@ -33,7 +33,7 @@ with their evidence level and a pointer to the supporting document.
 
 ## Runtime
 
-- [OBSERVED, partial] Player update loop structure — main loop pumps messages, polls input, accumulates frame delta `0x49b6e8`, dispatches mode handlers (traversal frame `FUN_00436100` for mode 3). Order: pump→tick/input→overlay-dialog check→mode dispatch→(present inside handlers). In-frame order inside traversal UNKNOWN.
+- [OBSERVED, partial] Player update loop structure — main loop pumps messages, polls input, accumulates frame delta `0x49b6e8`, dispatches mode handlers (traversal frame `FUN_00436100` for mode 3). Order: pump→tick/input→overlay-dialog check→mode dispatch→(present inside handlers). Phase 5A maps the input half inside traversal: `FUN_00436100 → FUN_00463608 → FUN_00406f14` merges the `FUN_00419370` action flags + W-set mouse + button masks + joystick tables into the `0x4ce6e0..0x4ce7ac` control block (see GAMEPLAY_RECONSTRUCTION.md). The downstream consumers of that block remain UNKNOWN.
 - [OBSERVED, partial] Fixed vs variable timestep — a per-frame delta global (`0x49b6e8`) is accumulated into timing counters; suggests variable-step accumulation, but exact integration semantics UNKNOWN.
 - [UNKNOWN] Collision detection approach and tolerances
 - [UNKNOWN] AI structure — state machines, scripts, pathfinding

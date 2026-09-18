@@ -73,6 +73,33 @@ public:
   //   9: ESC tap       -> Back -> return to root (FUN_00420d68)
   void pushFrontendSelfTestStep(std::uint64_t frameIndex, bool rootOnly);
 
+  // --selftest-gameplay-input support (Phase 5A): one scripted
+  // keyboard/mouse step per call, invoked before pumpEvents with the
+  // current frame index. The script exercises the real SDL->DIK->
+  // internal seam plus the mouse delta/wheel/button path; the
+  // application consumes each frame through consumeGameplayInput and
+  // verifies the semantic results (expectations are computed from
+  // the loaded bindings, so the same script covers factory and
+  // --settings-file-supplied configurations):
+  //   0: LEFT-arrow down        -> turn level starts
+  //   1: (held)                 -> level repeats (no edge needed)
+  //   2: LEFT-arrow up          -> level clears
+  //   3: SPACE down             -> sniper edge pulse (factory)
+  //   4: (held)                 -> edge does not repeat
+  //   5: SPACE up               -> re-arm
+  //   6: '1' tap                -> hidden weapon hotkey slot 0
+  //   7: '5' tap                -> hidden weapon hotkey slot 4
+  //   8: X + LEFT down          -> SideStep modifier -> strafe -1
+  //   9: X + LEFT up            -> release both
+  //  10: motion dx +320         -> mouse axis 'A' normalized turn
+  //  11: wheel +1 (dz 120)      -> zoom accumulator charge/decay
+  //  12: button A down          -> mask-decode Fire (+ loaded bits)
+  //  13: button A up + C down   -> sniper synthetic edge
+  //  14: (C held)               -> synthetic edge does not repeat
+  //  15: button C up            -> re-arm the snipe latch
+  //  16: settle frame           -> all controls idle
+  void pushGameplaySelfTestStep(std::uint64_t frameIndex);
+
   // Install an SDL event filter that drops all REAL key/button/motion
   // events — injected events carry a sentinel device ID and pass
   // through. Without this the physical mouse/keyboard race the script

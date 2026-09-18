@@ -103,6 +103,12 @@ injected-event script (real device input is filtered out for the
 duration; the timing machine is fed the original's paced regime —
 dt = 100/3 ms per frame — so runs and digests are
 machine-independent) and reports PASS/FAIL.
+`--selftest-gameplay-input` (Phase 5A) runs a deterministic
+keyboard/mouse script through the same SDL→DIK→internal seam into
+`consumeGameplayInput` and verifies the semantic `GameplayInputFrame`
+per frame — bindings from `--settings-file` when supplied, else
+factory; standalone (not combinable with `--interactive-frontend`),
+exits RC 3 on mismatch.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -152,6 +158,17 @@ src/
                                   (FUN_00421664/FUN_004217e8 +
                                   FUN_004216a0/FUN_00421774/
                                   FUN_00414b28, 4J)
+             gameplay_input.*   — Phase 5A gameplay-input consumption:
+                                  FUN_00419370 binding→flag
+                                  translation + FUN_00406f14 merge
+                                  into a platform-neutral
+                                  GameplayInputFrame (level/edge
+                                  queries + right-modifier fold,
+                                  hidden weapon hotkeys, button
+                                  masks, W-set axis letters/scales,
+                                  SideStep reroute, zoom accumulator,
+                                  OBSERVED rate constants) — no
+                                  world mutation (5A)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

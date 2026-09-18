@@ -477,6 +477,115 @@ void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
   }
 }
 
+void SdlHost::pushGameplaySelfTestStep(std::uint64_t frameIndex) {
+  constexpr std::uint64_t lastStep = 16;
+  if (!window_ || frameIndex > lastStep) {
+    return;
+  }
+  const SDL_WindowID id = SDL_GetWindowID(window_);
+  SDL_Event e{};
+  auto key = [&](SDL_Scancode sc, SDL_Keycode kc, bool down) {
+    e = SDL_Event{};
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.key.windowID = id;
+    e.key.which = kSelftestKeyboardID;
+    e.key.scancode = sc;
+    e.key.key = kc;
+    e.key.down = down;
+    SDL_PushEvent(&e);
+  };
+  auto keyTap = [&](SDL_Scancode sc, SDL_Keycode kc) {
+    key(sc, kc, true);
+    key(sc, kc, false);
+  };
+  auto motion = [&](float xrel, float yrel) {
+    e = SDL_Event{};
+    e.type = SDL_EVENT_MOUSE_MOTION;
+    e.motion.windowID = id;
+    e.motion.which = kSelftestMouseID;
+    e.motion.xrel = xrel;
+    e.motion.yrel = yrel;
+    SDL_PushEvent(&e);
+  };
+  auto wheel = [&](float y, std::int32_t intY) {
+    e = SDL_Event{};
+    e.type = SDL_EVENT_MOUSE_WHEEL;
+    e.wheel.windowID = id;
+    e.wheel.which = kSelftestMouseID;
+    e.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    e.wheel.y = y;
+    e.wheel.integer_y = intY;
+    SDL_PushEvent(&e);
+  };
+  auto button = [&](std::uint8_t btn, bool down) {
+    e = SDL_Event{};
+    e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN
+                  : SDL_EVENT_MOUSE_BUTTON_UP;
+    e.button.windowID = id;
+    e.button.which = kSelftestMouseID;
+    e.button.button = btn;
+    e.button.down = down;
+    SDL_PushEvent(&e);
+  };
+  switch (frameIndex) {
+  case 0:  // LEFT-arrow down: the KeyLeft level drives turn -1.
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, true);
+    break;
+  case 1:  // held — the level repeats the turn without a new edge.
+    break;
+  case 2:  // release: the level clears.
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, false);
+    break;
+  case 3:  // SPACE down: KeySniper's edge pulses (factory binding).
+    key(SDL_SCANCODE_SPACE, SDLK_SPACE, true);
+    break;
+  case 4:  // held — the edge does not repeat.
+    break;
+  case 5:  // release.
+    key(SDL_SCANCODE_SPACE, SDLK_SPACE, false);
+    break;
+  case 6:  // '1' tap -> internal code 2 -> hidden weapon slot 0.
+    keyTap(SDL_SCANCODE_1, SDLK_1);
+    break;
+  case 7:  // '5' tap -> internal code 6 -> hidden weapon slot 4.
+    keyTap(SDL_SCANCODE_5, SDLK_5);
+    break;
+  case 8:  // X (KeySide) + LEFT: the SideStep modifier reroutes the
+         // turn level into strafe -1.
+    key(SDL_SCANCODE_X, SDLK_X, true);
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, true);
+    break;
+  case 9:  // release both.
+    key(SDL_SCANCODE_X, SDLK_X, false);
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, false);
+    break;
+  case 10: // dx +320: the W-set axis-0 letter ('A' factory) ->
+         // normalized turn 20/33.333 = 0.6.
+    motion(320.0f, 0.0f);
+    break;
+  case 11: // wheel +1 -> dz 120: the axis-2 letter charges the zoom
+         // accumulator (factory 'G').
+    wheel(1.0f, 1);
+    break;
+  case 12: // button A down: mask bit decode (factory Fire).
+    button(SDL_BUTTON_LEFT, true);
+    break;
+  case 13: // A up + C down: the sniper button's synthetic edge.
+    button(SDL_BUTTON_LEFT, false);
+    button(SDL_BUTTON_MIDDLE, true);
+    break;
+  case 14: // C held — the synthetic edge does not repeat.
+    break;
+  case 15: // C up — re-arm the snipe latch.
+    button(SDL_BUTTON_MIDDLE, false);
+    break;
+  case 16: // settle — all controls idle.
+    break;
+  default:
+    break;
+  }
+}
+
 void SdlHost::windowSizeInPixels(int* w, int* h) const {
   if (window_) {
     SDL_GetWindowSizeInPixels(window_, w, h);

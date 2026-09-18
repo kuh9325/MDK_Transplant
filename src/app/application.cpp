@@ -16,6 +16,7 @@
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
+#include "core/gameplay_input.h"
 #include "core/indexed_image.h"
 #include "core/log.h"
 #include "core/mode_dispatch.h"
@@ -32,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1318,6 +1320,140 @@ static const char* soundAudioEventName(SoundAudioEvent e) {
   }
 }
 
+// --selftest-gameplay-input (Phase 5A) per-frame verifier. The SDL
+// script is fixed (SdlHost::pushGameplaySelfTestStep); the expected
+// semantics are computed from the LOADED bindings so the same script
+// verifies factory defaults and --settings-file-supplied values.
+// Returns true when every scripted expectation holds for the frame.
+static bool verifyGameplaySelfTestFrame(
+    std::uint64_t i, const GameplayInputFrame& f,
+    const GameplayInputBindings& b) {
+  bool ok = true;
+  auto expect = [&](bool cond, const char* what) {
+    if (!cond) {
+      log::warn(kTag, "gameplay selftest f%llu: %s",
+                (unsigned long long)i, what);
+      ok = false;
+    }
+  };
+  // Internal key codes used by the script (SDL->DIK->internal seam).
+  constexpr int kCodeSpace = 57, kCode1 = 2, kCode5 = 6, kCodeX = 45;
+  // Which configured action the injected keys reach under the
+  // loaded bindings.
+  const bool spaceIsSnipe = (b.keys[7] == kCodeSpace);
+  const bool xIsSideStep = (b.keys[5] == kCodeX);
+  // Mouse-axis letter routing (letters index axes 0..2).
+  const char ax0 = b.mouseAxesMap.size() > 0 ? b.mouseAxesMap[0] : '0';
+  const char ax2 = b.mouseAxesMap.size() > 2 ? b.mouseAxesMap[2] : '0';
+  auto near = [](float a, float e) {
+    return std::fabs(a - e) < 0.002f;
+  };
+  switch (i) {
+  case 0:  // LEFT down -> turn level -1 (turnNorm = -0.9 non-turbo).
+    expect(f.turnAxis == -1.0f, "left: turnAxis != -1");
+    expect(near(f.turnNorm, -0.9f), "left: turnNorm != -0.9");
+    expect(f.mouseTurnActive == 0, "left: mouse flag set");
+    break;
+  case 1:  // held — the LEVEL repeats the turn (no edge needed).
+    expect(f.turnAxis == -1.0f, "left held: turnAxis dropped");
+    break;
+  case 2:  // release clears the continuous action.
+    expect(f.turnAxis == 0.0f, "left up: turnAxis != 0");
+    expect(f.turnNorm == 0.0f, "left up: turnNorm != 0");
+    break;
+  case 3:  // SPACE down -> sniper edge pulse iff KeySniper=SPACE.
+    expect((f.sniperPulse != 0) == spaceIsSnipe,
+           "space: sniper edge mismatch");
+    break;
+  case 4:  // held — the edge does not repeat.
+    expect(f.sniperPulse == 0, "space held: edge repeated");
+    break;
+  case 6:  // '1' tap -> hidden weapon slot 0 iff keys[14]==2.
+    expect((f.weaponSelect[0] != 0) == (b.keys[14] == kCode1),
+           "hotkey1: weaponSelect[0] mismatch");
+    expect(f.weaponSelect[1] == 0, "hotkey1: extra slot fired");
+    break;
+  case 7:  // '5' tap -> hidden weapon slot 4 iff keys[18]==6.
+    expect((f.weaponSelect[4] != 0) == (b.keys[18] == kCode5),
+           "hotkey5: weaponSelect[4] mismatch");
+    break;
+  case 8:  // X+LEFT: SIDE reroutes the turn level into strafe -1.
+    expect(f.sideStepHeld == xIsSideStep, "sidestep: modifier wrong");
+    if (xIsSideStep) {
+      expect(f.strafeAxis == -1.0f, "sidestep: strafe != -1");
+      expect(f.turnAxis == 0.0f, "sidestep: turn not suppressed");
+    }
+    break;
+  case 10: { // dx +320 -> axis-0 letter effect.
+    if (!b.mouseOn) {
+      expect(f.mouseTurnActive == 0 && f.turnFast == 0.0f,
+             "mouseOff: axis not gated");
+      break;
+    }
+    if (ax0 == 'A') {
+      // 320/scale deadzoned, /33.333 clamped, *6*0.5.
+      const float v = 320.0f / b.mouseScale[0];
+      const float cl = v > 4.0f * (100.0f / 3.0f)
+                           ? 4.0f
+                           : v < -4.0f * (100.0f / 3.0f)
+                                 ? -4.0f
+                                 : v / (100.0f / 3.0f);
+      expect(f.mouseTurnActive == 1, "mouseA: flag not set");
+      expect(near(f.turnFast, cl * 6.0f * 0.5f),
+             "mouseA: turnFast wrong");
+      expect(near(f.turnNorm, f.turnFast / (100.0f / 3.0f)),
+             "mouseA: turnNorm wrong");
+      expect(f.mouseDx == 320, "mouseA: raw dx not preserved");
+    } else if (ax0 == 'D') {
+      expect(f.mouseTurnActive == 1 && f.turnFast < 0.0f,
+             "mouseD: not negated");
+    }
+    // Other letters on axis 0 are covered by unit tests; the app
+    // script only asserts the 'A'/'D' routes plus MouseOn gating.
+    break;
+  }
+  case 11: { // wheel +1 -> dz 120 on axis-2 letter.
+    if (b.mouseOn && (ax2 == 'G' || ax2 == 'H')) {
+      const double scaled =
+          120.0 / (double)b.mouseScale[2] + 1.0;
+      const int ticks = (int)std::nearbyint(scaled);
+      const int signedTicks = ax2 == 'G' ? ticks : -ticks;
+      // The acc charges then decays by frameDt in the same frame —
+      // post-frame it is back to 0 with the velocities emitted.
+      const float expectVel =
+          signedTicks >= 1 ? -0.01f : signedTicks <= -1 ? 0.01f : 0.0f;
+      expect(near(f.zoomVel, expectVel), "zoom: vel wrong");
+      expect(f.zoomAccumulator == 0, "zoom: acc not decayed");
+    }
+    break;
+  }
+  case 12: // button A -> mask decode (factory bit0 = Fire).
+    expect((f.fire != 0) == ((b.mouseButtMask[0] & kBtnFire) != 0),
+           "btnA: fire bit wrong");
+    expect((f.itemUse != 0) == ((b.mouseButtMask[0] & kBtnItemUse) != 0),
+           "btnA: itemUse bit wrong");
+    expect((f.jump != 0) == ((b.mouseButtMask[0] & kBtnJump) != 0),
+           "btnA: jump bit wrong");
+    break;
+  case 13: // button C down -> synthetic snipe edge iff mask has bit1.
+    expect((f.sniperPulse != 0) == ((b.mouseButtMask[2] & kBtnSniper) != 0),
+           "btnC: snipe edge wrong");
+    break;
+  case 14: // held — the synthetic edge does not repeat.
+    expect(f.sniperPulse == 0, "btnC held: edge repeated");
+    break;
+  case 16: // settle — every continuous/edge control idle.
+    expect(f.turnAxis == 0.0f && f.strafeAxis == 0.0f &&
+               f.moveDigital == 0.0f && f.fire == 0 &&
+               f.sniperPulse == 0,
+           "settle: residual state");
+    break;
+  default:
+    break;
+  }
+  return ok;
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -1338,6 +1474,13 @@ int Application::run() {
   log::info(kTag, "presenter: %s", presenter->name());
 
   ModeDispatcher dispatcher;
+  if (cfg_.selftestGameplayInput && cfg_.interactiveFrontend) {
+    // The diagnostic owns the raw-key machine per frame; combining it
+    // with the front-end would double-poll the latch/edge bitmaps.
+    log::error(kTag, "--selftest-gameplay-input is standalone — do "
+                     "not combine with --interactive-frontend");
+    return 2;
+  }
   host.onQuit = [&] { dispatcher.requestQuit(); };
   host.onDrawableSizeChanged = [&](int w, int h) {
     log::info(kTag, "drawable resized to %dx%d", w, h);
@@ -1742,6 +1885,46 @@ int Application::run() {
     }
   }
 
+  // Phase 5A: --selftest-gameplay-input — deterministic keyboard/mouse
+  // script through the real SDL->DIK->internal seam into
+  // consumeGameplayInput. Bindings come from --settings-file when
+  // supplied (the FUN_00425de4 load analogue), else factory defaults.
+  // No front-end or original data required.
+  GameplayInputBindings gameplayBindings;
+  GameplayInputState gameplayState;
+  const GameplayInputEnvironment gameplayEnv;  // 100/3 step, dt 33
+  if (cfg_.selftestGameplayInput) {
+    host.isolateHardwareInputForSelftest();
+    FrontendSettings gs;
+    if (cfg_.settingsFile) {
+      std::string serr;
+      auto loaded =
+          loadFrontendSettingsFile(*cfg_.settingsFile, &serr);
+      if (loaded) {
+        gs = loaded->settings;
+        log::info(kTag,
+                  "gameplay selftest: loaded settings %s "
+                  "(keySniper=%d axes=%s buttA=%u xscale=%g "
+                  "mouseOn=%d yrev=%u)",
+                  cfg_.settingsFile->string().c_str(), gs.keySniper,
+                  gs.mouseWAxesMap.c_str(), gs.mouseWButtMapA,
+                  (double)gs.mouseWXScale, gs.mouseOn ? 1 : 0,
+                  gs.mouseYReversed);
+      } else {
+        log::warn(kTag,
+                  "gameplay selftest: settings %s — %s; factory "
+                  "defaults",
+                  cfg_.settingsFile->string().c_str(),
+                  serr.empty() ? "absent" : serr.c_str());
+      }
+    }
+    gameplayBindings = gameplayBindingsFromSettings(gs);
+    if (cfg_.frames == 0) {
+      // Script: 17 steps (0..16) — quit right after the settle frame.
+      cfg_.frames = 17;
+    }
+  }
+
   while (!dispatcher.quitRequested()) {
     input.beginFrame();
     if (cfg_.selftest && (frontendCtl || frontendFlow)) {
@@ -1750,6 +1933,10 @@ int Application::run() {
       host.pushFrontendSelfTestStep(clock.frameCount(),
                                   cfg_.frontendRootOnly);
     }
+    if (cfg_.selftestGameplayInput) {
+      // Phase 5A script: one deterministic keyboard/mouse step.
+      host.pushGameplaySelfTestStep(clock.frameCount());
+    }
     host.pumpEvents(input);
     const FrameTick t = clock.tick();
 
@@ -1757,6 +1944,27 @@ int Application::run() {
       selftestOk_ = host.verifySelfTestInput(input);
       log::info(kTag, "input selftest: %s",
                 selftestOk_ ? "PASS" : "FAIL");
+    }
+
+    if (cfg_.selftestGameplayInput) {
+      // frontendInputFromSdl runs the raw-key machine (level/latch/
+      // prev — the FUN_0046b688 analogue) and the DIMOUSESTATE-domain
+      // mouse fields; the bindings snapshot carries the loaded
+      // settings (or factory defaults).
+      const FrontendMenuInput gi =
+          frontendInputFromSdl(input, frontendRawKeys);
+      RawGameplayInput raw;
+      raw.keyLevel = frontendRawKeys.level;
+      raw.keyEdge = gi.rawKeyEdge;
+      raw.mouseDx = gi.mouseDx;
+      raw.mouseDy = gi.mouseDy;
+      raw.mouseDz = gi.mouseDz;
+      raw.mouseButtons = gi.mouseButtons;
+      const GameplayInputFrame gf = consumeGameplayInput(
+          raw, gameplayBindings, gameplayEnv, gameplayState);
+      selftestOk_ =
+          verifyGameplaySelfTestFrame(t.index, gf, gameplayBindings) &&
+          selftestOk_;
     }
 
     dispatcher.dispatch({t.index, t.dtSeconds, t.elapsedSeconds});
@@ -2644,6 +2852,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.settingsFile = v;
     } else if (!std::strcmp(a, "--selftest")) {
       cfg.selftest = true;
+    } else if (!std::strcmp(a, "--selftest-gameplay-input")) {
+      cfg.selftestGameplayInput = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {
       cfg.relativeMouse = false;
     } else {
