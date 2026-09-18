@@ -9,16 +9,26 @@ namespace mdk {
 
 std::string serializeFrontendSettings(const FrontendSettings& s) {
   // FUN_004260ac (OBSERVED): header + blank line, then one
-  // `name = value` line per NON-default table value. For Skill
-  // (entry 88, int, default 1): `Skill = %d` iff skill != 1.
+  // `name = value` line per NON-default table value, in table
+  // order — Skill (entry 88, int), Brightness (entry 89, int),
+  // ForcePCorrect (entry 90, type-2 bool `%s = TRUE`; the mirror
+  // compare means a non-default bool is always TRUE).
   // CRLF terminators — the original's "wt" mode text file.
   std::string out;
   out += kFrontendSettingsHeader;
   out += "\r\n\r\n";
+  char line[40];
   if (s.skill != kFrontendSkillDefault) {
-    char line[32];
     std::snprintf(line, sizeof(line), "Skill = %d\r\n", s.skill);
     out += line;
+  }
+  if (s.brightness != kFrontendBrightnessDefault) {
+    std::snprintf(line, sizeof(line), "Brightness = %d\r\n",
+                  s.brightness);
+    out += line;
+  }
+  if (s.forcePCorrect) {
+    out += "ForcePCorrect = TRUE\r\n";
   }
   return out;
 }
@@ -95,22 +105,39 @@ FrontendSettingsParse parseFrontendSettings(std::string_view text) {
     std::size_t kend = eq;
     while (kend > i && isSpace(line[kend - 1])) --kend;
     const std::string_view key = line.substr(i, kend - i);
-    if (key.empty() || !keyEquals(key, "Skill")) {
-      continue;  // not our table entry — untouched like the original
-    }
     // Value: up to `;` or EOL (the original terminates there).
     std::string_view value = line.substr(eq + 1);
     const std::size_t semi = value.find(';');
     if (semi != std::string_view::npos) {
       value = value.substr(0, semi);
     }
-    int v = 0;
-    if (!parseLeadingInt(value, &v) || v < kFrontendSkillMin ||
-        v > kFrontendSkillMax) {
-      ++r.ignoredSkillLines;   // NATIVE hardening — see header
-      continue;
+    if (keyEquals(key, "Skill")) {
+      int v = 0;
+      if (!parseLeadingInt(value, &v) || v < kFrontendSkillMin ||
+          v > kFrontendSkillMax) {
+        ++r.ignoredSkillLines;   // NATIVE hardening — see header
+        continue;
+      }
+      r.settings.skill = v;
+    } else if (keyEquals(key, "Brightness")) {
+      int v = 0;
+      if (!parseLeadingInt(value, &v) ||
+          v < kFrontendBrightnessMin || v > kFrontendBrightnessMax) {
+        ++r.ignoredBrightnessLines;   // NATIVE hardening — see header
+        continue;
+      }
+      r.settings.brightness = v;
+    } else if (keyEquals(key, "ForcePCorrect")) {
+      // Type-2 parse (OBSERVED): toupper(first non-space value char)
+      // == 'T' -> 1 else 0 — applied unconditionally.
+      std::size_t j = 0;
+      while (j < value.size() && isSpace(value[j])) ++j;
+      r.settings.forcePCorrect =
+          j < value.size() &&
+          (value[j] == 'T' || value[j] == 't');
     }
-    r.settings.skill = v;
+    // Unknown keys are skipped — the original's apply loop only
+    // touches table entries it knows.
   }
   return r;
 }

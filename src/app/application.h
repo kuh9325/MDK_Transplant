@@ -45,11 +45,18 @@ struct AppConfig {
   // labels (selection 8) + ARROW at the entry mouse position, under
   // the resident system palette. Requires --data-path.
   bool optionsSubmenuPreview = false;
+  // --preview-display-submenu: compose the static Display child
+  // screen frame (Phase 4H): cleared framebuffer + DSP_* scaled
+  // centered rows (entry selection 2 = Quit) + the 4x48 swatch grid
+  // + ARROW, under the composed display palette (SYS_PAL head +
+  // ramps). Requires --data-path.
+  bool displaySubmenuPreview = false;
   // --interactive-frontend: run the reconstructed front-end flow —
   // Phase 4E root menu plus the Phase 4F options sub-menu transition
-  // (OpenOptions enters the real OM_* screen; Back/Esc returns).
-  // Requires --data-path. Downstream actions (gameplay, saves, child
-  // options screens, settings mutations, audio) stay deferred.
+  // (OpenOptions enters the real OM_* screen; Back/Esc returns) plus
+  // the Phase 4H Display child (options row 7 enters it; Esc/Quit
+  // returns to options). Requires --data-path. Downstream actions
+  // (gameplay, saves, other child screens, audio) stay deferred.
   bool interactiveFrontend = false;
   // --frontend-root-only (test-only): run the Phase 4E root controller
   // alone so OpenOptions stays a deferred semantic action — keeps the

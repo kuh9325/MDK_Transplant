@@ -2,6 +2,7 @@
 
 #include "core/compat.h"
 #include "core/framebuffer.h"
+#include "core/frontend_palette.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 #include "core/indexed_image.h"
@@ -59,13 +60,15 @@ bool renderFrontendMenuFrame(IndexedFramebuffer& fb, Palette& palette,
               static_cast<std::size_t>(fb.width()) * fb.height());
 
   // Palette upload (FUN_00413b40 -> FUN_0046d208 head+tail: the full
-  // 256-entry embedded palette).
+  // 256-entry embedded palette, then the DAT_0054147e brightness
+  // lift that every FUN_0046d208 upload applies).
   if (backdrop.hasPalette) {
     for (int i = 0; i < palette.size(); ++i) {
       const auto& c = backdrop.palette[static_cast<std::size_t>(i)];
       palette.set(i, {c.r, c.g, c.b, 255});
     }
   }
+  applyFrontendBrightness(palette, spec.brightness);
 
   // Step 2: items. x_arg = maxW/2 — integer signed division per the
   // original SAR/SUB/SAR pattern; maxW = largest UNSCALED measure
@@ -275,6 +278,7 @@ bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
                                const FtiSpriteFrame& arrow,
                                std::span<const std::string_view> optStrings,
                                FrontendMenuController& ctl,
+                               int brightness,
                                std::string* err) {
   auto fail = [&](const char* msg) {
     if (err) {
@@ -300,6 +304,8 @@ bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
       palette.set(i, {c.r, c.g, c.b, 255});
     }
   }
+  // Same FUN_0046d208 upload lift as the static path (DAT_0054147e).
+  applyFrontendBrightness(palette, brightness);
 
   // Item layout (OBSERVED): saves -> indices 0..4 at y=31+36i;
   // no saves -> indices 1..4 at y=31+36(i-1) (global indices preserved).

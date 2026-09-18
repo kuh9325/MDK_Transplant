@@ -88,6 +88,10 @@ struct FrontendMenuItem {
 // The frozen frame state (OBSERVED entry-state register values).
 struct FrontendMenuSpec {
   std::vector<FrontendMenuItem> items;
+  int brightness = 0;   // DAT_0054147e — the FUN_0046d208 upload
+                        // lift; canonical 0 at front-end entry,
+                        // nonzero after a Display-screen mutation
+                        // returns through Options (Phase 4H)
   int arrowX = kFrontendMouseResetX;
   int arrowY = kFrontendMouseResetY;
 };
@@ -268,12 +272,16 @@ private:
 // from the controller's FUN_00423a24 ramp machine (called in draw order)
 // and the arrow sits at the controller's logical mouse position.
 // `ctl` is non-const because the scale machine mutates during the pass.
+// `brightness` is DAT_0054147e — the FUN_0046d208 upload lift applied
+// to the bound palette (a process global mutated by the Display
+// screen; 0 on the pre-Phase-4H paths).
 bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
                                const IndexedImage& backdrop,
                                const FtiFont& fontBig,
                                const FtiSpriteFrame& arrow,
                                std::span<const std::string_view> optStrings,
                                FrontendMenuController& ctl,
+                               int brightness,
                                std::string* err);
 
 } // namespace mdk

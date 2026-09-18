@@ -6,6 +6,7 @@
 #include "core/clock.h"
 #include "core/compat.h"
 #include "core/data_root.h"
+#include "core/display_menu.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/frontend_flow.h"
@@ -366,6 +367,13 @@ struct FrontendResources {
   // system-palette head the options palette upload uses.
   std::array<std::string, kOptionsItemCount> omStrings;
   std::array<std::string, 3> omSkill;    // OM_SK_0/1/2 skill variants
+  // Phase 4H display child (FUN_0041d1e0): the DSP_* row records —
+  // DSP_BRGT is a printf format ("Brightness %d"), the rest plain
+  // strings (OBSERVED NUL-terminated, same as OM_*).
+  std::string dspBrightness;             // DSP_BRGT
+  std::string dspDetailHigh;             // DSP_DETH
+  std::string dspDetailLow;              // DSP_DETL
+  std::string dspQuit;                   // DSP_QUIT
   std::array<std::byte, 192> sysPalHead{};  // SYS_PAL record head
   bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
 };
@@ -496,6 +504,15 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
     if (!loadCStr(kOptionsSkillRecords[i], res.omSkill[i])) {
       return false;
     }
+  }
+
+  // Phase 4H: DSP_* records — same NUL-terminated string shape;
+  // DSP_BRGT's text is the row-0 printf format ("Brightness %d").
+  if (!loadCStr(kDisplayBrightnessRecord, res.dspBrightness) ||
+      !loadCStr(kDisplayDetailHighRecord, res.dspDetailHigh) ||
+      !loadCStr(kDisplayDetailLowRecord, res.dspDetailLow) ||
+      !loadCStr(kDisplayQuitRecord, res.dspQuit)) {
+    return false;
   }
 
   // SYS_PAL head — the resident system palette whose head fills
@@ -635,6 +652,48 @@ static bool loadOptionsSubmenuPreview(DataRoot& root,
   return true;
 }
 
+// Phase 4H display child preview: compose the proven static
+// FUN_0041d1e0 entry frame — cleared framebuffer + the three DSP_*
+// rows (entry selection 2 = DSP_QUIT at scale 1.0, the rest 0.65)
+// + the 4x48 swatch grid + ARROW at the (unchanged) logical mouse
+// position, under the composed display palette (SYS_PAL head +
+// gray/red/green/blue ramps — see display_menu.h).
+// Fills `err` -> false on failure.
+static bool loadDisplaySubmenuPreview(DataRoot& root,
+                                      IndexedFramebuffer& fb,
+                                      Palette& palette,
+                                      std::string* err) {
+  FrontendResources res;
+  if (!loadFrontendResources(root, res, err)) {
+    return false;
+  }
+  const DisplayMenuSpec spec;  // canonical entry state
+  const DisplayMenuLabels labels{res.dspBrightness, res.dspDetailHigh,
+                                 res.dspDetailLow, res.dspQuit};
+  std::string derr;
+  if (!renderDisplayMenuFrame(fb, palette, res.fontBig,
+                              *res.arrow.frame(0), labels,
+                              res.sysPalHead, spec, &derr)) {
+    *err = "display sub-menu preview: compose — " + derr;
+    return false;
+  }
+
+  const std::uint64_t fbDigest = digestIndexedFb(fb);
+  const std::uint64_t palDigest = digestPalette(palette);
+  log::info(kTag,
+            "display sub-menu preview: DSP_* %dx%d sel=%d "
+            "brightness=%d pcorrect=%d | FONTBIG digest=%016llx | "
+            "ARROW digest=%016llx | composed fb=%016llx "
+            "palette=%016llx",
+            fb.width(), fb.height(), spec.selection, spec.brightness,
+            spec.forcePCorrect ? 1 : 0,
+            static_cast<unsigned long long>(ftiFontDigest(res.fontBig)),
+            static_cast<unsigned long long>(ftiSpriteDigest(res.arrow)),
+            static_cast<unsigned long long>(fbDigest),
+            static_cast<unsigned long long>(palDigest));
+  return true;
+}
+
 // Phase 4E — translate the platform InputState into the controller's
 // semantic per-frame input. Original reference points:
 //   prevHeld/nextHeld : DIK_UP/DIK_DOWN with the original keymap's
@@ -704,6 +763,13 @@ static const char* optionsActionName(OptionsAction a) {
   }
 }
 
+static const char* displayActionName(DisplayAction a) {
+  switch (a) {
+  case DisplayAction::Back: return "Back";
+  default: return "None";
+  }
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -766,15 +832,24 @@ int Application::run() {
   OptionsAction frontendLastOptionsAction = OptionsAction::None;
   bool frontendEnteredOptions = false;
   bool frontendReturnedToRoot = false;
-  // Phase 4G observability for the scripted selftest verdict:
+  // Phase 4G/4H observability for the scripted selftest verdict:
   // the skill value seen at each options entry (process-lifetime
-  // retention), the dirty flag seen at each options exit, and the
-  // persistence-sink invocation count.
+  // retention), the dirty flag seen at each options exit, the
+  // persistence-sink invocation count plus the last persisted
+  // triple, and the Display child's entry/resume state.
   std::vector<int> optionsEntrySkills;
   std::vector<bool> optionsExitDirty;
   int settingsPersistCalls = 0;
   int settingsPersistedSkill = -1;
+  int settingsPersistedBrightness = -1;
+  int settingsPersistedForcePCorrect = -1;
   int settingsInitialSkill = 1;  // post-config startup value
+  bool displayEntered = false;
+  int displayEntrySelection = -1;    // DAT_0054b834 seen at entry
+  int optionsResumeSelection = -1;   // _DAT_0054bd34 after FUN_0041d144
+  int displayFramesDrawn = 0;
+  std::uint64_t displayLastFbDigest = 0;
+  std::uint64_t displayLastPalDigest = 0;
 
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
@@ -785,6 +860,7 @@ int Application::run() {
                            cfg_.spritePreviewFile.has_value() ||
                            cfg_.optionsPreview ||
                            cfg_.optionsSubmenuPreview ||
+                           cfg_.displaySubmenuPreview ||
                            cfg_.interactiveFrontend;
   if (cfg_.previewFile) {
     if (!dataRoot) {
@@ -846,6 +922,18 @@ int Application::run() {
                  perr.c_str());
       return 2;
     }
+  } else if (cfg_.displaySubmenuPreview) {
+    if (!dataRoot) {
+      log::error(kTag,
+                 "--preview-display-submenu requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadDisplaySubmenuPreview(*dataRoot, fb, palette, &perr)) {
+      log::error(kTag, "display sub-menu preview failed: %s",
+                 perr.c_str());
+      return 2;
+    }
   } else if (cfg_.interactiveFrontend) {
     if (!dataRoot) {
       log::error(kTag, "--interactive-frontend requires --data-path");
@@ -878,9 +966,13 @@ int Application::run() {
           initialSettings = loaded->settings;
           settingsInitialSkill = initialSettings.skill;
           log::info(kTag,
-                    "settings: loaded %s (skill=%d ignored=%d)",
+                    "settings: loaded %s (skill=%d brightness=%d "
+                    "pcorrect=%d ignored=%d,%d)",
                     cfg_.settingsFile->string().c_str(),
-                    initialSettings.skill, loaded->ignoredSkillLines);
+                    initialSettings.skill, initialSettings.brightness,
+                    initialSettings.forcePCorrect ? 1 : 0,
+                    loaded->ignoredSkillLines,
+                    loaded->ignoredBrightnessLines);
         } else {
           log::warn(kTag, "settings: %s — %s; factory defaults",
                     cfg_.settingsFile->string().c_str(),
@@ -891,12 +983,15 @@ int Application::run() {
       auto sink = [&](const FrontendSettings& s) {
         ++settingsPersistCalls;
         settingsPersistedSkill = s.skill;
+        settingsPersistedBrightness = s.brightness;
+        settingsPersistedForcePCorrect = s.forcePCorrect ? 1 : 0;
         if (!cfg_.settingsFile) {
           // No writable location configured — the FUN_004260ac
           // silent-failure analogue: process-lifetime only.
           log::warn(kTag,
                     "settings persist skipped — no --settings-file "
-                    "(skill=%d)", s.skill);
+                    "(skill=%d brightness=%d pcorrect=%d)", s.skill,
+                    s.brightness, s.forcePCorrect ? 1 : 0);
           return false;
         }
         std::string perr;
@@ -905,8 +1000,11 @@ int Application::run() {
                     perr.c_str());
           return false;
         }
-        log::info(kTag, "settings persisted: %s (skill=%d)",
-                  cfg_.settingsFile->string().c_str(), s.skill);
+        log::info(kTag,
+                  "settings persisted: %s (skill=%d brightness=%d "
+                  "pcorrect=%d)",
+                  cfg_.settingsFile->string().c_str(), s.skill,
+                  s.brightness, s.forcePCorrect ? 1 : 0);
         return true;
       };
       frontendFlow.emplace(res.savesExist, initialSettings,
@@ -939,11 +1037,14 @@ int Application::run() {
     dispatcher.setPrimary(mode::nativeShell);
   });
   dispatcher.on(mode::nativeShell, [&](const FrameContext& ctx) {
-    // While the options sub-menu owns Esc (FUN_00420eac cancel edge ->
-    // Back), the native diagnostic-shell Esc-to-quit convenience is
-    // suspended; at the root screen it keeps its Phase 4E behavior.
+    // While a reconstructed front-end sub-screen owns Esc
+    // (FUN_00420eac cancel edge -> Back; FUN_0041d1e0 cancel edge ->
+    // FUN_0041d144), the native diagnostic-shell Esc-to-quit
+    // convenience is suspended; at the root screen it keeps its
+    // Phase 4E behavior.
     const bool escRoutesToOptions =
-        frontendFlow && frontendFlow->inOptions();
+        frontendFlow &&
+        frontendFlow->screen() != FrontendScreen::Root;
     if (input.keyDown(SDL_SCANCODE_ESCAPE) && !escRoutesToOptions) {
       dispatcher.requestQuit();
       return;
@@ -960,9 +1061,9 @@ int Application::run() {
       host.injectSelfTestEvents();
     }
     if (cfg_.frames == 0) {
-      // Phase 4G two-screen script: 14 steps (0..13) + one settled
-      // post-return root frame.
-      cfg_.frames = frontendFlow ? 15 : 10;
+      // Phase 4H three-screen script: 24 steps (0..23) + one
+      // settled post-return root frame.
+      cfg_.frames = frontendFlow ? 25 : 10;
     }
   }
 
@@ -997,9 +1098,12 @@ int Application::run() {
         endedEarly = frontendCtl->frameEndedEarly();
       } else {
         frontendFlow->update(fi);
-        endedEarly = frontendFlow->inOptions()
-                         ? frontendFlow->options().frameEndedEarly()
-                         : frontendFlow->root().frameEndedEarly();
+        endedEarly =
+            frontendFlow->screen() == FrontendScreen::Display
+                ? frontendFlow->display().frameEndedEarly()
+            : frontendFlow->inOptions()
+                ? frontendFlow->options().frameEndedEarly()
+                : frontendFlow->root().frameEndedEarly();
       }
       // OBSERVED: every activation-dispatch branch RETs before the
       // draw block and the timing update — a dispatched frame draws
@@ -1008,7 +1112,19 @@ int Application::run() {
       if (!endedEarly) {
         std::string rerr;
         bool rok = false;
-        if (frontendFlow && frontendFlow->inOptions()) {
+        if (frontendFlow &&
+            frontendFlow->screen() == FrontendScreen::Display) {
+          // Phase 4H display frame: cleared buffer + DSP_* rows +
+          // swatch grid + ARROW under the composed display palette
+          // (FUN_0041d1e0 draw block).
+          const DisplayMenuLabels labels{
+              frontendRes->dspBrightness, frontendRes->dspDetailHigh,
+              frontendRes->dspDetailLow, frontendRes->dspQuit};
+          rok = renderDisplayMenuDynamic(
+              fb, palette, frontendRes->fontBig,
+              *frontendRes->arrow.frame(0), labels,
+              frontendRes->sysPalHead, frontendFlow->display(), &rerr);
+        } else if (frontendFlow && frontendFlow->inOptions()) {
           // Phase 4F options frame: cleared buffer + OM_* labels +
           // ARROW under the system palette (FUN_00420eac draw block).
           OptionsMenuLabels labels;
@@ -1022,18 +1138,28 @@ int Application::run() {
           rok = renderOptionsMenuDynamic(
               fb, palette, frontendRes->fontBig,
               *frontendRes->arrow.frame(0), labels,
-              frontendRes->sysPalHead, frontendFlow->options(), &rerr);
+              frontendRes->sysPalHead, frontendFlow->options(),
+              frontendFlow->brightness(), &rerr);
         } else {
           rok = renderFrontendMenuDynamic(
               fb, palette, frontendRes->backdrop, frontendRes->fontBig,
               *frontendRes->arrow.frame(0), frontendViews,
-              frontendCtl ? *frontendCtl : frontendFlow->root(), &rerr);
+              frontendCtl ? *frontendCtl : frontendFlow->root(),
+              frontendFlow ? frontendFlow->brightness() : 0, &rerr);
         }
         if (!rok) {
           log::error(kTag, "interactive front-end render failed: %s",
                      rerr.c_str());
           selftestOk_ = false;
           dispatcher.requestQuit();
+        }
+        if (cfg_.selftest && frontendFlow &&
+            frontendFlow->screen() == FrontendScreen::Display) {
+          // Deterministic post-interaction digests — recorded every
+          // drawn display frame; the last one is the child snapshot.
+          displayLastFbDigest = digestIndexedFb(fb);
+          displayLastPalDigest = digestPalette(palette);
+          ++displayFramesDrawn;
         }
         // FUN_0042fe78/FUN_0042fb68 timing update — the tail of the
         // drawn frame only. --selftest feeds the original's paced
@@ -1044,6 +1170,9 @@ int Application::run() {
             cfg_.selftest ? (100.0 / 3.0) : (t.dtSeconds * 1000.0);
         if (frontendCtl) {
           frontendCtl->endFrame(frontDtMs);
+        } else if (frontendFlow->screen() ==
+                   FrontendScreen::Display) {
+          frontendFlow->display().endFrame(frontDtMs);
         } else if (frontendFlow->inOptions()) {
           frontendFlow->options().endFrame(frontDtMs);
         } else {
@@ -1060,6 +1189,26 @@ int Application::run() {
           if (a == FrontendAction::Quit) {
             dispatcher.requestQuit();
           }
+        }
+      } else if (frontendFlow->screen() == FrontendScreen::Display) {
+        const DisplayAction a = frontendFlow->consumeDisplayAction();
+        if (a != DisplayAction::None) {
+          log::info(kTag, "display action: %s (sel=%d mouse=%d,%d)",
+                    displayActionName(a),
+                    frontendFlow->display().selection(),
+                    frontendFlow->display().mouseX(),
+                    frontendFlow->display().mouseY());
+        }
+        if (frontendFlow->screen() == FrontendScreen::Options) {
+          // Back/Esc consumed -> FUN_0041d144 -> options resumed.
+          optionsResumeSelection = frontendFlow->options().selection();
+          log::info(kTag,
+                    "front-end flow: display -> options (resume "
+                    "sel=%d mouse=%d,%d dirty=%d)",
+                    optionsResumeSelection,
+                    frontendFlow->options().mouseX(),
+                    frontendFlow->options().mouseY(),
+                    frontendFlow->options().settingsDirty() ? 1 : 0);
         }
       } else if (frontendFlow->inOptions()) {
         // Record the dirty flag consumed by FUN_00420d68 before the
@@ -1078,7 +1227,19 @@ int Application::run() {
                     frontendFlow->options().mouseX(),
                     frontendFlow->options().mouseY());
         }
-        if (!frontendFlow->inOptions()) {
+        if (frontendFlow->screen() == FrontendScreen::Display) {
+          // Display consumed -> FUN_0041d020 -> child entered.
+          displayEntered = true;
+          displayEntrySelection = frontendFlow->display().selection();
+          log::info(kTag,
+                    "front-end flow: options -> display (entry "
+                    "sel=%d mouse=%d,%d brightness=%d pcorrect=%d)",
+                    displayEntrySelection,
+                    frontendFlow->display().mouseX(),
+                    frontendFlow->display().mouseY(),
+                    frontendFlow->display().brightness(),
+                    frontendFlow->display().forcePCorrect() ? 1 : 0);
+        } else if (frontendFlow->screen() == FrontendScreen::Root) {
           // Back/Esc consumed -> FUN_00420d68 -> root restored.
           frontendReturnedToRoot = true;
           log::info(kTag, "front-end flow: options -> root (sel=%d "
@@ -1137,17 +1298,24 @@ int Application::run() {
   // same domains as the Phase 4D static preview.
   if (frontendCtl || frontendFlow) {
     const bool inOpts = frontendFlow && frontendFlow->inOptions();
+    const bool inDisp =
+        frontendFlow &&
+        frontendFlow->screen() == FrontendScreen::Display;
     log::info(kTag,
               "interactive front-end last frame: fb=%016llx "
-              "palette=%016llx screen=%s sel=%d skill=%d rampAcc=%.2f",
+              "palette=%016llx screen=%s sel=%d skill=%d "
+              "brightness=%d rampAcc=%.2f",
               static_cast<unsigned long long>(digestIndexedFb(fb)),
               static_cast<unsigned long long>(digestPalette(palette)),
-              inOpts ? "options" : "root",
-              inOpts ? frontendFlow->options().selection()
+              inDisp ? "display" : inOpts ? "options" : "root",
+              inDisp ? frontendFlow->display().selection()
+              : inOpts ? frontendFlow->options().selection()
                      : (frontendCtl ? frontendCtl->selection()
                                     : frontendFlow->root().selection()),
               inOpts ? frontendFlow->options().skill() : -1,
-              inOpts ? frontendFlow->options().rampAccumulator()
+              frontendFlow ? frontendFlow->brightness() : 0,
+              inDisp ? frontendFlow->display().rampAccumulator()
+              : inOpts ? frontendFlow->options().rampAccumulator()
                      : (frontendCtl
                             ? frontendCtl->rampAccumulator()
                             : frontendFlow->root().rampAccumulator()));
@@ -1171,14 +1339,18 @@ int Application::run() {
               frontendActionName(frontendLastAction));
   }
   if (cfg_.selftest && frontendFlow) {
-    // Phase 4G two-screen + persistence script:
-    //   root nav -> options entry (sel 8) -> motion to the skill
-    //   band -> RIGHT -> Enter -> LEFT -> LEFT -> RIGHT -> Esc
-    //   (dirty persist fires) -> Enter (re-entry; skill retained
-    //   process-lifetime) -> Esc (no mutation -> no persist).
-    // From the canonical startup (Normal): Hard -> Easy -> Hard ->
-    // Normal -> Hard — the persisted final value is Hard, a
-    // non-default that proves the round trip.
+    // Phase 4H three-screen + persistence script:
+    //   root nav -> options entry (sel 8) -> skill band -> RIGHT ->
+    //   Enter -> LEFT -> LEFT -> RIGHT -> Esc (persist #1: Skill
+    //   only) -> Enter (re-entry; skill retained process-lifetime)
+    //   -> motion to the Display row -> Enter (FUN_0041d020, child
+    //   entry sel 2) -> motion to band 0 -> RIGHT -> Enter
+    //   (brightness 0->2) -> motion to band 1 -> Enter (ForcePCorrect
+    //   -> TRUE) -> motion to band 2 -> Enter (FUN_0041d144 ->
+    //   options resumes sel 7) -> Esc (FUN_00420d68 -> persist #2:
+    //   Skill + Brightness + ForcePCorrect) -> Enter (entry 3 — the
+    //   triple survives process-lifetime) -> Esc (clean exit, no
+    //   persist) -> settled root frame.
     auto wrapUp = [](int s) { return s >= 2 ? 0 : s + 1; };
     auto wrapDn = [](int s) { return s <= 0 ? 2 : s - 1; };
     int expected = settingsInitialSkill;
@@ -1187,21 +1359,31 @@ int Application::run() {
     expected = wrapDn(expected);   // LEFT
     expected = wrapDn(expected);   // LEFT
     expected = wrapUp(expected);   // RIGHT — final persisted value
+    // Three options entries: initial config, post-persist-#1, and
+    // post-display — the skill and the display triple both survive
+    // process-lifetime.
     const bool entrySkillsOk =
-        optionsEntrySkills.size() == 2 &&
+        optionsEntrySkills.size() == 3 &&
         optionsEntrySkills[0] == settingsInitialSkill &&
-        optionsEntrySkills[1] == expected;
+        optionsEntrySkills[1] == expected &&
+        optionsEntrySkills[2] == expected;
+    // Exits 1 and 2 are dirty (skill mutations, then the display
+    // child's mutations carried back through the shared
+    // DAT_00541486); exit 3 is clean — persist #2 cleared the flag
+    // and nothing mutated since.
     const bool exitsOk =
-        optionsExitDirty.size() == 2 && optionsExitDirty[0] &&
-        !optionsExitDirty[1];
+        optionsExitDirty.size() == 3 && optionsExitDirty[0] &&
+        optionsExitDirty[1] && !optionsExitDirty[2];
     // With --settings-file the persisted file must hold the final
-    // skill — re-read here for the verdict.
+    // triple — re-read here for the verdict.
     bool fileOk = true;
     if (cfg_.settingsFile) {
       std::string ferr;
       const auto disk =
           loadFrontendSettingsFile(*cfg_.settingsFile, &ferr);
-      fileOk = disk && disk->settings.skill == expected;
+      fileOk = disk && disk->settings.skill == expected &&
+               disk->settings.brightness == 2 &&
+               disk->settings.forcePCorrect;
     }
     selftestOk_ = selftestOk_ && frontendEnteredOptions &&
                   frontendReturnedToRoot &&
@@ -1210,30 +1392,52 @@ int Application::run() {
                       OptionsAction::SkillCycleNext &&
                   frontendFlow->root().selection() == 3 &&
                   frontendFlow->root().mouseX() == 300 &&
-                  frontendFlow->root().mouseY() == 259 &&
+                  frontendFlow->root().mouseY() == 89 &&
                   entrySkillsOk && exitsOk &&
-                  settingsPersistCalls == 1 &&
+                  displayEntered &&
+                  displayEntrySelection == kDisplayEntrySelection &&
+                  optionsResumeSelection == 7 &&
+                  displayFramesDrawn > 0 &&
+                  frontendFlow->brightness() == 2 &&
+                  frontendFlow->forcePCorrect() &&
+                  settingsPersistCalls == 2 &&
                   settingsPersistedSkill == expected &&
+                  settingsPersistedBrightness == 2 &&
+                  settingsPersistedForcePCorrect == 1 &&
                   frontendFlow->skill() == expected &&
                   !frontendFlow->settingsDirty() && fileOk;
     log::info(kTag,
-              "frontend selftest (two-screen): %s (entries=%d "
-              "entry-skills=%d,%d exit-dirty=%d,%d persists=%d "
-              "persisted-skill=%d skill=%d dirty=%d root sel=%d "
-              "mouse=%d,%d last-options=%s)",
+              "frontend selftest (three-screen): %s (entries=%d "
+              "entry-skills=%d,%d,%d exit-dirty=%d,%d,%d persists=%d "
+              "persisted=%d,%d,%d skill=%d bright=%d pcorr=%d "
+              "dirty=%d display-entry=%d resume-sel=%d "
+              "display-frames=%d display-fb=%016llx "
+              "display-pal=%016llx root sel=%d mouse=%d,%d "
+              "last-options=%s)",
               selftestOk_ ? "PASS" : "FAIL",
               static_cast<int>(optionsEntrySkills.size()),
               optionsEntrySkills.size() > 0 ? optionsEntrySkills[0]
                                             : -1,
               optionsEntrySkills.size() > 1 ? optionsEntrySkills[1]
                                             : -1,
+              optionsEntrySkills.size() > 2 ? optionsEntrySkills[2]
+                                            : -1,
               optionsExitDirty.size() > 0 ? optionsExitDirty[0] ? 1 : 0
                                           : -1,
               optionsExitDirty.size() > 1 ? optionsExitDirty[1] ? 1 : 0
                                           : -1,
+              optionsExitDirty.size() > 2 ? optionsExitDirty[2] ? 1 : 0
+                                          : -1,
               settingsPersistCalls, settingsPersistedSkill,
-              frontendFlow->skill(),
+              settingsPersistedBrightness,
+              settingsPersistedForcePCorrect, frontendFlow->skill(),
+              frontendFlow->brightness(),
+              frontendFlow->forcePCorrect() ? 1 : 0,
               frontendFlow->settingsDirty() ? 1 : 0,
+              displayEntrySelection, optionsResumeSelection,
+              displayFramesDrawn,
+              static_cast<unsigned long long>(displayLastFbDigest),
+              static_cast<unsigned long long>(displayLastPalDigest),
               frontendFlow->root().selection(),
               frontendFlow->root().mouseX(),
               frontendFlow->root().mouseY(),
@@ -1324,6 +1528,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.optionsPreview = true;
     } else if (!std::strcmp(a, "--preview-options-submenu")) {
       cfg.optionsSubmenuPreview = true;
+    } else if (!std::strcmp(a, "--preview-display-submenu")) {
+      cfg.displaySubmenuPreview = true;
     } else if (!std::strcmp(a, "--interactive-frontend")) {
       cfg.interactiveFrontend = true;
     } else if (!std::strcmp(a, "--frontend-root-only")) {

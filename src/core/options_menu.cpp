@@ -2,6 +2,7 @@
 
 #include "core/framebuffer.h"
 #include "core/frontend_menu.h"
+#include "core/frontend_palette.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 
@@ -203,7 +204,8 @@ static bool drawOptionsFrame(IndexedFramebuffer& fb, Palette& palette,
                              const FtiSpriteFrame& arrow,
                              const OptionsMenuLabels& labels,
                              std::span<const std::byte> sysPalHead,
-                             bool devHidden, int arrowX, int arrowY,
+                             bool devHidden, int brightness,
+                             int arrowX, int arrowY,
                              float (*scaleFor)(void*, int),
                              void* scaleCtx, std::string* err) {
   if (fb.width() != kOptionsCenterWidth || fb.height() != 360) {
@@ -226,6 +228,11 @@ static bool drawOptionsFrame(IndexedFramebuffer& fb, Palette& palette,
   for (int i = 64; i < palette.size(); ++i) {
     palette.set(i, {0, 0, 0, 255});
   }
+  // FUN_0046d208 (OBSERVED): the DAT_0054147e brightness lift applies
+  // to every uploaded entry — including the zeroed tail (at a nonzero
+  // level the options "black" is a dark gray, exactly like the
+  // original's lifted zeros).
+  applyFrontendBrightness(palette, brightness);
 
   // Step 1 (OBSERVED): FUN_00415658 -> FUN_0047d20a zero-fill — the
   // whole framebuffer clears to index 0 (SYS_PAL[0] = black). No
@@ -278,8 +285,9 @@ bool renderOptionsMenuFrame(IndexedFramebuffer& fb, Palette& palette,
                              : kFrontendScaleUnselected;
   };
   return drawOptionsFrame(fb, palette, fontBig, arrow, labels,
-                          sysPalHead, spec.devHidden, spec.arrowX,
-                          spec.arrowY, scaleFor, &ctx, err);
+                          sysPalHead, spec.devHidden, spec.brightness,
+                          spec.arrowX, spec.arrowY, scaleFor, &ctx,
+                          err);
 }
 
 bool renderOptionsMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
@@ -288,6 +296,7 @@ bool renderOptionsMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
                               const OptionsMenuLabels& labels,
                               std::span<const std::byte> sysPalHead,
                               OptionsMenuController& ctl,
+                              int brightness,
                               std::string* err) {
   struct Ctx {
     OptionsMenuController* ctl;
@@ -300,8 +309,9 @@ bool renderOptionsMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
     return c->ctl->itemScale(y, i == c->ctl->selection());
   };
   return drawOptionsFrame(fb, palette, fontBig, arrow, labels,
-                          sysPalHead, ctl.devHidden(), ctl.mouseX(),
-                          ctl.mouseY(), scaleFor, &ctx, err);
+                          sysPalHead, ctl.devHidden(), brightness,
+                          ctl.mouseX(), ctl.mouseY(), scaleFor, &ctx,
+                          err);
 }
 
 } // namespace mdk

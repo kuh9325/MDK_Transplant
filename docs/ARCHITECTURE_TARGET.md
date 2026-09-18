@@ -96,7 +96,17 @@ Boundary notes (intentions, not commitments):
 > (`frontend_settings.*`) reproduces the `FUN_004260ac` delta-write
 > contract — `Skill = %d` emitted iff != factory default 1 — behind
 > a caller-supplied path that never touches the read-only
-> `DataRoot`. See `ENGINE_RECONSTRUCTION.md`.
+> `DataRoot`. Phase 4H adds the first real child screen:
+> `DisplayMenuController` (`display_menu.*`) reproduces
+> `FUN_0041d1e0` entered via `FUN_0041d020` from options row 7 —
+> three rows (`Brightness` ±1 wrap [0,7], `ForcePCorrect` toggle,
+> `Quit`), the SYS_PAL-head-plus-4×48-ramp palette composition
+> with the `FUN_0046d208` `min(c+level·16,255)` upload lift
+> (`frontend_palette.h`), the `FUN_0041cf80` swatch grid, and the
+> `FUN_0041d144` return that resumes options at selection 7 —
+> the flow is now Root → Options → Display → Options → Root and
+> the settings seam persists all three proven entries on the
+> options exit. See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

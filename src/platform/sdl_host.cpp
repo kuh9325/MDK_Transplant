@@ -180,7 +180,7 @@ void SdlHost::isolateHardwareInputForSelftest() {
 
 void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
                                        bool rootOnly) {
-  const std::uint64_t lastStep = rootOnly ? 3 : 13;
+  const std::uint64_t lastStep = rootOnly ? 3 : 24;
   if (!window_ || frameIndex > lastStep) {
     return;
   }
@@ -261,13 +261,54 @@ void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
   case 10: // RIGHT tap: skill +1 (Normal -> Hard) — persisted value.
     keyTap(SDL_SCANCODE_RIGHT, SDLK_RIGHT);
     break;
-  case 11: // ESC tap: Back -> FUN_00420d68 -> dirty persist fires.
+  case 11: // ESC tap: Back -> FUN_00420d68 -> dirty persist fires
+          // (persist #1: Skill = final value only).
     keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   case 12: // Enter tap: root sel 3 -> re-enter options (skill held).
     keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
     break;
-  case 13: // ESC tap: Back -> root; no mutation -> no persist call.
+  // ---- Phase 4H display leg (frames 13..24) ----
+  case 13: // Arrow y=259 -> 289: options band 7 (the Display row).
+    motion(30.0f);
+    break;
+  case 14: // Enter tap: activate row 7 -> FUN_0041d020 -> display
+          // child entered (entry sel 2 = DSP_QUIT).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 15: // Arrow y=289 -> 29: display band 0 (Brightness row).
+    motion(-260.0f);
+    break;
+  case 16: // RIGHT tap: brightness 0 -> 1 (repeat query), dirty.
+    keyTap(SDL_SCANCODE_RIGHT, SDLK_RIGHT);
+    break;
+  case 17: // Enter tap: activate row 0 -> brightness 1 -> 2.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 18: // Arrow y=29 -> 49: display band 1 (detail row).
+    motion(20.0f);
+    break;
+  case 19: // Enter tap: activate row 1 -> ForcePCorrect TRUE, dirty.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 20: // Arrow y=49 -> 89: display band 2 (DSP_QUIT row).
+    motion(40.0f);
+    break;
+  case 21: // Enter tap: activate row 2 -> FUN_0041d144 -> options
+          // resumes with selection 7.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 22: // ESC tap: options Back -> FUN_00420d68 -> dirty persist
+          // fires (persist #2: Skill + Brightness + ForcePCorrect).
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 23: // Enter tap: root sel 3 -> options entry 3 — proves the
+          // triple survives process-lifetime (persisted values, not
+          // defaults).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 24: // ESC tap: options Back -> root; dirty was cleared by
+          // persist #2, no mutation since -> no persist call.
     keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   default:

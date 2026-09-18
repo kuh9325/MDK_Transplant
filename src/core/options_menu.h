@@ -117,6 +117,9 @@ struct OptionsMenuSpec {
                           // by FUN_00425de4 at startup; BUILD_A's
                           // MDK.CFG carries no Skill override
   bool devHidden = false; // DAT_005414f4 ("-mapok") canonical 0
+  int brightness = 0;     // DAT_0054147e canonical 0 — the FUN_0046d208
+                          // upload lift; a Display-screen mutation
+                          // shows on every screen's palette (Phase 4H)
   int arrowX = 300;       // logical mouse — NOT reset on entry
   int arrowY = 180;
 };
@@ -158,6 +161,12 @@ public:
   float smoothedDelta() const { return m_.timing.smoothed; }
 
   const FrontendMachineState& machineState() const { return m_; }
+  // FUN_0041d144 returns from the Display child screen with the
+  // shared globals intact — the options controller resumes with the
+  // child's machine state and the shared dirty flag (DAT_00541486)
+  // written back (Phase 4H).
+  void setMachineState(const FrontendMachineState& s) { m_ = s; }
+  void setSettingsDirty(bool dirty) { settingsDirty_ = dirty; }
 
   // Per-frame update in the original order:
   //   prev query -> next query -> mouse hit-test -> Esc -> LEFT ->
@@ -226,13 +235,16 @@ bool renderOptionsMenuFrame(IndexedFramebuffer& fb, Palette& palette,
 
 // Same composition driven by the live controller: per-row scale from
 // the FUN_00423a24 ramp (keyed -1,y, called in draw order), ARROW at
-// the controller's logical mouse.
+// the controller's logical mouse. `brightness` is DAT_0054147e — the
+// FUN_0046d208 upload lift applied to the bound palette (the Display
+// screen mutates it; it is a process global, not options state).
 bool renderOptionsMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
                               const FtiFont& fontBig,
                               const FtiSpriteFrame& arrow,
                               const OptionsMenuLabels& labels,
                               std::span<const std::byte> sysPalHead,
                               OptionsMenuController& ctl,
+                              int brightness,
                               std::string* err);
 
 } // namespace mdk

@@ -8,6 +8,7 @@
 #include "core/compat.h"
 #include "core/container.h"
 #include "core/data_root.h"
+#include "core/display_menu.h"
 #include "core/dti_structure.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
@@ -4014,7 +4015,7 @@ void test_frontend_controller() {
     mdk::Palette palette;
     CHECK(mdk::renderFrontendMenuDynamic(fb, palette, backdrop, *font,
                                          *arrow->frame(0), opts, ctl,
-                                         &err));
+                                         0, &err));
     // First frame: the selected label draws through the live ramp
     // (acc=0 -> 0.65), so glyph pixels land in its label band.
     bool found9 = false;
@@ -4032,7 +4033,7 @@ void test_frontend_controller() {
     small.pixels.assign(16, 0);
     CHECK(!mdk::renderFrontendMenuDynamic(fb, palette, small, *font,
                                           *arrow->frame(0), opts, ctl,
-                                          &err));
+                                          0, &err));
   }
 }
 
@@ -4396,15 +4397,275 @@ void test_options_controller() {
   }
 }
 
-// Phase 4G — native-owned frontend settings persistence (Skill
-// only): the FUN_004260ac/FUN_00425de4 contract reimplemented
-// against caller-supplied paths outside the read-only DataRoot.
+// Phase 4H — display child controller (FUN_0041d1e0).
+void test_display_controller() {
+  // Entry state (FUN_0041d020): selection 2 (DSP_QUIT); the shared
+  // machine state carries over untouched — mouse, tick, deadlines,
+  // latch, ramp, timing. The settings globals seed from the parent.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 123;
+    s.mouseY = 45;
+    s.tick = 77;
+    mdk::DisplayMenuController ctl(s, 3, true, true);
+    CHECK(ctl.selection() == 2);
+    CHECK(ctl.mouseX() == 123 && ctl.mouseY() == 45);
+    CHECK(ctl.tick() == 77);
+    CHECK(ctl.brightness() == 3 && ctl.forcePCorrect());
+    CHECK(ctl.settingsDirty());
+    CHECK(ctl.pendingAction() == mdk::DisplayAction::None);
+  }
+
+  // Keyboard vertical walk: prev 2->1->0 wraps ->2; next wraps 2->0.
+  // Same repeat machine as the other screens (release resets the
+  // deadline between taps).
+  {
+    mdk::FrontendMachineState s;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);
+    in = {};
+    ctl.update(in);             // release — deadline resets
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+    in = {};
+    ctl.update(in);
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);   // 0-1 wraps to 2 (0x41d43b)
+    mdk::DisplayMenuController c2(s, 0, false);
+    in = {};
+    in.nextHeld = true;
+    c2.update(in);
+    CHECK(c2.selection() == 0);   // 2+1 wraps to 0 (0x41d224)
+  }
+
+  // Mouse hit-test: band = trunc((y - 5) / 36), x never consulted.
+  // Row i covers [5+36i, 40+36i]; y>=113 is band >=3 (invalid,
+  // selection holds). The trunc-toward-zero quirk maps y in [0,4]
+  // to band 0 — observed IDIV semantics.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 200;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    // Gate closed with no mouse input.
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    // Band boundaries: y=76 -> band 1; y=77 -> band 2; y=112 -> 2;
+    // y=113 -> band 3 invalid (holds).
+    in.mouseDy = 76 - 200;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 76 && ctl.selection() == 1);
+    in = {};
+    in.mouseDy = 1;   // 77 -> band trunc(72/36)=2
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    in = {};
+    in.mouseDy = 35;  // 112 -> band trunc(107/36)=2 still
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 112 && ctl.selection() == 2);
+    in = {};
+    in.mouseDy = 1;   // 113 -> band 3 invalid -> holds
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 113 && ctl.selection() == 2);
+    // y=4 -> trunc(-1/36)=0 -> row 0 (quirk); y=5 -> band 0.
+    in = {};
+    in.mouseDy = 4 - 113;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 4 && ctl.selection() == 0);
+    in = {};
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 5 && ctl.selection() == 0);
+    // Gate clamp: y > 350 clamps to 350 inside the gate -> band 9
+    // invalid, selection holds.
+    in = {};
+    in.mouseDy = 400;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 350 && ctl.selection() == 0);
+  }
+
+  // Row 0 brightness mutations (DAT_0054147e): LEFT -1 wraps <0 -> 7
+  // (0x41d478); RIGHT/activate +1 wraps >=8 -> 0 (0x41d306/0x41d33f).
+  // Every mutation latches DAT_00541486; LEFT/RIGHT never end the
+  // frame (they fall through to the next query).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 29;   // band trunc(24/36)=0 -> Brightness row
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0 && ctl.brightness() == 0);
+    CHECK(!ctl.settingsDirty());
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.brightness() == 7 && ctl.settingsDirty());  // 0-1 wraps
+    CHECK(!ctl.frameEndedEarly());
+    in = {};
+    ctl.update(in);             // release — deadline resets
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.brightness() == 0 && !ctl.frameEndedEarly()); // 7+1 wraps
+    in = {};
+    ctl.update(in);             // release — deadline resets
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.brightness() == 1);   // 0+1
+    // Activate on row 0 increments too.
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.brightness() == 2 && !ctl.frameEndedEarly());
+    CHECK(ctl.pendingAction() == mdk::DisplayAction::None);
+  }
+
+  // Row 1 ForcePCorrect toggles (DAT_00541482): LEFT, RIGHT, and
+  // activate all toggle + dirty; nothing ends the frame.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 49;   // band 1
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1 && !ctl.forcePCorrect());
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.forcePCorrect() && ctl.settingsDirty() &&
+          !ctl.frameEndedEarly());
+    in = {};
+    ctl.update(in);             // release
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(!ctl.forcePCorrect() && !ctl.frameEndedEarly());
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.forcePCorrect());
+    CHECK(ctl.pendingAction() == mdk::DisplayAction::None);
+  }
+
+  // Row 2 (DSP_QUIT): LEFT/RIGHT are no-ops that fall through to the
+  // next query (OBSERVED — the row-2 `jnz` skips both mutation
+  // blocks); activate -> FUN_0041d144 + RET (frame ends early).
+  {
+    mdk::FrontendMachineState s;   // entry sel = 2
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.pendingAction() == mdk::DisplayAction::None);
+    CHECK(ctl.selection() == 2 && !ctl.frameEndedEarly());
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.pendingAction() == mdk::DisplayAction::None);
+    CHECK(ctl.selection() == 2 && !ctl.frameEndedEarly());
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::DisplayAction::Back);
+    CHECK(ctl.frameEndedEarly());
+  }
+
+  // Esc edge -> FUN_0041d144 regardless of selection (0x41d469).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 29;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+    in = {};
+    in.cancelEdge = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::DisplayAction::Back);
+    CHECK(ctl.frameEndedEarly());
+  }
+
+  // Input order (OBSERVED): prev query runs before next in one frame.
+  {
+    mdk::FrontendMachineState s;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    in.nextHeld = true;
+    ctl.update(in);
+    // prev: 2->1, next: 1->2.
+    CHECK(ctl.selection() == 2);
+  }
+
+  // Button latch: held buttons don't refire; release re-arms. A
+  // click on the Quit row exits like Enter.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 89;   // band 2 -> Quit
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    ctl.update(in);   // buttons released -> latch arms
+    in.mouseButtons = 0x1;
+    in.mouseDy = 1;   // gate opens; band still 2
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    CHECK(ctl.consumeAction() == mdk::DisplayAction::Back);
+    CHECK(ctl.frameEndedEarly());
+  }
+
+  // A click on the Brightness row fires the row-0 activate (+1) —
+  // the same-frame hit-test selects, the latch fires the mutation.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseY = 29;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    mdk::FrontendMenuInput in;
+    ctl.update(in);   // arm
+    in.mouseButtons = 0x1;
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0 && ctl.brightness() == 1);
+    CHECK(ctl.settingsDirty() && !ctl.frameEndedEarly());
+    // Still held -> no refire.
+    in = {};
+    in.mouseButtons = 0x1;
+    ctl.update(in);
+    CHECK(ctl.brightness() == 1);
+  }
+
+  // Scale ramp: keyed (-1, y) exactly like the options rows — cold
+  // boot first selected draw 0.65, then acc advances once per pass.
+  {
+    mdk::FrontendMachineState s;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    const int y2 = 31 + 36 * 2;   // DSP_QUIT row (entry selection)
+    CHECK(near(ctl.itemScale(y2, true), 0.65));
+    const float grow[5] = {0.72f, 0.79f, 0.86f, 0.93f, 1.0f};
+    for (int f = 0; f < 5; ++f) {
+      CHECK(near(ctl.itemScale(y2, true), grow[f], 1e-5));
+    }
+    CHECK(near(ctl.itemScale(31, false), 0.65));
+  }
+}
+
+// Phase 4G/4H — native-owned frontend settings persistence (Skill,
+// Brightness, ForcePCorrect): the FUN_004260ac/FUN_00425de4 contract
+// reimplemented against caller-supplied paths outside the read-only
+// DataRoot.
 void test_frontend_settings() {
-  // Factory default: skill 1 (Normal) — the FUN_00425de4 defaults
-  // copy result for BUILD_A (no Skill line in its MDK.CFG).
+  // Factory defaults — the FUN_00425de4 defaults-copy result for
+  // BUILD_A (none of the three proven keys appear in its MDK.CFG):
+  // skill 1 (Normal), brightness 0, ForcePCorrect FALSE.
   {
     const mdk::FrontendSettings s;
-    CHECK(s.skill == 1);
+    CHECK(s.skill == 1 && s.brightness == 0 && !s.forcePCorrect);
   }
 
   // Delta serialization (FUN_004260ac, OBSERVED): header + blank
@@ -4423,6 +4684,39 @@ void test_frontend_settings() {
     CHECK(normal.find("; MDK Configuration file") == 0);
     CHECK(normal.find("Skill") == std::string::npos);
     CHECK(hard.find("Skill = 2\r\n") != std::string::npos);
+  }
+
+  // Phase 4H entries (OBSERVED): `Brightness = %d` iff != factory 0;
+  // `ForcePCorrect = TRUE` iff != factory FALSE (the writer emits a
+  // bool only when the live dword differs from the mirror — FALSE
+  // is never emitted). Emission order is the settings-table order:
+  // Skill (88) -> Brightness (89) -> ForcePCorrect (90).
+  {
+    mdk::FrontendSettings s;
+    s.skill = 2;
+    s.brightness = 5;
+    s.forcePCorrect = true;
+    const std::string out = mdk::serializeFrontendSettings(s);
+    const auto pSkill = out.find("Skill = 2\r\n");
+    const auto pBright = out.find("Brightness = 5\r\n");
+    const auto pFpc = out.find("ForcePCorrect = TRUE\r\n");
+    CHECK(pSkill != std::string::npos &&
+          pBright != std::string::npos &&
+          pFpc != std::string::npos);
+    CHECK(pSkill < pBright && pBright < pFpc);
+    // Defaults emit nothing for the new keys.
+    const std::string def = mdk::serializeFrontendSettings(
+        mdk::FrontendSettings{});
+    CHECK(def.find("Brightness") == std::string::npos &&
+          def.find("ForcePCorrect") == std::string::npos);
+    // A non-default ForcePCorrect alone emits just its own line.
+    mdk::FrontendSettings only;
+    only.forcePCorrect = true;
+    const std::string onlyOut = mdk::serializeFrontendSettings(only);
+    CHECK(onlyOut.find("ForcePCorrect = TRUE\r\n") !=
+          std::string::npos);
+    CHECK(onlyOut.find("Skill") == std::string::npos &&
+          onlyOut.find("Brightness") == std::string::npos);
   }
 
   // Parser (FUN_00425de4 apply loop, OBSERVED shape): defaults
@@ -4454,6 +4748,48 @@ void test_frontend_settings() {
               .settings.skill == 2);
   }
 
+  // Phase 4H parser entries: `Brightness` is an int (same
+  // strtol-style leading parse + the native [0,7] hardening);
+  // `ForcePCorrect` is a type-2 bool — toupper(first non-space
+  // value char) == 'T' (FUN_0047d1a5 + `cmp 0x54`), applied
+  // unconditionally like the original.
+  {
+    CHECK(mdk::parseFrontendSettings("Brightness = 0")
+              .settings.brightness == 0);
+    CHECK(mdk::parseFrontendSettings("Brightness = 7")
+              .settings.brightness == 7);
+    CHECK(mdk::parseFrontendSettings("BRIGHTNESS = 3")
+              .settings.brightness == 3);
+    // Leading-integer semantics like the original's strtol family.
+    CHECK(mdk::parseFrontendSettings("Brightness = 5px")
+              .settings.brightness == 5);
+    // Type-2: 'T'/'t' true, anything else false — never ignored.
+    auto p = mdk::parseFrontendSettings("ForcePCorrect = TRUE");
+    CHECK(p.settings.forcePCorrect && p.ignoredSkillLines == 0 &&
+          p.ignoredBrightnessLines == 0);
+    CHECK(mdk::parseFrontendSettings("ForcePCorrect = true")
+              .settings.forcePCorrect);
+    CHECK(mdk::parseFrontendSettings("ForcePCorrect = FALSE")
+              .settings.forcePCorrect == false);
+    CHECK(mdk::parseFrontendSettings("ForcePCorrect = xyz")
+              .settings.forcePCorrect == false);
+    CHECK(mdk::parseFrontendSettings("ForcePCorrect = T")
+              .settings.forcePCorrect);
+    CHECK(mdk::parseFrontendSettings("ForcePCorrect = 1")
+              .settings.forcePCorrect == false);   // '1' != 'T'
+    CHECK(mdk::parseFrontendSettings("ForcePCorrect = ")
+              .settings.forcePCorrect == false);   // no value char
+    // A serialized triple round-trips through the parser.
+    mdk::FrontendSettings triple;
+    triple.skill = 0;
+    triple.brightness = 4;
+    triple.forcePCorrect = true;
+    const auto rt = mdk::parseFrontendSettings(
+        mdk::serializeFrontendSettings(triple));
+    CHECK(rt.settings.skill == 0 && rt.settings.brightness == 4 &&
+          rt.settings.forcePCorrect);
+  }
+
   // NATIVE hardening (not an original-behavior claim): malformed
   // or out-of-range Skill lines are ignored and counted — the
   // running value is kept.
@@ -4469,6 +4805,19 @@ void test_frontend_settings() {
     // A bad line does not clobber an earlier good one.
     p = mdk::parseFrontendSettings("Skill = 0\nSkill = 9\n");
     CHECK(p.settings.skill == 0 && p.ignoredSkillLines == 1);
+    // Brightness carries its own ignored counter ([0,7] domain).
+    p = mdk::parseFrontendSettings("Brightness = abc");
+    CHECK(p.settings.brightness == 0 &&
+          p.ignoredBrightnessLines == 1);
+    p = mdk::parseFrontendSettings("Brightness = 8");
+    CHECK(p.settings.brightness == 0 &&
+          p.ignoredBrightnessLines == 1);
+    p = mdk::parseFrontendSettings("Brightness = -2");
+    CHECK(p.settings.brightness == 0 &&
+          p.ignoredBrightnessLines == 1);
+    p = mdk::parseFrontendSettings("Brightness = 3\nBrightness = 9\n");
+    CHECK(p.settings.brightness == 3 &&
+          p.ignoredBrightnessLines == 1);
   }
 
   // Temp-file round trips — Easy / Normal / Hard through the real
@@ -4567,7 +4916,10 @@ void test_frontend_flow() {
     CHECK(flow.root().mouseX() == 300 && flow.root().mouseY() == 301);
   }
 
-  // Non-transition options actions pass through to the caller.
+  // Options -> Display (Phase 4H): activating row 7 is consumed by
+  // the transition — FUN_0041d020 enters the child with selection 2
+  // and the shared machine state intact; the options controller
+  // stays alive underneath.
   {
     mdk::FrontendFlowController flow(true);
     mdk::FrontendMenuInput in;
@@ -4579,13 +4931,152 @@ void test_frontend_flow() {
     flow.consumeRootAction();
     in = {};
     in.mouseButtons = 0;
-    in.mouseDy = 162;   // Display band
+    in.mouseDy = 162;   // 139 -> 301: Display band
     flow.update(in);
     in = {};
     in.mouseButtons = 0x1;
     flow.update(in);    // click -> activate Display
-    CHECK(flow.consumeOptionsAction() == mdk::OptionsAction::Display);
+    CHECK(flow.consumeOptionsAction() == mdk::OptionsAction::None);
+    CHECK(flow.screen() == mdk::FrontendScreen::Display);
+    CHECK(flow.display().selection() == 2);   // DAT_0054b834 entry
+    CHECK(flow.display().mouseX() == 300 &&
+          flow.display().mouseY() == 301);
+  }
+
+  // Display -> Options (Phase 4H): FUN_0041d144 restores mode 0x0b
+  // with _DAT_0054bd34 still 7 — the options controller was never
+  // re-initialized. Esc and Quit-activate both take this exit; the
+  // machine state and the shared dirty flag carry back.
+  auto enterDisplay = [](mdk::FrontendFlowController& f) {
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;            // 180 -> 139: root band 3
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);
+    f.consumeRootAction();
+    in = {};
+    in.mouseButtons = 0;
+    in.mouseDy = 162;            // 139 -> 301: options band 7
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);                // click -> FUN_0041d020
+    f.consumeOptionsAction();
+  };
+
+  {
+    mdk::FrontendFlowController flow(true);
+    enterDisplay(flow);
+    CHECK(flow.screen() == mdk::FrontendScreen::Display);
+    // Navigate to row 1 and toggle ForcePCorrect.
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.mouseDy = 49 - 301;       // -> display band 1
+    flow.update(in);
+    CHECK(flow.display().selection() == 1);
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    CHECK(flow.display().forcePCorrect());
+    // Esc -> Back -> FUN_0041d144: options resumes at selection 7.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    CHECK(flow.consumeDisplayAction() == mdk::DisplayAction::None);
     CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.options().selection() == 7);
+    CHECK(flow.options().mouseX() == 300 &&
+          flow.options().mouseY() == 49);
+    // The child's mutations live in the flow globals now.
+    CHECK(flow.forcePCorrect());
+    CHECK(flow.options().settingsDirty());
+  }
+
+  // Display exit does NOT persist — FUN_00420d68 owns the write.
+  // The shared dirty flag the child latched reaches the options
+  // exit and persists the full triple.
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendFlowController flow(
+        true, {}, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    enterDisplay(flow);
+    // Brightness row: RIGHT twice -> 0 -> 2.
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.mouseDy = 29 - 301;       // -> display band 0
+    flow.update(in);
+    CHECK(flow.display().selection() == 0);
+    for (int i = 0; i < 2; ++i) {
+      in = {};
+      in.rightHeld = true;
+      flow.update(in);
+      in = {};
+      flow.update(in);           // release — deadline resets
+    }
+    CHECK(flow.display().brightness() == 2);
+    CHECK(flow.display().settingsDirty());
+    // Quit-activate -> options: no persist call yet.
+    in = {};
+    in.mouseDy = 89 - 29;        // -> display band 2
+    flow.update(in);
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    flow.consumeDisplayAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(calls == 0);
+    CHECK(flow.options().selection() == 7);
+    CHECK(flow.brightness() == 2 && flow.options().settingsDirty());
+    // Options exit -> FUN_00420d68 -> persist the triple.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(calls == 1);
+    CHECK(persisted.skill == 1 && persisted.brightness == 2 &&
+          persisted.forcePCorrect == false);
+    CHECK(!flow.settingsDirty());
+    const std::string ser = mdk::serializeFrontendSettings(persisted);
+    CHECK(ser.find("Brightness = 2\r\n") != std::string::npos);
+    CHECK(ser.find("ForcePCorrect") == std::string::npos);
+    CHECK(ser.find("Skill") == std::string::npos);   // default
+  }
+
+  // Re-entering Display re-runs FUN_0041d020: the child selection
+  // resets to 2 but the process globals keep their mutated values.
+  {
+    mdk::FrontendFlowController flow(true);
+    enterDisplay(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseButtons = 0;
+    in.mouseDy = 29 - 301;
+    flow.update(in);
+    in = {};
+    in.rightHeld = true;
+    flow.update(in);             // brightness 0 -> 1
+    CHECK(flow.display().brightness() == 1);
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeDisplayAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.brightness() == 1);
+    // Back into Display (options sel still 7 -> activate).
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Display);
+    CHECK(flow.display().selection() == 2);      // entry reset
+    CHECK(flow.display().brightness() == 1);     // process global
+    CHECK(flow.display().settingsDirty());       // flag carried
   }
 
   // Non-transition root actions pass through unchanged.
@@ -4913,15 +5404,183 @@ void test_options_render() {
     mdk::OptionsMenuController ctl(s, false, 0);
     CHECK(mdk::renderOptionsMenuDynamic(fb, palette, *font,
                                         *arrow->frame(0), lbl, sysPal,
-                                        ctl, &err));
+                                        ctl, 0, &err));
     CHECK(fb.at(300, 139) == 77);
     // First draw: the ramp keyed (-1, y) performs the transition —
     // the accumulator restarts at 0 and advances from the next pass.
     CHECK(ctl.rampAccumulator() == 0.0f);
     CHECK(mdk::renderOptionsMenuDynamic(fb, palette, *font,
                                         *arrow->frame(0), lbl, sysPal,
+                                        ctl, 0, &err));
+    CHECK(ctl.rampAccumulator() > 0.0f);
+  }
+
+  // Brightness lift (Phase 4H, FUN_0046d208 staging semantics):
+  // level L adds 16*L per channel clamped to 255 — applied to the
+  // SYS_PAL head AND the zeroed tail, matching the original's
+  // uniform staging-buffer lift.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::OptionsMenuSpec spec;
+    spec.brightness = 2;
+    CHECK(mdk::renderOptionsMenuFrame(fb, palette, *font,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      spec, &err));
+    // Entry 1: base (1,199,1) + lift 32.
+    CHECK(palette.get(1).r == 33 && palette.get(1).g == 231 &&
+          palette.get(1).b == 33);
+    // Zeroed tail lifts too: index 200 -> (32,32,32).
+    CHECK(palette.get(200).r == 32 && palette.get(200).g == 32 &&
+          palette.get(200).b == 32);
+    // Clamp: entry 63 base g = 137 -> 169 unclamped; r = 63 -> 95.
+    CHECK(palette.get(63).r == 95 && palette.get(63).g == 169);
+  }
+}
+
+// Phase 4H — display child renderers (FUN_0041d1e0 draw block +
+// FUN_0041cf80 swatch grid).
+void test_display_render() {
+  std::string err;
+  auto f = SyntheticFont::make();
+  const char* labels[3] = {"Brightness %d", "Detail is High",
+                           "Quit"};
+  for (const char* l : labels) {
+    for (const char* c = l; *c; ++c) {
+      f.put32(static_cast<std::uint8_t>(*c) * 4,
+              f.addGlyph(1, 0, 2, {9, 9, 9, 9}));
+    }
+  }
+  const auto font = mdk::decodeFtiFont(f.buf, &err);
+  CHECK(font);
+  auto arrowS = SyntheticSprite::make1(
+      2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+  const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+  CHECK(arrow && arrow->frame(0));
+
+  const mdk::DisplayMenuLabels lbl{"Brightness %d", "Detail is High",
+                                   "Detail is Low", "Quit"};
+  std::array<std::byte, 192> sysPal{};
+  for (int i = 0; i < 64; ++i) {
+    sysPal[i * 3 + 0] = std::byte(i);
+    sysPal[i * 3 + 1] = std::byte(200 - i);
+    sysPal[i * 3 + 2] = std::byte(i);
+  }
+
+  // Static spec frame: clear(0), 3 centered rows (sel 2 at 1.0, the
+  // rest 0.65), the 4x48 swatch grid, ARROW at the carried mouse,
+  // SYS_PAL head + ramps bound.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::DisplayMenuSpec spec;
+    spec.arrowX = 300;
+    spec.arrowY = 139;
+    CHECK(mdk::renderDisplayMenuFrame(fb, palette, *font,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      spec, &err));
+    // Arrow at the spec position.
+    CHECK(fb.at(300, 139) == 77 && fb.at(301, 140) == 77);
+    // Corners stay cleared (no backdrop).
+    CHECK(fb.at(0, 0) == 0 && fb.at(599, 0) == 0 &&
+          fb.at(0, 359) == 0);
+    // Glyph pixels land inside the Quit row (y 103+).
+    bool found9 = false;
+    for (int y = 103; y < 108 && !found9; ++y) {
+      for (int x = 270; x < 330 && !found9; ++x) {
+        found9 = fb.at(x, y) == 9;
+      }
+    }
+    CHECK(found9);
+    // Swatch grid (FUN_0041cf80): band b rows y=200+32b..231+32b,
+    // cells x=60+10i..69+10i, color index 64+48b+i.
+    CHECK(fb.at(60, 200) == 64 && fb.at(69, 231) == 64);
+    CHECK(fb.at(70, 200) == 65 && fb.at(60, 232) == 112);
+    CHECK(fb.at(60 + 10 * 47, 200 + 32 * 3) == 64 + 48 * 3 + 47);
+    CHECK(fb.at(69 + 10 * 47, 231 + 32 * 3) == 255);
+    // Between bands stays cleared (y 232..231 gap is inside band —
+    // check a column gap instead: x 70..69+10 = none; x=59 outside).
+    CHECK(fb.at(59, 200) == 0);
+    // Palette: SYS_PAL head bound for 0..63.
+    CHECK(palette.get(1).r == 1 && palette.get(1).g == 199);
+    // Ramps: gray ramp entry 64+i = (v,v,v) with v=i*255/47.
+    CHECK(palette.get(64).r == 0 && palette.get(64 + 47).r == 255 &&
+          palette.get(64 + 47).g == 255 &&
+          palette.get(64 + 47).b == 255);
+    // Red band: entry 112+47 = (255,0,0); green 160+47 = (0,255,0);
+    // blue 208+47 = (0,0,255).
+    CHECK(palette.get(112 + 47).r == 255 &&
+          palette.get(112 + 47).g == 0);
+    CHECK(palette.get(160 + 47).g == 255 &&
+          palette.get(160 + 47).b == 0);
+    CHECK(palette.get(208 + 47).b == 255 &&
+          palette.get(208 + 47).r == 0);
+    // Contracts: wrong fb size, empty label, short palette head.
+    mdk::IndexedFramebuffer small(64, 64);
+    CHECK(!mdk::renderDisplayMenuFrame(small, palette, *font,
+                                       *arrow->frame(0), lbl, sysPal,
+                                       spec, &err));
+    mdk::DisplayMenuLabels bad;
+    CHECK(!mdk::renderDisplayMenuFrame(fb, palette, *font,
+                                       *arrow->frame(0), bad, sysPal,
+                                       spec, &err));
+    std::array<std::byte, 64> shortPal{};
+    CHECK(!mdk::renderDisplayMenuFrame(fb, palette, *font,
+                                       *arrow->frame(0), lbl, shortPal,
+                                       spec, &err));
+  }
+
+  // The DSP_BRGT record is the row-0 printf format: a nonzero
+  // brightness renders "Brightness 3" and the lift applies to the
+  // whole bound palette (head AND ramps).
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::DisplayMenuSpec spec;
+    spec.brightness = 3;         // lift 48
+    spec.forcePCorrect = true;   // draws DSP_DETH
+    CHECK(mdk::renderDisplayMenuFrame(fb, palette, *font,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      spec, &err));
+    // SYS_PAL head lifted: entry 1 (1,199,1) -> (49,247,49).
+    CHECK(palette.get(1).r == 49 && palette.get(1).g == 247);
+    // Gray ramp head entry 64 (0,0,0) -> (48,48,48).
+    CHECK(palette.get(64).r == 48 && palette.get(64).b == 48);
+    // Blue ramp end 255 (0,0,255) -> (48,48,255) clamped.
+    CHECK(palette.get(255).r == 48 && palette.get(255).b == 255);
+  }
+
+  // Dynamic frame: live ramp drives row scales; ARROW follows the
+  // controller's logical mouse.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 139;
+    mdk::DisplayMenuController ctl(s, 0, false);
+    CHECK(mdk::renderDisplayMenuDynamic(fb, palette, *font,
+                                        *arrow->frame(0), lbl, sysPal,
+                                        ctl, &err));
+    CHECK(fb.at(300, 139) == 77);
+    CHECK(ctl.rampAccumulator() == 0.0f);
+    CHECK(mdk::renderDisplayMenuDynamic(fb, palette, *font,
+                                        *arrow->frame(0), lbl, sysPal,
                                         ctl, &err));
     CHECK(ctl.rampAccumulator() > 0.0f);
+    // Controller state drives the palette: mutate brightness and
+    // the bound palette lifts on the next frame.
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 29 - 139;   // -> band 0
+    ctl.update(in);
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);             // brightness 0 -> 1
+    CHECK(ctl.brightness() == 1);
+    CHECK(mdk::renderDisplayMenuDynamic(fb, palette, *font,
+                                        *arrow->frame(0), lbl, sysPal,
+                                        ctl, &err));
+    CHECK(palette.get(1).r == 17);   // base 1 + lift 16
   }
 }
 
@@ -4949,9 +5608,11 @@ int main() {
   test_frontend_menu();
   test_frontend_controller();
   test_options_controller();
+  test_display_controller();
   test_frontend_settings();
   test_frontend_flow();
   test_options_render();
+  test_display_render();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

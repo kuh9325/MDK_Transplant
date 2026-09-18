@@ -6,11 +6,15 @@ FrontendFlowController::FrontendFlowController(
     bool savesExist, const FrontendSettings& initial,
     SettingsPersistSink sink)
     : root_(savesExist), skill_(initial.skill),
+      brightness_(initial.brightness),
+      forcePCorrect_(initial.forcePCorrect),
       persistSink_(std::move(sink)) {}
 
 void FrontendFlowController::update(const FrontendMenuInput& in) {
   if (screen_ == FrontendScreen::Options) {
     options_->update(in);
+  } else if (screen_ == FrontendScreen::Display) {
+    display_->update(in);
   } else {
     root_.update(in);
   }
@@ -27,7 +31,7 @@ FrontendAction FrontendFlowController::consumeRootAction() {
 }
 
 OptionsAction FrontendFlowController::consumeOptionsAction() {
-  if (!options_) {
+  if (!options_ || screen_ != FrontendScreen::Options) {
     return OptionsAction::None;
   }
   if (options_->pendingAction() == OptionsAction::Back) {
@@ -35,7 +39,24 @@ OptionsAction FrontendFlowController::consumeOptionsAction() {
     returnToRoot();
     return OptionsAction::None;  // consumed by the transition
   }
+  if (options_->pendingAction() == OptionsAction::Display) {
+    options_->consumeAction();
+    enterDisplay();
+    return OptionsAction::None;  // consumed by the transition
+  }
   return options_->consumeAction();
+}
+
+DisplayAction FrontendFlowController::consumeDisplayAction() {
+  if (!display_ || screen_ != FrontendScreen::Display) {
+    return DisplayAction::None;
+  }
+  if (display_->pendingAction() == DisplayAction::Back) {
+    display_->consumeAction();
+    returnToOptions();
+    return DisplayAction::None;  // consumed by the transition
+  }
+  return display_->consumeAction();
 }
 
 // FUN_00420cf0 (OBSERVED): mode 0x0b, _DAT_0054bd34 = 8 — plus the
@@ -67,6 +88,8 @@ void FrontendFlowController::returnToRoot() {
     if (persistSink_) {
       FrontendSettings s;
       s.skill = skill_;
+      s.brightness = brightness_;
+      s.forcePCorrect = forcePCorrect_;
       persistSink_(s);
     }
     settingsDirty_ = false;
@@ -74,6 +97,36 @@ void FrontendFlowController::returnToRoot() {
   root_.setMachineState(options_->machineState());
   options_.reset();
   screen_ = FrontendScreen::Root;
+}
+
+// FUN_0041d020 (OBSERVED, disasm_41d020.txt / phase4h_funcs.txt):
+// DAT_00541493 = 7, DAT_0054b834 = 2 — plus the palette work (dlut
+// saves the active palette, slut = SYS_PAL head + 4x48 ramps
+// uploaded; the renderer binds that composition every frame, so the
+// controller only carries the state). The options controller stays
+// alive underneath: the original's options globals are never
+// re-initialized on the way back. The shared input-machine globals
+// carry over untouched — no reset anywhere in the entry.
+void FrontendFlowController::enterDisplay() {
+  display_.emplace(options_->machineState(), brightness_,
+                   forcePCorrect_, options_->settingsDirty());
+  screen_ = FrontendScreen::Display;
+}
+
+// FUN_0041d144 (OBSERVED): DAT_00541493 = 0x0b — the options screen
+// resumes with _DAT_0054bd34 still 7 (the Display row). The saved
+// dlut palette is re-uploaded (the renderer rebinds the options
+// palette every frame anyway). The child's machine state and the
+// shared dirty flag (DAT_00541486 — one global) transfer back;
+// DAT_0054147e/DAT_00541482 keep their mutated values in the flow.
+// NO persist here — FUN_00420d68 handles it on the options exit.
+void FrontendFlowController::returnToOptions() {
+  brightness_ = display_->brightness();
+  forcePCorrect_ = display_->forcePCorrect();
+  options_->setMachineState(display_->machineState());
+  options_->setSettingsDirty(display_->settingsDirty());
+  display_.reset();
+  screen_ = FrontendScreen::Options;
 }
 
 } // namespace mdk

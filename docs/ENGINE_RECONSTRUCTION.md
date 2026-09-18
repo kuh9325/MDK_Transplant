@@ -1380,18 +1380,321 @@ it loads `skill=2`, scripts back through Easy, and persists
 - Child screens (Sound/Display/etc.), attract mode, and audio
   remain deferred.
 
-## Phase 4H candidate directions
+# Phase 4H — Display options child screen
 
-1. **A real child options screen** — smallest evidence-complete
-   target from the dispatch table (Display `FUN_0041d020` or
-   Sound `FUN_004232c` chain; Sound also owns `DAT_00541538`
-   delegation).
+Phase 4H reconstructs the first real child screen of the options
+sub-menu: the **Display** screen entered from options row 7. The
+screen's state machine, mutations, palette composition, and exit
+transition are reconstructed from instruction-level evidence; the
+host-side effect of the brightness setting stays a deferred
+semantic hook (the bound palette lift IS the proven visible effect
+and is reproduced exactly).
+
+## Candidate comparison (OBSERVED)
+
+Two options rows were proven to enter child screens at the
+`FUN_00420eac` dispatch level — all three per-query tables
+(`FUN_004238bc` LEFT @`0x420e48`-region, `FUN_00423940` RIGHT,
+`FUN_00423764` activate) bind each row to one entry:
+
+| | Display (row 7) | Sound (row 1) |
+|---|---|---|
+| entry | `FUN_0041d020` | `FUN_0042322c` |
+| mode written (`DAT_00541493`) | 7 | 2 |
+| frame handler | `FUN_0041d1e0` | `FUN_004233d8` |
+| rows | 3 (`DSP_BRGT`/`DSP_DE*`/`DSP_QUIT`) | 4 (`SND_TITL`/`SND_FX`/`SND_MUSI`/`SND_DONE` + `SND_0`/`SND_100` bar) |
+| settings globals | `DAT_0054147e` Brightness int [0,7], `DAT_00541482` ForcePCorrect bool | `DAT_00541308` SoundFX int [0,100] step 10, `DAT_0054130c` SoundMusic same |
+| settings table idx | 89 (int), 90 (type-2 bool) | 8, 9 (int) |
+| extra visuals | 4×48 swatch ramp grid (`FUN_0041cf80` → `FUN_00416aa8` rectfill) | volume bar (`FUN_00416aa8`) |
+| palette | saves active → `dlut`, composes `slut` (SYS_PAL head + 4 ramps), restores on exit | none |
+| side effects | none beyond palette upload | `OPTSONG`/`OPTBUTT` from `MDKSOUND.SNI` on entry/edges; `DAT_00541538` delegation (dead — written only as 0 at WinMain init) |
+| backend needed | none — the only "hardware" effect is the `FUN_0046d208` palette lift, already proven math | DirectSound enumeration/playback only for the (deferred) blip — not needed to navigate, but the screen's purpose is audio state |
+
+**Display selected**: it reuses the exact proven machinery —
+`FUN_00423b88` rows (FONTBIG, centered, `(-1,y)` ramp key), the
+shared query helpers in the same order, the `FUN_00416aa8`
+rectfill — plus one new bounded visual (the ramp grid) and a
+palette composition whose math was already proven
+(`FUN_00413b40` head+tail, `FUN_0046d208` lift). Its only
+persisted fields are two more proven table entries in the same
+`FrontendSettings` seam. Sound is deferred, not because its UI is
+unknown — its handler is equally mapped — but because Phase 4H
+scopes to ONE child and Display touches no new subsystem; the
+sound screen's own records (`SND_*`), volume globals, and
+`OPTSONG`/`OPTBUTT` playback remain Phase 4I+ work. The
+`DAT_00541538` delegation path is documented dead in BUILD_A
+(only ever written 0) — no emulation needed.
+
+## Entry transition (`FUN_0041d020`, OBSERVED — `disasm_41d020.txt`)
+
+Reached from options row 7 under the LEFT, RIGHT, or activate
+query — all three dispatch tables bind row 7 to the same
+`0x4210ce` block (the earlier session note about a permuted
+activate table was a mis-decode of the trap-dword layout between
+tables; the full-range disassembly shows uniform binding):
+
+- `DAT_00541493 = 7` — display mode; the mode dispatcher
+  (`FUN_0040103c`, table `0x401010` indexed `mode-1`) routes it
+  to `FUN_0041d1e0`.
+- `DAT_0054b834 = 2` — entry selection = the `DSP_QUIT` row.
+- `dlut` ← tagged `0x300` buffer (`DAT_0049aa70`);
+  `FUN_0046d614` flattens the ACTIVE BGRX palette into RGB
+  triplets — the saved copy the exit restores.
+- `slut` ← tagged `0x300` buffer (`DAT_0049aa74`); head
+  `slut[0:0xc0]` copied from `dlut` (dead on arrival — see
+  palette), tail filled with four 48-entry ramps:
+  gray 64–111, red 112–159, green 160–207, blue 208–255;
+  intensity `i*255/47` per channel.
+- `FUN_00413b40(slut)` composes SYS_PAL head (`DAT_00540820`,
+  64 entries) + `slut` tail (192 entries) → `FUN_0046d208`
+  upload with the brightness lift — the slut head copy is dead
+  because the helper always rebinds the resident SYS_PAL head.
+- **No reset** of mouse (`DAT_0054b634/38`), tick
+  (`DAT_00541518`), repeat deadlines, button latch, ramp
+  (`DAT_0054bdc8` block), or timing (`DAT_0049b6e4` block) —
+  the shared globals continue on the child screen.
+- The options screen stays alive underneath: its selection
+  `_DAT_0054bd34` keeps 7.
+
+## Screen state globals
+
+- `DAT_0054b834` — selection, 0..2 (written only by the display
+  entry and its own handler — clean single-owner global).
+- `DAT_0054147e` — Brightness, int domain [0,7] (settings table
+  entry 89, `Brightness`, type 0, factory 0 — mirror byte
+  `@0x49b272`).
+- `DAT_00541482` — ForcePCorrect, type-2 bool (entry 90,
+  `ForcePCorrect`, factory FALSE — mirror `@0x49b276`).
+- `DAT_00541486` — the shared settings-dirty flag (ONE global
+  shared with the options screen — child mutations latch it and
+  the eventual options exit persists it).
+- `dlut`/`slut` — tagged palette buffers owned by the screen
+  (freed on exit).
+
+## Frame handler (`FUN_0041d1e0`, OBSERVED — `phase4h_funcs.txt`)
+
+Same prologue and the same query helpers in the same order as
+the options screen:
+
+1. `FUN_004187e0` mouse accumulate + `DAT_00541518 +=
+   DAT_0049b6e8`.
+2. prev query (`FUN_004237b4`): `sel -= 1`, wraps `<0 → 2`.
+3. next query (`FUN_00423838`): `sel += 1`, wraps `>=3 → 0`.
+4. Mouse hit-test gate (the three-global check, clamp to
+   `(590,350)` inside): `band = trunc((mouseY - 5) / 36)` — x86
+   IDIV truncation, so `mouseY` 0–4 truncates to band 0
+   (reproduced); valid bands 0–2 assign unconditionally.
+5. `DAT_0054b570` Esc edge → `FUN_0041d144` + RET — frame ends
+   before the draw block.
+6. LEFT query (`FUN_004238bc`): row 0 → `brightness -= 1`
+   (wraps `<0 → 7`) + dirty + `FUN_0046d208` re-upload of slut;
+   row 1 → toggle `ForcePCorrect` + dirty; row 2 → `jnz` skips
+   the block (no-op). Always falls through to the RIGHT query.
+7. RIGHT query (`FUN_00423940`): row 0 → `brightness += 1`
+   (wraps `>=8 → 0`) + dirty + re-upload; row 1 → toggle +
+   dirty; row 2 → no-op. Falls through to activate.
+8. Activate query (`FUN_00423764`): row 0 → same `+1` wrap +
+   dirty; row 1 → toggle + dirty; row 2 → `FUN_0041d144` + RET
+   (frame ends early). Rows 0/1 fall through to the draw.
+9. Draw block (below), then `FUN_0042fe78` timing update.
+
+## Draw block (OBSERVED)
+
+1. `FUN_00415658` → zero-fill `clear(0)` — no backdrop.
+2. `sprintf(buf, DSP_BRGT, brightness)` — the record text IS
+   the row-0 printf format (`"Brightness %d"`,
+   `FUN_0047d2e9` vsprintf) → drawn at y=31.
+3. `DSP_DETH` (`"Detail is High"`) or `DSP_DETL`
+   (`"Detail is Low"`) by `DAT_00541482` → y=67.
+4. `DSP_QUIT` (`"Quit"`) → y=103.
+   All three via `FUN_00423b88` — FONTBIG, centered on 600,
+   ramp key `(-1, y)` — the identical helper the options rows
+   use (`kFtiFontBigMissingAdvance` measure, x87-trunc center).
+5. `FUN_0041cf80` swatch grid — four bands × 48 cells of
+   `FUN_00416aa8` **inclusive** rectfill: cells
+   `x = 60+10i .. 69+10i` (10 px), `y = 200+32b .. 231+32b`
+   (32 px), color index `64 + 48*band + i` — the indices line
+   up exactly with the entry-composed palette ramps.
+6. `ARROW` at the raw logical mouse (`FUN_004236c0`).
+
+## Palette contract (OBSERVED)
+
+- On entry: active palette saved to `dlut`; composed palette =
+  SYS_PAL head (entries 0–63, from `DAT_00540820` — NOT the
+  dead slut head copy) + the four ramps (64–255), uploaded via
+  `FUN_0046d208`.
+- `FUN_0046d208` staging lift (OBSERVED, `disasm` head +
+  `0x46d2c3` branch): per channel `min(c + level*16, 255)` at
+  upload for `level = DAT_0054147e` — applied uniformly to
+  every bound entry, including index 0 (nonzero brightness →
+  dark-gray clear color, exactly like the original's lifted
+  zeros). The runtime `DAT_0054d7b8` table stays RAW — the
+  lift lives only in the staging buffer, so `FUN_0046d614`
+  snapshots never compound.
+- Row-0 mutations re-upload `slut` immediately (the new lift
+  shows the same frame — the native renderer binds the lifted
+  palette every frame, so the effect is identical).
+- On exit (`FUN_0041d144`): `FUN_0046d208(0,0x100,dlut)`
+  restores the saved palette; both tagged buffers freed.
+
+## Mutations (OBSERVED)
+
+| row | label | LEFT | RIGHT | activate |
+|---|---|---|---|---|
+| 0 | `DSP_BRGT` (sprintf brightness) | −1, wrap <0→7 | +1, wrap ≥8→0 | +1, wrap ≥8→0 |
+| 1 | `DSP_DETH`/`DSP_DETL` | toggle | toggle | toggle |
+| 2 | `DSP_QUIT` | no-op | no-op | exit |
+
+Every mutation latches `DAT_00541486`. LEFT/RIGHT never end
+the frame; Esc and row-2 activate RET before draw+timing.
+Row-2 LEFT/RIGHT no-ops are reproduced, not "fixed".
+
+## Exit transition (`FUN_0041d144`, OBSERVED)
+
+- `DAT_00541493 = 0x0b` — back to the options handler.
+- Saved `dlut` palette re-uploaded; `dlut`+`slut` freed.
+- `_DAT_0054bd34` untouched → options resumes at selection 7.
+- Machine state (mouse/tick/deadlines/latch/ramp/timing) and
+  the dirty flag carry back; **no persist here** — the
+  eventual `FUN_00420d68` options exit persists the dirty flag
+  exactly like Phase 4G.
+
+## Settings-table mapping (OBSERVED)
+
+| idx | key | type | global | factory (mirror) |
+|---|---|---|---|---|
+| 89 | `Brightness` | int | `DAT_0054147e` | 0 `@0x49b272` |
+| 90 | `ForcePCorrect` | 2 (bool) | `DAT_00541482` | FALSE `@0x49b276` |
+
+`FrontendSettings` gains `brightness`/`forcePCorrect` alongside
+the 4G `skill` — same serializer/parser contract: emitted in
+table order (Skill, Brightness, ForcePCorrect) only when
+non-default; `ForcePCorrect` emits `TRUE` only (the mirror
+compare means a written bool is always non-default); type-2
+parse = `toupper(first non-space value char) == 'T'` applied
+unconditionally; `Brightness` gets the same native hardening
+counter (`[0,7]` domain) as `Skill`.
+
+## Native port decisions (NATIVE PORT)
+
+- The flow owns `brightness_`/`forcePCorrect_` as process
+  globals (`DAT_0054147e/82` lifetime), seeded from
+  `--settings-file` config exactly like `skill_`; the child
+  controller borrows them on `FUN_0041d020` and writes them
+  back on `FUN_0041d144` — one shared mutable location, like
+  the original's globals.
+- The options controller gets `setMachineState`/
+  `setSettingsDirty` — the serialization seam the
+  `FUN_0041d144` return needs (the options globals were never
+  re-initialized in the original either).
+- `applyFrontendBrightness` (`core/frontend_palette.h`) is the
+  shared `FUN_0046d208` staging lift; all three screens bind it
+  over their palette composition (root/options apply it to
+  SYS_PAL head + zeroed tail — the original's uniform lift over
+  whatever is bound, zero entries included).
+- `DAT_00541538` delegation NOT modeled — dead in BUILD_A.
+- No host display-mode change, no renderer enumeration — the
+  child screen never called a platform display API; its only
+  visible effect is the palette lift, which is reproduced.
+
+## CLI + deterministic validation
+
+- `--preview-display-submenu` — composes the entry-state static
+  frame (`DAT_0054b834=2`, canonical brightness 0 /
+  ForcePCorrect FALSE, ARROW at the carried mouse) and logs
+  fb/palette digests.
+- `--interactive-frontend` — the options row-7 action now enters
+  the real child; Esc or Quit-activate returns to options at
+  selection 7; the display screen's frame is skipped (not
+  drawn) on the dispatch frame exactly like the original's RET.
+- The injected selftest extends to frames 13–24: options band-7
+  motion → Enter (`FUN_0041d020`, entry sel 2) → display band-0
+  motion → RIGHT + Enter (brightness 0→2) → band-1 motion →
+  Enter (ForcePCorrect → TRUE) → band-2 motion → Enter
+  (`FUN_0041d144`, resume sel 7) → Esc (`FUN_00420d68`,
+  persist #2 writes the full triple) → Enter (entry 3 proves
+  process-lifetime retention) → Esc (clean, no persist).
+  Default selftest frames: 25.
+
+## Digests and verification
+
+- Static display preview: fb `e8c31e4839c0e1d4`, palette
+  `64ce160e2384e256` (SYS_PAL head + 4 ramps, lift 0).
+  `/tmp/mdk-phase4h-child.ppm` — agent-inspected: three
+  centered rows ("Brightness 0" / "Detail is Low" / "Quit"
+  selected), four 48-cell gray/red/green/blue ramps, ARROW.
+- Dynamic child snapshot (script frame 20 — sel 2, brightness
+  2, pcorrect 1): fb `5bfe84dc4fc7a023`, palette
+  `514f0c9fb5abcb26`. `/tmp/mdk-phase4h-dynamic.ppm` —
+  agent-inspected: "Brightness 2" / "Detail is High" / lifted
+  background (index 0 lifts too, OBSERVED parity) + lifted
+  ramps. The `64ce→514f` palette shift IS the brightness-2
+  lift reaching the bound palette.
+- Pre-entry options frame (script frame 13 — sel 7, mouse
+  300,289): fb `1c5686da0ff03f41`, palette
+  `08e372297e745a06`.
+- Display frame at sel 0 (script frame 15): fb
+  `0b3c66e7e1d108ab`, palette `64ce160e2384e256` — palette
+  matches the static preview's (same composition at lift 0).
+- Three-screen selftest end state: `PASS` — entries=3
+  (skills 1,2,2), exit-dirty 1,1,0, persists=2 (final
+  `skill=2 brightness=2 pcorrect=1`), display-entry sel 2,
+  resume sel 7, 6 display frames drawn, root restored
+  (sel 3, mouse 300,89).
+- `--settings-file` round trip: persist #2 writes
+  `Skill = 2` + `Brightness = 2` + `ForcePCorrect = TRUE`
+  (CRLF); a second run loads `(2,2,1)` and the options entry
+  shows skill 2 — restart persistence intact.
+- Phase 4F frame-8 dynamic `ead555ffad0ca609` is **superseded
+  by design**: it was the options frame after a band-7 click
+  that only emitted a passthrough action; the click now enters
+  Display (`FUN_0041d020`) so that frame cannot occur on any
+  script path. The state it encoded remains proven by the
+  unchanged static options digest `0183fdb78c53a700`, palette
+  `08e372297e745a06`, all three 4G skill snapshots
+  (`780cfeb3a26c7390`/`01e229facdededd1`/`11ec77782b5ce37c`),
+  and the pre-entry frame above. All other 4A–4G digests
+  reproduce byte-exact.
+- Unit tests add: display entry state + carry-over, up/down
+  wrap, exact band boundaries incl. the `(y−5)/36` truncation
+  quirk and the (590,350) gate clamp, brightness wrap both
+  directions + activate, ForcePCorrect toggle on all three
+  queries, row-2 LEFT/RIGHT no-ops, Esc/Quit early frame end,
+  prev-before-next order, latch, ramp key `(-1,y)` +
+  accumulator semantics, renderer contracts + ramp/swatch
+  geometry + palette composition + lift, flow transitions both
+  directions + process-global mutation visibility + dirty
+  carry + triple persistence + delayed-persist gate;
+  `Brightness`/`ForcePCorrect` serializer/parser coverage.
+  `mdk_tests`: **2133 checks, 0 failures**.
+
+## Explicit non-goals (Phase 4H)
+
+- No Sound screen — its records, volume globals, `OPTSONG`/
+  `OPTBUTT` playback, and the (dead) `DAT_00541538` delegation
+  are documented but not implemented.
+- No host display-mode switching, no renderer enumeration —
+  the original child applies no platform display API; the
+  palette lift is the complete proven visible effect.
+- No audio (`SND_PUSH` still deferred).
+- No new asset formats — DSP_* are existing FTI string
+  records through the proven `MDKFONT.FTI` path.
+- No persistence of unproven fields — only the three mapped
+  entries serialize.
+
+## Phase 4I candidate directions
+
+1. **Sound options screen** — `FUN_0042322c`/`FUN_004233d8`
+   are already mapped (4 rows, volume globals
+   `DAT_00541308`/`0c` ±10 clamp [0,100], settings idx 8/9
+   `SoundFX`/`SoundMusic` defaults 70/100); its blip playback
+   (`OPTSONG`/`OPTBUTT`, `MDKSOUND.SNI`) can stay deferred or
+   become the first audio seam.
 2. **Attract slideshow** — `FUN_0041ef74` + the timeout chain
    (30/5/4/2 s thresholds on `DAT_0049aaa4`).
-3. **Frontend sound** — `SND_PUSH` (`FUN_00423734`) already fires
-   on every repeat/activate edge; the records behind it are the
-   next evidence target.
-4. **More settings-table entries** — 91 remain unmapped; the
-   `name`/type/pointer triples are all dumped at `0x49aca8`, but
-   each needs its own semantics proven before it joins
+3. **Frontend sound** — `SND_PUSH` (`FUN_00423734`) fires on
+   every repeat/activate edge; records pending.
+4. **More settings-table entries** — 89 remain unmapped; all
+   `name`/type/pointer triples dumped at `0x49aca8`, each
+   needs its own semantics proven before joining
    `FrontendSettings`.
