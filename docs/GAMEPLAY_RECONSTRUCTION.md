@@ -1,16 +1,21 @@
-# Gameplay Reconstruction — Phase 5A status
+# Gameplay Reconstruction — Phases 5A–5B status
 
 Phase 4 is **CLOSED at Phase 4K**. The remaining front-end children
 (Help `FUN_0041d540`, Joystick, Performance) and real frontend audio
 playback are deferred compatibility/polish work — they do not block
 keyboard+mouse gameplay reconstruction.
 
-Phase 5 begins gameplay reconstruction. **Phase 5A reproduces the
-original per-frame gameplay-input consumption layer only**: raw
-keyboard/mouse state + the configured bindings → the semantic
-control block. No player movement, camera physics, weapon
-simulation, sniper behavior, collision, level logic, or world
-mutation — the consumers of the control block are later-phase work.
+**Phase 5A reproduces the original per-frame gameplay-input
+consumption layer only**: raw keyboard/mouse state + the configured
+bindings → the semantic control block. No world mutation.
+
+**Phase 5B reproduces the first downstream player-movement consumer
+of that control block**: `FUN_00465228` — the normal-movement
+integrator — from the merged rates to player-local kinematic state
+(three velocity channels, yaw, bank/roll) plus the displacement the
+collision seam receives. Collision, vertical/jump, camera, sniper,
+slide, mantle, and the item/fire dispatch tail remain deferred
+boundaries (§15 onward).
 
 Evidence labels follow `docs/reverse-engineering/EVIDENCE_POLICY.md`.
 
@@ -163,7 +168,7 @@ A–F letters, per axis:
 v = delta / scale            // float division, scale is the setting
 if letter in {D,E,F}: v = -v // sign flip BEFORE the deadzone
 if |v| < 0.2:        v = 0   // deadzone
-rate = clamp(v / frameStep, -4, +4)  // frameStep = 0x49b6f0 (~33.33)
+rate = clamp(v / smoothed, -4, +4)  // smoothed = 0x49b6f0 (~1.0)
 ```
 
 The rate then multiplies the same per-axis constants the keyboard
@@ -180,13 +185,15 @@ ticks = rint(delta / scale + sign(delta) * 1)  // the ±1 bias makes
 acc += (G ? +ticks : -ticks); clamp acc to [-8, 8]
 ```
 
-## 8. Zoom accumulator tail (OBSERVED)
+## 8. Zoom accumulator tail (OBSERVED, corrected in 5B)
 
-`0x4ce760` decays by the raw frame delta `0x49b6e8` (~33) toward 0
-each frame; while `|acc| ≥ 1` the frame emits the zoom velocities
-(±0.01 slow / ±0.15 fast, sign per accumulator sign). Net effect: a
-single wheel detent (dz=120, scale 50 → 3 ticks) emits exactly one
-frame of zoom velocity — reproduced in the tail.
+`0x4ce760` decays by the integer frame-step `0x49b6e8` toward 0 each
+frame (the timing machine's `clamp(accum>>2,1,4)` count — **1** at
+the nominal rate, not a ~33 ms quantity; see §13/§15 for the
+corrected provenance). While `|acc| ≥ 1` the frame emits the zoom
+velocities (±0.01 slow / ±0.15 fast, sign per accumulator sign).
+Net effect: a single wheel detent (dz=120, scale 50 → 3 ticks)
+emits exactly one frame of zoom velocity — reproduced in the tail.
 
 ## 9. MouseOn and MouseYReversed (OBSERVED)
 
@@ -271,22 +278,284 @@ dependency enters `src/core/gameplay_input.*`.
 
 ## 13. Remaining input unknowns (for later phases)
 
-- `0x540c80` (`moveBoostGate`) — read each frame; writers are player
-  state machines. Meaning UNKNOWN — modeled as an environment
-  input, default 0 (the ×4/3 lift active).
 - `0x5414e4` (`debugMoveBoost`) — debug-command flag; with Tab
   level it overrides move rates to 20/3. Modeled, default 0.
 - Joystick consumption — `FUN_0046b9b4` outputs and the
   `JoyOn`/`JoyType`/axis-map/button-mask tables are modeled because
   `FUN_00406f14` reads them, but nothing upstream feeds them;
   `joyOn=false` reproduces the canonical no-device path.
-- `0x49b6f0`/`0x49b6e8` provenance — the frame-step divisor and raw
-  frame delta are read as environment inputs (default 100/3, 33);
-  the original timing writer is a later-phase concern.
 
-## 14. Recommended Phase 5B target
+Resolved by Phase 5B (moved here from the former unknowns list):
 
-The first downstream consumer of the control block — most plausibly
-the player-movement path that reads `0x4ce6e0..` rate products
-(`FUN_00463608` callers / the movement integrator), so the semantic
-frame gains its first real consumer. Not started in Phase 5A.
+- `0x540c80` (`moveBoostGate`) — **OBSERVED**: the jump-sustain
+  flag. `FUN_00466740` sets it to 1 while the airborne counter
+  `0x540c84 != 0` and the jump input stays held; it gates both the
+  ×4/3 horizontal move lift (here) and the weaker jump-sustain
+  gravity inside `FUN_00467180`. Kept as an environment input —
+  the airborne counter's writers are the deferred vertical system.
+- `0x49b6f0`/`0x49b6e8` provenance — **OBSERVED** (Phase 4F timing
+  machine, `FUN_0042fcd0`/`FUN_0042fdc8`): `0x49b6f0` is the
+  smoothed frame-units factor `f0` (EMA `x·0.75+units·0.25`, ≈1.0
+  nominal — the mouse-rate divisor and the integrator's accel/
+  displacement scale); `0x49b6e8` is the integer frame-step
+  `clamp(accum>>2,1,4)` (the zoom-accumulator decrement). Phase 5A
+  had mislabeled them as ~33 ms quantities — defaults corrected to
+  `smoothedDelta = 1.0f`, `frameStep = 1`.
+
+# Phase 5B — the normal-movement integrator (FUN_00465228)
+
+Phase 5B reconstructs **one bounded layer**: the first downstream
+player-local movement consumer of the merged control block.
+
+## 14. Control-block reader xref map
+
+Direct readers of the movement-related control fields
+(`0x4ce6e0..0x4ce73c`), separated by consumer class (OBSERVED from
+the xref table):
+
+| Control field | Phase-5A field | Movement readers | Other readers (deferred) |
+|---|---|---|---|
+| `0x4ce6f8`/`0x4ce6fc` | `strafeNorm`/`strafeFast` | `FUN_00465228` | `FUN_0046603c` (slide) |
+| `0x4ce700`/`0x4ce704` | `turnNorm`/`turnFast` | `FUN_00465228` | `FUN_0046603c` |
+| `0x4ce708`/`0x4ce70c` | `moveVel`/`moveVelBoosted` | `FUN_00465228` | `FUN_0046603c`, `FUN_00466aec` (mantle gate) |
+| `0x4ce710..` | `yawNorm`/`yawFast`/`yaw*` products | — | `FUN_00465c4c` (look/pitch), `FUN_0046603c` |
+| `0x4ce764` | `mouseTurnActive` | `FUN_00465228` | — |
+| `0x4ce768` | jump flag | — | `FUN_00466740` (vertical/jump) |
+| `0x4ce76c`/`0x4ce770`/`0x4ce774` | item/fire paths | — | `FUN_00469cd0` (item dispatch), tail |
+| `0x4ce780` | look/pitch path | — | `FUN_00465c4c` |
+| `0x4ce760` | zoom accumulator | — | sniper zoom path |
+
+Only the movement/locomotion consumers proceeded in 5B; camera
+(`FUN_00464624`), sniper (`FUN_004691c4`), and the item/fire tail
+remain untouched.
+
+## 15. The dispatcher and the one-frame input order
+
+`FUN_00436100 → FUN_00463608` is the per-frame traversal driver
+(OBSERVED, single call sites). `FUN_00463608` is a **dispatcher**:
+it zeroes the event word `0x54cb00/08`, runs one player-state
+branch selected by `DAT_00540cac`, then runs a shared tail:
+
+```
+FUN_00463608:
+  event word = 0
+  switch (DAT_00540cac):           // player-state gate
+    < 800:  if (e6c==0 && c9c==0)  FUN_00465228(param_1, 0)   // normal
+            else mount/drive branch
+    800:    FUN_0046603c(...)      // slide/dash mode — deferred
+    ...                            // other state branches
+  shared tail:
+    FUN_00464d10                   // debug fly-mode toggle
+                                   //  (DAT_005414e4 → cac=100)
+    FUN_00406f14                   // merge NEXT frame's control
+    FUN_0047d20a(0x4ce6e0,0xd0,0)  // dispatch/record the 208-byte
+                                   //  control block
+```
+
+**OBSERVED ordering consequence**: the integrator consumes the
+control block merged by the PREVIOUS frame's `FUN_00406f14` call —
+the pipeline carries exactly one frame of input latency. The native
+port reproduces this by integrating `prevFrame` while the current
+frame's input is being merged.
+
+`FUN_00465228(param_1, 0)` never reads either argument — the
+integrator is a pure global-state machine over the player block
+`0x540bfc..0x540eb8` plus the control block.
+
+## 16. Selected target and player state
+
+Selected target: **`FUN_00465228`, the normal-movement integrator**
+— the smallest function that turns control rates into persistent
+player-local kinematic state (velocity channels + yaw + bank), and
+whose output (a displacement vector) is consumed by the collision
+call `FUN_004630d4`. Chosen over `FUN_0046603c` (a separate gated
+slide mode), `FUN_00466740`/`FUN_00467180` (the vertical/jump
+consumer), and `FUN_00465c4c` (the look/pitch event consumer) —
+all sibling branches, not parents of this path.
+
+The player state the normal path proves (all OBSERVED; the
+structure is the flat `0x540bfc..` block, not a passed object —
+`FUN_00465228` ignores its stack args):
+
+| Address | Native field | Proven meaning |
+|---|---|---|
+| `0x540c2c` | `yawDeg` | persistent yaw, **degrees**, wrapped [0,360) by ±360 constants `0x498910/0x498914` |
+| `0x540d48` | `moveVel` | forward/back velocity channel (units/frame-unit) |
+| `0x540d4c` | `strafeVel` | strafe channel (+ = right) |
+| `0x540d50` | `turnVel` | yaw-rate channel (deg/frame-unit) |
+| `0x540b4c` | `bank` | bank/roll accumulator, clamped ±10 |
+| `0x540c84` | `airCharge` | airborne counter (drained here; written by the vertical system) |
+| `0x540cc0` | `moveDirLatch` | ±1 move-direction latch |
+| `0x540c94` | `turnLock` | turn-direction lockout (sibling-mode writers) |
+
+Environment gates read from sibling systems (not owned here):
+
+| Address | Env field | Proven effect |
+|---|---|---|
+| `0x540d9c` | `masterGate` | nonzero → immediate RET (no accel/decay/disp/events) |
+| `0x540e4c` | `groundContact` | selects accel/decel scales; gates conveyor |
+| `(0x540e4c+0x20)&4` | `lowFriction` | flag-4 ground: scales 0.5/0.1 |
+| `0x540dc0`/`0x540dc8` | `moveBlocked` | both set → move input skipped (channel still decays) |
+| `0x49b6f0` | `smoothed` | the `f0` frame-units factor |
+| `0x540e4c`+contact list | `conveyorX/Y/Z` | `FUN_00412ef0` surface-effect contribution, pre-multiplied by `0x49b6f4` |
+
+The player OBJECT (`DAT_00540c48`) is only touched at the collision
+seam (`+0x462` pitch limit, `+0x2c/0x28/0x24` collision cells,
+`+0x68` contact list) — deferred with collision.
+
+## 17. Channel semantics (all OBSERVED at instruction level)
+
+The integrator runs three independent velocity channels through two
+helper shapes, then decays whichever channels received no input
+(`FUN_00465a84`):
+
+| Channel | Input product | Cap | Helper | Decay |
+|---|---|---|---|---|
+| `d48` moveVel | `moveVel` rate ×accelScale | `moveVelBoosted` | `FUN_00465b54` (f0-scaled) | `4/45` in / `8/45` out ×decelScale, bound ±2/3 |
+| `d4c` strafeVel | `strafeNorm` ×accelScale | `strafeFast` | `FUN_00465b54` | same as move |
+| `d50` turnVel | `turnNorm` | `turnFast` | `FUN_00465b54` (mouse) / `FUN_00465bd8` (kbd — raw add, NOT f0-scaled) | `0.55` in / `1.6` out, bound ±4 |
+
+Helper semantics (OBSERVED): accelerate adds `rate·f0` toward the
+signed cap, but a **sign reversal replaces** the velocity with the
+increment (no brake-through-zero); the keyboard turn path uses the
+unscaled variant — an OBSERVED asymmetry. Decay steps toward 0 by
+`rIn` inside ±bound, `rOut` outside, snapping on crossing.
+
+Accel/decel **scales** come from the ground state: `e4c==0` →
+(0.75, 0.75); `e4c` without flag 4 → (1.0, 1.0); flag 4 →
+(0.5, 0.1). Only move/strafe are scaled — turn decay is constant.
+
+The `turnLock` (`0x540c94`) gates turn **input** (decay still
+runs): 1 persists while `turnNorm<0`, 2 while `turnNorm>0`, else
+clears — the lock itself is written by sibling modes.
+
+## 18. Displacement, yaw, and the coordinate convention
+
+After the channels settle (OBSERVED compose order):
+
+```
+basis = FUN_00437f98(yaw):  sin = sin(yaw·π/180), cos = cos(yaw·π/180)
+disp += conveyor (groundContact only — FUN_00412ef0's output)
+disp.x += moveVel·f0·cos + strafeVel·f0·sin
+disp.y += moveVel·f0·sin − strafeVel·f0·cos
+yaw   -= turnVel·f0          wrapped [0,360) via ±360 constants
+```
+
+So the local frame is **+X forward at yaw 0, +Y left** (a +strafe
+"right" channel subtracts from Y), yaw in degrees, positive
+`turnVel` decreasing yaw (turn-left key → negative `turnNorm` →
+yaw increases). Displacement components **add** — no diagonal
+normalization anywhere in the original.
+
+`dispX/Y/Z` (Z = conveyor only here) is exactly what
+`FUN_004630d4` receives — the layer stops at that call. The
+collision/query/apply system, floor snapping, and gravity are
+deferred; the native port exposes the seam as an output the caller
+applies or discards.
+
+## 19. Events, bank, and the post-step rules
+
+Movement event word `0x54cb00/0x54cb08` (OBSERVED emit rules):
+
+- `moveVel ≠ 0` → type 6 mag 600 (forward) — emits first and sets
+  the consumed-latch bit that suppresses the strafe event;
+  `moveDirLatch` is rewritten to ±1 by the channel sign.
+- `strafeVel ≠ 0` → type 5 mag 500, only when no move event fired.
+- `turnVel ≠ 0` → type 4 mag 400, only when no move event fired
+  AND no live strafe input was consumed this frame.
+- Post-collision (0x4655f3..0x4658ea): a move event whose apply
+  produced **no position change** is cancelled back to 0.
+
+Bank/roll `0x540b4c` (OBSERVED): while the move input is consumed,
+`sign(turnNorm·moveVel)` drives the accumulator at `±f0·0.25`/frame
+with a `±2` snap-through kick when crossing zero, clamped ±10, and
+sets `0x54cb04`. In the dispatcher tail, when the bank event did
+not fire, `bank` decays toward 0 by `clamp(|bank|·0.35, 0.05, 2.5)
+·f0` — proportional decay with a floor and a cap (constants
+`0x4986c0/c8/d0`).
+
+Air-charge `0x540c84` (OBSERVED): while the forward move input is
+consumed, the counter drains toward 20 at `f0·1.75` (soft ceiling
+60 applied first). The counter itself is written by the deferred
+vertical system (`FUN_00466740`/`FUN_00467180`).
+
+## 20. Native boundary (`src/core/player_motion.*`)
+
+```
+GameplayInputFrame ──► integratePlayerMotion ──► PlayerMotionOutput
+      (prev frame)     (FUN_00465228 mirror)       dispX/Y/Z + events
+                                                   │
+caller resolves displacement (collision seam — open)
+                                                   ▼
+                            playerMotionPostStep   event cancel +
+                                                   air-charge drain +
+                                                   bank tail decay
+```
+
+- `PlayerMotionState` — the eight persistent fields above only.
+- `PlayerMotionEnvironment` — `smoothed`, `masterGate`,
+  `groundContact`, `lowFriction`, `moveBlocked`, `conveyorX/Y/Z`.
+- The output displacement is player-local and pre-collision; the
+  app feeds `positionChanged` from the (deferred) apply result.
+
+## 21. Phase 5B diagnostics and tests
+
+- `--selftest-player-motion` — a 24-step deterministic SDL script
+  (`SdlHost::pushMotionSelfTestStep`) through the real
+  SDL→DIK→internal seam → `consumeGameplayInput` →
+  `integratePlayerMotion(prevFrame)`. The verifier checks the
+  channel/yaw/bank/event values per frame, binding-adaptively —
+  the same script proves the **one-frame input latency** (f0
+  integrates a zero block while a key is already held), accel/
+  decay ramps, SideStep strafe, turbo rates, a custom-bound move
+  key (`KeyUp=17` → 'W'), and the mouse axis-0 impulse (turn under
+  `'A'`, strafe under `'C'`, inert under `'0'`). Mutually exclusive
+  with `--selftest-gameplay-input` and `--interactive-frontend`
+  (RC 2); RC 3 on mismatch.
+- `tests/native` — `test_player_motion`: idle, turn ramp/decay/
+  wrap, move/strafe/diagonal compose, turbo, mouse override,
+  multi-frame state evolution, turn-lock, move-block, master gate,
+  conveyor, event precedence + post-collision cancel, air-charge
+  drain, bank drive/decay.
+
+## 22. Deferred boundaries and remaining movement unknowns
+
+Documented boundaries — siblings of this layer, NOT reconstructed:
+
+- `FUN_004630d4` — collision query/apply (the disp consumer).
+- `FUN_00466740`/`FUN_00467180` — jump sustain + vertical/gravity
+  integration (`0x540c78` vertical velocity, `0x540c80`
+  jump-sustain, `0x540c84` airborne counter writer).
+- `FUN_00465c4c` — look/pitch event consumer (`yaw*` products).
+- `FUN_0046603c` — slide/dash mode (`cac==800`, `0x540e24`-gated;
+  uses `0x49b6f4` delta-seconds, not `f0`).
+- `FUN_00466aec` — mantle/ledge-grab (gated on `moveNorm>0`,
+  `c78≤−0.25`).
+- `FUN_00469cd0` + the `FUN_0047d20a(0x4ce6e0,0xd0,0)` tail —
+  item-action dispatch and the 208-byte control-block record.
+- `FUN_00464624` (camera), `FUN_004691c4` (sniper) — unchanged
+  Phase 5A boundaries.
+
+Remaining unknowns inside the movement layer:
+
+- The full `0x540cac` player-state enumeration — only `<800`
+  (locomotion), `800` (slide), and the debug `100` fly-mode are
+  observed; sibling-mode writers of `turnLock`/`c54`-style gates
+  are only partially enumerated.
+- `FUN_00412ef0`'s surface-ID scan details (contact-list record
+  layout) — modeled as an env output, not re-derived.
+- Whether `0x540b4c` bank feeds a visual roll or gameplay
+  response downstream — consumer UNKNOWN.
+- The mount/drive branch (`e6c!=0`/`c9c!=0`) — observed to slave
+  the player's basis fields, not reconstructed.
+
+## 23. Recommended Phase 5C target
+
+The vertical/locomotion sibling: `FUN_00466740` (jump sustain) +
+`FUN_00467180` (gravity/vertical integrate) — they consume the same
+control block's jump flag and write `0x540c80`/`0x540c84`, which
+the horizontal layer already reads. They are the smallest
+remaining step toward a standing player before collision
+(`FUN_004630d4`) becomes unavoidable. Camera (`FUN_00464624`) is a
+viable alternative if input-only verification matters more.
+Not started in Phase 5B.

@@ -444,25 +444,25 @@ GameplayInputFrame consumeGameplayInput(
 
   // Mouse axis -> rate overrides (the dt-normalized +-4-clamped path).
   if (mTurn != 0.0f) {
-    const float v = clampRate(mTurn / env.frameStep);
+    const float v = clampRate(mTurn / env.smoothedDelta);
     f.turnFast = (float)(v * kSix * kHalf);
-    f.turnNorm = f.turnFast / env.frameStep;
+    f.turnNorm = f.turnFast / env.smoothedDelta;
     f.turnNorm75 = f.turnNorm * (float)kThreeQuarter;
     f.turnFast75 = (float)(kThreeQuarter * (double)f.turnFast);
     f.mouseTurnActive = 1;
   }
   if (mLateral != 0.0f) {
-    const float v = clampRate(mLateral / env.frameStep);
+    const float v = clampRate(mLateral / env.smoothedDelta);
     f.yaw4 = (float)(v * kFour);
     f.yawNeg45 = (float)(-v * (double)kYaw45);
   }
   if (mStrafe != 0.0f) {
-    const float v = clampRate(mStrafe / env.frameStep);
+    const float v = clampRate(mStrafe / env.smoothedDelta);
     f.strafeFast = (float)(v * kFourThirds * kHalf);
-    f.strafeNorm = f.strafeFast / env.frameStep;
+    f.strafeNorm = f.strafeFast / env.smoothedDelta;
   }
   if (mMove != 0.0f) {
-    const float v = clampRate(mMove / env.frameStep);
+    const float v = clampRate(mMove / env.smoothedDelta);
     const float boosted =
         env.moveBoostGate == 0 ? (float)(-v * kFourThirds) : -v;
     f.moveVelBoosted = boosted * (float)kHalf;
@@ -472,9 +472,9 @@ GameplayInputFrame consumeGameplayInput(
     // — 0 for pure-mouse input), not the mouse-normalized v.
     f.moveSpeed = (-moveDigital * (v >= 0.0f ? kMoveRateA : kMoveRateB)) *
                   (float)kHalf;
-    f.moveVel = f.moveVelBoosted * (float)(1.0 / (double)env.frameStep);
+    f.moveVel = f.moveVelBoosted * (float)(1.0 / (double)env.smoothedDelta);
     f.moveHalfSlow =
-        (float)(1.0 / (double)env.frameStep) * f.moveHalfFast;
+        (float)(1.0 / (double)env.smoothedDelta) * f.moveHalfFast;
   }
 
   // ---- zoom accumulator tail -----------------------------------------
@@ -483,12 +483,12 @@ GameplayInputFrame consumeGameplayInput(
   if (state.zoomAccumulator >= 1) {
     f.zoomVel = -kZoomVelSlow;
     f.zoomVelFast = -kZoomVelFast;
-    state.zoomAccumulator -= env.frameDt;
+    state.zoomAccumulator -= env.frameStep;
     if (state.zoomAccumulator < 0) state.zoomAccumulator = 0;
   } else if (state.zoomAccumulator <= -1) {
     f.zoomVel = kZoomVelSlow;
     f.zoomVelFast = kZoomVelFast;
-    state.zoomAccumulator += env.frameDt;
+    state.zoomAccumulator += env.frameStep;
     if (state.zoomAccumulator > 0) state.zoomAccumulator = 0;
   }
 

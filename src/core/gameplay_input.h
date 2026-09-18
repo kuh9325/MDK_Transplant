@@ -127,23 +127,29 @@ struct GameplayInputBindings {
 // Non-binding runtime gates the original consumer reads each frame.
 // These are game/timing state, not configuration.
 struct GameplayInputEnvironment {
-  // 0x540c80 — nonzero suppresses the x4/3 move-rate lift (the
-  // writers are player state machines; exact meaning UNKNOWN).
+  // 0x540c80 — nonzero suppresses the x4/3 move-rate lift. Phase 5B
+  // resolved the writer: FUN_00466740 sets it while airborne with
+  // the jump key held (the jump-sustain/floaty-gravity gate), and it
+  // doubles as the horizontal move-rate lift gate. Still modeled as
+  // an environment input until the vertical consumer is native.
   std::uint32_t moveBoostGate = 0;
   // 0x5414e4 — debug flag (written by the debug-command dispatcher);
   // together with Tab level it overrides the move rates to 20/3 x.
   std::uint32_t debugMoveBoost = 0;
-  // 0x49b6f0 / 0x49b6e8 — the frame step divisor for mouse-axis
-  // rates and the raw frame delta that decays the zoom accumulator.
-  float frameStep = 100.0f / 3.0f;
-  std::int32_t frameDt = 33;
+  // 0x49b6f0 — the smoothed frame-units factor (EMA ~= 1.0 at the
+  // nominal 30 Hz; FrontendTimingState::smoothed). OBSERVED as the
+  // FDIV divisor in the FUN_00406f14 mouse-rate path.
+  float smoothedDelta = 1.0f;
+  // 0x49b6e8 — the integer frame step (1..4; FrontendTimingState::
+  // frameStep). The zoom accumulator decays by this count per frame.
+  std::int32_t frameStep = 1;
 };
 
 // Consumer-internal state that persists across frames — the original
 // globals, carried here so the function stays deterministic.
 struct GameplayInputState {
   std::int32_t zoomAccumulator = 0;   // 0x4ce760 — clamped [-8,8],
-                                      // decays by frameDt toward 0
+                                      // decays by frameStep toward 0
   std::uint32_t setTurboLatch = 0;    // 0x540d38 — STURB edge toggles
   std::uint32_t sniperButtonLatch = 0;// 0x499f50 — previous button
                                       // snipe-request (synthetic edge)

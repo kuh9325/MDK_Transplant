@@ -586,6 +586,102 @@ void SdlHost::pushGameplaySelfTestStep(std::uint64_t frameIndex) {
   }
 }
 
+void SdlHost::pushMotionSelfTestStep(std::uint64_t frameIndex) {
+  constexpr std::uint64_t lastStep = 23;
+  if (!window_ || frameIndex > lastStep) {
+    return;
+  }
+  const SDL_WindowID id = SDL_GetWindowID(window_);
+  SDL_Event e{};
+  auto key = [&](SDL_Scancode sc, SDL_Keycode kc, bool down) {
+    e = SDL_Event{};
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.key.windowID = id;
+    e.key.which = kSelftestKeyboardID;
+    e.key.scancode = sc;
+    e.key.key = kc;
+    e.key.down = down;
+    SDL_PushEvent(&e);
+  };
+  auto motion = [&](float xrel, float yrel) {
+    e = SDL_Event{};
+    e.type = SDL_EVENT_MOUSE_MOTION;
+    e.motion.windowID = id;
+    e.motion.which = kSelftestMouseID;
+    e.motion.xrel = xrel;
+    e.motion.yrel = yrel;
+    SDL_PushEvent(&e);
+  };
+  switch (frameIndex) {
+  case 0:  // LEFT down: the turn level begins (consumed this frame,
+         // integrated next frame — the original's one-frame order).
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, true);
+    break;
+  case 1:
+  case 2:  // held.
+    break;
+  case 3:  // release.
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, false);
+    break;
+  case 4:  // idle.
+    break;
+  case 5:  // UP down: move-forward level.
+    key(SDL_SCANCODE_UP, SDLK_UP, true);
+    break;
+  case 6:
+  case 7:  // held.
+    break;
+  case 8:  // UP+LEFT down: move + turn together.
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, true);
+    break;
+  case 9:  // held.
+    break;
+  case 10: // release both.
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, false);
+    key(SDL_SCANCODE_UP, SDLK_UP, false);
+    break;
+  case 11: // X+LEFT down: the SideStep modifier reroutes the turn
+         // level into strafe -1.
+    key(SDL_SCANCODE_X, SDLK_X, true);
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, true);
+    break;
+  case 12: // held.
+    break;
+  case 13: // release both.
+    key(SDL_SCANCODE_X, SDLK_X, false);
+    key(SDL_SCANCODE_LEFT, SDLK_LEFT, false);
+    break;
+  case 14: // LSHIFT+UP down: turbo move.
+    key(SDL_SCANCODE_LSHIFT, SDLK_LSHIFT, true);
+    key(SDL_SCANCODE_UP, SDLK_UP, true);
+    break;
+  case 15:
+  case 16: // held.
+    break;
+  case 17: // release both.
+    key(SDL_SCANCODE_LSHIFT, SDLK_LSHIFT, false);
+    key(SDL_SCANCODE_UP, SDLK_UP, false);
+    break;
+  case 18: // 'W' down: unbound under factory settings; a custom
+         // KeyUp='W' makes it drive forward.
+    key(SDL_SCANCODE_W, SDLK_W, true);
+    break;
+  case 19: // held.
+    break;
+  case 20: // release.
+    key(SDL_SCANCODE_W, SDLK_W, false);
+    break;
+  case 21: // dx +320: the axis-0 letter (factory 'A' -> mouse turn).
+    motion(320.0f, 0.0f);
+    break;
+  case 22:
+  case 23: // idle: the mouse impulse integrates then decays.
+    break;
+  default:
+    break;
+  }
+}
+
 void SdlHost::windowSizeInPixels(int* w, int* h) const {
   if (window_) {
     SDL_GetWindowSizeInPixels(window_, w, h);

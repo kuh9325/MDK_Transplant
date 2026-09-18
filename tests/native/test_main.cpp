@@ -25,6 +25,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/options_menu.h"
+#include "core/player_motion.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
@@ -8343,7 +8344,7 @@ void test_keyboard_render() {
 
 // Phase 5A — gameplay input consumption. Values below are
 // hand-computed from the reconstructed FUN_00419370 + FUN_00406f14
-// semantics (OBSERVED constants; frameStep = 100/3, frameDt = 33
+// semantics (OBSERVED constants; smoothedDelta = 1.0, frameStep = 1
 // unless the test overrides them).
 void test_gameplay_input() {
   auto setBit = [](std::array<std::uint32_t, 4>& bm, int code) {
@@ -8357,7 +8358,7 @@ void test_gameplay_input() {
     setBit(r.keyLevel, code);
   };
   mdk::GameplayInputBindings bind;      // factory block + W set
-  mdk::GameplayInputEnvironment env;    // step 33.333, dt 33
+  mdk::GameplayInputEnvironment env;    // smoothed 1.0, step 1
   mdk::GameplayInputState st;
 
   // ---- key level/edge queries + right-modifier fold ---------------
@@ -8557,7 +8558,7 @@ void test_gameplay_input() {
     // ZoomIn level charged the accumulator (+1, then the tail emits
     // the zoom velocities and the dt decay drains the charge).
     CHECK(near(f.zoomVel, -0.01) && near(f.zoomVelFast, -0.15));
-    CHECK(f.zoomAccumulator == 0);  // 1 - 33 -> clamped to 0
+    CHECK(f.zoomAccumulator == 0);  // 1 - 1 -> 0
   }
 
   // ---- mouse axis letters A..F --------------------------------------
@@ -8566,10 +8567,10 @@ void test_gameplay_input() {
     mdk::RawGameplayInput r;
     r.mouseDx = 320;   // 'A' on axis 0 -> turn
     auto f = mdk::consumeGameplayInput(r, bind, env, st);
-    // 320/16 = 20; /33.333 -> 0.6
-    CHECK(near(f.turnFast, 0.6 * 6.0 * 0.5));
-    CHECK(near(f.turnNorm, 0.6 * 6.0 * 0.5 / (100.0 / 3.0)));
-    CHECK(near(f.yaw4, 0.6 * 4.0) && near(f.yawNeg45, -27.0, 1e-4));
+    // 320/16 = 20; /1.0 -> clamp(20,+-4) = 4
+    CHECK(near(f.turnFast, 4.0 * 6.0 * 0.5));
+    CHECK(near(f.turnNorm, 4.0 * 6.0 * 0.5 / 1.0));
+    CHECK(near(f.yaw4, 4.0 * 4.0) && near(f.yawNeg45, -180.0, 1e-4));
     CHECK(f.mouseTurnActive == 1);
   }
   st = {};
@@ -8577,23 +8578,23 @@ void test_gameplay_input() {
     mdk::RawGameplayInput r;
     r.mouseDy = 160;   // 'B' on axis 1 -> move
     auto f = mdk::consumeGameplayInput(r, bind, env, st);
-    // 160/16 = 10; /33.333 -> 0.3
-    CHECK(near(f.moveVelBoosted, -0.3 * (4.0 / 3.0) * 0.5));
-    CHECK(near(f.moveVel, -0.3 * (4.0 / 3.0) * 0.5 * (3.0 / 100.0)));
-    CHECK(near(f.moveHalfFast, -0.3 * (2.0 / 3.0) * 0.25));
-    CHECK(near(f.move5pct, -0.3 * 0.05 * 0.5));
+    // 160/16 = 10; /1.0 -> clamp(10) = 4
+    CHECK(near(f.moveVelBoosted, -4.0 * (4.0 / 3.0) * 0.5));
+    CHECK(near(f.moveVel, -4.0 * (4.0 / 3.0) * 0.5 / 1.0));
+    CHECK(near(f.moveHalfFast, -4.0 * (2.0 / 3.0) * 0.25));
+    CHECK(near(f.move5pct, -4.0 * 0.05 * 0.5));
     CHECK(f.moveSpeed == 0.0f);   // digital move is 0 (mouse-only)
   }
   st = {};
   {
     mdk::RawGameplayInput r;
     r.mouseDz = 120;   // 'G' on axis 2 -> sniper zoom charge
-    env.frameDt = 0;   // isolate the accumulator from decay
+    env.frameStep = 0;  // isolate the accumulator from decay
     auto f = mdk::consumeGameplayInput(r, bind, env, st);
     // rint(120/50 + 1) = rint(3.4) = 3 ticks, sign + for 'G'.
     CHECK(f.zoomAccumulator == 3);
     CHECK(near(f.zoomVel, -0.01));
-    env.frameDt = 33;
+    env.frameStep = 1;
   }
   st = {};
   {
@@ -8603,32 +8604,32 @@ void test_gameplay_input() {
     mdk::RawGameplayInput r;
     r.mouseDx = 320;
     auto f = mdk::consumeGameplayInput(r, b2, env, st);
-    CHECK(near(f.turnFast, -1.8));
+    CHECK(near(f.turnFast, -12.0));
     // 'E' negates move — the letter position selects the axis, so
     // 'E' on axis 0 consumes mouseDx (not dy).
     b2.mouseAxesMap = "EBG";
     r.mouseDx = 160;
     f = mdk::consumeGameplayInput(r, b2, env, st);
-    CHECK(near(f.moveVelBoosted, 0.3 * (4.0 / 3.0) * 0.5));
+    CHECK(near(f.moveVelBoosted, 4.0 * (4.0 / 3.0) * 0.5));
     // 'C' routes to strafe; 'F' negates it.
     b2.mouseAxesMap = "C0G";
     r = {};
     r.mouseDx = 160;
     st = {};
     f = mdk::consumeGameplayInput(r, b2, env, st);
-    CHECK(near(f.strafeFast, 0.3 * (4.0 / 3.0) * 0.5));
+    CHECK(near(f.strafeFast, 4.0 * (4.0 / 3.0) * 0.5));
     b2.mouseAxesMap = "F0G";
     f = mdk::consumeGameplayInput(r, b2, env, st);
-    CHECK(near(f.strafeFast, -0.3 * (4.0 / 3.0) * 0.5));
+    CHECK(near(f.strafeFast, -4.0 * (4.0 / 3.0) * 0.5));
     // 'H' is negative sniper zoom.
     b2.mouseAxesMap = "ABH";
     r = {};
     r.mouseDz = 120;
-    env.frameDt = 0;
+    env.frameStep = 0;
     st = {};
     f = mdk::consumeGameplayInput(r, b2, env, st);
     CHECK(f.zoomAccumulator == -3);
-    env.frameDt = 33;
+    env.frameStep = 1;
     // '0' is inert.
     b2.mouseAxesMap = "0BG";
     r = {};
@@ -8651,13 +8652,13 @@ void test_gameplay_input() {
     // the scan — the 'H' on axis 2 never processes dz.
     mdk::GameplayInputBindings b2 = bind;
     b2.mouseAxesMap = "G0H";
-    env.frameDt = 0;
+    env.frameStep = 0;
     mdk::RawGameplayInput r;
     r.mouseDx = 50;    // rint(50/16+1) = 4
     r.mouseDz = 50;    // would be -4 if 'H' were reached
     auto f = mdk::consumeGameplayInput(r, b2, env, st);
     CHECK(f.zoomAccumulator == 4);
-    env.frameDt = 33;
+    env.frameStep = 1;
   }
 
   // ---- scale math / deadzone / clamp --------------------------------
@@ -8672,10 +8673,10 @@ void test_gameplay_input() {
     CHECK(f.mouseTurnActive == 1);
     mdk::GameplayInputBindings b2 = bind;
     b2.mouseScale = {8.0f, 16.0f, 50.0f};
-    r.mouseDx = 80;    // 80/8 = 10 -> v 0.3
+    r.mouseDx = 80;    // 80/8 = 10 -> clamp(10/1.0) = 4 -> *3 = 12
     f = mdk::consumeGameplayInput(r, b2, env, st);
-    CHECK(near(f.turnFast, 0.9));
-    // dt-normalized clamp: 16000/8 = 2000 -> /33.333 = 60 -> clamp 4
+    CHECK(near(f.turnFast, 12.0));
+    // smoothed-delta clamp: 16000/8 = 2000 -> /1.0 = 2000 -> clamp 4
     r.mouseDx = 16000;
     f = mdk::consumeGameplayInput(r, b2, env, st);
     CHECK(near(f.turnFast, 4.0 * 6.0 * 0.5));
@@ -8756,11 +8757,11 @@ void test_gameplay_input() {
   {
     mdk::RawGameplayInput r;
     hold(r, 105);          // kbd LEFT: turn -1
-    r.mouseDx = 320;       // mouse 'A': normalized 0.6
+    r.mouseDx = 320;       // mouse 'A': clamp(20/1.0) = 4
     auto f = mdk::consumeGameplayInput(r, bind, env, st);
     // OBSERVED priority: a nonzero mouse axis OVERWRITES the shared
-    // rate fields (0.6*3 = 1.8, not the keyboard -4).
-    CHECK(near(f.turnFast, 1.8));
+    // rate fields (4*3 = 12, not the keyboard -4).
+    CHECK(near(f.turnFast, 12.0));
     CHECK(f.mouseTurnActive == 1);
     // Keyboard-only fields (item/action flags) are unaffected.
     r.mouseDx = 0;
@@ -8788,11 +8789,11 @@ void test_gameplay_input() {
     CHECK(f.sniperPulse != 0);
     r = {};
     r.mouseDx = 8;               // 'H' sits on axis 0 -> consumes dx;
-    env.frameDt = 0;             // 8/8=1 -> +1 bias -> 2 ticks, '-'
+    env.frameStep = 0;           // 8/8=1 -> +1 bias -> 2 ticks, '-'
     st = {};
     f = mdk::consumeGameplayInput(r, b2, env, st);
     CHECK(f.zoomAccumulator == -2);        // 'H' route honored
-    env.frameDt = 33;
+    env.frameStep = 1;
     CHECK(f.mouseYReversed);               // pass-through flag set
     r = {};
     r.mouseButtons = 0x1;
@@ -8818,6 +8819,428 @@ void test_gameplay_input() {
     press(r, 2);
     f = mdk::consumeGameplayInput(r, b2, env, st);
     CHECK(f.weaponSelect[0] != 0 && f.weaponSelect[9] == 0);
+  }
+}
+
+// Phase 5B — FUN_00465228 horizontal movement integration. Golden
+// values are hand-computed from the disassembly: f0-scaled accel
+// (move/strafe), raw-add accel (kbd turn), decel rates 4/45|8/45
+// (bound 2/3) and 0.55|1.6 (bound 4), airborne scales 0.75/0.75,
+// disp = move*(cos,sin) + strafe*(sin,-cos), yaw -= turnVel*f0.
+void test_player_motion() {
+  auto setBit = [](std::array<std::uint32_t, 4>& bm, int code) {
+    bm[code >> 5] |= 1u << (code & 31);
+  };
+  auto hold = [&](mdk::RawGameplayInput& r, int code) {
+    setBit(r.keyLevel, code);
+  };
+  mdk::GameplayInputBindings bind;
+  mdk::GameplayInputEnvironment genv;
+  mdk::PlayerMotionEnvironment env;   // smoothed 1.0, airborne
+  const double kMoveRate = 1.0 / 22.5;   // 0.04444 kbd fwd accel
+  const double kMoveCap = 2.0 / 3.0;     // 0.66667 kbd fwd cap
+
+  // ---- idle --------------------------------------------------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(mdk::RawGameplayInput{}, bind, genv, gst);
+    const mdk::PlayerMotionOutput out =
+        mdk::integratePlayerMotion(f, env, s);
+    CHECK(out.ran && out.dispX == 0.0f && out.dispY == 0.0f &&
+          out.dispZ == 0.0f);
+    CHECK(out.eventType == 0 && out.eventMag == 0);
+    CHECK(s.moveVel == 0.0f && s.strafeVel == 0.0f && s.turnVel == 0.0f);
+    mdk::PlayerMotionState s2 = s;
+    mdk::PlayerMotionOutput o2 = out;
+    mdk::playerMotionPostStep(env, true, s2, o2);
+    CHECK(o2.eventType == 0 && s2.yawDeg == 0.0f);
+  }
+
+  // ---- turn left (kbd — raw-add channel, no f0 scaling) ------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 105);                    // KeyLeft -> turnNorm -0.9
+    auto step = [&](const mdk::RawGameplayInput& rr) {
+      const mdk::GameplayInputFrame f =
+          mdk::consumeGameplayInput(rr, bind, genv, gst);
+      mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+      mdk::playerMotionPostStep(env, true, s, o);
+      return o;
+    };
+    mdk::PlayerMotionOutput o = step(r);
+    CHECK(near(s.turnVel, -0.9));             // raw add, not x f0
+    CHECK(near(s.yawDeg, 0.9));               // yaw -= turnVel
+    CHECK(o.eventType == 4 && o.eventMag == 400);
+    o = step(r);
+    CHECK(near(s.turnVel, -1.8) && near(s.yawDeg, 2.7));
+    o = step(r);
+    CHECK(near(s.turnVel, -2.7) && near(s.yawDeg, 5.4));
+    o = step(r);
+    CHECK(near(s.turnVel, -3.6) && near(s.yawDeg, 9.0));
+    o = step(r);                              // -4.5 clamps to -4
+    CHECK(near(s.turnVel, -4.0) && near(s.yawDeg, 13.0));
+    mdk::RawGameplayInput rel;                // release -> decay 0.55
+    o = step(rel);
+    CHECK(near(s.turnVel, -3.45) && near(s.yawDeg, 16.45, 1e-4));
+    CHECK(o.eventType == 4);                  // residual still emits
+    for (int i = 0; i < 7; ++i) o = step(rel);
+    CHECK(s.turnVel == 0.0f);                 // snapped through zero
+    CHECK(near(s.yawDeg, 25.6, 1e-4));
+    CHECK(o.eventType == 0);
+  }
+
+  // ---- turn right + negative yaw wrap ------------------------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 106);                    // KeyRight -> turnNorm +0.9
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, bind, genv, gst);
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(s.turnVel, 0.9));
+    CHECK(near(s.yawDeg, 359.1, 1e-4));       // 0 - 0.9 -> +360 wrap
+    CHECK(o.eventType == 4 && o.eventMag == 400);
+  }
+
+  // ---- forward/back (f0-scaled channel) ----------------------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 103);                    // KeyUp -> moveVel +1/22.5
+    auto step = [&](const mdk::RawGameplayInput& rr) {
+      const mdk::GameplayInputFrame f =
+          mdk::consumeGameplayInput(rr, bind, genv, gst);
+      mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+      mdk::playerMotionPostStep(env, true, s, o);
+      return o;
+    };
+    mdk::PlayerMotionOutput o = step(r);
+    CHECK(near(s.moveVel, kMoveRate));
+    CHECK(near(o.dispX, kMoveRate) && o.dispY == 0.0f);
+    CHECK(o.eventType == 6 && o.eventMag == 600);
+    CHECK(o.moveConsumed && o.forwardIntent && s.moveDirLatch == 1);
+    for (int i = 0; i < 14; ++i) o = step(r); // 15 * 1/22.5 = 2/3 cap
+    CHECK(near(s.moveVel, kMoveCap, 1e-4));
+    CHECK(near(o.dispX, kMoveCap, 1e-4));
+    mdk::RawGameplayInput rel;                // release -> decel 0.0667
+    o = step(rel);
+    CHECK(near(s.moveVel, kMoveCap - 0.75 * (4.0 / 45.0), 1e-4));
+    for (int i = 0; i < 10; ++i) o = step(rel);
+    CHECK(s.moveVel == 0.0f);
+    // Backward: negative channel + latch -1.
+    mdk::RawGameplayInput rb;
+    hold(rb, 108);                            // KeyDown
+    gst = {};
+    s = {};
+    o = step(rb);
+    CHECK(near(s.moveVel, -kMoveRate));
+    CHECK(near(o.dispX, -kMoveRate) && s.moveDirLatch == -1);
+    CHECK(o.eventMag == 600 && !o.forwardIntent);
+  }
+
+  // ---- strafe left/right + basis sign ------------------------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 51);                     // KeySideL -> strafe -1/22.5
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, bind, genv, gst);
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    // Airborne accel scale 0.75: rate = -1/22.5 * 0.75 = -1/30.
+    CHECK(near(s.strafeVel, -kMoveRate * 0.75));
+    CHECK(o.dispX == 0.0f);                   // sin(0) term
+    CHECK(near(o.dispY, kMoveRate * 0.75));   // -(-1/30)*cos(0)
+    CHECK(o.eventType == 5 && o.eventMag == 500);
+    // At yaw 90 the same left strafe goes -X.
+    s = {};
+    s.yawDeg = 90.0f;
+    o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(o.dispX, -kMoveRate * 0.75, 1e-4));
+    CHECK(std::fabs(o.dispY) < 1e-5f);
+    // KeySideR -> +strafe -> -Y at yaw 0.
+    mdk::GameplayInputState gst2;
+    mdk::PlayerMotionState s2;
+    mdk::RawGameplayInput r2;
+    hold(r2, 52);
+    const mdk::GameplayInputFrame f2 =
+        mdk::consumeGameplayInput(r2, bind, genv, gst2);
+    o = mdk::integratePlayerMotion(f2, env, s2);
+    CHECK(near(s2.strafeVel, kMoveRate * 0.75));
+    CHECK(near(o.dispY, -kMoveRate * 0.75));
+  }
+
+  // ---- diagonal: additive, not normalized ---------------------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 103);                    // fwd + strafe-left
+    hold(r, 51);
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, bind, genv, gst);
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(o.dispX, kMoveRate));
+    CHECK(near(o.dispY, kMoveRate * 0.75));
+    // |d| > |move| alone — OBSERVED additive compose, no normalize.
+    CHECK(std::sqrt(o.dispX * o.dispX + o.dispY * o.dispY) >
+          (float)kMoveRate);
+    CHECK(o.eventType == 6 && o.eventMag == 600);  // move priority
+  }
+
+  // ---- forward + turn: bank drive + move event wins -----------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 103);
+    hold(r, 105);                    // turnNorm -0.9 * moveVel +1/22.5
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, bind, genv, gst);
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(s.bank, -0.25));               // drive < 0 -> bank down
+    CHECK(o.bankEvent);
+    CHECK(o.eventType == 6 && o.eventMag == 600);
+    mdk::playerMotionPostStep(env, true, s, o);
+    CHECK(near(s.bank, -0.25));               // no decay while driven
+    mdk::PlayerMotionState s2 = s;
+    mdk::PlayerMotionOutput o2 = o;
+    o2.bankEvent = false;                     // decay engages
+    mdk::playerMotionPostStep(env, true, s2, o2);
+    // rate = |bank|*0.35 = 0.0875 (inside [0.05,2.5]).
+    CHECK(near(s2.bank, -0.25 + 0.0875, 1e-5));
+  }
+
+  // ---- turbo forward -------------------------------------------------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 42);                     // KeyTurbo
+    hold(r, 103);
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, bind, genv, gst);
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    // Turbo rates feed the same channels — no extra scaling here.
+    CHECK(near(s.moveVel, 4.0 / 45.0));
+    CHECK(near(o.dispX, 4.0 / 45.0));
+    for (int i = 0; i < 14; ++i)
+      o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(s.moveVel, 4.0 / 3.0, 1e-4));  // the x4/3-lifted cap
+    CHECK(near(o.dispX, 4.0 / 3.0, 1e-4));
+    // Beyond-bound decay: 4/3 > 2/3 -> rOut 0.75*8/45.
+    o = mdk::integratePlayerMotion(mdk::GameplayInputFrame{}, env, s);
+    CHECK(near(s.moveVel, 4.0 / 3.0 - 0.75 * (8.0 / 45.0), 1e-4));
+    CHECK(o.eventMag == 600);   // residual still emits the move event
+  }
+
+  // ---- mouse-derived turn (f0-scaled helper, instant impulse) -------
+  {
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    r.mouseDx = 320;                 // 'A': clamp(20) = 4 -> rates 12
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, bind, genv, gst);
+    CHECK(f.mouseTurnActive == 1);
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(s.turnVel, 12.0));             // f0-scaled: 12 in one hit
+    CHECK(near(s.yawDeg, 348.0));
+    mdk::RawGameplayInput idle;
+    const mdk::GameplayInputFrame f2 =
+        mdk::consumeGameplayInput(idle, bind, genv, gst);
+    o = mdk::integratePlayerMotion(f2, env, s);
+    CHECK(near(s.turnVel, 10.4));             // beyond bound: -1.6
+    CHECK(near(s.yawDeg, 337.6, 1e-4));
+  }
+
+  // ---- one-frame input ordering --------------------------------------
+  {
+    // The integrator consumes the PREVIOUS frame's control block —
+    // the original runs FUN_00465228 before FUN_00406f14.
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::GameplayInputFrame prev{};            // zero block pre-merge
+    mdk::RawGameplayInput r;
+    hold(r, 103);
+    // Frame 0: input arrives but motion still sees the zero block.
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(prev, env, s);
+    CHECK(s.moveVel == 0.0f && o.dispX == 0.0f);
+    prev = mdk::consumeGameplayInput(r, bind, genv, gst);
+    // Frame 1: now the held key drives the channel.
+    o = mdk::integratePlayerMotion(prev, env, s);
+    CHECK(near(s.moveVel, kMoveRate) && near(o.dispX, kMoveRate));
+  }
+
+  // ---- event quirk: residual strafe + fresh turn -> turn wins -------
+  {
+    mdk::PlayerMotionState s;
+    mdk::GameplayInputFrame fs;
+    fs.strafeNorm = -4.0f / 45.0f;             // turbo strafe input
+    fs.strafeFast = -4.0f / 3.0f;
+    mdk::PlayerMotionOutput o;
+    for (int i = 0; i < 20; ++i)               // charge to the -4/3 cap
+      o = mdk::integratePlayerMotion(fs, env, s);
+    CHECK(near(s.strafeVel, -4.0 / 3.0, 1e-4));
+    // Strafe input gone: channel residual emits 5/500, then the fresh
+    // turn overwrites (no strafe INPUT this frame -> bit1 clear).
+    mdk::GameplayInputFrame ft;
+    ft.turnNorm = -0.9f;
+    ft.turnFast = -4.0f;
+    o = mdk::integratePlayerMotion(ft, env, s);
+    CHECK(near(s.strafeVel, -4.0 / 3.0 + 0.75 * (8.0 / 45.0), 1e-4));
+    CHECK(o.eventType == 4 && o.eventMag == 400);  // overwritten
+    // With strafe input live the event stays strafe (bit1 suppresses).
+    s = {};
+    for (int i = 0; i < 20; ++i)
+      o = mdk::integratePlayerMotion(fs, env, s);
+    mdk::GameplayInputFrame both = fs;
+    both.turnNorm = -0.9f;
+    both.turnFast = -4.0f;
+    o = mdk::integratePlayerMotion(both, env, s);
+    CHECK(o.eventType == 5 && o.eventMag == 500);
+  }
+
+  // ---- gates: turnLock / moveBlocked / masterGate / conveyor --------
+  {
+    mdk::PlayerMotionState s;
+    s.turnLock = 1;
+    mdk::GameplayInputFrame f;
+    f.turnNorm = -0.9f;
+    f.turnFast = -4.0f;
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(s.turnVel == 0.0f && s.turnLock == 1);  // persists on < 0
+    f.turnNorm = 0.9f;
+    f.turnFast = 4.0f;
+    o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(s.turnVel == 0.0f && s.turnLock == 0);  // releases, still no
+    o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(s.turnVel, 0.9));                  // now applies
+    // Lock 2 mirrors for positive input.
+    s = {};
+    s.turnLock = 2;
+    o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(s.turnVel == 0.0f && s.turnLock == 2);
+    s.turnLock = 3;                               // out-of-range resets
+    o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(s.turnLock == 0);
+    // moveBlocked skips the move input (decay still runs).
+    s = {};
+    mdk::PlayerMotionEnvironment be = env;
+    be.moveBlocked = true;
+    mdk::GameplayInputFrame fm;
+    fm.moveVel = 1.0f / 22.5f;
+    fm.moveVelBoosted = 2.0f / 3.0f;
+    o = mdk::integratePlayerMotion(fm, be, s);
+    CHECK(s.moveVel == 0.0f && !o.moveConsumed && !o.forwardIntent);
+    // masterGate: immediate RET — nothing runs.
+    be = env;
+    be.masterGate = true;
+    s = {};
+    s.bank = 1.0f;
+    o = mdk::integratePlayerMotion(fm, be, s);
+    CHECK(!o.ran && s.moveVel == 0.0f && o.eventType == 0);
+    mdk::playerMotionPostStep(be, true, s, o);   // tail decay still runs
+    CHECK(near(s.bank, 1.0 - 0.35));
+    // conveyor applies only on ground contact.
+    s = {};
+    mdk::PlayerMotionEnvironment ce = env;
+    ce.groundContact = true;
+    ce.conveyorX = 0.5f;
+    ce.conveyorZ = 0.25f;
+    o = mdk::integratePlayerMotion(fm, ce, s);
+    CHECK(near(o.dispX, 0.5 + kMoveRate) && near(o.dispZ, 0.25));
+    s = {};
+    ce.groundContact = false;
+    o = mdk::integratePlayerMotion(fm, ce, s);
+    CHECK(near(o.dispX, kMoveRate) && o.dispZ == 0.0f);
+    // Ground-contact accel scales: contact 1.0, low-friction 0.5.
+    s = {};
+    mdk::GameplayInputFrame fst;
+    fst.strafeNorm = -1.0f / 22.5f;
+    fst.strafeFast = -2.0f / 3.0f;
+    mdk::PlayerMotionEnvironment ge = env;
+    ge.groundContact = true;
+    o = mdk::integratePlayerMotion(fst, ge, s);
+    CHECK(near(s.strafeVel, -kMoveRate));
+    s = {};
+    ge.lowFriction = true;
+    o = mdk::integratePlayerMotion(fst, ge, s);
+    CHECK(near(s.strafeVel, -kMoveRate * 0.5));
+  }
+
+  // ---- post rules: event cancel + air-charge drain ------------------
+  {
+    mdk::PlayerMotionState s;
+    mdk::GameplayInputFrame f;
+    f.moveVel = 1.0f / 22.5f;
+    f.moveVelBoosted = 2.0f / 3.0f;
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(o.eventMag == 600);
+    mdk::playerMotionPostStep(env, false, s, o);  // position unchanged
+    CHECK(o.eventMag == 0 && o.eventType == 0);
+    o = mdk::integratePlayerMotion(f, env, s);
+    mdk::playerMotionPostStep(env, true, s, o);
+    CHECK(o.eventMag == 600);
+    // air-charge drain: only while moving forward, floor 20, cap 60.
+    s = {};
+    s.airCharge = 30.0f;
+    o = mdk::integratePlayerMotion(f, env, s);
+    mdk::playerMotionPostStep(env, true, s, o);
+    CHECK(near(s.airCharge, 28.25));
+    s.airCharge = 100.0f;
+    o = mdk::integratePlayerMotion(f, env, s);
+    mdk::playerMotionPostStep(env, true, s, o);
+    CHECK(near(s.airCharge, 58.25));              // 100->60->58.25
+    s.airCharge = 20.0f;
+    o = mdk::integratePlayerMotion(f, env, s);
+    mdk::playerMotionPostStep(env, true, s, o);
+    CHECK(s.airCharge == 20.0f);                  // floor: no drain
+    // Backward motion does not drain.
+    mdk::GameplayInputFrame fb;
+    fb.moveVel = -1.0f / 22.5f;
+    fb.moveVelBoosted = -2.0f / 3.0f;
+    s = {};
+    s.airCharge = 40.0f;
+    o = mdk::integratePlayerMotion(fb, env, s);
+    mdk::playerMotionPostStep(env, true, s, o);
+    CHECK(s.airCharge == 40.0f);
+  }
+
+  // ---- settings-derived bindings -> motion ---------------------------
+  {
+    // Custom key + custom mouse map reach the channels through the
+    // real settings->bindings->consume seam (no bypass).
+    mdk::FrontendSettings fs;
+    fs.keyUp = 17;                               // 'W' drives KeyUp
+    fs.mouseWAxesMap = "C0G";                    // dx -> strafe
+    fs.mouseWXScale = 8.0f;
+    const mdk::GameplayInputBindings b2 =
+        mdk::gameplayBindingsFromSettings(fs);
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionState s;
+    mdk::RawGameplayInput r;
+    hold(r, 17);                                 // 'W'
+    const mdk::GameplayInputFrame f =
+        mdk::consumeGameplayInput(r, b2, genv, gst);
+    CHECK(near(f.moveVel, kMoveRate));
+    mdk::PlayerMotionOutput o = mdk::integratePlayerMotion(f, env, s);
+    CHECK(near(s.moveVel, kMoveRate) && near(o.dispX, kMoveRate));
+    mdk::RawGameplayInput rm;
+    rm.mouseDx = 160;                            // 160/8 = 20 -> clamp 4
+    const mdk::GameplayInputFrame fm =
+        mdk::consumeGameplayInput(rm, b2, genv, gst);
+    CHECK(near(fm.strafeFast, 4.0 * (4.0 / 3.0) * 0.5));
+    s = {};
+    o = mdk::integratePlayerMotion(fm, env, s);
+    // Airborne accel scale 0.75: vel += strafeNorm*0.75*f0.
+    CHECK(near(s.strafeVel, fm.strafeNorm * 0.75f, 1e-3));
   }
 }
 
@@ -8861,6 +9284,7 @@ int main() {
   test_mode_dispatch();
   test_input_state();
   test_gameplay_input();
+  test_player_motion();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

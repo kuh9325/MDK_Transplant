@@ -57,6 +57,11 @@ void usage(const char* argv0) {
       "                        keyboard/mouse script and verify the\n"
       "                        semantic gameplay-input frame each frame\n"
       "                        (optionally honors --settings-file)\n"
+      "  --selftest-player-motion\n"
+      "                        inject the deterministic Phase 5B\n"
+      "                        movement script and verify the local\n"
+      "                        player-motion state each frame\n"
+      "                        (optionally honors --settings-file)\n"
       "  --no-relative-mouse   do not capture the mouse\n"
       "  -h, --help            this message\n",
       argv0);

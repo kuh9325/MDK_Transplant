@@ -21,6 +21,7 @@
 #include "core/log.h"
 #include "core/mode_dispatch.h"
 #include "core/options_menu.h"
+#include "core/player_motion.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
@@ -1391,17 +1392,13 @@ static bool verifyGameplaySelfTestFrame(
       break;
     }
     if (ax0 == 'A') {
-      // 320/scale deadzoned, /33.333 clamped, *6*0.5.
+      // 320/scale deadzoned, /smoothedDelta(=1) clamped +-4, *6*0.5.
       const float v = 320.0f / b.mouseScale[0];
-      const float cl = v > 4.0f * (100.0f / 3.0f)
-                           ? 4.0f
-                           : v < -4.0f * (100.0f / 3.0f)
-                                 ? -4.0f
-                                 : v / (100.0f / 3.0f);
+      const float cl = v > 4.0f ? 4.0f : v < -4.0f ? -4.0f : v;
       expect(f.mouseTurnActive == 1, "mouseA: flag not set");
       expect(near(f.turnFast, cl * 6.0f * 0.5f),
              "mouseA: turnFast wrong");
-      expect(near(f.turnNorm, f.turnFast / (100.0f / 3.0f)),
+      expect(near(f.turnNorm, f.turnFast / 1.0f),
              "mouseA: turnNorm wrong");
       expect(f.mouseDx == 320, "mouseA: raw dx not preserved");
     } else if (ax0 == 'D') {
@@ -1418,12 +1415,14 @@ static bool verifyGameplaySelfTestFrame(
           120.0 / (double)b.mouseScale[2] + 1.0;
       const int ticks = (int)std::nearbyint(scaled);
       const int signedTicks = ax2 == 'G' ? ticks : -ticks;
-      // The acc charges then decays by frameDt in the same frame —
-      // post-frame it is back to 0 with the velocities emitted.
+      // The acc charges then decays by frameStep(=1) in the same
+      // frame — post-frame |acc| is one step closer to 0.
       const float expectVel =
           signedTicks >= 1 ? -0.01f : signedTicks <= -1 ? 0.01f : 0.0f;
+      const int expectAcc = signedTicks > 0 ? signedTicks - 1
+                            : signedTicks < 0 ? signedTicks + 1 : 0;
       expect(near(f.zoomVel, expectVel), "zoom: vel wrong");
-      expect(f.zoomAccumulator == 0, "zoom: acc not decayed");
+      expect(f.zoomAccumulator == expectAcc, "zoom: acc not decayed");
     }
     break;
   }
@@ -1454,6 +1453,269 @@ static bool verifyGameplaySelfTestFrame(
   return ok;
 }
 
+// --selftest-player-motion (Phase 5B) per-frame verifier. The SDL
+// script is fixed (SdlHost::pushMotionSelfTestStep); expectations
+// are hand-computed from the reconstructed FUN_00465228 semantics
+// (smoothed=1.0, airborne scales 0.75/0.75) and adapted to the
+// loaded bindings the same way the Phase 5A verifier adapts.
+// `out`/`s` come from integrating the PREVIOUS frame's control
+// block — the original's one-frame input order.
+static bool verifyMotionSelfTestFrame(
+    std::uint64_t i, const PlayerMotionOutput& out,
+    const PlayerMotionState& s, const GameplayInputBindings& b) {
+  bool ok = true;
+  auto expect = [&](bool cond, const char* what) {
+    if (!cond) {
+      log::warn(kTag, "motion selftest f%llu: %s",
+                (unsigned long long)i, what);
+      ok = false;
+    }
+  };
+  auto near = [](float a, double e, double eps = 0.002) {
+    return std::fabs((double)a - e) < eps;
+  };
+  auto wrap = [](double y) {
+    while (y >= 360.0) y -= 360.0;
+    while (y < 0.0) y += 360.0;
+    return y;
+  };
+  // Which configured action the injected keys reach under the
+  // loaded bindings (internal codes: LEFT 105, UP 103, X 45,
+  // LSHIFT 42, 'W' 17).
+  const bool leftIsTurn = (b.keys[0] == 105);
+  const bool upIsMove = (b.keys[2] == 103);
+  const bool xIsSide = (b.keys[5] == 45);
+  const bool shiftIsTurbo = (b.keys[9] == 42);
+  const bool wIsMove = (b.keys[2] == 17);
+  const char ax0 = b.mouseAxesMap.size() > 0 ? b.mouseAxesMap[0] : '0';
+  // Mouse axis-0 products under the loaded scale: v = 320/scale,
+  // deadzoned then clamped +-4.
+  const float mv = 320.0f / b.mouseScale[0];
+  const float mcl = std::fabs(mv) < 0.2f ? 0.0f
+                  : mv > 4.0f ? 4.0f
+                  : mv < -4.0f ? -4.0f : mv;
+  const double kR = 1.0 / 22.5;   // keyboard move/strafe rate
+  switch (i) {
+  case 0:  // LEFT down consumed but the integrator still sees the
+         // zero block — OBSERVED one-frame input latency.
+    expect(out.ran, "f0: integrator did not run");
+    expect(out.dispX == 0.0f && out.dispY == 0.0f &&
+               out.eventType == 0 && s.turnVel == 0.0f &&
+               s.moveVel == 0.0f,
+           "f0: motion before the merge (latency broken)");
+    break;
+  case 1:
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -0.9), "f1: turnVel != -0.9");
+      expect(near(s.yawDeg, 0.9), "f1: yaw != +0.9");
+      expect(out.eventType == 4 && out.eventMag == 400,
+             "f1: turn event missing");
+    } else {
+      expect(s.turnVel == 0.0f, "f1: unbound LEFT still turned");
+    }
+    break;
+  case 2:
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -1.8) && near(s.yawDeg, 2.7),
+             "f2: turn ramp wrong");
+    }
+    break;
+  case 3:  // release this frame — the HELD control still integrates.
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -2.7) && near(s.yawDeg, 5.4),
+             "f3: release landed a frame early");
+    }
+    break;
+  case 4:
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -2.15) && near(s.yawDeg, 7.55),
+             "f4: turn decay wrong");
+      expect(out.eventType == 4, "f4: residual event lost");
+    }
+    break;
+  case 5:
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -1.6) && near(s.yawDeg, 9.15),
+             "f5: decay wrong");
+    }
+    expect(s.moveVel == 0.0f, "f5: move started before its frame");
+    break;
+  case 6:
+    if (upIsMove) {
+      expect(near(s.moveVel, kR), "f6: moveVel != 1/22.5");
+      expect(out.moveConsumed && out.forwardIntent &&
+                 s.moveDirLatch == 1,
+             "f6: move flags wrong");
+      expect(out.eventType == 6 && out.eventMag == 600,
+             "f6: move event missing");
+    }
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -1.05) && near(s.yawDeg, 10.2),
+             "f6: turn decay wrong");
+    }
+    break;
+  case 7:
+    if (upIsMove) expect(near(s.moveVel, 2.0 * kR), "f7: ramp wrong");
+    if (leftIsTurn) expect(near(s.turnVel, -0.5), "f7: decay wrong");
+    break;
+  case 8:  // integrate still sees move-only (UP+LEFT lands next).
+    if (upIsMove) expect(near(s.moveVel, 3.0 * kR), "f8: ramp wrong");
+    if (leftIsTurn) expect(s.turnVel == 0.0f, "f8: turn not snapped");
+    break;
+  case 9:  // move+turn together: the bank drive engages.
+    if (upIsMove && leftIsTurn) {
+      expect(near(s.moveVel, 4.0 * kR) && near(s.turnVel, -0.9),
+             "f9: combined ramp wrong");
+      expect(near(s.bank, -0.25) && out.bankEvent,
+             "f9: bank drive wrong");
+      expect(out.eventType == 6 && out.eventMag == 600,
+             "f9: move event lost");
+      expect(near(s.yawDeg, 11.6), "f9: yaw wrong");
+    }
+    break;
+  case 10:
+    if (upIsMove && leftIsTurn) {
+      expect(near(s.moveVel, 5.0 * kR) && near(s.turnVel, -1.8) &&
+                 near(s.bank, -0.5) && near(s.yawDeg, 13.4),
+             "f10: combined state wrong");
+    }
+    break;
+  case 11: // idle control — every channel decays, bank unwinds.
+    if (upIsMove) expect(near(s.moveVel, 5.0 * kR - 4.0 / 45.0),
+                         "f11: move decay wrong");
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -1.25) && near(s.yawDeg, 14.65),
+             "f11: turn decay wrong");
+    }
+    if (upIsMove && leftIsTurn) {
+      expect(near(s.bank, -0.325), "f11: bank decay wrong");
+    }
+    break;
+  case 12: // SIDE+LEFT: strafe channel while move/turn still decay.
+    if (xIsSide && leftIsTurn) {
+      expect(near(s.strafeVel, -kR), "f12: strafe rate wrong");
+      expect(near(s.turnVel, -0.7) && near(s.yawDeg, 15.35),
+             "f12: turn decay wrong");
+    }
+    if (upIsMove) {
+      expect(near(s.moveVel, kR), "f12: move decay wrong");
+      expect(out.eventType == 6 && out.eventMag == 600,
+             "f12: move residual lost its event");
+    }
+    break;
+  case 13: // strafe input still integrates (latency); the move
+         // residual snaps to zero so the strafe event surfaces.
+    if (xIsSide && leftIsTurn) {
+      expect(near(s.strafeVel, -2.0 * kR), "f13: strafe ramp wrong");
+      if (upIsMove) {
+        expect(out.eventType == 5 && out.eventMag == 500,
+               "f13: strafe event wrong");
+      }
+    }
+    if (leftIsTurn) {
+      expect(near(s.turnVel, -0.15) && near(s.yawDeg, 15.5),
+             "f13: turn decay wrong");
+    }
+    break;
+  case 14: // idle control: the last residuals snap to zero.
+    expect(s.moveVel == 0.0f && s.strafeVel == 0.0f &&
+               s.turnVel == 0.0f,
+           "f14: residual channel not cleared");
+    expect(out.eventType == 0, "f14: phantom event");
+    break;
+  case 15:
+    if (upIsMove && shiftIsTurbo) {
+      expect(near(s.moveVel, 4.0 / 45.0), "f15: turbo rate wrong");
+      expect(out.eventType == 6 && out.eventMag == 600,
+             "f15: turbo move event missing");
+    }
+    break;
+  case 16:
+    if (upIsMove && shiftIsTurbo)
+      expect(near(s.moveVel, 8.0 / 45.0), "f16: turbo ramp wrong");
+    break;
+  case 17:
+    if (upIsMove && shiftIsTurbo)
+      expect(near(s.moveVel, 12.0 / 45.0), "f17: turbo ramp wrong");
+    break;
+  case 18: // 'W' consumed this frame; motion still decays (latency).
+    if (upIsMove && shiftIsTurbo)
+      expect(near(s.moveVel, 12.0 / 45.0 - 4.0 / 45.0),
+             "f18: turbo decay wrong");
+    break;
+  case 19:
+    if (wIsMove) {  // 'W' bound: the move channel starts from 0 —
+                    // an unbound UP arrow left no turbo residual.
+      expect(near(s.moveVel, kR), "f19: custom KeyUp did not move");
+      expect(out.eventType == 6 && out.eventMag == 600,
+             "f19: custom move event missing");
+    } else if (upIsMove && shiftIsTurbo) {
+      expect(near(s.moveVel, 12.0 / 45.0 - 8.0 / 45.0),
+             "f19: decay wrong");
+    }
+    break;
+  case 20:
+    if (wIsMove) {
+      expect(near(s.moveVel, 2.0 * kR),
+             "f20: custom KeyUp ramp wrong");
+    } else if (upIsMove && shiftIsTurbo) {
+      expect(s.moveVel == 0.0f, "f20: channel not cleared");
+    }
+    break;
+  case 21: // mouse dx consumed; motion integrates the 'W' release
+         // frame's idle control — the move channel snaps to zero.
+    if (wIsMove) {
+      expect(s.moveVel == 0.0f, "f21: post-release decay wrong");
+    } else if (upIsMove && shiftIsTurbo) {
+      expect(s.moveVel == 0.0f, "f21: channel not cleared");
+    }
+    break;
+  case 22: { // the mouse axis-0 impulse integrates.
+    if (!b.mouseOn) {
+      expect(s.turnVel == 0.0f && s.strafeVel == 0.0f,
+             "f22: mouse axes not gated");
+      break;
+    }
+    if (ax0 == 'A') {
+      // turn impulse: rate=cap=3*v, f0-scaled -> saturates at once.
+      const double yb = leftIsTurn ? 15.5 : 0.0;
+      expect(near(s.turnVel, 3.0 * mcl), "f22: mouse turn wrong");
+      expect(near(s.yawDeg, wrap(yb - 3.0 * mcl), 0.01),
+             "f22: yaw impulse wrong");
+      // The move channel has fully decayed by now, so the turn
+      // impulse owns the event word.
+      expect(out.eventType == 4 && out.eventMag == 400,
+             "f22: turn event missing");
+    } else if (ax0 == 'C') {
+      // strafe impulse: rate = v*4/3*0.5*1.0 (grounded scale).
+      expect(near(s.strafeVel, mcl * (4.0 / 3.0) * 0.5),
+             "f22: mouse strafe wrong");
+      expect(out.eventType == 5 && out.eventMag == 500,
+             "f22: strafe event missing");
+    } else {
+      expect(s.turnVel == 0.0f && s.strafeVel == 0.0f,
+             "f22: inert axis letter produced motion");
+    }
+    break;
+  }
+  case 23: { // impulse decays — rOut beyond the +-4 bound, rIn in.
+    if (b.mouseOn && ax0 == 'A') {
+      const double tv22 = 3.0 * mcl;
+      const double tv23 = tv22 > 4.0 ? tv22 - 1.6
+                          : tv22 - 0.55 < 0.0 ? 0.0 : tv22 - 0.55;
+      expect(near(s.turnVel, tv23), "f23: decay wrong");
+      const double yb = leftIsTurn ? 15.5 : 0.0;
+      expect(near(s.yawDeg, wrap(yb - tv22 - tv23), 0.01),
+             "f23: yaw wrong");
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  return ok;
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -1474,11 +1736,21 @@ int Application::run() {
   log::info(kTag, "presenter: %s", presenter->name());
 
   ModeDispatcher dispatcher;
-  if (cfg_.selftestGameplayInput && cfg_.interactiveFrontend) {
-    // The diagnostic owns the raw-key machine per frame; combining it
-    // with the front-end would double-poll the latch/edge bitmaps.
-    log::error(kTag, "--selftest-gameplay-input is standalone — do "
+  if ((cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion) &&
+      cfg_.interactiveFrontend) {
+    // The diagnostics own the raw-key machine per frame; combining
+    // them with the front-end would double-poll the latch/edge
+    // bitmaps.
+    log::error(kTag, "input/motion selftests are standalone — do "
                      "not combine with --interactive-frontend");
+    return 2;
+  }
+  if (cfg_.selftestGameplayInput && cfg_.selftestPlayerMotion) {
+    // Each selftest injects its own script; running both would
+    // interleave two incompatible event streams.
+    log::error(kTag, "--selftest-gameplay-input and "
+                     "--selftest-player-motion are mutually "
+                     "exclusive");
     return 2;
   }
   host.onQuit = [&] { dispatcher.requestQuit(); };
@@ -1892,8 +2164,16 @@ int Application::run() {
   // No front-end or original data required.
   GameplayInputBindings gameplayBindings;
   GameplayInputState gameplayState;
-  const GameplayInputEnvironment gameplayEnv;  // 100/3 step, dt 33
-  if (cfg_.selftestGameplayInput) {
+  const GameplayInputEnvironment gameplayEnv;  // smoothed 1.0, step 1
+  // Phase 5B: the motion integrator consumes the PREVIOUS frame's
+  // control block (the original's FUN_00465228 -> FUN_00406f14
+  // one-frame order). The environment models grounded normal
+  // movement: contact present, standard friction, no gates.
+  GameplayInputFrame prevGameplayFrame;
+  PlayerMotionState motionState;
+  PlayerMotionEnvironment motionEnv;
+  motionEnv.groundContact = true;
+  if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion) {
     host.isolateHardwareInputForSelftest();
     FrontendSettings gs;
     if (cfg_.settingsFile) {
@@ -1920,8 +2200,9 @@ int Application::run() {
     }
     gameplayBindings = gameplayBindingsFromSettings(gs);
     if (cfg_.frames == 0) {
-      // Script: 17 steps (0..16) — quit right after the settle frame.
-      cfg_.frames = 17;
+      // Scripts: 17 gameplay steps (0..16) / 24 motion steps
+      // (0..23) — quit right after the last injected step.
+      cfg_.frames = cfg_.selftestPlayerMotion ? 24 : 17;
     }
   }
 
@@ -1937,6 +2218,10 @@ int Application::run() {
       // Phase 5A script: one deterministic keyboard/mouse step.
       host.pushGameplaySelfTestStep(clock.frameCount());
     }
+    if (cfg_.selftestPlayerMotion) {
+      // Phase 5B script: one deterministic movement step.
+      host.pushMotionSelfTestStep(clock.frameCount());
+    }
     host.pumpEvents(input);
     const FrameTick t = clock.tick();
 
@@ -1946,7 +2231,7 @@ int Application::run() {
                 selftestOk_ ? "PASS" : "FAIL");
     }
 
-    if (cfg_.selftestGameplayInput) {
+    if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion) {
       // frontendInputFromSdl runs the raw-key machine (level/latch/
       // prev — the FUN_0046b688 analogue) and the DIMOUSESTATE-domain
       // mouse fields; the bindings snapshot carries the loaded
@@ -1962,9 +2247,27 @@ int Application::run() {
       raw.mouseButtons = gi.mouseButtons;
       const GameplayInputFrame gf = consumeGameplayInput(
           raw, gameplayBindings, gameplayEnv, gameplayState);
-      selftestOk_ =
-          verifyGameplaySelfTestFrame(t.index, gf, gameplayBindings) &&
-          selftestOk_;
+      if (cfg_.selftestGameplayInput) {
+        selftestOk_ =
+            verifyGameplaySelfTestFrame(t.index, gf,
+                                        gameplayBindings) &&
+            selftestOk_;
+      }
+      if (cfg_.selftestPlayerMotion) {
+        // Original frame order (FUN_00463608): the movement branch
+        // integrates the PREVIOUS frame's merged control block; the
+        // merge for the next frame happens afterwards. The collision
+        // seam is open — no world, so the displacement is always
+        // "applied" (positionChanged = true).
+        PlayerMotionOutput mo = integratePlayerMotion(
+            prevGameplayFrame, motionEnv, motionState);
+        playerMotionPostStep(motionEnv, true, motionState, mo);
+        selftestOk_ =
+            verifyMotionSelfTestFrame(t.index, mo, motionState,
+                                      gameplayBindings) &&
+            selftestOk_;
+        prevGameplayFrame = gf;
+      }
     }
 
     dispatcher.dispatch({t.index, t.dtSeconds, t.elapsedSeconds});
@@ -2775,6 +3078,14 @@ int Application::run() {
   host.shutdown();
   log::info(kTag, "shutdown complete after %llu frames",
             static_cast<unsigned long long>(clock.frameCount()));
+  if (cfg_.selftestGameplayInput) {
+    log::info(kTag, "gameplay-input selftest: %s",
+              selftestOk_ ? "PASS" : "FAIL");
+  }
+  if (cfg_.selftestPlayerMotion) {
+    log::info(kTag, "player-motion selftest: %s",
+              selftestOk_ ? "PASS" : "FAIL");
+  }
   return selftestOk_ ? 0 : 3;
 }
 
@@ -2854,6 +3165,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.selftest = true;
     } else if (!std::strcmp(a, "--selftest-gameplay-input")) {
       cfg.selftestGameplayInput = true;
+    } else if (!std::strcmp(a, "--selftest-player-motion")) {
+      cfg.selftestPlayerMotion = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {
       cfg.relativeMouse = false;
     } else {

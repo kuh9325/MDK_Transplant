@@ -100,6 +100,37 @@ public:
   //  16: settle frame           -> all controls idle
   void pushGameplaySelfTestStep(std::uint64_t frameIndex);
 
+  // --selftest-player-motion (Phase 5B) deterministic 24-step
+  // movement script (indices 0..23). Injected through the same SDL
+  // seam; the app consumes the raw input, then integrates the
+  // PREVIOUS frame's control block (the original FUN_00465228 ->
+  // FUN_00406f14 one-frame order):
+  //   0: LEFT down               -> turn -1 (motion starts next frame)
+  //   1: held                    -> turn channel -0.9, yaw +0.9
+  //   2: held                    -> -1.8
+  //   3: LEFT up                 -> still integrates the turn (-2.7)
+  //   4: idle                    -> decay begins (-2.15)
+  //   5: UP down                 -> decay continues; move queued
+  //   6: held                    -> move +1/22.5 while turn decays
+  //   7: held                    -> move 2/22.5
+  //   8: UP+LEFT down            -> move 3/22.5, turn snaps 0
+  //   9: held                    -> move+turn: bank drive engages
+  //  10: release all             -> held-frame products integrate
+  //  11: X+LEFT down             -> decays run (idle control)
+  //  12: held                    -> SideStep strafe -1
+  //  13: release                 -> strafe continues (latency)
+  //  14: TURBO+UP down           -> decays finish (idle control)
+  //  15: held                    -> turbo move +4/45
+  //  16: held                    -> turbo move 2x
+  //  17: release                 -> turbo move 3x (latency)
+  //  18: 'W' down                -> custom-candidate move key
+  //  19: held                    -> bound? move resumes : decays
+  //  20: 'W' up                  -> release
+  //  21: motion dx +320          -> axis-0 letter (factory 'A' turn)
+  //  22: idle                    -> mouse impulse integrates
+  //  23: idle                    -> impulse decays
+  void pushMotionSelfTestStep(std::uint64_t frameIndex);
+
   // Install an SDL event filter that drops all REAL key/button/motion
   // events — injected events carry a sentinel device ID and pass
   // through. Without this the physical mouse/keyboard race the script

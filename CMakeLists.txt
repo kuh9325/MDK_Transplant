@@ -49,6 +49,7 @@ add_library(mdk_core STATIC
   src/core/mti_directory.cpp
   src/core/mto_directory.cpp
   src/core/options_menu.cpp
+  src/core/player_motion.cpp
   src/core/sni_directory.cpp
   src/core/sound_menu.cpp
   src/core/stream_context.cpp

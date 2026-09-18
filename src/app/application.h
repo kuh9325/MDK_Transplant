@@ -99,6 +99,13 @@ struct AppConfig {
   // consumeGameplayInput's semantic output each frame. Exits
   // non-zero on mismatch. No front-end or --data-path required.
   bool selftestGameplayInput = false;
+  // --selftest-player-motion (Phase 5B): the same deterministic
+  // injection route, but each frame additionally runs
+  // integratePlayerMotion on the PREVIOUS frame's control block
+  // (the original FUN_00465228 -> FUN_00406f14 order) and verifies
+  // the resulting PlayerMotionState/output. Exits non-zero on
+  // mismatch. No front-end or --data-path required.
+  bool selftestPlayerMotion = false;
   bool relativeMouse = true;  // --no-relative-mouse to disable
   int windowWidth = 960;      // logical points; drawable may be 2x (Retina)
   int windowHeight = 720;     // 4:3 default

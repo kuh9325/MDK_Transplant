@@ -159,6 +159,21 @@ Boundary notes (intentions, not commitments):
 > SDL/frontend/renderer/filesystem dependency and produces no world
 > mutation. `--selftest-gameplay-input` drives it through the real
 > SDL→DIK→internal seam. See `GAMEPLAY_RECONSTRUCTION.md`.
+>
+> Phase 5B adds the first downstream consumer of that control block:
+> `player_motion.*` reproduces `FUN_00465228` — the normal-movement
+> integrator — as three persistent velocity channels (move/strafe/
+> turn) driven by the merged rate products through the observed
+> accel/decay helpers, a yaw-basis displacement compose, the
+> bank/roll accumulator, the movement event word, and the post-step
+> rules (blocked-move event cancel, air-charge drain, bank tail
+> decay). It stops exactly at the `FUN_004630d4` collision seam —
+> the displacement is an output the caller applies — and it
+> reproduces the original's one-frame input order (the integrator
+> consumes the previous frame's merged block). Jump/vertical, slide,
+> mantle, camera, sniper, and the item/fire tail remain documented
+> boundaries. `--selftest-player-motion` verifies the full
+> SDL→bindings→consume→integrate route under loaded settings.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

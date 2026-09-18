@@ -109,6 +109,16 @@ keyboard/mouse script through the same SDL→DIK→internal seam into
 per frame — bindings from `--settings-file` when supplied, else
 factory; standalone (not combinable with `--interactive-frontend`),
 exits RC 3 on mismatch.
+`--selftest-player-motion` (Phase 5B) runs a deterministic 24-step
+keyboard/mouse movement script through the same seam, then
+integrates each PREVIOUS frame's `GameplayInputFrame` through
+`integratePlayerMotion` — reproducing the original's one-frame
+control-block latency — and verifies the resulting velocity
+channels/yaw/bank/event word per frame under the loaded bindings.
+The collision seam is open (no world); the diagnostic models
+grounded normal movement. Mutually exclusive with
+`--selftest-gameplay-input` and `--interactive-frontend` (RC 2);
+exits RC 3 on mismatch.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -169,6 +179,17 @@ src/
                                   SideStep reroute, zoom accumulator,
                                   OBSERVED rate constants) — no
                                   world mutation (5A)
+             player_motion.*    — Phase 5B first movement consumer:
+                                  FUN_00465228 normal-movement
+                                  integrator — three persistent
+                                  velocity channels (move/strafe/
+                                  turn), yaw-basis displacement,
+                                  bank/roll accumulator, movement
+                                  event word, conveyor seam, and the
+                                  post-step rules (event cancel,
+                                  air-charge drain, bank tail
+                                  decay) — stops at the FUN_004630d4
+                                  collision seam (5B)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +
