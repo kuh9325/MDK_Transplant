@@ -682,6 +682,36 @@ void SdlHost::pushMotionSelfTestStep(std::uint64_t frameIndex) {
   }
 }
 
+void SdlHost::pushVerticalSelfTestStep(std::uint64_t frameIndex) {
+  constexpr std::uint64_t lastStep = 55;
+  if (!window_ || frameIndex > lastStep) {
+    return;
+  }
+  const SDL_WindowID id = SDL_GetWindowID(window_);
+  auto key = [&](bool down) {
+    SDL_Event e{};
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.key.windowID = id;
+    e.key.which = kSelftestKeyboardID;
+    e.key.scancode = SDL_SCANCODE_LALT;
+    e.key.key = SDLK_LALT;
+    e.key.down = down;
+    SDL_PushEvent(&e);
+  };
+  switch (frameIndex) {
+  case 0:  // LALT down: factory KeyJump=56; the level is consumed this
+         // frame and drives the jump machine next frame (latency).
+    key(true);
+    break;
+  case 31: // LALT up: release mid-float — the sustain-end event and
+         // normal gravity land next frame.
+    key(false);
+    break;
+  default: // held (1..30) / idle (32..55).
+    break;
+  }
+}
+
 void SdlHost::windowSizeInPixels(int* w, int* h) const {
   if (window_) {
     SDL_GetWindowSizeInPixels(window_, w, h);

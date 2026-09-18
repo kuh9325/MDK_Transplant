@@ -131,6 +131,22 @@ public:
   //  23: idle                    -> impulse decays
   void pushMotionSelfTestStep(std::uint64_t frameIndex);
 
+  // --selftest-player-vertical (Phase 5C) deterministic jump script.
+  // A single LALT (factory KeyJump=56) hold/release drives the whole
+  // vertical arc through the same one-frame-latency seam; the app
+  // then feeds a flat-floor synthetic collision result:
+  //   0: LALT down   -> jump flag set (integrates next frame)
+  //   1: held        -> jump initiation (impulse 40, charge 6)
+  //   2..7: held     -> hold charge drains to 0
+  //   8..27: held    -> rise, apex, accelerating fall
+  //  28: held        -> air-charge seeds + sustain gravity engages
+  //  29..31: held    -> float at the -8 sustain bound
+  //  31: LALT up     -> release queued
+  //  32: idle        -> sustain-end event 700, normal gravity resumes
+  //  33..: idle      -> accelerate, pre-land clamp, soft landing,
+  //                     c84 clears the frame AFTER landing (quirk)
+  void pushVerticalSelfTestStep(std::uint64_t frameIndex);
+
   // Install an SDL event filter that drops all REAL key/button/motion
   // events — injected events carry a sentinel device ID and pass
   // through. Without this the physical mouse/keyboard race the script

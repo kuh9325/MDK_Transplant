@@ -559,3 +559,218 @@ remaining step toward a standing player before collision
 (`FUN_004630d4`) becomes unavoidable. Camera (`FUN_00464624`) is a
 viable alternative if input-only verification matters more.
 Not started in Phase 5B.
+
+# Phase 5C — jump sustain and vertical gravity
+
+Phase 5C reconstructs **one bounded layer**: `FUN_00466740` (the
+jump-state machine) and `FUN_00467180` (vertical gravity +
+collision-result handling), stopping at a semantic `FUN_004630d4`
+seam. No world, collision geometry, mantle internals, or level
+logic is reconstructed.
+
+## 24. Exact per-frame call order (OBSERVED)
+
+Inside `FUN_00463608`'s `cac<800` branch, `FUN_00465228` runs the
+horizontal integrator and then, in its own tail, the vertical
+chain — all still consuming the PREVIOUS frame's merged control
+block (the 5B one-frame latency applies to the jump flag too):
+
+```
+FUN_00465228 tail:
+  FUN_004630d4(ctx, mode, dx, dy, 0, r=0.75, ...)   horizontal move
+  FUN_0046603c()                                   slide helper (deferred)
+  FUN_00466740(in_EAX)                             jump-state machine
+    FUN_00467180()                                 vertical gravity +
+      FUN_004630d4(ctx, mode, 0, 0, dispZ, r=0.5, 0, &e50)
+    FUN_00466aec()                                 mantle (deferred)
+    DAT_00540e28 = 0                               bounce flag clear
+dispatcher tail:
+  FUN_00464d10 / FUN_00406f14 / FUN_0047d20a       (next-frame merge)
+```
+
+Two `FUN_004630d4` calls per frame — horizontal (XY, radius 0.75)
+then vertical (Z only, radius 0.5, with the `0x540e50` normal
+out-param). `DAT_00540e24 != 0` (slide mode) makes `FUN_00466740`
+early-out straight to `FUN_00467180`: no jump machine, no mantle
+call, no `e28` clear.
+
+## 25. Vertical-state block
+
+| Addr | Native field | Writers | Meaning (evidence) |
+|---|---|---|---|
+| `0x540c78` | `vertVel` | jump impulse, release cut, slope assist, gravity, collision paths | vertical velocity, +Z up (OBSERVED) |
+| `0x540c7c` | `vertSkip` | `FUN_00466aec` (=2 on mantle), `FUN_00461954` | skip gate: `FUN_00467180` RETs while nonzero (OBSERVED) |
+| `0x540c80` | `jumpSustain` | `FUN_00466740` rewrite, `FUN_00467180` in-volume force | sustain flag: feeds 5A `moveBoostGate` + the sustain-gravity branch (OBSERVED) |
+| `0x540c84` | `PlayerMotionState::airCharge` | `FUN_00466740` seed/accumulate/reset, `FUN_00467180` volume drain, hard-land/silent landing clear, 5B forward-move drain | airborne charge/airtime scalar (OBSERVED readers/writers; the single shared global lives in 5B's state) |
+| `0x540c88` | `jumpActive` | `FUN_00466740` only | jump-in-progress flag; cleared once `cac` leaves 0x2be/0x2bf (OBSERVED) |
+| `0x540c8c` | `jumpHoldCharge` | `FUN_00466740` only | hold charge: init 6, drains by `frameStep`/held frame, remainder scales the release cut (OBSERVED) |
+| `0x540c90` | `jumpLatch` | `FUN_00466740`, `FUN_00467ed0`, `FUN_00461954` | jump edge latch: set on start + airborne release; re-arms while grounded+stopped+jump-low (OBSERVED) |
+| `0x540c98` | `jumpAux` | `FUN_00466740` only | aux flag, no observed readers (OBSERVED write-only) |
+| `0x540c54` | `contactFlags` | collision seam + landing paths | bit0 grounded, bit1 floor-probe valid (OBSERVED) |
+| `0x540c58` | `floorZ` | `FUN_00435eec` inside the collision call | probed floor height (seam result) |
+| `0x540c60/64` | `blocker0/1` | `FUN_00435eec` | probe blocker objects (opaque tokens) |
+| `0x540dc0/dc4/dc8` | `moveBlocker0/1/Flag` | `FUN_00467180` pre-land-no-contact path, `FUN_00461878` | movement blockers consumed by the horizontal layer |
+| `0x540e28` | `bounceFlag` | collision internals/siblings; cleared in `FUN_00466740` tail | bounce/trampoline state (OBSERVED readers) |
+| `0x540e4c` | `contactObj` | `FUN_004630d4` EAX | last contact token; feeds 5B `groundContact` |
+| `0x540e50..58` | `contactNormal[3]` | `FUN_004630d4` out-param | contact normal (4th dword also copied — only xyz consumed) |
+| `0x540cbc` | `eventIdle` | `FUN_00466740`, `FUN_00467180`, landing | event-channel counter; jump gate `<7`, reset on 7 when sustain/land events fire (OBSERVED) |
+| `0x540c6c` | `env.vertEnable` | environment | vertical master enable (0 → `FUN_00467180` RETs) |
+| `0x540cac` | `env.locoState` | dispatcher | dispatched player-state code (0x2be/0x2bf jump, 0x2bd sustain, 800 slide) |
+| `0x54cb00/08` | `env.eventWordType` / `frame.eventType/eventMag` | event writers | event word type/detail (jump 7/0x2be-0x2bf, sustain 7/0x2bd, fall 7/700, hard land 8/806) |
+| `0x540cc4` | `env.moveConsumed` | `FUN_00465228` | move-consumed flag → selects 0x2be vs 0x2bf |
+| `0x541554` | `fallCounter` | `FUN_00467a00` readers; failsafe zeroes | fall-out counter |
+| `0x540d5c` | `landingAccum` | `FUN_00467180` (hard land), `FUN_00467a00` | deferred fall-damage accumulator |
+| `0x540e6c`, `0x540e72`, `0x540ca4`, `0x540d3c` | env flags | shared world state | rise-cap/land-event suppression, carrier volume gates (OBSERVED readers) |
+| `0x540e24` | `env.slideMode` | slide system | slide mode gate |
+| `0x4ce768` | `env.jumpHeld` | `FUN_00406f14` | merged jump flag (previous frame) |
+| `0x49b6e8/f0/f4` | `env.frameStep/smoothed/deltaSeconds` | timing system | frameStep 1..4, f0≈1.0, f4=1/30 constant (zero writers — true constant) |
+
+## 26. `FUN_00466740` — the jump-state machine
+
+Per-frame order inside the function (all OBSERVED at instruction
+level):
+
+1. `e24 != 0` → RET via `FUN_00467180` (slide mode).
+2. `c88` maintain: cleared when `cac` leaves 0x2be/0x2bf.
+3. `c84` update (reads the PRE-gravity velocity):
+   - `c84 == 0` (bit test, ±0 counts as zero): seed `c84 += 1.0` when
+     `c78 < -16.0` (f64 compare).
+   - `c84 != 0`: `cac != 0x2bd && c78 > 0` → reset to 0 (rising
+     outside the sustain state); else `c78 != 0` → `c84 += f0`;
+     `c78 == 0 && grounded` → 0; `c78 == 0 && !grounded` → `+= f0`.
+4. `c88 == 0` → jump-init gate: `cbc < 7 && cb00 < 7 && c78 == 0 &&
+   c54&1` then the `c90` latch (`c90 != 0`: cleared only when the
+   jump flag is low → re-arm; `c90 == 0 && flag set` → jump).
+   Initiation writes `cb08 = 0x2be` (or `0x2bf` when `cc4 != 0`),
+   `cb00 = 7`, `c88 = 1`, `c8c = 6`, `c78 = 40.0f` (literal
+   `0x42200000`), `c98 = 1`, `c90 = 1`.
+5. `c88 != 0` → held: `c8c -= frameStep` when `c8c > 0` (floored 0,
+   untouched at ≤0). Released: `c8c > 0` → `c78 -= c8c * 20 * (1/6)`
+   then `c8c = 0`; `c98 = 0` either way.
+6. `c80` rewrite every frame: `c80 = 0`, then `c84 != 0` →
+   `!held` → event `cb08=700/cb00=7` + `c98=0` + `c90=1`;
+   `held && e28 != 0` → same event, no latch writes;
+   else `cbc==7 → cbc=0`, event `0x2bd/7`, `c80 = 1`.
+7. Slope assist (`e4c != 0 && c88 == 0 && in_EAX != 0 && c84 == 0`):
+   if the contact normal (flipped when z<0) has `z > 0.25` and
+   `dot(vec, normal.xy) > 0` → `c78 = min(c78, -dot/f4)`. The
+   `in_EAX` vector's provenance in the normal path is UNKNOWN
+   (`FUN_0046603c` is `void`; the dispatcher's `cac>=800` path
+   passes 0 explicitly) — modeled as a nullable env pointer.
+8. `FUN_00467180()` → `FUN_00466aec()` (deferred) → `e28 = 0`.
+
+## 27. `FUN_00467180` — vertical gravity + collision handling
+
+1. Gates: `c6c == 0` or `c7c != 0` → RET.
+2. `c78 > 0 && e24 == 0` → rise loop: `frameStep` gravity substeps,
+   `c80` re-read per substep. Otherwise → exactly ONE `f4` step —
+   OBSERVED asymmetry: falls and slide-mode rises always integrate
+   a single step regardless of `frameStep`.
+3. Gravity (double-precision intermediates; terminal compares run
+   on the pre-truncation double via `FCOMP double`):
+   - normal: `c78 += -2.1333333` (precomputed f64 `64*f4`) per
+     substep, or `c78 -= f4*64` single-step; terminal `-250.0`
+     (clamped to f32 `-250.0f`).
+   - sustain: `c78 += -0.7111111` (`64/3*f4`) or `c78 -= f4*(64/3)`;
+     when below `-8.0`, rebound `+8.5333333` (`256*f4`); a rebound
+     landing above `-8` pins `c78 = -8.0f`. The `-8` is a bounce
+     floor, not a straight clamp — OBSERVED.
+4. Ribbon-volume check: `FUN_00412e94(player, &pos, 1, &vec)` then
+   the same query on the carrier (`ca4 != 0 && d3c == 0`). A hit:
+   the out-vector z is copied back into `c78` (the volume can
+   rewrite velocity — modeled as `ribbonVelZ`), `cbc==7 → 0`,
+   event `0x2bd/7`, `c80 = 1`, `c84 -= f0*1.75` floored by a SIGNED
+   BIT-PATTERN compare (`bits < 0x3f800000` → `1.0f` — every float
+   below 1.0 including negatives), and `disp` is REDONE single-step
+   (`c78*f4`, discarding the loop accumulation).
+5. Rise cap (non-volume path only): `cac < 800 && e6c == 0 &&
+   c78 > 40` → `c78 = 40.0f` and `disp = f4*40.0f`.
+6. Pre-land clamp: `c78 <= 0 && c54&2 && posZ+disp <= c58` →
+   `disp = c58 + 0.05 - posZ`, pre-land flag set.
+7. `c54 &= ~1` → `FUN_004630d4(ctx, mode, 0, 0, dispZ, 0.5f, 0,
+   &e50)` → `e4c = EAX`. The seam is semantic: position applied,
+   normal, floor probe (`c54&2`, `c58`, `c60/64`), blocker `+0x14a`
+   bit-7, and a bounce indication are the only consumed facts.
+8. Post-collision:
+   - `e4c == 0 && pre-land` → `c60/64` copied to `dc0/dc4`;
+     blocker `+0x14a&0x80` → `dc8 = 1`, else `dc8 != 0` →
+     `FUN_00461878(0)` (deferred release) + `dc8 = 0`; then the
+     landing path runs.
+   - `e4c == 0 && !pre-land` → if applied Z dropped,
+     `c78 = (posZ - oldZ)/f4` (realized velocity).
+   - `e24 != 0` (slide) → realized-velocity recompute on either
+     route.
+   - landing (impact `c78` at contact): `impact > 0` → CEILING:
+     `c78 = 0`, `e4c = 0`, grounded cleared — no landing state
+     (OBSERVED asymmetry). `impact < -100 && e28 == 0` → hard
+     landing: `e6c == 0` or `e72&2 == 0` → event `806/8`, `cbc = 0`,
+     deferred `FUN_00467a00(10)`, `d5c = 0`; `e6c && e72&2` →
+     silent (no event, no anti-jitter). Hard/silent paths clear
+     `c84`; the soft/bounce path does the anti-jitter check
+     (`dist² < (f4*0.35)²` → restore pre-call position) and does
+     **NOT** clear `c84` — it resets next frame via the grounded
+     branch (OBSERVED quirk). Common tail: `c78 = 0`, `c54 |= 1`;
+     `e4c == 0` → `posZ = c58` floor snap.
+   - deep-floor failsafe (all exits): `posZ <= player+0x44e - 50` →
+     `0x541554 = 0`, `c78 = 0`, `c54 |= 1`.
+
+## 28. Coordinate sign and displacement (OBSERVED)
+
++Z is up (jump impulse `+40`, gravity subtracts, floor clamp adds
+`+0.05`). `disp = c78 * f4` (or the substep accumulation on a
+multi-step rise); the displacement uses the POST-gravity velocity
+of the last step.
+
+## 29. Native boundary (`src/core/player_vertical.*`)
+
+- `integratePlayerVertical(env, ms, vs)` — `FUN_00466740` plus the
+  pre-collision half of `FUN_00467180`; returns the collision
+  request (`dispZ`, `preLand`, events, jump state).
+- `applyPlayerVerticalCollision(env, ms, vs, res, frame)` — the
+  post-collision half: seam apply, blocker refresh/release,
+  slide realized-velocity, landing/ceiling, anti-jitter, deep-floor
+  failsafe.
+- `playerVerticalPostStep(env, vs)` — the `FUN_00466aec` boundary
+  and the `e28` clear (skipped in slide mode).
+- `VerticalCollisionResult` — the semantic `FUN_004630d4` seam:
+  contact token, applied position, normal, floor probe, blockers,
+  `+0x14a` bit-7, bounce. Collision internals are NOT
+  reconstructed.
+- `PlayerMotionState::airCharge` IS `0x540c84` (single-sourced);
+  `PlayerVerticalState` carries the remaining vertical globals.
+
+## 30. Phase 5C diagnostics and tests
+
+- `--selftest-player-vertical`: deterministic 56-frame LALT
+  (KeyJump) hold/release script through the real SDL seam →
+  previous-frame control block → 5B horizontal → 5C vertical →
+  synthetic flat-floor collision. Verifies latency, impulse 40,
+  charge drain, apex, the `-16` seed, sustain `0x2bd`, the `-8`
+  bound, sustain-end `700`, soft landing, and the `c84`
+  post-landing quirk. RC 3 on mismatch; RC 2 for invalid combos
+  (mutual exclusion with the other selftests and
+  `--interactive-frontend` preserved).
+- Native tests: 3090 checks — idle/jump gates/hold/release-cut/
+  sustain/normal gravity/rise-loop vs single-step asymmetry/rise
+  cap/terminals/pre-land/no-contact realized velocity/landing
+  variants (soft/hard/bounce/silent)/ceiling/blockers/deep-floor/
+  ribbon drain+floor/slope assist/gates/the full golden arc/c80
+  coupling into 5A→5B.
+
+## 31. Deferred boundaries and remaining vertical unknowns
+
+- `FUN_004630d4` collision internals (triangle tests, arena
+  traversal, `FUN_00435eec` floor probe, `FUN_00461878` release).
+- `FUN_00466aec` mantle — its full gate is retained
+  (`moveVel>0`, `c78<=-0.25`, `c7c==0`, `cac!=800`, `cbc<9`) and
+  `c7c=2` models its skip.
+- `FUN_0046603c` slide — `e24`/`in_EAX` provenance UNKNOWN (the
+  slope-assist vector is modeled nullable).
+- `FUN_00412e94` volume system (ribbon/updraft internals, the
+  out-vector semantics).
+- `FUN_00467a00` fall damage, `FUN_00461878` blocker release,
+  `FUN_00402388`/`FUN_0040210c` event side calls — deferred
+  side-effect seams.
+- The `0x540cac` player-state enumeration is still only partially
+  mapped (0x2bc fall / 0x2bd sustain / 0x2be-0x2bf jump / 0x326
+  hard-land / 800 slide / <800 locomotion observed).

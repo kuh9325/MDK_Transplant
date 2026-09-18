@@ -26,6 +26,7 @@
 #include "core/mto_directory.h"
 #include "core/options_menu.h"
 #include "core/player_motion.h"
+#include "core/player_vertical.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
@@ -9244,6 +9245,563 @@ void test_player_motion() {
   }
 }
 
+// Phase 5C — FUN_00466740 jump-state machine + FUN_00467180
+// gravity/vertical integration, bounded by the semantic
+// FUN_004630d4 collision seam. The scripted world is a flat floor
+// at z=10 (contact iff appliedZ reaches floorZ+0.05).
+void test_player_vertical() {
+  constexpr float kF4 = 1.0f / 30.0f;          // 0.033333335
+  const double kGrav = 2.133333333333333;      // rise-loop step
+  const double kGravS = 0.7111111111111111;    // sustain step
+  const double kReb = 8.533333333333333;       // sustain rebound
+
+  mdk::PlayerVerticalEnvironment env;
+  env.deepFloorZ = -1000.0f;
+  auto idleState = [&](mdk::PlayerVerticalState& vs) {
+    vs.contactFlags = 0x3;         // grounded + floor probe valid
+    vs.posZ = 10.05f;
+    vs.floorZ = 10.0f;
+    vs.contactObj = 1;
+  };
+  // Flat-floor collision stub (deterministic seam).
+  auto collideFloor = [](mdk::PlayerVerticalState& vs, float dispZ,
+                         mdk::VerticalCollisionResult& res) {
+    res.posX = vs.posX;
+    res.posY = vs.posY;
+    res.posZ = vs.posZ + dispZ;
+    res.hasFloor = true;
+    res.floorZ = 10.0f;
+    res.contactObj = res.posZ <= 10.05f ? 1u : 0u;
+    res.normalZ = res.contactObj != 0 ? 1.0f : 0.0f;
+  };
+  auto frame = [&](mdk::PlayerVerticalEnvironment& e,
+                   mdk::PlayerMotionState& ms,
+                   mdk::PlayerVerticalState& vs,
+                   const mdk::VerticalCollisionResult& res) {
+    mdk::PlayerVerticalFrame f =
+        mdk::integratePlayerVertical(e, ms, vs);
+    if (f.collisionIssued)
+      mdk::applyPlayerVerticalCollision(e, ms, vs, res, f);
+    mdk::playerVerticalPostStep(e, vs);
+    return f;
+  };
+  auto floorFrame = [&](mdk::PlayerVerticalEnvironment& e,
+                        mdk::PlayerMotionState& ms,
+                        mdk::PlayerVerticalState& vs) {
+    mdk::PlayerVerticalFrame f =
+        mdk::integratePlayerVertical(e, ms, vs);
+    if (f.collisionIssued) {
+      mdk::VerticalCollisionResult res;
+      collideFloor(vs, f.dispZ, res);
+      mdk::applyPlayerVerticalCollision(e, ms, vs, res, f);
+    }
+    mdk::playerVerticalPostStep(e, vs);
+    return f;
+  };
+
+  // ---- grounded idle: gravity runs, pre-land clamps, lands --------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.collisionIssued && f.preLand);
+    CHECK(near(f.dispZ, 0.0, 1e-4));   // clamped to the epsilon hover
+    CHECK(f.landed && !f.ceilingHit && !f.hardLanding);
+    CHECK(vs.vertVel == 0.0f);
+    CHECK((vs.contactFlags & 0x1) != 0);          // grounded kept
+    CHECK(near(vs.posZ, 10.05));
+    CHECK(ms.airCharge == 0.0f && vs.jumpSustain == 0);
+    // Stable across frames.
+    f = floorFrame(env, ms, vs);
+    CHECK(f.landed && vs.vertVel == 0.0f && near(vs.posZ, 10.05));
+  }
+
+  // ---- jump rejected gates -----------------------------------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    env.jumpHeld = true;
+    // Airborne (no grounded bit) -> no jump.
+    vs.contactFlags = 0x2;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(!f.jumped && vs.vertVel <= 0.0f);
+    // Rising velocity -> no jump.
+    idleState(vs);
+    vs.vertVel = 3.0f;
+    f = floorFrame(env, ms, vs);
+    CHECK(!f.jumped);
+    // Event channel busy -> no jump.
+    idleState(vs);
+    vs.vertVel = 0.0f;
+    vs.eventIdle = 7;
+    f = floorFrame(env, ms, vs);
+    CHECK(!f.jumped);
+    vs.eventIdle = 0;
+    mdk::PlayerVerticalEnvironment e2 = env;
+    e2.eventWordType = 8;
+    f = floorFrame(e2, ms, vs);
+    CHECK(!f.jumped);
+    // Held latch -> no re-jump until release.
+    idleState(vs);
+    vs.vertVel = 0.0f;
+    vs.jumpLatch = 1;
+    f = floorFrame(env, ms, vs);
+    CHECK(!f.jumped && vs.jumpLatch == 1);
+    // Release while grounded re-arms the latch.
+    mdk::PlayerVerticalEnvironment e3 = env;
+    e3.jumpHeld = false;
+    f = floorFrame(e3, ms, vs);
+    CHECK(!f.jumped && vs.jumpLatch == 0);
+    env.jumpHeld = false;
+  }
+
+  // ---- jump start: impulse 40, charge 6, event picks --------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    env.jumpHeld = true;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.jumped && f.eventType == 7 && f.eventMag == 0x2be);
+    CHECK(vs.jumpActive == 1 && vs.jumpHoldCharge == 6 &&
+          vs.jumpLatch == 1 && vs.jumpAux == 1);
+    CHECK(near(vs.vertVel, 40.0 - kGrav, 1e-3));    // 37.8667
+    CHECK(near(f.dispZ, (40.0 - kGrav) * kF4, 1e-3));
+    CHECK(!f.landed);                              // rising, no contact
+    // Moving jump picks 0x2bf.
+    vs = mdk::PlayerVerticalState{};
+    idleState(vs);
+    env.moveConsumed = true;
+    f = floorFrame(env, ms, vs);
+    CHECK(f.jumped && f.eventMag == 0x2bf);
+    env.moveConsumed = false;
+    env.jumpHeld = false;
+  }
+
+  // ---- hold: charge drains 6..0 over six held frames --------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    env.jumpHeld = true;
+    env.locoState = 0x2be;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.jumped && vs.jumpHoldCharge == 6);     // start frame: no drain
+    int charges[6];
+    for (int i = 0; i < 6; ++i) {
+      f = floorFrame(env, ms, vs);
+      charges[i] = vs.jumpHoldCharge;
+    }
+    CHECK(charges[0] == 5 && charges[5] == 0);
+    // Late release (charge empty): no cut.
+    env.jumpHeld = false;
+    const float vBefore = vs.vertVel;
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, (double)vBefore - kGrav, 1e-3));
+    env.jumpHeld = false;
+    env.locoState = 0;
+  }
+
+  // ---- early release cuts the rise by charge*20/6 -----------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    env.jumpHeld = true;
+    env.locoState = 0x2be;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.jumped);
+    env.jumpHeld = false;
+    // Charge 6 -> cut 20.0: 37.867 - 20 = 17.867, then gravity.
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, 40.0 - kGrav - 20.0 - kGrav, 1e-3));
+    CHECK(vs.jumpHoldCharge == 0 && vs.jumpAux == 0);
+    env.locoState = 0;
+  }
+
+  // ---- fall: air-charge seeds at c78 < -16, sustain engages -------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    vs.contactFlags = 0x2;                  // airborne, high up
+    vs.posZ = 100.0f;
+    vs.vertVel = -17.0f;
+    vs.contactObj = 0;
+    env.jumpHeld = true;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    // Seeded this frame -> sustain engages the same frame.
+    CHECK(near(ms.airCharge, 1.0));
+    CHECK(vs.jumpSustain == 1 && f.sustain);
+    CHECK(f.eventType == 7 && f.eventMag == 0x2bd);
+    // Sustain gravity + rebound: -17 - 0.711 = -17.71 < -8
+    //   -> +8.533 = -9.18 (still < -8, no pin).
+    CHECK(near(vs.vertVel, -17.0 - kGravS + kReb, 1e-2));
+    // Next frame: charge accumulates; rebound converges to -8.
+    f = floorFrame(env, ms, vs);
+    CHECK(near(ms.airCharge, 2.0));
+    CHECK(near(vs.vertVel, -8.0, 0.01));
+    // Terminal: pinned at -8 while sustain holds (the realized-
+    // velocity recompute adds sub-epsilon noise).
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, -8.0, 0.01));
+    env.jumpHeld = false;
+  }
+
+  // ---- normal terminal fall clamps at -250 -------------------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.vertVel = -249.0f;
+    // Stationary result: isolates the integrator clamp.
+    mdk::VerticalCollisionResult res;
+    mdk::PlayerVerticalFrame f = frame(env, ms, vs, res);
+    CHECK(vs.vertVel == -250.0f);
+    f = frame(env, ms, vs, res);
+    CHECK(vs.vertVel == -250.0f);            // pinned
+    // Fall path always runs exactly one f4 step even at frameStep>1.
+    vs.vertVel = -10.0f;
+    env.frameStep = 4;
+    f = frame(env, ms, vs, res);
+    CHECK(near(vs.vertVel, -10.0 - kGrav, 1e-3));
+    env.frameStep = 1;
+  }
+
+  // ---- apex: no state, velocity crosses zero under gravity ---------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x2;
+    vs.posZ = 30.0f;                        // above the floor band
+    vs.vertVel = 1.0f;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    // Rise loop still ran (entry > 0): exits negative — already
+    // descending within the same frame. No apex state exists.
+    CHECK(near(vs.vertVel, 1.0 - kGrav, 1e-3));
+    CHECK(f.dispZ < 0.0f);
+  }
+
+  // ---- release-while-airborne: fall event + latch held -------------
+  {
+    mdk::PlayerMotionState ms;
+    ms.airCharge = 5.0f;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x2;
+    vs.posZ = 100.0f;
+    vs.vertVel = -20.0f;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.eventType == 7 && f.eventMag == 700);
+    CHECK(vs.jumpLatch == 1 && vs.jumpAux == 0 && vs.jumpSustain == 0);
+    // With bounce set: same event, no latch/aux writes.
+    vs.jumpLatch = 0;
+    vs.jumpAux = 1;
+    vs.bounceFlag = 1;
+    env.jumpHeld = true;
+    f = floorFrame(env, ms, vs);
+    CHECK(f.eventMag == 700 && vs.jumpLatch == 0 && vs.jumpAux == 1);
+    CHECK(vs.bounceFlag == 0);               // cleared by the tail
+    env.jumpHeld = false;
+  }
+
+  // ---- hard landing: event 806 vs soft / bounce / silenced ---------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    vs.contactFlags = 0x2;                  // falling
+    vs.contactObj = 0;
+    vs.vertVel = -120.0f;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.landed && f.hardLanding);
+    CHECK(f.eventType == 8 && f.eventMag == 806);
+    CHECK(vs.vertVel == 0.0f && ms.airCharge == 0.0f &&
+          (vs.contactFlags & 0x1) != 0);
+    CHECK(vs.eventIdle == 0 && vs.landingAccum == 0.0f);
+    // Bounce suppresses the event, keeps the anti-jitter path. The
+    // event word is left at the seeded 700 fall event (c84 seeded
+    // on the way down).
+    vs = mdk::PlayerVerticalState{};
+    idleState(vs);
+    vs.contactFlags = 0x2;
+    vs.vertVel = -120.0f;
+    vs.bounceFlag = 1;
+    f = floorFrame(env, ms, vs);
+    CHECK(f.landed && !f.hardLanding && f.eventMag == 700);
+    // e6c + e72 bit1 silences the event (no anti-jitter either).
+    vs = mdk::PlayerVerticalState{};
+    idleState(vs);
+    vs.contactFlags = 0x2;
+    vs.vertVel = -120.0f;
+    mdk::PlayerVerticalEnvironment e2 = env;
+    e2.sharedGateE6C = true;
+    e2.flagE72bit1 = true;
+    f = floorFrame(e2, ms, vs);
+    CHECK(f.landed && !f.hardLanding && f.eventMag == 700);
+    // e6c without e72 bit1 still emits.
+    vs = mdk::PlayerVerticalState{};
+    idleState(vs);
+    vs.contactFlags = 0x2;
+    vs.vertVel = -120.0f;
+    e2.flagE72bit1 = false;
+    f = floorFrame(e2, ms, vs);
+    CHECK(f.hardLanding && f.eventMag == 806);
+  }
+
+  // ---- ceiling: upward contact zeroes velocity, no landing ---------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x2;
+    vs.vertVel = 5.0f;
+    mdk::VerticalCollisionResult res;
+    res.contactObj = 7;
+    res.posZ = 20.0f;
+    res.normalZ = -1.0f;
+    mdk::PlayerVerticalFrame f = frame(env, ms, vs, res);
+    CHECK(f.ceilingHit && !f.landed);
+    CHECK(vs.vertVel == 0.0f && vs.contactObj == 0 &&
+          (vs.contactFlags & 0x1) == 0);
+  }
+
+  // ---- no-contact fall: realized velocity recompute ----------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x2;                  // airborne, no floor probe
+    vs.posZ = 50.0f;
+    vs.vertVel = -30.0f;
+    // Stub clamps the applied Z mid-move (invisible blocker).
+    mdk::VerticalCollisionResult res;
+    res.posZ = 49.5f;                        // moved less than requested
+    res.hasFloor = false;
+    mdk::PlayerVerticalFrame f = frame(env, ms, vs, res);
+    CHECK(!f.landed && f.realizedVelocity);
+    CHECK(near(vs.vertVel, (49.5 - 50.0) / kF4, 1e-2));  // -15
+    // Moving up or stationary: velocity kept.
+    vs.vertVel = -30.0f;
+    res.posZ = 51.0f;
+    f = frame(env, ms, vs, res);
+    CHECK(near(vs.vertVel, -30.0 - kGrav, 1e-3));
+  }
+
+  // ---- pre-land-no-contact: blocker refresh + floor snap -----------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    vs.vertVel = 0.0f;
+    mdk::VerticalCollisionResult res;
+    res.posZ = 10.05f;
+    res.hasFloor = true;
+    res.floorZ = 10.0f;
+    res.blocker0 = 0xaa;
+    res.blocker1 = 0xbb;
+    res.blocker0Flag80 = true;
+    // contactObj == 0 despite the clamp -> blocker copy + snap.
+    mdk::PlayerVerticalFrame f = frame(env, ms, vs, res);
+    CHECK(f.landed && f.blockerRefresh && !f.ceilingHit);
+    CHECK(vs.moveBlocker0 == 0xaa && vs.moveBlocker1 == 0xbb &&
+          vs.moveBlockerFlag == 1);
+    CHECK(near(vs.posZ, 10.0));              // hard snap to floorZ
+    // Next landing without the flag releases the blocker.
+    f = frame(env, ms, vs, res);
+    res.blocker0Flag80 = false;
+    f = frame(env, ms, vs, res);
+    CHECK(f.blockerReleased && vs.moveBlockerFlag == 0);
+  }
+
+  // ---- ribbon volume: forced sustain, drain floor 1.0, disp re-do --
+  {
+    mdk::PlayerMotionState ms;
+    ms.airCharge = 10.0f;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x2;
+    vs.posZ = 100.0f;
+    vs.vertVel = 10.0f;
+    mdk::PlayerVerticalEnvironment e2 = env;
+    e2.insideRibbonVolume = true;
+    e2.frameStep = 3;
+    e2.locoState = 0x2bd;               // keeps c84 while rising
+    // Frame: accumulate c84 -> 11; release latch (not held); rise
+    // loop runs NORMAL gravity (sustain was 0): 3 substeps ->
+    // 10 - 3*2.1333 = 3.6. The volume then forces sustain, drains
+    // c84 to 9.25, and REDOES the displacement single-step.
+    mdk::PlayerVerticalFrame f = floorFrame(e2, ms, vs);
+    CHECK(f.inRibbonVolume && vs.jumpSustain == 1);
+    CHECK(f.eventType == 7 && f.eventMag == 0x2bd);
+    CHECK(near(ms.airCharge, 11.0 - 1.75, 1e-3));
+    CHECK(near(vs.vertVel, 10.0 - 3.0 * kGrav, 1e-3));
+    CHECK(near(f.dispZ, (10.0 - 3.0 * kGrav) * kF4, 1e-3));
+    // Bit-pattern floor: drain below 1.0 -> exactly 1.0f.
+    ms.airCharge = 1.2f;
+    f = floorFrame(e2, ms, vs);
+    CHECK(ms.airCharge == 1.0f);
+  }
+
+  // ---- rise cap: c78 > 40 clamped (cac < 800, e6c clear) -----------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x2;
+    vs.posZ = 100.0f;
+    vs.vertVel = 60.0f;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, 40.0));
+    CHECK(near(f.dispZ, 40.0 * kF4, 1e-3));
+    // cac >= 800 suppresses the cap.
+    vs.vertVel = 60.0f;
+    env.locoState = 800;
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, 60.0 - kGrav, 1e-3));
+    env.locoState = 0;
+  }
+
+  // ---- gates: c6c master, c7c skip, e24 slide ----------------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    env.vertEnable = false;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(!f.collisionIssued && !f.landed);
+    env.vertEnable = true;
+    vs.vertSkip = 2;                         // mantle in progress
+    f = floorFrame(env, ms, vs);
+    CHECK(!f.collisionIssued);
+    vs.vertSkip = 0;
+    // Slide mode: jump machine skipped (no jump even grounded+held),
+    // integrator still runs single-step, e28 NOT cleared.
+    env.slideMode = true;
+    env.jumpHeld = true;
+    vs.bounceFlag = 1;
+    vs.vertVel = -20.0f;
+    f = floorFrame(env, ms, vs);
+    CHECK(!f.jumped && f.collisionIssued);
+    CHECK(vs.bounceFlag == 1);               // tail skipped
+    env.slideMode = false;
+    env.jumpHeld = false;
+    vs.bounceFlag = 0;
+  }
+
+  // ---- deep-floor failsafe ------------------------------------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.contactFlags = 0x0;                  // no floor probe -> no clamp
+    vs.posZ = -60.0f;
+    vs.vertVel = -40.0f;
+    vs.fallCounter = 9;
+    env.deepFloorZ = -10.0f;                 // -60 <= -10 - 50
+    mdk::VerticalCollisionResult res;
+    res.posZ = -60.0f;
+    mdk::PlayerVerticalFrame f = frame(env, ms, vs, res);
+    CHECK(f.deepFloorReset);
+    CHECK(vs.vertVel == 0.0f && vs.fallCounter == 0 &&
+          (vs.contactFlags & 0x1) != 0);
+    env.deepFloorZ = -1000.0f;
+  }
+
+  // ---- slope assist (in_EAX vector) ---------------------------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    vs.contactNormal[0] = 0.0f;
+    vs.contactNormal[1] = 0.5f;
+    vs.contactNormal[2] = 0.9f;
+    const float vec[2] = {1.0f, 0.5f};
+    mdk::PlayerVerticalEnvironment e2 = env;
+    e2.slideVec = vec;
+    e2.vertEnable = false;                 // keep the assist readable
+    mdk::PlayerVerticalFrame f = frame(e2, ms, vs,
+                                     mdk::VerticalCollisionResult{});
+    // dot = 0.25 -> vertVel = min(0, -0.25/f4) = -7.5
+    CHECK(near(vs.vertVel, -7.5, 1e-2));
+    (void)f;
+  }
+
+  // ---- complete golden sequence ------------------------------------
+  {
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    idleState(vs);
+    // f1: jump pressed (previous frame's merged flag).
+    env.jumpHeld = true;
+    mdk::PlayerVerticalFrame f = floorFrame(env, ms, vs);
+    CHECK(f.jumped && f.eventMag == 0x2be);
+    env.locoState = 0x2be;                   // dispatched
+    // Rising: decelerate 2.1333/frame; apex crossed inside the loop.
+    for (int i = 0; i < 18; ++i) f = floorFrame(env, ms, vs);
+    CHECK(vs.vertVel < 0.0f && vs.vertVel > -3.0f);  // ~-0.53
+    // Falling: accelerate -2.1333/frame (single-step path).
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, -2.6667, 1e-3));
+    for (int i = 0; i < 7; ++i) f = floorFrame(env, ms, vs);
+    CHECK(vs.vertVel < -16.0f);              // crossed the seed
+    // Seed + sustain engage next frame (still held).
+    f = floorFrame(env, ms, vs);
+    CHECK(ms.airCharge > 0.0f);
+    CHECK(vs.jumpSustain == 1 && f.eventMag == 0x2bd);
+    env.locoState = 0x2bd;
+    // Rebound brakes the fall to -8 within two frames (the
+    // realized-velocity recompute adds sub-epsilon noise).
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, -8.0, 0.01));
+    f = floorFrame(env, ms, vs);
+    CHECK(near(vs.vertVel, -8.0, 0.01));
+    // Float down at -8 until the floor (pre-land clamps -> soft land).
+    int guard = 0;
+    while (!f.landed && guard++ < 80) f = floorFrame(env, ms, vs);
+    CHECK(f.landed && !f.hardLanding);       // -8 >= -100 -> soft
+    CHECK(vs.vertVel == 0.0f && (vs.contactFlags & 0x1) != 0);
+    // OBSERVED quirk: a SOFT landing does not clear c84 — the
+    // grounded branch of next frame's update resets it instead.
+    CHECK(ms.airCharge > 0.0f);
+    f = floorFrame(env, ms, vs);
+    CHECK(ms.airCharge == 0.0f && vs.jumpSustain == 0);
+    // Still holding: no re-jump (the c90 latch).
+    CHECK(!f.jumped);
+    env.jumpHeld = false;
+    env.locoState = 0;
+  }
+
+  // ---- c80 -> 5A moveBoostGate -> 5B move channel coupling ---------
+  {
+    // Prove the seam end-to-end: vertical sets c80 -> the next
+    // consumeGameplayInput environment reports the gate -> 5B uses
+    // the resulting control block. moveBoostGate suppresses the x4/3
+    // lift in the turbo move branch, so the boosted cap differs.
+    mdk::GameplayInputState gst;
+    mdk::GameplayInputEnvironment ge;
+    ge.moveBoostGate = 0;
+    mdk::GameplayInputBindings bind;
+    mdk::RawGameplayInput r;
+    r.keyLevel[3] |= 1u << (103 & 31);       // KeyUp held
+    r.keyLevel[1] |= 1u << (42 & 31);        // KeyTurbo held
+    mdk::GameplayInputFrame f0 =
+        mdk::consumeGameplayInput(r, bind, ge, gst);
+    gst = {};
+    ge.moveBoostGate = 1;                    // as vs.jumpSustain feeds
+    mdk::GameplayInputFrame f1 =
+        mdk::consumeGameplayInput(r, bind, ge, gst);
+    CHECK(f0.moveVel != 0.0f && f1.moveVel != 0.0f);
+    CHECK(f1.moveVelBoosted != f0.moveVelBoosted);
+    CHECK(near(f0.moveVelBoosted, 4.0 / 3.0));
+    CHECK(near(f1.moveVelBoosted, 1.0));
+    mdk::PlayerMotionState ms;
+    mdk::PlayerMotionEnvironment me;
+    mdk::PlayerMotionOutput o =
+        mdk::integratePlayerMotion(f1, me, ms);
+    // First-frame increment equals the unboosted rate; the gate only
+    // lifts the cap. The ORIGINAL coupling is that the boosted cap
+    // (5A) changes with c80 (5C) — proved above.
+    CHECK(near(ms.moveVel, f1.moveVel));
+    CHECK(o.moveConsumed);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -9285,6 +9843,7 @@ int main() {
   test_input_state();
   test_gameplay_input();
   test_player_motion();
+  test_player_vertical();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

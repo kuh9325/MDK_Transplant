@@ -119,6 +119,15 @@ The collision seam is open (no world); the diagnostic models
 grounded normal movement. Mutually exclusive with
 `--selftest-gameplay-input` and `--interactive-frontend` (RC 2);
 exits RC 3 on mismatch.
+`--selftest-player-vertical` (Phase 5C) runs a deterministic
+56-frame LALT (KeyJump) hold/release script through the same seam,
+then integrates each PREVIOUS frame's control block through
+`integratePlayerVertical` — jump machine + vertical gravity — and
+feeds a synthetic flat-floor `FUN_004630d4` result into
+`applyPlayerVerticalCollision`, verifying the jump/charge/sustain/
+landing state per frame under the loaded bindings. Mutually
+exclusive with the other selftests and `--interactive-frontend`
+(RC 2); exits RC 3 on mismatch.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -190,6 +199,18 @@ src/
                                   air-charge drain, bank tail
                                   decay) — stops at the FUN_004630d4
                                   collision seam (5B)
+             player_vertical.*  — Phase 5C jump/vertical layer:
+                                  FUN_00466740 jump-state machine
+                                  (impulse 40, hold charge 6,
+                                  release cut, c90 latch, c80
+                                  sustain rewrite) + FUN_00467180
+                                  vertical gravity (frameStep rise
+                                  loop vs single-step fall, sustain
+                                  rebound, terminals -250/-8, rise
+                                  cap 40, pre-land clamp, landing/
+                                  ceiling/blocker/deep-floor
+                                  handling) — stops at the semantic
+                                  FUN_004630d4 collision seam (5C)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

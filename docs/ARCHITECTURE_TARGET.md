@@ -174,6 +174,22 @@ Boundary notes (intentions, not commitments):
 > mantle, camera, sniper, and the item/fire tail remain documented
 > boundaries. `--selftest-player-motion` verifies the full
 > SDL→bindings→consume→integrate route under loaded settings.
+>
+> Phase 5C adds the vertical sibling inside `FUN_00465228`'s tail:
+> `player_vertical.*` reproduces `FUN_00466740` — the jump-state
+> machine (impulse 40.0, hold-charge drain, release cut, the `c90`
+> edge latch, the per-frame `c80` sustain rewrite, `c84` airborne
+> charge seed/accumulate/reset, slope assist) — and `FUN_00467180`,
+> the vertical integrator (frameStep rise loop vs single-step fall,
+> normal gravity 64·f4, sustain gravity 64/3·f4 with the 256·f4
+> rebound, terminals −250/−8, rise cap 40, the pre-land floor
+> clamp). It consumes a semantic `FUN_004630d4` result — contact
+> token, applied position, normal, floor probe, blockers, bounce —
+> and handles landing/ceiling/realized-velocity/deep-floor rules.
+> Collision internals, mantle (`FUN_00466aec`), slide
+> (`FUN_0046603c`), and the volume system (`FUN_00412e94`) remain
+> documented boundaries. `--selftest-player-vertical` verifies the
+> full route under loaded settings.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

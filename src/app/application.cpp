@@ -22,6 +22,7 @@
 #include "core/mode_dispatch.h"
 #include "core/options_menu.h"
 #include "core/player_motion.h"
+#include "core/player_vertical.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
@@ -1716,6 +1717,134 @@ static bool verifyMotionSelfTestFrame(
   return ok;
 }
 
+// --selftest-player-vertical (Phase 5C) per-frame verifier. The SDL
+// script holds/releases LALT (factory KeyJump=56); expectations are
+// hand-computed from the reconstructed FUN_00466740/FUN_00467180
+// semantics (f4=1/30, normal gravity 64*f4, sustain 64/3*f4 with the
+// 256*f4 rebound, terminals -250/-8, jump impulse 40). `landedAt`
+// records the frame the synthetic floor was reached so the c84
+// post-landing quirk can be checked on the following frame.
+static bool verifyVerticalSelfTestFrame(
+    std::uint64_t i, const PlayerVerticalFrame& vf,
+    const PlayerVerticalState& vs, const PlayerMotionState& ms,
+    const GameplayInputBindings& b, std::uint64_t& landedAt) {
+  bool ok = true;
+  auto expect = [&](bool cond, const char* what) {
+    if (!cond) {
+      log::warn(kTag, "vertical selftest f%llu: %s",
+                (unsigned long long)i, what);
+      ok = false;
+    }
+  };
+  auto near = [](float a, double e, double eps = 0.05) {
+    return std::fabs((double)a - e) < eps;
+  };
+  const bool altIsJump = (b.keys[4] == 56);
+  const bool grounded = (vs.contactFlags & 0x1) != 0;
+  switch (i) {
+  case 0:  // LALT consumed this frame; the jump machine still sees
+         // the zero flag — OBSERVED one-frame input latency.
+    expect(!vf.jumped && vs.vertVel == 0.0f && grounded,
+           "f0: jump before the merge (latency broken)");
+    break;
+  case 1:
+    if (altIsJump) {
+      expect(vf.jumped && vf.eventType == 7 && vf.eventMag == 0x2be,
+             "f1: jump event/state wrong");
+      expect(vs.jumpActive == 1 && vs.jumpHoldCharge == 6 &&
+                 vs.jumpLatch == 1 && vs.jumpAux == 1,
+             "f1: jump state writes wrong");
+      expect(near(vs.vertVel, 40.0 - 2.1333333),
+             "f1: impulse+gravity wrong");
+    } else {
+      expect(!vf.jumped, "f1: unbound LALT still jumped");
+    }
+    break;
+  case 2:
+    if (altIsJump) {
+      expect(vs.jumpHoldCharge == 5, "f2: hold charge not draining");
+      expect(near(vs.vertVel, 40.0 - 2.0 * 2.1333333),
+             "f2: rise rate wrong");
+    }
+    break;
+  case 7:
+    if (altIsJump) {
+      expect(vs.jumpHoldCharge == 0, "f7: charge should be spent");
+    }
+    break;
+  case 19: // apex crossed inside the rise loop — no state flag.
+    if (altIsJump) {
+      expect(near(vs.vertVel, 40.0 - 19.0 * 2.1333333, 0.1),
+             "f19: apex velocity wrong");
+      expect(vf.dispZ < 0.0f, "f19: apex frame should descend");
+    }
+    break;
+  case 20:
+    if (altIsJump) {
+      expect(near(vs.vertVel, 40.0 - 20.0 * 2.1333333, 0.1),
+             "f20: fall single-step wrong");
+    }
+    break;
+  case 27:
+    if (altIsJump) {
+      expect(near(vs.vertVel, -17.6, 0.2), "f27: fall rate wrong");
+    }
+    break;
+  case 28: // seed + sustain engage the same frame (still held).
+    if (altIsJump) {
+      expect(near(ms.airCharge, 1.0), "f28: c84 seed wrong");
+      expect(vs.jumpSustain == 1 && vf.sustain &&
+                 vf.eventMag == 0x2bd,
+             "f28: sustain engage wrong");
+      expect(vs.vertVel < -8.0f && vs.vertVel > -10.5f,
+             "f28: sustain rebound wrong");
+    }
+    break;
+  case 29:
+  case 30:
+  case 31: // LALT up at 31 — still held on the control seam.
+    if (altIsJump) {
+      expect(near(vs.vertVel, -8.0, 0.1),
+             "f29-31: sustain bound wrong");
+      expect(vs.jumpSustain == 1, "f29-31: sustain dropped early");
+    }
+    break;
+  case 32: // release lands: sustain-end event, normal gravity resumes.
+    if (altIsJump) {
+      expect(vf.eventType == 7 && vf.eventMag == 700,
+             "f32: sustain-end event wrong");
+      expect(vs.jumpSustain == 0 && vs.jumpLatch == 1 &&
+                 vs.jumpAux == 0,
+             "f32: release writes wrong");
+      expect(near(vs.vertVel, -8.0 - 2.1333333, 0.1),
+             "f32: normal gravity did not resume");
+    }
+    break;
+  default:
+    if (altIsJump && vf.landed && landedAt == ~0ull) {
+      // Soft landing (~-34 impact): grounded, zeroed velocity, and
+      // the OBSERVED quirk — c84 is NOT cleared by the soft path.
+      expect(vs.vertVel == 0.0f && grounded && !vf.hardLanding,
+             "landing: post-state wrong");
+      expect(ms.airCharge > 0.0f,
+             "landing: soft path should keep c84 (quirk)");
+      landedAt = i;
+    } else if (altIsJump && landedAt != ~0ull &&
+               i == landedAt + 1) {
+      // The grounded branch of the c84 update resets it next frame.
+      expect(ms.airCharge == 0.0f, "landing+1: c84 not reset");
+      expect(vs.jumpSustain == 0, "landing+1: sustain stuck");
+    }
+    break;
+  }
+  if (altIsJump && i == 55) {
+    expect(landedAt != ~0ull, "f55: never landed");
+    expect(vs.vertVel == 0.0f && grounded && !vf.jumped,
+           "f55: idle unstable");
+  }
+  return ok;
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -1736,7 +1865,8 @@ int Application::run() {
   log::info(kTag, "presenter: %s", presenter->name());
 
   ModeDispatcher dispatcher;
-  if ((cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion) &&
+  if ((cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
+       cfg_.selftestPlayerVertical) &&
       cfg_.interactiveFrontend) {
     // The diagnostics own the raw-key machine per frame; combining
     // them with the front-end would double-poll the latch/edge
@@ -1745,11 +1875,12 @@ int Application::run() {
                      "not combine with --interactive-frontend");
     return 2;
   }
-  if (cfg_.selftestGameplayInput && cfg_.selftestPlayerMotion) {
-    // Each selftest injects its own script; running both would
+  if ((int)cfg_.selftestGameplayInput + (int)cfg_.selftestPlayerMotion +
+          (int)cfg_.selftestPlayerVertical >
+      1) {
+    // Each selftest injects its own script; running two would
     // interleave two incompatible event streams.
-    log::error(kTag, "--selftest-gameplay-input and "
-                     "--selftest-player-motion are mutually "
+    log::error(kTag, "gameplay/motion/vertical selftests are mutually "
                      "exclusive");
     return 2;
   }
@@ -2173,7 +2304,21 @@ int Application::run() {
   PlayerMotionState motionState;
   PlayerMotionEnvironment motionEnv;
   motionEnv.groundContact = true;
-  if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion) {
+  // Phase 5C: the vertical layer consumes the same previous-frame
+  // control block; its environment models a flat floor at z=10 with
+  // the dispatcher consuming each event word (type returns idle).
+  PlayerVerticalState verticalState;
+  PlayerVerticalEnvironment verticalEnv;
+  std::uint64_t verticalLandedAt = ~0ull;
+  if (cfg_.selftestPlayerVertical) {
+    verticalState.contactFlags = 0x3;   // grounded + floor probe
+    verticalState.posZ = 10.05f;
+    verticalState.floorZ = 10.0f;
+    verticalState.contactObj = 1;
+    verticalEnv.deepFloorZ = -1000.0f;
+  }
+  if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
+      cfg_.selftestPlayerVertical) {
     host.isolateHardwareInputForSelftest();
     FrontendSettings gs;
     if (cfg_.settingsFile) {
@@ -2201,8 +2346,10 @@ int Application::run() {
     gameplayBindings = gameplayBindingsFromSettings(gs);
     if (cfg_.frames == 0) {
       // Scripts: 17 gameplay steps (0..16) / 24 motion steps
-      // (0..23) — quit right after the last injected step.
-      cfg_.frames = cfg_.selftestPlayerMotion ? 24 : 17;
+      // (0..23) / 56 vertical steps (0..55) — quit right after the
+      // last injected step.
+      cfg_.frames = cfg_.selftestPlayerVertical ? 56
+                    : cfg_.selftestPlayerMotion ? 24 : 17;
     }
   }
 
@@ -2222,6 +2369,10 @@ int Application::run() {
       // Phase 5B script: one deterministic movement step.
       host.pushMotionSelfTestStep(clock.frameCount());
     }
+    if (cfg_.selftestPlayerVertical) {
+      // Phase 5C script: one deterministic jump hold/release step.
+      host.pushVerticalSelfTestStep(clock.frameCount());
+    }
     host.pumpEvents(input);
     const FrameTick t = clock.tick();
 
@@ -2231,7 +2382,8 @@ int Application::run() {
                 selftestOk_ ? "PASS" : "FAIL");
     }
 
-    if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion) {
+    if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
+        cfg_.selftestPlayerVertical) {
       // frontendInputFromSdl runs the raw-key machine (level/latch/
       // prev — the FUN_0046b688 analogue) and the DIMOUSESTATE-domain
       // mouse fields; the bindings snapshot carries the loaded
@@ -2265,6 +2417,51 @@ int Application::run() {
         selftestOk_ =
             verifyMotionSelfTestFrame(t.index, mo, motionState,
                                       gameplayBindings) &&
+            selftestOk_;
+        prevGameplayFrame = gf;
+      }
+      if (cfg_.selftestPlayerVertical) {
+        // The same original order continues into the vertical path:
+        // horizontal integration -> (world collision seam) ->
+        // FUN_0046603c (deferred) -> FUN_00466740 jump machine ->
+        // FUN_00467180 vertical gravity -> vertical FUN_004630d4 ->
+        // FUN_00466aec mantle (deferred). The ground-contact gate
+        // feeds the horizontal layer the way e4c does in the
+        // original.
+        motionEnv.groundContact = verticalState.contactObj != 0;
+        PlayerMotionOutput mo = integratePlayerMotion(
+            prevGameplayFrame, motionEnv, motionState);
+        playerMotionPostStep(motionEnv, true, motionState, mo);
+        verticalEnv.jumpHeld = prevGameplayFrame.jump != 0;
+        verticalEnv.moveConsumed = mo.moveConsumed;
+        PlayerVerticalFrame vf = integratePlayerVertical(
+            verticalEnv, motionState, verticalState);
+        if (vf.collisionIssued) {
+          // Synthetic flat floor at z=10: contact once the applied Z
+          // reaches the 0.05 landing hover; the probe always reports
+          // the floor. This is the semantic FUN_004630d4 seam — no
+          // collision geometry is reconstructed.
+          VerticalCollisionResult vres;
+          vres.posX = verticalState.posX;
+          vres.posY = verticalState.posY;
+          vres.posZ = verticalState.posZ + vf.dispZ;
+          vres.hasFloor = true;
+          vres.floorZ = 10.0f;
+          if (vres.posZ <= 10.05f) {
+            vres.contactObj = 1;
+            vres.normalZ = 1.0f;
+          }
+          applyPlayerVerticalCollision(verticalEnv, motionState,
+                                       verticalState, vres, vf);
+        }
+        playerVerticalPostStep(verticalEnv, verticalState);
+        // The deferred dispatcher consumes the event word and mirrors
+        // the detail code into the loco state (cac).
+        if (vf.eventMag != 0) verticalEnv.locoState = vf.eventMag;
+        selftestOk_ =
+            verifyVerticalSelfTestFrame(t.index, vf, verticalState,
+                                        motionState, gameplayBindings,
+                                        verticalLandedAt) &&
             selftestOk_;
         prevGameplayFrame = gf;
       }
@@ -3086,6 +3283,10 @@ int Application::run() {
     log::info(kTag, "player-motion selftest: %s",
               selftestOk_ ? "PASS" : "FAIL");
   }
+  if (cfg_.selftestPlayerVertical) {
+    log::info(kTag, "player-vertical selftest: %s",
+              selftestOk_ ? "PASS" : "FAIL");
+  }
   return selftestOk_ ? 0 : 3;
 }
 
@@ -3167,6 +3368,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.selftestGameplayInput = true;
     } else if (!std::strcmp(a, "--selftest-player-motion")) {
       cfg.selftestPlayerMotion = true;
+    } else if (!std::strcmp(a, "--selftest-player-vertical")) {
+      cfg.selftestPlayerVertical = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {
       cfg.relativeMouse = false;
     } else {

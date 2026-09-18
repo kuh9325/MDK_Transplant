@@ -106,6 +106,13 @@ struct AppConfig {
   // the resulting PlayerMotionState/output. Exits non-zero on
   // mismatch. No front-end or --data-path required.
   bool selftestPlayerMotion = false;
+  // --selftest-player-vertical (Phase 5C): a single LALT hold/release
+  // drives the FUN_00466740 jump machine + FUN_00467180 vertical
+  // integrator on the same previous-frame control seam; each frame
+  // gets a synthetic flat-floor FUN_004630d4 result and the
+  // jump/gravity/landing state is verified. Exits non-zero on
+  // mismatch. No front-end or --data-path required.
+  bool selftestPlayerVertical = false;
   bool relativeMouse = true;  // --no-relative-mouse to disable
   int windowWidth = 960;      // logical points; drawable may be 2x (Retina)
   int windowHeight = 720;     // 4:3 default

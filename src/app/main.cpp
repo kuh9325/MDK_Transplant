@@ -62,6 +62,11 @@ void usage(const char* argv0) {
       "                        movement script and verify the local\n"
       "                        player-motion state each frame\n"
       "                        (optionally honors --settings-file)\n"
+      "  --selftest-player-vertical\n"
+      "                        inject the deterministic Phase 5C\n"
+      "                        jump hold/release script and verify the\n"
+      "                        vertical state machine each frame\n"
+      "                        (optionally honors --settings-file)\n"
       "  --no-relative-mouse   do not capture the mouse\n"
       "  -h, --help            this message\n",
       argv0);
