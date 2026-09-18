@@ -57,6 +57,13 @@ struct AppConfig {
   // bars at factory 70/100, FONTSML endpoints) + SND_DONE + ARROW
   // under the inherited options palette. Requires --data-path.
   bool soundSubmenuPreview = false;
+  // --preview-mouse-submenu: compose the static Mouse child screen
+  // frame (Phase 4J): cleared framebuffer + the four left rows
+  // (JOY_TEST/M_ENA/M_NORM/JOY_QUIT at factory state) + the 4x16
+  // button-map grid + three axis bars with centered markers + the
+  // test indicator + ARROW — all FONTSML, under the inherited
+  // options palette. Requires --data-path.
+  bool mouseSubmenuPreview = false;
   // --interactive-frontend: run the reconstructed front-end flow —
   // Phase 4E root menu plus the Phase 4F options sub-menu transition
   // (OpenOptions enters the real OM_* screen; Back/Esc returns) plus

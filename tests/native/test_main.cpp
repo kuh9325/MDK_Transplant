@@ -4956,6 +4956,527 @@ void test_sound_controller() {
   }
 }
 
+// Phase 4J — Mouse options child (FUN_004217e8, mode 0x04).
+void test_mouse_controller() {
+  // Entry (FUN_00421664, OBSERVED): DAT_0054bd40 selection and
+  // DAT_0054bd38 column reset to 0; DAT_0054bd3c=3 axes /
+  // DAT_0054bd44=4 buttons are constants; the settings globals and
+  // the shared machine state (mouse, tick, deadlines, marker acc)
+  // carry over untouched.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 45;
+    s.tick = 77;
+    s.markerAcc = 9;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16.0f, 16.0f, 50.0f});
+    CHECK(ctl.selection() == 0 && ctl.column() == 0);
+    CHECK(ctl.mouseOn() && ctl.mouseYReversedBits() == 0);
+    CHECK(ctl.axesMap() == "ABG");
+    CHECK(ctl.buttMask(0) == 1 && ctl.buttMask(1) == 4 &&
+          ctl.buttMask(2) == 2 && ctl.buttMask(3) == 0);
+    CHECK(near(ctl.scale(0), 16.0) && near(ctl.scale(2), 50.0));
+    CHECK(!ctl.settingsDirty());
+    CHECK(ctl.mouseX() == 300 && ctl.mouseY() == 45 &&
+          ctl.tick() == 77 && ctl.markerAccumulator() == 9);
+    CHECK(ctl.pendingAction() == mdk::MouseAction::None);
+  }
+
+  // prev/next wrap through all 23 rows (sel-1 <0 -> 22; sel+1
+  // >=DAT_0054bd3c+0x13 -> 0) — the same repeat machine as the
+  // other screens.
+  {
+    mdk::FrontendMachineState s;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 22);   // 0-1 wraps
+    in = {};
+    ctl.update(in);                 // release — deadline resets
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);    // 22+1 wraps
+    // Drive next through the whole range to prove 0..22 all reach.
+    for (int i = 1; i <= 22; ++i) {
+      in = {};
+      ctl.update(in);
+      in.nextHeld = true;
+      ctl.update(in);
+      CHECK(ctl.selection() == i);
+    }
+    in = {};
+    ctl.update(in);
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);    // 22+1 -> 0
+  }
+
+  // Esc is checked FIRST — before prev (OBSERVED 0x4217f3): a
+  // frame holding both Esc and prev exits without the selection
+  // moving; the exit ends the frame before the draw.
+  {
+    mdk::FrontendMachineState s;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.cancelEdge = true;
+    in.prevHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);    // prev never ran
+    CHECK(ctl.consumeAction() == mdk::MouseAction::Back);
+    CHECK(ctl.frameEndedEarly());
+    CHECK(ctl.consumeAction() == mdk::MouseAction::None);
+  }
+
+  // Mouse hit-test left column (OBSERVED): x<250 — band =
+  // trunc((y-2)/16) valid 0..3 selects rows 0-3; else band2 =
+  // trunc((y-259)/16) valid 0..2 selects rows 4-6. Trunc-toward-
+  // zero maps y in [2-15,1] to band 0 (the quirk); y<2-15 is band
+  // -1 -> falls to the axis band check.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 100;
+    s.mouseY = 350;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    ctl.update(in);   // gate closed — no mouse input
+    CHECK(ctl.selection() == 0);
+    // y=18 -> band trunc(16/16)=1 -> row 1.
+    in = {};
+    in.mouseDy = 18 - 350;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 18 && ctl.selection() == 1);
+    // y=49 -> band trunc(47/16)=2 -> row 2; y=65 -> band 3.
+    in = {};
+    in.mouseDy = 49 - 18;
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    in = {};
+    in.mouseDy = 65 - 49;
+    ctl.update(in);
+    CHECK(ctl.selection() == 3);
+    // y=66 -> band trunc(64/16)=4 -> falls to axis band:
+    // trunc((66-259)/16) = -12 invalid -> selection holds at 3.
+    in = {};
+    in.mouseDy = 1;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 66 && ctl.selection() == 3);
+    // y=275 -> axis band trunc(16/16)=1 -> row 5; y=259 -> band 0
+    // -> row 4; y=302 -> band 2 -> row 6.
+    in = {};
+    in.mouseDy = 275 - 66;
+    ctl.update(in);
+    CHECK(ctl.selection() == 5);
+    in = {};
+    in.mouseDy = 259 - 275;
+    ctl.update(in);
+    CHECK(ctl.selection() == 4);
+    in = {};
+    in.mouseDy = 302 - 259;
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    // y=318 -> band trunc(59/16)=3 invalid -> holds at 6.
+    in = {};
+    in.mouseDy = 318 - 302;
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    // y=1 -> band trunc(-1/16)=0 (trunc quirk) -> row 0.
+    in = {};
+    in.mouseDy = 1 - 318;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 1 && ctl.selection() == 0);
+  }
+
+  // Mouse hit-test right column (OBSERVED): x>=250 — band =
+  // trunc((y-33)/16) valid 0..15 -> sel = band+7 AND col =
+  // clamp(trunc((x-396)/16), 0, 3); the column assignment runs
+  // ONLY when the band is valid.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 40;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    // y=33 -> band 0 -> row 7; x=300 -> trunc(-96/16)=-6 -> col 0.
+    in.mouseDy = -7;   // 40 -> 33
+    ctl.update(in);
+    CHECK(ctl.selection() == 7 && ctl.column() == 0);
+    // x=412 -> trunc(16/16)=1 -> col 1 (same band, y stays 33).
+    in = {};
+    in.mouseDx = 412 - 300;
+    ctl.update(in);
+    CHECK(ctl.column() == 1 && ctl.selection() == 7);
+    // x=444 -> trunc(48/16)=3 -> col 3; y=49 -> band 1 -> row 8.
+    in = {};
+    in.mouseDx = 444 - 412;
+    in.mouseDy = 49 - 33;
+    ctl.update(in);
+    CHECK(ctl.column() == 3 && ctl.selection() == 8);
+    // x=460 -> trunc(64/16)=4 -> clamps to 3; y=288 -> band 15
+    // -> row 22.
+    in = {};
+    in.mouseDx = 460 - 444;
+    in.mouseDy = 288 - 49;
+    ctl.update(in);
+    CHECK(ctl.column() == 3 && ctl.selection() == 22);
+    // x=380 -> trunc(-16/16) = -1 -> clamps to 0 (same band).
+    in = {};
+    in.mouseDx = 380 - 460;
+    ctl.update(in);
+    CHECK(ctl.column() == 0 && ctl.selection() == 22);
+    // y=290 -> band trunc(257/16)=16 -> invalid: sel AND col hold.
+    in = {};
+    in.mouseDy = 290 - 288;
+    ctl.update(in);
+    CHECK(ctl.selection() == 22 && ctl.column() == 0);
+    // The gate clamp: accumulated 359 -> clamped 350 inside the
+    // gate -> band 19 invalid (selection and column hold).
+    in = {};
+    in.mouseDy = 500;
+    ctl.update(in);
+    CHECK(ctl.mouseY() == 350 && ctl.selection() == 22 &&
+          ctl.column() == 0);
+  }
+
+  // LEFT/RIGHT on rows 1/2 (OBSERVED): BOTH directions toggle —
+  // MouseOn 0<->1 + dirty (0x421ceb/0x421d65), MouseYReversed raw
+  // bits 0<->1 + dirty (0x421d17/0x421d91). Rows 0/3 fall through.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 100;
+    s.mouseY = 17;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // -> 18: gate opens, band 1 -> MouseOn row
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(!ctl.mouseOn() && ctl.settingsDirty());
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;   // RIGHT toggles too — OBSERVED
+    ctl.update(in);
+    CHECK(ctl.mouseOn());
+    // Row 2: MouseYReversed — raw int bits into the float slot.
+    in = {};
+    in.mouseDy = 49 - 18;
+    ctl.update(in);
+    CHECK(ctl.selection() == 2);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.mouseYReversedBits() == 1 && ctl.mouseYReversed());
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.mouseYReversedBits() == 0);
+    // Rows 0/3 take no LEFT/RIGHT mutation.
+    in = {};
+    in.mouseDy = 16 - 49;   // band 0
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.mouseOn() && ctl.mouseYReversedBits() == 0 &&
+          ctl.column() == 0);
+    in = {};
+    in.mouseDy = 65 - 16;   // band 3 -> Quit row
+    ctl.update(in);
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.consumeAction() == mdk::MouseAction::None &&
+          !ctl.frameEndedEarly());
+  }
+
+  // LEFT/RIGHT on the axis rows 4-6 (OBSERVED): cycle the map
+  // letter -1/+1 inside '0'+'A'..'H' (FUN_004216a0) — '0'->'H' on
+  // LEFT, '0'->'A' on RIGHT, 'H'+1 -> '0', 'A'-1 -> '0', each
+  // mutation latching dirty.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 100;
+    s.mouseY = 258;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // -> 259: axis band 0 -> row 4
+    ctl.update(in);
+    CHECK(ctl.selection() == 4 && ctl.axisMapChar(0) == 'A');
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "0BG" && ctl.settingsDirty());  // A-1->'0'
+    in = {};
+    ctl.update(in);
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "HBG");   // '0'-1 -> 'H'
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "0BG");   // 'H'+1 -> '0'
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "ABG");   // '0'+1 -> 'A'
+    // 'G' on axis 2: RIGHT -> 'H' -> '0' -> 'A'.
+    in = {};
+    in.mouseDy = 302 - 259;   // axis band 2 -> row 6
+    ctl.update(in);
+    CHECK(ctl.selection() == 6);
+    in = {};
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "ABH");
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "AB0");
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.axesMap() == "ABA");
+  }
+
+  // LEFT/RIGHT on grid rows 7-22 (OBSERVED): the column wraps
+  // bidirectionally — LEFT <0 -> cols-1, RIGHT >=cols -> 0. The
+  // dirty flag is NOT set by column movement.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 32;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // -> 33: grid band 0 -> row 7, col 0
+    ctl.update(in);
+    CHECK(ctl.selection() == 7 && ctl.column() == 0);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(ctl.column() == 3);      // 0-1 wraps to 3
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.column() == 0);      // 3+1 wraps to 0
+    in = {};
+    ctl.update(in);
+    in.rightHeld = true;
+    ctl.update(in);
+    CHECK(ctl.column() == 1);
+    CHECK(!ctl.settingsDirty());   // column moves never latch
+  }
+
+  // Activate (OBSERVED jump table 0x4217d8): row 0 -> no-op fall
+  // through to the draw; row 1 -> MouseOn toggle; row 2 ->
+  // MouseYReversed toggle; row 3 -> mode 0x0b + RET (exit);
+  // rows 4-6 -> letter +1; rows 7-22 -> FUN_00421774.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 100;
+    s.mouseY = 9;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // -> 10: band 0 -> row 0 (Test — no-op)
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.pendingAction() == mdk::MouseAction::None &&
+          !ctl.frameEndedEarly() && !ctl.settingsDirty());
+    // Row 1 activate toggles MouseOn.
+    in = {};
+    in.mouseDy = 18 - 10;
+    ctl.update(in);
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(!ctl.mouseOn() && ctl.settingsDirty());
+    // Row 3 activate -> Back + frame ends early.
+    mdk::FrontendMachineState s2;
+    s2.mouseX = 100;
+    s2.mouseY = 64;
+    mdk::MouseMenuController c2(s2, true, 0, "ABG", {1, 4, 2, 0},
+                                {16, 16, 50});
+    in = {};
+    in.mouseDy = 1;   // -> 65: band 3 -> Quit row
+    c2.update(in);
+    in = {};
+    in.confirmEdge = true;
+    c2.update(in);
+    CHECK(c2.consumeAction() == mdk::MouseAction::Back);
+    CHECK(c2.frameEndedEarly());
+    // Row 4 activate cycles the axis letter +1 (same as RIGHT).
+    mdk::FrontendMachineState s3;
+    s3.mouseX = 100;
+    s3.mouseY = 258;
+    mdk::MouseMenuController c3(s3, true, 0, "ABG", {1, 4, 2, 0},
+                                {16, 16, 50});
+    in = {};
+    in.mouseDy = 1;   // -> 259: axis band 0 -> row 4
+    c3.update(in);
+    in = {};
+    in.confirmEdge = true;
+    c3.update(in);
+    CHECK(c3.axesMap() == "BBG" && c3.settingsDirty());
+  }
+
+  // Button-bit exclusivity (FUN_00421774 + table @0x499f0c,
+  // OBSERVED): bit set -> clear only it; bit clear -> clear the
+  // row's exclusive group then set the bit. Factory masks
+  // {1,4,2,0}: activating row 7 col 0 clears bit 0 of mask A.
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 396;
+    s.mouseY = 32;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // -> 33: row 7, col trunc(0/16) = 0
+    ctl.update(in);
+    CHECK(ctl.selection() == 7 && ctl.column() == 0);
+    in = {};
+    in.confirmEdge = true;
+    ctl.update(in);
+    CHECK(ctl.buttMask(0) == 0 && ctl.settingsDirty());
+    // Group exclusivity: row 7's group table[0] = 0x2 — setting
+    // bit 0 of mask C clears bit 1 (group) then sets bit 0.
+    // Factory mask C = 2 (bit 1). Select row 7 col 2.
+    mdk::FrontendMachineState s2;
+    s2.mouseX = 428;
+    s2.mouseY = 32;
+    mdk::MouseMenuController c2(s2, true, 0, "ABG", {1, 4, 2, 0},
+                                {16, 16, 50});
+    in = {};
+    in.mouseDy = 1;   // -> 33: row 7, col trunc(32/16) = 2
+    c2.update(in);
+    CHECK(c2.selection() == 7 && c2.column() == 2);
+    in = {};
+    in.confirmEdge = true;
+    c2.update(in);
+    CHECK(c2.buttMask(2) == 1);   // (2 & ~0x2) | 1 = 1
+    // Setting a different row's bit in the same column clears the
+    // old exclusive partner: mask A row 8 (bit 1, group 0x1) —
+    // factory A=1; activate row 8 col 0 -> (1 & ~0x1) | 2 = 2.
+    mdk::FrontendMachineState s3;
+    s3.mouseX = 396;
+    s3.mouseY = 48;
+    mdk::MouseMenuController c3(s3, true, 0, "ABG", {1, 4, 2, 0},
+                                {16, 16, 50});
+    in = {};
+    in.mouseDy = 1;   // -> 49: band 1 -> row 8, col 0
+    c3.update(in);
+    CHECK(c3.selection() == 8 && c3.column() == 0);
+    in = {};
+    in.confirmEdge = true;
+    c3.update(in);
+    CHECK(c3.buttMask(0) == 2);
+  }
+
+  // Axis value / test marker (OBSERVED FLD/FDIV + FCOMP/JNC):
+  // delta/scale clamped [-1,1]; a zero scale makes the quotient
+  // NaN -> -1.0. Test marker = clamp(FISTP(50*delta/scale),-50,50)
+  // — out-of-range yields INT_MIN -> -50.
+  {
+    mdk::FrontendMachineState s;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDx = 32;    // 32/16 = 2 -> clamps +1
+    in.mouseDy = -8;    // -8/16 = -0.5
+    in.mouseDz = 100;   // 100/50 = 2 -> clamps +1
+    ctl.update(in);
+    CHECK(near(ctl.axisValue(0), 1.0));
+    CHECK(near(ctl.axisValue(1), -0.5));
+    CHECK(near(ctl.axisValue(2), 1.0));
+    CHECK(ctl.lastDelta(0) == 32 && ctl.lastDelta(1) == -8 &&
+          ctl.lastDelta(2) == 100);
+    // FISTP(50*32/16)=100 -> +50; FISTP(50*-8/16)=-25 -> -25.
+    CHECK(ctl.testOffsetX() == 50 && ctl.testOffsetY() == -25);
+    // Zero scale: +inf quotient -> axisValue +1 (FCOMP/JNC);
+    // -inf -> -1; FISTP of either -> INT_MIN -> test offset -50.
+    mdk::MouseMenuController c2(s, true, 0, "ABG", {1, 4, 2, 0},
+                                {0, 0, 50});
+    c2.update(in);
+    CHECK(near(c2.axisValue(0), 1.0));
+    CHECK(near(c2.axisValue(1), -1.0));
+    CHECK(c2.testOffsetX() == -50 && c2.testOffsetY() == -50);
+    // 0/0 = NaN -> axisValue -1.0 (the JNC fallthrough), FISTP ->
+    // INT_MIN -> -50.
+    mdk::MouseMenuController c3(s, true, 0, "ABG", {1, 4, 2, 0},
+                                {0, 0, 50});
+    in = {};
+    c3.update(in);   // zero deltas
+    CHECK(near(c3.axisValue(0), -1.0));
+    CHECK(c3.testOffsetX() == -50 && c3.testOffsetY() == -50);
+  }
+
+  // The blink accumulator (DAT_0049a770) advances
+  // floor(acc+DAT_0049b6f0) per flagged draw; bit 3 is the phase.
+  {
+    mdk::FrontendMachineState s;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    CHECK(ctl.markerAccumulator() == 0);
+    CHECK(!ctl.advanceBlink());   // 0+1.0 -> 1, bit3 clear
+    CHECK(ctl.markerAccumulator() == 1);
+    for (int i = 0; i < 7; ++i) ctl.advanceBlink();
+    CHECK(ctl.markerAccumulator() == 8);
+    CHECK(ctl.advanceBlink());    // 9 — bit 3 set
+  }
+
+  // Mutate-back-to-default keeps the dirty latch (same OBSERVED
+  // latch semantics as the other screens).
+  {
+    mdk::FrontendMachineState s;
+    s.mouseX = 100;
+    s.mouseY = 17;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;   // -> 18: row 1
+    ctl.update(in);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);               // MouseOn off
+    in = {};
+    ctl.update(in);
+    in.leftHeld = true;
+    ctl.update(in);               // MouseOn back on
+    CHECK(ctl.mouseOn() && ctl.settingsDirty());
+  }
+
+  // Input order (OBSERVED): Esc first, then prev before next.
+  {
+    mdk::FrontendMachineState s;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    mdk::FrontendMenuInput in;
+    in.prevHeld = true;
+    in.nextHeld = true;
+    ctl.update(in);
+    CHECK(ctl.selection() == 0);   // 0-1=22 then 22+1=0
+  }
+}
+
 // Phase 4G/4H/4I — native-owned frontend settings persistence
 // (Skill, Brightness, ForcePCorrect, SoundFX, SoundMusic): the
 // FUN_004260ac/FUN_00425de4 contract reimplemented against
@@ -5162,6 +5683,123 @@ void test_frontend_settings() {
     CHECK(rt.settings.soundFx == 10 && rt.settings.soundMusic == 20 &&
           rt.settings.skill == 0 && rt.settings.brightness == 4 &&
           rt.settings.forcePCorrect);
+  }
+
+  // Phase 4J entries (OBSERVED — settings table 49-68): the mouse
+  // block sits between SoundMusic (9) and Skill (88) in table
+  // order. Type-3 strings (axes/butt maps) compare case-insensibly
+  // like the original's fold; type-0 masks emit %d; type-1 floats
+  // emit %g; type-2 bool emits TRUE only; MouseYReversed's float
+  // slot emits the denormal its raw bits represent.
+  {
+    mdk::FrontendSettings s;
+    CHECK(s.mouseWAxesMap == "ABG" && s.mouseDAxesMap == "ABG");
+    CHECK(s.mouseWButtMap == "ACB" && s.mouseDButtMap == "ACB");
+    CHECK(s.mouseWButtMapA == 1 && s.mouseWButtMapB == 4 &&
+          s.mouseWButtMapC == 2 && s.mouseWButtMapD == 0);
+    CHECK(s.mouseDButtMapA == 1 && s.mouseDButtMapD == 0);
+    CHECK(near(s.mouseWXScale, 16.0) && near(s.mouseWZScale, 50.0));
+    CHECK(near(s.mouseDXScale, 16.0) && near(s.mouseDZScale, 50.0));
+    CHECK(s.mouseOn && s.mouseYReversed == 0);
+    // Defaults emit none of the mouse keys.
+    const std::string def = mdk::serializeFrontendSettings(s);
+    CHECK(def.find("Mouse") == std::string::npos);
+    // Every dirty mouse entry emits, in table order 49..68, all
+    // before Skill (88).
+    s.mouseWAxesMap = "BCD";       // 49
+    s.mouseDAxesMap = "BCD";       // 50
+    s.mouseWButtMap = "BCA";       // 51
+    s.mouseDButtMap = "BCA";       // 52
+    s.mouseWButtMapA = 3;          // 53
+    s.mouseWButtMapB = 9;          // 54
+    s.mouseWButtMapC = 5;          // 55
+    s.mouseWButtMapD = 32768;      // 56 — BUILD_A's real dword
+    s.mouseDButtMapA = 3;          // 57
+    s.mouseDButtMapB = 9;          // 58
+    s.mouseDButtMapC = 5;          // 59
+    s.mouseDButtMapD = 32768;      // 60
+    s.mouseWXScale = 20.0f;        // 61
+    s.mouseWYScale = 20.0f;        // 62
+    s.mouseWZScale = 60.0f;        // 63
+    s.mouseDXScale = 20.0f;        // 64
+    s.mouseDYScale = 20.0f;        // 65
+    s.mouseDZScale = 60.0f;        // 66
+    s.mouseOn = false;             // 67
+    s.mouseYReversed = 1;          // 68 — raw bits 1 -> denormal
+    s.skill = 2;
+    const std::string out = mdk::serializeFrontendSettings(s);
+    const char* keys[] = {
+        "MouseWAxesMap = BCD",   "MouseDAxesMap = BCD",
+        "MouseWButtMap = BCA",   "MouseDButtMap = BCA",
+        "MouseWButtMapA = 3",    "MouseWButtMapB = 9",
+        "MouseWButtMapC = 5",    "MouseWButtMapD = 32768",
+        "MouseDButtMapA = 3",    "MouseDButtMapB = 9",
+        "MouseDButtMapC = 5",    "MouseDButtMapD = 32768",
+        "MouseWXScale = 20",     "MouseWYScale = 20",
+        "MouseWZScale = 60",     "MouseDXScale = 20",
+        "MouseDYScale = 20",     "MouseDZScale = 60",
+        "MouseOn = FALSE",       "MouseYReversed = 1.4013e-45"};
+    std::size_t prev = 0;
+    for (const char* k : keys) {
+      const auto p = out.find(k);
+      CHECK(p != std::string::npos);
+      CHECK(p > prev || p == 0);
+      prev = p;
+    }
+    CHECK(out.find("Skill = 2") > out.find("MouseYReversed"));
+    // The denormal quirk (OBSERVED): the screen writes int bits
+    // 0/1 into a type-1 float slot — bits 1 serialize as the
+    // smallest denormal, exactly like BUILD_A's own write would.
+    mdk::FrontendSettings q;
+    q.mouseYReversed = 1;
+    CHECK(mdk::serializeFrontendSettings(q).find(
+              "MouseYReversed = 1.4013e-45\r\n") != std::string::npos);
+    // Type-3 fold comparison (OBSERVED FUN_0042fab4): a case
+    // variant compares equal to the mirror and is NOT emitted.
+    mdk::FrontendSettings fold;
+    fold.mouseWAxesMap = "abg";
+    CHECK(mdk::serializeFrontendSettings(fold).find("MouseWAxesMap")
+          == std::string::npos);
+  }
+
+  // Phase 4J parser entries: type-3 strings take the value
+  // verbatim (the original's unbounded copy); type-0 masks take
+  // the leading integer; type-1 floats take the leading float;
+  // type-2 bool folds the first value char to 'T'. Keys match
+  // case-insensitively.
+  {
+    const auto p = mdk::parseFrontendSettings(
+        "MouseWAxesMap = A0G\r\n"     // BUILD_A's real syntax
+        "mousewbuttmapa = 32768\r\n"
+        "MouseWXScale = 24.5\r\n"
+        "MouseOn = FALSE\r\n"
+        "MouseYReversed = 1.4013e-45\r\n");
+    CHECK(p.settings.mouseWAxesMap == "A0G");
+    CHECK(p.settings.mouseWButtMapA == 32768);
+    CHECK(near(p.settings.mouseWXScale, 24.5));
+    CHECK(!p.settings.mouseOn);
+    CHECK(p.settings.mouseYReversed == 1);   // denormal -> bits 1
+    // The bool/type-2 fold like ForcePCorrect.
+    CHECK(mdk::parseFrontendSettings("MouseOn = true")
+              .settings.mouseOn);
+    CHECK(mdk::parseFrontendSettings("MouseOn = xyz")
+              .settings.mouseOn == false);
+    // A serialized mouse block round-trips — incl. the denormal.
+    mdk::FrontendSettings m;
+    m.mouseWAxesMap = "B0H";
+    m.mouseWButtMapD = 32768;
+    m.mouseWXScale = 24.0f;
+    m.mouseOn = false;
+    m.mouseYReversed = 1;
+    const auto rt = mdk::parseFrontendSettings(
+        mdk::serializeFrontendSettings(m));
+    CHECK(rt.settings.mouseWAxesMap == "B0H");
+    CHECK(rt.settings.mouseWButtMapD == 32768);
+    CHECK(near(rt.settings.mouseWXScale, 24.0));
+    CHECK(!rt.settings.mouseOn && rt.settings.mouseYReversed == 1);
+    // Untouched D-set fields survive a round-trip.
+    CHECK(rt.settings.mouseDButtMapA == 1 &&
+          rt.settings.mouseDAxesMap == "ABG");
   }
 
   // NATIVE hardening (not an original-behavior claim): malformed
@@ -5625,6 +6263,182 @@ void test_frontend_flow() {
           ev[2] == mdk::SoundAudioEvent::SongStop &&
           ev[3] == mdk::SoundAudioEvent::AmbientSongStart);
     CHECK(flow.drainAudioEvents().empty());
+  }
+
+  // Options -> Mouse (Phase 4J): activating row 3 is consumed by
+  // the transition — FUN_00421664 enters the child with selection
+  // AND column reset to 0 and the shared machine state intact; the
+  // options controller stays alive underneath.
+  auto enterMouse = [](mdk::FrontendFlowController& f) {
+    mdk::FrontendMenuInput in;
+    in.mouseDy = -41;            // 180 -> 139: root band 3
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);
+    f.consumeRootAction();
+    in = {};
+    in.mouseButtons = 0;
+    in.mouseDy = 140 - 139;      // 139 -> 140: options band 3
+    f.update(in);
+    in = {};
+    in.mouseButtons = 0x1;
+    f.update(in);                // click -> FUN_00421664
+    f.consumeOptionsAction();
+  };
+
+  {
+    mdk::FrontendFlowController flow(true);
+    enterMouse(flow);
+    CHECK(flow.screen() == mdk::FrontendScreen::Mouse);
+    CHECK(flow.mouse().selection() == 0 &&   // DAT_0054bd40 reset
+          flow.mouse().column() == 0);       // DAT_0054bd38 reset
+    CHECK(flow.mouse().mouseX() == 300 &&
+          flow.mouse().mouseY() == 140);
+    CHECK(flow.mouse().mouseOn() &&
+          flow.mouse().mouseYReversedBits() == 0);
+    CHECK(flow.mouse().axesMap() == "ABG");
+  }
+
+  // Mouse -> Options (Phase 4J): the inline exit writes mode 0x0b
+  // with _DAT_0054bd34 still 3 — options resumes the Mouse row;
+  // machine state, mutations, and the shared dirty flag carry.
+  {
+    mdk::FrontendFlowController flow(true);
+    enterMouse(flow);
+    mdk::FrontendMenuInput in;
+    // Move into the MouseOn band (x<250, y=18) and LEFT-toggle.
+    in.mouseDx = 100 - 300;
+    in.mouseDy = 18 - 140;
+    flow.update(in);
+    CHECK(flow.mouse().selection() == 1);
+    in = {};
+    in.leftHeld = true;
+    flow.update(in);
+    CHECK(!flow.mouse().mouseOn() && flow.mouse().settingsDirty());
+    // Esc -> Back -> options resumes at selection 3.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    CHECK(flow.consumeMouseAction() == mdk::MouseAction::None);
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(flow.options().selection() == 3);
+    CHECK(!flow.mouseOn() && flow.options().settingsDirty());
+    CHECK(flow.options().mouseX() == 100 &&
+          flow.options().mouseY() == 18);
+  }
+
+  // Mouse exit does NOT persist — FUN_00420d68 owns the write.
+  // The overlay emits the W-set mutations while untouched fields
+  // (the D set, scales, map strings at factory) round-trip from
+  // the loaded base instead of reverting to factory defaults.
+  {
+    int calls = 0;
+    mdk::FrontendSettings persisted;
+    mdk::FrontendSettings initial;
+    initial.mouseDButtMapD = 32768;   // BUILD_A's real D-set dword
+    initial.mouseDAxesMap = "A0G";
+    mdk::FrontendFlowController flow(
+        true, initial, [&](const mdk::FrontendSettings& s) {
+          ++calls;
+          persisted = s;
+          return true;
+        });
+    enterMouse(flow);
+    mdk::FrontendMenuInput in;
+    // Toggle MouseOn (row 1) and MouseYReversed (row 2).
+    in.mouseDx = 100 - 300;
+    in.mouseDy = 18 - 140;
+    flow.update(in);
+    in = {};
+    in.leftHeld = true;
+    flow.update(in);             // MouseOn -> off
+    in = {};
+    in.mouseDy = 49 - 18;        // -> row 2
+    flow.update(in);
+    in = {};
+    in.leftHeld = true;
+    flow.update(in);             // yrev bits -> 1
+    // Toggle grid row 7 col 0: factory buttA 1 -> 0.
+    in = {};
+    in.mouseDx = 396 - 100;
+    in.mouseDy = 33 - 49;
+    flow.update(in);
+    CHECK(flow.mouse().selection() == 7 && flow.mouse().column() == 0);
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    CHECK(flow.mouse().buttMask(0) == 0);
+    // Esc -> options: no persist yet.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeMouseAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    CHECK(calls == 0);
+    CHECK(flow.mouseYReversedBits() == 1 && !flow.mouseOn());
+    CHECK(flow.mouseButtMap()[0] == 0);
+    // Options exit -> FUN_00420d68 -> persist with the overlays.
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Root);
+    CHECK(calls == 1);
+    CHECK(!persisted.mouseOn && persisted.mouseYReversed == 1);
+    CHECK(persisted.mouseWButtMapA == 0);
+    CHECK(persisted.mouseWAxesMap == "ABG");   // untouched
+    // The D-set fields from `initial` round-trip — not factory.
+    CHECK(persisted.mouseDButtMapD == 32768);
+    CHECK(persisted.mouseDAxesMap == "A0G");
+    CHECK(!flow.settingsDirty());
+    const std::string ser = mdk::serializeFrontendSettings(persisted);
+    CHECK(ser.find("MouseWButtMapA = 0\r\n") != std::string::npos);
+    CHECK(ser.find("MouseOn = FALSE\r\n") != std::string::npos);
+    CHECK(ser.find("MouseYReversed = 1.4013e-45\r\n") !=
+          std::string::npos);
+    CHECK(ser.find("MouseDButtMapD = 32768\r\n") != std::string::npos);
+    CHECK(ser.find("MouseDAxesMap = A0G\r\n") != std::string::npos);
+    CHECK(ser.find("MouseWAxesMap") == std::string::npos);
+  }
+
+  // Re-entering Mouse re-runs FUN_00421664: selection and column
+  // reset to 0 but the mutated settings globals are retained
+  // (they are process globals, borrowed — never re-initialized).
+  {
+    mdk::FrontendFlowController flow(true);
+    enterMouse(flow);
+    mdk::FrontendMenuInput in;
+    in.mouseDx = 100 - 300;
+    in.mouseDy = 18 - 140;
+    flow.update(in);
+    in = {};
+    in.leftHeld = true;
+    flow.update(in);             // MouseOn -> off
+    // Move the column and selection away from the entry values.
+    in = {};
+    in.mouseDx = 396 - 100;
+    in.mouseDy = 33 - 18;
+    flow.update(in);
+    CHECK(flow.mouse().selection() == 7 && flow.mouse().column() == 0);
+    in = {};
+    in.rightHeld = true;
+    flow.update(in);             // col 0 -> 1
+    in = {};
+    in.cancelEdge = true;
+    flow.update(in);
+    flow.consumeMouseAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Options);
+    // Re-enter (options sel still 3 -> activate).
+    in = {};
+    in.confirmEdge = true;
+    flow.update(in);
+    flow.consumeOptionsAction();
+    CHECK(flow.screen() == mdk::FrontendScreen::Mouse);
+    CHECK(flow.mouse().selection() == 0 &&   // reset at entry
+          flow.mouse().column() == 0);       // reset at entry
+    CHECK(!flow.mouse().mouseOn());          // global retained
+    CHECK(flow.mouse().settingsDirty());     // flag carried back
   }
 
   // Non-transition root actions pass through unchanged.
@@ -6276,6 +7090,216 @@ void test_sound_render() {
   }
 }
 
+// Phase 4J — Mouse child rendering (FUN_004217e8 draw block +
+// FUN_004213e8/21504/21448/212d0 + FUN_00414dd4/14b28 marker).
+void test_mouse_render() {
+  std::string err;
+  auto fSml = SyntheticFont::make();
+  const char* baseLabels[7] = {"Test", "Enabled", "Disabled",
+                               "Reversed", "Normal", "Quit",
+                               "Buttons"};
+  const char* actions[16] = {"Fire",      "Sniper",    "Jump",
+                             "Next Weap", "Prev Weap", "Strafe L",
+                             "Strafe R",  "Accel",     "Decel",
+                             "Look Up",   "Look Down", "Center",
+                             "Action13",  "Action14",  "Action15",
+                             "Action16"};
+  const char* axisNames[9] = {"Off",   "Turn",  "Move",  "Fire",
+                              "Jump",  "Snipe", "Look",  "Strafe",
+                              "Zoom"};
+  const char* axisCaptions[3] = {"X-Axis", "Y-Axis", "Z-Axis"};
+  for (const char* l : baseLabels) {
+    for (const char* c = l; *c; ++c) {
+      const std::uint8_t ch = static_cast<std::uint8_t>(*c);
+      fSml.put32(ch * 4, fSml.addGlyph(1, 0, 1, {7, 7}));
+    }
+  }
+  for (const char* l : actions) {
+    for (const char* c = l; *c; ++c) {
+      const std::uint8_t ch = static_cast<std::uint8_t>(*c);
+      fSml.put32(ch * 4, fSml.addGlyph(1, 0, 1, {7, 7}));
+    }
+  }
+  for (const char* l : axisNames) {
+    for (const char* c = l; *c; ++c) {
+      const std::uint8_t ch = static_cast<std::uint8_t>(*c);
+      fSml.put32(ch * 4, fSml.addGlyph(1, 0, 1, {7, 7}));
+    }
+  }
+  for (const char* l : axisCaptions) {
+    for (const char* c = l; *c; ++c) {
+      const std::uint8_t ch = static_cast<std::uint8_t>(*c);
+      fSml.put32(ch * 4, fSml.addGlyph(1, 0, 1, {7, 7}));
+    }
+  }
+  const auto fontSml = mdk::decodeFtiFont(fSml.buf, &err);
+  CHECK(fontSml);
+  auto arrowS = SyntheticSprite::make1(
+      2, 2, 0, 0, {0x01, 77, 77, 0xfe, 0x01, 77, 77, 0xff});
+  const auto arrow = mdk::decodeFtiSprite(arrowS.buf, &err);
+  CHECK(arrow && arrow->frame(0));
+
+  mdk::MouseMenuLabels lbl{};
+  lbl.test = baseLabels[0];
+  lbl.enabled = baseLabels[1];
+  lbl.disabled = baseLabels[2];
+  lbl.reversed = baseLabels[3];
+  lbl.normal = baseLabels[4];
+  lbl.quit = baseLabels[5];
+  lbl.buttons = baseLabels[6];
+  for (int i = 0; i < 16; ++i) lbl.actions[i] = actions[i];
+  for (int i = 0; i < 9; ++i) lbl.axisNames[i] = axisNames[i];
+  for (int i = 0; i < 3; ++i) lbl.axisCaptions[i] = axisCaptions[i];
+
+  std::array<std::byte, 192> sysPal{};
+  for (int i = 0; i < 64; ++i) {
+    sysPal[i * 3 + 0] = std::byte(i);
+    sysPal[i * 3 + 1] = std::byte(200 - i);
+    sysPal[i * 3 + 2] = std::byte(i);
+  }
+
+  // Static spec frame (OBSERVED entry state): clear(0), left rows
+  // at y=row*16+16 centered x=(300-w)>>1, grid header row -1 at
+  // y=30 + 16 rows at y=row*16+46, axis rows at y=270/286/302,
+  // test frame (50,110)-(150,210), centered marker, ARROW at the
+  // carried mouse, SYS_PAL head bound.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::MouseMenuSpec spec;
+    spec.arrowX = 300;
+    spec.arrowY = 45;
+    CHECK(mdk::renderMouseMenuFrame(fb, palette, *fontSml,
+                                    *arrow->frame(0), lbl, sysPal,
+                                    spec, &err));
+    // Arrow at the spec position.
+    CHECK(fb.at(300, 45) == 77 && fb.at(301, 46) == 77);
+    // Corners stay cleared (no backdrop).
+    CHECK(fb.at(0, 0) == 0 && fb.at(599, 0) == 0 &&
+          fb.at(0, 359) == 0);
+    // Row 0 "Test" selected: the blink bracket — the glyph strip
+    // spans (x, 15)-(x+3, 16) at y=16 pen; the bracket draws its
+    // outer outline (x-2, 2)-(x+2+3, 20)-ish around it. Prove the
+    // bracket exists by checking a pixel left of the text.
+    // "Test" = 4 glyphs * 1px = w 4 -> x = (300-4)>>1 = 148.
+    CHECK(fb.at(148, 15) == 7);   // the text itself (row0 pen 16,
+                                  // glyph top 1 -> y 15)
+    // Bracket outer: (x-2, penY-top+? ) — verify a bracket pixel
+    // exists below the text line where nothing else draws.
+    bool bracketFound = false;
+    for (int x = 140; x < 160 && !bracketFound; ++x) {
+      for (int y = 17; y < 24 && !bracketFound; ++y) {
+        if (fb.at(x, y) == 1 || fb.at(x, y) == 2) bracketFound = true;
+      }
+    }
+    CHECK(bracketFound);
+    // Grid header row -1: "Buttons" right-aligned before x=396-8;
+    // header cells show the live buttons nibble (0 -> hollow 14).
+    CHECK(fb.at(397, 30 - 13) == 14);   // hollow outline color
+    // Factory buttMap {1,4,2,0}: A->action0, C->action1, B->action2.
+    // Row 0 (y=46): col0 filled -> solid 6 at (396,33)-(409,45).
+    // Row 1 (y=62): col2 filled (mask C bit 1) -> (428,49) solid;
+    //   col0 hollow -> outline (397,49)-(409,61) color 14.
+    // Row 2 (y=78): col1 filled (mask B bit 2) -> (412,65) solid.
+    CHECK(fb.at(396, 33) == 6);    // row0 col0 fill
+    CHECK(fb.at(397, 49) == 14);   // row1 col0 hollow outline edge
+    CHECK(fb.at(428, 49) == 6);    // row1 col2 fill
+    CHECK(fb.at(412, 65) == 6);    // row2 col1 fill
+    // Axis bars: hollow outline color 14 at (10, y-11)-(50, y-3);
+    // marker centered at floor(0*20+30)=30 -> fill 6 x 28..32 —
+    // it overwrites the bar's top/bottom edges where they cross.
+    CHECK(fb.at(10, 259) == 14 && fb.at(50, 259) == 14);
+    CHECK(fb.at(30, 263) == 6 && fb.at(28, 263) == 6 &&
+          fb.at(32, 263) == 6);
+    CHECK(fb.at(27, 263) == 0 && fb.at(33, 263) == 0);
+    // Test indicator frame color 2 at (50,110)-(150,210); boxes
+    // centered at (100,160) with delta 0.
+    CHECK(fb.at(50, 110) == 2 && fb.at(150, 210) == 2);
+    CHECK(fb.at(97, 157) == 3 && fb.at(103, 163) == 3);
+    // Palette: SYS_PAL head bound, tail zeroed.
+    CHECK(palette.get(1).r == 1 && palette.get(1).g == 199);
+    CHECK(palette.get(200).r == 0 && palette.get(200).a == 255);
+    // Contracts: wrong fb size, empty label, short palette head.
+    mdk::IndexedFramebuffer small(64, 64);
+    CHECK(!mdk::renderMouseMenuFrame(small, palette, *fontSml,
+                                     *arrow->frame(0), lbl, sysPal,
+                                     spec, &err));
+    mdk::MouseMenuLabels bad{};
+    CHECK(!mdk::renderMouseMenuFrame(fb, palette, *fontSml,
+                                     *arrow->frame(0), bad, sysPal,
+                                     spec, &err));
+    std::array<std::byte, 64> shortPal{};
+    CHECK(!mdk::renderMouseMenuFrame(fb, palette, *fontSml,
+                                     *arrow->frame(0), lbl, shortPal,
+                                     spec, &err));
+  }
+
+  // MouseOn=false / yrev bits=1 swap the row-1/2 texts; nonzero
+  // deltas move the axis marker and the test box.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::MouseMenuSpec spec;
+    spec.mouseOn = false;
+    spec.mouseYReversedBits = 1;
+    spec.deltas = {16, -32, 25};
+    CHECK(mdk::renderMouseMenuFrame(fb, palette, *fontSml,
+                                    *arrow->frame(0), lbl, sysPal,
+                                    spec, &err));
+    // Axis 0: delta/scale = 1 -> marker at floor(1*20+30)=50 ->
+    // fill x 48..52; axis 1: -32/16 = -2 -> clamp -1 -> pos 10.
+    CHECK(fb.at(50, 259) == 6 && fb.at(48, 259) == 6);
+    CHECK(fb.at(10, 275) == 6);   // pos-2..pos+2 = 8..12 on row 1
+    // Test box: mx = clamp(FISTP(50*16/16)=50) = 50 -> outer box
+    // (147,107)-(153,113); its side edges land x=147/153.
+    CHECK(fb.at(147, 110) == 3 && fb.at(153, 110) == 3);
+  }
+
+  // Dynamic frame: the controller drives the draw; the blink
+  // accumulator advances once per flagged draw (rows 0-3 +
+  // selected axis) — 2 flagged draws when an axis row is selected.
+  {
+    mdk::IndexedFramebuffer fb(600, 360);
+    mdk::Palette palette;
+    mdk::FrontendMachineState s;
+    s.mouseX = 300;
+    s.mouseY = 45;
+    mdk::MouseMenuController ctl(s, true, 0, "ABG", {1, 4, 2, 0},
+                                 {16, 16, 50});
+    CHECK(mdk::renderMouseMenuDynamic(fb, palette, *fontSml,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      ctl, 0, &err));
+    CHECK(fb.at(300, 45) == 77);
+    // Entry selection 0 -> one flagged draw (row 0) -> acc += 1.
+    CHECK(ctl.markerAccumulator() == 1);
+    // Selection on an axis row flags BOTH its left-row-less slot
+    // and the axis action — only the axis action draws flagged
+    // here (rows 0-3 flag only when selected) -> still 1 draw.
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 259 - 45;
+    in.mouseDx = 100 - 300;
+    ctl.update(in);
+    CHECK(ctl.selection() == 4);
+    const int accBefore = ctl.markerAccumulator();
+    CHECK(mdk::renderMouseMenuDynamic(fb, palette, *fontSml,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      ctl, 0, &err));
+    CHECK(ctl.markerAccumulator() == accBefore + 1);
+    // Mutate MouseOn off: next frame draws "Disabled" on row 1.
+    in = {};
+    in.mouseDy = 18 - 259;
+    ctl.update(in);
+    CHECK(ctl.selection() == 1);
+    in = {};
+    in.leftHeld = true;
+    ctl.update(in);
+    CHECK(!ctl.mouseOn());
+    CHECK(mdk::renderMouseMenuDynamic(fb, palette, *fontSml,
+                                      *arrow->frame(0), lbl, sysPal,
+                                      ctl, 0, &err));
+  }
+}
+
 } // namespace
 
 int main() {
@@ -6302,11 +7326,13 @@ int main() {
   test_options_controller();
   test_display_controller();
   test_sound_controller();
+  test_mouse_controller();
   test_frontend_settings();
   test_frontend_flow();
   test_options_render();
   test_display_render();
   test_sound_render();
+  test_mouse_render();
   test_indexed_image_blit();
   test_data_root();
   test_mode_dispatch();

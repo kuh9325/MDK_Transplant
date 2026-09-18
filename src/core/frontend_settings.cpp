@@ -1,47 +1,13 @@
 #include "core/frontend_settings.h"
 
+#include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <system_error>
 
 namespace mdk {
-
-std::string serializeFrontendSettings(const FrontendSettings& s) {
-  // FUN_004260ac (OBSERVED): header + blank line, then one
-  // `name = value` line per NON-default table value, in table
-  // order — SoundFX (entry 8, int), SoundMusic (entry 9, int),
-  // Skill (entry 88, int), Brightness (entry 89, int),
-  // ForcePCorrect (entry 90, type-2 bool `%s = TRUE`; the mirror
-  // compare means a non-default bool is always TRUE).
-  // CRLF terminators — the original's "wt" mode text file.
-  std::string out;
-  out += kFrontendSettingsHeader;
-  out += "\r\n\r\n";
-  char line[40];
-  if (s.soundFx != kFrontendSoundFxDefault) {
-    std::snprintf(line, sizeof(line), "SoundFX = %d\r\n", s.soundFx);
-    out += line;
-  }
-  if (s.soundMusic != kFrontendSoundMusicDefault) {
-    std::snprintf(line, sizeof(line), "SoundMusic = %d\r\n",
-                  s.soundMusic);
-    out += line;
-  }
-  if (s.skill != kFrontendSkillDefault) {
-    std::snprintf(line, sizeof(line), "Skill = %d\r\n", s.skill);
-    out += line;
-  }
-  if (s.brightness != kFrontendBrightnessDefault) {
-    std::snprintf(line, sizeof(line), "Brightness = %d\r\n",
-                  s.brightness);
-    out += line;
-  }
-  if (s.forcePCorrect) {
-    out += "ForcePCorrect = TRUE\r\n";
-  }
-  return out;
-}
 
 namespace {
 
@@ -63,6 +29,12 @@ bool keyEquals(std::string_view key, std::string_view name) {
 }
 
 bool isSpace(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+std::string_view trim(std::string_view v) {
+  while (!v.empty() && isSpace(v.front())) v.remove_prefix(1);
+  while (!v.empty() && isSpace(v.back())) v.remove_suffix(1);
+  return v;
+}
 
 // The original's value read: strtol-style leading integer parse
 // (whitespace skipped, optional sign, digits; scanning stops at
@@ -88,7 +60,142 @@ bool parseLeadingInt(std::string_view text, int* out) {
   return true;
 }
 
+// The type-1 value read (OBSERVED): atof-family leading float
+// parse. `out` is left untouched on failure (caller counts the
+// line as ignored — NATIVE hardening; the original's atof yields
+// 0.0 on unparseable input, an edge deliberately not reproduced).
+bool parseLeadingFloat(std::string_view text, float* out) {
+  const std::string v = std::string(trim(text));
+  if (v.empty()) return false;
+  const char* begin = v.c_str();
+  char* end = nullptr;
+  const float f = std::strtof(begin, &end);
+  if (end == begin) return false;
+  *out = f;
+  return true;
+}
+
+// Writer-side emit helpers — FUN_004260ac's `%g` float format
+// (OBSERVED; MSVC %g and C11 %g agree for the proven values) and
+// the fold-compare the writer uses for type-3 strings (OBSERVED:
+// "abg" compares EQUAL to the "ABG" mirror and is not emitted).
+void emitFloat(std::string& out, const char* key, float v) {
+  char line[64];
+  std::snprintf(line, sizeof(line), "%s = %g\r\n", key,
+                static_cast<double>(v));
+  out += line;
+}
+void emitInt(std::string& out, const char* key, std::uint32_t bits) {
+  char line[64];
+  std::snprintf(line, sizeof(line), "%s = %d\r\n", key,
+                static_cast<std::int32_t>(bits));
+  out += line;
+}
+void emitString(std::string& out, const char* key,
+                const std::string& v) {
+  out += key;
+  out += " = ";
+  out += v;
+  out += "\r\n";
+}
+
 } // namespace
+
+std::string serializeFrontendSettings(const FrontendSettings& s) {
+  // FUN_004260ac (OBSERVED): header + blank line, then one
+  // `name = value` line per NON-default table value, in table
+  // order — SoundFX (entry 8, int), SoundMusic (entry 9, int),
+  // the entries-49-68 Mouse block, Skill (entry 88, int),
+  // Brightness (entry 89, int), ForcePCorrect (entry 90, type-2
+  // bool `%s = TRUE`; the mirror compare means a non-default bool
+  // is always TRUE).
+  // CRLF terminators — the original's "wt" mode text file.
+  std::string out;
+  out += kFrontendSettingsHeader;
+  out += "\r\n\r\n";
+  char line[40];
+  if (s.soundFx != kFrontendSoundFxDefault) {
+    std::snprintf(line, sizeof(line), "SoundFX = %d\r\n", s.soundFx);
+    out += line;
+  }
+  if (s.soundMusic != kFrontendSoundMusicDefault) {
+    std::snprintf(line, sizeof(line), "SoundMusic = %d\r\n",
+                  s.soundMusic);
+    out += line;
+  }
+  // Entries 49-52: type-3 strings — emit iff the fold compare
+  // against the mirror string differs (OBSERVED at 0x4261ab).
+  if (!keyEquals(s.mouseWAxesMap, kFrontendMouseAxesMapDefault)) {
+    emitString(out, "MouseWAxesMap", s.mouseWAxesMap);
+  }
+  if (!keyEquals(s.mouseDAxesMap, kFrontendMouseAxesMapDefault)) {
+    emitString(out, "MouseDAxesMap", s.mouseDAxesMap);
+  }
+  if (!keyEquals(s.mouseWButtMap, kFrontendMouseButtMapDefault)) {
+    emitString(out, "MouseWButtMap", s.mouseWButtMap);
+  }
+  if (!keyEquals(s.mouseDButtMap, kFrontendMouseButtMapDefault)) {
+    emitString(out, "MouseDButtMap", s.mouseDButtMap);
+  }
+  // Entries 53-60: type-0 dword slots — emit iff bits differ.
+  const std::uint32_t wButt[4] = {s.mouseWButtMapA, s.mouseWButtMapB,
+                                  s.mouseWButtMapC, s.mouseWButtMapD};
+  const std::uint32_t dButt[4] = {s.mouseDButtMapA, s.mouseDButtMapB,
+                                  s.mouseDButtMapC, s.mouseDButtMapD};
+  const char* const wButtKey[4] = {"MouseWButtMapA", "MouseWButtMapB",
+                                   "MouseWButtMapC", "MouseWButtMapD"};
+  const char* const dButtKey[4] = {"MouseDButtMapA", "MouseDButtMapB",
+                                   "MouseDButtMapC", "MouseDButtMapD"};
+  for (int i = 0; i < 4; ++i) {
+    if (wButt[i] != kFrontendMouseButtDefaults[i]) {
+      emitInt(out, wButtKey[i], wButt[i]);
+    }
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (dButt[i] != kFrontendMouseButtDefaults[i]) {
+      emitInt(out, dButtKey[i], dButt[i]);
+    }
+  }
+  // Entries 61-66: type-1 floats — emit iff the float compare
+  // against the mirror differs (OBSERVED at 0x42620d).
+  if (s.mouseWXScale != kFrontendMouseXYScaleDefault)
+    emitFloat(out, "MouseWXScale", s.mouseWXScale);
+  if (s.mouseWYScale != kFrontendMouseXYScaleDefault)
+    emitFloat(out, "MouseWYScale", s.mouseWYScale);
+  if (s.mouseWZScale != kFrontendMouseZScaleDefault)
+    emitFloat(out, "MouseWZScale", s.mouseWZScale);
+  if (s.mouseDXScale != kFrontendMouseXYScaleDefault)
+    emitFloat(out, "MouseDXScale", s.mouseDXScale);
+  if (s.mouseDYScale != kFrontendMouseXYScaleDefault)
+    emitFloat(out, "MouseDYScale", s.mouseDYScale);
+  if (s.mouseDZScale != kFrontendMouseZScaleDefault)
+    emitFloat(out, "MouseDZScale", s.mouseDZScale);
+  // Entry 67: type-2 bool — mirror TRUE, so only FALSE emits.
+  if (!s.mouseOn) {
+    out += "MouseOn = FALSE\r\n";
+  }
+  // Entry 68: type-1 float slot written raw int32 by the screen —
+  // emit iff the float compare differs from 0.0f (OBSERVED quirk:
+  // a toggled-on value emits `1.4013e-45`, the denormal whose bits
+  // are 1; the original never emits `MouseYReversed = 1`).
+  if (std::bit_cast<float>(s.mouseYReversed) != 0.0f) {
+    emitFloat(out, "MouseYReversed",
+              std::bit_cast<float>(s.mouseYReversed));
+  }
+  if (s.skill != kFrontendSkillDefault) {
+    std::snprintf(line, sizeof(line), "Skill = %d\r\n", s.skill);
+    out += line;
+  }
+  if (s.brightness != kFrontendBrightnessDefault) {
+    std::snprintf(line, sizeof(line), "Brightness = %d\r\n",
+                  s.brightness);
+    out += line;
+  }
+  if (s.forcePCorrect) {
+    out += "ForcePCorrect = TRUE\r\n";
+  }
+  return out;
+}
 
 FrontendSettingsParse parseFrontendSettings(std::string_view text) {
   FrontendSettingsParse r;   // factory defaults first (FUN_00425de4)
@@ -161,6 +268,83 @@ FrontendSettingsParse parseFrontendSettings(std::string_view text) {
       r.settings.forcePCorrect =
           j < value.size() &&
           (value[j] == 'T' || value[j] == 't');
+    } else if (keyEquals(key, "MouseWAxesMap")) {
+      // Type-3 (OBSERVED): string copy of the value — NATIVE
+      // hardening bounds it via std::string (the original's strcpy
+      // into char[4] is unbounded; UNKNOWN edge, not reproduced).
+      r.settings.mouseWAxesMap = std::string(trim(value));
+    } else if (keyEquals(key, "MouseDAxesMap")) {
+      r.settings.mouseDAxesMap = std::string(trim(value));
+    } else if (keyEquals(key, "MouseWButtMap")) {
+      r.settings.mouseWButtMap = std::string(trim(value));
+    } else if (keyEquals(key, "MouseDButtMap")) {
+      r.settings.mouseDButtMap = std::string(trim(value));
+    } else if (keyEquals(key, "MouseWButtMapA") ||
+               keyEquals(key, "MouseWButtMapB") ||
+               keyEquals(key, "MouseWButtMapC") ||
+               keyEquals(key, "MouseWButtMapD") ||
+               keyEquals(key, "MouseDButtMapA") ||
+               keyEquals(key, "MouseDButtMapB") ||
+               keyEquals(key, "MouseDButtMapC") ||
+               keyEquals(key, "MouseDButtMapD")) {
+      // Type-0 (OBSERVED): leading int stored as raw dword bits —
+      // BUILD_A writes `MouseWButtMapD = 32768` (bit 15). NATIVE
+      // hardening: a failed parse is ignored and counted.
+      int v = 0;
+      if (!parseLeadingInt(value, &v)) {
+        ++r.ignoredMouseLines;
+        continue;
+      }
+      std::uint32_t* slot = nullptr;
+      if (keyEquals(key, "MouseWButtMapA")) slot = &r.settings.mouseWButtMapA;
+      else if (keyEquals(key, "MouseWButtMapB")) slot = &r.settings.mouseWButtMapB;
+      else if (keyEquals(key, "MouseWButtMapC")) slot = &r.settings.mouseWButtMapC;
+      else if (keyEquals(key, "MouseWButtMapD")) slot = &r.settings.mouseWButtMapD;
+      else if (keyEquals(key, "MouseDButtMapA")) slot = &r.settings.mouseDButtMapA;
+      else if (keyEquals(key, "MouseDButtMapB")) slot = &r.settings.mouseDButtMapB;
+      else if (keyEquals(key, "MouseDButtMapC")) slot = &r.settings.mouseDButtMapC;
+      else slot = &r.settings.mouseDButtMapD;
+      *slot = static_cast<std::uint32_t>(v);
+    } else if (keyEquals(key, "MouseWXScale") ||
+               keyEquals(key, "MouseWYScale") ||
+               keyEquals(key, "MouseWZScale") ||
+               keyEquals(key, "MouseDXScale") ||
+               keyEquals(key, "MouseDYScale") ||
+               keyEquals(key, "MouseDZScale")) {
+      // Type-1 (OBSERVED): atof-family leading float parse. NATIVE
+      // hardening: a failed parse is ignored and counted (the
+      // original's atof yields 0.0 — UNKNOWN edge, not reproduced).
+      float v = 0.0f;
+      if (!parseLeadingFloat(value, &v)) {
+        ++r.ignoredMouseLines;
+        continue;
+      }
+      if (keyEquals(key, "MouseWXScale")) r.settings.mouseWXScale = v;
+      else if (keyEquals(key, "MouseWYScale")) r.settings.mouseWYScale = v;
+      else if (keyEquals(key, "MouseWZScale")) r.settings.mouseWZScale = v;
+      else if (keyEquals(key, "MouseDXScale")) r.settings.mouseDXScale = v;
+      else if (keyEquals(key, "MouseDYScale")) r.settings.mouseDYScale = v;
+      else r.settings.mouseDZScale = v;
+    } else if (keyEquals(key, "MouseOn")) {
+      // Type-2 (OBSERVED): toupper(first value char) == 'T',
+      // unconditional — same contract as ForcePCorrect.
+      std::size_t j = 0;
+      while (j < value.size() && isSpace(value[j])) ++j;
+      r.settings.mouseOn =
+          j < value.size() &&
+          (value[j] == 'T' || value[j] == 't');
+    } else if (keyEquals(key, "MouseYReversed")) {
+      // Type-1 float slot (OBSERVED): atof into the float slot —
+      // BOTH file forms round-trip: `= 1` (hand edit) -> float
+      // 1.0f -> bits 0x3f800000 (nonzero = ON); `= 1.4013e-45`
+      // (writer's denormal for raw bits 1) -> bits 1 (ON). NATIVE
+      // hardening: a failed parse is ignored and counted.
+      float v = 0.0f;
+      if (!parseLeadingFloat(value, &v)) {
+        ++r.ignoredMouseLines;
+        continue;
+      }
+      r.settings.mouseYReversed = std::bit_cast<std::uint32_t>(v);
     }
     // Unknown keys are skipped — the original's apply loop only
     // touches table entries it knows.

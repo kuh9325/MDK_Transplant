@@ -25,8 +25,8 @@
 //     Formats: int `%s = %d`, bool `%s = TRUE`/`%s = FALSE`,
 //     string `%s = %s`, float `%s = %g`, hex `%s = 0x%X`.
 //
-//   This module reproduces that contract for the five proven
-//   entries only — deliberately not a general settings framework:
+//   This module reproduces that contract for the proven entries
+//   only — deliberately not a general settings framework:
 //     entry 8  SoundFX       int  DAT_00541308  factory 70 (@0x49b0fc)
 //     entry 9  SoundMusic    int  DAT_0054130c  factory 100 (@0x49b100)
 //     entry 88 Skill         int  DAT_0054147a  factory 1 (@0x49b26e)
@@ -35,6 +35,27 @@
 //   (Phase 4I adds entries 8/9 — the Sound screen's volume globals.
 //   Table order places them BEFORE Skill: the writer emits a dirty
 //   file with the SoundFX/SoundMusic lines first.)
+//
+//   Phase 4J adds the proven Mouse block, entries 49-68 (the Mouse
+//   screen mutates the W set; the D set is persisted so a dirty
+//   rewrite doesn't lose proven non-default lines like BUILD_A's
+//   `MouseDButtMapD = 32768`):
+//     49 MouseWAxesMap   type-3 char[4]  DAT_005413de  "ABG"
+//     50 MouseDAxesMap   type-3 char[4]  DAT_005413e2  "ABG"
+//     51 MouseWButtMap   type-3 char[5]  DAT_005413b4  "ACB"
+//     52 MouseDButtMap   type-3 char[5]  DAT_005413b9  "ACB"
+//     53-56 MouseWButtMapA..D type-0 dword DAT_005413be..ca {1,4,2,0}
+//     57-60 MouseDButtMapA..D type-0 dword DAT_005413ce..da {1,4,2,0}
+//     61-63 MouseWX/Y/ZScale   type-1 float DAT_005413e6..ee {16,16,50}
+//     64-66 MouseDX/Y/ZScale   type-1 float DAT_005413f2..fa {16,16,50}
+//     67 MouseOn         type-2 bool DAT_00541472  factory TRUE
+//     68 MouseYReversed  type-1 float DAT_00541476  factory 0.0f —
+//        the screen writes raw int32 0/1 into the float slot
+//        (OBSERVED quirk — a toggled-on value serializes as
+//        `MouseYReversed = 1.4013e-45`, the denormal for bits 1);
+//        the port stores the raw dword bits.
+//   Emission order is the table order: entries 49-68 sit between
+//   SoundMusic (9) and Skill (88).
 //   The file is written through the native-owned seam below, never
 //   inside the read-only DataRoot (the original's MDK.CFG paths are
 //   NOT reproduced: `original/installed/MDK.CFG` and anything under
@@ -43,6 +64,7 @@
 #ifndef MDK_CORE_FRONTEND_SETTINGS_H
 #define MDK_CORE_FRONTEND_SETTINGS_H
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -50,22 +72,54 @@
 
 namespace mdk {
 
-// Persisted frontend settings — the five proven table entries:
+// Persisted frontend settings — the proven table entries:
 // DAT_00541308 SoundFX (sound row-0 domain [0,100] step 10,
 // factory 70), DAT_0054130c SoundMusic (row-1, factory 100),
 // DAT_0054147a skill (domain [0,2], factory 1 = "Skill - Normal"),
 // DAT_0054147e brightness (display row-0 domain [0,7], factory 0),
-// DAT_00541482 ForcePCorrect (type-2 bool, factory FALSE).
+// DAT_00541482 ForcePCorrect (type-2 bool, factory FALSE), and the
+// Phase-4J Mouse block (entries 49-68 — see the header comment).
 // Field order below keeps the 4G/4H members first so existing
 // positional `FrontendSettings{skill}` initializers keep their
-// meaning; the SERIALIZER emits in original table order
-// (SoundFX, SoundMusic, Skill, Brightness, ForcePCorrect).
+// meaning; the SERIALIZER emits in original table order (SoundFX,
+// SoundMusic, the 49-68 Mouse block, Skill, Brightness,
+// ForcePCorrect).
+//
+// Mouse field shapes (OBSERVED storage): the axis-map and
+// button-map keys are type-3 string buffers; the ButtMapA..D keys
+// are type-0 dword slots stored as raw bits (BUILD_A writes
+// `MouseWButtMapD = 32768`); the scales are type-1 floats;
+// MouseOn is type-2; MouseYReversed is a type-1 float slot the
+// screen writes raw int32 0/1 into — the port keeps the raw dword
+// bits so both file forms (`= 1.4013e-45` after a toggle, `= 1`
+// if the user edits by hand) round-trip through the original
+// atof read.
 struct FrontendSettings {
   int skill = 1;
   int brightness = 0;
   bool forcePCorrect = false;
   int soundFx = 70;
   int soundMusic = 100;
+  std::string mouseWAxesMap = "ABG";
+  std::string mouseDAxesMap = "ABG";
+  std::string mouseWButtMap = "ACB";
+  std::string mouseDButtMap = "ACB";
+  std::uint32_t mouseWButtMapA = 1;
+  std::uint32_t mouseWButtMapB = 4;
+  std::uint32_t mouseWButtMapC = 2;
+  std::uint32_t mouseWButtMapD = 0;
+  std::uint32_t mouseDButtMapA = 1;
+  std::uint32_t mouseDButtMapB = 4;
+  std::uint32_t mouseDButtMapC = 2;
+  std::uint32_t mouseDButtMapD = 0;
+  float mouseWXScale = 16.0f;
+  float mouseWYScale = 16.0f;
+  float mouseWZScale = 50.0f;
+  float mouseDXScale = 16.0f;
+  float mouseDYScale = 16.0f;
+  float mouseDZScale = 50.0f;
+  bool mouseOn = true;
+  std::uint32_t mouseYReversed = 0;
 };
 
 inline constexpr int kFrontendSkillDefault = 1;       // @0x49b26e
@@ -78,6 +132,13 @@ inline constexpr int kFrontendSoundFxDefault = 70;    // @0x49b0fc
 inline constexpr int kFrontendSoundMusicDefault = 100;// @0x49b100
 inline constexpr int kFrontendSoundVolumeMin = 0;     // OBSERVED rows
 inline constexpr int kFrontendSoundVolumeMax = 100;   //   0..100
+// Mouse factories — entries 49-68 mirror bytes (@0x49b1ba..):
+inline constexpr std::string_view kFrontendMouseAxesMapDefault = "ABG";
+inline constexpr std::string_view kFrontendMouseButtMapDefault = "ACB";
+inline constexpr std::uint32_t kFrontendMouseButtDefaults[4] =
+    {1, 4, 2, 0};
+inline constexpr float kFrontendMouseXYScaleDefault = 16.0f;
+inline constexpr float kFrontendMouseZScaleDefault = 50.0f;
 
 // OBSERVED file head (`;` comment line + blank line, "\n\n" in the
 // original's text-mode write -> CRLF pairs on disk in BUILD_A).
@@ -86,10 +147,14 @@ inline constexpr int kFrontendSoundVolumeMax = 100;   //   0..100
 inline constexpr std::string_view kFrontendSettingsHeader =
     "; MDK Configuration file automatically generated by MDK";
 
-// FUN_004260ac's emission contract for the five proven entries
+// FUN_004260ac's emission contract for the proven entries
 // (OBSERVED): header + blank line, then non-default values in
 // table order — `SoundFX = %d` iff != 70, `SoundMusic = %d` iff
-// != 100, `Skill = %d` iff != 1, `Brightness = %d` iff != 0,
+// != 100, the entries-49-68 Mouse block iff each differs from its
+// mirror (strings fold-compared via FUN_0042fab4 — OBSERVED, so
+// "abg" counts as the "ABG" default and is NOT emitted; ints as
+// signed `%d`; floats as `%g`; `MouseOn = FALSE` when off), then
+// `Skill = %d` iff != 1, `Brightness = %d` iff != 0,
 // `ForcePCorrect = TRUE` iff != FALSE (the writer emits a value
 // only when the live dword differs from the mirror, so FALSE is
 // never emitted for the proven bool). Lines terminate CRLF —
@@ -98,7 +163,7 @@ inline constexpr std::string_view kFrontendSettingsHeader =
 // rather than host-dependent.
 std::string serializeFrontendSettings(const FrontendSettings& s);
 
-// FUN_00425de4's load contract for the five proven entries:
+// FUN_00425de4's load contract for the proven entries:
 // start from the factory defaults, apply `name = value` lines in
 // order (the last valid line for each key wins). `;`-led lines
 // and lines without a valid `name = value` shape are skipped like
@@ -114,12 +179,25 @@ std::string serializeFrontendSettings(const FrontendSettings& s);
 // it unconditionally as toupper(first value char) == 'T'
 // (FUN_0047d1a5 + `cmp 0x54`) — reproduced exactly, never
 // counted as ignored.
+//
+// Phase-4J Mouse block (OBSERVED per-type reads): type-3 map
+// strings are copied verbatim (NATIVE hardening: bounded — the
+// original's strcpy into fixed buffers is unbounded, UNKNOWN at
+// the overflow edge and deliberately not reproduced); type-0
+// ButtMapA..D parse a leading int stored as raw bits; type-1
+// scales parse a leading float (atof-family); `MouseOn` is type-2
+// (`T`-first-char, unconditional); `MouseYReversed` reads the
+// float slot so BOTH file forms round-trip — `1` (int-looking
+// hand edit) parses to float 1.0f, `1.4013e-45` parses to the
+// denormal; a failed scale/mask parse is ignored and counted in
+// `ignoredMouseLines` (NATIVE hardening).
 struct FrontendSettingsParse {
   FrontendSettings settings;
   int ignoredSkillLines = 0;
   int ignoredBrightnessLines = 0;
   int ignoredSoundFxLines = 0;
   int ignoredSoundMusicLines = 0;
+  int ignoredMouseLines = 0;
 };
 FrontendSettingsParse parseFrontendSettings(std::string_view text);
 

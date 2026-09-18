@@ -62,6 +62,7 @@
 #include "core/display_menu.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
+#include "core/mouse_menu.h"
 #include "core/options_menu.h"
 #include "core/sound_menu.h"
 
@@ -76,6 +77,7 @@ enum class FrontendScreen {
   Options,  // FUN_00420eac — mode 0x0b
   Display,  // FUN_0041d1e0 — mode 7 (Phase 4H)
   Sound,    // FUN_004233d8 — mode 2 (Phase 4I)
+  Mouse,    // FUN_004217e8 — mode 4 (Phase 4J)
 };
 
 // Phase 4G persistence seam — the native-owned counterpart of
@@ -119,6 +121,9 @@ public:
   // Valid only while screen() == Sound.
   SoundMenuController& sound() { return *sound_; }
   const SoundMenuController& sound() const { return *sound_; }
+  // Valid only while screen() == Mouse.
+  MouseMenuController& mouse() { return *mouse_; }
+  const MouseMenuController& mouse() const { return *mouse_; }
 
   // One frame: route the neutral input to the active controller.
   void update(const FrontendMenuInput& in);
@@ -131,12 +136,16 @@ public:
   //   options Sound       -> FUN_0042322c (enters the sound child)
   //   display Back        -> FUN_0041d144 (returns to options)
   //   sound   Back        -> FUN_00423280 (returns to options)
+  //   options Mouse       -> FUN_00421664 (enters the mouse child)
+  //   mouse   Back        -> FUN_004217e8 inline (mode 0x0b —
+  //                          returns to options, selection 3)
   // All other actions pass through to the caller unchanged (semantic
   // events only — downstream systems deferred).
   FrontendAction consumeRootAction();
   OptionsAction consumeOptionsAction();
   DisplayAction consumeDisplayAction();
   SoundAction consumeSoundAction();
+  MouseAction consumeMouseAction();
 
   // The front-end settings globals (DAT_0054147a / DAT_005414f4 /
   // DAT_0054147e / DAT_00541482 / DAT_00541308 / DAT_0054130c) live
@@ -147,6 +156,16 @@ public:
   bool forcePCorrect() const { return forcePCorrect_; }
   int soundFx() const { return soundFx_; }       // DAT_00541308
   int soundMusic() const { return soundMusic_; } // DAT_0054130c
+  // Mouse-screen settings globals (Phase 4J — the W set the screen
+  // mutates; DAT_005413de/0x5413be..ca/0x541472/0x541476).
+  bool mouseOn() const { return mouseOn_; }
+  std::uint32_t mouseYReversedBits() const { return mouseYRevBits_; }
+  const std::string& mouseAxesMap() const { return axesMap_; }
+  const std::array<std::uint32_t, kMouseButtonCount>& mouseButtMap()
+      const { return mouseButtMap_; }
+  const std::array<float, kMouseAxisCount>& mouseScales() const {
+    return mouseScales_;
+  }
   // DAT_00541486 — the shared settings-dirty flag (see returnToRoot).
   bool settingsDirty() const { return settingsDirty_; }
 
@@ -165,11 +184,14 @@ private:
   void returnToOptions();   // FUN_0041d144
   void enterSound();        // FUN_0042322c
   void returnToOptionsFromSound();  // FUN_00423280
+  void enterMouse();        // FUN_00421664
+  void returnToOptionsFromMouse();  // FUN_004217e8 inline (mode 0x0b)
 
   FrontendMenuController root_;
   std::optional<OptionsMenuController> options_;
   std::optional<DisplayMenuController> display_;
   std::optional<SoundMenuController> sound_;
+  std::optional<MouseMenuController> mouse_;
   FrontendScreen screen_ = FrontendScreen::Root;
   // DAT_0054147a — the post-config startup value (`initial`): the
   // FUN_00425de4 defaults copy yields factory 1 ("Skill - Normal"),
@@ -195,8 +217,26 @@ private:
   // later entries (FUN_00423280 leaves it wherever the frame
   // handler put it).
   int soundSelection_ = 0;
+  // Phase 4J mouse-screen settings globals — the post-config
+  // values the Mouse screen mutates (the W set). Same
+  // process-global lifetime as skill_/soundFx_: the child borrows
+  // them on FUN_00421664 entry and the mutated values flow back
+  // on the mode-0x0b return. DAT_00541472 bool, DAT_00541476 raw
+  // float-slot bits, DAT_005413de axes map, DAT_005413be..ca masks,
+  // DAT_005413e6..ee scales (read-only for this screen — marker
+  // divisors, never mutated by it).
+  bool mouseOn_;
+  std::uint32_t mouseYRevBits_;
+  std::string axesMap_;
+  std::array<std::uint32_t, kMouseButtonCount> mouseButtMap_;
+  std::array<float, kMouseAxisCount> mouseScales_;
   bool settingsDirty_ = false;  // DAT_00541486 — canonical 0 (inside
                                 // the factory-defaults copy block)
+  // The full post-config settings — the persist emit starts from
+  // this so mouse fields the screen never touches (the D set, the
+  // map-string keys, scales as loaded) round-trip instead of
+  // silently reverting to factory defaults on a dirty rewrite.
+  FrontendSettings baseSettings_;
   SettingsPersistSink persistSink_;  // FUN_004260ac seam — see above
   // Sound-screen audio events collected at controller destruction
   // (the exit frame's SongStop/AmbientSongStart) — merged into

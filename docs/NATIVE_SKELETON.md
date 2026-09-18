@@ -68,16 +68,23 @@ rows + the two volume rows (scaled FONTBIG label, inclusive fill
 bar, `0%`/`100%` FONTSML endpoints) + centered `SND_DONE` +
 `ARROW` under the inherited options palette head; requires
 `--data-path`),
-`--interactive-frontend` (Phase 4E/4F/4G/4H/4I: run the reconstructed
+`--preview-mouse-submenu` (Phase 4J: compose the static Mouse
+child frame — framebuffer clear + the four `JOY_*`/`M_*` left
+rows + the `JOY_B` 4×16 button-binding grid + three axis bars +
+the test indicator + `ARROW`, all FONTSML under the inherited
+options palette head; requires `--data-path`),
+`--interactive-frontend` (Phase 4E/4F/4G/4H/4I/4J: run the reconstructed
 FUN_0041dc90 root-menu controller, flowing into the FUN_00420eac
 options sub-menu on `OpenOptions`, into the FUN_0041d1e0
-Display child on the row-7 action, and into the FUN_004233d8
-Sound child on the row-1 action — original-style UP/DOWN/LEFT/
+Display child on the row-7 action, into the FUN_004233d8
+Sound child on the row-1 action, and into the FUN_004217e8
+Mouse child on the row-3 action — original-style UP/DOWN/LEFT/
 RIGHT selection with key repeat, gated mouse hit-test, scale ramp,
 Skill row mutation, Brightness/ForcePCorrect child mutations,
 SoundFX/SoundMusic child mutations + dirty latch, semantic
-audio-trigger events (no playback), Esc/Quit/Done unwind
-Display/Sound → Options → Root; requires
+audio-trigger events (no playback), Mouse axis-letter cycling +
+button-binding exclusivity + blink bracket, Esc/Quit/Done unwind
+Display/Sound/Mouse → Options → Root; requires
 `--data-path`). `--frontend-root-only` is a test-only switch that
 keeps `OpenOptions` deferred so the Phase 4E single-screen
 regression snapshot stays reproducible. `--settings-file FILE`
@@ -133,23 +140,34 @@ src/
                                   semantic audio-trigger events
                                   (FUN_0042322c/FUN_004233d8/
                                   FUN_00423280, 4I)
+             mouse_menu.*       — Mouse child controller +
+                                  static/dynamic renderers +
+                                  axis-letter cycler + button-bit
+                                  exclusivity + blink bracket
+                                  (FUN_00421664/FUN_004217e8 +
+                                  FUN_004216a0/FUN_00421774/
+                                  FUN_00414b28, 4J)
              frontend_palette.h — shared FUN_0046d208 upload
                                   brightness lift (4H)
-             frontend_flow.*    — four-screen flow controller:
+             frontend_flow.*    — five-screen flow controller:
                                   FUN_00420cf0 enter options,
                                   FUN_0041d020 enter display,
                                   FUN_0042322c enter sound,
-                                  FUN_0041d144/FUN_00423280 back
-                                  to options, FUN_00420d68 return
+                                  FUN_00421664 enter mouse,
+                                  FUN_0041d144/FUN_00423280/mode-0x0b
+                                  back to options, FUN_00420d68 return
                                   to root + dirty-gated persist
-                                  sink (4F/4G/4H/4I)
+                                  sink (4F/4G/4H/4I/4J)
              frontend_settings.*— native-owned settings persistence:
                                   FrontendSettings (SoundFX/
                                   SoundMusic/Skill/Brightness/
-                                  ForcePCorrect) + serialize/parse/
+                                  ForcePCorrect + the Mouse block —
+                                  axis maps, button masks, scales,
+                                  MouseOn, MouseYReversed raw bits)
+                                  + serialize/parse/
                                   file seam — caller-supplied
                                   path, never under --data-path
-                                  (4G/4H/4I)
+                                  (4G/4H/4I/4J)
   input/     input_state.*       — neutral per-frame input state (no SDL)
   platform/  sdl_host.*          — SDL3 init/window/event-pump/rel-mouse
   renderer/  presenter.h         — presentation backend interface
@@ -261,7 +279,7 @@ uploaded to Metal).
 ## Current limitations / non-goals
 
 - No gameplay, no levels, no enemies, no collision, no audio, no video.
-- Runtime original-data use is limited to the Phase 4A–4I
+- Runtime original-data use is limited to the Phase 4A–4J
   front-end paths:
   one named record from one BNI file (`--preview-resource`), decoded by
   the proven paletted-bitmap layout or — for `STREAM/STREAM.BNI BG`
@@ -280,8 +298,11 @@ uploaded to Metal).
   action with its Brightness/ForcePCorrect mutations, and into
   the FUN_004233d8 Sound child on the row-1 action with its
   SoundFX/SoundMusic mutations + the semantic audio-trigger events
-  (structure-verified `MISC/MDKSOUND.SNI`, no playback) + the
-  native-owned persistence seam — the other child screens deferred)
+  (structure-verified `MISC/MDKSOUND.SNI`, no playback), and into
+  the FUN_004217e8 Mouse child on the row-3 action with its
+  axis-letter cycling / button-binding exclusivity / MouseOn /
+  MouseYReversed-raw-bits mutations + the native-owned
+  persistence seam — the other child screens deferred)
   — see `ENGINE_RECONSTRUCTION.md`. Metadata-only interior parsers for
   `.SNI/.MTI/.MTO/.CMI/.DTI/.FTI/.BNI` exist in `mdk_core`/
   `mdk-inspect` (Phases 3C–3H). `.LBB/.SAV/.FLC/.MVE` remain unparsed.

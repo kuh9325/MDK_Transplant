@@ -180,7 +180,7 @@ void SdlHost::isolateHardwareInputForSelftest() {
 
 void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
                                        bool rootOnly) {
-  const std::uint64_t lastStep = rootOnly ? 3 : 35;
+  const std::uint64_t lastStep = rootOnly ? 3 : 48;
   if (!window_ || frameIndex > lastStep) {
     return;
   }
@@ -353,6 +353,59 @@ void SdlHost::pushFrontendSelfTestStep(std::uint64_t frameIndex,
     break;
   case 35: // ESC tap: options Back -> root; dirty cleared by
           // persist #3 -> no persist call.
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  // ---- Phase 4J mouse leg (frames 36..48) ----
+  case 36: // Enter tap: root sel 3 -> options entry 6 (mouse
+          // 300,90 -> options sel 8).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 37: // Arrow y=90 -> 140: options band 3 — the Mouse row
+          // (trunc((140-23)/36) = 3).
+    motion(50.0f);
+    break;
+  case 38: // Enter tap: activate row 3 -> FUN_00421664 -> mouse
+          // child entered (DAT_0054bd40/38 reset -> sel 0 col 0).
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 39: // DOWN tap: mouse selection 0 -> 1 (the MouseOn row).
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+    break;
+  case 40: // Enter tap: activate row 1 -> MouseOn toggle
+          // (TRUE -> FALSE), dirty.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 41: // DOWN tap: selection 1 -> 2 (the MouseYReversed row).
+    keyTap(SDL_SCANCODE_DOWN, SDLK_DOWN);
+    break;
+  case 42: // RIGHT tap: row 2 -> MouseYReversed raw bits 0 -> 1
+          // (the float-slot denormal quirk), dirty.
+    keyTap(SDL_SCANCODE_RIGHT, SDLK_RIGHT);
+    break;
+  case 43: // Arrow y=140 -> 45 with x=300 >= 250: grid band 0
+          // (trunc((45-33)/16) = 0 -> sel 7), column clamps to 0.
+    motion(-95.0f);
+    break;
+  case 44: // Enter tap: activate grid row 0 -> FUN_00421774 toggles
+          // bit 0 of MouseWButtMapA through the exclusivity table
+          // (factory mask 1 -> 0), dirty.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 45: // ESC tap: silent exit — DAT_00541493 = 0x0b + RET,
+          // options resumes with selection 3 (the Mouse row).
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 46: // ESC tap: options Back -> FUN_00420d68 -> dirty persist
+          // fires (persist #4: all settings incl. the W-set mouse
+          // mutations).
+    keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
+    break;
+  case 47: // Enter tap: root sel 3 -> options entry 7 — proves the
+          // mutated mouse tuple survives process-lifetime.
+    keyTap(SDL_SCANCODE_RETURN, SDLK_RETURN);
+    break;
+  case 48: // ESC tap: options Back -> root; dirty cleared by
+          // persist #4 -> no persist call.
     keyTap(SDL_SCANCODE_ESCAPE, SDLK_ESCAPE);
     break;
   default:

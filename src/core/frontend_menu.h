@@ -156,6 +156,9 @@ enum class FrontendAction {
 //                         DAT_0054b570). Options sub-menu only.
 //   mouseDx / mouseDy   : raw per-frame mouse deltas (DAT_0054b644/48;
 //                         no sensitivity scaling in the original).
+//   mouseDz             : third DIMOUSESTATE axis delta
+//                         (DAT_0054b64c — the wheel; the mouse
+//                         child's Z-axis indicator reads it).
 //   mouseButtons        : 4-bit nibble, bit i = button i+1 held
 //                         (bit0 left, bit1 right, bit2 middle, bit3 btn4;
 //                         the original polls a DIMOUSESTATE and packs
@@ -170,6 +173,7 @@ struct FrontendMenuInput {
   bool cancelEdge = false;
   int mouseDx = 0;
   int mouseDy = 0;
+  int mouseDz = 0;
   std::uint8_t mouseButtons = 0;
 };
 

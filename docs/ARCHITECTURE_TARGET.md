@@ -114,10 +114,24 @@ Boundary notes (intentions, not commitments):
 > `FUN_00423280` return that resumes options at selection 1 —
 > with the proven `OPTSONG`/`OPTBUTT`/ambient-song triggers
 > emitted as semantic `SoundAudioEvent`s (actual playback
-> deferred). The flow is now Root → Options → {Display|Sound}
-> → Options → Root and the settings seam persists all five
-> proven entries (SoundFX, SoundMusic, Skill, Brightness,
-> ForcePCorrect — table order) on the options exit.
+> deferred). Phase 4J adds the third real child screen:
+> `MouseMenuController` (`mouse_menu.*`) reproduces
+> `FUN_004217e8` entered via `FUN_00421664` from options row 3 —
+> the 23-row machine (four `JOY_*`/`M_*` left rows + the `JOY_B`
+> 4×16 button-binding grid + three axis bars + the test
+> indicator), the truncated-toward-zero hit-test bands, the
+> axis-letter cycler (`'0'`,`'A'`–`'H'`, bounded repair), the
+> button-bit exclusivity table, the `FUN_00414b28` blink
+> bracket, and the inline mode-0x0b return that resumes options
+> at selection 3. Mouse mutates settings-table entries 49–68
+> only — `MouseOn`, the `MouseYReversed` float slot toggled
+> through raw integer bits (denormal `1.4013e-45` emission
+> preserved), the W-set axis/button maps — while the flow
+> overlays them on `baseSettings_` so the D-set/scales round-
+> trip untouched. The flow is now Root → Options →
+> {Display|Sound|Mouse} → Options → Root and the settings
+> seam persists all proven entries in table order on the
+> options exit.
 > See `ENGINE_RECONSTRUCTION.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they

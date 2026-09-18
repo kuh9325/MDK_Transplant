@@ -7,6 +7,7 @@
 #include "core/compat.h"
 #include "core/data_root.h"
 #include "core/display_menu.h"
+#include "core/mouse_menu.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/frontend_flow.h"
@@ -389,6 +390,18 @@ struct FrontendResources {
   std::string sndDone;                   // SND_DONE
   std::string sndEnd100;                 // SND_100
   std::string sndEnd0;                   // SND_0
+  // Phase 4J mouse child (FUN_004217e8): the JOY_*/M_* records —
+  // same NUL-terminated string shape, all drawn FONTSML.
+  std::string mouseTest;                 // JOY_TEST
+  std::string mouseEnabled;              // M_ENA
+  std::string mouseDisabled;             // M_DIS
+  std::string mouseReversed;             // M_REV
+  std::string mouseNormal;               // M_NORM
+  std::string mouseQuit;                 // JOY_QUIT
+  std::string mouseButtons;              // JOY_B (grid header)
+  std::array<std::string, kMouseGridRows> mouseActions;   // JOY_BA..BP
+  std::array<std::string, 9> mouseAxisNames; // JOY_A0 + JOY_AA..AH
+  std::array<std::string, kMouseAxisCount> mouseAxisCaps; // JOY_AX0..2
   std::array<std::byte, 192> sysPalHead{};  // SYS_PAL record head
   bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
 };
@@ -551,6 +564,37 @@ static bool loadFrontendResources(DataRoot& root, FrontendResources& res,
       !loadCStr(kSoundEnd100Record, res.sndEnd100) ||
       !loadCStr(kSoundEnd0Record, res.sndEnd0)) {
     return false;
+  }
+
+  // Phase 4J: JOY_*/M_* records — same NUL-terminated string shape.
+  // Grid rows resolve "JOY_B%c" ('A'+r -> JOY_BA..BP), axis actions
+  // "JOY_A%c" (JOY_A0 for '0'/invalid, JOY_AA..AH), captions
+  // "JOY_AX%d" (0..2) — the same resolution the frame handler's
+  // sprintf calls perform (OBSERVED literals).
+  if (!loadCStr(kMouseTestRecord, res.mouseTest) ||
+      !loadCStr(kMouseEnabledRecord, res.mouseEnabled) ||
+      !loadCStr(kMouseDisabledRecord, res.mouseDisabled) ||
+      !loadCStr(kMouseReversedRecord, res.mouseReversed) ||
+      !loadCStr(kMouseNormalRecord, res.mouseNormal) ||
+      !loadCStr(kMouseQuitRecord, res.mouseQuit) ||
+      !loadCStr(kMouseButtonsRecord, res.mouseButtons)) {
+    return false;
+  }
+  for (int r = 0; r < kMouseGridRows; ++r) {
+    char name[8];
+    std::snprintf(name, sizeof(name), "JOY_B%c", 'A' + r);
+    if (!loadCStr(name, res.mouseActions[r])) return false;
+  }
+  if (!loadCStr("JOY_A0", res.mouseAxisNames[0])) return false;
+  for (int i = 0; i < 8; ++i) {
+    char name[8];
+    std::snprintf(name, sizeof(name), "JOY_A%c", 'A' + i);
+    if (!loadCStr(name, res.mouseAxisNames[i + 1])) return false;
+  }
+  for (int i = 0; i < kMouseAxisCount; ++i) {
+    char name[8];
+    std::snprintf(name, sizeof(name), "JOY_AX%d", i);
+    if (!loadCStr(name, res.mouseAxisCaps[i])) return false;
   }
 
   // SYS_PAL head — the resident system palette whose head fills
@@ -814,6 +858,65 @@ static bool loadSoundSubmenuPreview(DataRoot& root,
   return true;
 }
 
+// Phase 4J mouse child preview: compose the proven static
+// FUN_004217e8 entry frame — cleared framebuffer + the four left
+// rows (JOY_TEST/M_ENA/M_NORM/JOY_QUIT at factory MouseOn=TRUE,
+// MouseYReversed=0) + the JOY_B header and 4x16 button-map cell
+// grid + three axis bars (centered markers at zero deltas) + the
+// test indicator + ARROW at the (unchanged) logical mouse — all
+// FONTSML under the inherited options palette (SYS_PAL head +
+// zeroed tail; the screen uploads no palette of its own). Entry
+// resets selection and grid column to 0 (FUN_00421664).
+// Fills `err` -> false on failure.
+static bool loadMouseSubmenuPreview(DataRoot& root,
+                                    IndexedFramebuffer& fb,
+                                    Palette& palette,
+                                    std::string* err) {
+  FrontendResources res;
+  if (!loadFrontendResources(root, res, err)) {
+    return false;
+  }
+  const MouseMenuSpec spec;  // canonical entry state
+  MouseMenuLabels labels;
+  labels.test = res.mouseTest;
+  labels.enabled = res.mouseEnabled;
+  labels.disabled = res.mouseDisabled;
+  labels.reversed = res.mouseReversed;
+  labels.normal = res.mouseNormal;
+  labels.quit = res.mouseQuit;
+  labels.buttons = res.mouseButtons;
+  for (int r = 0; r < kMouseGridRows; ++r) {
+    labels.actions[r] = res.mouseActions[r];
+  }
+  for (int i = 0; i < 9; ++i) {
+    labels.axisNames[i] = res.mouseAxisNames[i];
+  }
+  for (int i = 0; i < kMouseAxisCount; ++i) {
+    labels.axisCaptions[i] = res.mouseAxisCaps[i];
+  }
+  std::string derr;
+  if (!renderMouseMenuFrame(fb, palette, res.fontSml,
+                            *res.arrow.frame(0), labels,
+                            res.sysPalHead, spec, &derr)) {
+    *err = "mouse sub-menu preview: compose — " + derr;
+    return false;
+  }
+
+  const std::uint64_t fbDigest = digestIndexedFb(fb);
+  const std::uint64_t palDigest = digestPalette(palette);
+  log::info(kTag,
+            "mouse sub-menu preview: JOY_* %dx%d sel=%d col=%d "
+            "on=%d yrev=%d | FONTSML digest=%016llx | ARROW "
+            "digest=%016llx | composed fb=%016llx palette=%016llx",
+            fb.width(), fb.height(), spec.selection, spec.column,
+            spec.mouseOn ? 1 : 0, spec.mouseYReversedBits != 0 ? 1 : 0,
+            static_cast<unsigned long long>(ftiFontDigest(res.fontSml)),
+            static_cast<unsigned long long>(ftiSpriteDigest(res.arrow)),
+            static_cast<unsigned long long>(fbDigest),
+            static_cast<unsigned long long>(palDigest));
+  return true;
+}
+
 // Phase 4E — translate the platform InputState into the controller's
 // semantic per-frame input. Original reference points:
 //   prevHeld/nextHeld : DIK_UP/DIK_DOWN with the original keymap's
@@ -847,6 +950,11 @@ static FrontendMenuInput frontendInputFromSdl(const InputState& input) {
   fi.rightHeld = input.keyDown(SDL_SCANCODE_RIGHT) || rightPress;
   fi.mouseDx = static_cast<int>(input.mouseDx());
   fi.mouseDy = static_cast<int>(input.mouseDy());
+  // DIMOUSESTATE.lZ — the wheel axis the Mouse child's Z indicator
+  // reads (DAT_0054b64c). DirectInput reports ±WHEEL_DELTA (120)
+  // per detent; SDL gives ±1 integer tick per notch — scale by 120
+  // to keep the original's device-delta domain (Phase 4J).
+  fi.mouseDz = input.wheelTicksY() * 120;
   fi.mouseButtons = static_cast<std::uint8_t>(
       (input.mouseButtonDown(SDL_BUTTON_LEFT) ? 0x1 : 0) |
       (input.mouseButtonDown(SDL_BUTTON_RIGHT) ? 0x2 : 0) |
@@ -893,6 +1001,13 @@ static const char* displayActionName(DisplayAction a) {
 static const char* soundActionName(SoundAction a) {
   switch (a) {
   case SoundAction::Back: return "Back";
+  default: return "None";
+  }
+}
+
+static const char* mouseActionName(MouseAction a) {
+  switch (a) {
+  case MouseAction::Back: return "Back";
   default: return "None";
   }
 }
@@ -1009,6 +1124,24 @@ int Application::run() {
   std::uint64_t soundLastFbDigest = 0;
   std::uint64_t soundLastPalDigest = 0;
   std::vector<SoundAudioEvent> audioEventLog;
+  // Phase 4J mouse child observability: entry state (DAT_0054bd40
+  // IS reset at FUN_00421664 — always 0), the options selection on
+  // resume (row 3), drawn-frame digests, and the loaded/persisted
+  // W-set values for the verdict.
+  bool mouseEntered = false;
+  int mouseEntrySelection = -1;      // DAT_0054bd40 seen at entry
+  int mouseResumeSelection = -1;     // _DAT_0054bd34 after the exit
+  int mouseFramesDrawn = 0;
+  std::uint64_t mouseLastFbDigest = 0;
+  std::uint64_t mouseLastPalDigest = 0;
+  bool settingsInitialMouseOn = true;   // post-config (factory TRUE)
+  std::uint32_t settingsInitialMouseYRev = 0;  // raw float-slot bits
+  std::string settingsInitialAxesMap = "ABG";  // W axes map
+  std::uint32_t settingsInitialButtA = 1;      // MouseWButtMapA
+  int settingsPersistedMouseOn = -1;
+  std::uint32_t settingsPersistedMouseYRev = 0;
+  std::string settingsPersistedAxesMap;
+  std::uint32_t settingsPersistedButtA = 0;
 
   // Phase 4A preview mode: one proven original visual resource
   // decoded into the indexed framebuffer, then presented unchanged
@@ -1021,6 +1154,7 @@ int Application::run() {
                            cfg_.optionsSubmenuPreview ||
                            cfg_.displaySubmenuPreview ||
                            cfg_.soundSubmenuPreview ||
+                           cfg_.mouseSubmenuPreview ||
                            cfg_.interactiveFrontend;
   if (cfg_.previewFile) {
     if (!dataRoot) {
@@ -1106,6 +1240,18 @@ int Application::run() {
                  perr.c_str());
       return 2;
     }
+  } else if (cfg_.mouseSubmenuPreview) {
+    if (!dataRoot) {
+      log::error(kTag,
+                 "--preview-mouse-submenu requires --data-path");
+      return 2;
+    }
+    std::string perr;
+    if (!loadMouseSubmenuPreview(*dataRoot, fb, palette, &perr)) {
+      log::error(kTag, "mouse sub-menu preview failed: %s",
+                 perr.c_str());
+      return 2;
+    }
   } else if (cfg_.interactiveFrontend) {
     if (!dataRoot) {
       log::error(kTag, "--interactive-frontend requires --data-path");
@@ -1142,17 +1288,27 @@ int Application::run() {
           settingsInitialBrightness = initialSettings.brightness;
           settingsInitialPcorrect =
               initialSettings.forcePCorrect ? 1 : 0;
+          settingsInitialMouseOn = initialSettings.mouseOn;
+          settingsInitialMouseYRev = initialSettings.mouseYReversed;
+          settingsInitialAxesMap = initialSettings.mouseWAxesMap;
+          settingsInitialButtA = initialSettings.mouseWButtMapA;
           log::info(kTag,
                     "settings: loaded %s (skill=%d brightness=%d "
-                    "pcorrect=%d fx=%d mus=%d ignored=%d,%d,%d,%d)",
+                    "pcorrect=%d fx=%d mus=%d mouseOn=%d yrev=%u "
+                    "axes=%s buttA=%u ignored=%d,%d,%d,%d,%d)",
                     cfg_.settingsFile->string().c_str(),
                     initialSettings.skill, initialSettings.brightness,
                     initialSettings.forcePCorrect ? 1 : 0,
                     initialSettings.soundFx, initialSettings.soundMusic,
+                    initialSettings.mouseOn ? 1 : 0,
+                    initialSettings.mouseYReversed,
+                    initialSettings.mouseWAxesMap.c_str(),
+                    initialSettings.mouseWButtMapA,
                     loaded->ignoredSkillLines,
                     loaded->ignoredBrightnessLines,
                     loaded->ignoredSoundFxLines,
-                    loaded->ignoredSoundMusicLines);
+                    loaded->ignoredSoundMusicLines,
+                    loaded->ignoredMouseLines);
         } else {
           log::warn(kTag, "settings: %s — %s; factory defaults",
                     cfg_.settingsFile->string().c_str(),
@@ -1167,6 +1323,10 @@ int Application::run() {
         settingsPersistedForcePCorrect = s.forcePCorrect ? 1 : 0;
         settingsPersistedSoundFx = s.soundFx;
         settingsPersistedSoundMusic = s.soundMusic;
+        settingsPersistedMouseOn = s.mouseOn ? 1 : 0;
+        settingsPersistedMouseYRev = s.mouseYReversed;
+        settingsPersistedAxesMap = s.mouseWAxesMap;
+        settingsPersistedButtA = s.mouseWButtMapA;
         if (!cfg_.settingsFile) {
           // No writable location configured — the FUN_004260ac
           // silent-failure analogue: process-lifetime only.
@@ -1246,9 +1406,9 @@ int Application::run() {
       host.injectSelfTestEvents();
     }
     if (cfg_.frames == 0) {
-      // Phase 4I four-screen script: 36 steps (0..35) — the run
+      // Phase 4J five-screen script: 49 steps (0..48) — the run
       // quits right after the last injected step.
-      cfg_.frames = frontendFlow ? 36 : 10;
+      cfg_.frames = frontendFlow ? 49 : 10;
     }
   }
 
@@ -1288,6 +1448,8 @@ int Application::run() {
                 ? frontendFlow->display().frameEndedEarly()
             : frontendFlow->screen() == FrontendScreen::Sound
                 ? frontendFlow->sound().frameEndedEarly()
+            : frontendFlow->screen() == FrontendScreen::Mouse
+                ? frontendFlow->mouse().frameEndedEarly()
             : frontendFlow->inOptions()
                 ? frontendFlow->options().frameEndedEarly()
                 : frontendFlow->root().frameEndedEarly();
@@ -1326,6 +1488,35 @@ int Application::run() {
               fb, palette, frontendRes->fontBig, frontendRes->fontSml,
               *frontendRes->arrow.frame(0), labels,
               frontendRes->sysPalHead, frontendFlow->sound(),
+              frontendFlow->brightness(), &rerr);
+        } else if (frontendFlow &&
+                   frontendFlow->screen() == FrontendScreen::Mouse) {
+          // Phase 4J mouse frame: cleared buffer + left rows + the
+          // 4x16 button grid + axis bars/markers + test indicator +
+          // ARROW — all FONTSML under the inherited options palette
+          // (FUN_004217e8 draw block; the blink bracket advances
+          // DAT_0049a770 once per flagged draw).
+          MouseMenuLabels labels;
+          labels.test = frontendRes->mouseTest;
+          labels.enabled = frontendRes->mouseEnabled;
+          labels.disabled = frontendRes->mouseDisabled;
+          labels.reversed = frontendRes->mouseReversed;
+          labels.normal = frontendRes->mouseNormal;
+          labels.quit = frontendRes->mouseQuit;
+          labels.buttons = frontendRes->mouseButtons;
+          for (int r = 0; r < kMouseGridRows; ++r) {
+            labels.actions[r] = frontendRes->mouseActions[r];
+          }
+          for (int i = 0; i < 9; ++i) {
+            labels.axisNames[i] = frontendRes->mouseAxisNames[i];
+          }
+          for (int i = 0; i < kMouseAxisCount; ++i) {
+            labels.axisCaptions[i] = frontendRes->mouseAxisCaps[i];
+          }
+          rok = renderMouseMenuDynamic(
+              fb, palette, frontendRes->fontSml,
+              *frontendRes->arrow.frame(0), labels,
+              frontendRes->sysPalHead, frontendFlow->mouse(),
               frontendFlow->brightness(), &rerr);
         } else if (frontendFlow && frontendFlow->inOptions()) {
           // Phase 4F options frame: cleared buffer + OM_* labels +
@@ -1371,6 +1562,13 @@ int Application::run() {
           soundLastPalDigest = digestPalette(palette);
           ++soundFramesDrawn;
         }
+        if (cfg_.selftest && frontendFlow &&
+            frontendFlow->screen() == FrontendScreen::Mouse) {
+          // Same for the mouse child — the post-mutation snapshot.
+          mouseLastFbDigest = digestIndexedFb(fb);
+          mouseLastPalDigest = digestPalette(palette);
+          ++mouseFramesDrawn;
+        }
         // FUN_0042fe78/FUN_0042fb68 timing update — the tail of the
         // drawn frame only. --selftest feeds the original's paced
         // regime (100/3 ms per frame — rawDelta 4, step 1) so the
@@ -1385,6 +1583,8 @@ int Application::run() {
           frontendFlow->display().endFrame(frontDtMs);
         } else if (frontendFlow->screen() == FrontendScreen::Sound) {
           frontendFlow->sound().endFrame(frontDtMs);
+        } else if (frontendFlow->screen() == FrontendScreen::Mouse) {
+          frontendFlow->mouse().endFrame(frontDtMs);
         } else if (frontendFlow->inOptions()) {
           frontendFlow->options().endFrame(frontDtMs);
         } else {
@@ -1457,6 +1657,33 @@ int Application::run() {
                     frontendFlow->soundFx(),
                     frontendFlow->soundMusic());
         }
+      } else if (frontendFlow->screen() == FrontendScreen::Mouse) {
+        const MouseAction a = frontendFlow->consumeMouseAction();
+        if (a != MouseAction::None) {
+          log::info(kTag, "mouse action: %s (sel=%d col=%d mouse=%d,%d)",
+                    mouseActionName(a),
+                    frontendFlow->mouse().selection(),
+                    frontendFlow->mouse().column(),
+                    frontendFlow->mouse().mouseX(),
+                    frontendFlow->mouse().mouseY());
+        }
+        if (frontendFlow->screen() == FrontendScreen::Options) {
+          // Esc/row-3 consumed -> mode 0x0b -> options resumed at
+          // the Mouse row (sel 3 — _DAT_0054bd34 untouched).
+          mouseResumeSelection = frontendFlow->options().selection();
+          log::info(kTag,
+                    "front-end flow: mouse -> options (resume "
+                    "sel=%d mouse=%d,%d dirty=%d on=%d yrev=%u "
+                    "axes=%s buttA=%u)",
+                    mouseResumeSelection,
+                    frontendFlow->options().mouseX(),
+                    frontendFlow->options().mouseY(),
+                    frontendFlow->options().settingsDirty() ? 1 : 0,
+                    frontendFlow->mouseOn() ? 1 : 0,
+                    frontendFlow->mouseYReversedBits(),
+                    frontendFlow->mouseAxesMap().c_str(),
+                    frontendFlow->mouseButtMap()[0]);
+        }
       } else if (frontendFlow->inOptions()) {
         // Record the dirty flag consumed by FUN_00420d68 before the
         // transition eats it — the persist gate for this exit.
@@ -1501,6 +1728,23 @@ int Application::run() {
                     frontendFlow->sound().soundFx(),
                     frontendFlow->sound().soundMusic(),
                     frontendFlow->sound().settingsDirty() ? 1 : 0);
+        } else if (frontendFlow->screen() == FrontendScreen::Mouse) {
+          // Mouse consumed -> FUN_00421664 -> child entered.
+          // DAT_0054bd40/38 ARE reset at entry — always 0.
+          mouseEntered = true;
+          mouseEntrySelection = frontendFlow->mouse().selection();
+          log::info(kTag,
+                    "front-end flow: options -> mouse (entry "
+                    "sel=%d col=%d mouse=%d,%d on=%d yrev=%u "
+                    "axes=%s dirty=%d)",
+                    mouseEntrySelection,
+                    frontendFlow->mouse().column(),
+                    frontendFlow->mouse().mouseX(),
+                    frontendFlow->mouse().mouseY(),
+                    frontendFlow->mouseOn() ? 1 : 0,
+                    frontendFlow->mouseYReversedBits(),
+                    frontendFlow->mouseAxesMap().c_str(),
+                    frontendFlow->options().settingsDirty() ? 1 : 0);
         } else if (frontendFlow->screen() == FrontendScreen::Root) {
           // Back/Esc consumed -> FUN_00420d68 -> root restored.
           frontendReturnedToRoot = true;
@@ -1566,6 +1810,9 @@ int Application::run() {
     const bool inSnd =
         frontendFlow &&
         frontendFlow->screen() == FrontendScreen::Sound;
+    const bool inMse =
+        frontendFlow &&
+        frontendFlow->screen() == FrontendScreen::Mouse;
     log::info(kTag,
               "interactive front-end last frame: fb=%016llx "
               "palette=%016llx screen=%s sel=%d skill=%d "
@@ -1573,9 +1820,11 @@ int Application::run() {
               static_cast<unsigned long long>(digestIndexedFb(fb)),
               static_cast<unsigned long long>(digestPalette(palette)),
               inDisp ? "display" : inSnd ? "sound"
+                     : inMse ? "mouse"
                      : inOpts ? "options" : "root",
               inDisp ? frontendFlow->display().selection()
               : inSnd ? frontendFlow->sound().selection()
+              : inMse ? frontendFlow->mouse().selection()
               : inOpts ? frontendFlow->options().selection()
                      : (frontendCtl ? frontendCtl->selection()
                                     : frontendFlow->root().selection()),
@@ -1583,6 +1832,7 @@ int Application::run() {
               frontendFlow ? frontendFlow->brightness() : 0,
               inDisp ? frontendFlow->display().rampAccumulator()
               : inSnd ? frontendFlow->sound().rampAccumulator()
+              : inMse ? 0.0f
               : inOpts ? frontendFlow->options().rampAccumulator()
                      : (frontendCtl
                             ? frontendCtl->rampAccumulator()
@@ -1643,24 +1893,39 @@ int Application::run() {
     // one toggle on row 1 — computed from the loaded start.
     const int expectedBright = (settingsInitialBrightness + 2) % 8;
     const int expectedPcorrect = settingsInitialPcorrect ? 0 : 1;
-    // Five options entries: initial config, post-persist-#1,
-    // post-display, post-sound-entry, and post-persist-#3 — the
-    // settings survive process-lifetime.
+    // Mouse leg (Phase 4J): one row-1 toggle, one row-2 toggle,
+    // one grid-row-0 bit toggle on column 0 — computed from the
+    // loaded W-set values (FUN_00421774 exclusivity for row 0:
+    // bit set -> clear it; clear -> (mask & ~0x2) | 1).
+    const int expectedMouseOn = settingsInitialMouseOn ? 0 : 1;
+    const std::uint32_t expectedMouseYRev =
+        settingsInitialMouseYRev != 0 ? 0u : 1u;
+    const std::uint32_t expectedButtA =
+        (settingsInitialButtA & 1u)
+            ? (settingsInitialButtA & ~1u)
+            : ((settingsInitialButtA & ~0x2u) | 1u);
+    // Seven options entries: initial config, post-persist-#1,
+    // post-display, post-sound-entry, post-persist-#3, post-mouse-
+    // entry, and post-persist-#4 — the settings survive
+    // process-lifetime.
     const bool entrySkillsOk =
-        optionsEntrySkills.size() == 5 &&
+        optionsEntrySkills.size() == 7 &&
         optionsEntrySkills[0] == settingsInitialSkill &&
         optionsEntrySkills[1] == expected &&
         optionsEntrySkills[2] == expected &&
         optionsEntrySkills[3] == expected &&
-        optionsEntrySkills[4] == expected;
-    // Exits 1, 2, 4 are dirty (skill mutations, then the display
-    // child's, then the sound child's — all carried back through
-    // the shared DAT_00541486); exits 3 and 5 are clean — the
-    // preceding persists cleared the flag.
+        optionsEntrySkills[4] == expected &&
+        optionsEntrySkills[5] == expected &&
+        optionsEntrySkills[6] == expected;
+    // Exits 1, 2, 4, 6 are dirty (skill mutations, then the display
+    // child's, then the sound child's, then the mouse child's — all
+    // carried back through the shared DAT_00541486); exits 3, 5, 7
+    // are clean — the preceding persists cleared the flag.
     const bool exitsOk =
-        optionsExitDirty.size() == 5 && optionsExitDirty[0] &&
+        optionsExitDirty.size() == 7 && optionsExitDirty[0] &&
         optionsExitDirty[1] && !optionsExitDirty[2] &&
-        optionsExitDirty[3] && !optionsExitDirty[4];
+        optionsExitDirty[3] && !optionsExitDirty[4] &&
+        optionsExitDirty[5] && !optionsExitDirty[6];
     // The proven audio-trigger sequence for the whole run — entry
     // (ambient stop + OPTSONG start), per-query OPTBUTT + the two
     // FUN_004024c4 volume applies, exit (OPTSONG stop + ambient
@@ -1681,7 +1946,7 @@ int Application::run() {
     };
     const bool audioOk = audioEventLog == expectedAudio;
     // With --settings-file the persisted file must hold the final
-    // five-tuple — re-read here for the verdict.
+    // settings tuple — re-read here for the verdict.
     bool fileOk = true;
     if (cfg_.settingsFile) {
       std::string ferr;
@@ -1692,7 +1957,11 @@ int Application::run() {
                disk->settings.forcePCorrect ==
                    (expectedPcorrect != 0) &&
                disk->settings.soundFx == expectedFx &&
-               disk->settings.soundMusic == expectedMus;
+               disk->settings.soundMusic == expectedMus &&
+               disk->settings.mouseOn == (expectedMouseOn != 0) &&
+               disk->settings.mouseYReversed == expectedMouseYRev &&
+               disk->settings.mouseWButtMapA == expectedButtA &&
+               disk->settings.mouseWAxesMap == settingsInitialAxesMap;
     }
     selftestOk_ = selftestOk_ && frontendEnteredOptions &&
                   frontendReturnedToRoot &&
@@ -1701,7 +1970,7 @@ int Application::run() {
                       OptionsAction::SkillCycleNext &&
                   frontendFlow->root().selection() == 3 &&
                   frontendFlow->root().mouseX() == 300 &&
-                  frontendFlow->root().mouseY() == 90 &&
+                  frontendFlow->root().mouseY() == 45 &&
                   entrySkillsOk && exitsOk &&
                   displayEntered &&
                   displayEntrySelection == kDisplayEntrySelection &&
@@ -1717,23 +1986,41 @@ int Application::run() {
                   frontendFlow->soundFx() == expectedFx &&
                   frontendFlow->soundMusic() == expectedMus &&
                   audioOk &&
-                  settingsPersistCalls == 3 &&
+                  mouseEntered &&
+                  mouseEntrySelection == 0 &&
+                  mouseResumeSelection == 3 &&
+                  mouseFramesDrawn == 6 &&
+                  frontendFlow->mouseOn() == (expectedMouseOn != 0) &&
+                  frontendFlow->mouseYReversedBits() ==
+                      expectedMouseYRev &&
+                  frontendFlow->mouseButtMap()[0] == expectedButtA &&
+                  frontendFlow->mouseAxesMap() ==
+                      settingsInitialAxesMap &&
+                  settingsPersistCalls == 4 &&
                   settingsPersistedSkill == expected &&
                   settingsPersistedBrightness == expectedBright &&
                   settingsPersistedForcePCorrect == expectedPcorrect &&
                   settingsPersistedSoundFx == expectedFx &&
                   settingsPersistedSoundMusic == expectedMus &&
+                  settingsPersistedMouseOn == expectedMouseOn &&
+                  settingsPersistedMouseYRev == expectedMouseYRev &&
+                  settingsPersistedButtA == expectedButtA &&
+                  settingsPersistedAxesMap == settingsInitialAxesMap &&
                   frontendFlow->skill() == expected &&
                   !frontendFlow->settingsDirty() && fileOk;
     log::info(kTag,
-              "frontend selftest (four-screen): %s (entries=%d "
-              "entry-skills=%d,%d,%d,%d,%d exit-dirty=%d,%d,%d,%d,%d "
+              "frontend selftest (five-screen): %s (entries=%d "
+              "entry-skills=%d,%d,%d,%d,%d,%d,%d "
+              "exit-dirty=%d,%d,%d,%d,%d,%d,%d "
               "persists=%d persisted=%d,%d,%d,%d,%d skill=%d "
               "bright=%d pcorr=%d fx=%d mus=%d dirty=%d "
               "display-entry=%d resume-sel=%d display-frames=%d "
               "display-fb=%016llx display-pal=%016llx "
               "sound-entry=%d sound-resume=%d sound-frames=%d "
               "sound-fb=%016llx sound-pal=%016llx audio-events=%d "
+              "mouse-entry=%d mouse-resume=%d mouse-frames=%d "
+              "mouse-fb=%016llx mouse-pal=%016llx "
+              "mouseOn=%d yrev=%u axes=%s buttA=%u "
               "root sel=%d mouse=%d,%d last-options=%s)",
               selftestOk_ ? "PASS" : "FAIL",
               static_cast<int>(optionsEntrySkills.size()),
@@ -1747,6 +2034,10 @@ int Application::run() {
                                             : -1,
               optionsEntrySkills.size() > 4 ? optionsEntrySkills[4]
                                             : -1,
+              optionsEntrySkills.size() > 5 ? optionsEntrySkills[5]
+                                            : -1,
+              optionsEntrySkills.size() > 6 ? optionsEntrySkills[6]
+                                            : -1,
               optionsExitDirty.size() > 0 ? optionsExitDirty[0] ? 1 : 0
                                           : -1,
               optionsExitDirty.size() > 1 ? optionsExitDirty[1] ? 1 : 0
@@ -1756,6 +2047,10 @@ int Application::run() {
               optionsExitDirty.size() > 3 ? optionsExitDirty[3] ? 1 : 0
                                           : -1,
               optionsExitDirty.size() > 4 ? optionsExitDirty[4] ? 1 : 0
+                                          : -1,
+              optionsExitDirty.size() > 5 ? optionsExitDirty[5] ? 1 : 0
+                                          : -1,
+              optionsExitDirty.size() > 6 ? optionsExitDirty[6] ? 1 : 0
                                           : -1,
               settingsPersistCalls, settingsPersistedSkill,
               settingsPersistedBrightness,
@@ -1775,6 +2070,14 @@ int Application::run() {
               static_cast<unsigned long long>(soundLastFbDigest),
               static_cast<unsigned long long>(soundLastPalDigest),
               static_cast<int>(audioEventLog.size()),
+              mouseEntrySelection, mouseResumeSelection,
+              mouseFramesDrawn,
+              static_cast<unsigned long long>(mouseLastFbDigest),
+              static_cast<unsigned long long>(mouseLastPalDigest),
+              frontendFlow->mouseOn() ? 1 : 0,
+              frontendFlow->mouseYReversedBits(),
+              frontendFlow->mouseAxesMap().c_str(),
+              frontendFlow->mouseButtMap()[0],
               frontendFlow->root().selection(),
               frontendFlow->root().mouseX(),
               frontendFlow->root().mouseY(),
@@ -1869,6 +2172,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.displaySubmenuPreview = true;
     } else if (!std::strcmp(a, "--preview-sound-submenu")) {
       cfg.soundSubmenuPreview = true;
+    } else if (!std::strcmp(a, "--preview-mouse-submenu")) {
+      cfg.mouseSubmenuPreview = true;
     } else if (!std::strcmp(a, "--interactive-frontend")) {
       cfg.interactiveFrontend = true;
     } else if (!std::strcmp(a, "--frontend-root-only")) {

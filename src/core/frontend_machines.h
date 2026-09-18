@@ -209,6 +209,12 @@ struct FrontendMachineState {
   bool buttonLatch = false;  // DAT_0049ac80
   FrontendRampState ramp;    // DAT_0054bdc8..bdd8
   FrontendTimingState timing; // DAT_0049b6e4 struct
+  // DAT_0049a770 — the flagged-FONTSML blink accumulator
+  // (FUN_00414b28): a process global that persists across screens
+  // and advances only when a flagged draw runs; bit 3 is the
+  // blink phase. Phase 4J: the mouse child is the first screen
+  // that uses flagged draws.
+  int markerAcc = 0;
 };
 
 } // namespace mdk

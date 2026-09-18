@@ -2016,3 +2016,333 @@ int gets the native `[0,100]` hardening counter
    `name`/type/pointer triples dumped at `0x49aca8`, each
    needs its own semantics proven before joining
    `FrontendSettings`.
+
+# Phase 4J — Mouse options child screen
+
+Phase 4J reconstructs the third real child screen of the
+options sub-menu: the **Mouse** screen entered from options
+row 3 — the first child whose settings feed the later
+gameplay-input path (axis mapping + button bindings). The
+screen is a bounded 23-row state machine: 4 left-column rows,
+3 axis-mapping rows, and a 4-column × 16-row button-binding
+grid, plus a live test indicator.
+
+## Candidate triage (bounded comparison —
+`decomp_4j_candidates.txt`)
+
+| candidate | entry | frame handler | verdict |
+|---|---|---|---|
+| **Mouse** | `FUN_00421664` | `FUN_004217e8` | **selected** — finite 23-row FSM, FONTSML-only, no HW dep; its settings feed gameplay input |
+| Help | `FUN_0041d540` | `FUN_0041d630` | smallest (static page + any-key exit) but not preferred |
+| Keyboard | `FUN_0041f030` | `FUN_0041f18c` | 19 bindings + capture mode + raw-key poll — much larger |
+| Performance | `FUN_00421e70` | `FUN_004224bc` | live render benchmark + DDraw enum — backend in scope, out |
+| Joystick | `FUN_0041fa24` | `FUN_0041fc08` | same shape as Mouse + calibration FSM + `joyGetPosEx` poll — deprioritized per instructions |
+
+Mouse satisfied every selection rule: finite state machine,
+existing FTI/font/sprite resources, traceable settings
+globals, bounded mutations, traceable exit, no OS mouse
+configuration needed to render/navigate.
+
+## Entry transition (`FUN_00421664`, OBSERVED —
+`disasm_421664.txt`)
+
+Reached from options row 3 under LEFT, RIGHT, or activate —
+all three dispatch tables bind row 3 to the same block:
+
+- `DAT_00541493 = 0x04` — mouse mode; the dispatcher routes
+  it to `FUN_004217e8`.
+- `DAT_0054bd40 = 0` — selection reset.
+- `DAT_0054bd38 = 0` — grid column reset.
+- `DAT_0054bd3c = 3` — axis count.
+- `DAT_0054bd44 = 4` — button count.
+- **No reset** of mouse, tick, repeat deadlines, button
+  latch, ramp, timing, or `DAT_0049a770` (the blink
+  accumulator — a process global that persists across
+  screens) — the shared globals continue on the child.
+- The options screen stays alive underneath: `_DAT_0054bd34`
+  keeps 3.
+
+## Screen state globals
+
+- `DAT_0054bd40` — selection, 0..22 (`DAT_0054bd3c + 0x13`).
+- `DAT_0054bd38` — grid column, 0..3 (`DAT_0054bd44-1`).
+- `DAT_005413de` — `MouseWAxesMap` char[4], the W-set axis
+  letter map (type-3 string, entry 49, factory `"ABG"`).
+- `DAT_005413be..ca` — `MouseWButtMapA..D` dwords (type-0,
+  entries 53–56, factory `{1,4,2,0}`).
+- `DAT_005413e6..ee` — `MouseWX/Y/ZScale` floats (type-1,
+  entries 61–63, factory `{16,16,50}`) — marker divisors,
+  read-only on this screen.
+- `DAT_00541472` — `MouseOn` bool (type-2, entry 67, factory
+  TRUE).
+- `DAT_00541476` — `MouseYReversed` — a type-1 **float slot**
+  (entry 68) the screen writes raw int32 `0/1` into (the
+  denormal quirk below).
+- `DAT_00541486` — shared dirty flag; `DAT_0054b640/44/48/4c`
+  — the live button nibble + per-axis deltas the draw reads.
+- `DAT_0049a770` — the flagged-FONTSML blink accumulator
+  (process global; bit 3 = blink phase; advances
+  `floor(acc + DAT_0049b6f0)` per flagged draw).
+
+## Frame handler (`FUN_004217e8`, OBSERVED —
+`disasm_4217e8.txt`)
+
+Same prologue and query helpers as the options screen, but
+**Esc is checked FIRST** (before prev):
+
+1. `FUN_004187e0` accumulate + `DAT_00541518 += DAT_0049b6e8`.
+2. `DAT_0054b570` Esc raw level → `DAT_00541493 = 0x0b` +
+   RET — silent exit, ends the frame before the draw.
+3. prev query: `sel -= 1`, wraps `<0 → 22`.
+4. next query: `sel += 1`, wraps `>= 23 → 0`.
+5. Mouse hit-test gate (the three-global check — `dx/dy/
+   buttons`; `DAT_0054b64c` Z-delta is NOT in the gate;
+   clamp `(590,350)` inside):
+   - `x < 250`: `band = trunc((y-2)/16)` valid 0..3 →
+     `sel = band`; else `band2 = trunc((y-259)/16)` valid
+     0..2 → `sel = band2 + 4` (axis rows).
+   - `x >= 250`: `band = trunc((y-33)/16)` valid 0..15 →
+     `sel = band + 7` AND `col = clamp(trunc((x-396)/16),
+     0, 3)` — the column assign runs only when the band is
+     valid.
+6. LEFT query: rows 1/2 toggle (`MouseOn`, `MouseYReversed`
+   bits) + dirty; rows 4–6 cycle the axis letter −1
+   (`FUN_004216a0`); rows 7–22 `col -= 1`, wraps `<0 → 3`.
+   Rows 0/3 fall through.
+7. RIGHT query: same row 1/2 toggles; rows 4–6 cycle +1;
+   rows 7–22 `col += 1`, wraps `>= 4 → 0`.
+8. Activate query (jump table `0x4217d8`): row 0 → no-op
+   (falls to draw); row 1 → `MouseOn` toggle; row 2 →
+   `MouseYReversed` toggle; row 3 → `DAT_00541493 = 0x0b` +
+   RET (exit); rows 4–6 → letter +1; rows 7–22 →
+   `FUN_00421774` button-bit toggle.
+9. Draw block, `FUN_0046c86c` present, `FUN_0042fe78`
+   timing.
+
+## Axis-letter domain (`FUN_004216a0`, OBSERVED)
+
+`'0'` plus `'A'..'H'` — `'0'` is the valid "Off" mapping
+(`JOY_A0`). +1: `'0'→'A'`, …, `'H'→'0'`; −1 the reverse. An
+out-of-domain byte repairs to `'0'`. If the map is shorter
+than the axis index the original resets the whole map to the
+literal `"0"` and re-runs the check — for a map that stays
+too short the original **loops forever**; the port applies
+the repair once and skips the cycle (documented NATIVE
+hardening of a proven hang).
+
+## Button-bit exclusivity (`FUN_00421774` + table `@0x499f0c`)
+
+16-entry exclusive-group table `{0x2, 0x1, 0x0, 0x7c18,
+0x7c18, 0xe0, 0x3e0, 0x3e0, 0x3c0, 0x3c0, 0x1c18, 0x1c18,
+0x1c18, 0x6018, 0x6018, 0x0}`: bit set → clear just that
+bit; bit clear → `mask = (mask & ~group[row]) | bit`. Dirty
+latches either way.
+
+## Draw block (OBSERVED — `disasm_4j_helpers.txt`,
+`disasm_4j_marker.txt`, `disasm_4j_font3.txt`,
+`disasm_4j_fill.txt`)
+
+All **FONTSML** — no FONTBIG, no `FUN_00423a24` ramp calls:
+
+1. `FUN_00415658` → `clear(0)` — no backdrop.
+2. `FUN_004213e8` left rows 0–3 at `y = row*16+16`, text at
+   `x = (300-w)>>1` (SAR floor-halving), flag `= (row==sel)`:
+   row 0 `JOY_TEST`, row 1 `M_ENA`/`M_DIS` by MouseOn, row 2
+   `M_REV`/`M_NORM` by MouseYReversed, row 3 `JOY_QUIT`.
+3. `FUN_00421504` grid: header row −1 (`JOY_B`, cellMask =
+   live buttons nibble) + 16 rows (`JOY_B%c` A..P) — label
+   right-aligned at `gridX0-w-8` (`gridX0 = 428-cols*8 =
+   396`), row `y = row*16+46`; per column c at
+   `cellX = 396+16c`: bit set → solid fill color 6
+   `(cellX, y-13)-(cellX+13, y-1)`; bit clear → hollow
+   outline color 14 `(cellX+1, y-13)-(cellX+13, y-1)`;
+   active column → cursor outline `(cellX, y-14)-(cellX+14,
+   y)` color 14 on filled / 6 on hollow cells; `cellMask`
+   for row r = bit c of `MouseWButtMap[c]>>r`.
+4. `FUN_00421448` axis rows i at `y = 350-(5-i)*16 =
+   270/286/302`: `JOY_AX%d` caption at x=60 flag=0, `JOY_A%c`
+   action at x=90 flag `= (i+4==sel)`, hollow bar outline
+   color 14 `(10, y-11)-(50, y-3)`, marker fill color 6
+   `(pos-2, y-11)-(pos+2, y-3)` where `pos =
+   floor(clamp(delta_i/scale_i, -1, 1)*20 + 30)` — the
+   FCOMP/JNC sequence clamps NaN to −1.0 and +inf to +1.0.
+5. `FUN_004212d0` test indicator — frame outline color 2
+   `(50,110)-(150,210)`; box outlines color 3 at
+   `(97+mx, 157+my)-(103+mx, 163+my)` and
+   `(98+mx, 158+my)-(102+mx, 162+my)` where `m =
+   clamp(FISTP(50*delta/scale), -50, 50)` — FISTP of an
+   out-of-int-range quotient yields INT_MIN → −50.
+6. `ARROW` at the logical mouse (`FUN_004236c0`).
+
+## Selection marker (`FUN_00414dd4` flag=1 → `FUN_00414b28`,
+OBSERVED)
+
+A blinking **double-outline bracket** around the text rect
+`(penStart, penY-top)-(penEnd, penY+bottom)` — multi-char
+default `top=14 bottom=2`, a single mapped char uses its
+glyph's own extents. Clamps `x0>=2, x1<=597, y0>=0,
+y1<=357`. Colors 1/2 swap on bit 3 of `DAT_0049a770`,
+advanced `floor(acc + DAT_0049b6f0)` per call. Flagged
+draws: the selected left row (0–3) and the selected axis
+action (4–6). Grid rows draw no flagged text — the cell
+cursor is their indicator and the accumulator freezes
+there.
+
+## Mutations (OBSERVED)
+
+| row | label | LEFT | RIGHT | activate |
+|---|---|---|---|---|
+| 0 | `JOY_TEST` | no-op | no-op | no-op (draw) |
+| 1 | `M_ENA`/`M_DIS` | MouseOn toggle + dirty | same | MouseOn toggle + dirty |
+| 2 | `M_REV`/`M_NORM` | YRev bits toggle + dirty | same | YRev bits toggle + dirty |
+| 3 | `JOY_QUIT` | no-op | no-op | mode 0x0b + RET |
+| 4–6 | `JOY_AX%d`/`JOY_A%c` | letter −1 + dirty | letter +1 + dirty | letter +1 + dirty |
+| 7–22 | `JOY_B%c` grid | col −1 (wrap 0→3) | col +1 (wrap 3→0) | `FUN_00421774` + dirty |
+
+Column moves never latch dirty. Esc and row-3 activate RET
+before draw+timing; all other mutations continue the frame.
+
+## Palette contract (OBSERVED)
+
+No palette upload of its own — the bound palette is the
+options screen's SYS_PAL composition (head + zeroed tail +
+the `DAT_0054147e` lift), rebound per frame. The static
+preview's palette digest `08e372297e745a06` matches the
+Sound screen's inherited composition exactly.
+
+## Settings-table mapping (OBSERVED — `dump_4j_settab.txt`,
+`dump_4j_mirror.txt`, BUILD_A `MDK.CFG`)
+
+Entries 49–68 between SoundMusic (9) and Skill (88):
+
+| idx | key | type | factory (mirror) |
+|---|---|---|---|
+| 49/50 | `MouseWAxesMap`/`MouseDAxesMap` | 3 string | `"ABG"` |
+| 51/52 | `MouseWButtMap`/`MouseDButtMap` | 3 string | `"ACB"` |
+| 53–56 | `MouseWButtMapA..D` | 0 dword | `{1,4,2,0}` |
+| 57–60 | `MouseDButtMapA..D` | 0 dword | `{1,4,2,0}` |
+| 61–63 | `MouseWX/Y/ZScale` | 1 float | `{16,16,50}` |
+| 64–66 | `MouseDX/Y/ZScale` | 1 float | `{16,16,50}` |
+| 67 | `MouseOn` | 2 bool | TRUE |
+| 68 | `MouseYReversed` | 1 float slot | bits 0 |
+
+BUILD_A's real file proves the syntax: `MouseWAxesMap =
+A0G` (`'0'` a valid Off letter), `MouseWButtMapD = 32768`
+(bit 15). Type-3 strings compare through `FUN_0042fab4`'s
+fold — `"abg"` matches the `"ABG"` mirror and is not
+emitted.
+
+**The `MouseYReversed` denormal quirk (OBSERVED):** the
+screen writes raw int32 `0/1` into a type-1 float slot;
+the writer compares/serializes the float those bits form —
+bits 1 emit `MouseYReversed = 1.4013e-45` (the smallest
+denormal), never `= 1`. The port stores raw `uint32` bits
+and `bit_cast`s for emit/parse — reproduced byte-exactly.
+
+## Exit transition (OBSERVED — inline in `FUN_004217e8`)
+
+`DAT_00541493 = 0x0b` + RET — reached by Esc (first check)
+or row-3 activate. `_DAT_0054bd34` untouched → options
+resumes at selection 3. Machine state, mutations, and the
+shared dirty flag carry back; **no persist here** —
+`FUN_00420d68` owns the write on the eventual options exit.
+
+## Persistence (Phase 4G seam extended)
+
+The flow keeps `baseSettings_` (the full parsed settings)
+and overlays only the proven W-set mutations on persist:
+`mouseOn`, `mouseYReversed` raw bits, `mouseWAxesMap`, the
+four `mouseWButtMap` dwords. Untouched fields — the D set,
+map strings at factory, the scales — round-trip from the
+base instead of reverting to factory defaults on a dirty
+rewrite (verified by the flow tests with a loaded
+`mouseDAxesMap = "A0G"` / `mouseDButtMapD = 32768` base).
+
+## Native port decisions (NATIVE PORT)
+
+- `MouseMenuController` (`core/mouse_menu.h`) mirrors
+  `FUN_004217e8`: constructor takes the shared machine state
+  + the W-set globals + the carried dirty flag; `update()`
+  runs the proven Esc-first query order; `frameEndedEarly()`
+  marks the Esc/row-3 RET paths; `axisValue()`/`testOffset*()`
+  reproduce the FCOMP/JNC and FISTP/INT_MIN edge behavior;
+  `advanceBlink()` is `FUN_00414b28`'s accumulator step.
+- `FrontendMenuInput` gains `mouseDz` (the third
+  DIMOUSESTATE axis — `DAT_0054b64c`); `FrontendMachineState`
+  gains `markerAcc` (`DAT_0049a770`).
+- `FrontendScreen::Mouse` joins the flow; options row-3
+  `OptionsAction::Mouse` is consumed by `enterMouse()`,
+  `MouseAction::Back` by `returnToOptionsFromMouse()`.
+- The axis-map too-short repair is bounded (one pass) —
+  the original's proven infinite loop is documented, not
+  reproduced (NATIVE hardening).
+- No platform mouse API is called — the screen mutates game
+  state only; SDL supplies raw deltas (wheel scaled ×120 to
+  the DirectInput `WHEEL_DELTA` domain).
+
+## CLI + deterministic validation
+
+- `--preview-mouse-submenu` (needs `--data-path`): composes
+  the entry-state static frame — sel 0, col 0, factory
+  mappings, centered markers — and logs fb/palette digests.
+- `--interactive-frontend`: options row 3 enters the real
+  child; Esc or Quit-activate returns to options at
+  selection 3.
+- The injected selftest extends to frames 36–48: options
+  band-3 motion → Enter (`FUN_00421664`, sel 0/col 0) →
+  hit-test to row 1 → LEFT (MouseOn→off) → row 2 → LEFT
+  (yrev bits→1) → grid row 7 → activate (buttA 1→0) → Esc
+  (options resumes sel 3) → Esc (`FUN_00420d68` → persist
+  #4 writes the mouse tuple) → Enter (re-entry proves the
+  reset + retained globals) → Esc (clean exit). Default
+  selftest frames: 49.
+
+## Digests and verification
+
+- Static mouse preview (sel 0, col 0, factory state,
+  brightness 0): fb `b1b738d187125379`, palette
+  `08e372297e745a06` — the inherited options composition.
+  `/tmp/mdk-phase4j-child.ppm` — agent-inspected: "Test"
+  carries the blink bracket, `ABG` axes resolve
+  Turn/Move/Sniper Zoom, the grid shows the factory
+  {1,4,2,0} masks (Fire/Sniper/Jump filled), centered
+  test marker, ARROW.
+- Dynamic child snapshot (script frame 48 — root after the
+  full leg, brightness 2 inherited): fb `b1c09e91882c8080`,
+  palette `75a1d38a3e02b12e`.
+- Five-screen selftest end state: `PASS` — entries=7,
+  persists=4, mouse-entry sel 0/col 0 → options resume sel
+  3, mouse frames drawn 6, final file holds
+  `MouseWButtMapA = 0`, `MouseOn = FALSE`,
+  `MouseYReversed = 1.4013e-45` plus the Phase 4G–4I tuple
+  in table order.
+- Rebaselined: none — every Phase 4A–4I digest is preserved
+  exactly (incl. display `5bfe84dc4fc7a023`/`514f0c9fb5abcb26`
+  and sound `4d5c0eed048e0532`/`75a1d38a3e02b12e`
+  re-confirmed inside the extended selftest's legs).
+
+## Explicit non-goals (Phase 4J)
+
+- No OS mouse configuration, no gameplay-input binding —
+  the settings are persisted state only; the consumers
+  (gameplay look/move) are later phases.
+- No actual audio playback (unchanged from Phase 4I).
+- No new asset formats — `JOY_*`/`M_*` are existing FTI
+  string records; FONTSML/ARROW/SYS_PAL are proven paths.
+- No generic rebind UI — exactly the 23-row machine.
+- No persistence of unproven fields — the D set and scales
+  parse/round-trip but the screen never mutates them.
+
+## Phase 4K candidate directions
+
+1. **Help child** (`FUN_0041d540`/`FUN_0041d630`) — the
+   smallest remaining: static page + any-key exit; needs
+   its `HELP_%02d` record set proven.
+2. **Keyboard child** (`FUN_0041f030`/`FUN_0041f18c`) — 19
+   bindings + capture mode + raw-key poll; the largest
+   bounded candidate, feeds the input path like Mouse.
+3. **Gameplay-input consumption** — the now-persisted
+   Mouse/Keyboard maps + scales reach the real input path.
+4. **Frontend sound events on other screens** — `SND_PUSH`
+   fires on repeat/activate edges engine-wide; records
+   pending.
