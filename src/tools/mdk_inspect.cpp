@@ -35,6 +35,7 @@
 #include "core/player_vertical.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
+#include "core/traversal_runtime.h"
 
 #include <bit>
 #include <cstdio>
@@ -69,6 +70,13 @@ int usage() {
                "       mdk-inspect --data-path DIR --surface-census "
                "<relative-path>   (a .DTI path; the sibling <stem>O.MTO\n"
                "                            is scanned for surface polys)\n"
+               "       mdk-inspect --data-path DIR --traversal-runtime "
+               "<relative-path>\n"
+               "                            (a .DTI path; loads the sibling\n"
+               "                            .CMI + <stem>O.MTO, assembles the\n"
+               "                            Phase 5G runtime and steps frames.\n"
+               "                            Options: --arena NAME --start X Y Z\n"
+               "                            --yaw DEG --frames N)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n");
   return 2;
@@ -824,6 +832,13 @@ int main(int argc, char** argv) {
   bool collisionProbe = false;
   bool arenaObjects = false;
   bool surfaceCensus = false;
+  bool traversalRuntime = false;
+  std::optional<std::string> travArena;
+  float travStart[3] = {0.0f, 0.0f, 0.0f};
+  bool travStartGiven = false;
+  float travYaw = 0.0f;
+  bool travYawGiven = false;
+  int travFrames = 90;
   float probePos[3] = {0.0f, 0.0f, 0.0f};
   int probePosGiven = 0;
 
@@ -920,6 +935,47 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       surfaceCensus = true;
+    } else if (!std::strcmp(a, "--traversal-runtime")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;
+      traversalRuntime = true;
+    } else if (!std::strcmp(a, "--arena")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      travArena = v;
+    } else if (!std::strcmp(a, "--start")) {
+      for (int k = 0; k < 3; ++k) {
+        const char* c = value(a);
+        if (!c) return usage();
+        char* endp = nullptr;
+        travStart[k] = static_cast<float>(std::strtod(c, &endp));
+        if (!endp || *endp != '\0') {
+          std::fprintf(stderr, "invalid --start coordinate: %s\n", c);
+          return usage();
+        }
+      }
+      travStartGiven = true;
+    } else if (!std::strcmp(a, "--yaw")) {
+      const char* c = value(a);
+      if (!c) return usage();
+      char* endp = nullptr;
+      travYaw = static_cast<float>(std::strtod(c, &endp));
+      if (!endp || *endp != '\0') {
+        std::fprintf(stderr, "invalid --yaw: %s\n", c);
+        return usage();
+      }
+      travYawGiven = true;
+    } else if (!std::strcmp(a, "--frames")) {
+      const char* c = value(a);
+      if (!c) return usage();
+      char* endp = nullptr;
+      const long fv = std::strtol(c, &endp, 10);
+      if (!endp || *endp != '\0' || fv < 1 || fv > 100000) {
+        std::fprintf(stderr, "invalid --frames: %s\n", c);
+        return usage();
+      }
+      travFrames = static_cast<int>(fv);
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
     } else if (!std::strcmp(a, "--selftest-player-surface")) {
@@ -1031,7 +1087,7 @@ int main(int argc, char** argv) {
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
       !spriteInfoName && !collisionProbe && !arenaObjects &&
-      !surfaceCensus) {
+      !surfaceCensus && !traversalRuntime) {
     return 0;
   }
 
@@ -1216,6 +1272,204 @@ int main(int argc, char** argv) {
       break;
     }
     return 0;
+  }
+
+  // --traversal-runtime: Phase 5G BUILD_A smoke. Assembles the native
+  // traversal runtime over the .DTI target's sibling triple (.DTI +
+  // .CMI + <stem>O.MTO), resolves the s0 spawn, attaches the initial
+  // arena (MTO region-C collision + spawn-once objects), and steps
+  // the frame driver in the original FUN_00436100 order. Headless —
+  // script-object calls, the scripted-move gate, the arena event
+  // list, the world tick and camera/teleport blocks are counted as
+  // seams, never emulated. --arena/--start/--yaw are NATIVE
+  // DIAGNOSTIC OVERRIDES, not original spawn behavior.
+  if (traversalRuntime) {
+    const std::string dtiPath = *target;
+    const auto slash = dtiPath.find_last_of("/\\");
+    const auto dot = dtiPath.find_last_of('.');
+    if (dot == std::string::npos) {
+      std::fprintf(stderr, "--traversal-runtime wants a .DTI path\n");
+      return 1;
+    }
+    const std::string dir =
+        slash == std::string::npos ? "" : dtiPath.substr(0, slash + 1);
+    const std::string stem = dtiPath.substr(
+        slash == std::string::npos ? 0 : slash + 1,
+        dot - (slash == std::string::npos ? 0 : slash + 1));
+    const std::string cmiPath = dir + stem + ".CMI";
+    const std::string mtoPath = dir + stem + "O.MTO";
+
+    mdk::TraversalRuntime rt;
+    const auto le = mdk::traversalRuntimeLoad(
+        *root, dtiPath, cmiPath, mtoPath, rt, &err);
+    if (le != mdk::TraversalLoadError::kOk) {
+      std::fprintf(stderr, "traversal-load: FAILED (%s: %s)\n",
+                   mdk::traversalLoadErrorName(le), err.c_str());
+      return 1;
+    }
+    std::printf("level:     %s + %s + %s\n", dtiPath.c_str(),
+                cmiPath.c_str(), mtoPath.c_str());
+    std::printf("arenas:    %zu  enemy-tbl=%zu  models=%d ok/%d fail\n",
+                rt.arenas.size(), rt.level.enemies.entries.size(),
+                rt.level.modelsResolved, rt.level.modelsFailed);
+    if (!rt.level.unresolvedNames.empty())
+      std::printf("unresolved spawn names: %zu\n",
+                  rt.level.unresolvedNames.size());
+    std::printf("spawn(s0): arena=%d (%s) pos=(%g, %g, %g) yaw=%g\n",
+                rt.cur->index, rt.cur->name.c_str(),
+                (double)rt.cs.pos[0], (double)rt.cs.pos[1],
+                (double)rt.cs.pos[2], (double)rt.motion.yawDeg);
+    for (const auto& a : rt.arenas)
+      std::printf(
+          "  arena[%2d] %-9s geom=%d objs=%2zu subs=%u scal=%g %s\n",
+          a->index, a->name.c_str(), a->geometryLoaded ? 1 : 0,
+          a->dyn.storage.size(), a->rec->subRecordCount,
+          (double)a->scalar,
+          a->hasScriptObject ? "script-obj" : "");
+
+    // NATIVE DIAGNOSTIC OVERRIDE — not original spawn behavior.
+    if (travArena || travStartGiven || travYawGiven) {
+      int arenaIdx = rt.cur->index;
+      if (travArena) {
+        arenaIdx = -1;
+        for (const auto& a : rt.arenas)
+          if (a->name == *travArena) arenaIdx = a->index;
+        if (arenaIdx < 0) {
+          char* endp = nullptr;
+          const long v = std::strtol(travArena->c_str(), &endp, 10);
+          if (endp && *endp == '\0') arenaIdx = static_cast<int>(v);
+        }
+      }
+      float pos[3];
+      for (int i = 0; i < 3; ++i)
+        pos[i] = travStartGiven ? travStart[i] : rt.cs.pos[i];
+      const float yaw = travYawGiven ? travYaw : rt.motion.yawDeg;
+      const auto oe = mdk::traversalRuntimeDiagnosticStart(
+          rt, arenaIdx, pos, yaw, &err);
+      if (oe != mdk::TraversalLoadError::kOk) {
+        std::fprintf(stderr, "diagnostic-start: FAILED (%s: %s)\n",
+                     mdk::traversalLoadErrorName(oe), err.c_str());
+        return 1;
+      }
+      std::printf("override:  arena=%d (%s) pos=(%g, %g, %g) yaw=%g "
+                  "— NATIVE DIAGNOSTIC OVERRIDE\n",
+                  rt.cur->index, rt.cur->name.c_str(), (double)pos[0],
+                  (double)pos[1], (double)pos[2], (double)yaw);
+    }
+
+    // Scripted input: idle -> KeyUp (forward) -> idle -> KeyJump.
+    // Key bindings are the factory defaults (KeyUp=103, KeyJump=56).
+    const mdk::GameplayInputBindings bindings;
+    auto rawFor = [](int phase) {
+      mdk::RawGameplayInput r;
+      if (phase == 1) r.keyLevel[103 >> 5] |= 1u << (103 & 31);
+      if (phase == 3) r.keyLevel[56 >> 5] |= 1u << (56 & 31);
+      return r;
+    };
+    mdk::FrontendTimingState timing; // f0=1, dt=1/30, step=1
+    std::uint64_t digest = 1469598103934665603ull;
+    auto mix = [&](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        digest ^= (v >> (i * 8)) & 0xff;
+        digest *= 1099511628211ull;
+      }
+    };
+    const mdk::TraversalArena* startArena = rt.cur;
+    int framesRun = 0;
+    bool floorObjSeen = false;
+    bool groundedSeen = false;
+    bool airborneSeen = false;
+    bool contactSeen = false;
+    bool partnerSeen = false;
+    for (int f = 0; f < travFrames; ++f) {
+      const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
+      const auto out =
+          mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
+      ++framesRun;
+      floorObjSeen |= (rt.cs.contactFlags & 2) != 0;
+      groundedSeen |= out.grounded;
+      airborneSeen |= !out.grounded;
+      contactSeen |= out.contactObj != 0;
+      partnerSeen |= out.partnerArenaIndex >= 0;
+      std::printf(
+          "f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "
+          "mv=%5.2f sv=%5.2f vv=%6.2f gnd=%d ctc=%08x sld=%d ev=%d/%d\n",
+          out.frame, out.curArenaIndex, out.partnerArenaIndex,
+          (double)out.pos[0], (double)out.pos[1], (double)out.pos[2],
+          (double)out.yawDeg, (double)out.moveVel,
+          (double)out.strafeVel, (double)out.vertVel,
+          out.grounded ? 1 : 0, out.contactObj, out.slideChannel,
+          out.eventType, out.eventMag);
+      // The digest mixes only deterministic state — raw contact
+      // tokens are process addresses and are mixed as booleans.
+      mix(static_cast<std::uint64_t>(out.frame));
+      mix(static_cast<std::uint64_t>(out.curArenaIndex));
+      mix(static_cast<std::uint64_t>(
+          out.partnerArenaIndex < 0 ? 0xffff : out.partnerArenaIndex));
+      for (int i = 0; i < 3; ++i) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &out.pos[i], 4);
+        mix(bits);
+      }
+      std::uint32_t bits;
+      std::memcpy(&bits, &out.yawDeg, 4);
+      mix(bits);
+      std::memcpy(&bits, &out.vertVel, 4);
+      mix(bits);
+      mix(out.contactObj != 0 ? 1 : 0);
+      mix(out.grounded ? 1 : 0);
+      mix(static_cast<std::uint64_t>(out.locoState));
+      mix(static_cast<std::uint64_t>(out.slideChannel));
+      mix(out.currentArenaSwapped ? 1 : 0);
+    }
+    const auto& s = rt.seams;
+    std::printf("digest:    %016llx  (%d frames)\n",
+                (unsigned long long)digest, framesRun);
+    std::printf("seams:     stream=%d prepass=%d scriptObj=%d "
+                "move=%d evlist=%d slide=%d mantle=%d timers=%d "
+                "world=%d xworld=%d prof=%d tail=%d teleport=%d "
+                "vsnap=%d migrations=%d t1=%d t3=%d portals=%d "
+                "deep=%d\n",
+                s.streamStageCalls, s.objectPrepass,
+                s.scriptObjectCalls, s.scriptedMoveCalls,
+                s.arenaEventListCalls, s.slideHelperCalls,
+                s.mantleCalls, s.timersCalls, s.worldTickCalls,
+                s.extraWorldTickCalls, s.profilerHooks,
+                s.postTailCalls, s.teleportCalls,
+                s.pendingViewSnaps, s.objectMigrations,
+                s.type1Triggers, s.type3Prefetches,
+                s.portalsCrossed, s.deepFloorFallbacks);
+    // Bounded checks: gates + at least one grounded frame. Arenas
+    // with their own MTO collision blob must also show a collision
+    // contact. 'C*' corridor arenas carry no blob (OBSERVED: the MTO
+    // has exactly the 10 HMO_* blocks) — their traversal is driven by
+    // the per-arena CMI script VM (+0x220 -> FUN_004388d8, exposed as
+    // the scriptObj seam) and the type-1/type-3/portal seams, so the
+    // honest corridor check is that a partner attach fired; the
+    // observed +0x44e failsafe catch (posZ <= -50) is reported but
+    // not asserted — reaching it depends on start height / frames.
+    // contactFlags bit1 is the OBSERVED *object*-floor flag
+    // (collisionFloorProbe walks cs.arena->objects only) — reported
+    // but not asserted: arenas without rideable objects never set it.
+    const bool carrierGeom =
+        rt.partner && rt.partner->geometryLoaded;
+    bool ok;
+    if (startArena->geometryLoaded) {
+      ok = rt.cs.arenaValid && contactSeen && groundedSeen;
+    } else {
+      ok = rt.cs.arenaValid && partnerSeen &&
+           (s.type1Triggers > 0 || s.type3Prefetches > 0);
+    }
+    std::printf("checks:    geom=%d gates=%d contact=%d grounded=%d "
+                "airborne=%d floor-obj=%d partner=%d car-vld=%d "
+                "car-bsy=%d car-geom=%d — %s\n",
+                startArena->geometryLoaded ? 1 : 0, rt.cs.arenaValid,
+                contactSeen ? 1 : 0, groundedSeen ? 1 : 0,
+                airborneSeen ? 1 : 0, floorObjSeen ? 1 : 0,
+                partnerSeen ? 1 : 0, rt.cs.carrierValid ? 1 : 0,
+                rt.cs.carrierBusy ? 1 : 0, carrierGeom ? 1 : 0,
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
   }
 
   // --surface-census: Phase 5F BUILD_A smoke. Reads the .DTI target

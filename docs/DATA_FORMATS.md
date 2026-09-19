@@ -554,7 +554,40 @@ next u32 after table[3] is data content, not a fifth count (OBSERVED
 | table[0] | none traced (`FUN_004583fc` uncalled) | names look like `OBJ$ANIM` composites; UNKNOWN |
 | table[1] | `FUN_00433d40` → `FUN_004286c8`: walks it into a 0x88-stride array at `DAT_004edcc0`, cap 0x50 | the cap diagnostic is the original string `"Overflowed enemy table"` — table 1 is therefore CODE-CORROBORATED as the enemy-name table's source. Phase 5E PROVED the value semantics: `value != 0` → model geometry record at `blob+value` (see §"Model geometry record"); `value == 0` → `dest+0xa=1` deferred → resolved later from `.MTO` region-A array-B by name (`FUN_00403498`) |
 | table[2] | `FUN_004566f0` (object init): formats a name via sprintf, searches table[2], stores `blob+value` at `obj+0x108`, calls `FUN_004388d8` (tr_alcmd.c region), then clears it | per-object init-time lookup; semantics UNKNOWN |
-| table[3] | `FUN_0045849c` (callers `FUN_00431fbc`, `FUN_0043394c`) and `FUN_00458550` (called once per arena record in `FUN_00433d40`, result stored at `arena+0x220`) | name → target structure in the data region |
+| table[3] | `FUN_0045849c` (callers `FUN_00431fbc`, `FUN_0043394c`) and `FUN_00458550` (called once per arena record in `FUN_00433d40`, result stored at `arena+0x220`) | name → target structure in the data region; see §"Arena script record — table[3] data targets" |
+
+### Arena script record — table[3] data targets (OBSERVED, Phase 5G)
+
+`FUN_00458550` returns `cmiImage + value`, then re-parses the target as
+a second interior record and dereferences a trailing u32:
+
+```text
+record base: u8  nameLen, byte[nameLen] name   (same counted-name form)
+             u8  dataLen, byte[dataLen] data
+             u32 imageOff                     (read at base+1+nameLen
+                                                +1+dataLen — i.e. the
+                                                second length byte is
+                                                used as the skip count)
+```
+
+So the arena's `+0x220` = `cmiImage + imageOff` — a pointer to the
+arena's bytecode record. The frame loop `FUN_00436100` calls
+`FUN_004388d8` once for `c48` and once for `ca4` whenever the
+respective arena's `+0x220 != 0`. `FUN_004388d8` is the `tr_alcmd`
+bytecode VM: per-arena persistent state `+0x108` (program counter into
+the record), `+0x22c` (wait/delay counter — decremented per call,
+execution suspends while >0), `+0x230` (alternate PC seed when the
+wait lapses), opcode `0xff` = end-of-stream, and a 1000-instruction
+cap per call guarded by the `"Alien %s looped %d commands, off %lx"`
+diagnostic. The VM snapshots the player
+position (`0x540bfc`→`0x54c6c4`) and yaw (`0x540c2c`→`0x54c6c0`) for
+opcodes to read. Record payloads contain `{u8 tag, f32 x,y,z, u32,
+u8-len strings}`-style entries referencing model names (`XCORDOOR`)
+and arena names — corridor scripts drive scripted objects/doors.
+Corpus note (6/6 `.CMI` files): table[3] always opens with a record
+named `"C"` followed by the 10 main arenas plus a SUBSET of the
+corridor arenas — LEVEL5 has zero corridor entries, the other levels
+have 7–8 of 9 (e.g. LEVEL3 lacks `CHMO_3`/`CHMO_7`).
 
 ### Model geometry record — table[1] data targets (OBSERVED, Phase 5E)
 

@@ -33,6 +33,7 @@
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
+#include "core/traversal_runtime.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
 
@@ -11273,6 +11274,197 @@ void test_dynamic_objects() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Phase 5G — traversal runtime (synthetic arenas + records)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+mdk::DtiSubRecord travSub(std::uint32_t type,
+                          std::initializer_list<std::uint32_t> f) {
+  mdk::DtiSubRecord r;
+  r.type = type;
+  std::size_t i = 0;
+  for (std::uint32_t v : f)
+    if (i < r.fields.size()) r.fields[i++] = v;
+  return r;
+}
+
+std::uint32_t fbits(float v) {
+  std::uint32_t u;
+  std::memcpy(&u, &v, 4);
+  return u;
+}
+
+mdk::TraversalArena* travArenaAdd(mdk::TraversalRuntime& rt,
+                                  const char* name) {
+  // rec points into level.work — reserve so later push_backs can't
+  // reallocate and dangle earlier arenas' record pointers.
+  rt.level.work.reserve(64);
+  rt.level.work.push_back(mdk::DtiArenaRecord{});
+  auto a = std::make_unique<mdk::TraversalArena>();
+  a->name = name;
+  a->index = static_cast<int>(rt.arenas.size());
+  a->rec = &rt.level.work.back();
+  rt.arenas.push_back(std::move(a));
+  return rt.arenas.back().get();
+}
+
+} // namespace
+
+void test_traversal_connect_pairing() {
+  // FUN_00434e54 — file-form connect ids (>999) rewrite fields[0] to
+  // the partner arena index; side codes must XOR to 1, boxes equal.
+  std::vector<mdk::DtiArenaRecord> arenas(2);
+  const float box[6] = {-19.f, 654.f, 104.f, 17.f, 654.f, 126.f};
+  mdk::DtiSubRecord a = travSub(6, {1000, 2, 0, 0, 0, 0, 0, 0});
+  mdk::DtiSubRecord b = travSub(6, {1000, 3, 0, 0, 0, 0, 0, 0});
+  for (int i = 0; i < 6; ++i) {
+    a.fields[2 + i] = fbits(box[i]);
+    b.fields[2 + i] = fbits(box[i]);
+  }
+  arenas[0].subRecords.push_back(a);
+  arenas[1].subRecords.push_back(b);
+  std::string detail;
+  CHECK(mdk::traversalConnectPairing(arenas, &detail) ==
+        mdk::TraversalLoadError::kOk);
+  CHECK(arenas[0].subRecords[0].fields[0] == 1);  // -> partner index
+  CHECK(arenas[1].subRecords[0].fields[0] == 0);
+
+  // Mismatched side codes are load-fatal.
+  std::vector<mdk::DtiArenaRecord> bad(2);
+  bad[0].subRecords.push_back(a);
+  bad[1].subRecords.push_back(a);  // side 2 vs side 2 — not XOR-1
+  CHECK(mdk::traversalConnectPairing(bad, &detail) !=
+        mdk::TraversalLoadError::kOk);
+}
+
+void test_traversal_portal_test() {
+  // FUN_00435178 — side 0: x-plane crossing toward -x with y-slab and
+  // z-slab (z0-5.0) segment overlap on prev->current.
+  mdk::TraversalRuntime rt;
+  mdk::TraversalArena* cur = travArenaAdd(rt, "CHMO_1");
+  travArenaAdd(rt, "HMO_1");
+  mdk::DtiSubRecord portal = travSub(
+      6, {1, 0, fbits(42.f), fbits(720.f), fbits(133.f),
+          fbits(42.f), fbits(744.f), fbits(147.f)});
+  rt.level.work[0].subRecords.push_back(portal);
+  rt.cur = cur;
+
+  // Cross x=42 going -x inside the slabs -> pass, returns arena 1.
+  rt.cs.pos[0] = 41.0f;  rt.cs.pos[1] = 730.f; rt.cs.pos[2] = 140.f;
+  rt.cs.entryPos[0] = 43.0f; rt.cs.entryPos[1] = 730.f;
+  rt.cs.entryPos[2] = 140.f;
+  CHECK(mdk::traversalPortalTest(rt) == rt.arenas[1].get());
+
+  // Same crossing +x direction -> fail (side 0 requires -x motion).
+  rt.cs.pos[0] = 43.0f; rt.cs.entryPos[0] = 41.0f;
+  CHECK(mdk::traversalPortalTest(rt) == nullptr);
+
+  // Crossing -x but outside the y slab -> fail.
+  rt.cs.pos[0] = 41.0f; rt.cs.pos[1] = 750.f;
+  rt.cs.entryPos[0] = 43.0f; rt.cs.entryPos[1] = 750.f;
+  CHECK(mdk::traversalPortalTest(rt) == nullptr);
+
+  // Crossing -x, y inside, z below z0-5.0 (128) -> fail.
+  rt.cs.pos[1] = 730.f; rt.cs.pos[2] = 120.f;
+  rt.cs.entryPos[1] = 730.f; rt.cs.entryPos[2] = 120.f;
+  CHECK(mdk::traversalPortalTest(rt) == nullptr);
+
+  // Diagonal sides — OBSERVED correction: side 5 passes on cross > 0,
+  // side 6 (and unmatched codes) on cross < 0.
+  mdk::TraversalRuntime rt2;
+  mdk::TraversalArena* cur2 = travArenaAdd(rt2, "A");
+  travArenaAdd(rt2, "B");
+  // Box x[0,10], y[0,10], z[0,10] — the diagonal line runs from
+  // (x0,y0)=(0,0) to (x1,y1)=(10,10): cross = (py-0)*10 - (10)*(px-0)
+  // = 10(py - px); positive when py > px.
+  mdk::DtiSubRecord d5 = travSub(
+      6, {1, 5, fbits(0.f), fbits(0.f), fbits(0.f),
+          fbits(10.f), fbits(10.f), fbits(10.f)});
+  rt2.level.work[0].subRecords.push_back(d5);
+  rt2.cur = cur2;
+  rt2.cs.pos[0] = 5.f; rt2.cs.pos[1] = 8.f; rt2.cs.pos[2] = 5.f;  // cross=30>0
+  rt2.cs.entryPos[0] = 5.f; rt2.cs.entryPos[1] = 2.f;
+  rt2.cs.entryPos[2] = 5.f;
+  CHECK(mdk::traversalPortalTest(rt2) == rt2.arenas[1].get());
+  rt2.cs.pos[1] = 2.f;                                            // cross=-30<0
+  CHECK(mdk::traversalPortalTest(rt2) == nullptr);
+
+  mdk::TraversalRuntime rt3;
+  mdk::TraversalArena* cur3 = travArenaAdd(rt3, "A");
+  travArenaAdd(rt3, "B");
+  mdk::DtiSubRecord d6 = d5;
+  d6.fields[1] = 6;
+  rt3.level.work[0].subRecords.push_back(d6);
+  rt3.cur = cur3;
+  rt3.cs.pos[0] = 5.f; rt3.cs.pos[1] = 2.f; rt3.cs.pos[2] = 5.f;  // cross<0
+  rt3.cs.entryPos[0] = 5.f; rt3.cs.entryPos[1] = 8.f;
+  rt3.cs.entryPos[2] = 5.f;
+  CHECK(mdk::traversalPortalTest(rt3) == rt3.arenas[1].get());
+  rt3.cs.pos[1] = 8.f;                                            // cross>0
+  CHECK(mdk::traversalPortalTest(rt3) == nullptr);
+}
+
+void test_traversal_trigger_scan() {
+  // FUN_00434b44 — type-1 attach / -1 detach, type-3 cold prefetch.
+  mdk::TraversalRuntime rt;
+  mdk::TraversalArena* cur = travArenaAdd(rt, "CHMO_1");
+  mdk::TraversalArena* hmo = travArenaAdd(rt, "HMO_2");
+  rt.level.work[0].subRecords.push_back(travSub(
+      1, {1, 0, fbits(147.f), fbits(681.f), fbits(88.f),
+          fbits(154.f), fbits(716.f), fbits(100.f)}));
+  rt.level.work[0].subRecords.push_back(travSub(
+      1, {0xffffffffu, 0, fbits(140.f), fbits(681.f), fbits(88.f),
+          fbits(146.f), fbits(716.f), fbits(100.f)}));
+  rt.level.work[0].subRecords.push_back(travSub(
+      3, {0, 0, fbits(73.f), fbits(684.f), fbits(88.f),
+          fbits(80.f), fbits(716.f), fbits(100.f)}));
+  rt.cur = cur;
+
+  // Inside the attach strip: type-1 fires, partner attaches hot.
+  rt.cs.pos[0] = 150.f; rt.cs.pos[1] = 700.f;
+  rt.cs.entryPos[0] = 150.f; rt.cs.entryPos[1] = 700.f;
+  mdk::traversalTriggerScan(rt);
+  CHECK(rt.seams.type1Triggers == 1);
+  CHECK(rt.partner == hmo && rt.cs.carrier == &hmo->dyn.col);
+  CHECK(rt.partnerActive && rt.cs.carrierValid == 1);
+
+  // Idempotent re-fire while in-zone (OBSERVED: attach short-circuits
+  // on equal ca4) — still counted, still attached.
+  mdk::traversalTriggerScan(rt);
+  CHECK(rt.seams.type1Triggers == 2);
+  CHECK(rt.partner == hmo && rt.partnerActive);
+
+  // Inside the detach strip: -1 -> FUN_00432bf8 clears everything.
+  rt.cs.pos[0] = 143.f; rt.cs.entryPos[0] = 143.f;
+  mdk::traversalTriggerScan(rt);
+  CHECK(rt.seams.type1Triggers == 3);
+  CHECK(rt.partner == nullptr && rt.cs.carrier == nullptr);
+  CHECK(!rt.partnerActive && rt.cs.carrierValid == 0);
+
+  // Inside the type-3 prefetch strip: partner slotted but cold —
+  // ca8=0 means no carrierValid and no partnerActive.
+  rt.cs.pos[0] = 76.f; rt.cs.entryPos[0] = 76.f;
+  mdk::traversalTriggerScan(rt);
+  CHECK(rt.seams.type3Prefetches == 1);
+  CHECK(rt.partner == rt.arenas[0].get());  // fields[0]==0 -> arena 0
+  CHECK(!rt.partnerActive && rt.cs.carrierValid == 0);
+
+  // Outside all strips: nothing fires.
+  rt.cs.pos[0] = 60.f; rt.cs.entryPos[0] = 60.f;
+  const int t1 = rt.seams.type1Triggers, t3 = rt.seams.type3Prefetches;
+  mdk::traversalTriggerScan(rt);
+  CHECK(rt.seams.type1Triggers == t1 && rt.seams.type3Prefetches == t3);
+}
+
+void test_traversal_deep_floor() {
+  // +0x44e has no writer in MDK95 — a fresh CollisionArena carries the
+  // observed zero-init: the 0x4673ee failsafe is a flat posZ<=-50.
+  mdk::CollisionArena arena;
+  CHECK(arena.deepFloorZ == 0.0f);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -11316,6 +11508,10 @@ int main() {
   test_player_collision();
   test_player_surface();
   test_dynamic_objects();
+  test_traversal_connect_pairing();
+  test_traversal_portal_test();
+  test_traversal_trigger_scan();
+  test_traversal_deep_floor();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

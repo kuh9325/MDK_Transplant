@@ -1498,3 +1498,108 @@ builds a synthetic 0x32e alien object whose script pointer is
   state `0x327`) — the redirect impulse args are captured, but the
   slide channel itself is part of the deferred movement modes.
 - `FUN_00461878` dismount internals — unchanged from Phase 5D.
+
+# Phase 5G — traversal runtime assembly
+
+Phase 5G assembles the proven Phase 5A–5F systems into a bounded,
+headless traversal runtime (`src/core/traversal_runtime.*`) driven by
+`mdk-inspect --traversal-runtime` on real BUILD_A data
+(DTI + CMI + MTO). It is not a renderer, camera, or script VM —
+unresolved spawn/script/portal behavior stays an explicit seam.
+
+## 59. Arena streaming model (OBSERVED)
+
+- DTI s2 expands each arena into a 0x466-stride record; the name's
+  leading `c`/`C` gates `+0x44 |= 3` — NON-`c` names get it, `C*`
+  corridor arenas do not. `FUN_00432404` only streams arenas with
+  `+0x44` bit0, so corridors never request an `.MTO` block (the
+  no-match path is the original `"No overlay data for %s"` assert).
+- Each `.MTO` holds exactly the 10 main-arena blocks (LEVEL3:
+  `HMO_1..HMO_10`); there are no `CHMO_*` blocks — OBSERVED on all
+  6 level MTOs. Corridors therefore have NO static collision blob,
+  and no main-arena blob covers corridor space (verified by direct
+  spawn probes into `HMO_1`/`HMO_2` at corridor coordinates — free
+  fall through the failsafe).
+- `FUN_00433d40` calls `FUN_00458550` (CMI table-3 name lookup) once
+  per arena, storing the result at `arena+0x220`: a `{u8 nameLen,
+  name, u8 dataLen, data, u32 imageOff}` record whose trailing u32
+  points at the arena's bytecode record. Table[3] = `"C"` + the 10
+  main arenas + a per-level SUBSET of corridors (LEVEL5: none;
+  LEVEL3 lacks `CHMO_3`/`CHMO_7`).
+
+## 60. Portal test — `FUN_00435178` (OBSERVED, instruction-level)
+
+- Scans the CURRENT arena's type-6 records (`+0x38` count / `+0x3c`
+  table). Record: `fields[0]` = partner arena index (rewritten by the
+  `FUN_00434e54` connect pairing from the file-form connect ID),
+  `fields[1]` = side code, `fields[2..7]` = box `{x0,y0,z0,x1,y1,z1}`.
+- Tests current pos `0x540bfc` vs previous committed pos `0x540c08`
+  per axis: closed segment-interval overlap on the two slab axes
+  (with `z0-5.0` margin at `0x497778`), directional crossing on the
+  portal axis.
+- Sides: 0/1 = x-plane crossings (−x/+x), 2/3 = y-plane, 4 = z-plane
+  downward at `z0-0.5` (`0x497780`), 7 = z-plane upward, 5 = diagonal
+  `cross > 0`, 6 = diagonal `cross < 0` where
+  `cross = (p.y-y0)(x1-x0) - (y1-y0)(p.x-x0)`; unmatched codes take
+  the side-6 path.
+- On pass: `slideChannel` (`0x540e24`) → `-15` only if `>0`;
+  `ca4=c48`, `ca8=1`, `c48=dest`, `FUN_00432d9c(dest)` leaves
+  `ca4=dest` — the old arena remains reachable only via a NEW type-1
+  attach.
+
+## 61. Trigger scan — `FUN_00434b44` (OBSERVED, instruction-level)
+
+- Per frame over the current arena's sub-records; x/y closed
+  segment-overlap box `fields[2],[3]` vs `fields[5],[6]` on
+  current-vs-previous position.
+- Type 1: `fields[0]` = partner arena index → `FUN_00432d9c`
+  (attach; idempotent when equal — per-frame re-fire in-zone is the
+  OBSERVED behavior), or `fields[0] == -1` → `FUN_00432bf8` (detach).
+- Type 3: `fields[0]` = partner index → `ca4` set + `FUN_00432980(0)`
+  stream request, `ca8=0` — cold prefetch, no hot attach/spawn.
+- Attach side effects (`FUN_00432d9c` tail): partner geometry stream,
+  type-6-peer object migration (`+0x14a&0x10` records whose `+0x60`
+  home is the partner), spawn-once guarded by `+0x44` bit2.
+
+## 62. Arena script VM — `FUN_004388d8` (OBSERVED)
+
+- Called once for `c48` and once for `ca4` per frame whenever the
+  arena's `+0x220` is non-null — the `tr_alcmd` bytecode interpreter
+  driven per-ARENA, not only per-alien.
+- Per-arena persistent state: `+0x108` program counter, `+0x22c`
+  wait/delay counter (execution suspends while >0), `+0x230`
+  alternate PC, `0xff` end-of-stream, and a 1000-instruction-per-call
+  cap guarded by the original `"Alien %s looped %d commands, off %lx"`
+  diagnostic.
+- The VM snapshots player pos/yaw (`0x540bfc`→`0x54c6c4`,
+  `0x540c2c`→`0x54c6c0`) for opcodes. Corridor scripts drive scripted
+  objects (e.g. `XCORDOOR` doors) — corridor traversal is
+  SCRIPT/PORTAL-DRIVEN, not static-collision-driven. The runtime
+  counts these calls as the `scriptObj` seam and does not emulate them.
+
+## 63. Deep-floor failsafe — arena `+0x44e` (OBSERVED)
+
+- `0x4673ee` computes `c48->+0x44e + (-50.0) >= posZ` → forced
+  grounded + vertVel=0 (`kDeepFloorDelta` = `0x498a98` = -50.0).
+- All five `+0x44e` sites in MDK95 are READS (0x4583ab/0x4583ce/
+  0x45bdd6/0x45fd55/0x4673f3) — the field has no writer, so the
+  record's zero-init leaves it 0 for every arena: the failsafe is a
+  flat `posZ <= -50` world floor, not per-arena geometry.
+- Native note: an earlier implementation derived it from the arena's
+  own vertex min — corrected to the observed flat -50.
+
+## 64. Phase 5G validation + boundary
+
+- `mdk-inspect --traversal-runtime` on LEVEL3/HMO_1: real-data run
+  passes (geometry loaded, gates, contact, grounded), deterministic
+  digest `f568d6aa986f4b70` over 60 frames; the player walks off the
+  authored ledge and falls — observed, not corrected.
+- CHMO_1 corridor run: `geom=0`, type-1 attach fires per frame,
+  partner loads (`car-vld=1 car-bsy=0 car-geom=1`), failsafe catch at
+  -50 — the honest corridor outcome. Corridor checks assert the
+  attach/prefetch seams instead of static contact.
+- Boundary (explicit seams): the `FUN_004388d8` arena scripts are
+  counted but not executed; corridor crossing mechanics (script-
+  driven doors/forced movement/teleports) are UNKNOWN until the VM
+  is mapped; type-5/type-8 records remain UNKNOWN; `+0x44e`'s lack of
+  a writer is confirmed for MDK95 — DOS build parity unchecked.
