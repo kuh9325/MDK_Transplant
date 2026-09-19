@@ -128,6 +128,15 @@ feeds a synthetic flat-floor `FUN_004630d4` result into
 landing state per frame under the loaded bindings. Mutually
 exclusive with the other selftests and `--interactive-frontend`
 (RC 2); exits RC 3 on mismatch.
+`--selftest-player-collision` (Phase 5D) runs the same 56-frame
+LALT script but drives the REAL `FUN_004630d4` sweep — a synthetic
+flat-floor arena in the proven `FUN_00419ee0` runtime layouts —
+with the horizontal query (scale 0.75) then the vertical query
+(scale 0.5, outAux→node) each frame and `collisionFloorProbe`
+(FUN_00435eec) at frame end. Verifies the full jump/fall/land arc
+and the `9.99` landing quirk (the lifted box stops 0.01 below the
+plane). Mutually exclusive with the other selftests and
+`--interactive-frontend` (RC 2); exits RC 3 on mismatch.
 `--no-relative-mouse`, `--help`. `Esc` or closing the window quits.
 
 ## Source layout
@@ -211,6 +220,20 @@ src/
                                   ceiling/blocker/deep-floor
                                   handling) — stops at the semantic
                                   FUN_004630d4 collision seam (5C)
+             collision_query.*  — Phase 5D collision layer:
+                                  FUN_004630d4 swept box-vs-BSP
+                                  query/apply (scale = slide
+                                  budget, outAux = hit node,
+                                  EAX = poly token), FUN_00407fc0
+                                  iterative sweep + FUN_00408260
+                                  BSP recursion + FUN_00408820
+                                  leaf polys + FUN_004089c0 SAT +
+                                  plane pushout, swept-AABB
+                                  object pass (FUN_0045ce58/
+                                  FUN_0045c838), carrier retry,
+                                  FUN_00435eec per-frame object
+                                  floor probe, FUN_00419ee0
+                                  level-stream blob parse (5D)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

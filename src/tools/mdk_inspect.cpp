@@ -9,12 +9,16 @@
 //   mdk-inspect --data-path DIR --visual-info <relative-path> <record>
 //   mdk-inspect --data-path DIR --font-info <relative-path> <record>
 //               [<code>]
+//   mdk-inspect --data-path DIR --collision-probe <relative-path>
+//               [<x> <y> <z>]   (Phase 5D: locate the level-stream
+//               collision blob, run one swept query + floor probe)
 //   mdk-inspect --selftest        (synthetic in-memory checks)
 
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
 #include "core/bni_image.h"
 #include "core/cmi_directory.h"
+#include "core/collision_query.h"
 #include "core/container.h"
 #include "core/data_root.h"
 #include "core/dti_structure.h"
@@ -52,6 +56,8 @@ int usage() {
                "<relative-path> <record> [<code>]\n"
                "       mdk-inspect --data-path DIR --sprite-info "
                "<relative-path> <record>\n"
+               "       mdk-inspect --data-path DIR --collision-probe "
+               "<relative-path> [<x> <y> <z>]\n"
                "       mdk-inspect --selftest\n");
   return 2;
 }
@@ -657,6 +663,9 @@ int main(int argc, char** argv) {
   std::optional<std::string> spriteInfoName;
   std::optional<unsigned> fontInfoCode;
   bool entriesMode = false;
+  bool collisionProbe = false;
+  float probePos[3] = {0.0f, 0.0f, 0.0f};
+  int probePosGiven = 0;
 
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -713,6 +722,34 @@ int main(int argc, char** argv) {
       if (!n) return usage();
       target = v;
       spriteInfoName = n;
+    } else if (!std::strcmp(a, "--collision-probe")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;
+      collisionProbe = true;
+      // Optional probe position (defaults to the vert-bounds centre).
+      // A leading '-' followed by a digit is a negative coordinate,
+      // not a flag.
+      for (int k = 0; k < 3; ++k) {
+        if (i + 1 < argc &&
+            (argv[i + 1][0] != '-' ||
+             (argv[i + 1][1] >= '0' && argv[i + 1][1] <= '9'))) {
+          const char* c = argv[++i];
+          char* endp = nullptr;
+          const double dv = std::strtod(c, &endp);
+          if (!endp || *endp != '\0') {
+            std::fprintf(stderr, "invalid probe coordinate: %s\n", c);
+            return usage();
+          }
+          probePos[k] = static_cast<float>(dv);
+          probePosGiven |= 1 << k;
+        }
+      }
+      if (probePosGiven != 0 && probePosGiven != 7) {
+        std::fprintf(stderr, "--collision-probe needs either no "
+                             "position or all of <x> <y> <z>\n");
+        return usage();
+      }
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
@@ -821,7 +858,93 @@ int main(int argc, char** argv) {
   }
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
-      !spriteInfoName) {
+      !spriteInfoName && !collisionProbe) {
+    return 0;
+  }
+
+  // --collision-probe: Phase 5D BUILD_A smoke. Scans the file for the
+  // first self-consistent FUN_00419ee0 collision blob (the level
+  // stream's {nodes,polys,verts} triple), then runs one real swept
+  // FUN_004630d4 query + FUN_00435eec floor probe against it.
+  if (collisionProbe) {
+    const auto cfile = root->readFile(*target, kEntriesMaxBytes, &err);
+    if (!cfile) {
+      std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
+      return 1;
+    }
+    const std::uint8_t* bytes =
+        reinterpret_cast<const std::uint8_t*>(cfile->data());
+    const std::size_t n = cfile->size();
+    std::size_t blobOff = 0;
+    mdk::CollisionArena arena;
+    std::uint32_t counts[4] = {0, 0, 0, 0};
+    bool found = false;
+    for (std::size_t off = 0; off + 16 <= n; off += 4) {
+      mdk::CollisionArena a;
+      if (mdk::collisionBlobParse(bytes + off, n - off, &a, counts)) {
+        blobOff = off;
+        arena = a;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      std::printf("collision: no self-consistent FUN_00419ee0 blob "
+                  "found\n");
+      return 1;
+    }
+    std::printf("blob:      0x%08zx — countA=%u nodes=%u polys=%u "
+                "verts=%u\n",
+                blobOff, counts[0], counts[1], counts[2], counts[3]);
+    // Vertex bounds for the default probe position.
+    float bmin[3] = {1e30f, 1e30f, 1e30f};
+    float bmax[3] = {-1e30f, -1e30f, -1e30f};
+    for (std::uint32_t i = 0; i < counts[3]; ++i) {
+      for (int k = 0; k < 3; ++k) {
+        const float v = arena.verts[i * 3 + k];
+        if (v < bmin[k]) bmin[k] = v;
+        if (v > bmax[k]) bmax[k] = v;
+      }
+    }
+    std::printf("bounds:    min (%g, %g, %g)  max (%g, %g, %g)\n",
+                (double)bmin[0], (double)bmin[1], (double)bmin[2],
+                (double)bmax[0], (double)bmax[1], (double)bmax[2]);
+    mdk::CollisionState cs;
+    cs.arena = &arena;
+    cs.queryEnabled = 1;
+    cs.arenaValid = 1;
+    cs.objectDataLoaded = 1;
+    cs.pos[0] = probePosGiven ? probePos[0]
+                            : (bmin[0] + bmax[0]) * 0.5f;
+    cs.pos[1] = probePosGiven ? probePos[1]
+                            : (bmin[1] + bmax[1]) * 0.5f;
+    cs.pos[2] = probePosGiven ? probePos[2]
+                            : (bmin[2] + bmax[2]) * 0.5f;
+    std::printf("probe-pos: (%g, %g, %g)\n", (double)cs.pos[0],
+                (double)cs.pos[1], (double)cs.pos[2]);
+    // One vertical swept query spanning the whole vert range.
+    const float dz = -(bmax[2] - bmin[2] + 20.0f);
+    const mdk::CollisionNode* node = nullptr;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, dz, 0.5f, nullptr, &node);
+    std::printf("sweep:     dz=%g -> pos (%g, %g, %g)  contact=%s",
+                (double)dz, (double)cs.pos[0], (double)cs.pos[1],
+                (double)cs.pos[2], hit ? "yes" : "no");
+    if (hit) {
+      std::printf(" poly#%td", hit - arena.polys);
+    }
+    if (node) {
+      std::printf(" node#%td n=(%g, %g, %g)", node - arena.nodes,
+                  (double)node->nx, (double)node->ny,
+                  (double)node->nz);
+    }
+    std::printf("\n");
+    // FUN_00435eec at frame end: the blob carries no object list, so
+    // bit1 clears — the original behaves the same on static floors.
+    mdk::collisionFloorProbe(cs);
+    std::printf("probe:     flags=0x%02x floorZ=%g (object list "
+                "empty in blob — bit1 clears as on static floors)\n",
+                cs.contactFlags, (double)cs.floorZ);
     return 0;
   }
 

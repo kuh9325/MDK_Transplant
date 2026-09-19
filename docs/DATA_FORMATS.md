@@ -396,12 +396,22 @@ Palette-like; semantics UNKNOWN — reported as a fixed-size span.
 Region C at `off+4+ofsC` (CODE-CORROBORATED walk — `FUN_00419ee0`):
 
 ```
-u32le c1;  rec10[c1] name fields; 2-byte pad iff c1 odd
+u32le c1;  rec10[c1]; 2-byte pad iff c1 odd
 u32le c2;  rec44[c2]
 u32le c3;  rec36[c3]
 u32le c4;  rec12[c4]
 u32le;     trailing data to block end
 ```
+
+Phase 5D proves the record semantics — region C IS the arena
+collision blob consumed by the `FUN_004630d4` sweep: `c2` = BSP
+nodes (0x2c: `{plane f32x4, child s16x2, polyset u32x2,
+relocated offsets +0x1c/+0x20, +0x24/+0x28}`), `c3` = polygon
+records (0x24: `{u16 v[3]@0, u16 flags@0x20, u8 surface+1@0x23}`),
+`c4` = f32 vertex triples. `c1`'s 10-byte records are skipped by
+the sweep — consumer UNKNOWN. Verified live: `LEVEL3O.MTO` blob
+`0xdaa64` (248/399/234) answers a real swept query
+(`mdk-inspect --collision-probe`).
 
 ### Field-by-field evidence matrix
 
@@ -1067,8 +1077,11 @@ Two payload layouts are CODE-CORROBORATED inside BNI records:
   semantics UNKNOWN (sound-processing reads them; no field names
   proven).
 - MTO region B contents: fixed 0x150 bytes, palette-like; UNKNOWN.
-- MTO region C record internals (44/36/12-byte arrays, the c1 name
-  table's role, the trailing data): UNKNOWN.
+- MTO region C record internals: RESOLVED for the collision path —
+  Phase 5D proves it is the arena collision blob (44B BSP nodes /
+  36B poly records / 12B f32 verts — see the region C section
+  above). The c1 10-byte records' consumer and the trailing data
+  remain UNKNOWN.
 - MTO embedded ".MAT" payloads: same UNKNOWN level as MTI payloads.
 - CMI table[0] consumer path: UNKNOWN (`FUN_004583fc` has no static
   caller; the `OBJ$ANIM`-shaped names suggest a per-object animation

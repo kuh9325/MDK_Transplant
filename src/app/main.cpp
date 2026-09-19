@@ -67,6 +67,11 @@ void usage(const char* argv0) {
       "                        jump hold/release script and verify the\n"
       "                        vertical state machine each frame\n"
       "                        (optionally honors --settings-file)\n"
+      "  --selftest-player-collision\n"
+      "                        inject the deterministic Phase 5D\n"
+      "                        jump hold/release script and drive the\n"
+      "                        real collision query on a synthetic\n"
+      "                        flat-floor arena each frame\n"
       "  --no-relative-mouse   do not capture the mouse\n"
       "  -h, --help            this message\n",
       argv0);

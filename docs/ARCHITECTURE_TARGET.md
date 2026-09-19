@@ -190,6 +190,24 @@ Boundary notes (intentions, not commitments):
 > (`FUN_0046603c`), and the volume system (`FUN_00412e94`) remain
 > documented boundaries. `--selftest-player-vertical` verifies the
 > full route under loaded settings.
+>
+> Phase 5D adds the collision layer: `collision_query.*` reproduces
+> `FUN_004630d4` — the swept box-vs-BSP query/apply (six stack args,
+> position globals always committed, scale = slide budget 0.75/0.5,
+> outAux = hit BSP node → plane normal, EAX = poly-record token) —
+> the `FUN_00407fc0` iterative sweep over `FUN_00408260` BSP
+> recursion + `FUN_00408820` leaf polys + `FUN_004089c0` SAT +
+> post-slide pushout, the swept-AABB object pass
+> (`FUN_0045ce58`/`FUN_0045c838`), the carrier-arena retry, and
+> `FUN_00435eec` — the per-frame object-list floor probe at the
+> traversal-frame tail (NOT inside the query). Runtime geometry
+> arrives through `collisionBlobParse` — the `FUN_00419ee0`
+> level-stream blob layout (verified live on BUILD_A's
+> `LEVEL3O.MTO`). The surface-effect dispatcher (`FUN_0040b5d0`)
+> and mount-release reset (`FUN_00461878`) are hook boundaries.
+> `--selftest-player-collision` drives the real seam through the
+> LALT script; `mdk-inspect --collision-probe` runs one real query
+> on original data.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

@@ -5,6 +5,7 @@
 #include "core/bni_directory.h"
 #include "core/bni_image.h"
 #include "core/cmi_directory.h"
+#include "core/collision_query.h"
 #include "core/compat.h"
 #include "core/container.h"
 #include "core/data_root.h"
@@ -9804,6 +9805,619 @@ void test_player_vertical() {
 
 } // namespace
 
+// Phase 5D — FUN_004630d4 swept collision query + FUN_00435eec
+// floor probe, exercised on synthetic runtime geometry built with the
+// proven original record layouts (BSP node 0x2c, poly record 0x24,
+// float3 verts, element/object fields at the probed offsets).
+namespace {
+
+mdk::CollisionPoly makePoly(std::uint16_t a, std::uint16_t b,
+                            std::uint16_t c) {
+  mdk::CollisionPoly p = {};
+  p.v[0] = a;
+  p.v[1] = b;
+  p.v[2] = c;
+  return p;
+}
+
+mdk::CollisionNode makeNode(float nx, float ny, float nz, float d,
+                            std::uint32_t posSet, std::uint32_t negSet,
+                            std::int16_t near_, std::int16_t far_) {
+  mdk::CollisionNode n = {};
+  n.nx = nx;
+  n.ny = ny;
+  n.nz = nz;
+  n.d = d;
+  n.polysPos = posSet;
+  n.polysNeg = negSet;
+  n.childNear = near_;
+  n.childFar = far_;
+  return n;
+}
+
+// {lo16 count, hi16 firstIdx} polygon-set dword.
+constexpr std::uint32_t polySet(std::uint32_t count, std::uint32_t first) {
+  return (first << 16) | count;
+}
+
+struct CollisionFixture {
+  std::vector<float> verts;
+  std::vector<mdk::CollisionPoly> polys;
+  std::vector<mdk::CollisionNode> nodes;
+  mdk::CollisionArena arena = {};
+  void finish() {
+    arena.verts = verts.data();
+    arena.polys = polys.data();
+    arena.nodes = nodes.data();
+  }
+};
+
+// Flat floor at z=10 (plane +z facing up, approached from above).
+CollisionFixture makeFloorArena() {
+  CollisionFixture f;
+  f.verts = {-50, -50, 10, 50, -50, 10, 50, 50, 10};
+  f.polys = {makePoly(0, 1, 2)};
+  f.nodes = {makeNode(0, 0, 1, -10, polySet(1, 0), 0, -1, -1)};
+  f.arena.deepFloorZ = -1000.0f;
+  f.finish();
+  return f;
+}
+
+// Vertical wall at x=5, normal -x facing the room (player at x<5).
+// Two tris tile the quad — the leaf scan accepts the first overlap.
+CollisionFixture makeWallArena() {
+  CollisionFixture f;
+  f.verts = {5, 50, 50,  5, -50, 50, 5, 50, -50,
+             5, -50, -50, 5, 50, -50, 5, -50, 50};
+  f.polys = {makePoly(0, 1, 2), makePoly(3, 4, 5)};
+  f.nodes = {makeNode(-1, 0, 0, 5, polySet(2, 0), 0, -1, -1)};
+  f.finish();
+  return f;
+}
+
+// Ceiling at z=20, normal -z facing down.
+CollisionFixture makeCeilArena() {
+  CollisionFixture f;
+  f.verts = {-50, -50, 20, 50, -50, 20, 50, 50, 20};
+  f.polys = {makePoly(0, 1, 2)};
+  f.nodes = {makeNode(0, 0, -1, 20, polySet(1, 0), 0, -1, -1)};
+  f.finish();
+  return f;
+}
+
+// Empty space: node present but no polygons anywhere.
+CollisionFixture makeEmptyArena() {
+  CollisionFixture f;
+  f.nodes = {makeNode(0, 0, 1, -10, 0, 0, -1, -1)};
+  f.finish();
+  return f;
+}
+
+struct ObjectFixture {
+  std::vector<float> elemVerts;
+  std::array<std::uint8_t, 0x24> triRec = {};
+  mdk::CollisionElement elem = {};
+  mdk::CollisionElementSet elemSet = {};
+  mdk::CollisionObject obj = {};
+  int modelDummy = 0;
+};
+
+// Rideable/probe-able object: one element carrying a flat tri at
+// local z, identity transform, origin (0,0,0). Filled in place — the
+// intra-struct pointers (elements, model) must not be moved after.
+void initFloorObject(ObjectFixture& o, float z) {
+  o.elemVerts = {-50, -50, z, 50, -50, z, 50, 50, z};
+  auto* idx = reinterpret_cast<std::uint16_t*>(o.triRec.data());
+  idx[0] = 0;
+  idx[1] = 1;
+  idx[2] = 2;
+  o.elem.triCount = 1;
+  o.elem.verts = o.elemVerts.data();
+  o.elem.tris = o.triRec.data();
+  const float zmin = z - 0.5f, zmax = z + 0.5f;
+  float eb[6] = {-60, -60, zmin, 60, 60, zmax};
+  std::memcpy(o.elem.aabb, eb, sizeof(eb));
+  o.elemSet.count = 1;
+  o.elemSet.elems = &o.elem;
+  o.obj.next = nullptr;
+  o.obj.named = true;
+  o.obj.model = &o.modelDummy;
+  o.obj.elements = &o.elemSet;
+  o.obj.baseZ = z;
+  o.obj.flags148 = 0;
+  o.obj.flags149 = 1;
+  o.obj.flags14a = 0;
+  float ab[6] = {-60, -60, zmin, 60, 60, zmax};
+  std::memcpy(o.obj.aabb, ab, sizeof(ab));
+  const float ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  std::memcpy(o.obj.xform, ident, sizeof(ident));
+  o.obj.origin[0] = o.obj.origin[1] = o.obj.origin[2] = 0.0f;
+  o.obj.scale = 1.0f;
+  o.obj.elemMaskB = 0;
+  o.obj.elemMaskA = 0;
+}
+
+mdk::CollisionState makeCollisionState(const mdk::CollisionArena* arena) {
+  mdk::CollisionState cs;
+  cs.arena = arena;
+  cs.queryEnabled = 1;
+  cs.arenaValid = 1;
+  cs.objectDataLoaded = 1;
+  return cs;
+}
+
+// Adapt the collision layer to the semantic VerticalCollisionResult
+// the 5C seam consumes (token = truncated object pointer; the vertical
+// layer never dereferences it).
+mdk::VerticalCollisionResult adaptCollision(
+    const mdk::CollisionState& cs, const mdk::CollisionPoly* contact,
+    const mdk::CollisionNode* node) {
+  mdk::VerticalCollisionResult res;
+  res.contactObj =
+      (std::uint32_t)(uintptr_t)contact;
+  res.posX = cs.pos[0];
+  res.posY = cs.pos[1];
+  res.posZ = cs.pos[2];
+  if (node) {
+    res.normalX = node->nx;
+    res.normalY = node->ny;
+    res.normalZ = node->nz;
+  }
+  res.hasFloor = (cs.contactFlags & 0x2) != 0;
+  res.floorZ = cs.floorZ;
+  res.blocker0 = (std::uint32_t)(uintptr_t)cs.floorObj;
+  res.blocker1 = cs.floorElemMask;
+  res.blocker0Flag80 =
+      cs.floorObj != nullptr && (cs.floorObj->flags14a & 0x80) != 0;
+  return res;
+}
+
+void test_player_collision() {
+  // ---- empty space: full displacement, no contact -----------------
+  {
+    CollisionFixture f = makeEmptyArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0;
+    cs.pos[1] = 0;
+    cs.pos[2] = 12;
+    const mdk::CollisionNode* node = &f.nodes[0];
+    const mdk::CollisionPoly* hit =
+        mdk::collisionApply(cs, 1.0f, 2.0f, 0.0f, 0.75f, nullptr, &node);
+    CHECK(hit == nullptr && node == nullptr);
+    CHECK(near(cs.pos[0], 1.0) && near(cs.pos[1], 2.0) &&
+          near(cs.pos[2], 12.0));
+    // Player AABB refreshed around the pre-move lifted position.
+    CHECK(near(cs.playerBox[0], -0.6) && near(cs.playerBox[3], 0.6));
+    CHECK(near(cs.playerBox[1], -0.6) && near(cs.playerBox[4], 0.6));
+    CHECK(near(cs.playerBox[2], 12.5) && near(cs.playerBox[5], 17.5));
+  }
+
+  // ---- flat floor: vertical contact resolves feet to F - 0.01 -----
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 12;
+    const mdk::CollisionNode* node = nullptr;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -4.0f, 0.5f, nullptr, &node);
+    CHECK(hit == &f.polys[0]);
+    CHECK(node == &f.nodes[0]);
+    CHECK(near(node->nz, 1.0));
+    // Lifted centre stops at plane+2.5 -> feet at floorZ - 0.01.
+    CHECK(near(cs.pos[2], 9.99f, 1e-4));
+  }
+
+  // ---- free fall: short drop misses the floor ----------------------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 12;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -0.05f, 0.5f, nullptr, nullptr);
+    CHECK(hit == nullptr);
+    CHECK(near(cs.pos[2], 11.95));
+  }
+
+  // ---- ceiling: upward contact, normal -z --------------------------
+  {
+    CollisionFixture f = makeCeilArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10;
+    const mdk::CollisionNode* node = nullptr;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, 8.0f, 0.5f, nullptr, &node);
+    CHECK(hit == &f.polys[0]);
+    CHECK(node != nullptr && near(node->nz, -1.0));
+    // Head (feet+5.01) stops at the ceiling plane.
+    CHECK(near(cs.pos[2], 14.99f, 1e-4));
+  }
+
+  // ---- wall: horizontal contact stops at face distance -------------
+  {
+    CollisionFixture f = makeWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 2;
+    cs.pos[2] = 10;
+    const mdk::CollisionNode* node = nullptr;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 4.0f, 0.0f, 0.0f, 0.75f, nullptr, &node);
+    CHECK(hit == &f.polys[0]);
+    CHECK(node != nullptr && near(node->nx, -1.0));
+    CHECK(near(cs.pos[0], 4.4f, 1e-4)); // wall x=5 minus ext 0.6
+    // Already at the face: pushing again yields zero applied motion.
+    hit = mdk::collisionApply(cs, 4.0f, 0.0f, 0.0f, 0.75f, nullptr,
+                              nullptr);
+    CHECK(hit == &f.polys[0]);
+    CHECK(near(cs.pos[0], 4.4f, 1e-4));
+  }
+
+  // ---- tangential motion along the wall is free --------------------
+  {
+    CollisionFixture f = makeWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 2;
+    cs.pos[2] = 10;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 4.0f, 0.0f, 0.75f, nullptr, nullptr);
+    CHECK(hit == nullptr);
+    CHECK(near(cs.pos[0], 2.0) && near(cs.pos[1], 4.0));
+  }
+
+  // ---- grazing incidence slides along the wall ---------------------
+  {
+    CollisionFixture f = makeWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 2;
+    cs.pos[2] = 10;
+    // dn^2 = 16 <= 0.75 * (16+64) = 60 -> slide allowed.
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 4.0f, 8.0f, 0.0f, 0.75f, nullptr, nullptr);
+    // The slide resolves cleanly -> the LAST traversal is free ->
+    // the seam reports no contact even though a plane was grazed.
+    CHECK(hit == nullptr);
+    // Contact at x=4.4, pushout margin 0.61 -> x=4.39; y slides on.
+    CHECK(near(cs.pos[0], 4.39f, 1e-4));
+    CHECK(near(cs.pos[1], 8.0f, 1e-4));
+  }
+
+  // ---- steep incidence stops dead (no slide) -----------------------
+  {
+    CollisionFixture f = makeWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 2;
+    cs.pos[2] = 10;
+    // dn^2 = 36 > 0.75 * (36+4) = 30 -> terminal contact, no slide.
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 6.0f, 2.0f, 0.0f, 0.75f, nullptr, nullptr);
+    CHECK(hit == &f.polys[0]);
+    CHECK(near(cs.pos[0], 4.4f, 1e-4));
+    CHECK(near(cs.pos[1], 0.8f, 1e-4)); // advanced only to the contact t
+  }
+
+  // ---- zero displacement: stable result ----------------------------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 12;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, 0.0f, 0.75f, nullptr, nullptr);
+    CHECK(hit == nullptr);
+    CHECK(near(cs.pos[2], 12.0));
+  }
+
+  // ---- query disabled: full displacement, outNode cleared ----------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.queryEnabled = 0;
+    cs.pos[2] = 12;
+    const mdk::CollisionNode* node = &f.nodes[0];
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -4.0f, 0.5f, nullptr, &node);
+    CHECK(hit == nullptr && node == nullptr);
+    CHECK(near(cs.pos[2], 8.0));
+  }
+
+  // ---- floor probe: object floor sets c58/c60/c64/c54 bit1 ---------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    initFloorObject(o, 10.0f);
+    f.arena.objects = &o.obj;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10.05;
+    mdk::collisionFloorProbe(cs);
+    CHECK((cs.contactFlags & 0x2) != 0);
+    CHECK(near(cs.floorZ, 10.0));
+    CHECK(cs.floorObj == &o.obj);
+    CHECK(cs.floorElemMask == 1);
+    CHECK(near(cs.floorOffset, 10.0 - o.obj.baseZ));
+  }
+
+  // ---- floor probe: empty list clears bit1 + mount state -----------
+  {
+    CollisionFixture f = makeEmptyArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10.05;
+    cs.contactFlags = 0x3;
+    // Stale mount flag with no ride object: the dc0==0 || dc8==0
+    // branch scans, finds nothing, then runs the dismount path.
+    static int emptyDismounts = 0;
+    emptyDismounts = 0;
+    cs.dismountHook = [](mdk::CollisionState&) { ++emptyDismounts; };
+    cs.rideActive = 1;
+    mdk::collisionFloorProbe(cs);
+    CHECK((cs.contactFlags & 0x2) == 0);
+    CHECK(cs.floorObj == nullptr);
+    CHECK(emptyDismounts == 1);
+    CHECK(cs.rideObj == nullptr && cs.rideActive == 0);
+  }
+
+  // ---- floor probe: mounted ride recomputes floorZ from baseZ ------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    initFloorObject(o, 10.0f);
+    o.obj.flags14a = 0x80; // mountable
+    f.arena.objects = &o.obj;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10.05;
+    // Mount established (dc0/dc4/dc8 as the vertical landing left it).
+    cs.rideObj = &o.obj;
+    cs.rideElemMask = 1;
+    cs.rideActive = 1;
+    cs.floorOffset = 0.25f; // c5c saved at mount time
+    mdk::collisionFloorProbe(cs);
+    CHECK((cs.contactFlags & 0x2) != 0);
+    CHECK(cs.floorObj == &o.obj);
+    CHECK(cs.floorElemMask == 1);
+    // floorZ = baseZ + floorOffset — follows the object, no re-probe.
+    CHECK(near(cs.floorZ, 10.0f + 0.25f));
+  }
+
+  // ---- floor probe: dismount hook on losing the 0x80 flag ----------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    initFloorObject(o, 10.0f);
+    o.obj.flags14a = 0; // no longer mountable
+    f.arena.objects = &o.obj;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10.05;
+    cs.rideObj = &o.obj;
+    cs.rideActive = 1;
+    static int dismountCalls = 0;
+    dismountCalls = 0;
+    cs.dismountHook = [](mdk::CollisionState&) { ++dismountCalls; };
+    mdk::collisionFloorProbe(cs);
+    CHECK(dismountCalls == 1);
+    CHECK(cs.rideActive == 0);
+    // Probe then re-scans: the object floor is still found.
+    CHECK((cs.contactFlags & 0x2) != 0);
+  }
+
+  // ---- horizontal -> vertical ordering on one frame ----------------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0;
+    cs.pos[2] = 9.99f; // standing on the z=10 floor
+    // Horizontal first: box bottom at posZ+0.5 clears the floor.
+    const mdk::CollisionPoly* h = mdk::collisionApply(
+        cs, 1.0f, 0.0f, 0.0f, 0.75f, nullptr, nullptr);
+    CHECK(h == nullptr && near(cs.pos[0], 1.0));
+    // Vertical second: gravity drop -> floor contact, feet at 9.99.
+    const mdk::CollisionPoly* v = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -0.05f, 0.5f, nullptr, nullptr);
+    CHECK(v == &f.polys[0]);
+    CHECK(near(cs.pos[2], 9.99f, 1e-4));
+  }
+
+  // ---- standing player sequence (full 5C pipeline, real query) -----
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 12.0f;
+    mdk::PlayerVerticalEnvironment env;
+    env.deepFloorZ = -1000.0f;
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.posZ = 12.0f;
+    vs.contactFlags = 0;
+    bool grounded = false;
+    for (int i = 0; i < 200 && !grounded; ++i) {
+      cs.pos[0] = vs.posX;
+      cs.pos[1] = vs.posY;
+      cs.pos[2] = vs.posZ;
+      mdk::PlayerVerticalFrame fr = mdk::integratePlayerVertical(env, ms, vs);
+      if (fr.collisionIssued) {
+        const mdk::CollisionNode* node = nullptr;
+        const mdk::CollisionPoly* hit = mdk::collisionApply(
+            cs, 0.0f, 0.0f, fr.dispZ, 0.5f, nullptr, &node);
+        mdk::VerticalCollisionResult res = adaptCollision(cs, hit, node);
+        mdk::applyPlayerVerticalCollision(env, ms, vs, res, fr);
+      }
+      mdk::playerVerticalPostStep(env, vs);
+      mdk::collisionFloorProbe(cs);
+      grounded = (vs.contactFlags & 0x1) != 0;
+    }
+    CHECK(grounded);
+    CHECK(near(vs.vertVel, 0.0));
+    // Landed feet ride 0.01 under the plane (the margin quirk) — then
+    // each grounded frame re-contacts at t=0 and the anti-jitter keeps
+    // the position pinned there.
+    CHECK(near(vs.posZ, 9.99f, 0.05));
+    // Ten more idle frames stay grounded and stable.
+    for (int i = 0; i < 10; ++i) {
+      cs.pos[2] = vs.posZ;
+      mdk::PlayerVerticalFrame fr = mdk::integratePlayerVertical(env, ms, vs);
+      if (fr.collisionIssued) {
+        const mdk::CollisionNode* node = nullptr;
+        const mdk::CollisionPoly* hit = mdk::collisionApply(
+            cs, 0.0f, 0.0f, fr.dispZ, 0.5f, nullptr, &node);
+        mdk::VerticalCollisionResult res = adaptCollision(cs, hit, node);
+        mdk::applyPlayerVerticalCollision(env, ms, vs, res, fr);
+      }
+      mdk::playerVerticalPostStep(env, vs);
+      mdk::collisionFloorProbe(cs);
+    }
+    CHECK((vs.contactFlags & 0x1) != 0);
+    CHECK(near(vs.posZ, 9.99f, 0.05));
+  }
+
+  // ---- standing on an object floor (probe + pre-land snap) ---------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    initFloorObject(o, 10.0f);
+    o.obj.flags14a = 0x80; // mountable -> blocker bit7 flows through
+    f.arena.objects = &o.obj;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 12.0f;
+    mdk::PlayerVerticalEnvironment env;
+    env.deepFloorZ = -1000.0f;
+    mdk::PlayerMotionState ms;
+    mdk::PlayerVerticalState vs;
+    vs.posZ = 12.0f;
+    bool grounded = false;
+    for (int i = 0; i < 200 && !grounded; ++i) {
+      cs.pos[0] = vs.posX;
+      cs.pos[1] = vs.posY;
+      cs.pos[2] = vs.posZ;
+      mdk::PlayerVerticalFrame fr = mdk::integratePlayerVertical(env, ms, vs);
+      if (fr.collisionIssued) {
+        const mdk::CollisionNode* node = nullptr;
+        const mdk::CollisionPoly* hit = mdk::collisionApply(
+            cs, 0.0f, 0.0f, fr.dispZ, 0.5f, nullptr, &node);
+        mdk::VerticalCollisionResult res = adaptCollision(cs, hit, node);
+        mdk::applyPlayerVerticalCollision(env, ms, vs, res, fr);
+      }
+      mdk::playerVerticalPostStep(env, vs);
+      mdk::collisionFloorProbe(cs);
+      // The probe runs at frame end; next frame's seam sees its state.
+      grounded = (vs.contactFlags & 0x1) != 0;
+    }
+    CHECK(grounded);
+    CHECK(near(vs.vertVel, 0.0));
+    // contactObj==0 + pre-land path snaps exactly to floorZ.
+    CHECK(near(vs.posZ, 10.0f, 0.05));
+    // The probe blockers became the movement blockers.
+    CHECK(vs.blocker0 == (std::uint32_t)(uintptr_t)&o.obj);
+    CHECK(vs.blocker1 == 1);
+    CHECK(vs.moveBlocker0 == vs.blocker0);
+    CHECK(vs.moveBlockerFlag == 1); // +0x14a bit7 -> dc8
+  }
+
+  // ---- wall movement through the 5B seam ---------------------------
+  {
+    CollisionFixture f = makeWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 2.0f;
+    cs.pos[2] = 10.0f;
+    mdk::GameplayInputBindings bind;
+    mdk::GameplayInputEnvironment genv;
+    mdk::GameplayInputState gst;
+    mdk::PlayerMotionEnvironment menv;
+    mdk::PlayerMotionState ms;
+    auto setBit = [](std::array<std::uint32_t, 4>& bm, int code) {
+      bm[code >> 5] |= 1u << (code & 31);
+    };
+    mdk::RawGameplayInput r;
+    setBit(r.keyLevel, 103); // KeyUp -> forward
+    auto stepFrame = [&]() {
+      const mdk::GameplayInputFrame fr =
+          mdk::consumeGameplayInput(r, bind, genv, gst);
+      mdk::PlayerMotionOutput mo = mdk::integratePlayerMotion(fr, menv, ms);
+      const float oldX = cs.pos[0], oldY = cs.pos[1];
+      mdk::collisionApply(cs, mo.dispX, mo.dispY, 0.0f, 0.75f, nullptr,
+                          nullptr);
+      const bool posChanged =
+          !near(cs.pos[0], oldX, 1e-6) || !near(cs.pos[1], oldY, 1e-6);
+      mdk::playerMotionPostStep(menv, posChanged, ms, mo);
+      return std::make_pair(mo, posChanged);
+    };
+    // First frames: the request is small (accel) but real — motion
+    // begins and the move event stands.
+    auto first = stepFrame();
+    CHECK(first.first.dispX > 0.0f);
+    CHECK(first.second);
+    // Drive into the wall until the face is reached.
+    for (int i = 0; i < 200 && cs.pos[0] < 4.39f; ++i) stepFrame();
+    CHECK(cs.pos[0] <= 4.4f + 1e-4f); // never past the face
+    // Pushing from the face: zero applied motion -> positionChanged
+    // goes false and the move event cancels.
+    auto last = stepFrame();
+    CHECK(!last.second);
+    CHECK(near(cs.pos[0], 4.4f, 1e-4));
+  }
+
+  // ---- FUN_00419ee0 blob parse (synthetic stream record) -----------
+  {
+    // Minimal self-consistent blob: countA=0, 1 node, 1 poly,
+    // 3 verts — the proven {40B A, 44B nodes, 36B polys, 12B verts}
+    // chain with the dword tail.
+    std::vector<std::uint8_t> blob;
+    auto put32 = [&](std::uint32_t v) {
+      blob.push_back((std::uint8_t)(v & 0xff));
+      blob.push_back((std::uint8_t)((v >> 8) & 0xff));
+      blob.push_back((std::uint8_t)((v >> 16) & 0xff));
+      blob.push_back((std::uint8_t)((v >> 24) & 0xff));
+    };
+    auto putF = [&](float f) {
+      std::uint32_t v;
+      std::memcpy(&v, &f, 4);
+      put32(v);
+    };
+    put32(0);                       // countA
+    put32(1);                       // countB
+    putF(0.0f); putF(0.0f); putF(1.0f); putF(-10.0f); // plane
+    blob.push_back(0xff); blob.push_back(0xff);       // childFar -1
+    blob.push_back(0xff); blob.push_back(0xff);       // childNear -1
+    put32(1);                       // polysPos {count 1, idx 0}
+    put32(0);                       // polysNeg unused
+    put32(0); put32(0); put32(0); put32(0);           // +0x1c..+0x28
+    put32(1);                       // countC
+    blob.push_back(0); blob.push_back(0);             // v0
+    blob.push_back(1); blob.push_back(0);             // v1
+    blob.push_back(2); blob.push_back(0);             // v2
+    for (int i = 0; i < 30; ++i) blob.push_back(0);   // poly pad
+    put32(3);                       // countD
+    putF(-1.0f); putF(-1.0f); putF(10.0f);
+    putF(1.0f); putF(-1.0f); putF(10.0f);
+    putF(1.0f); putF(1.0f); putF(10.0f);
+    put32(0);                       // tail
+    mdk::CollisionArena a;
+    std::uint32_t counts[4] = {0, 0, 0, 0};
+    CHECK(mdk::collisionBlobParse(blob.data(), blob.size(), &a,
+                                  counts));
+    CHECK(counts[0] == 0 && counts[1] == 1 && counts[2] == 1 &&
+          counts[3] == 3);
+    CHECK(a.nodes != nullptr && a.polys != nullptr &&
+          a.verts != nullptr);
+    CHECK(near(a.nodes[0].nz, 1.0) && a.polys[0].v[2] == 2);
+    // A parsed arena answers a real query.
+    mdk::CollisionState cs = makeCollisionState(&a);
+    cs.pos[2] = 12.0f;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -4.0f, 0.5f, nullptr, nullptr);
+    CHECK(hit == a.polys);
+    CHECK(near(cs.pos[2], 9.99f, 1e-4));
+    // Rejections: truncated chain, bad poly index, non-unit plane.
+    CHECK(!mdk::collisionBlobParse(blob.data(), blob.size() - 8, &a,
+                                   counts));
+    std::vector<std::uint8_t> bad = blob;
+    bad[4 + 4 + 44 + 4] = 9; // poly v0 = 9 >= countD
+    CHECK(!mdk::collisionBlobParse(bad.data(), bad.size(), &a,
+                                   counts));
+    bad = blob;
+    std::memcpy(bad.data() + 4 + 4 + 8, &counts[0], 4); // nz = 0
+    CHECK(!mdk::collisionBlobParse(bad.data(), bad.size(), &a,
+                                   counts));
+  }
+}
+
+} // namespace
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -9844,6 +10458,7 @@ int main() {
   test_gameplay_input();
   test_player_motion();
   test_player_vertical();
+  test_player_collision();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

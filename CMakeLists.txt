@@ -29,6 +29,7 @@ add_library(mdk_core STATIC
   src/core/bni_image.cpp
   src/core/clock.cpp
   src/core/cmi_directory.cpp
+  src/core/collision_query.cpp
   src/core/container.cpp
   src/core/data_root.cpp
   src/core/display_menu.cpp

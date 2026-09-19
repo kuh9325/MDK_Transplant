@@ -4,6 +4,7 @@
 #include "core/bni_directory.h"
 #include "core/bni_image.h"
 #include "core/clock.h"
+#include "core/collision_query.h"
 #include "core/compat.h"
 #include "core/data_root.h"
 #include "core/display_menu.h"
@@ -1845,6 +1846,63 @@ static bool verifyVerticalSelfTestFrame(
   return ok;
 }
 
+// --selftest-player-collision (Phase 5D): the same LALT script as the
+// vertical diagnostic, but the FUN_004630d4 seam is real — a synthetic
+// flat-floor arena (BSP node 0x2c + poly record 0x24 + float3 verts,
+// the FUN_00419ee0 runtime layouts). The FUN_00435eec floor probe runs
+// at frame end. The observable checks mirror the vertical verifier;
+// the landing z is the distinguishing quirk: the sweep resolves feet
+// to floorZ - 0.01 (9.99), not the 10.05 the synthetic stub used.
+namespace {
+
+struct CollisionSelftestFixture {
+  float verts[9] = {-50, -50, 10, 50, -50, 10, 50, 50, 10};
+  CollisionPoly poly = {};
+  CollisionNode node = {};
+  CollisionArena arena = {};
+  CollisionSelftestFixture() {
+    poly.v[0] = 0;
+    poly.v[1] = 1;
+    poly.v[2] = 2;
+    node.nz = 1.0f;
+    node.d = -10.0f;
+    node.childNear = -1;
+    node.childFar = -1;
+    node.polysPos = 1; // count=1, firstIdx=0
+    arena.verts = verts;
+    arena.polys = &poly;
+    arena.nodes = &node;
+    arena.deepFloorZ = -1000.0f;
+  }
+};
+
+// Mirrors adaptCollision() in tests/native/test_main.cpp — maps the
+// collision layer to the semantic VerticalCollisionResult the 5C seam
+// consumes (object tokens are truncated pointers, never dereferenced).
+VerticalCollisionResult adaptCollisionSelftest(
+    const CollisionState& cs, const CollisionPoly* contact,
+    const CollisionNode* node) {
+  VerticalCollisionResult res;
+  res.contactObj = (std::uint32_t)(uintptr_t)contact;
+  res.posX = cs.pos[0];
+  res.posY = cs.pos[1];
+  res.posZ = cs.pos[2];
+  if (node) {
+    res.normalX = node->nx;
+    res.normalY = node->ny;
+    res.normalZ = node->nz;
+  }
+  res.hasFloor = (cs.contactFlags & 0x2) != 0;
+  res.floorZ = cs.floorZ;
+  res.blocker0 = (std::uint32_t)(uintptr_t)cs.floorObj;
+  res.blocker1 = cs.floorElemMask;
+  res.blocker0Flag80 =
+      cs.floorObj != nullptr && (cs.floorObj->flags14a & 0x80) != 0;
+  return res;
+}
+
+} // namespace
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -1866,7 +1924,7 @@ int Application::run() {
 
   ModeDispatcher dispatcher;
   if ((cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
-       cfg_.selftestPlayerVertical) &&
+       cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) &&
       cfg_.interactiveFrontend) {
     // The diagnostics own the raw-key machine per frame; combining
     // them with the front-end would double-poll the latch/edge
@@ -1876,12 +1934,13 @@ int Application::run() {
     return 2;
   }
   if ((int)cfg_.selftestGameplayInput + (int)cfg_.selftestPlayerMotion +
-          (int)cfg_.selftestPlayerVertical >
+          (int)cfg_.selftestPlayerVertical +
+          (int)cfg_.selftestPlayerCollision >
       1) {
     // Each selftest injects its own script; running two would
     // interleave two incompatible event streams.
-    log::error(kTag, "gameplay/motion/vertical selftests are mutually "
-                     "exclusive");
+    log::error(kTag, "gameplay/motion/vertical/collision selftests "
+                     "are mutually exclusive");
     return 2;
   }
   host.onQuit = [&] { dispatcher.requestQuit(); };
@@ -2310,15 +2369,34 @@ int Application::run() {
   PlayerVerticalState verticalState;
   PlayerVerticalEnvironment verticalEnv;
   std::uint64_t verticalLandedAt = ~0ull;
-  if (cfg_.selftestPlayerVertical) {
+  if (cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
     verticalState.contactFlags = 0x3;   // grounded + floor probe
     verticalState.posZ = 10.05f;
     verticalState.floorZ = 10.0f;
     verticalState.contactObj = 1;
     verticalEnv.deepFloorZ = -1000.0f;
   }
+  // Phase 5D diagnostic world: a synthetic flat-floor arena in the
+  // FUN_00419ee0 runtime layouts, plus the collision state globals.
+  // The floor probe scans only the (empty) object list, so bit1
+  // clears after the first frame-end probe — landing arrives via the
+  // sweep contact token exactly as it does on static original floors.
+  CollisionSelftestFixture collisionFixture;
+  CollisionState collisionState;
+  if (cfg_.selftestPlayerCollision) {
+    collisionState.pos[0] = verticalState.posX;
+    collisionState.pos[1] = verticalState.posY;
+    collisionState.pos[2] = verticalState.posZ;
+    collisionState.arena = &collisionFixture.arena;
+    collisionState.arenaValid = 1;
+    collisionState.queryEnabled = 1;
+    collisionState.objectDataLoaded = 1;
+    collisionState.contactFlags = 0x2;
+    collisionState.floorZ = 10.0f;
+  }
+  bool collisionLandingChecked = false;
   if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
-      cfg_.selftestPlayerVertical) {
+      cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
     host.isolateHardwareInputForSelftest();
     FrontendSettings gs;
     if (cfg_.settingsFile) {
@@ -2348,8 +2426,10 @@ int Application::run() {
       // Scripts: 17 gameplay steps (0..16) / 24 motion steps
       // (0..23) / 56 vertical steps (0..55) — quit right after the
       // last injected step.
-      cfg_.frames = cfg_.selftestPlayerVertical ? 56
-                    : cfg_.selftestPlayerMotion ? 24 : 17;
+      cfg_.frames = (cfg_.selftestPlayerVertical ||
+                     cfg_.selftestPlayerCollision)
+                        ? 56
+                        : cfg_.selftestPlayerMotion ? 24 : 17;
     }
   }
 
@@ -2369,8 +2449,8 @@ int Application::run() {
       // Phase 5B script: one deterministic movement step.
       host.pushMotionSelfTestStep(clock.frameCount());
     }
-    if (cfg_.selftestPlayerVertical) {
-      // Phase 5C script: one deterministic jump hold/release step.
+    if (cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
+      // Phase 5C/5D script: one deterministic jump hold/release step.
       host.pushVerticalSelfTestStep(clock.frameCount());
     }
     host.pumpEvents(input);
@@ -2383,7 +2463,7 @@ int Application::run() {
     }
 
     if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
-        cfg_.selftestPlayerVertical) {
+        cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
       // frontendInputFromSdl runs the raw-key machine (level/latch/
       // prev — the FUN_0046b688 analogue) and the DIMOUSESTATE-domain
       // mouse fields; the bindings snapshot carries the loaded
@@ -2420,7 +2500,7 @@ int Application::run() {
             selftestOk_;
         prevGameplayFrame = gf;
       }
-      if (cfg_.selftestPlayerVertical) {
+      if (cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
         // The same original order continues into the vertical path:
         // horizontal integration -> (world collision seam) ->
         // FUN_0046603c (deferred) -> FUN_00466740 jump machine ->
@@ -2432,24 +2512,48 @@ int Application::run() {
         PlayerMotionOutput mo = integratePlayerMotion(
             prevGameplayFrame, motionEnv, motionState);
         playerMotionPostStep(motionEnv, true, motionState, mo);
+        if (cfg_.selftestPlayerCollision) {
+          // Phase 5D: the horizontal displacement also goes through
+          // the real FUN_004630d4 seam (scale 0.75, no outAux) before
+          // the vertical query — the original's ordering.
+          collisionState.pos[0] = verticalState.posX;
+          collisionState.pos[1] = verticalState.posY;
+          collisionState.pos[2] = verticalState.posZ;
+          collisionApply(collisionState, mo.dispX, mo.dispY, 0.0f,
+                         0.75f, nullptr, nullptr);
+        }
         verticalEnv.jumpHeld = prevGameplayFrame.jump != 0;
         verticalEnv.moveConsumed = mo.moveConsumed;
         PlayerVerticalFrame vf = integratePlayerVertical(
             verticalEnv, motionState, verticalState);
         if (vf.collisionIssued) {
-          // Synthetic flat floor at z=10: contact once the applied Z
-          // reaches the 0.05 landing hover; the probe always reports
-          // the floor. This is the semantic FUN_004630d4 seam — no
-          // collision geometry is reconstructed.
           VerticalCollisionResult vres;
-          vres.posX = verticalState.posX;
-          vres.posY = verticalState.posY;
-          vres.posZ = verticalState.posZ + vf.dispZ;
-          vres.hasFloor = true;
-          vres.floorZ = 10.0f;
-          if (vres.posZ <= 10.05f) {
-            vres.contactObj = 1;
-            vres.normalZ = 1.0f;
+          if (cfg_.selftestPlayerCollision) {
+            // The real FUN_004630d4 vertical query (scale 0.5, outAux
+            // -> BSP node) on the synthetic flat-floor arena.
+            collisionState.pos[0] = verticalState.posX;
+            collisionState.pos[1] = verticalState.posY;
+            collisionState.pos[2] = verticalState.posZ;
+            const CollisionNode* outNode = nullptr;
+            const CollisionPoly* contact = collisionApply(
+                collisionState, 0.0f, 0.0f, vf.dispZ, 0.5f, nullptr,
+                &outNode);
+            vres = adaptCollisionSelftest(collisionState, contact,
+                                          outNode);
+          } else {
+            // Synthetic flat floor at z=10: contact once the applied
+            // Z reaches the 0.05 landing hover; the probe always
+            // reports the floor. This is the semantic FUN_004630d4
+            // seam — no collision geometry is reconstructed.
+            vres.posX = verticalState.posX;
+            vres.posY = verticalState.posY;
+            vres.posZ = verticalState.posZ + vf.dispZ;
+            vres.hasFloor = true;
+            vres.floorZ = 10.0f;
+            if (vres.posZ <= 10.05f) {
+              vres.contactObj = 1;
+              vres.normalZ = 1.0f;
+            }
           }
           applyPlayerVerticalCollision(verticalEnv, motionState,
                                        verticalState, vres, vf);
@@ -2463,6 +2567,29 @@ int Application::run() {
                                         motionState, gameplayBindings,
                                         verticalLandedAt) &&
             selftestOk_;
+        if (cfg_.selftestPlayerCollision) {
+          // FUN_00435eec runs at the traversal-frame tail — after the
+          // movement dispatcher, not inside the query.
+          collisionFloorProbe(collisionState);
+          if (vf.landed && !collisionLandingChecked) {
+            collisionLandingChecked = true;
+            // The 9.99 quirk: the lifted box stops 0.01 below the
+            // plane, not at the 10.05 hover the synthetic stub used.
+            if (std::fabs(verticalState.posZ - 9.99) > 0.02) {
+              log::error(kTag,
+                         "collision selftest: landing z=%g — "
+                         "expected the 9.99 sweep quirk",
+                         (double)verticalState.posZ);
+              selftestOk_ = false;
+            }
+          }
+          if (t.index == 55 && !collisionLandingChecked) {
+            log::error(kTag,
+                       "collision selftest: never landed on the "
+                       "synthetic floor");
+            selftestOk_ = false;
+          }
+        }
         prevGameplayFrame = gf;
       }
     }
@@ -3287,6 +3414,10 @@ int Application::run() {
     log::info(kTag, "player-vertical selftest: %s",
               selftestOk_ ? "PASS" : "FAIL");
   }
+  if (cfg_.selftestPlayerCollision) {
+    log::info(kTag, "player-collision selftest: %s",
+              selftestOk_ ? "PASS" : "FAIL");
+  }
   return selftestOk_ ? 0 : 3;
 }
 
@@ -3370,6 +3501,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.selftestPlayerMotion = true;
     } else if (!std::strcmp(a, "--selftest-player-vertical")) {
       cfg.selftestPlayerVertical = true;
+    } else if (!std::strcmp(a, "--selftest-player-collision")) {
+      cfg.selftestPlayerCollision = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {
       cfg.relativeMouse = false;
     } else {

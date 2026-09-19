@@ -113,6 +113,12 @@ struct AppConfig {
   // jump/gravity/landing state is verified. Exits non-zero on
   // mismatch. No front-end or --data-path required.
   bool selftestPlayerVertical = false;
+  // --selftest-player-collision (Phase 5D): the same LALT script and
+  // previous-frame seam, but the collision result comes from the real
+  // FUN_004630d4 sweep on a synthetic flat-floor arena (FUN_00435eec
+  // floor probe runs at frame end). Verifies the observable jump/
+  // fall/land sequence plus the 9.99 (floorZ - 0.01) landing quirk.
+  bool selftestPlayerCollision = false;
   bool relativeMouse = true;  // --no-relative-mouse to disable
   int windowWidth = 960;      // logical points; drawable may be 2x (Retina)
   int windowHeight = 720;     // 4:3 default

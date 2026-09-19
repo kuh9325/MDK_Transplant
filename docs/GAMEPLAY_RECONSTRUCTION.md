@@ -774,3 +774,221 @@ of the last step.
 - The `0x540cac` player-state enumeration is still only partially
   mapped (0x2bc fall / 0x2bd sustain / 0x2be-0x2bf jump / 0x326
   hard-land / 800 slide / <800 locomotion observed).
+
+# Phase 5D — collision query and floor probe
+
+Phase 5D reconstructs the bounded collision layer around
+`FUN_004630d4` (the swept player/object collision query/apply) and
+`FUN_00435eec` (the per-frame floor/contact probe), including the
+proven lower level: BSP traversal, polygon records, the
+box-vs-triangle test, and the iterative slide.
+
+## 32. `FUN_004630d4` recovered signature (OBSERVED)
+
+Instruction-level recovery: six stack arguments, no register
+inputs (ECX/EDX are clobbered at the prologue — the earlier
+conceptual `context`/`mode` arguments were dead registers):
+
+```text
+u32 /*EAX = poly-record token*/ FUN_004630d4(
+    float dx, float dy, float dz,   /* +0x08,+0x0c,+0x10 */
+    float scale,                    /* +0x14 -> FUN_00407fc0 */
+    float *extVec,                  /* +0x18 NULL -> defaults */
+    void **outAux)                  /* +0x1c -> BSP node ptr */
+```
+
+Position lives in globals `DAT_00540bfc/c00/c04` and is ALWAYS
+committed as `pos += resolved delta` — never restored on failure.
+
+Call-site contracts:
+
+| call | args | defaults |
+|------|------|----------|
+| horizontal | `(dx, dy, 0, 0.75, NULL, NULL)` | `{0.6, 0.6, 2.5}` |
+| vertical | `(0, 0, dz, 0.5, NULL, &e50)` | `{0.4, 0.4, 2.5}` |
+
+`scale` is NOT a radius: it is the slide-continuation budget —
+the sweep keeps sliding while `(totalDelta · n)² > scale ·
+|totalDelta|²` (grazing-incidence threshold). `outAux` receives
+the hit BSP **node pointer** (default `&DAT_0049b3d0`); the
+contact normal the vertical path reads is `node->plane[0..2]`.
+
+Return value = hit **polygon-record pointer** (stored in
+`DAT_00540e4c`); 0 = no contact.
+
+## 33. Outer orchestration (OBSERVED)
+
+```text
+pos (globals) -> lifted start (posZ + ext.z + margin;
+                 margin 0.5 horizontal / 0.01 vertical)
+  -> FUN_00407fc0 iterative sweep vs arena c48 {nodes,polys,verts}
+     (flag=4: up to 4 slide steps + 1 contact pass; resolved
+      target initialized to the requested target -> full motion
+      when no geometry)
+  -> carrier retry once vs arena ca4 (flag=0) when the primary
+     reports no contact AND portal gates allow
+     (ca8 && !d3c && !e6c); replays the FULL requested segment
+     in the partner arena
+  -> swept-AABB object pass over arena +0x68 list:
+     FUN_0045ce58 (6-float AABB overlap) + FUN_0045c838
+     (2.5D segment/AABB resolver — X/Y face clamp only, Z
+      early-outs; element AABBs expanded by the player extents)
+  -> final static re-sweep (flag=0) when an object resolved
+  -> pos += applied delta
+```
+
+The swept player AABB (`0x540c30..0x540c44`) is rebuilt per
+query: `min += negative delta`, `max += positive delta` per axis
+around the pre-move lifted box.
+
+## 34. `FUN_00435eec` floor probe (OBSERVED)
+
+NOT inside the collision call — it runs once per frame at the
+tail of `FUN_00436100`'s traversal update (after the movement
+dispatcher, object updates, enemy AI). The `c54&2`/`c58` state
+the vertical layer reads is the PREVIOUS frame's probe.
+
+- Probes ONLY the arena `+0x68` object list — never the static
+  BSP (static-floor landings arrive through the sweep contact
+  token `e4c` instead).
+- Segment: `(x, y, z+3) -> (x, y, z-3)` top-to-bottom, via
+  `FUN_004138d8` (node-local transform: 3x3 @+0xac, origin
+  @+0xb8/c8/d8, scale @+0x58) and `FUN_00413730` (local
+  segment-vs-triangle). Hit written into the bottom endpoint.
+- On hit: `c58 = hitZ`, `c5c = hitZ - objectBaseZ`,
+  `c64 = 1<<elemIdx`, `c60 = object`, `c54 |= 2`. Bit1 is
+  cleared before each scan.
+- Riding branch (`dc0 && dc8`): `c58 = dc0->baseZ + c5c` — the
+  prior relative offset rides the moving object. `dc0/dc4/dc8`
+  are written by the vertical LANDING path (`0x46739b`,
+  gated on blocker `+0x14a & 0x80`), not by the probe.
+- Stale mount (`!dc0 || !dc8`): calls `FUN_00461878` (debug-fly/
+  reset — `cac=100`, zeroes velocity; gated on `0x540c9c`),
+  clears `dc8`, rescans.
+
+## 35. Runtime geometry provenance (OBSERVED)
+
+`FUN_00419ee0` lazily parses the level-stream collision blob
+(fetched via `FUN_0041ab44` stream cursor `DAT_0054b744`, inside
+`FUN_004321dc`/`FUN_00432404` arena attach) into the arena
+record:
+
+```text
+blob:  [u32 countA][A x 10B][pad 2B if countA odd]
+       [u32 countB][B x 44B = BSP nodes][u32 countC]
+       [C x 36B = poly records][u32 countD][D x 12B = f32 verts]
+       [u32 tail]
+arena: +0x0c=vertCount +0x10=polyCount (via EBX) +0x14=nodeCount
+       +0x18=countA +0x1c=A-base
+       +0x24=vertBase +0x28=polyBase +0x2c=nodeBase +0x30=end
+node +0x1c/+0x20: relocated as (end + offset) pointers
+```
+
+BUILD_A confirmation: self-consistent blobs exist inside
+`TRAVERSE/LEVEL3/LEVEL3O.MTO` (the `.MTO` overlay stream) —
+e.g. file offset `0xdaa64`: 248 nodes / 399 polys / 234 verts,
+all planes ~unit, all children in range, all poly indices
+saturating the vert table. `.DTI` supplies the arena TABLE +
+connect records; the collision geometry stream is `.MTO`.
+`.CMI` is not involved.
+
+## 36. Deep-layer primitives (OBSERVED)
+
+- `FUN_00408260`: recursive BSP sweep over 0x2c-byte nodes —
+  `+0x00..0x0f` plane `{nx,ny,nz,d}`, `+0x10/+0x12` s16 child
+  pair, `+0x14/+0x18` poly-set dwords `{lo16 count, hi16
+  firstIdx}` selected by approach side (count 0 = unused,
+  firstIdx 0xffff is filler). Box projected as `|n . ext|`
+  margin; computes hit `t`, slide target via plane projection.
+- `FUN_00408820`: per-leaf polygon-set scan; poly records are
+  0x24 bytes `{u16 v0,v1,v2 @+0; ...; u16 flags @+0x20 (bit5
+  skip, bit2 low-friction); u8 surface+1 @+0x23}`.
+- `FUN_004089c0`: box-vs-triangle SAT at the contact point —
+  dominant-axis projection, axis table `{1,2, 0,2, 0,1}`,
+  `|n_i| >= 0.1` gate; `FUN_00425600` is the point-in-triangle
+  parity test (EAX = candidate hit, EBX = v0 — vertex-relative
+  coordinates).
+- `FUN_004088cc` / `FUN_0040894c`: post-slide plane pushout —
+  full 3D vs XY-only split on `|n.z| < 0.75` (wall vs floor),
+  `+0.01` margin.
+- `FUN_004089c0` contact -> `0x4635e0` callback ->
+  `FUN_0040b5d0` surface-effect dispatcher: poly `+0x23` gate,
+  `+0x20>>24`-adjacent surface type -> player `+0x6c[type]` flag
+  table + `+0x8c[type]` handler -> `FUN_004546ac`. Bounce
+  (`0x540e28`) and conveyor effects originate THERE, not in
+  this layer — kept as an optional contact hook.
+- `FUN_0045c838` return split: first-hit/inside takes the
+  slide-past alternate output; later hits take the clamp point.
+- `FUN_004138d8` element records: `+0x10` tri count, `+0x14`
+  vert base, `+0x18` tri records (0x24 stride, u16 x3 indices);
+  element AABB @+0x44.
+
+## 37. Position application and grounded ownership
+
+- Sweep applies the resolved slide endpoint; `pos += applied`.
+- `c54` bit0 (grounded) is written by the vertical LANDING path
+  (`0x46763b` `c54 |= 1`), NOT by collision. `e4c == 0` on the
+  pre-land path snaps `pos.z = c58`.
+- `c54` bit1 (floor-probe valid) is written only by
+  `FUN_00435eec`.
+- `0x540e28` bounce = `FUN_00466aec` return + external write —
+  external input to landing, kept as an external flag.
+
+## 38. Native implementation
+
+- `src/core/collision_query.{h,cpp}` — faithful transcription:
+  `collisionApply` (FUN_004630d4), `collisionSweep`
+  (FUN_00407fc0 + FUN_00408260 + leaf/SAT/pushout),
+  `collisionFloorProbe` (FUN_00435eec), `collisionBlobParse`
+  (FUN_00419ee0). Record layouts mirror the proven runtime
+  structs (CollisionNode 0x2c, CollisionPoly 0x24).
+- `CollisionState` carries the original's globals (pos, c54,
+  c58/c5c, c60/c64, c68/c70, ca4/ca8/d3c, dc0/dc4/dc8, e6c,
+  e68, c30..c44 box). The `0x4635e0` surface dispatch and
+  `FUN_00461878` reset are optional hooks.
+- `--selftest-player-collision`: the 56-frame LALT script
+  through the REAL seam on a synthetic flat-floor arena —
+  horizontal query (0.75) then vertical query (0.5, outAux)
+  each frame, floor probe at frame end. Verifies the whole 5C
+  observable arc AND the `9.99` landing quirk (lifted box stops
+  0.01 below the plane — not the synthetic stub's 10.05).
+- `mdk-inspect --collision-probe <file> [x y z]`: BUILD_A
+  smoke — locates the first self-consistent blob, runs one real
+  sweep + floor probe. On `LEVEL3O.MTO`: blob `0xdaa64`, probe
+  at vert-centre contacts poly#328 via node#212 `n=(0,0,1)`,
+  resolving z to `103.99` — the same `-0.01` margin quirk on
+  real data.
+
+## 39. Phase 5D diagnostics and tests
+
+- Native tests: 3166 checks, 0 failures (3090 baseline + 76
+  Phase 5D): empty/full-motion, flat floor (`9.99` quirk),
+  free-fall miss, ceiling (`14.99`, `n=(0,0,-1)`), wall face
+  stop + re-push zero-motion, tangent/grazing, contact token +
+  node normal, player-AABB rebuild, object element sweep,
+  AABB-resolver side flags, carrier retry, floor probe hit /
+  bit1 clear / ride carry / stale-mount dismount, horizontal→
+  vertical ordering, standing-player sequence, wall sequence
+  through the real 5A→5B seam, blob parse accept/reject.
+- Selftests: gameplay-input, player-motion, player-vertical,
+  player-collision all PASS; mutual exclusion + frontend
+  combos RC 2.
+- Phase 4 regressions: root-only digest `cf09ecdad5b0808f`,
+  six-screen flow PASS (200 frames).
+
+## 40. Remaining collision unknowns / PARTIAL boundary
+
+- `FUN_0040b5d0` surface-effect internals (bounce/conveyor
+  handlers behind `+0x8c[type]`) — the dispatcher is reached
+  but its per-type effects are a hook, not reconstructed.
+- `FUN_00461878` full reset semantics (debug-fly path) — the
+  mount-release call site is preserved via hook.
+- Arena `+0x68` object-list construction and the `+0xac..0xd8`
+  transform writers (which loader fills moving-object models).
+- `countA`/10-byte leading blob records — parsed for layout
+  but their consumer is UNKNOWN (skipped by the sweep).
+- Portal `ca4` partner-arena selection details
+  (`FUN_00435178` connect-record side codes) — the retry
+  contract is proven; partner assignment is runtime state.
+- `FUN_004089c0` is transcribed as proven; degenerate-triangle
+  edge cases beyond the observed SAT path are untested.
