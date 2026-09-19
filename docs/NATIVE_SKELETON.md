@@ -245,6 +245,19 @@ src/
                                   FUN_0046b2f8 degree-Euler
                                   matrix + FUN_0045612c
                                   transform/AABB rebuild (5E)
+             player_surface.*   — Phase 5F surface contact effects:
+                                  FUN_0040b5d0 per-contact dispatch
+                                  (callback 0x4635e0) over the
+                                  16-slot +0x6c..+0x114 tables,
+                                  FUN_0040a704 poly-flag op +
+                                  FUN_0040b4dc pending pass, the
+                                  +0x45e fan-record list —
+                                  FUN_00412ef0 conveyor +
+                                  FUN_00412e94/FUN_00412f84 volume
+                                  query + FUN_004134a0 rate ramp —
+                                  the opcode-0xe0 type-9
+                                  slide-zone trigger, and the
+                                  FUN_004546ac script seam (5F)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

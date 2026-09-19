@@ -194,6 +194,26 @@ Phase 5E addition (read-only):
   17 models, 0 failures). This is an inspection seam — it does not
   make the inspector a gameplay runtime dependency.
 
+Phase 5F additions (read-only / synthetic, no payloads):
+
+- `mdk-inspect --data-path DIR --surface-census <rel-path>` loads the
+  given `.DTI` plus its sibling `<stem>O.MTO` and censuses the
+  surface-contact data the dispatcher (`FUN_0040b5d0`) and the
+  volume/slide-zone records consume: per-arena type-7 (fan/volume) and
+  type-9 (slide-zone) DTI sub-record counts, and per-MTO-block
+  region-C collision-blob poly census — the surface byte (`+0x23`)
+  distribution plus the `+0x20` flag-bit counts. Verified on all six
+  BUILD_A levels (`LEVEL3`–`LEVEL8`): surface ids 1–16 used (out-of-
+  domain >16 also observed on LEVEL4), type-9 records only in
+  LEVEL6's `COLYM_*` corridors, `+0x20` flag bits all zero in static
+  data (runtime-written by opcodes `0x62`/`0xa8` + the dispatcher).
+- `mdk-inspect --selftest-player-surface` runs a synthetic end-to-end
+  through the real seams (no `--data-path`): `collisionApply` →
+  `surfaceContactHook` → `surfaceDispatch`, `surfaceConveyorDelta` →
+  `integratePlayerMotion`, `slideZoneTrigger` →
+  `applyPlayerVerticalCollision`, and the `surfaceApplyPending`
+  re-arm. Prints PASS/FAIL per stage; exits nonzero on mismatch.
+
 ## Validation performed (BUILD_A, read-only)
 
 - `traverse\level7\level7s.mti` → resolved `TRAVERSE/LEVEL7/LEVEL7S.MTI`;

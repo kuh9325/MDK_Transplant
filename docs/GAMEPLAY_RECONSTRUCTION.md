@@ -1267,3 +1267,234 @@ update (`FUN_004572ac` + `FUN_0045cf18` per arena) → scripts
   portal test) — trigger-side, not collision-side.
 - Surface effects (`FUN_0040b5d0`) and `FUN_00461878` dismount
   internals — unchanged hook boundaries from Phase 5D.
+
+# Phase 5F — surface contact effects
+
+Phase 5F reconstructs **one bounded layer**: the surface-effect block
+hanging off the collision object — the per-contact dispatcher
+`FUN_0040b5d0` invoked through the sweep's registered callback
+(`0x4635e0`), the poly-flag operation helper `FUN_0040a704` and the
+pending-flag pass `FUN_0040b4dc`, the `+0x45e` "fan" record list with
+its conveyor (`FUN_00412ef0`) and volume-updraft (`FUN_00412e94` /
+`FUN_00412f84`) consumers, the record update `FUN_004134a0`, and the
+type-9 slide-zone trigger behind tr_alcmd opcode `0xe0`. The script
+handler (`FUN_004546ac` → the tr_alcmd VM) stays a seam — the native
+port does not implement the VM.
+
+The chain is:
+
+```
+collision contact -> callback 0x4635e0 -> FUN_0040b5d0
+                  -> surface/contact dispatch -> locomotion effect
+```
+
+## 50. The contact callback — `0x4635e0` (OBSERVED)
+
+`0x4635e0` is **pushed as a function-pointer argument** to the BSP
+sweep `FUN_00407fc0` — twice in the player query (`FUN_004630d4`):
+once for the player's own collision set, and again for `0x540ca4`
+(the ridden/attached object from 5E) when the first sweep misses.
+The sweep calls it once per contact-producing iteration with
+`EDX` = the hit poly. Its register signature (recovered from exact
+disassembly):
+
+```
+FUN_0040b5d0(EAX = ctx (player/arena collision object),
+             EDX = poly,
+             EBX = 0,
+             ECX = 8,
+             stack{-0xb, vecA=0x4a20c0, posB=0x540bfc, c08=0x540c08})
+```
+
+`0x4a20c0` is the sweep's working/contact-position buffer;
+`0x540bfc` is the live player position; `0x540c08` is the
+entry/snapshot position written by the load/transition path (not per
+contact). The other six `FUN_0040b5d0` call sites use masks `0x1`,
+`0x2`, `0x3`, `0x10` — the player sweep callback is channel `0x8`.
+
+## 51. The dispatcher — `FUN_0040b5d0` (OBSERVED)
+
+Per contact:
+
+1. Rejects polys whose byte `+0x23` is zero (the surface enable gate).
+2. Derives the surface id as `(u32@+0x20 >> 24)` — i.e. the same
+   `+0x23` byte — and indexes `id - 1`; rejects ids outside the
+   16-entry tables.
+3. Reads `ctx+0x6c[id-1]` and tests it against the contact-context
+   mask (channel `0x8` for the player sweep).
+4. Config bit `0x80`: sets `marks |= 1<<id` (`ctx+0x114`) and clears
+   the poly's `0x10` flag via `FUN_0040a704` op 3.
+5. Config bit `0x40`: produces the secondary result condition.
+6. Config bit `0x20`: adds result bit `0x02`.
+7. If `ctx+0x8c[id-1]` holds a handler offset and
+   `ctx+0x7c[id-1]` matches the mask, invokes the script seam
+   (`FUN_004546ac`); handler invocation sets result bit `0x01`.
+8. Increments `ctx+0xcc[id-1]` by the secondary arg.
+
+The poly's `+0x20` u32 packs `{surfaceId << 24 | flags}`; the flag
+bits `0x10` (per-frame armed), `0x20` (the sweep's skip bit),
+`0x30` (combined op), `0x04` (low friction) live in the low byte.
+
+## 52. Flag ops — `FUN_0040a704` / `FUN_0040b4dc` (OBSERVED)
+
+`FUN_0040a704(surfId, polyTable, op, count)` iterates the collision
+object's poly table (`ctx+0x28`, count `ctx+0x10`), matching
+`poly+0x20 >> 24 == surfId`, and applies the op to the low-byte flag
+bits:
+
+```
+op0  |= 0x30     op2  |= 0x10     op4  |= 0x20
+op1  &= ~0x30    op3  &= ~0x10    op5  &= ~0x20
+```
+
+`FUN_0040b4dc(mode)` is the pending/persistent pass:
+
+- **mode 0** — for each bit set in `marks` (`+0x114`), re-arm the
+  `0x10` flag on that surface's polys, then clear `marks`. This is the
+  per-frame re-arm that pairs with the dispatcher's `0x80` clear.
+- **mode 1** — set `0x30` on polys flagged `&2`, then apply the
+  persistent op masks `+0x10c` / `+0x110` (op2 for bits in `+0x110`,
+  else op4); clears consumed bits.
+
+## 53. The `+0x45e` "fan" record list (OBSERVED)
+
+`ctx+0x45e` heads an intrusive list of 0x48-byte records (a static
+pool in the original — `"P_Fan_ %s not found"`). `record+0x14` selects
+the kind:
+
+- **`-1` — surface-bound.** `+0x0c` = the surface id, `+0x20..0x28` =
+  a normalized 3D direction, `+0x18` = rate, `+0x40` = target rate,
+  `+0x44` = ramp delta. `FUN_004134a0` ramps `rate` toward `target`
+  per frame and scrolls matching-surface poly UVs (render-side — not
+  modelled); `FUN_00412ef0` adds `dir * rate * frameStep` to an out
+  vector for each record whose surface matches a queried poly — the
+  conveyor displacement.
+- **`1..6` — volume/ribbon.** `+0x20..0x37` = an AABB. `FUN_00412e94`
+  scans them and `FUN_00412f84` runs a box test plus a per-shape
+  falloff `t`, easing an out `vec.z` toward `rate * t` — the updraft
+  volumes 5C already models as environment inputs.
+
+`FUN_00413380` creates a surface record (normalize dir, push front);
+`FUN_00412e10`/`FUN_00412d04` create volume records from **type-7**
+DTI "fan hotspot" sub-records; `FUN_00413210`/`FUN_004132e0`/
+`FUN_00413354` delete / set-rate / enable by name (script-facing).
+
+## 54. The type-9 slide-zone — opcode `0xe0` (OBSERVED)
+
+tr_alcmd opcode `0xe0` (dispatch-table slot `0xdf` at `0x438a5c`)
+takes `{flag, yaw, speed}`. With `flag == 0` it clears slide mode;
+otherwise it scans the arena's DTI sub-record table (`+0x38/+0x3c`)
+for **type-9** records and tests the player position against each
+record's closed bounds box `fields[3..8]` (`minx..maxz`). On a
+containing box it writes `DAT_00540e28 = 1` (the bounce flag) and:
+
+- if sliding or a contact normal exists → `FUN_00465de8` enters
+  slide mode (`e24 = 1`, state `0x327`) + `FUN_00465e64` applies a
+  yaw/speed impulse;
+- else → `vertVel -= f4 * 128.0` (the constant `double 128.0` at
+  `0x497ccc`) — a downward slam, since `vertVel` is `+Z`-up.
+
+So the type-9 record is a **slide/deflect zone** (MDK's slalom
+mechanic), not a generic trampoline: `e28` marks "in zone" so the
+landing path suppresses the normal landing transition while the
+redirect applies. In the native seam this feeds
+`VerticalCollisionResult::bounce` → `vs.bounceFlag`, which suppresses
+the hard-landing event (`FUN_00467180`) and clears on the post-step.
+
+## 55. Surface-table population — script opcodes (OBSERVED)
+
+The collision object's surface block is **script-configured**, not
+loaded from static data. The arena object is memset at creation; the
+tr_alcmd opcodes then write the tables through the context pointer
+(`alien+0x60` → the arena object):
+
+| opcode | args | writes |
+| ------ | ---- | ------ |
+| `0x62` | `{surfId, op}` | `FUN_0040a704` + `+0x10c`/`+0x110` persistent masks |
+| `0x63` | `{mask, surfId, handlerOff}` | `+0x7c` handler mask + `+0x8c` CMI-relative handler offset |
+| `0xa8` | `{surfId, mask}` | `+0x6c` config (+ `FUN_0040a704` set-`0x10` when `mask&0x80`) |
+| (counter setter) | `{surfId, u16}` | `+0xcc` counter |
+| `0xe0` | `{flag, yaw, speed}` | type-9 slide-zone scan (above) |
+
+`+0x8c` handler offsets are **CMI-image-relative** — `FUN_004546ac`
+builds a synthetic 0x32e alien object whose script pointer is
+`CMI base + handlerOff` (player as the `+0x60` context) and runs the
+`FUN_004388d8` VM on it. The per-arena CMI block resolves via
+`FUN_00458550` → `arena+0x220`.
+
+## 56. Native implementation (`src/core/player_surface.*`)
+
+- `SurfaceObjectState` — the collision object's `+0x6c..+0x45e`
+  block: `config`/`handlerMask`/`handlerOff`/`counters` (16 slots),
+  `opMaskA`/`opMaskB`/`marks`, the mutable poly table + count, the
+  record list, and a native-only `SurfaceScriptFn` hook for the
+  `FUN_004546ac` seam.
+- `surfacePolyOp` — `FUN_0040a704`; `surfaceDispatch` —
+  `FUN_0040b5d0`; `surfaceApplyPending` — `FUN_0040b4dc`.
+- `surfaceRecordCreate` / `surfaceVolumeCreate` /
+  `surfaceRecordUpdate` / `surfaceRecordsDestroy` — the `+0x45e`
+  record lifecycle + rate ramp (`FUN_004134a0`'s locomotion-relevant
+  half; UV-scroll poly writes are render-side and skipped).
+- `surfaceConveyorDelta` — `FUN_00412ef0` (`out += dir*rate*dt`);
+  `surfaceVolumeQuery` — `FUN_00412e94` + `FUN_00412f84`.
+- `slideZoneTrigger` — opcode `0xe0`'s mechanics (box scan, bounce
+  flag, redirect / down-slam) without the slide locomotion channel.
+- `surfaceContactHook` — the `0x4635e0` callback equivalent, installed
+  as `CollisionState::contactHook`; the sweep stages `cs.sweepContact`
+  (the `0x4a20c0` vecA) before each invoke.
+
+`CollisionState` gained the dispatch inputs (`entryPos`,
+`sweepContact`, `surfDelta`/`surfVec` fx outputs, `surface`,
+`surfaceContextMask`, `surfaceResult`) — the callback's argument set.
+
+## 57. Phase 5F diagnostics and tests
+
+- Native tests: **3323 checks, 0 failures** (3257 baseline + 66 Phase
+  5F): surface-metadata decode + gating, the dispatch mask effects
+  (`0x80`/`0x40`/`0x20`), poly-flag ops, pending-flag apply mode 0/1,
+  handler mask gating + invoke + result mutation, conveyor
+  normalize/accumulate/nonmatch/multi-record, record lifetime + rate
+  ramp, volume query/falloff, type-9 inside/outside/redirect/down-slam,
+  and the real seam paths (`collisionApply` → `surfaceContactHook`,
+  conveyor → `integratePlayerMotion`, bounce →
+  `applyPlayerVerticalCollision`).
+- `mdk-inspect --selftest-player-surface`: synthetic end-to-end
+  through the real seams — contact ordinary floor → no effect;
+  contact a conveyor surface → 5B displacement; contact a slide-zone →
+  5C bounce flag; pending re-arm. PASS.
+- `mdk-inspect --surface-census <path/LEVELn.DTI>`: BUILD_A census —
+  reads the `.DTI` + sibling `<stem>O.MTO`, counts the type-7
+  (fan/volume) / type-9 (slide-zone) sub-records per arena and the
+  surface byte (`+0x23`) + flag bits (`+0x20`) across each arena's
+  region-C collision blob. Results (all OBSERVED on real data):
+
+  | level | surface polys | surface ids seen | type7 | type9 |
+  | ----- | ------------- | ---------------- | ----- | ----- |
+  | 3 | 1044 / 7205 | 1–14 | 2 | 0 |
+  | 4 | 10700 / 14509 | 1–16 (+2372 out-of-domain >16) | 5 | 0 |
+  | 5 | 1023 / 6044 | 1–11 | 4 | 0 |
+  | 6 | 836 / 7043 | 1–10 | 6 | 8 |
+  | 7 | 1903 / 10208 | 1–16 | 2 | 0 |
+  | 8 | 617 / 6593 | 1–12 | 4 | 0 |
+
+  Type-9 slide-zones appear only in LEVEL6, all inside the `COLYM_*`
+  corridor arenas — consistent with the slide/deflect mechanic living
+  in connector corridors. Type-7 volumes are spread across all levels.
+  **The `+0x20` flag bits are all zero in static data** — confirming
+  `0x10`/`0x20`/`0x30`/`0x04` are runtime state written by opcodes
+  `0x62`/`0xa8` and the dispatcher, not serialized. The `+0x23` byte
+  can exceed 16 (LEVEL4) — the dispatcher's slot bound correctly
+  rejects those; whether they carry a non-surface meaning is UNKNOWN.
+
+## 58. Remaining Phase 5F unknowns / boundary
+
+- `FUN_004546ac` — the CMI-relative handler scripts. The dispatch,
+  mask, counter, and fx plumbing are proven; the script bodies that
+  produce game-specific effects are the VM's domain — intentionally a
+  seam, not reimplemented.
+- `+0x23` values >16 — out of the dispatch domain; possibly a
+  different packed field. OBSERVED distribution, semantics UNKNOWN.
+- Slide-mode locomotion (`FUN_00465de8` / `FUN_00465e64` internals,
+  state `0x327`) — the redirect impulse args are captured, but the
+  slide channel itself is part of the deferred movement modes.
+- `FUN_00461878` dismount internals — unchanged from Phase 5D.

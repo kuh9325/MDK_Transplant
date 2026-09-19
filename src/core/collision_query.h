@@ -147,6 +147,9 @@ using CollisionContactHook = void (*)(
 // Hook replacing FUN_00461878 (dismount/reset on the ride state).
 using CollisionDismountHook = void (*)(struct CollisionState& cs);
 
+// Phase 5F — the collision object's surface-effect block (player_surface.h).
+struct SurfaceObjectState;
+
 struct CollisionState {
   // 0x540bfc / 0x540c00 / 0x540c04 — player position. collisionApply
   // always commits pos += applied delta (no restore on failure).
@@ -179,6 +182,23 @@ struct CollisionState {
   const CollisionObject* lastObjContact = nullptr;
   // 0x540c30..0x540c44 — the per-query player AABB (6 floats).
   float playerBox[6] = {0, 0, 0, 0, 0, 0};
+  // --- Phase 5F — surface-contact dispatch inputs (the 0x4635e0 args) ---
+  // 0x540c08 — the entry/snapshot position the dispatch's delta reads
+  // (host-written on arena entry; the original sets it in the load/
+  // transition path, NOT per contact).
+  float entryPos[3] = {0.0f, 0.0f, 0.0f};
+  // The sweep's working/contact position (s.hitPt), staged before each
+  // contactHook invoke — the 0x4a20c0 vecA of the original callback.
+  float sweepContact[3] = {0.0f, 0.0f, 0.0f};
+  // 0x4a2438 / 0x4a2448 — the surface-handler fx outputs (delta/vec),
+  // written by the dispatch when a handler invokes.
+  float surfDelta[3] = {0.0f, 0.0f, 0.0f};
+  float surfVec[3] = {0.0f, 0.0f, 0.0f};
+  // The collision object's +0x6c..0x45e surface block + the dispatch
+  // result byte + the caller's context channel (8 = player sweep).
+  SurfaceObjectState* surface = nullptr;
+  std::uint8_t surfaceContextMask = 0;
+  std::uint8_t surfaceResult = 0;
   // Optional hooks (surface effects + dismount reset).
   CollisionContactHook contactHook = nullptr;
   CollisionDismountHook dismountHook = nullptr;

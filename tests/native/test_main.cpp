@@ -28,6 +28,7 @@
 #include "core/mto_directory.h"
 #include "core/options_menu.h"
 #include "core/player_motion.h"
+#include "core/player_surface.h"
 #include "core/player_vertical.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
@@ -10547,6 +10548,394 @@ mdk::DtiSubRecord makeSpawnRec(std::uint32_t type, std::uint32_t f1,
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5F — surface contact effects
+// ---------------------------------------------------------------------------
+
+mdk::CollisionPoly makeSurfacePoly(std::uint16_t a, std::uint16_t b,
+                                   std::uint16_t c, std::uint8_t surf,
+                                   std::uint16_t flags) {
+  mdk::CollisionPoly p = {};
+  p.v[0] = a;
+  p.v[1] = b;
+  p.v[2] = c;
+  p.surface = surf;
+  p.flags = flags;
+  return p;
+}
+
+// Records the FUN_004546ac seam's invokes (the script hook).
+struct SurfaceScriptLog {
+  int calls = 0;
+  std::uint32_t lastOff = 0;
+  std::int32_t lastEvent = 0;
+  std::uint8_t resultIn = 0;
+  float delta[3] = {};
+};
+void surfaceScriptSpy(mdk::SurfaceObjectState& /*ctx*/,
+                      std::uint32_t off, std::int32_t event,
+                      std::uint8_t& result, const mdk::SurfaceFxState& fx,
+                      void* user) {
+  auto* log = static_cast<SurfaceScriptLog*>(user);
+  ++log->calls;
+  log->lastOff = off;
+  log->lastEvent = event;
+  log->resultIn = result;
+  for (int i = 0; i < 3; ++i) log->delta[i] = fx.delta[i];
+  result |= 0x40;   // the VM may modify the result byte (CL return)
+}
+
+void test_player_surface() {
+  const float zero3[3] = {0, 0, 0};
+
+  // --- surface metadata decode + dispatch gate -------------------------
+  {
+    mdk::CollisionPoly polys[3] = {
+        makeSurfacePoly(0, 1, 2, 3, 0x0),   // surface 3 -> index 2
+        makeSurfacePoly(0, 1, 2, 0, 0x0),   // no surface
+        makeSurfacePoly(0, 1, 2, 20, 0x0)}; // surface > 16 -> rejected
+    mdk::SurfaceObjectState ctx = {};
+    ctx.polys = polys;
+    ctx.polyCount = 3;
+    ctx.config[2] = 0x8;          // channel-8 enable only
+    ctx.handlerOff[2] = 0x100;    // a CMI-relative handler
+    ctx.handlerMask[2] = 0x8;
+    SurfaceScriptLog log;
+    mdk::SurfaceFxState fx;
+    // Surface byte 0 -> no dispatch.
+    CHECK(mdk::surfaceDispatch(ctx, 0, 0x8, &polys[1], -0xb, zero3, zero3,
+                               zero3, fx, surfaceScriptSpy, &log) == 0);
+    // Surface > 16 -> index out of range, no dispatch.
+    CHECK(mdk::surfaceDispatch(ctx, 0, 0x8, &polys[2], -0xb, zero3, zero3,
+                               zero3, fx, surfaceScriptSpy, &log) == 0);
+    // A wrong channel (contextMask=2) gates both side-effects and the
+    // handler invoke (handlerMask has only bit3 set).
+    CHECK(mdk::surfaceDispatch(ctx, 0, 0x2, &polys[0], -0xb, zero3, zero3,
+                               zero3, fx, surfaceScriptSpy, &log) == 0);
+    CHECK(log.calls == 0);
+    // The matching channel invokes the handler -> bit0 set + the spy's
+    // CL modification lands in the returned byte.
+    const std::uint8_t r = mdk::surfaceDispatch(
+        ctx, 0, 0x8, &polys[0], -0xb, zero3, zero3, zero3, fx,
+        surfaceScriptSpy, &log);
+    CHECK(log.calls == 1 && log.lastOff == 0x100 && log.lastEvent == -0xb);
+    CHECK((r & 0x1) != 0 && (r & 0x40) != 0);
+  }
+
+  // --- polyOp flag ops (FUN_0040a704) ----------------------------------
+  {
+    mdk::CollisionPoly polys[3] = {
+        makeSurfacePoly(0, 0, 0, 2, 0x0),
+        makeSurfacePoly(0, 0, 0, 2, 0x0),
+        makeSurfacePoly(0, 0, 0, 5, 0x0)};
+    // set-0x10 only hits surface-2 polys.
+    mdk::surfacePolyOp(polys, 3, 2, mdk::kSurfOpSet10);
+    CHECK((polys[0].flags & 0x10) && (polys[1].flags & 0x10));
+    CHECK((polys[2].flags & 0x10) == 0);
+    mdk::surfacePolyOp(polys, 3, 2, mdk::kSurfOpSet20);
+    CHECK((polys[0].flags & 0x20) && (polys[1].flags & 0x20));
+    mdk::surfacePolyOp(polys, 3, 2, mdk::kSurfOpClear10);
+    CHECK((polys[0].flags & 0x10) == 0 && (polys[0].flags & 0x20) != 0);
+    mdk::surfacePolyOp(polys, 3, 2, mdk::kSurfOpSet30);
+    CHECK((polys[0].flags & 0x30) == 0x30);
+    mdk::surfacePolyOp(polys, 3, 2, mdk::kSurfOpClear30);
+    CHECK((polys[0].flags & 0x30) == 0);
+    // surfId 0 / out of range is a no-op.
+    mdk::surfacePolyOp(polys, 3, 0, mdk::kSurfOpSet10);
+    CHECK((polys[0].flags & 0x10) == 0);
+  }
+
+  // --- dispatcher side-effects (0x80/0x40/0x20) + counters -------------
+  {
+    mdk::CollisionPoly polys[2] = {
+        makeSurfacePoly(0, 0, 0, 1, 0x10),   // armed 0x10
+        makeSurfacePoly(0, 0, 0, 1, 0x0)};
+    mdk::SurfaceObjectState ctx = {};
+    ctx.polys = polys;
+    ctx.polyCount = 2;
+    ctx.config[0] = 0x8 | 0x80;   // channel-8 + the 0x80 flag effect
+    mdk::SurfaceFxState fx;
+    // The 0x80 effect: marks bit (1<<surf) + clears poly flag 0x10.
+    CHECK(mdk::surfaceDispatch(ctx, 0, 0x8, &polys[0], -0xb, zero3, zero3,
+                               zero3, fx, nullptr, nullptr) == 0);
+    CHECK((ctx.marks & 0x2) != 0);              // 1 << surfId(1)
+    CHECK((polys[0].flags & 0x10) == 0);        // cleared on contact
+    CHECK((polys[1].flags & 0x10) == 0);        // all surf-1 polys
+    // cfg&0x20 sets result bit1; cfg&0x40 force-invokes the handler.
+    mdk::CollisionPoly p2 = makeSurfacePoly(0, 0, 0, 2, 0x0);
+    mdk::SurfaceObjectState ctx2 = {};
+    ctx2.polys = &p2;
+    ctx2.polyCount = 1;
+    ctx2.config[1] = 0x8 | 0x40 | 0x20;
+    ctx2.handlerOff[1] = 0x55;
+    ctx2.handlerMask[1] = 0x0;    // no channel bits — but 0x40 forces it
+    SurfaceScriptLog log;
+    const std::uint8_t r = mdk::surfaceDispatch(
+        ctx2, 0, 0x8, &p2, -0xb, zero3, zero3, zero3, fx,
+        surfaceScriptSpy, &log);
+    CHECK((r & 0x2) != 0);                 // cfg&0x20 result bit
+    CHECK(log.calls == 1);                 // 0x40 force-invoked
+    CHECK(ctx2.counters[1] == 1);          // secondary 0 -> 1 via 0x40
+  }
+
+  // --- surfaceApplyPending (FUN_0040b4dc) ------------------------------
+  {
+    mdk::CollisionPoly polys[2] = {
+        makeSurfacePoly(0, 0, 0, 1, 0x0),
+        makeSurfacePoly(0, 0, 0, 2, 0x0)};
+    mdk::SurfaceObjectState ctx = {};
+    ctx.polys = polys;
+    ctx.polyCount = 2;
+    ctx.marks = 0x2;   // bit1 = surface 1
+    // mode0 re-arms flag 0x10 on marked surfaces and clears the marks.
+    mdk::surfaceApplyPending(ctx, 0);
+    CHECK(ctx.marks == 0);
+    CHECK((polys[0].flags & 0x10) != 0);
+    CHECK((polys[1].flags & 0x10) == 0);
+    // mode1: polys flagged &2 get 0x30; opMaskA bit -> op4, opMaskB -> op2.
+    polys[0].flags = 0x2;
+    ctx.opMaskA = 0x4;   // bit2 = surface 2 -> op4 (set 0x20)
+    ctx.opMaskB = 0x0;
+    mdk::surfaceApplyPending(ctx, 1);
+    CHECK((polys[0].flags & 0x30) == 0x30);
+    CHECK((polys[1].flags & 0x20) != 0);
+    CHECK((polys[1].flags & 0x10) == 0);
+    ctx.opMaskA = 0x0;
+    ctx.opMaskB = 0x4;   // surface 2 -> op2 (set 0x10)
+    mdk::surfaceApplyPending(ctx, 1);
+    CHECK((polys[1].flags & 0x10) != 0);
+  }
+
+  // --- conveyor (FUN_00412ef0) -----------------------------------------
+  {
+    mdk::SurfaceObjectState ctx = {};
+    mdk::CollisionPoly p = makeSurfacePoly(0, 0, 0, 4, 0x0);
+    const float dir[3] = {3.0f, 0.0f, 4.0f};   // len 5 -> unit (0.6,0,0.8)
+    mdk::SurfaceRecord* r =
+        mdk::surfaceRecordCreate(ctx, 4, dir, 2.0f);
+    CHECK(r && r->kind == -1 && r->surfType == 4);
+    // normalized direction
+    CHECK(std::fabs(r->v[0] - 0.6f) < 1e-5f &&
+          std::fabs(r->v[2] - 0.8f) < 1e-5f);
+    float out[3] = {0, 0, 0};
+    const float dt = 1.0f / 30.0f;
+    mdk::surfaceConveyorDelta(ctx, &p, dt, out);
+    // out += (dir*rate)*dt : (0.6*2)*dt, (0.8*2)*dt
+    CHECK(std::fabs(out[0] - 0.6f * 2.0f * dt) < 1e-5f);
+    CHECK(std::fabs(out[1] - 0.0f) < 1e-6f);
+    CHECK(std::fabs(out[2] - 0.8f * 2.0f * dt) < 1e-5f);
+    // A non-matching surface produces nothing.
+    mdk::CollisionPoly pOther = makeSurfacePoly(0, 0, 0, 7, 0x0);
+    float out2[3] = {0, 0, 0};
+    mdk::surfaceConveyorDelta(ctx, &pOther, dt, out2);
+    CHECK(out2[0] == 0.0f && out2[2] == 0.0f);
+    // A volume record on the same surface is skipped by the conveyor.
+    const float box[6] = {0, 0, 0, 1, 1, 1};
+    mdk::surfaceVolumeCreate(ctx, 2, box, 5.0f, ~0u);
+    float out3[3] = {0, 0, 0};
+    mdk::surfaceConveyorDelta(ctx, &p, dt, out3);
+    CHECK(std::fabs(out3[0] - out[0]) < 1e-6f);   // only the surface rec
+    // Two surface records on the same type accumulate.
+    const float dir2[3] = {-1.0f, 0.0f, 0.0f};
+    mdk::surfaceRecordCreate(ctx, 4, dir2, 1.0f);
+    float out4[3] = {0, 0, 0};
+    mdk::surfaceConveyorDelta(ctx, &p, dt, out4);
+    CHECK(std::fabs(out4[0] - (0.6f * 2.0f - 1.0f * 1.0f) * dt) < 1e-5f);
+    mdk::surfaceRecordsDestroy(ctx);
+    CHECK(ctx.records == nullptr);
+  }
+
+  // --- record update: the rate ramp (FUN_004134a0 subset) --------------
+  {
+    mdk::SurfaceObjectState ctx = {};
+    const float dir[3] = {1, 0, 0};
+    mdk::SurfaceRecord* r = mdk::surfaceRecordCreate(ctx, 1, dir, 0.0f);
+    r->target = 2.0f;
+    r->ramp = 1.0f;              // rate/sec toward target
+    const float dt = 1.0f / 30.0f;
+    mdk::surfaceRecordUpdate(ctx, dt);
+    CHECK(std::fabs(r->rate - (0.0f + 1.0f * dt)) < 1e-6f);
+    // Keep ramping; when it would overshoot the target it clamps +
+    // zeroes the ramp.
+    for (int i = 0; i < 200 && r->rate != r->target; ++i)
+      mdk::surfaceRecordUpdate(ctx, dt);
+    CHECK(r->rate == 2.0f && r->ramp == 0.0f);
+    mdk::surfaceRecordsDestroy(ctx);
+  }
+
+  // --- volume/ribbon query (FUN_00412e94 + FUN_00412f84) ---------------
+  {
+    mdk::SurfaceObjectState ctx = {};
+    const float box[6] = {0, 0, 0, 10, 10, 20};   // min0, max{10,10,20}
+    mdk::surfaceVolumeCreate(ctx, 5, box, 30.0f, ~0u);  // shape5: t=1-t
+    float pos[3] = {5, 5, 10};
+    float vec[3] = {0, 0, 0};
+    const float dt = 1.0f / 30.0f;
+    // shape5: t = 1 - (posz-minz)/(maxz-minz) = 1 - 10/20 = 0.5
+    // target = 30*0.5 = 15; vec.z(0) < target -> vec.z += 15*dt.
+    CHECK(mdk::surfaceVolumeQuery(ctx, ~0u, pos, dt, vec) == 1);
+    CHECK(std::fabs(vec[2] - 15.0f * dt) < 1e-5f);
+    // Outside the box -> no hit.
+    float outPos[3] = {50, 5, 10};
+    float vec2[3] = {0, 0, 0};
+    CHECK(mdk::surfaceVolumeQuery(ctx, ~0u, outPos, dt, vec2) == 0);
+    CHECK(vec2[2] == 0.0f);
+    // The z-top pad (+5.0): pos.z just above maxz still counts.
+    float topPos[3] = {5, 5, 23.0f};   // 20 < 23 <= 25
+    CHECK(mdk::surfaceVolumeQuery(ctx, ~0u, topPos, dt, vec2) == 1);
+    // queryMask gate: a record masked to bit0 fails a bit1 query.
+    mdk::SurfaceObjectState ctx2 = {};
+    mdk::surfaceVolumeCreate(ctx2, 5, box, 30.0f, 0x1);
+    float vec3[3] = {0, 0, 0};
+    CHECK(mdk::surfaceVolumeQuery(ctx2, 0x2, pos, dt, vec3) == 0);
+    CHECK(mdk::surfaceVolumeQuery(ctx2, 0x1, pos, dt, vec3) == 1);
+    // Above target -> halve the gap: z=(z+target)*0.5.
+    float vec4[3] = {0, 0, 30.0f};
+    mdk::surfaceVolumeQuery(ctx, ~0u, pos, dt, vec4);  // target 15
+    CHECK(std::fabs(vec4[2] - (30.0f + 15.0f) * 0.5) < 1e-4f);
+    mdk::surfaceRecordsDestroy(ctx);
+    mdk::surfaceRecordsDestroy(ctx2);
+  }
+
+  // --- slide-zone trigger (opcode 0xe0) --------------------------------
+  {
+    // One type-9 record: box fields[3..8] = {minx,miny,minz,maxx,maxy,maxz}.
+    mdk::DtiSubRecord rec = {};
+    rec.type = 9;
+    auto putf = [&](int i, float v) {
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      rec.fields[i] = u;
+    };
+    putf(3, 0); putf(4, 0); putf(5, 0);
+    putf(6, 10); putf(7, 10); putf(8, 20);
+    const float posIn[3] = {5, 5, 10};
+    const float posOut[3] = {50, 5, 10};
+    const float dt = 1.0f / 30.0f;
+    // flag==0 -> clear-slide path, no scan.
+    mdk::SlideZoneResult z0 = mdk::slideZoneTrigger(
+        &rec, 1, 0, posIn, false, false, 0, 0, dt);
+    CHECK(z0.clearedSlide && !z0.inside && !z0.setBounceFlag);
+    // outside the box -> no trigger.
+    mdk::SlideZoneResult z1 = mdk::slideZoneTrigger(
+        &rec, 1, 1, posOut, false, false, 0, 0, dt);
+    CHECK(!z1.inside && !z1.setBounceFlag);
+    // inside, airborne (no slide/contact normal) -> down-slam.
+    mdk::SlideZoneResult z2 = mdk::slideZoneTrigger(
+        &rec, 1, 1, posIn, false, false, 0, 0, dt);
+    CHECK(z2.inside && z2.setBounceFlag);
+    CHECK(z2.downSlam && !z2.slideRedirect);
+    CHECK(std::fabs(z2.downSlamDelta - (-(dt * 128.0))) < 1e-4f);
+    // inside, grounded (contact normal) -> slide redirect + impulse.
+    mdk::SlideZoneResult z3 = mdk::slideZoneTrigger(
+        &rec, 1, 1, posIn, false, true, 90.0f, 10.0f, dt);
+    CHECK(z3.slideRedirect && !z3.downSlam);
+    CHECK(z3.yawDeg == 90.0f);
+    // impulse = {sin(90),cos(90)}*10 -> {10, ~0}.
+    CHECK(std::fabs(z3.impulseX - 10.0f) < 1e-3f);
+    CHECK(std::fabs(z3.impulseZ) < 1e-3f);
+    // A non-type-9 record is skipped.
+    mdk::DtiSubRecord other = {};
+    other.type = 7;
+    mdk::SlideZoneResult z4 = mdk::slideZoneTrigger(
+        &other, 1, 1, posIn, false, false, 0, 0, dt);
+    CHECK(!z4.inside);
+  }
+
+  // --- real callback path: sweep -> surfaceContactHook -> dispatch -----
+  {
+    // Flat floor at z=10 carrying surface byte 3.
+    CollisionFixture f = makeFloorArena();
+    f.polys[0].surface = 3;
+    f.polys[0].flags = 0x10;                  // armed
+    f.finish();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0.0f;
+    cs.pos[1] = 0.0f;
+    cs.pos[2] = 20.0f;
+    mdk::SurfaceObjectState ctx = {};
+    ctx.polys = const_cast<mdk::CollisionPoly*>(f.arena.polys);
+    ctx.polyCount = 1;
+    ctx.config[2] = 0x8 | 0x80;               // channel-8 + 0x80 effect
+    cs.surface = &ctx;
+    cs.surfaceContextMask = 0x8;
+    cs.contactHook = &mdk::surfaceContactHook;
+    // Fall onto the floor — the contact should dispatch the 0x80 effect.
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -15.0f, 0.5f, nullptr, nullptr);
+    CHECK(hit == &f.polys[0]);
+    CHECK((ctx.marks & 0x8) != 0);            // 1 << surfId(3)
+    CHECK((f.polys[0].flags & 0x10) == 0);    // flag cleared on contact
+  }
+
+  // --- conveyor -> 5B displacement (contact -> record -> move) ---------
+  {
+    CollisionFixture f = makeFloorArena();
+    f.polys[0].surface = 2;
+    f.finish();
+    mdk::SurfaceObjectState ctx = {};
+    const float dir[3] = {1.0f, 0.0f, 0.0f};
+    mdk::surfaceRecordCreate(ctx, 2, dir, 6.0f);
+    const float dt = 1.0f / 30.0f;
+    // The 5B seam: env.conveyor* now comes from the real record query on
+    // the contact poly instead of a synthetic injection.
+    float conv[3] = {0, 0, 0};
+    mdk::surfaceConveyorDelta(ctx, &f.polys[0], dt, conv);
+    CHECK(std::fabs(conv[0] - 1.0f * 6.0f * dt) < 1e-5f);
+    mdk::PlayerMotionEnvironment env = {};
+    env.groundContact = true;
+    env.conveyorX = conv[0];
+    env.conveyorY = conv[1];
+    env.conveyorZ = conv[2];
+    mdk::PlayerMotionState s = {};
+    const mdk::PlayerMotionOutput o =
+        mdk::integratePlayerMotion(mdk::GameplayInputFrame{}, env, s);
+    CHECK(std::fabs(o.dispX - conv[0]) < 1e-5f);   // conveyor carried +X
+    CHECK(o.dispY == 0.0f && o.dispZ == 0.0f);
+    mdk::surfaceRecordsDestroy(ctx);
+  }
+
+  // --- bounce -> 5C: the slide-zone sets res.bounce -> vs.bounceFlag ---
+  {
+    mdk::DtiSubRecord rec = {};
+    rec.type = 9;
+    auto putf = [&](int i, float v) {
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      rec.fields[i] = u;
+    };
+    putf(3, -50); putf(4, -50); putf(5, 0);
+    putf(6, 50); putf(7, 50); putf(8, 5);
+    const float pos[3] = {0, 0, 2};
+    const float dt = 1.0f / 30.0f;
+    mdk::SlideZoneResult zr = mdk::slideZoneTrigger(
+        &rec, 1, 1, pos, false, true, 0.0f, 0.0f, dt);
+    CHECK(zr.setBounceFlag);
+    // Feed the proven flag into the 5C seam.
+    mdk::VerticalCollisionResult res = {};
+    res.bounce = zr.setBounceFlag;
+    res.contactObj = 1;                // a contact token
+    res.hasFloor = true;
+    res.floorZ = 0.0f;
+    res.posZ = 0.0f;
+    mdk::PlayerVerticalState vs = {};
+    mdk::PlayerMotionState ms = {};
+    mdk::PlayerVerticalEnvironment env = {};
+    env.frameStep = 1;
+    env.deltaSeconds = dt;
+    env.deepFloorZ = -1000.0f;
+    vs.vertVel = -60.0f;               // a hard impact
+    mdk::PlayerVerticalFrame vf;
+    mdk::applyPlayerVerticalCollision(env, ms, vs, res, vf);
+    CHECK(vs.bounceFlag == 1);
+    // bounceFlag suppresses the hard-landing event path.
+    CHECK(!vf.hardLanding);
+    // The flag clears on the post-step (FUN_00466aec tail).
+    mdk::playerVerticalPostStep(env, vs);
+    CHECK(vs.bounceFlag == 0);
+  }
+}
+
 void test_dynamic_objects() {
   using mdk::DynamicArena;
   using mdk::DynamicObject;
@@ -10925,6 +11314,7 @@ int main() {
   test_player_motion();
   test_player_vertical();
   test_player_collision();
+  test_player_surface();
   test_dynamic_objects();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

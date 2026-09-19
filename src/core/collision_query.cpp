@@ -615,8 +615,12 @@ const CollisionPoly* collisionSweep(CollisionState& cs, const float* start,
     if (s.slideProduced) {
       std::memcpy(s.target, s.slideTarget, sizeof(s.target));
       std::memcpy(s.pos, s.hitPt, sizeof(s.pos));
-      if (cs.contactHook) cs.contactHook(cs, s.hitNode, s.hitPoly);
+      if (cs.contactHook) {
+        std::memcpy(cs.sweepContact, s.hitPt, sizeof(s.hitPt));
+        cs.contactHook(cs, s.hitNode, s.hitPoly);
+      }
     } else if (s.hitPoly && cs.contactHook) {
+      std::memcpy(cs.sweepContact, s.hitPt, sizeof(s.hitPt));
       cs.contactHook(cs, s.hitNode, s.hitPoly);
     }
     --flag;

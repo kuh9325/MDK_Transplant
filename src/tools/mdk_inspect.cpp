@@ -27,8 +27,12 @@
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
+#include "core/gameplay_input.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
+#include "core/player_motion.h"
+#include "core/player_surface.h"
+#include "core/player_vertical.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
 
@@ -62,7 +66,11 @@ int usage() {
                "       mdk-inspect --data-path DIR --arena-objects "
                "<relative-path>   (a .DTI path; the sibling .CMI and\n"
                "                            <stem>O.MTO are loaded too)\n"
-               "       mdk-inspect --selftest\n");
+               "       mdk-inspect --data-path DIR --surface-census "
+               "<relative-path>   (a .DTI path; the sibling <stem>O.MTO\n"
+               "                            is scanned for surface polys)\n"
+               "       mdk-inspect --selftest\n"
+               "       mdk-inspect --selftest-player-surface\n");
   return 2;
 }
 
@@ -657,6 +665,152 @@ int selftest() {
   return ok ? 0 : 1;
 }
 
+// Phase 5F — synthetic end-to-end surface-contact selftest. Drives the
+// real seams (not the original VM): collisionApply -> surfaceContactHook
+// -> surfaceDispatch (FUN_0040b5d0), surfaceConveyorDelta (FUN_00412ef0)
+// -> integratePlayerMotion, slideZoneTrigger (opcode 0xe0) ->
+// applyPlayerVerticalCollision, and surfaceApplyPending (FUN_0040b4dc).
+// The route is contact ordinary floor -> no effect; contact a conveyor
+// surface -> 5B displacement; contact a slide-zone -> 5C bounce flag;
+// then the pending-flag re-arm. No --data-path required.
+int selftestPlayerSurface() {
+  bool ok = true;
+  auto check = [&](bool c, const char* what) {
+    if (!c) ok = false;
+    std::fprintf(stderr, "  %-56s %s\n", what, c ? "ok" : "FAIL");
+  };
+  const float dt = 1.0f / 30.0f;
+
+  // Flat floor at z=10 carrying surface byte 2 (the armed bit set).
+  float verts[9] = {-50, -50, 10, 50, -50, 10, 50, 50, 10};
+  mdk::CollisionPoly poly = {};
+  poly.v[0] = 0;
+  poly.v[1] = 1;
+  poly.v[2] = 2;
+  poly.surface = 2;   // surfId 2 -> dispatch slot index 1
+  poly.flags = 0x10;  // the contact/re-arm bit, armed
+  mdk::CollisionNode node = {};
+  node.nz = 1.0f;
+  node.d = -10.0f;
+  node.childNear = -1;
+  node.childFar = -1;
+  node.polysPos = 1;  // count=1, firstIdx=0
+  mdk::CollisionArena arena = {};
+  arena.verts = verts;
+  arena.polys = &poly;
+  arena.nodes = &node;
+  arena.deepFloorZ = -1000.0f;
+
+  mdk::SurfaceObjectState ctx = {};
+  ctx.polys = &poly;
+  ctx.polyCount = 1;
+  ctx.config[1] = 0x8 | 0x80;  // surfId 2: channel-8 + the 0x80 mark fx
+  const float dir[3] = {1.0f, 0.0f, 0.0f};
+  mdk::surfaceRecordCreate(ctx, 2, dir, 6.0f);   // conveyor +X, rate 6
+
+  mdk::CollisionState cs;
+  cs.arena = &arena;
+  cs.arenaValid = 1;
+  cs.queryEnabled = 1;
+  cs.objectDataLoaded = 1;
+  cs.surface = &ctx;
+  cs.surfaceContextMask = 0x8;
+  cs.contactHook = &mdk::surfaceContactHook;
+  cs.pos[0] = 0.0f;
+  cs.pos[1] = 0.0f;
+  cs.pos[2] = 20.0f;
+
+  // 1. Contact on the surface poly runs the dispatch: the 0x80 effect
+  //    marks surfId 2 and clears the armed flag.
+  const mdk::CollisionPoly* hit = mdk::collisionApply(
+      cs, 0.0f, 0.0f, -15.0f, 0.5f, nullptr, nullptr);
+  check(hit == &poly, "sweep contacted the surface floor");
+  check((ctx.marks & (1u << 2)) != 0, "0x80 effect set the surf-2 mark");
+  check((poly.flags & 0x10) == 0, "0x80 effect cleared the armed flag");
+
+  // 2. Conveyor: standing on the surface poly yields dir*rate*dt, which
+  //    the 5B integrator carries into the displacement while grounded.
+  float conv[3] = {0, 0, 0};
+  mdk::surfaceConveyorDelta(ctx, hit, dt, conv);
+  check(std::fabs(conv[0] - 6.0f * dt) < 1e-5f && conv[1] == 0.0f &&
+            conv[2] == 0.0f,
+        "conveyor delta = dir*rate*dt");
+  mdk::PlayerMotionEnvironment me = {};
+  me.groundContact = true;
+  me.conveyorX = conv[0];
+  me.conveyorY = conv[1];
+  me.conveyorZ = conv[2];
+  mdk::PlayerMotionState ms = {};
+  const mdk::PlayerMotionOutput mo =
+      mdk::integratePlayerMotion(mdk::GameplayInputFrame{}, me, ms);
+  check(std::fabs(mo.dispX - conv[0]) < 1e-5f,
+        "conveyor reached the 5B displacement");
+
+  // 3. An ordinary (surface=0) poly produces no dispatch result.
+  mdk::CollisionPoly plain = {};
+  plain.v[0] = 0;
+  plain.v[1] = 1;
+  plain.v[2] = 2;
+  plain.surface = 0;
+  plain.flags = 0x10;
+  mdk::SurfaceFxState fx;
+  const std::uint8_t r0 = mdk::surfaceDispatch(
+      ctx, 0, 0x8, &plain, -0xb, cs.pos, cs.pos, cs.entryPos, fx,
+      nullptr, nullptr);
+  check(r0 == 0, "surface=0 poly -> no dispatch effect");
+
+  // 4. A type-9 slide-zone over the floor sets the bounce flag on a
+  //    grounded contact; fed into the 5C seam it suppresses the
+  //    hard-landing event and clears on the post-step.
+  mdk::DtiSubRecord z9 = {};
+  z9.type = 9;
+  auto putf = [&](int i, float v) {
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    z9.fields[i] = u;
+  };
+  putf(3, -50);
+  putf(4, -50);
+  putf(5, 0);
+  putf(6, 50);
+  putf(7, 50);
+  putf(8, 15);
+  const float pos[3] = {0, 0, 10};
+  mdk::SlideZoneResult zr = mdk::slideZoneTrigger(
+      &z9, 1, 1, pos, false, true, 0.0f, 0.0f, dt);
+  check(zr.inside && zr.setBounceFlag && zr.slideRedirect,
+        "slide-zone inside + grounded -> bounce flag + redirect");
+  mdk::VerticalCollisionResult res = {};
+  res.bounce = zr.setBounceFlag;
+  res.contactObj = 1;
+  res.hasFloor = true;
+  res.floorZ = 10.0f;
+  res.posZ = 10.0f;
+  mdk::PlayerVerticalState vs = {};
+  mdk::PlayerMotionState vms = {};
+  mdk::PlayerVerticalEnvironment ve = {};
+  ve.frameStep = 1;
+  ve.deltaSeconds = dt;
+  ve.deepFloorZ = -1000.0f;
+  vs.vertVel = -60.0f;  // a hard impact
+  mdk::PlayerVerticalFrame vf;
+  mdk::applyPlayerVerticalCollision(ve, vms, vs, res, vf);
+  check(vs.bounceFlag == 1 && !vf.hardLanding,
+        "bounce flag suppressed the hard-landing event");
+  mdk::playerVerticalPostStep(ve, vs);
+  check(vs.bounceFlag == 0, "post-step cleared the bounce flag");
+
+  // 5. The pending pass re-arms the flag and clears the mark.
+  mdk::surfaceApplyPending(ctx, 0);
+  check((poly.flags & 0x10) != 0 && ctx.marks == 0,
+        "mode-0 re-armed the flag and cleared the mark");
+
+  mdk::surfaceRecordsDestroy(ctx);
+  std::fprintf(stderr, "selftest player-surface: %s\n",
+               ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -669,6 +823,7 @@ int main(int argc, char** argv) {
   bool entriesMode = false;
   bool collisionProbe = false;
   bool arenaObjects = false;
+  bool surfaceCensus = false;
   float probePos[3] = {0.0f, 0.0f, 0.0f};
   int probePosGiven = 0;
 
@@ -760,8 +915,15 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       arenaObjects = true;
+    } else if (!std::strcmp(a, "--surface-census")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;
+      surfaceCensus = true;
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
+    } else if (!std::strcmp(a, "--selftest-player-surface")) {
+      return selftestPlayerSurface();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
       return usage();
     } else if (a[0] == '-') {
@@ -868,7 +1030,8 @@ int main(int argc, char** argv) {
   }
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
-      !spriteInfoName && !collisionProbe && !arenaObjects) {
+      !spriteInfoName && !collisionProbe && !arenaObjects &&
+      !surfaceCensus) {
     return 0;
   }
 
@@ -1052,6 +1215,137 @@ int main(int argc, char** argv) {
                   cs.floorObj == &o.col ? "spawned-object" : "none");
       break;
     }
+    return 0;
+  }
+
+  // --surface-census: Phase 5F BUILD_A smoke. Reads the .DTI target
+  // plus the sibling <stem>O.MTO and censuses the surface-contact data
+  // the dispatcher (FUN_0040b5d0) and the volume/slide-zone records
+  // consume: the poly surface byte (+0x23) and flag bits (+0x20) across
+  // each arena's region-C collision blob, and the type-7 (fan/volume) /
+  // type-9 (slide-zone) DTI sub-records. Metadata only — no payloads.
+  if (surfaceCensus) {
+    const std::string dtiPath = *target;
+    const auto slash = dtiPath.find_last_of("/\\");
+    const auto dot = dtiPath.find_last_of('.');
+    if (dot == std::string::npos) {
+      std::fprintf(stderr, "--surface-census wants a .DTI path\n");
+      return 1;
+    }
+    const std::string dir =
+        slash == std::string::npos ? "" : dtiPath.substr(0, slash + 1);
+    const std::string stem = dtiPath.substr(
+        slash == std::string::npos ? 0 : slash + 1,
+        dot - (slash == std::string::npos ? 0 : slash + 1));
+    const std::string mtoPath = dir + stem + "O.MTO";
+
+    const auto dtiFile = root->readFile(dtiPath, kEntriesMaxBytes, &err);
+    const auto mtoFile = root->readFile(mtoPath, kEntriesMaxBytes, &err);
+    if (!dtiFile || !mtoFile) {
+      std::fprintf(stderr, "read-file: FAILED (%s) — need .DTI + "
+                           "sibling <stem>O.MTO\n",
+                   err.c_str());
+      return 1;
+    }
+    const auto dti = mdk::inspectDtiStructure(
+        std::span<const std::byte>(dtiFile->data(), dtiFile->size()));
+    const auto mto = mdk::inspectMtoDirectory(
+        std::span<const std::byte>(mtoFile->data(), mtoFile->size()));
+    if (dti.status != mdk::DtiStructureStatus::kOk ||
+        mto.status != mdk::MtoDirectoryStatus::kOk) {
+      std::fprintf(stderr, "parse: FAILED (dti=%s mto=%s)\n",
+                   std::string(mdk::dtiStructureStatusName(dti.status))
+                       .c_str(),
+                   std::string(mdk::mtoDirectoryStatusName(mto.status))
+                       .c_str());
+      return 1;
+    }
+    std::printf("dti:   %s — %zu arenas\n", dtiPath.c_str(),
+                dti.arenas.size());
+    std::printf("mto:   %s — %u blocks\n", mtoPath.c_str(), mto.count);
+
+    // DTI: the type-7 (fan/volume) + type-9 (slide-zone) sub-records.
+    int tot7 = 0, tot9 = 0;
+    for (const auto& arec : dti.arenas) {
+      int t7 = 0, t9 = 0;
+      for (const auto& sr : arec.subRecords) {
+        if (sr.type == 7) {
+          ++t7;
+        } else if (sr.type == 9) {
+          ++t9;
+        }
+      }
+      tot7 += t7;
+      tot9 += t9;
+      if (t7 || t9) {
+        std::printf("  arena %-8.8s  type7=%d type9=%d subs=%u\n",
+                    arec.name().c_str(), t7, t9, arec.subRecordCount);
+      }
+    }
+    std::printf("dti-total:  type7=%d type9=%d\n", tot7, tot9);
+
+    // MTO: per-block region-C collision blob -> poly surface census.
+    const std::uint8_t* mb =
+        reinterpret_cast<const std::uint8_t*>(mtoFile->data());
+    const std::size_t mn = mtoFile->size();
+    std::uint32_t surfHist[17] = {};  // [0]=none, [1..16]=surface id
+    std::uint32_t over16 = 0;         // surface byte beyond the 16 slots
+    std::uint32_t f04 = 0, f10 = 0, f20 = 0, f30 = 0;
+    std::size_t totPolys = 0, surfPolys = 0, blobs = 0;
+    for (std::size_t bi = 0; bi < mto.blocks.size(); ++bi) {
+      const auto& b = mto.blocks[bi];
+      mdk::CollisionArena arena;
+      std::uint32_t counts[4] = {};
+      if (b.regionCOffset >= mn) {
+        continue;
+      }
+      if (!mdk::collisionBlobParse(mb + b.regionCOffset,
+                                   mn - b.regionCOffset, &arena,
+                                   counts)) {
+        continue;
+      }
+      ++blobs;
+      std::size_t blkSurf = 0;
+      for (std::uint32_t p = 0; p < counts[2]; ++p) {
+        const mdk::CollisionPoly& poly = arena.polys[p];
+        const std::uint8_t s = poly.surface;
+        const std::uint16_t f = poly.flags;
+        if (s <= 16) {
+          ++surfHist[s];
+        } else {
+          ++over16;
+        }
+        if (s != 0) {
+          ++blkSurf;
+        }
+        if (f & 0x04) ++f04;
+        if (f & 0x10) ++f10;
+        if (f & 0x20) ++f20;
+        if (f & 0x30) ++f30;
+        ++totPolys;
+      }
+      surfPolys += blkSurf;
+      if (blkSurf) {
+        const std::string nm =
+            bi < mto.entries.size() ? mto.entries[bi].name() : "?";
+        std::printf("  block %-8.8s  polys=%u surface=%zu\n", nm.c_str(),
+                    counts[2], blkSurf);
+      }
+    }
+    std::printf("mto-total:  blobs=%zu polys=%zu surface-polys=%zu\n",
+                blobs, totPolys, surfPolys);
+    std::printf("surface-id histogram (byte +0x23 = id, 0 = none):\n");
+    for (int i = 1; i <= 16; ++i) {
+      if (surfHist[i]) {
+        std::printf("  id %2d: %u polys\n", i, surfHist[i]);
+      }
+    }
+    if (over16) {
+      std::printf("  out-of-domain (>16): %u polys\n", over16);
+    }
+    std::printf("poly flag bits (+0x20, all %zu polys): "
+                "0x04=%u 0x10=%u 0x20=%u 0x30=%u\n",
+                totPolys, f04, f10, f20, f30);
     return 0;
   }
 
