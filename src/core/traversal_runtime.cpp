@@ -163,11 +163,18 @@ TraversalLoadError traversalArenaLoadGeometry(TraversalRuntime& rt,
     if (detail) *detail = "collision blob parse failed for " + arena.name;
     return TraversalLoadError::kCollisionBlobParse;
   }
-  // deepFloorZ (+0x44e) has no observed writer in MDK95 — all five
-  // sites referencing the field are reads (0x4583ab/0x4583ce/
-  // 0x45bdd6/0x45fd55/0x4673f3). The record's zero-init leaves it
-  // 0 for every arena, so the 0x4673ee failsafe fires at posZ <= -50
-  // everywhere — reproduced by leaving the CollisionArena default.
+  // deepFloorZ (+0x44e) is provably zero for every arena: the
+  // 0x466-stride record array is memset(0) at creation inside
+  // FUN_00433d40 (0x434147 call 0x47d20a, edx=0), the per-record
+  // init loop only writes +0x00 name/+0x34/+0x38/+0x3c/+0x40/
+  // +0x44/+0x5c..+0x64/+0x462, and a full code-section sweep finds
+  // no store to +0x44e (the only overlapping +0x44c/+0x450 dword
+  // writes are FUN_00413c20/FUN_00413dd8 on a different record
+  // type — name at +4, dispatch block at +0x444). All five +0x44e
+  // readers take it as the arena's abyss reference: the player
+  // failsafe (0x4673f3, -50) and object respawn checks through
+  // obj+0x60 (0x4583ab/0x45bdd6/0x45fd55, -200/-150). Leaving the
+  // CollisionArena default reproduces the observed flat -50 catch.
 
   // The arena's surface state aliases the live poly table (the
   // original's +0x28/+0x10 fields on the surface block).

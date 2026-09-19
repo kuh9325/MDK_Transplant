@@ -130,7 +130,11 @@ struct CollisionArena {
   const CollisionPoly* polys = nullptr;    // +0x28 — 0x24 records
   const CollisionNode* nodes = nullptr;    // +0x2c — 0x2c records
   const CollisionObject* objects = nullptr;// +0x68 — linked list
-  float deepFloorZ = 0.0f;                 // +0x44e — failsafe ref
+  // +0x44e — arena "abyss" reference for the failsafe family
+  // (player -50 at 0x4673f3; object respawn -200/-150 at
+  // 0x4583ab/0x45bdd6/0x45fd55). Zero-init proven: the record array
+  // is memset at creation and +0x44e has no writer anywhere.
+  float deepFloorZ = 0.0f;
 };
 
 // ---------------------------------------------------------------------------

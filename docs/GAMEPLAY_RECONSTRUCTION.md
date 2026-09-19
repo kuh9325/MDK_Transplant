@@ -711,7 +711,7 @@ level):
      **NOT** clear `c84` — it resets next frame via the grounded
      branch (OBSERVED quirk). Common tail: `c78 = 0`, `c54 |= 1`;
      `e4c == 0` → `posZ = c58` floor snap.
-   - deep-floor failsafe (all exits): `posZ <= player+0x44e - 50` →
+   - deep-floor failsafe (all exits): `posZ <= c48+0x44e - 50` →
      `0x541554 = 0`, `c78 = 0`, `c54 |= 1`.
 
 ## 28. Coordinate sign and displacement (OBSERVED)
@@ -1581,25 +1581,61 @@ unresolved spawn/script/portal behavior stays an explicit seam.
 
 - `0x4673ee` computes `c48->+0x44e + (-50.0) >= posZ` → forced
   grounded + vertVel=0 (`kDeepFloorDelta` = `0x498a98` = -50.0).
-- All five `+0x44e` sites in MDK95 are READS (0x4583ab/0x4583ce/
-  0x45bdd6/0x45fd55/0x4673f3) — the field has no writer, so the
-  record's zero-init leaves it 0 for every arena: the failsafe is a
-  flat `posZ <= -50` world floor, not per-arena geometry.
+- Zero-init is proven, not inferred: the 0x466-stride arena array is
+  allocated (`0x434130` call `0x41c884`) then memset to 0
+  (`0x434147` call `0x47d20a`, fill byte edx=0, size `count*0x466`),
+  and the per-record init loop (`0x434191..0x434229`) writes only
+  `+0x00` name, `+0x34`, `+0x38`/`+0x3c`, `+0x40`, `+0x44` flag-or
+  (`c`/`C` corridor gate), `+0x5c..+0x64` (embedded self-ref), and
+  `+0x462` (DTI scalar). A full code-section sweep for displacements
+  `0x448..0x453` finds no store to `+0x44e`; the only overlapping
+  `+0x44c`/`+0x450` dword writes are in `FUN_00413c20`/`FUN_00413dd8`
+  on a *different* record type (name at `+4`, 5-pointer dispatch
+  block at `+0x444` copied from table `0x49a750`).
+- All five `+0x44e` readers consume it as the arena's abyss
+  reference: the player failsafe (`0x4673f3`, base `c48`, `-50`),
+  and object checks through `obj+0x60` (the object's arena pointer):
+  `0x4583ab`/`0x4583ce` respawn an object that fell below
+  `+0x44e + (-200)` by writing `obj+0x18 = +0x44e + (-150)`;
+  `0x45bdd6` compares `+0x44e + (-200)` vs `obj+0x18` to skip a kill
+  path; `0x45fd55` compares through `rec+0x18`.
+- Net effect: a flat `posZ <= -50` catch for the player and `-200`
+  (respawn to `-150`) for objects, worldwide — not per-arena
+  geometry. LEVEL5 (MUSE) spawns at z=-293, so the failsafe fires
+  every frame there; it only re-asserts grounded/vertVel=0 atop real
+  contact — OBSERVED, harmless.
 - Native note: an earlier implementation derived it from the arena's
   own vertex min — corrected to the observed flat -50.
 
 ## 64. Phase 5G validation + boundary
 
-- `mdk-inspect --traversal-runtime` on LEVEL3/HMO_1: real-data run
-  passes (geometry loaded, gates, contact, grounded), deterministic
-  digest `f568d6aa986f4b70` over 60 frames; the player walks off the
-  authored ledge and falls — observed, not corrected.
-- CHMO_1 corridor run: `geom=0`, type-1 attach fires per frame,
-  partner loads (`car-vld=1 car-bsy=0 car-geom=1`), failsafe catch at
-  -50 — the honest corridor outcome. Corridor checks assert the
-  attach/prefetch seams instead of static contact.
+- `mdk-inspect --traversal-runtime` on all six BUILD_A levels: every
+  spawn arena (HMO_1, MEAT_1, MUSE_1, OLYM_1, DANT_1, GUNT_1) passes
+  with real contact+grounded — LEVEL3 digest `f568d6aa986f4b70`
+  (60 frames); MUSE_1 spawns below the -50 abyss line so the
+  failsafe fires all frames alongside real contact (OBSERVED
+  no-op); GUNT_1 spawns 2 objects + 2 models cleanly.
+- Corridor attach fired on every level: CHMO_1, CMEAT_3, CMUSE_1,
+  COLYM_1, CDANT_3, CGUNT_1 all show `partner=1 car-vld=1
+  car-geom=1` (partner = adjacent main arena, blob loaded).
+- Type-1 detach proven live on CHMO_1: attach strip x[26,33] →
+  `p=0`; walking into the adjacent detach strip x[34,41] → `p=-1`
+  the same frame the position enters the box.
+- Type-3 cold prefetch proven live on CHMO_1: `p=0` + `car-vld=0` +
+  `car-geom=1` — partner selected and geometry loaded with `ca8=0`.
+- Type-6 portal crossings proven live both directions:
+  HMO_2 --(side 6, z-plane 68, x[-21,19] y[1092,1131])--> CHMO_2
+  on a downward fall; CHMO_1 --(side 2, y-plane 654, x[-19,17]
+  z[99,126] with margin)--> HMO_1 on a walk+fall segment. The
+  post-swap state shows `ca4 = dest` — the observed slot semantics,
+  not a scene replacement.
+- Check classification: a run that crosses a portal is asserted by
+  gates + post-swap partner state instead of the start arena's
+  contact requirement; a start in uncovered airspace (e.g. inside a
+  boundary attach strip with no floor) still fails honestly.
 - Boundary (explicit seams): the `FUN_004388d8` arena scripts are
   counted but not executed; corridor crossing mechanics (script-
   driven doors/forced movement/teleports) are UNKNOWN until the VM
-  is mapped; type-5/type-8 records remain UNKNOWN; `+0x44e`'s lack of
-  a writer is confirmed for MDK95 — DOS build parity unchecked.
+  is mapped; type-5/type-8 records remain UNKNOWN; `+0x44e`'s
+  zero-init is proven via the creation memset for MDK95 — DOS build
+  parity unchecked.

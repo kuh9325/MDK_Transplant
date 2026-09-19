@@ -1448,13 +1448,22 @@ int main(int argc, char** argv) {
     // honest corridor check is that a partner attach fired; the
     // observed +0x44e failsafe catch (posZ <= -50) is reported but
     // not asserted — reaching it depends on start height / frames.
+    // A crossed portal reclassifies the run: the start arena's
+    // requirements are replaced by gates + post-swap partner state.
     // contactFlags bit1 is the OBSERVED *object*-floor flag
     // (collisionFloorProbe walks cs.arena->objects only) — reported
     // but not asserted: arenas without rideable objects never set it.
     const bool carrierGeom =
         rt.partner && rt.partner->geometryLoaded;
     bool ok;
-    if (startArena->geometryLoaded) {
+    if (s.portalsCrossed > 0) {
+      // A portal swap is itself the demonstrated traversal: the run
+      // left the start arena through the proven type-6 path, so the
+      // start arena's contact requirement no longer applies — the
+      // honest assertions are valid gates plus the observed
+      // post-swap ca4=dest partner slot.
+      ok = rt.cs.arenaValid && partnerSeen;
+    } else if (startArena->geometryLoaded) {
       ok = rt.cs.arenaValid && contactSeen && groundedSeen;
     } else {
       ok = rt.cs.arenaValid && partnerSeen &&

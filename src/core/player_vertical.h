@@ -188,8 +188,14 @@ struct PlayerVerticalEnvironment {
   // (UNKNOWN provenance — the dispatcher's cac>=800 path passes 0
   // explicitly). Modeled nullable; nullptr skips the assist.
   const float* slideVec = nullptr;
-  // player object +0x44e — the deep-floor reference height. The
-  // failsafe fires when posZ <= deepFloorZ - 50.
+  // current arena (c48) +0x44e — the deep-floor reference height.
+  // The failsafe fires when posZ <= deepFloorZ - 50. OBSERVED: the
+  // 0x466-stride arena array is memset to 0 at creation
+  // (FUN_00433d40: call 0x41c884 alloc -> call 0x47d20a memset) and
+  // no code path ever writes +0x44e, so it is 0 for every arena —
+  // a flat -50 catch worldwide. The same field is read for objects
+  // through obj+0x60 (arena) at 0x4583ab/0x45bdd6/0x45fd55 with
+  // -200/-150 respawn constants.
   float deepFloorZ = -1.0e30f;
 };
 
