@@ -340,6 +340,11 @@ void DynamicArena::transfer(DynamicObject& obj, DynamicArena& dst) {
   }
   obj.col.next = dst.col.objects;
   dst.col.objects = &obj.col;
+  // FUN_004574d0 — for a connector (+0x14a & 0x10) the destination
+  // pointer flips to the arena it just left, so the door keeps working
+  // in both directions after the player crosses.
+  if (obj.col.flags14a & 0x10)
+    obj.connDest = owner;                     // +0x302 <- old home arena
   obj.arena = &dst;
   obj.pendingArena = nullptr;
 }
@@ -437,14 +442,36 @@ void rebuildObjectTransform(DynamicObject& obj) {
 // FUN_004566f0 — init (collision subset)
 // ---------------------------------------------------------------------------
 
-void initObjectCollision(DynamicObject& obj) {
+// FUN_004566f0's default block + identity matrix — the part that runs
+// BEFORE the table-2 "%s$%s" init script (which may then override
+// +0x58 scale / +0x08 health / etc.). rebuildObjectTransform is NOT
+// called here: FUN_004566f0 runs it once AFTER the init script, so the
+// script's +0x58/+0x5c take effect. Callers that don't run a script
+// call initObjectCollision (defaults + view + rebuild) instead.
+void initObjectDefaults(DynamicObject& obj) {
+  // OBSERVED (MDK95.EXE FUN_004566f0): +0x08=10, +0x38=50, +0x3c=10,
+  // +0x40=15, +0x44=64, +0x48=32, +0x58=1.0, +0xe0=30, +0xd4/+0xe8/
+  // +0x2c0=1.0, +0x2c4=1000, +0xc0=+0xd4, +0xac=+0xc0.
   obj.health = 10;                       // +0x08
+  obj.field38 = 50.0f;                   // +0x38
+  obj.field3c = 10.0f;                   // +0x3c
+  obj.field40 = 15.0f;                   // +0x40
+  obj.field44 = 64.0f;                   // +0x44
+  obj.field48 = 32.0f;                   // +0x48
   obj.col.scale = 1.0f;                  // +0x58
+  obj.connAnimRate = 30.0f;              // +0xe0
+  obj.fieldE8 = 1.0f;                    // +0xe8
+  obj.field2c0 = 1.0f;                   // +0x2c0
+  obj.field2c4 = 1000.0f;                // +0x2c4
   const float ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-  std::memcpy(obj.col.xform, ident, sizeof(ident));
+  std::memcpy(obj.col.xform, ident, sizeof(ident));  // +0xac..+0xd4
   obj.col.origin[0] = obj.pos[0];
   obj.col.origin[1] = obj.pos[1];
   obj.col.origin[2] = obj.pos[2];
+}
+
+void initObjectCollision(DynamicObject& obj) {
+  initObjectDefaults(obj);
   obj.syncCollisionView();
   rebuildObjectTransform(obj);
 }

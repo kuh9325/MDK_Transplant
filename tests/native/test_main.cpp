@@ -11307,6 +11307,8 @@ mdk::TraversalArena* travArenaAdd(mdk::TraversalRuntime& rt,
   a->name = name;
   a->index = static_cast<int>(rt.arenas.size());
   a->rec = &rt.level.work.back();
+  a->dyn.name = a->name;
+  a->dyn.owner = a.get();
   rt.arenas.push_back(std::move(a));
   return rt.arenas.back().get();
 }
@@ -11613,6 +11615,11 @@ void test_traversal_script() {
   // --- spawn records a dormant object --------------------------------
   {
     ScriptFixture f;
+    // 0x95 is the connector variant: it needs the class in the enemy
+    // table and a resolvable destination arena (FUN_00454794 aborts
+    // the spawn on either miss).
+    travArenaAdd(f.rt, "HMO_3");
+    f.rt.level.enemies.entries.push_back({"XCORDOOR", 0, false});
     f.write(C, {0x95});                          // spawn
     f.writeF(C + 1, 1.0f); f.writeF(C + 5, 2.0f); f.writeF(C + 9, 3.0f);
     f.writeF(C + 0xd, 90.0f);                    // yaw
@@ -11657,6 +11664,169 @@ void test_traversal_script() {
     auto r = mdk::traversalScriptRun(f.env);
     CHECK(r.error);
     CHECK(r.diag.find("Unrecognised") != std::string::npos);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5I — FUN_004566f0 table-2 object-init script + connector door
+// ---------------------------------------------------------------------------
+
+void test_traversal_object_init() {
+  // cmiObjectScriptOffset — table-2 "%s$%s" -> image-relative code off
+  // (no {str}{str}{u32} wrapper like table-3).
+  auto mkRec = [](const char* nm, std::uint32_t v) {
+    mdk::CmiRecord r;
+    const std::size_t n = std::strlen(nm) + 1;   // counted incl. NUL
+    r.nameLength = static_cast<std::uint8_t>(n);
+    const auto* b = reinterpret_cast<const std::byte*>(nm);
+    r.nameBytes.assign(b, b + n);
+    r.nameEndsWithTerminator = true;
+    r.value = v;
+    return r;
+  };
+  {
+    mdk::CmiDirectory cmi;
+    cmi.tables.resize(4);
+    cmi.tables[2].records.push_back(mkRec("CHMO_2$XCORDOOR", 0x204c0));
+    cmi.tables[2].records.push_back(mkRec("HMO_2$XG", 0x7e31));
+    CHECK(mdk::cmiObjectScriptOffset(cmi, "CHMO_2$XCORDOOR") == 0x204c0);
+    CHECK(mdk::cmiObjectScriptOffset(cmi, "HMO_2$XG") == 0x7e31);
+    CHECK(mdk::cmiObjectScriptOffset(cmi, "CHMO_2$XTUR") == 0);
+    mdk::CmiDirectory empty;
+    CHECK(mdk::cmiObjectScriptOffset(empty, "CHMO_2$XCORDOOR") == 0);
+  }
+
+  // Helper that writes the observed CHMO_2$XCORDOOR init stream at C
+  // with the two 0x96 anim operands retargeted to `an`/`af` (so they
+  // land inside a fixture image), plus fake {rate,pad,frameCount}
+  // anim records there.
+  auto writeDoorScript = [&](ScriptFixture& f, std::uint32_t C,
+                             std::uint32_t an, std::uint32_t af) {
+    f.write(C,     {0x10, 0xe8, 0xfd});        // +0x8=+0x2a2=0xfde8, +0x21f=1
+    f.write(C + 3, {0x53, 0x03});              // +0x58 = inline f32
+    f.writeF(C + 5, 1.01021f);
+    f.write(C + 9, {0x96});                    // +0x306/+0x30a anim recs
+    f.writeW(C + 0xa, an);
+    f.writeW(C + 0xe, af);
+    f.write(C + 0x12, {0x97});                 // 4 counted sound names
+    f.writeStr(C + 0x13, "DOOR");              // op0 -> +0x31a
+    f.writeStr(C + 0x19, "DOOR");              // op1 -> +0x322
+    f.writeStr(C + 0x1f, "");                  // op2 -> +0x316 (cleared)
+    f.writeStr(C + 0x21, "");                  // op3 -> +0x31e (cleared)
+    f.write(C + 0x23, {0x98});                 // +0x312 hi nibble
+    f.writeW(C + 0x24, 0x10);
+    f.write(C + 0x28, {0x99});                 // +0x30e radius
+    f.writeF(C + 0x29, 20.0f);
+    f.write(C + 0x2d, {0xff});
+    // anim records: [f32 rate][u32][i32 frameCount]
+    f.writeF(an, 1.0f); f.writeW(an + 4, 0); f.writeW(an + 8, 16);
+    f.writeF(af, 1.0f); f.writeW(af + 4, 0); f.writeW(af + 8, 21);
+  };
+
+  // traversalObjectInitScript applies the door's config opcodes.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    writeDoorScript(f, C, 0x600, 0x620);
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.connState = 8;                             // connector-create defaults
+    o.connRadius = 20.0f;
+    o.col.flags148 = 0x8000;
+    o.col.flags149 = 0x80;
+    o.col.flags14a = 0x10;
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(o.health == 0xfde8);
+    CHECK(o.healthMirror2a2 == 0xfde8);
+    CHECK(o.flag21f == 1);
+    CHECK(near(o.col.scale, 1.01021, 1e-5));
+    CHECK(o.connAnimNear ==
+          static_cast<const void*>(f.image.data() + 4 + 0x600));
+    CHECK(o.connAnimFar ==
+          static_cast<const void*>(f.image.data() + 4 + 0x620));
+    CHECK(o.connState == 0x18);                  // closed | collision-toggle
+    CHECK(near(o.connRadius, 20.0, 1e-5));
+    CHECK(o.connSound31a == "DOOR" && o.connSound322 == "DOOR");
+    CHECK(o.connSound316.empty() && o.connSound31e.empty());
+  }
+
+  // Field-set family beyond the door's: 0x5a->+0xe8, 0xc6->+0x104
+  // (same {mode,[f32|idx]} grammar as 0x53/0x54) and 0x75->+0x118
+  // (u32 slot, low16-1). Confirmed from MDK95.EXE handler disasm.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C,      {0x5a, 0x03});  f.writeF(C + 2, 4.5f);   // +0xe8
+    f.write(C + 6,  {0xc6, 0x03});  f.writeF(C + 8, 7.25f);  // +0x104
+    f.write(C + 12, {0x75});        f.writeW(C + 13, 9);     // +0x118=8
+    f.write(C + 17, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.fieldE8, 4.5, 1e-5));
+    CHECK(near(o.field104, 7.25, 1e-5));
+    CHECK(o.connAnimLatch == 8);                 // 9 - 1
+  }
+
+  // End-to-end: traversalScriptSpawn runs the init script on a real
+  // connector, then FUN_004555bc animates it open and the collision
+  // toggle makes it passable. CHMO_2 -> HMO_3.
+  {
+    ScriptFixture f;
+    f.arena->name = "CHMO_2";
+    f.arena->dyn.name = "CHMO_2";
+    mdk::TraversalArena* dst = travArenaAdd(f.rt, "HMO_3");
+    f.rt.level.enemies.entries.push_back({"XCORDOOR", 0, false});
+    mdk::RuntimeModel mdl = makePlatformModel("XCORDOOR", "ELEM", 0.0f);
+    TestModelSrc src{{&mdl}};
+    f.env.modelFor = testModelFor;
+    f.env.modelCtx = &src;
+    const std::uint32_t C = 0x200;
+    writeDoorScript(f, C, 0x600, 0x620);
+    f.rt.level.cmi.tables.resize(4);
+    f.rt.level.cmi.tables[2].records.push_back(
+        mkRec("CHMO_2$XCORDOOR", C));
+
+    // variant 0 connector: cls=XCORDOOR, name=dest arena HMO_3.
+    mdk::traversalScriptSpawn(f.env, 0, 0, 0, 0.0f, 0, "XCORDOOR",
+                              "HMO_3", 0, 0);
+    CHECK(f.env.seamsSpawned == 1);
+    CHECK(!f.arena->dyn.storage.empty());
+    mdk::DynamicObject& o = *f.arena->dyn.storage.front();
+    CHECK(o.connDest == dst);
+    CHECK(o.connState == 0x18);                  // closed | toggle
+    CHECK(near(o.connRadius, 20.0, 1e-5));
+    CHECK(o.connAnimNear != nullptr && o.connAnimFar != nullptr);
+    CHECK(o.health == 0xfde8);
+    CHECK(near(o.col.scale, 1.01021, 1e-5));
+    CHECK((o.col.flags148 & 0x10) == 0);         // born solid
+
+    // Player inside the radius -> the connector starts opening and
+    // attaches the far-side arena (HMO_3) as the partner.
+    f.rt.cur = f.arena;
+    f.rt.cs.pos[0] = o.pos[0];
+    f.rt.cs.pos[1] = o.pos[1];
+    f.rt.cs.pos[2] = o.pos[2];
+    mdk::traversalConnectorUpdate(o, f.rt);
+    CHECK((o.connState & 0xf) == 2);             // opening
+    CHECK(o.connAnim == o.connAnimNear);
+    CHECK(f.rt.partner == dst && f.rt.partnerActive);
+
+    // FUN_004555bc: the open anim (16 frames @ rate1, animRate30)
+    // advances +0xdc by 1.0/frame to the frameCount-1 latch.
+    for (int i = 0; i < 40 && !o.connAnimDone(); ++i)
+      mdk::traversalObjectAnimUpdate(o);
+    CHECK(o.connAnimDone());
+    CHECK(static_cast<std::uint16_t>(o.connAnimLatch) == 0xff00u);
+
+    // Done -> open; the +0x312 bit4 collision toggle sets the
+    // sweep-skip bit so the door becomes passable.
+    mdk::traversalConnectorUpdate(o, f.rt);
+    CHECK((o.connState & 0xf) == 1);             // open
+    CHECK(o.col.flags148 & 0x10);
   }
 }
 
@@ -11708,6 +11878,7 @@ int main() {
   test_traversal_trigger_scan();
   test_traversal_deep_floor();
   test_traversal_script();
+  test_traversal_object_init();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

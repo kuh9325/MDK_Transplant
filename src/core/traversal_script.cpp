@@ -40,6 +40,14 @@ struct Reader {
     ++pc;
     return static_cast<std::uint8_t>(*p);
   }
+  std::uint16_t u16() {
+    const std::byte* p = ptr(pc, 2);
+    if (!p) return 0;
+    pc += 2;
+    std::uint16_t v;
+    std::memcpy(&v, p, 2);
+    return v;
+  }
   std::uint32_t u32() {
     const std::byte* p = ptr(pc, 4);
     if (!p) return 0;
@@ -81,9 +89,10 @@ struct Reader {
 // >=3 -> caller ctx +0x234 (or the sink 0x49b81c when no caller —
 // the arena ctx has none, so the bounded fallback targets locals).
 static inline int varIndex(std::uint8_t idx) { return idx < 4 ? idx : 0; }
-float resolveVar(Reader& r, TraversalScriptEnv& env,
-                 TraversalScriptState& st) {
-  std::uint8_t mode = r.u8();
+// Resolve a var-operand given an already-read mode byte. mode 3 =
+// inline f32; otherwise a u8 index selects a slot via FUN_00438654.
+float resolveVarMode(std::uint8_t mode, Reader& r,
+                     TraversalScriptEnv& env, TraversalScriptState& st) {
   if (mode == 3) return r.f32();          // inline f32 (read-op form)
   const int idx = varIndex(r.u8());
   switch (mode) {
@@ -93,6 +102,10 @@ float resolveVar(Reader& r, TraversalScriptEnv& env,
   case 2:                                        // ctx+0x234 locals
   default: return st.locals[idx];                // >=3: caller +0x234
   }                                              // -> local (bounded)
+}
+float resolveVar(Reader& r, TraversalScriptEnv& env,
+                 TraversalScriptState& st) {
+  return resolveVarMode(r.u8(), r, env, st);
 }
 
 // Var-operand WRITE resolver — FUN_00438654's pointer form. Returns
@@ -176,6 +189,21 @@ std::uint32_t cmiScriptCodeOffset(const CmiDirectory& cmi,
     if (!r.ok) return 0;
     return r.u32();
   }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// CMI table-2 object-init lookup — FUN_004566f0's "%s$%s" match
+// ---------------------------------------------------------------------------
+// Unlike table-3, the table-2 record's `value` is the image-relative
+// code offset itself (code at file 4 + value); there is no
+// {str}{str}{u32} indirection. OBSERVED: CHMO_2$XCORDOOR -> 0x204c0.
+std::uint32_t cmiObjectScriptOffset(const CmiDirectory& cmi,
+                                    const std::string& objectKey) {
+  if (cmi.tables.size() < 3) return 0;
+  for (const auto& rec : cmi.tables[2].records)
+    if (rec.name() == objectKey)
+      return static_cast<std::uint32_t>(rec.value);
   return 0;
 }
 
@@ -639,33 +667,409 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
 }
 
 // ---------------------------------------------------------------------------
-// Spawn helper — creates a dormant DynamicObject carrying the class /
-// name / script metadata the original's FUN_00454894 records. The
-// destination is the arena named `name` (FUN_00432ec4 lookup) when it
-// exists, else the script's own arena — matching the original's
-// FUN_004574d0 pending-transfer.
+// Object-init interpreter — the FUN_004566f0 table-2 "%s$%s" script.
+// Same VM bytecode + linkage rules as FUN_004388d8, but the bound
+// object is a DynamicObject (field ops write its +0xNN fields, not the
+// arena ctx's). Runs synchronously to completion at spawn.
+//
+// OBSERVED opcode set implemented (MDK95.EXE handler disassembly):
+//   control:  0x01 ckpt / 0x09 stop / 0xff end / 0xfd ret /
+//             0x0c rgoto / 0xfc rcall (random-pick -> first, seam)
+//   fields:   0x08 +0x4c yaw(i16,neg+360)  0x0b +0x11a  0x49 +0x11b
+//             0x10 +0x8/+0x2a2/+0x21f health(u16)  0x6f +0x146(u16)
+//             0x32/0x33/0x34 +0x38/+0x3c/+0x40     0x53 +0x58 scale
+//             0x54 +0x5c zBias   0x5a +0xe8        0xc6 +0x104
+//             0x75 +0x118 anim-target(u16-1)     0x4c +0x110 imgref
+//   flags:    0x23 +0x148|2   0x24 +0x148|1  0x29 +0x149|1/+0x14a|0x80
+//             0x3f +0x148^0x10(inv)  0x61 +0x148^0x80(inv,+0x54=0)
+//             0x74 +0x148 dword |=
+//   masks:    0x1f {count,strings} -> +0x2c8 element-name/"ALL" mask
+//   vars:     0x41 {mode,idx,u32} -> *FUN_00438654 slot
+//   connect:  0x96 {u32,u32}->+0x306/+0x30a anim recs
+//             0x97 {4 strs}->+0x316/31a/31e/322 sound names
+//             0x98 +0x312 hi nibble  0x99 +0x30e radius
+// Unknown/other opcodes halt with a diagnostic (native safety policy —
+// the original would desync on a mis-framed stream).
+// ---------------------------------------------------------------------------
+TraversalScriptResult traversalObjectInitScript(
+    TraversalScriptEnv& env, DynamicObject& obj, std::uint32_t codeOff) {
+  TraversalScriptResult res;
+  if (codeOff == 0) return res;
+
+  // Var mode 1 resolves the bound object's home arena (+0x48). Rebind
+  // selfArena to the object's actual home so resolveVar/resolveVarRef
+  // hit the right arena even if env.selfArena differs.
+  TraversalScriptEnv oenv = env;
+  if (obj.arena && obj.arena->owner) oenv.selfArena = obj.arena->owner;
+
+  TraversalScriptState st;                 // transient ctx (locals+stack)
+  st.pcImageOff = codeOff;
+  Reader r{oenv.image, oenv.imageBase, codeOff};
+  const char* name =
+      oenv.selfArena ? oenv.selfArena->name.c_str() : "<obj>";
+
+  auto fail = [&](const char* why) {
+    res.error = true;
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "%s: %s", name, why);
+    res.diag = buf;
+    if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
+  };
+  auto doCall = [&](std::uint32_t target) -> bool {
+    if (target == 0) return true;
+    if (st.callDepth >= 4) { fail("Gosub overflow"); return false; }
+    st.retPc[st.callDepth] = r.pc;
+    ++st.callDepth;
+    r.pc = target;
+    return true;
+  };
+  auto doGoto = [&](std::uint32_t target) { r.pc = target; };
+  // Image-relative ref (cmiBase + off). operand==0 -> the image base
+  // (cmiBase+0), matching the original's unconditional add.
+  auto imageRef = [&](std::uint32_t off, std::size_t n) -> const void* {
+    return r.ptr(off, n);
+  };
+
+  for (int i = 0; i < 1000; ++i) {
+    if (!r.ok) { fail("init read out of bounds"); return res; }
+    const std::uint32_t insnOff = r.pc;
+    const std::uint8_t op = r.u8();
+    ++res.instructions;
+    if (!r.ok) { fail("init opcode fetch out of bounds"); return res; }
+
+    switch (op) {
+    case 0xff:                              // end
+      res.halted = true; return res;
+    case 0x09:                              // stop
+      res.stopped = true; return res;
+    case 0xfd:                              // standalone return
+      if (st.callDepth <= 0) { fail("Gosub underflow"); return res; }
+      --st.callDepth; r.pc = st.retPc[st.callDepth];
+      break;
+    case 0x01:                              // ckpt: transient in init
+      break;
+    case 0x0c: {                            // rgoto {u8 n, n×u32}
+      std::uint8_t n = r.u8();
+      if (!r.ok || n == 0) { fail("init rgoto"); return res; }
+      std::uint32_t tgt = 0;
+      for (std::uint8_t k = 0; k < n; ++k) {
+        std::uint32_t o = r.u32();
+        if (k == 0) tgt = o;
+      }
+      if (!r.ok) { fail("init rgoto offs"); return res; }
+      doGoto(tgt);
+      break;
+    }
+    case 0xfc: {                            // rcall {u8 n, n×u32}
+      std::uint8_t n = r.u8();
+      if (!r.ok || n == 0) { fail("init rcall"); return res; }
+      std::uint32_t tgt = 0;
+      for (std::uint8_t k = 0; k < n; ++k) {
+        std::uint32_t o = r.u32();
+        if (k == 0) tgt = o;
+      }
+      if (!r.ok) { fail("init rcall offs"); return res; }
+      if (!doCall(tgt)) return res;
+      break;
+    }
+
+    // ----- object field writes -----
+    case 0x08: {                            // +0x4c yaw (MOVSX u16)
+      std::int16_t v = static_cast<std::int16_t>(r.u16());
+      obj.yawDeg = static_cast<float>(v);
+      if (obj.yawDeg < 0.0f) obj.yawDeg += 360.0f;   // normalize to [0,360)
+      break;
+    }
+    case 0x0b: obj.field11a = r.u8(); break;         // +0x11a
+    case 0x49: obj.field11b = r.u8(); break;         // +0x11b
+    case 0x10: {                            // +0x8 health (MOVZX u16)
+      std::uint16_t v = r.u16();
+      obj.health = static_cast<int>(v);
+      obj.healthMirror2a2 = v;                       // +0x2a2 = low16(+0x8)
+      if (v >= 0xfde8) {                             // +0x21f = 1 sentinel
+        obj.flag21f = 1;
+      } else if (v == 0) {                           // +0x8==0 -> FUN_004581a4
+        obj.health = 0;                              //   remove (seam — the
+        obj.syncCollisionView();                     //   list detach is not
+      }                                              //   modelled; health=0
+      break;                                         //   makes it inert)
+    }
+    case 0x6f: obj.spawnId =                    // +0x146 (u16 of u32)
+        static_cast<std::uint16_t>(r.u32() & 0xffff); break;
+    case 0x32: obj.field38 = resolveVar(r, oenv, st); break;  // +0x38
+    case 0x33: obj.field3c = resolveVar(r, oenv, st); break;  // +0x3c
+    case 0x34: obj.field40 = resolveVar(r, oenv, st); break;  // +0x40
+    case 0x53: {                              // +0x58 scale
+      std::uint8_t mode = r.u8();
+      if (mode == 0xff) {                     // ramp form {u8,u32,u32}:
+        (void)r.u8(); (void)r.u32(); (void)r.u32();   // per-frame ease of
+        // +0x58 toward a target — a runtime behavior; no init script
+        // uses it, so consume operands only (HYPOTHESIS: single step).
+      } else {
+        obj.col.scale = resolveVarMode(mode, r, oenv, st);
+      }
+      break;
+    }
+    case 0x54: obj.zBias = resolveVar(r, oenv, st); break;    // +0x5c
+    case 0x5a: obj.fieldE8 = resolveVar(r, oenv, st); break;  // +0xe8
+    case 0xc6: obj.field104 = resolveVar(r, oenv, st); break; // +0x104
+    case 0x4c: {                              // +0x110 image ref (0->null)
+      std::uint32_t off = r.u32();
+      obj.field110 = (off == 0) ? nullptr : imageRef(off, 4);
+      break;
+    }
+    case 0x75:                                // +0x118 anim target word
+      // {u32 slot, low u16 used}: +0x118 = (i16)low16 - 1. Shared
+      // anim-status word — for XM3 etc. it pre-loads the frame the
+      // anim player (FUN_004555bc) runs toward before latching done.
+      obj.connAnimLatch = static_cast<std::int16_t>(
+          static_cast<std::int16_t>(r.u32() & 0xffff) - 1);
+      break;
+    case 0x41: {                              // setVar {mode,idx,u32}
+      std::uint8_t mode = r.u8(), idx = r.u8();
+      std::uint32_t v = r.u32();
+      if (!r.ok) { fail("init setVar"); return res; }
+      if (float* slot = resolveVarRef(mode, idx, oenv, st)) {
+        float f; std::memcpy(&f, &v, 4); *slot = f;
+      }
+      break;
+    }
+
+    // ----- +0x148/+0x149/+0x14a flag ops (byte-addressed) -----
+    case 0x23: {                              // +0x148 bit2
+      if (r.u8()) obj.col.flags148 |= 0x4; else obj.col.flags148 &= ~0x4u;
+      break;
+    }
+    case 0x24: {                              // +0x148 bit1
+      if (r.u8()) obj.col.flags148 |= 0x2; else obj.col.flags148 &= ~0x2u;
+      break;
+    }
+    case 0x3f: {                              // +0x148 bit4 INVERTED
+      if (r.u8()) obj.col.flags148 &= ~0x10u; else obj.col.flags148 |= 0x10u;
+      break;
+    }
+    case 0x61: {                              // +0x148 bit7 INVERTED
+      if (r.u8()) { obj.col.flags148 &= ~0x80u; }
+      else { obj.col.flags148 |= 0x80u; obj.pitchDeg = 0.0f; }  // +0x54=0
+      break;
+    }
+    case 0x29: {                              // +0x149 bit0 / +0x14a bit7
+      std::uint8_t v = r.u8();
+      if (v) { obj.col.flags148 |= 0x100u; obj.col.flags149 |= 0x1; }
+      else   { obj.col.flags148 &= ~0x100u; obj.col.flags149 &= ~0x1; }
+      if (v == 2) obj.col.flags14a |= 0x80; else obj.col.flags14a &= ~0x80;
+      // +0x149 bit0 clear while ridden -> FUN_00461878 dismount (seam).
+      break;
+    }
+    case 0x74: {                              // +0x148 dword |= operand
+      std::uint32_t v = r.u32();
+      obj.col.flags148 = static_cast<std::uint16_t>(
+          obj.col.flags148 | (v & 0xffffu));
+      obj.col.flags149 = static_cast<std::uint8_t>(obj.col.flags148 >> 8);
+      obj.col.flags14a |= static_cast<std::uint8_t>((v >> 16) & 0xff);
+      break;                                  // +0x14b byte unmodelled
+    }
+
+    // ----- element-name mask -> +0x2c8 -----
+    case 0x1f: {                              // {u8 count, count×str}
+      std::uint8_t n = r.u8();
+      for (std::uint8_t k = 0; k < n; ++k) {
+        std::string s = r.str();
+        if (!r.ok) break;
+        for (int e = 0; e < obj.elemSet.count; ++e) {
+          const std::string en = obj.model.elemName(e);
+          if (en == s || s == "ALL")            // FUN_0042fa50 match /
+            obj.col.elemMaskB |= (1u << (e & 31)); //  "ALL" wildcard
+        }
+      }
+      if (!r.ok) { fail("init elemmask"); return res; }
+      break;
+    }
+
+    // ----- connector config family -----
+    case 0x96: {                              // {u32,u32}->+0x306/+0x30a
+      std::uint32_t a = r.u32(), b = r.u32();
+      obj.connAnimNear = imageRef(a, 12);      // +0x306 (open anim)
+      obj.connAnimFar  = imageRef(b, 12);      // +0x30a (close anim)
+      // FUN_00438898 lazy-resolve (*ptr==0 -> symbol) is a seam — the
+      // door's records carry rate=1.0 (nonzero) so no resolve occurs.
+      break;
+    }
+    case 0x97: {                              // {4 strs}->+0x316..+0x322
+      std::string s[4];
+      for (auto& x : s) { x = r.str(); if (x == "NONE") x.clear(); }
+      // OBSERVED field order: op0->+0x31a op1->+0x322 op2->+0x316
+      // op3->+0x31e (scrambled). "NONE" sentinel clears the slot.
+      obj.connSound31a = s[0]; obj.connSound322 = s[1];
+      obj.connSound316 = s[2]; obj.connSound31e = s[3];
+      break;
+    }
+    case 0x98: {                              // +0x312 hi nibble
+      std::uint32_t v = r.u32();
+      obj.connState = static_cast<std::uint8_t>(
+          (obj.connState & 0x0f) | (v & 0xf0));
+      break;
+    }
+    case 0x99: obj.connRadius = r.f32(); break; // +0x30e
+
+    default: {
+      char buf[160];
+      std::snprintf(buf, sizeof buf,
+                    "Unrecognised objinit op 0x%02x at +%x",
+                    op, insnOff);
+      fail(buf);
+      return res;
+    }
+    }
+  }
+
+  {
+    char buf[160];
+    std::snprintf(buf, sizeof buf,
+                  "Objinit %s looped %d commands, off %lx", name,
+                  res.instructions, static_cast<unsigned long>(r.pc));
+    res.diag = buf;
+    if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
+    res.error = true;
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// FUN_00432ec4 — arena-name lookup. The arena record's name is at the
+// record start; the original logs "arena %s not found" on a miss and
+// the 0x95 handler aborts the spawn when it returns 0.
+// ---------------------------------------------------------------------------
+static TraversalArena* traversalFindArena(TraversalRuntime& rt,
+                                          const std::string& name) {
+  for (const auto& ap : rt.arenas)
+    if (ap && ap->name == name) return ap.get();
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Spawn helper — FUN_00454af8 / the tr_alcmd spawn opcodes. The object
+// is created on the SCRIPT's own arena +0x68 list (the original's
+// in_EAX is the bound arena, not the destination). For the 0x95
+// connector form (variant 0) it additionally records the resolved
+// class index (+0x04), spawn id (+0x146), destination arena (+0x302),
+// connector flag (+0x148 = 0x1108000 -> +0x14a bit4), and the closed
+// connector state (+0x312 = 8, radius +0x30e = 20) — see
+// FUN_00454af8's param_9 != 0 block.
 // ---------------------------------------------------------------------------
 void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
                           float z, float yaw, std::uint32_t flags,
                           const std::string& cls, const std::string& name,
                           std::uint32_t scriptOff, int variant) {
   if (!env.rt || !env.selfArena) return;
-  TraversalArena* dst = env.selfArena;
-  if (!name.empty()) {
-    for (const auto& ap : env.rt->arenas) {
-      if (ap && ap->name == name) { dst = ap.get(); break; }
-    }
+  TraversalRuntime& rt = *env.rt;
+  TraversalArena* self = env.selfArena;
+
+  // FUN_00454794 — class/model name -> enemy-table index. The original
+  // scans DAT_004edcc0 records by C-string; a miss logs "ENEMY name %s
+  // not found" and aborts the spawn (no object created).
+  int enemyIdx = -1;
+  if (!cls.empty()) enemyIdx = rt.level.enemies.indexOf(cls);
+  if (!cls.empty() && enemyIdx < 0) return;
+
+  TraversalArena* dst = nullptr;
+  if (variant == 0) {
+    // 0x95 only: the second string is the destination arena name,
+    // resolved by FUN_00432ec4. A miss aborts the spawn.
+    dst = traversalFindArena(rt, name);
+    if (dst == nullptr) return;
+
+    // FUN_00454894 — connector dedup: reuse an existing object already
+    // bridging self<->dst with this class index (+0x04) and the
+    // {+0x60,+0x302} pair in either order. The original then migrates
+    // it toward the current arena instead of spawning a duplicate.
+    auto isConn = [&](DynamicObject& o) {
+      if (!o.col.named || o.enemyIndex != enemyIdx) return false;
+      const bool fwd = (o.arena == &self->dyn && o.connDest == dst);
+      const bool rev = (o.connDest == self && o.arena == &dst->dyn);
+      return fwd || rev;
+    };
+    for (DynamicArena* la : {&self->dyn, &dst->dyn})
+      for (auto& up : la->storage)
+        if (isConn(*up)) { ++env.seamsSpawned; return; }
   }
-  DynamicObject& o = dst->dyn.allocFront();
+
+  DynamicObject& o = self->dyn.allocFront();   // FUN_0045cffc
   o.scriptClass = cls;
   o.scriptName = name;
   o.scriptOff = scriptOff;
   o.scriptVariant = variant;
-  o.col.flags14a = flags & 0xffffu;         // spawn flags -> +0x14a half
-  o.setPosition(x, y, z);
-  o.prevPos[0] = x; o.prevPos[1] = y; o.prevPos[2] = z;
-  o.yawDeg = yaw;
-  o.prevYawDeg = yaw;
+  o.enemyIndex = static_cast<std::uint16_t>(enemyIdx < 0 ? 0 : enemyIdx);
+  o.spawnId = static_cast<std::uint16_t>(flags & 0xffffu);   // +0x146
+  o.setPosition(x, y, z);                    // +0x10..0x18 / +0x1c..0x24
+  o.prevPos[0] = x; o.prevPos[1] = y; o.prevPos[2] = z;      // +0x180..
+  o.yawDeg = yaw;                            // +0x4c
+  o.prevYawDeg = yaw;                        // +0x50
+  o.behaviorByte = 7;                        // +0x11c
+
+  // FUN_00403720 — deep-copy the resolved model into +0x0c.
+  if (env.modelFor && enemyIdx >= 0) {
+    if (const RuntimeModel* src = env.modelFor(enemyIdx, env.modelCtx))
+      o.model = deepCopyModel(*src);
+  }
+
+  if (variant == 0) {
+    // Connector fields — the param_9 != 0 block of FUN_00454af8 plus
+    // the handler tail (+0x302 dest, +0x148 = 0x1108000). OBSERVED
+    // dword 0x1108000 -> +0x148=0x00 +0x149=0x80 +0x14a=0x10 +0x14b=0x01:
+    // flags148=0x8000 (its high byte mirrors flags149=0x80),
+    // flags14a=0x10 (connector bit). No sweep-skip bits — the door is
+    // born solid and opens via the +0x312-state collision toggle.
+    o.connDest = dst;                        // +0x302
+    o.connRadius = 20.0f;                    // +0x30e
+    o.connState = 8;                         // +0x312 = closed
+    o.connStateHi = 0;                       // +0x313
+    o.connAnimNear = nullptr;                // +0x306
+    o.connAnimFar = nullptr;                 // +0x30a
+    o.col.flags148 = 0x8000;                 // +0x148=0x00 +0x149=0x80
+    o.col.flags149 = 0x80;                   // +0x149
+    o.col.flags14a = 0x10;                   // +0x14a (connector)
+  } else {
+    o.col.flags14a = flags & 0xffffu;        // spawn-flags byte (+0x14a)
+  }
+
+  // FUN_004566f0 — generic object init, common to every spawned object:
+  // default block (health/scale/fields/identity) -> bind the model ->
+  // the table-2 "%s$%s" init script -> FUN_0045612c transform rebuild
+  // (applies the script's +0x58 scale / +0x5c zBias).
+  initObjectDefaults(o);
+  o.syncCollisionView();                     // bind +0x0c (elemSet+gate)
+  {
+    // Key "%s$%s" = homeArena$className. *+0xc is the model record's
+    // name — use the deep-copied model's name, falling back to the
+    // class/name operand when the model is absent (unresolved).
+    std::string cn = o.model.modelName();
+    if (cn.empty()) cn = cls.empty() ? name : cls;
+    const std::string key = self->name + "$" + cn;
+    const std::uint32_t initOff = cmiObjectScriptOffset(rt.level.cmi, key);
+    if (initOff != 0) {
+      TraversalScriptResult ir = traversalObjectInitScript(env, o, initOff);
+      rt.scriptInsnTotal += ir.instructions;
+    }
+    o.syncCollisionView();                   // presence-gate re-check
+    rebuildObjectTransform(o);               // FUN_0045612c (+0x58/+0x5c)
+  }
+
+  if (variant == 0) {
+    // Handler tail (0x44a55a..0x44a648): build the element-name masks
+    // the connector update ORs into +0x2c8. +0x326 = elements named
+    // "LOCK" (FUN_0042fa50 exact compare); +0x32a = elements whose
+    // name starts with "HC". For XCORDOOR both resolve to 0 — its
+    // leaves are XCORD_L*/XCORD_R*, so the mask path is inert.
+    for (int e = 0; e < o.elemSet.count; ++e) {
+      const std::string en = o.model.elemName(e);
+      if (en == "LOCK")
+        o.connMaskLock |= (1u << (e & 31));        // +0x326
+      else if (en.size() >= 2 && en[0] == 'H' && en[1] == 'C')
+        o.connMaskHC |= (1u << (e & 31));          // +0x32a
+    }
+    o.col.elemMaskA = o.connMaskLock;              // +0x326 alias
+  }
   ++env.seamsSpawned;
 }
 

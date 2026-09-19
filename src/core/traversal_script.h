@@ -72,6 +72,8 @@ namespace mdk {
 
 struct TraversalArena;
 struct TraversalRuntime;
+struct RuntimeModel;
+struct DynamicObject;
 
 // ---------------------------------------------------------------------------
 // CMI table-3 script record (FUN_00458550, OBSERVED)
@@ -93,6 +95,19 @@ struct CmiScriptRecord {
 std::uint32_t cmiScriptCodeOffset(const CmiDirectory& cmi,
                                   std::span<const std::byte> cmiImage,
                                   const std::string& arenaName);
+
+// ---------------------------------------------------------------------------
+// CMI table-2 per-object init record (FUN_004566f0, OBSERVED)
+// ---------------------------------------------------------------------------
+// At spawn, FUN_004566f0 formats "%s$%s" (arenaName$className) and
+// scans CMI table[2] for a matching record. On a hit the record's
+// value IS the image-relative bytecode offset (no {str}{str}{u32}
+// wrapper — unlike table-3) and the script runs immediately with the
+// new object as the bound target, then FUN_0045612c rebuilds the
+// transform (so the script's +0x58 scale applies). Returns 0 when no
+// record matches — the object then keeps FUN_004566f0's defaults.
+std::uint32_t cmiObjectScriptOffset(const CmiDirectory& cmi,
+                                    const std::string& objectKey);
 
 // ---------------------------------------------------------------------------
 // VM context — the native equivalent of the arena +0x118 block's
@@ -174,6 +189,13 @@ struct TraversalScriptEnv {
   float slideImpulseZ = 0.0f;
   bool deflectBounce = false;         // 0x540e28
 
+  // FUN_004286c8 deferred-geometry model source — CMI enemy-table
+  // index -> source RuntimeModel (the 0x95 spawn resolves its class
+  // name to this index via the enemy table, then deep-copies it).
+  // Wired by the traversal runtime; nullptr when models are absent.
+  const RuntimeModel* (*modelFor)(int modelIndex, void* ctx) = nullptr;
+  void* modelCtx = nullptr;
+
   // Spawn accounting — increments per created object (seam metric).
   int seamsSpawned = 0;
 
@@ -196,6 +218,18 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
 // error or the 1000-instruction cap. `image` is the full CMI file
 // bytes; code offsets are image-relative (file offset = 4 + off).
 TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env);
+
+// Run one table-2 object-init script synchronously — the bound object
+// is `obj` (field ops write its +0xNN fields, not the arena ctx). The
+// object-init run rebinds selfArena to the object's home arena (var
+// mode 1 source) and uses a transient ctx for locals/call-stack, like
+// the original's fresh FUN_004388d8 invocation from FUN_004566f0.
+// Runs to 0xff/0x09/end or the 1000-instruction cap. OBSERVED subset
+// implemented: the door opcodes (0x10/0x53/0x96/0x97/0x98/0x99/0xff)
+// plus the common field/flag/element-init family; unknown opcodes halt
+// with a diagnostic (native safety policy — the original desyncs).
+TraversalScriptResult traversalObjectInitScript(
+    TraversalScriptEnv& env, DynamicObject& obj, std::uint32_t codeOff);
 
 // ---------------------------------------------------------------------------
 // FUN_004546ac — the surface-contact handler seam. Matches the

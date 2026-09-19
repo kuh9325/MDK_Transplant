@@ -366,6 +366,18 @@ void traversalDetachPartner(TraversalRuntime& rt);
 // the portal plane as the original does), else nullptr.
 TraversalArena* traversalPortalTest(TraversalRuntime& rt);
 
+// FUN_00457738 — arena-connector (door) state update, gated by
+// col.flags14a & 0x10. Runs first in the per-object dispatch: self-
+// migration, proximity open/close, partner attach/detach, element
+// mask rebuild, +0x148 bit4 collision toggle.
+void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt);
+
+// FUN_004555bc — per-object animation advance for the +0x114
+// connector anim record. Advances +0xdc by rate*+0xe0/30 per frame,
+// applies FRNDINT(+0xdc) to +0xe4, latches +0x118=0xff00 at
+// frameCount-1 (non-looping). Inert when +0x114 == nullptr.
+void traversalObjectAnimUpdate(DynamicObject& o);
+
 // FUN_00434b44 — type-1/3 trigger scan on the current arena.
 void traversalTriggerScan(TraversalRuntime& rt);
 

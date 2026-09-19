@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstring>
 #include <span>
 
@@ -278,6 +279,193 @@ void traversalDetachPartner(TraversalRuntime& rt) {
   rt.cs.carrier = nullptr;
   rt.partnerActive = false;
   rt.cs.carrierValid = 0;
+}
+
+// ---------------------------------------------------------------------------
+// FUN_00457738 — arena-connector update, gated by col.flags14a & 0x10
+// (the tr_alcmd 0x95 connector spawn). Runs first in the per-object
+// dispatch (FUN_004572ac) before movement/animation.
+//
+// OBSERVED behavior (0x457738..0x457a5b):
+//  * Self-migration: when the player's current arena == +0x302 (the
+//    connector's destination) but the object is still homed elsewhere,
+//    +0x2bc <- +0x302 so the door follows the player across.
+//  * +0x312 state byte: low nibble = phase {8 closed, 2 opening,
+//    1 open, 4 closing}, high nibble = sub-flags. An "active" anim
+//    (+0x114 != 0 and +0x118 != 0xff00) blocks the open/close latch;
+//    with +0x114 == 0 the latch is immediate.
+//  * Proximity: player inside +0x30e -> opening (attach the far-side
+//    arena via FUN_00432d9c); outside -> closing; closing latch ->
+//    closed + detach partner.
+//  * +0x2c8 element mask rebuilt from +0x326 (LOCK) / +0x32a (HC).
+//  * +0x148 bit4 toggled on (state&0x10 && state&1) / off — sets the
+//    sweep-skip bit 0x10 when a flagged connector is open.
+//
+// For XCORDOOR (this route) the table-2 init script CHMO_2$XCORDOOR
+// binds +0x306/+0x30a to real anim records (16-frame open, 21-frame
+// close) and sets +0x312 bit4 (collision toggle). So the door does NOT
+// latch immediately — it animates over ~16 frames while +0x118 runs
+// from 0xffff to the 0xff00 done latch, then opens. There are no HC*/
+// LOCK elements, so the mask update is a no-op; the observable effect
+// is the collision-toggle sweep-skip plus the partner attach/detach
+// that supplies the corridor's carrier floor.
+// ---------------------------------------------------------------------------
+void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt) {
+  TraversalArena* cur = rt.cur;                 // 0x540c48
+  TraversalArena* home = o.arena ? o.arena->owner : nullptr;  // +0x60
+  TraversalArena* dest = o.connDest;            // +0x302
+  TraversalArena* partner = rt.partner;         // 0x540ca4
+  const bool partnerActive = rt.partnerActive;  // 0x540ca8
+  if (!dest) return;
+
+  // Self-migration (0x457745..0x45775e): cur!=home && cur==dest ->
+  // +0x2bc <- +0x302. The pending-arena transfer then flips +0x302 to
+  // the old home (FUN_004574d0), making the connector bidirectional.
+  if (cur != home && cur == dest)
+    o.pendingArena = &dest->dyn;                // +0x2bc
+
+  // Anim latch (0x457764..0x4577a1). +0x114==0 or +0x118==0xff00 means
+  // "no active anim / complete". With the init script bound the door
+  // animates: +0x118 stays -1 while running, 0xff00 when done.
+  const bool animDone = o.connAnimDone();
+  if ((o.connState & 2) == 0) {
+    if ((o.connState & 4) != 0 && animDone) {
+      o.connState = static_cast<std::uint8_t>((o.connState & 0xf0) | 8);
+      traversalDetachPartner(rt);               // FUN_00432d9c(0)
+      // play +0x31e (seam — sound system not reconstructed)
+    }
+  } else if (animDone) {
+    o.connState = static_cast<std::uint8_t>((o.connState & 0x70) | 1);
+    // play +0x316 (seam)
+  }
+
+  // Proximity (0x4577a6..0x4579a5): squared distance player->object.
+  const float dx = o.pos[0] - rt.cs.pos[0];
+  const float dy = o.pos[1] - rt.cs.pos[1];
+  const float dz = o.pos[2] - rt.cs.pos[2];
+  const float dist2 = dx * dx + dy * dy + dz * dz;
+  const float r2 = o.connRadius * o.connRadius;
+
+  if (r2 <= dist2) {
+    // Player outside radius -> closing (0x4579aa..0x457a1a). The
+    // transition writes +0xdc=-1.0, +0xe4=0xffff, +0x118=0xffff,
+    // +0xe0=30, clears +0x148 bit3 (loop) and binds +0x114=+0x30a.
+    if ((o.connState & 0x2c) == 0) {
+      o.connAnimFrame = -1.0f;                  // +0xdc
+      o.connAnimCurFrame = -1;                  // +0xe4 = 0xffff
+      o.connAnimLatch = -1;                     // +0x118 = 0xffff
+      o.connAnimRate = 30.0f;                   // +0xe0
+      o.col.flags148 &= ~0x8u;                  // +0x148 &= 0xf7
+      o.connAnim = o.connAnimFar;               // +0x114 = +0x30a
+      o.connState = static_cast<std::uint8_t>((o.connState & 0xf0) | 4);
+      // play +0x322 (seam)
+    }
+  } else {
+    // Player inside radius -> opening + partner attach
+    // (0x4577f0..0x4579a5). Transition writes +0x114=+0x306, +0xdc=-1,
+    // +0xe4=0xffff, +0x118=0xffff, clears +0x148 bit3, +0xe0=30.
+    if ((o.connState & 0x43) == 0) {
+      o.connAnim = o.connAnimNear;              // +0x114 = +0x306
+      o.connAnimFrame = -1.0f;                  // +0xdc
+      o.connAnimCurFrame = -1;                  // +0xe4 = 0xffff
+      o.connAnimLatch = -1;                     // +0x118 = 0xffff
+      o.col.flags148 &= ~0x8u;                  // +0x148 &= 0xf7
+      o.connState = static_cast<std::uint8_t>((o.connState & 0xf0) | 2);
+      o.connAnimRate = 30.0f;                   // +0xe0
+      // FUN_00432d9c — attach whichever of {dest,home} is on the far
+      // side of the door from the player and not already the partner.
+      // Primary target is +0x302; the +0x60 home is the secondary when
+      // the player has already crossed (cur==dest) or dest is resident.
+      TraversalArena* tgt = nullptr;
+      if (dest != cur) {
+        if (!partnerActive || dest != partner) tgt = dest;
+      }
+      if (tgt == nullptr && cur != home &&
+          (!partnerActive || partner != home))
+        tgt = home;
+      if (tgt) traversalAttachPartner(rt, *tgt);
+      // play +0x31a (seam)
+    }
+  }
+
+  // Element-mask update (0x457890..0x4578df): rebuild +0x2c8 from the
+  // LOCK(+0x326)/HC(+0x32a) masks per the open/closed phase.
+  if ((o.connState & 8) == 0) {
+    // not closed: LOCK in, HC out
+    o.col.elemMaskB |= o.connMaskLock;
+    o.col.elemMaskB &= ~o.connMaskHC;
+  } else {
+    // closed: HC in; LOCK in unless the 0x40 variant + +0x313 bit0 say
+    // otherwise
+    o.col.elemMaskB |= o.connMaskHC;
+    if ((o.connState & 0x40) == 0 || (o.connStateHi & 1) != 0)
+      o.col.elemMaskB |= o.connMaskLock;
+    else
+      o.col.elemMaskB &= ~o.connMaskLock;
+  }
+
+  // Collision toggle (0x4578df..0x4578f1): when +0x312 bit4 is set the
+  // door's solidity follows the open bit — +0x148 bit4 = sweep skip.
+  if ((o.connState & 0x10) != 0) {
+    if ((o.connState & 1) != 0) o.col.flags148 |= 0x10u;
+    else o.col.flags148 &= ~0x10u;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FUN_004555bc — per-object animation advance (the +0x114 connector
+// anim subset). Runs for every named object in FUN_004572ac's update
+// dispatch, after the connector update.
+//
+// The +0x114 record is a float array: [0] = rate, [2] = frameCount
+// (i32). Each frame +0xdc += rate * +0xe0 * (1/30); the applied frame
+// +0xe4 = FRNDINT(+0xdc) (round-to-nearest). Reaching frameCount-1 on
+// a non-looping anim (+0x148 bit3 clear) clamps +0xdc and latches
+// +0x118 = 0xff00 — the connector's "done" gate. +0x118==-1 (0xffff)
+// while running; a +0x118 >= 0 target frame holds/clamps the advance.
+// FUN_00455890 applies the frame to the model's element transforms —
+// render-side, a documented seam (collision only needs the latch).
+// ---------------------------------------------------------------------------
+void traversalObjectAnimUpdate(DynamicObject& o) {
+  if (o.connAnim == nullptr) return;              // +0x114 == 0 -> inert
+  // +0x118 >= 0 (i16) && +0xe4 == +0x118  -> idle at target frame.
+  // +0x118 == 0xff00 (i16 -256)          -> done latch. Either way the
+  // accumulator resyncs to the applied frame and the anim holds.
+  if ((o.connAnimLatch >= 0 && o.connAnimCurFrame == o.connAnimLatch) ||
+      static_cast<std::uint16_t>(o.connAnimLatch) == 0xff00u) {
+    o.connAnimFrame = static_cast<float>(o.connAnimCurFrame);
+    return;
+  }
+  float rate = 0.0f;
+  std::int32_t frameCount = 0;
+  std::memcpy(&rate, o.connAnim, 4);                          // [0]
+  std::memcpy(&frameCount,
+              static_cast<const char*>(o.connAnim) + 8, 4);   // [2]
+  if (frameCount <= 0) return;
+  // +0xdc += rate * +0xe0 * (1/30)  (DAT_0049b6f4 = 1/30 s)
+  o.connAnimFrame += rate * o.connAnimRate * (1.0f / 30.0f);
+  // Target clamp: when +0x118 >= 0 is a real target frame and the
+  // running frame hasn't reached it, cap the accumulator at the
+  // target. The door runs with +0x118==-1 so this is inert for it.
+  if (o.connAnimLatch >= 0 && o.connAnimCurFrame < o.connAnimLatch &&
+      static_cast<int>(lroundf(o.connAnimFrame)) > o.connAnimLatch)
+    o.connAnimFrame = static_cast<float>(o.connAnimLatch);
+  const bool loop = (o.col.flags148 & 0x8u) != 0;   // +0x148 bit3
+  if (o.connAnimFrame >= static_cast<float>(frameCount - 1)) {
+    if (loop) {
+      if (o.connAnimFrame >= static_cast<float>(frameCount))
+        o.connAnimFrame -= static_cast<float>(frameCount);
+    } else {
+      o.connAnimFrame = static_cast<float>(frameCount - 1);   // clamp
+    }
+  }
+  // FUN_00455890(local_20 = FRNDINT(+0xdc)) applies the frame; record
+  // the applied index for the completion-latch test.
+  o.connAnimCurFrame =
+      static_cast<std::int16_t>(lroundf(o.connAnimFrame));    // +0xe4
+  if (o.connAnimCurFrame == frameCount - 1 && !loop &&
+      o.connAnimCurFrame != o.connAnimLatch)
+    o.connAnimLatch = static_cast<std::int16_t>(0xff00);      // +0x118
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +741,7 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
     a->index = static_cast<int>(i);
     a->rec = &rt.level.work[i];
     a->dyn.name = a->name;
+    a->dyn.owner = a.get();
     a->scalar = rt.level.work[i].scalar();
     a->hasScriptObject = cmiTable3Has(rt.level.cmi, a->name);
     // FUN_00458550 bind — +0x220 = image-relative code offset (the
@@ -824,8 +1013,21 @@ TraversalFrameResult stepTraversalRuntime(
     }
     for (int ai = 0; ai < updateCount; ++ai) {
       DynamicArena& da = updateArenas[ai]->dyn;
+      // FUN_00457738 connector pass runs first in the original
+      // dispatch (before the mover/ride tail). Collect the connectors
+      // first — the update can reattach the partner and flag a
+      // pendingArena migration, mutating arena lists mid-iteration.
+      std::vector<DynamicObject*> conns;
+      for (auto& up : da.storage)
+        if (up->col.flags14a & 0x10) conns.push_back(up.get());
+      for (DynamicObject* o : conns)
+        traversalConnectorUpdate(*o, rt);
       for (auto& up : da.storage) {
         DynamicObject& o = *up;
+        // FUN_004555bc — per-object animation advance (+0x114 connector
+        // anim): runs after the connector update for every named object.
+        if (o.col.named && o.connAnim != nullptr)
+          traversalObjectAnimUpdate(o);
         if (o.col.flags14a & 0x20) {
           updateMoverCollision(o, rt.cs, &rt.motion.yawDeg);
         } else {
@@ -859,6 +1061,8 @@ TraversalFrameResult stepTraversalRuntime(
     env.playerPos = rt.cs.pos;
     env.rt = &rt;
     env.currentArena = cur;
+    env.modelFor = traversalModelFor;     // FUN_004286c8 lazy models
+    env.modelCtx = &rt.level;
     env.dt = dt;
     env.slideChannel = rt.slideChannel;
     env.slideMode = (rt.slideChannel != 0);

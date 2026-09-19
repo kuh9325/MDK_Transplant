@@ -235,6 +235,7 @@ std::optional<std::span<const std::uint8_t>> enemyModelData(
 // ---------------------------------------------------------------------------
 
 struct DynamicArena;
+struct TraversalArena;
 
 // Runtime object — CollisionObject is the +0x68 list node consumed by
 // the query; the rest mirrors the update-side record fields the
@@ -272,6 +273,66 @@ struct DynamicObject {
   DynamicArena* arena = nullptr;        // +0x60
   DynamicArena* pendingArena = nullptr; // +0x2bc
 
+  // Arena-connector (door) state — FUN_00457738, gated by
+  // col.flags14a & 0x10 (the tr_alcmd 0x95 spawn writes the dword
+  // +0x148 = 0x1108000, so +0x14a = 0x10). +0x302 aliases the
+  // rawMatrix region only when +0x148 & 0x40 is clear — for a
+  // connector it is the destination arena record pointer instead.
+  TraversalArena* connDest = nullptr;   // +0x302 (connector only)
+  std::uint8_t connState = 0;           // +0x312 — 8 closed / 2 opening
+                                      //    / 1 open / 4 closing; high
+                                      //    nibble bits 0x40/0x10 are
+                                      //    sub-flags (mask +0x313 bit0
+                                      //    variant, collision toggle)
+  std::uint8_t connStateHi = 0;         // +0x313 — sub-flag byte (bit0
+                                      //    gates the closed-state LOCK
+                                      //    mask choice)
+  float connRadius = 0.0f;              // +0x30e — proximity radius
+  const void* connAnimNear = nullptr;   // +0x306 — open anim record
+  const void* connAnimFar = nullptr;    // +0x30a — close anim record
+  const void* connAnim = nullptr;       // +0x114 — active anim record
+  float connAnimFrame = 0.0f;           // +0xdc — anim frame counter
+  float connAnimRate = 0.0f;            // +0xe0 — anim rate (30.0f)
+  // +0xe4 = applied frame index; +0x118 = target/done word. The
+  // connector transition writes both to 0xffff (-1: run-to-end); the
+  // anim player latches +0x118 = 0xff00 on completion. "done" ==
+  // (connAnimLatch == -256) i.e. (u16)+0x118 == 0xff00.
+  std::int16_t connAnimCurFrame = 0;    // +0xe4
+  std::int16_t connAnimLatch = 0;       // +0x118
+  // FUN_004555bc anim-done test: +0x114 null OR +0x118 == 0xff00.
+  bool connAnimDone() const {
+    return connAnim == nullptr ||
+           static_cast<std::uint16_t>(connAnimLatch) == 0xff00u;
+  }
+  std::uint32_t connMaskLock = 0;       // +0x326 — "LOCK"-named elems
+  std::uint32_t connMaskHC = 0;         // +0x32a — "HC*"-named elems
+  // 0x97 sound-name slots (+0x316/+0x31a/+0x31e/+0x322). The original
+  // stores bytecode string pointers, clearing a slot whose operand is
+  // the "NONE" sentinel (0x497c54); this port keeps the text ("" = no
+  // sound). Sound playback itself is a documented seam.
+  std::string connSound316;
+  std::string connSound31a;
+  std::string connSound31e;
+  std::string connSound322;
+
+  // Object-init script (FUN_004566f0's table-2 "%s$%s" lookup) targets.
+  // These are generic object fields the tr_alcmd init family writes;
+  // initObjectCollision applies the FUN_004566f0 default block first.
+  float field38 = 0.0f;              // +0x38 — 50.0 default (0x32 target)
+  float field3c = 0.0f;              // +0x3c — 10.0 default (0x33)
+  float field40 = 0.0f;              // +0x40 — 15.0 default (0x34)
+  float field44 = 0.0f;              // +0x44 — 64.0 default
+  float field48 = 0.0f;              // +0x48 — 32.0 default
+  std::uint32_t healthMirror2a2 = 0; // +0x2a2 — 0x10's low-16 +0x8 mirror
+  std::uint8_t flag21f = 0;          // +0x21f — set when +0x8 >= 0xfde8
+  std::uint8_t field11a = 0;         // +0x11a — 0x0b target
+  std::uint8_t field11b = 0;         // +0x11b — 0x49 target
+  const void* field110 = nullptr;    // +0x110 — 0x4c image-ref target
+  float field104 = 0.0f;             // +0x104 — 0xc6 target (consumer UNKNOWN)
+  float fieldE8 = 0.0f;              // +0xe8 — 1.0 default, 0x5a target
+  float field2c0 = 0.0f;             // +0x2c0 — 1.0 default
+  float field2c4 = 0.0f;             // +0x2c4 — 1000.0 default
+
   // Write +0x10..0x18 and mirror +0x18 into col.baseZ.
   void setPosition(float x, float y, float z);
   // Refresh elemSet + presence gate after (re)binding the model.
@@ -283,6 +344,9 @@ struct DynamicObject {
 struct DynamicArena {
   CollisionArena col{};
   std::string name;                    // s2 record name (script keys)
+  TraversalArena* owner = nullptr;     // back-pointer to the owning
+                                       // TraversalArena (the +0x60
+                                       // home-arena view objects hold)
   std::list<std::unique_ptr<DynamicObject>> storage;
 
   // FUN_0045cffc — allocate + push-front onto +0x68 (col.objects),
@@ -311,8 +375,13 @@ void buildObjectMatrix(float pitchDeg, float bankDeg, float yawDeg,
 // behavior).
 void rebuildObjectTransform(DynamicObject& obj);
 
-// FUN_004566f0 collision subset — health 10, scale 1.0, identity
-// matrix then rebuildObjectTransform. (Script lookup/VM excluded.)
+// FUN_004566f0 default block — health 10, behavior-float defaults,
+// scale 1.0, identity matrix, origin. Does NOT rebuild: FUN_004566f0
+// runs the table-2 init script between the defaults and the rebuild,
+// so callers with a script call initObjectDefaults -> script ->
+// rebuildObjectTransform. (Script lookup/VM live in traversal_script.)
+void initObjectDefaults(DynamicObject& obj);
+// FUN_004566f0 with no init script — defaults then sync + rebuild.
 void initObjectCollision(DynamicObject& obj);
 
 // FUN_00456808 — spawn the arena record's type-2/type-4 objects onto

@@ -1051,9 +1051,11 @@ Iterates the arena's DTI sub-record table (`arena+0x38` count,
 - **type 1/3** — trigger bounds (`FUN_00434b44`); **type 6** —
   portal partner arena index.
 
-`FUN_004566f0` init (collision subset): `+0x08`=10, `+0x58`=1.0f
-scale, identity matrix, script lookup + one VM run, then
-`FUN_0045612c` transform/AABB rebuild.
+`FUN_004566f0` init (collision subset): `+0x08`=10, `+0x38`=50,
+`+0x3c`=10, `+0x40`=15, `+0x44`=64, `+0x48`=32, `+0x58`=1.0f scale,
+`+0xe0`=30 anim rate, identity matrix; then the table-2 `"%s$%s"`
+init script runs on the object (Phase 5I — `traversalObjectInitScript`,
+formerly "script VM out"), then `FUN_0045612c` transform/AABB rebuild.
 
 ## 43. Geometry record format — `FUN_00428400` (OBSERVED)
 
@@ -1225,7 +1227,11 @@ update (`FUN_004572ac` + `FUN_0045cf18` per arena) → scripts
 - `buildObjectMatrix` — `FUN_0046b2f8`.
 - `rebuildObjectTransform` — `FUN_0045612c` collision core (matrix
   select + element world AABBs + degenerate-seeded union).
-- `initObjectCollision` — `FUN_004566f0` subset (script VM out).
+- `initObjectDefaults` — the `FUN_004566f0` default block (pre-script).
+  `initObjectCollision` = defaults + view + rebuild for the
+  non-scripted spawn path; the scripted path splits them so the
+  table-2 init runs between the defaults and the `FUN_0045612c`
+  rebuild (Phase 5I).
 - `resolveArenaRecordNames` — the `FUN_00433d40` load-time rewrite.
 - `spawnArenaObjects` — `FUN_00456808` type-2/type-4 (dedup, model
   deep-copy, flags, `SW_DUMMY` mask, push-front attach).
@@ -1572,10 +1578,12 @@ unresolved spawn/script/portal behavior stays an explicit seam.
   cap guarded by the original `"Alien %s looped %d commands, off %lx"`
   diagnostic.
 - The VM snapshots player pos/yaw (`0x540bfc`→`0x54c6c4`,
-  `0x540c2c`→`0x54c6c0`) for opcodes. Corridor scripts drive scripted
-  objects (e.g. `XCORDOOR` doors) — corridor traversal is
-  SCRIPT/PORTAL-DRIVEN, not static-collision-driven. The runtime
-  counts these calls as the `scriptObj` seam and does not emulate them.
+  `0x540c2c`→`0x54c6c0`) for opcodes. Corridor scripts spawn scripted
+  objects (e.g. the `XCORDOOR` connector door) — corridor traversal is
+  SCRIPT/PORTAL-DRIVEN, not static-collision-driven. The arena-script
+  calls run the real VM (`scriptObj` was the Phase 5G counted seam);
+  the spawned connector's open/close/class behavior is the native
+  `FUN_00457738`/`FUN_004555bc` path reconstructed in Phase 5I.
 
 ## 63. Deep-floor failsafe — arena `+0x44e` (OBSERVED)
 
@@ -1753,8 +1761,10 @@ opcodes. The native interpreter implements the proven traversal subset:
 
 Spawning routes through the existing `DynamicArena`/`DynamicObject`
 abstractions (`allocFront` + `spawnRecord`); the spawned object's
-class behavior (e.g. XCORDOOR teleport) stays a Phase 5E native seam
-— the VM creates the dormant record, the class drives it. Rare
+`FUN_004566f0` table-2 init script then configures it (Phase 5I —
+anim refs, radius, collision toggle). The connector door's open/close
+class behavior is the native `FUN_00457738`/`FUN_004555bc` path; other
+classes' native behaviors remain Phase 5E seams. Rare
 subroutine opcodes (`0x04`, `0x64`, `0x87`, `0xad`, `0xdf`) are
 mechanically identified as object/spawn-family but their bounded
 native effect is less complete — they remain explicit seams that
@@ -1801,11 +1811,120 @@ Verified on real BUILD_A data:
 - Object/spawn-family opcodes `0x04/0x64/0x87/0xad/0xdf` and a few
   object-script opcodes (`0x74`, `0x8a`, `0x8b`, `0x98`, `0x49/4a`)
   are partially decoded — retained as bounded seams.
-- The spawned door object's teleport/class behavior (XCORDOOR etc.)
-  is native object code, not VM — the VM only creates the record.
+- The spawned door object's open/close behavior (XCORDOOR etc.) is
+  native object code, not VM — the VM creates the record, the
+  `FUN_004566f0` table-2 init configures it, and `FUN_00457738` +
+  `FUN_004555bc` drive it (Phase 5I). The XCORDOOR route CHMO_2→HMO_3
+  is proven end-to-end (portal crossing, no teleport).
 - AI, camera, audio, combat and rendering opcodes are mapped in the
   dispatch table but intentionally not implemented — out of scope.
 - DOS-build parity for opcode numbering is unchecked.
 - Malformed-stream policy is NATIVE SAFETY POLICY: the port
   bounds-checks every fetch and halts the script rather than reading
   out of range; valid BUILD_A streams never reach the bound.
+
+# Phase 5I — scripted corridor-door init + the XCORDOOR route
+
+Phase 5H left the connector door inert: `traversalScriptSpawn` created
+the dormant record but never ran the per-object configuration the
+original applies, so a spawned `XCORDOOR` kept the spawn's dead fields
+( no anim records, default radius, no collision toggle) and the
+corridor could not be traversed. The missing piece is the **table-2
+object-init script** the original runs inside `FUN_004566f0`.
+
+## 72. The object-init script — `FUN_004566f0` (OBSERVED)
+
+`FUN_004566f0` is generic object init, called for every spawned object
+(the connector create `FUN_0045cffc` calls it; so does the record
+spawn `FUN_00456808` tail). Its order is OBSERVED:
+
+1. Write the default block: `+0x08`=10, `+0x38`=50, `+0x3c`=10,
+   `+0x40`=15, `+0x44`=64, `+0x48`=32, `+0x58`=1.0 (scale),
+   `+0xd4`=1, `+0xe0`=30.0 (anim rate), `+0xe8`=1, `+0x2c0`=1,
+   `+0x2c4`=1000, `+0xc0`/`+0xac`=1, identity matrix.
+2. Format the key `"%s$%s"` = `*(obj+0x60)` arena name `$`
+   `*(obj+0x0c)` model name (e.g. `CHMO_2$XCORDOOR`), scan CMI
+   **table[2]** for a record with that name, and — on a hit — run its
+   script **immediately** via a fresh `FUN_004388d8` ctx whose bound
+   object is the new object (field ops write the object's `+0xNN`, not
+   an arena ctx). Table-2 `record.value` IS the image-relative code
+   offset directly — unlike table-3 there is no `{str}{str}{u32}`
+   indirection. A miss leaves the defaults.
+3. `FUN_0045612c` transform/AABB rebuild — AFTER the script, so the
+   script's `+0x58` scale / `+0x5c` zBias take effect.
+
+Dispatch correction (OBSERVED, resolves an earlier mislabel): the
+opcode jump table is indexed `table[opcode - 1]`, not `table[opcode]`.
+Under the corrected map the door's init stream decodes cleanly.
+
+## 73. `CHMO_2$XCORDOOR` decode (OBSERVED, LEVEL3.CMI image 0x204c0)
+
+```
+10 e8fd          +0x8 = +0x2a2 = 0xfde8 (MOVZX u16); +0x21f=1 (>=0xfde8)
+53 03 <1.0102>   +0x58 scale = 1.0102   (mode 3 inline f32)
+96 <64a68><654fc>+0x306/+0x30a = anim records (open 16f, close 21f)
+97 D..           4 counted strings -> +0x31a/+0x322/+0x316/+0x31e
+                 ("NONE" sentinel 0x497c54 -> slot cleared)
+98 <10>          +0x312 = (+0x312&0xf)|(op&0xf0)  -> 0x18 (toggle en)
+99 <20.0>        +0x30e radius = 20.0
+ff               end
+```
+
+So `XCORDOOR` **does** get animation records (the earlier "no anim
+records" claim was wrong — it described the spawn opcode, which does
+not bind them; the init script does). `0x96` resolves two image-rel
+refs through `FUN_00438898` (lazy `*ptr==0 -> symbol`, a seam — the
+door's records carry a nonzero rate so no resolve fires). `0x98`
+merges the operand's high nibble into `+0x312`, enabling the
+collision-toggle bit `0x10`.
+
+## 74. Connector state machine — `FUN_00457738` (OBSERVED)
+
+Gated by `col.flags14a & 0x10` (the `0x95` connector spawn writes
+`+0x148` dword `0x01108000` → `flags148=0x8000`, `flags149=0x80`,
+`flags14a=0x10`). Runs first in the per-object update:
+
+- `+0x312` is ONE byte: low nibble = phase (`8` closed, `2` opening,
+  `1` open, `4` closing), high nibble = sub-flags (`0x10` = collision
+  toggle, `0x40` = mask variant gated by `+0x313` bit0).
+- An "active" anim (`+0x114 != 0` and `+0x118 != 0xff00`) blocks the
+  open/close latch; `+0x114 == 0` latches immediately.
+- Proximity on `+0x30e` (squared distance): inside → opening +
+  far-side partner attach (`FUN_00432d9c`); outside → closing;
+  closing latch → closed + detach.
+- Collision toggle: when `+0x312` bit `0x10` is set, `+0x148` bit
+  `0x10` (sweep-skip) follows the open bit — open door is passable.
+- `+0x2c8` element mask rebuilt from `+0x326` ("LOCK")/`+0x32a` ("HC*").
+
+## 75. Connector anim player — `FUN_004555bc` (OBSERVED)
+
+Runs after the connector update for every named object. `+0x114` is a
+record `{f32 rate, u32, i32 frameCount}`; per frame `+0xdc +=
+rate * +0xe0 * (1/30)`; the applied frame `+0xe4 = FRNDINT(+0xdc)`.
+Reaching `frameCount-1` on a non-looping anim (`+0x148` bit3 clear)
+clamps `+0xdc` and latches `+0x118 = 0xff00` — the connector's "done"
+gate. Transitions write `+0xdc=-1`, `+0xe4=0xffff`, `+0x118=0xffff`.
+`FUN_00455890` (apply frame to element transforms) is a render seam —
+collision only needs the latch.
+
+## 76. Phase 5I validation (OBSERVED on real BUILD_A LEVEL3)
+
+- `traversalScriptSpawn` order matches `FUN_004566f0`: connector
+  defaults → `initObjectDefaults` → table-2 init →
+  `rebuildObjectTransform`. The temporary forced sweep-skip `0x810`
+  is removed; the door is born solid and opens via the toggle.
+- `mdk-inspect --traversal-runtime ... --arena CHMO_2 --start 3 1230
+  -929`: the scripted `0x95` spawns XCORDOOR, its `CHMO_2$XCORDOOR`
+  init runs (`diag=0`), the door animates `st 0x18 -> 0x12 -> 0x11`
+  over 16 frames as `+0x118` goes `0xffff -> 0xff00`, `flags148` goes
+  `0x8000 -> 0x8010`, partner HMO_3 attaches (`ca4`), and the player
+  crosses the `y=1237` portal into HMO_3 (arena 11 -> 2) through the
+  normal type-6 path — `portals=1`, `teleport=0`, no scripted warp.
+- Synthetic tests cover `cmiObjectScriptOffset` lookup, the door
+  init-stream field writes, and the open/close/collision-toggle cycle.
+- The interpreter covers the field/flag/mask/connector family plus
+  `0x5a`/`0xc6`/`0x75` (`+0xe8`/`+0x104`/`+0x118` writes) — 58 of the
+  63 LEVEL3 table-2 scripts init fully. The remainder use
+  conditional/string opcodes not yet decoded (`0x07` yaw-normalize,
+  `0x3c`, `0x55`, `0xd4`, `0xe8`); they halt with a diagnostic per the
+  safety policy — the spawn completes regardless.

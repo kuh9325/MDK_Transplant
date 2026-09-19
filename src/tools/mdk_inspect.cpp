@@ -1410,6 +1410,23 @@ int main(int argc, char** argv) {
           (double)out.strafeVel, (double)out.vertVel,
           out.grounded ? 1 : 0, out.contactObj, out.slideChannel,
           out.eventType, out.eventMag);
+      // Connector (door) state dump — connState/anim/flags per frame.
+      for (const auto& ap : rt.arenas)
+        for (const auto& up : ap->dyn.storage) {
+          const mdk::DynamicObject& o = *up;
+          if (!(o.col.flags14a & 0x10)) continue;
+          std::printf(
+              "      door %s home=%s st=%02x anim=%c fr=%.2f cur=%d "
+              "lat=%04x f148=%04x f14a=%02x r=%.1f done=%d\n",
+              o.scriptClass.c_str(),
+              o.arena && o.arena->owner ? o.arena->owner->name.c_str()
+                                        : "?",
+              o.connState, o.connAnim ? 'Y' : 'n',
+              (double)o.connAnimFrame, (int)o.connAnimCurFrame,
+              (unsigned)(std::uint16_t)o.connAnimLatch,
+              (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
+              (double)o.connRadius, o.connAnimDone() ? 1 : 0);
+        }
       // The digest mixes only deterministic state — raw contact
       // tokens are process addresses and are mixed as booleans.
       mix(static_cast<std::uint64_t>(out.frame));

@@ -553,7 +553,7 @@ next u32 after table[3] is data content, not a fifth count (OBSERVED
 |---|---|---|
 | table[0] | none traced (`FUN_004583fc` uncalled) | names look like `OBJ$ANIM` composites; UNKNOWN |
 | table[1] | `FUN_00433d40` → `FUN_004286c8`: walks it into a 0x88-stride array at `DAT_004edcc0`, cap 0x50 | the cap diagnostic is the original string `"Overflowed enemy table"` — table 1 is therefore CODE-CORROBORATED as the enemy-name table's source. Phase 5E PROVED the value semantics: `value != 0` → model geometry record at `blob+value` (see §"Model geometry record"); `value == 0` → `dest+0xa=1` deferred → resolved later from `.MTO` region-A array-B by name (`FUN_00403498`) |
-| table[2] | `FUN_004566f0` (object init): formats a name via sprintf, searches table[2], stores `blob+value` at `obj+0x108`, calls `FUN_004388d8` (tr_alcmd.c region), then clears it | per-object init-time lookup; semantics UNKNOWN |
+| table[2] | `FUN_004566f0` (object init): formats `"%s$%s"` = `obj+0x60` arena `$` `obj+0x0c` model, searches table[2] for a matching record name, and — on a hit — runs `value` as bytecode **immediately** via a fresh `FUN_004388d8` ctx bound to the new object, before the `FUN_0045612c` transform rebuild | per-object init script (OBSERVED, Phase 5I): `value` IS the image-relative code offset — no `{str}{str}{u32}` wrapper like table-3. Field ops write the object's `+0xNN`; e.g. `CHMO_2$XCORDOOR` binds `+0x306/+0x30a` anim records, sets `+0x312` collision-toggle, `+0x30e` radius |
 | table[3] | `FUN_0045849c` (callers `FUN_00431fbc`, `FUN_0043394c`) and `FUN_00458550` (called once per arena record in `FUN_00433d40`, result stored at `arena+0x220`) | name → target structure in the data region; see §"Arena script record — table[3] data targets" |
 
 ### Arena script record — table[3] data targets (OBSERVED, Phase 5G)
@@ -721,7 +721,7 @@ convention, not a file-format value (none observed in the corpus).
 | `FUN_004286c8` | Table-1 → "enemy table" copy: name→dest+0, flag at +0xa when value==0, `blob+value`-derived pointer at +0x20; cap 0x50 → `"Overflowed enemy table"` |
 | `FUN_0045849c` | Table-3 lookup → copies the target's two length-prefixed strings |
 | `FUN_00458550` | Table-3 lookup → follows the target's second-level u32; returns `blob+off` or 0 |
-| `FUN_004566f0` | Object init: sprintf-name → table-2 lookup → `blob+value` to `obj+0x108`, consumed by `FUN_004388d8` |
+| `FUN_004566f0` | Object init: default block → sprintf `"%s$%s"` (arena`$`model) → table-2 lookup → `record.value` IS the image-rel code offset, run **immediately** as a fresh `FUN_004388d8` ctx bound to the new object → `FUN_0045612c` rebuild (Phase 5I — OBSERVED; `traversalObjectInitScript`) |
 | `FUN_00426f34`/`FUN_00426738` | Load/save pointer relocation over object fields vs `DAT_0054c6bc`; `0xffffffff` null convention via `FUN_004262b0`/`FUN_004262c8` |
 | `FUN_0042fa50` | Unbounded C-string compare (name lookups) |
 | `FUN_0041c884` | 8-byte-aligned pool allocator (image allocation callback) |
