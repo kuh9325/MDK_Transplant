@@ -22,6 +22,7 @@
 #include "core/container.h"
 #include "core/data_root.h"
 #include "core/dti_structure.h"
+#include "core/dynamic_objects.h"
 #include "core/file_family.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
@@ -58,6 +59,9 @@ int usage() {
                "<relative-path> <record>\n"
                "       mdk-inspect --data-path DIR --collision-probe "
                "<relative-path> [<x> <y> <z>]\n"
+               "       mdk-inspect --data-path DIR --arena-objects "
+               "<relative-path>   (a .DTI path; the sibling .CMI and\n"
+               "                            <stem>O.MTO are loaded too)\n"
                "       mdk-inspect --selftest\n");
   return 2;
 }
@@ -664,6 +668,7 @@ int main(int argc, char** argv) {
   std::optional<unsigned> fontInfoCode;
   bool entriesMode = false;
   bool collisionProbe = false;
+  bool arenaObjects = false;
   float probePos[3] = {0.0f, 0.0f, 0.0f};
   int probePosGiven = 0;
 
@@ -750,6 +755,11 @@ int main(int argc, char** argv) {
                              "position or all of <x> <y> <z>\n");
         return usage();
       }
+    } else if (!std::strcmp(a, "--arena-objects")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;
+      arenaObjects = true;
     } else if (!std::strcmp(a, "--selftest")) {
       return selftest();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
@@ -858,7 +868,190 @@ int main(int argc, char** argv) {
   }
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
-      !spriteInfoName && !collisionProbe) {
+      !spriteInfoName && !collisionProbe && !arenaObjects) {
+    return 0;
+  }
+
+  // --arena-objects: Phase 5E BUILD_A smoke. Loads the .DTI target
+  // plus the sibling .CMI and <stem>O.MTO, builds the CMI enemy
+  // table, resolves each arena's HotGen/HotPick records, spawns the
+  // runtime objects (FUN_00456808 semantics), and reports the +0x68
+  // list per arena — geometry parse, deep copy, transform rebuild and
+  // list attach all exercised on original data.
+  if (arenaObjects) {
+    // Derive sibling paths: <dir>/<stem>.CMI and <dir>/<stem>O.MTO.
+    const std::string dtiPath = *target;
+    const auto slash = dtiPath.find_last_of("/\\");
+    const auto dot = dtiPath.find_last_of('.');
+    if (dot == std::string::npos) {
+      std::fprintf(stderr, "--arena-objects wants a .DTI path\n");
+      return 1;
+    }
+    const std::string dir =
+        slash == std::string::npos ? "" : dtiPath.substr(0, slash + 1);
+    const std::string stem = dtiPath.substr(
+        slash == std::string::npos ? 0 : slash + 1,
+        dot - (slash == std::string::npos ? 0 : slash + 1));
+    const std::string cmiPath = dir + stem + ".CMI";
+    const std::string mtoPath = dir + stem + "O.MTO";
+
+    const auto dtiFile = root->readFile(dtiPath, kEntriesMaxBytes, &err);
+    const auto cmiFile = root->readFile(cmiPath, kEntriesMaxBytes, &err);
+    const auto mtoFile = root->readFile(mtoPath, kEntriesMaxBytes, &err);
+    if (!dtiFile || !cmiFile || !mtoFile) {
+      std::fprintf(stderr, "read-file: FAILED (%s) — need .DTI + "
+                           "sibling .CMI + <stem>O.MTO\n",
+                   err.c_str());
+      return 1;
+    }
+    std::printf("siblings:  %s + %s\n", cmiPath.c_str(), mtoPath.c_str());
+
+    const auto dti = mdk::inspectDtiStructure(
+        std::span<const std::byte>(dtiFile->data(), dtiFile->size()));
+    const auto cmi = mdk::inspectCmiDirectory(
+        std::span<const std::byte>(cmiFile->data(), cmiFile->size()));
+    const auto mto = mdk::inspectMtoDirectory(
+        std::span<const std::byte>(mtoFile->data(), mtoFile->size()));
+    if (dti.status != mdk::DtiStructureStatus::kOk ||
+        cmi.status != mdk::CmiDirectoryStatus::kOk ||
+        mto.status != mdk::MtoDirectoryStatus::kOk) {
+      std::fprintf(stderr, "parse: FAILED (dti=%s cmi=%s mto=%s)\n",
+                   std::string(mdk::dtiStructureStatusName(dti.status))
+                       .c_str(),
+                   std::string(mdk::cmiDirectoryStatusName(cmi.status))
+                       .c_str(),
+                   std::string(mdk::mtoDirectoryStatusName(mto.status))
+                       .c_str());
+      return 1;
+    }
+
+    const mdk::EnemyTable enemies = mdk::buildEnemyTable(cmi);
+    std::printf("enemy-tbl: %zu entries (%zu unresolved -> MTO)\n",
+                enemies.entries.size(),
+                [&] {
+                  std::size_t n = 0;
+                  for (const auto& e : enemies.entries)
+                    n += e.unresolved ? 1 : 0;
+                  return n;
+                }());
+
+    // Lazily resolved model cache — mirrors FUN_004286c8's
+    // deferred-geometry table.
+    struct Cache {
+      std::vector<std::optional<mdk::RuntimeModel>> models;
+      std::vector<bool> tried;
+      const mdk::EnemyTable* enemies;
+      std::span<const std::byte> cmiFile;
+      const mdk::CmiDirectory* cmiDir;
+      const mdk::MtoDirectory* mtoDir;
+      std::span<const std::byte> mtoFile;
+      int resolved = 0;
+      int failed = 0;
+    } cache;
+    cache.models.resize(enemies.entries.size());
+    cache.tried.resize(enemies.entries.size(), false);
+    cache.enemies = &enemies;
+    cache.cmiFile = std::span<const std::byte>(cmiFile->data(),
+                                             cmiFile->size());
+    cache.cmiDir = &cmi;
+    cache.mtoDir = &mto;
+    cache.mtoFile = std::span<const std::byte>(mtoFile->data(),
+                                              mtoFile->size());
+    auto modelFor = [](int idx, void* ctx) -> const mdk::RuntimeModel* {
+      auto* c = static_cast<Cache*>(ctx);
+      if (idx < 0 || static_cast<std::size_t>(idx) >= c->models.size())
+        return nullptr;
+      const std::size_t i = static_cast<std::size_t>(idx);
+      if (!c->tried[i]) {
+        c->tried[i] = true;
+        const auto span = mdk::enemyModelData(
+            *c->enemies, idx, c->cmiFile, *c->cmiDir, c->mtoDir,
+            c->mtoFile);
+        if (span) {
+          c->models[i] = mdk::parseGeometryRecord(
+              span->data(), span->data() + span->size());
+        }
+        if (c->models[i]) {
+          ++c->resolved;
+        } else {
+          ++c->failed;
+        }
+      }
+      return c->models[i] ? &*c->models[i] : nullptr;
+    };
+
+    // Per arena: copy the record (the original rewrites fields in
+    // place at load), resolve names, spawn, report.
+    int totalSpawn = 0;
+    for (const auto& arec : dti.arenas) {
+      mdk::DtiArenaRecord work = arec;   // mutable copy for the rewrite
+      const auto failed =
+          mdk::resolveArenaRecordNames(work, enemies);
+      int types[10] = {};
+      for (const auto& sr : work.subRecords)
+        if (sr.type < 10) ++types[sr.type];
+      mdk::DynamicArena arena;
+      arena.name = arec.name();
+      std::vector<mdk::DynamicObject*> spawned;
+      const int n = mdk::spawnArenaObjects(arena, work, modelFor, &cache,
+                                          &spawned);
+      totalSpawn += n;
+      std::printf("arena %-8.8s  subs=%u t2=%d t4=%d t6=%d  spawn=%d",
+                  arec.name().c_str(), arec.subRecordCount, types[2],
+                  types[4], types[6], n);
+      if (!failed.empty()) {
+        std::printf("  unresolved-names=%zu", failed.size());
+      }
+      std::printf("\n");
+      for (const auto* o : spawned) {
+        std::printf("  obj idx=%-3u spawn=%-5u pos=(%g, %g, %g) "
+                    "elems=%zd tris=%d aabb=(%g..%g, %g..%g, %g..%g)\n",
+                    o->enemyIndex, o->spawnId, (double)o->pos[0],
+                    (double)o->pos[1], (double)o->pos[2],
+                    o->model.elems.size(),
+                    o->model.elems.empty() ? 0 : o->model.elems[0].triCount,
+                    (double)o->col.aabb[0], (double)o->col.aabb[3],
+                    (double)o->col.aabb[1], (double)o->col.aabb[4],
+                    (double)o->col.aabb[2], (double)o->col.aabb[5]);
+      }
+    }
+    std::printf("total:     spawned=%d  models resolved=%d failed=%d\n",
+                totalSpawn, cache.resolved, cache.failed);
+
+    // Floor-probe smoke on the first spawned object: force the
+    // standable bit (script-assigned in the original — opcode 0x29)
+    // and probe straight down through the object's position.
+    for (const auto& arec : dti.arenas) {
+      mdk::DtiArenaRecord work = arec;
+      mdk::resolveArenaRecordNames(work, enemies);
+      mdk::DynamicArena arena;
+      arena.name = arec.name();
+      if (mdk::spawnArenaObjects(arena, work, modelFor, &cache,
+                                 nullptr) == 0) {
+        continue;
+      }
+      auto& o = *arena.storage.front();
+      o.col.flags149 |= 1;
+      mdk::CollisionArena ca = {};
+      ca.objects = arena.col.objects;
+      ca.deepFloorZ = -1000.0f;
+      mdk::CollisionState cs;
+      cs.arena = &ca;
+      cs.queryEnabled = 1;
+      cs.arenaValid = 1;
+      cs.objectDataLoaded = 1;
+      cs.pos[0] = o.pos[0];
+      cs.pos[1] = o.pos[1];
+      cs.pos[2] = o.pos[2] + 2.0f;
+      mdk::collisionFloorProbe(cs);
+      std::printf("floorprobe arena=%s obj@(%g,%g,%g): flags=0x%02x "
+                  "floorZ=%g hit=%s\n",
+                  arena.name.c_str(), (double)o.pos[0],
+                  (double)o.pos[1], (double)o.pos[2], cs.contactFlags,
+                  (double)cs.floorZ,
+                  cs.floorObj == &o.col ? "spawned-object" : "none");
+      break;
+    }
     return 0;
   }
 

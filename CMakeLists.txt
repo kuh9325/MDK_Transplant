@@ -34,6 +34,7 @@ add_library(mdk_core STATIC
   src/core/data_root.cpp
   src/core/display_menu.cpp
   src/core/dti_structure.cpp
+  src/core/dynamic_objects.cpp
   src/core/file_family.cpp
   src/core/framebuffer.cpp
   src/core/frontend_flow.cpp

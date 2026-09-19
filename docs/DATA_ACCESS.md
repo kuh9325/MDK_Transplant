@@ -177,6 +177,23 @@ CMI-directory + DTI-structure + FTI- + BNI-directory checks. Links
 code the app uses. Never prints payload bytes; never writes into the
 data root.
 
+Phase 5E addition (read-only):
+
+- `mdk-inspect --data-path DIR --arena-objects <rel-path>` loads the
+  given `.DTI` plus its sibling `<stem>.CMI` and `<stem>O.MTO`,
+  builds the CMI enemy table (`FUN_004286c8`), resolves model
+  geometry (CMI-direct for nonzero values, MTO region-A array-B for
+  deferred entries), spawns each arena's type-2/type-4 sub-records
+  (`FUN_00456808`), and prints: enemy-table size and unresolved
+  (MTO-routed) count; per-arena sub-record type histograms; spawned
+  object model index/spawnId/position/element counts/world AABB; a
+  total model-resolution success/failure count; and a `floorprobe`
+  smoke line that runs `collisionFloorProbe` at the first spawned
+  object. Verified on LEVEL3 (HMO_9 XGS spawns, floor probe hits its
+  real geometry), LEVEL6 (MTO-resolved XT), and LEVEL8 (21 objects,
+  17 models, 0 failures). This is an inspection seam — it does not
+  make the inspector a gameplay runtime dependency.
+
 ## Validation performed (BUILD_A, read-only)
 
 - `traverse\level7\level7s.mti` → resolved `TRAVERSE/LEVEL7/LEVEL7S.MTI`;

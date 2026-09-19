@@ -93,7 +93,11 @@ struct CollisionElement {
   std::int32_t triCount;      // +0x10
   const float* verts;         // +0x14 — local-space f32 triples
   const std::uint8_t* tris;   // +0x18 — 0x24-stride records, u16 v[3] at +0
-  float aabb[6];              // +0x44 {minx,miny,minz,maxx,maxy,maxz}
+  float aabb[6];              // +0x44 {minx,miny,minz,maxx,maxy,maxz} — world
+  float localAabb[6];         // +0x2c — local bounds (FUN_00459d54 output);
+                              // consumed only by the transform rebuild
+                              // (FUN_00459e40 8-corner transform), never
+                              // by the query itself. Phase 5E addition.
 };
 
 struct CollisionElementSet { // object +0x0c record {+0x1c count, +0x20 elems}

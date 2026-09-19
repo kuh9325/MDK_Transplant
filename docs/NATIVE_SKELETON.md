@@ -234,6 +234,17 @@ src/
                                   FUN_00435eec per-frame object
                                   floor probe, FUN_00419ee0
                                   level-stream blob parse (5D)
+             dynamic_objects.*  — Phase 5E dynamic collision
+                                  objects: FUN_00428400 model
+                                  geometry parser, FUN_00403720
+                                  deep copy, FUN_004286c8 enemy
+                                  table + CMI/MTO resolution,
+                                  FUN_00456808 type-2/4 spawn,
+                                  arena +0x68 list ops
+                                  (FUN_0045cffc/5cf90/574d0),
+                                  FUN_0046b2f8 degree-Euler
+                                  matrix + FUN_0045612c
+                                  transform/AABB rebuild (5E)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

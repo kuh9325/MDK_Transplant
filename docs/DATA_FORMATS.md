@@ -379,7 +379,11 @@ at `off+4+ofsA` (OBSERVED: `tA == innerEnd+4`, i.e.
 tA+0x00  u32le countA → rec12[countA] {name[8], u32 tA-relative off}
 tA+0x04  u32le countB → rec12[countB] {name[8], u32 tA-relative off}
          CODE-CORROBORATED: resolved by FUN_00403720 — "Failed to
-         resolve overlay alien %s" → overlay-alien references
+         resolve overlay alien %s" → overlay-alien references.
+         Phase 5E: `FUN_00403498` proves the record at `tA+off` IS a
+         model geometry record `{u32 flag}{data}` (same parser as the
+         CMI table[1] targets — see the CMI §"Model geometry record");
+         verified against LEVEL6 XT at `tA+0xa8` (`0xc2eec`)
 tA+0x08  u32le countC → rec24[countC]
          {u32,u32,u32,u16,u16,u32 tA-rel off,u32}
          CODE-CORROBORATED: countC > 0x10 aborts with "Too many
@@ -548,9 +552,59 @@ next u32 after table[3] is data content, not a fifth count (OBSERVED
 | Table | Consumer (static evidence) | Role evidence |
 |---|---|---|
 | table[0] | none traced (`FUN_004583fc` uncalled) | names look like `OBJ$ANIM` composites; UNKNOWN |
-| table[1] | `FUN_00433d40` → `FUN_004286c8`: walks it into a 0x88-stride array at `DAT_004edcc0`, cap 0x50 | the cap diagnostic is the original string `"Overflowed enemy table"` — table 1 is therefore CODE-CORROBORATED as the enemy-name table's source. value==0 → dest flag + null pointer |
+| table[1] | `FUN_00433d40` → `FUN_004286c8`: walks it into a 0x88-stride array at `DAT_004edcc0`, cap 0x50 | the cap diagnostic is the original string `"Overflowed enemy table"` — table 1 is therefore CODE-CORROBORATED as the enemy-name table's source. Phase 5E PROVED the value semantics: `value != 0` → model geometry record at `blob+value` (see §"Model geometry record"); `value == 0` → `dest+0xa=1` deferred → resolved later from `.MTO` region-A array-B by name (`FUN_00403498`) |
 | table[2] | `FUN_004566f0` (object init): formats a name via sprintf, searches table[2], stores `blob+value` at `obj+0x108`, calls `FUN_004388d8` (tr_alcmd.c region), then clears it | per-object init-time lookup; semantics UNKNOWN |
 | table[3] | `FUN_0045849c` (callers `FUN_00431fbc`, `FUN_0043394c`) and `FUN_00458550` (called once per arena record in `FUN_00433d40`, result stored at `arena+0x220`) | name → target structure in the data region |
+
+### Model geometry record — table[1] data targets (OBSERVED, Phase 5E)
+
+`FUN_00428400` parses ONE layout at every table[1] `blob+value` — and
+at `.MTO` region-A array-B record bases (`tA + off`). Both call sites
+pass the base's u32 as a `flag` register arg and the stream at +4, so
+the record is `{u32 flag}{geometry data}`:
+
+```text
+record base: u32 flag                    (register arg, not parsed)
+stream +4:   u32 nameCount               (unconditional — even flag==0)
+             nameCount x {char[12] name, u32 tag}   (16B records;
+                                       tag stored at name-list +0xa)
+             if flag != 0:
+               u32 elemCount
+               elemCount x element:
+                 char[12] name     -> runtime elem +0x00
+                 byte[12] field2   -> runtime elem +0x20
+                 u32 vertCount     -> runtime elem +0x0c
+                 f32 verts[vc*3]   -> runtime elem +0x14;
+                                      FUN_00459d54 min/max -> +0x2c
+                 u32 triCount      -> runtime elem +0x10
+                 byte tris[tc*0x24]-> runtime elem +0x18
+                 byte[0x18] trailer — skipped ONLY on this path
+             else (flag == 0):
+               ONE anonymous element (elemCount forced 1; no name/
+               field2 copies, no 0x18 trailer):
+                 u32 vertCount, verts, u32 triCount, tris
+             byte[0x18] gap               (always, after last element)
+             u32 refPointCount            (<= 8; else error)
+             f32 refPoints[rc][3] -> dest record +0x24..0x84
+```
+
+Destination record fields written by the parser (0x88 enemy record /
+0xb0 spawn copy): `+0x14` name-list base, `+0x18` nameCount,
+`+0x1c` elemCount, `+0x20` element array, `+0x24..0x84` up to 8 ref
+points, `+0xb` = index of the element named `"XG1_BODY"` (default
+0xff), `+0xc |= 1<<index` for each `"XG1_HEAD"` element.
+
+Element runtime records are 0x5c bytes; `+0x44..0x5b` is the
+transformed world AABB (written later by `FUN_00459e40`), the
++0x2c local AABB seeds it. Triangle records are 0x24 bytes with
+u16 vertex indices at +0 — the same +0x24-stride/36B family the
+collision polys use.
+
+Boundary validation (BUILD_A): parses land EXACTLY on the next
+record for every tested sample — LEVEL3 XGS → XTUR
+(`0x43d78`→`0x4680c`), XGEN → XGEND, SW_GATT → SW_HGREN, BULLET →
+BIGBOLT; LEVEL6 XT (MTO path, `tA+0xa8` at `0xc2eec`). flag==0
+records still carry a name table (SW_GATT: nameCount=1 `"SW_GATT"`).
 
 ### Data-region target head (CODE-CORROBORATED for table[3])
 
@@ -731,8 +785,8 @@ CODE-CORROBORATED:
 
 | Type | Proven role | Evidence |
 |---|---|---|
-| 2 | "HotGen" | name @+0x18 (12 bytes) strcmp'd against the CMI enemy table; match index OR-ed into high half of field[1] (`"HotGen %s not found"`). Corpus: 23 records, all +0x18 names match enemy names |
-| 4 | "HotPick" | same +0x18 name field; match index overwrites field[1] (`"HotPick %s not found"`). Corpus: 9 |
+| 2 | "HotGen" | name @+0x18 (12 bytes) strcmp'd against the CMI enemy table; match index OR-ed into high half of field[1] (`"HotGen %s not found"`). Corpus: 23 records, all +0x18 names match enemy names. Phase 5E (`FUN_00456808`): spawns a dynamic object — `field[0]` low16 = spawnId, high16 = enemy index; `field[2..4]` = pos; dedup on (enemyIdx, spawnId, pos); model deep-copied; `+0x11c=7`; script key `arena$MODEL_spawnId` |
+| 4 | "HotPick" | same +0x18 name field; match index overwrites field[1] (`"HotPick %s not found"`). Corpus: 9. Phase 5E (`FUN_00456808`): `field[0]` = model index; `field[2..4]` = pos; dedup on (modelIdx, pos); `+0x08=1`, `+0x148 |= 0x2008a0` (mover bit `+0x14a&0x20`; sweep's `&0x810` skip) — moving platforms/doors; script key `arena$MODEL`; `"SW_DUMMY"` elements get `+0x2c8` mask |
 | 6 | "connect" | field[1] = connect-ID (>999 in file form), field[2] = side code (pairs 0↔1, 2↔3, 4↔5, 6↔7), fields[3..8] = six floats; `FUN_00434e54` pairs endpoints across arenas (same ID, identical floats, complementary sides) and rewrites field[1] to the partner arena index. Corpus: 168, all IDs 1000–1017 |
 | 1,3,5,7,8,9 | UNKNOWN | OBSERVED only; histogram {1:85, 3:58, 5:171, 7:23, 8:88, 9:8} — type 9 exists only in LEVEL6 |
 
@@ -1086,14 +1140,18 @@ Two payload layouts are CODE-CORROBORATED inside BNI records:
 - CMI table[0] consumer path: UNKNOWN (`FUN_004583fc` has no static
   caller; the `OBJ$ANIM`-shaped names suggest a per-object animation
   role — HYPOTHESIS only).
-- CMI record `value` semantics beyond "image-relative offset": what
-  each table's targets ARE is UNKNOWN (table[3] targets provably begin
-  with two length-prefixed strings + a second-level offset; deeper
-  structure undecoded).
+- CMI record `value` semantics beyond "image-relative offset": table[1]
+  RESOLVED in Phase 5E (model geometry records, or deferred MTO
+  resolution when 0); table[3] targets provably begin with two
+  length-prefixed strings + a second-level offset; table[0]/[2] targets
+  and deeper structure UNKNOWN.
 - CMI data region interior (≈99.9% of each file): UNKNOWN — bounded
   only. Contains the offset targets plus further structure.
 - CMI "enemy table" table-1 destination record fields (0x88-stride
-  array): only +0x00 name / +0x0a flag / +0x20 pointer are proven.
+  array): Phase 5E proved `+0x00` name, `+0x0a` unresolved flag,
+  `+0x14`/`+0x18`/`+0x1c`/`+0x20` name-list/count/element fields,
+  `+0x24..0x84` ref points, `+0xb`/`+0xc` body/head bookkeeping
+  (see the model geometry record section); remaining fields UNKNOWN.
 - The expansion of "CMI"/"CMD": UNKNOWN — no original string names it.
 - DTI s0 semantics per word: proven *destinations* (above), but what
   the view params/fill bytes/ramp matrix MEAN is UNKNOWN.

@@ -11,6 +11,7 @@
 #include "core/data_root.h"
 #include "core/display_menu.h"
 #include "core/dti_structure.h"
+#include "core/dynamic_objects.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/frontend_flow.h"
@@ -10416,6 +10417,471 @@ void test_player_collision() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5E — dynamic collision objects
+// ---------------------------------------------------------------------------
+
+// Synthetic geometry-record builder (no original data). Layout is the
+// OBSERVED+CODE-CORROBORATED FUN_00428400 form:
+//   {u32 flag}{u32 nameCount}{nameCount x {name[12], u32 tag}}
+//   flag!=0: {u32 elemCount}{elems: name[12], field2[12], u32 vc,
+//             vc x 12B verts, u32 tc, tc x 0x24B tris, 24B trailer}
+//   flag==0: {u32 vc, verts, u32 tc, tris}  (one anonymous element)
+//   {0x18 gap}{u32 refCount}{refCount x 12B}
+struct GeoElemSpec {
+  const char* name;
+  std::vector<float> verts;
+  std::vector<std::uint16_t> triIdx;   // 3 u16 per tri -> 0x24 record
+};
+
+std::vector<std::uint8_t> makeGeoRecord(
+    std::uint32_t flag,
+    std::initializer_list<const char*> names,
+    const std::vector<GeoElemSpec>& elems,
+    std::initializer_list<std::array<float, 3>> refPts) {
+  std::vector<std::uint8_t> b;
+  auto u32 = [&](std::uint32_t v) {
+    for (int k = 0; k < 4; ++k) b.push_back((v >> (k * 8)) & 0xff);
+  };
+  auto f32 = [&](float v) {
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    u32(u);
+  };
+  auto name12 = [&](const char* s) {
+    for (int i = 0; i < 12; ++i) b.push_back(s && s[i] ? s[i] : 0);
+  };
+  u32(flag);
+  u32(static_cast<std::uint32_t>(names.size()));
+  for (const char* n : names) {
+    name12(n);
+    u32(0);   // tag
+  }
+  if (flag != 0) u32(static_cast<std::uint32_t>(elems.size()));
+  for (const auto& e : elems) {
+    if (flag != 0) {
+      name12(e.name);
+      for (int i = 0; i < 12; ++i) b.push_back(0xAB);  // field2
+    }
+    u32(static_cast<std::uint32_t>(e.verts.size() / 3));
+    for (float v : e.verts) f32(v);
+    u32(static_cast<std::uint32_t>(e.triIdx.size() / 3));
+    for (std::size_t t = 0; t < e.triIdx.size(); t += 3) {
+      b.push_back(e.triIdx[t] & 0xff);
+      b.push_back((e.triIdx[t] >> 8) & 0xff);
+      b.push_back(e.triIdx[t + 1] & 0xff);
+      b.push_back((e.triIdx[t + 1] >> 8) & 0xff);
+      b.push_back(e.triIdx[t + 2] & 0xff);
+      b.push_back((e.triIdx[t + 2] >> 8) & 0xff);
+      for (int i = 0; i < 30; ++i) b.push_back(0);   // rest of 0x24 rec
+    }
+    if (flag != 0) for (int i = 0; i < 0x18; ++i) b.push_back(0xEE);
+  }
+  for (int i = 0; i < 0x18; ++i) b.push_back(0);      // +0x18 gap
+  u32(static_cast<std::uint32_t>(refPts.size()));
+  for (const auto& p : refPts) {
+    f32(p[0]);
+    f32(p[1]);
+    f32(p[2]);
+  }
+  return b;
+}
+
+// A single-element flat platform model: square tri at local z, with
+// an optional element name — used as the spawn "source" model.
+mdk::RuntimeModel makePlatformModel(const char* modelName,
+                                    const char* elemName, float z) {
+  mdk::RuntimeModel m;
+  m.flag = 1;
+  mdk::RuntimeModel::NameRec nr;
+  std::snprintf(nr.name.data(), nr.name.size(), "%s", modelName);
+  m.names.push_back(nr);
+  m.elems.resize(1);
+  m.elemNames.resize(1);
+  m.elemField2.resize(1);
+  m.elemVerts.resize(1);
+  m.elemTris.resize(1);
+  std::snprintf(m.elemNames[0].data(), m.elemNames[0].size(), "%s",
+                elemName);
+  m.elemVerts[0] = {-5, -5, z, 5, -5, z, 5, 5, z};
+  m.elemTris[0].assign(0x24, 0);
+  auto* idx = reinterpret_cast<std::uint16_t*>(m.elemTris[0].data());
+  idx[0] = 0;
+  idx[1] = 1;
+  idx[2] = 2;
+  m.elems[0].triCount = 1;
+  const float lb[6] = {-5, -5, z, 5, 5, z};
+  std::memcpy(m.elems[0].localAabb, lb, sizeof(lb));
+  m.rebind();
+  return m;
+}
+
+// Model-source callback over a small table of models.
+struct TestModelSrc {
+  std::vector<const mdk::RuntimeModel*> byIndex;
+};
+const mdk::RuntimeModel* testModelFor(int idx, void* ctx) {
+  auto* s = static_cast<TestModelSrc*>(ctx);
+  if (idx < 0 || static_cast<std::size_t>(idx) >= s->byIndex.size())
+    return nullptr;
+  return s->byIndex[static_cast<std::size_t>(idx)];
+}
+
+mdk::DtiSubRecord makeSpawnRec(std::uint32_t type, std::uint32_t f1,
+                               float x, float y, float z,
+                               const char* name) {
+  mdk::DtiSubRecord r = {};
+  r.type = type;
+  r.fields[0] = f1;
+  r.fields[1] = 0;
+  auto putf = [&](int i, float v) {
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    r.fields[i] = u;
+  };
+  putf(2, x);
+  putf(3, y);
+  putf(4, z);
+  auto* nm = reinterpret_cast<char*>(&r.fields[5]);
+  std::snprintf(nm, 12, "%s", name);
+  return r;
+}
+
+void test_dynamic_objects() {
+  using mdk::DynamicArena;
+  using mdk::DynamicObject;
+
+  // ---- geometry record parse: flag=1 (named elements) ------------
+  {
+    auto rec = makeGeoRecord(1, {"MODEL_A", "SECOND"},
+        {{"XG1_BODY", {0, 0, 0, 4, 0, 0, 0, 4, 0}, {0, 1, 2}},
+         {"XG1_HEAD", {0, 0, 10, 2, 0, 10, 0, 2, 10}, {0, 1, 2}}},
+        {{1, 2, 3}});
+    auto m = mdk::parseGeometryRecord(rec.data(), rec.data() + rec.size());
+    CHECK(m.has_value());
+    CHECK(m->flag == 1);
+    CHECK(m->names.size() == 2);
+    CHECK(m->modelName() == "MODEL_A");
+    CHECK(m->elems.size() == 2);
+    CHECK(m->elemName(0) == "XG1_BODY");
+    CHECK(m->bodyElemIndex == 0);
+    CHECK(m->elemName(1) == "XG1_HEAD");
+    CHECK(m->headElemMask == 2u);
+    CHECK(m->elems[0].triCount == 1);
+    CHECK(m->elemVerts[0].size() == 9);
+    // FUN_00459d54 local AABB of elem0 = {0,0,0,4,4,0}.
+    CHECK(near(m->elems[0].localAabb[0], 0.f, 1e-5) &&
+          near(m->elems[0].localAabb[3], 4.f, 1e-5) &&
+          near(m->elems[0].localAabb[4], 4.f, 1e-5) &&
+          near(m->elems[0].localAabb[2], 0.f, 1e-5));
+    CHECK(m->refPointCount == 1);
+    CHECK(near(m->refPoints[0][0], 1.f, 1e-5) &&
+          near(m->refPoints[0][2], 3.f, 1e-5));
+    // views point into owned storage
+    CHECK(m->elems[0].verts == m->elemVerts[0].data());
+    CHECK(m->elems[0].tris == m->elemTris[0].data());
+    CHECK(m->elementSet().count == 2);
+  }
+
+  // ---- geometry record parse: flag=0 (anonymous element) ---------
+  {
+    auto rec = makeGeoRecord(0, {"SW_GATT"},
+        {{"", {1, 2, 3, 4, 5, 6, 7, 8, 9}, {0, 1, 2}}}, {});
+    auto m = mdk::parseGeometryRecord(rec.data(), rec.data() + rec.size());
+    CHECK(m.has_value());
+    CHECK(m->flag == 0);
+    CHECK(m->names.size() == 1 && m->modelName() == "SW_GATT");
+    CHECK(m->elems.size() == 1);
+    CHECK(m->elemName(0).empty());       // anonymous
+    CHECK(m->elems[0].triCount == 1);
+    CHECK(near(m->elems[0].localAabb[0], 1.f, 1e-5) &&
+          near(m->elems[0].localAabb[5], 9.f, 1e-5));
+    CHECK(m->refPointCount == 0);
+  }
+
+  // ---- parse bounds rejection ------------------------------------
+  {
+    auto rec = makeGeoRecord(1, {"M"},
+        {{"E", {0, 0, 0, 1, 0, 0, 0, 1, 0}, {0, 1, 2}}}, {});
+    CHECK(!mdk::parseGeometryRecord(rec.data(), rec.data() + 20));
+    // Corrupt: huge nameCount.
+    std::vector<std::uint8_t> bad = rec;
+    bad[4] = 0x40;
+    CHECK(!mdk::parseGeometryRecord(bad.data(), bad.data() + bad.size()));
+  }
+
+  // ---- FUN_00403720 deep-copy independence ------------------------
+  {
+    auto rec = makeGeoRecord(1, {"M"},
+        {{"E", {0, 0, 0, 1, 0, 0, 0, 1, 0}, {0, 1, 2}}}, {});
+    auto m = mdk::parseGeometryRecord(rec.data(), rec.data() + rec.size());
+    auto cp = mdk::deepCopyModel(*m);
+    CHECK(cp.elems.size() == 1);
+    CHECK(cp.elems[0].verts == cp.elemVerts[0].data());
+    CHECK(cp.elems[0].verts != m->elems[0].verts);   // fresh storage
+    cp.elemVerts[0][0] = 99.0f;
+    CHECK(m->elemVerts[0][0] != 99.0f);              // source untouched
+  }
+
+  // ---- FUN_0046b2f8 matrix: identity / yaw90 / scale --------------
+  {
+    float m[9], o[3];
+    const float pos[3] = {10, 20, 30};
+    mdk::buildObjectMatrix(0, 0, 0, 1.0f, pos, m, o);
+    CHECK(near(m[0], 1.f, 1e-5) && near(m[4], 1.f, 1e-5) &&
+          near(m[8], 1.f, 1e-5) && near(m[1], 0.f, 1e-5));
+    CHECK(near(o[0], 10.f, 1e-5) && near(o[2], 30.f, 1e-5));
+    // yaw=90deg: local +x -> world +y (rows {0,-1,0},{1,0,0},{0,0,1}).
+    mdk::buildObjectMatrix(0, 0, 90.0f, 2.0f, pos, m, o);
+    CHECK(near(m[0], 0.f, 1e-5) && near(m[1], -2.f, 1e-5) &&
+          near(m[3], 2.f, 1e-5) && near(m[4], 0.f, 1e-5) &&
+          near(m[8], 2.f, 1e-5));
+  }
+
+  // ---- FUN_0045612c rebuild: Euler path + AABB seed quirk ----------
+  {
+    DynamicArena ar;
+    DynamicObject& o = ar.allocFront();
+    o.model = makePlatformModel("PLAT", "ELEM", 0.0f);
+    o.setPosition(10, 20, 30);
+    o.prevYawDeg = o.yawDeg = 0;
+    mdk::initObjectCollision(o);
+    // first build: seed {0,0,0}/{0,0,0} then union elem world
+    // {-5,-5,0,5,5,0}+pos = {5,15,30,15,25,30} -> min clamps to 0.
+    CHECK(near(o.col.aabb[0], 0.f, 1e-5) &&
+          near(o.col.aabb[3], 15.f, 1e-5) &&
+          near(o.col.aabb[4], 25.f, 1e-5) &&
+          near(o.col.aabb[5], 30.f, 1e-5));
+    CHECK(near(o.model.elems[0].aabb[0], 5.f, 1e-5) &&
+          near(o.model.elems[0].aabb[3], 15.f, 1e-5) &&
+          near(o.model.elems[0].aabb[5], 30.f, 1e-5));
+    // second build at same pos: seed = {minZ x3}/{maxZ x3} of the
+    // PREVIOUS aabb {0,0,0,15,25,30} -> {0,0,0}/{30,30,30}, then the
+    // element union -> {0,0,0,30,30,30} (z-seed quirk reproduced).
+    mdk::rebuildObjectTransform(o);
+    CHECK(near(o.col.aabb[2], 0.f, 1e-5) &&
+          near(o.col.aabb[5], 30.f, 1e-5) &&
+          near(o.col.aabb[3], 30.f, 1e-5));
+    // elemMaskB excludes the element: AABB stays the degenerate seed.
+    o.col.elemMaskB = 1;
+    mdk::rebuildObjectTransform(o);
+    CHECK(near(o.col.aabb[0], 0.f, 1e-5) &&
+          near(o.col.aabb[3], 30.f, 1e-5));
+    o.col.elemMaskB = 0;
+  }
+
+  // ---- rebuild: raw-matrix path + zBias fold ----------------------
+  {
+    DynamicArena ar;
+    DynamicObject& o = ar.allocFront();
+    o.model = makePlatformModel("PLAT", "ELEM", 0.0f);
+    o.setPosition(0, 0, 100);
+    mdk::initObjectCollision(o);
+    o.col.flags148 |= 0x40;
+    o.zBias = 7.0f;
+    const float twice[9] = {2, 0, 0, 0, 2, 0, 0, 0, 2};
+    std::memcpy(o.rawMatrix, twice, sizeof(twice));
+    o.col.scale = 1.0f;
+    mdk::rebuildObjectTransform(o);
+    CHECK(near(o.col.xform[0], 2.f, 1e-5) &&
+          near(o.col.xform[4], 2.f, 1e-5));
+    CHECK(near(o.col.origin[2], 107.f, 1e-5));   // z + zBias
+    // world AABB: local {-5..5} * 2 + {0,0,107} -> {-10,-10,107,10,10,107}
+    CHECK(near(o.model.elems[0].aabb[0], -10.f, 1e-5) &&
+          near(o.model.elems[0].aabb[3], 10.f, 1e-5) &&
+          near(o.model.elems[0].aabb[2], 107.f, 1e-5));
+  }
+
+  // ---- enemy table + DTI name rewrite -----------------------------
+  {
+    mdk::EnemyTable enemies;
+    enemies.entries = {{"XGS", 0x100, false}, {"XT", 0, true},
+                       {"SW_GATT", 0x200, false}};
+    CHECK(enemies.indexOf("XT") == 1);
+    CHECK(enemies.indexOf("MISSING") == -1);
+    mdk::DtiArenaRecord rec = {};
+    rec.subRecords = {makeSpawnRec(2, 9, 1, 2, 3, "XGS"),
+                      makeSpawnRec(4, 0, 5, 6, 7, "SW_GATT"),
+                      makeSpawnRec(6, 0, 0, 0, 0, "CONN"),
+                      makeSpawnRec(2, 2, 8, 9, 0, "NOPE")};
+    auto failed = mdk::resolveArenaRecordNames(rec, enemies);
+    CHECK(rec.subRecords[0].fields[0] == (0u << 16 | 9u));
+    CHECK(rec.subRecords[1].fields[0] == 2u);
+    CHECK(rec.subRecords[2].fields[0] == 0u);   // type 6 untouched
+    CHECK(failed.size() == 1 && failed[0] == 3);
+  }
+
+  // ---- spawnArenaObjects: type-2 + type-4 + dedup + push-front -----
+  {
+    mdk::RuntimeModel plat = makePlatformModel("PLAT", "ELEM", 0.0f);
+    mdk::RuntimeModel sw = makePlatformModel("SW_DUMMY", "SW_DUMMY", 0.0f);
+    // second element in `sw` that must stay enabled
+    sw.elemNames.push_back({});
+    sw.elemField2.push_back({});
+    sw.elemVerts.push_back({-1, -1, 0, 1, -1, 0, 1, 1, 0});
+    sw.elemTris.push_back(std::vector<std::uint8_t>(0x24, 0));
+    sw.elems.push_back(mdk::CollisionElement{});
+    sw.elems[1].triCount = 1;
+    sw.elemNames[0] = {};
+    std::snprintf(sw.elemNames[0].data(), 12, "SW_DUMMY");
+    std::snprintf(sw.elemNames[1].data(), 12, "KEEP");
+    sw.rebind();
+
+    TestModelSrc src{{&plat, &sw}};
+    DynamicArena ar;
+    ar.name = "HMO_9";
+    mdk::DtiArenaRecord rec = {};
+    rec.subRecords = {
+        makeSpawnRec(2, (1u << 16) | 9u, -174, 2603, -4660, "XGS"),
+        makeSpawnRec(4, 1, 5, 6, 7, "SW_DUMMY"),
+        makeSpawnRec(6, 0, 0, 0, 0, "CONN")};
+    std::vector<DynamicObject*> spawned;
+    const int n =
+        mdk::spawnArenaObjects(ar, rec, testModelFor, &src, &spawned);
+    CHECK(n == 2 && spawned.size() == 2);
+    CHECK(ar.storage.size() == 2);
+    // push-front: type-4 object (spawned second) is the +0x68 head.
+    CHECK(ar.col.objects == &spawned[1]->col);
+    CHECK(ar.col.objects->next == &spawned[0]->col);
+    // type-2 fields
+    DynamicObject& t2 = *spawned[0];
+    CHECK(t2.enemyIndex == 1);
+    CHECK(t2.spawnId == 9);
+    CHECK(t2.behaviorByte == 7);
+    CHECK(t2.health == 10);
+    CHECK(t2.col.named && t2.col.model != nullptr);
+    CHECK(t2.col.elements == &t2.elemSet);
+    CHECK(near(t2.pos[0], -174.f, 1e-4) && near(t2.pos[2], -4660.f, 1e-4));
+    CHECK(near(t2.prevPos[2], -4660.f, 1e-4));
+    CHECK(near(t2.col.baseZ, -4660.f, 1e-4));
+    CHECK(t2.arena == &ar);
+    // deep copy: spawned model verts differ from the source's storage
+    CHECK(t2.model.elems[0].verts != plat.elems[0].verts);
+    // type-4 fields: +0x148 dword 0x2008a0 -> bytes a0/08/20.
+    DynamicObject& t4 = *spawned[1];
+    CHECK(t4.health == 1);
+    CHECK((t4.col.flags148 & 0x08a0) == 0x08a0);
+    CHECK((t4.col.flags149 & 0x08) == 0x08);
+    CHECK((t4.col.flags14a & 0x20) == 0x20);
+    // SW_DUMMY model: element named SW_DUMMY masked, KEEP enabled.
+    CHECK((t4.col.elemMaskB & 1u) == 1u);
+    CHECK((t4.col.elemMaskB & 2u) == 0u);
+    // dedup: same records again -> nothing new.
+    const int n2 =
+        mdk::spawnArenaObjects(ar, rec, testModelFor, &src, nullptr);
+    CHECK(n2 == 0 && ar.storage.size() == 2);
+  }
+
+  // ---- attach / detach / transfer ---------------------------------
+  {
+    DynamicArena a, b;
+    a.name = "A";
+    b.name = "B";
+    DynamicObject& o1 = a.allocFront();
+    DynamicObject& o2 = a.allocFront();
+    DynamicObject& o3 = a.allocFront();
+    CHECK(a.col.objects == &o3.col);
+    CHECK(a.col.objects->next == &o2.col);
+    CHECK(a.col.objects->next->next == &o1.col);
+    a.transfer(o2, b);
+    CHECK(b.col.objects == &o2.col);
+    CHECK(o2.arena == &b && o2.pendingArena == nullptr);
+    CHECK(a.col.objects == &o3.col);
+    CHECK(a.col.objects->next == &o1.col);
+    CHECK(a.storage.size() == 2 && b.storage.size() == 1);
+    a.detach(o3);
+    CHECK(a.col.objects == &o1.col);
+    CHECK(a.storage.size() == 1);
+  }
+
+  // ---- floor probe consumes a spawned object's rebuilt transform --
+  {
+    mdk::RuntimeModel plat = makePlatformModel("PLAT", "ELEM", 0.0f);
+    TestModelSrc src{{&plat}};
+    DynamicArena ar;
+    mdk::DtiArenaRecord rec = {};
+    rec.subRecords = {makeSpawnRec(4, 0, 0, 0, 50, "PLAT")};
+    mdk::spawnArenaObjects(ar, rec, testModelFor, &src, nullptr);
+    DynamicObject& o = *ar.storage.front();
+    o.col.flags149 |= 1;                       // standable (script bit)
+    CollisionFixture f = makeEmptyArena();
+    f.arena.objects = ar.col.objects;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0;
+    cs.pos[1] = 0;
+    cs.pos[2] = 51.0f;                         // 1 above the platform
+    mdk::collisionFloorProbe(cs);
+    CHECK(cs.floorObj == &o.col);
+    CHECK((cs.contactFlags & 2) != 0);
+    CHECK(near(cs.floorZ, 50.f, 1e-3));
+    CHECK(near(cs.floorOffset, 50.f - 50.f, 1e-3));  // bot.z - baseZ
+  }
+
+  // ---- ride displacement: moving platform carries the player ------
+  {
+    mdk::RuntimeModel plat = makePlatformModel("PLAT", "ELEM", 0.0f);
+    TestModelSrc src{{&plat}};
+    DynamicArena ar;
+    mdk::DtiArenaRecord rec = {};
+    rec.subRecords = {makeSpawnRec(4, 0, 0, 0, 50, "PLAT")};
+    mdk::spawnArenaObjects(ar, rec, testModelFor, &src, nullptr);
+    DynamicObject& o = *ar.storage.front();
+    o.col.flags149 |= 1;
+    o.col.flags14a |= 0x80;                    // mountable (script op)
+    CollisionFixture f = makeEmptyArena();
+    f.arena.objects = ar.col.objects;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0;
+    cs.pos[1] = 0;
+    cs.pos[2] = 51.0f;
+    mdk::collisionFloorProbe(cs);
+    CHECK(cs.floorObj == &o.col);
+    // vertical landing establishes the ride (the +0x14a&0x80 gate in
+    // FUN_00467180); the probe leaves the object as the blocker.
+    cs.rideObj = &o.col;
+    cs.rideElemMask = cs.floorElemMask;
+    cs.rideActive = 1;
+    // platform rises 5 and yaws 30 degrees this frame.
+    o.setPosition(0, 0, 55);
+    o.yawDeg = 30.0f;
+    float playerYaw = 0.0f;
+    mdk::updateMoverCollision(o, cs, &playerYaw);
+    CHECK(near(cs.pos[2], 56.0f, 1e-4));       // carried +5
+    CHECK(near(playerYaw, 30.0f, 1e-4));       // yaw delta applied
+    CHECK(near(o.prevPos[2], 55.f, 1e-4));     // prev latched
+    CHECK(near(o.prevYawDeg, 30.f, 1e-4));
+    // next frame floorZ follows the carrier's baseZ + stored offset.
+    mdk::collisionFloorProbe(cs);
+    CHECK(near(cs.floorZ, 55.f + cs.floorOffset, 1e-3));
+  }
+
+  // ---- sweep object pass consumes spawned objects -----------------
+  {
+    // Tall box: the object pass is a segment-vs-element-AABB test, so
+    // the player's z must fall inside the expanded element box.
+    mdk::RuntimeModel wall = makePlatformModel("WALL", "ELEM", 0.0f);
+    const float tall[6] = {-5, -5, -10, 5, 5, 10};
+    std::memcpy(wall.elems[0].localAabb, tall, sizeof(tall));
+    TestModelSrc src{{&wall}};
+    DynamicArena ar;
+    mdk::DtiArenaRecord rec = {};
+    rec.subRecords = {makeSpawnRec(2, (0u << 16) | 1u, 0, 0, 0, "P")};
+    mdk::spawnArenaObjects(ar, rec, testModelFor, &src, nullptr);
+    DynamicObject& o = *ar.storage.front();
+    CollisionFixture f = makeEmptyArena();
+    f.arena.objects = ar.col.objects;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0;
+    cs.pos[1] = -8.0f;
+    cs.pos[2] = 3.0f;
+    // horizontal move +y through the object's element AABB
+    // {-5,-5,-10,5,5,10} expanded by ext {0.6,0.6,2.5}.
+    mdk::collisionApply(cs, 0.0f, 12.0f, 0.0f, 0.75f, nullptr, nullptr);
+    CHECK(cs.lastObjContact == &o.col);
+    CHECK(cs.pos[1] < -5.0f);                  // blocked before the box
+  }
+}
+
 } // namespace
 
 int main() {
@@ -10459,6 +10925,7 @@ int main() {
   test_player_motion();
   test_player_vertical();
   test_player_collision();
+  test_dynamic_objects();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

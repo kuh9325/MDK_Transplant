@@ -992,3 +992,278 @@ connect records; the collision geometry stream is `.MTO`.
   contract is proven; partner assignment is runtime state.
 - `FUN_004089c0` is transcribed as proven; degenerate-triangle
   edge cases beyond the observed SAT path are untested.
+
+# Phase 5E — dynamic collision objects and runtime arena attachment
+
+Phase 5E reconstructs the runtime link behind arena `+0x68`: how
+dynamic collision objects are created from original data, attached
+to arenas, transformed, updated, and consumed by the `collisionApply`
+object pass and `collisionFloorProbe` — the system that makes moving
+floors, doors, platforms and blocker tokens work.
+
+## 41. Arena `+0x68` object list (OBSERVED)
+
+Singly-linked list through object `+0x00` (next); head at
+`arena+0x68`. The object pool is 399 static records x 0x32e bytes at
+`DAT_004f0740`, freelist-linked via `DAT_00540ed0`.
+
+- `FUN_0045cffc` — spawn: pop the freelist head, push-front onto
+  `arena+0x68`, set `+0x06=1` (named), `+0x60`=arena.
+- `FUN_0045cf90` — despawn: unlink from the arena list, push onto
+  the freelist.
+- `FUN_0045cf18` — arena cleanup: recycles every `+0x06==0`
+  (unnamed) object.
+- `FUN_004574d0` — portal transfer: unlink from the object's
+  current arena `+0x60` list, push-front onto the pending arena
+  `+0x2bc` list, update `+0x60`. Triggered inside the per-frame
+  update (`FUN_004572ac`) when `+0x2bc != 0`.
+- `FUN_00432980` — portal side: for each DTI type-6 connect record,
+  walks the partner arena's `+0x68` list for `+0x14a&0x10` objects
+  and calls `FUN_004574d0` to pull them through.
+- `FUN_00459618` — object-vs-object resolution: objects with
+  `+0x14a&8` adopt the collided object's arena as `+0x2bc`
+  (projectile arena-follow).
+
+## 42. Dynamic object spawn — `FUN_00456808` (OBSERVED)
+
+Iterates the arena's DTI sub-record table (`arena+0x38` count,
+`+0x3c` records, 0x24-stride). Dispatch on `rec.type`:
+
+- **type 2 "HotGen"** — `fields[0]` = `enemyIdx<<16 | spawnId` (the
+  index half is OR-ed in at load by `FUN_00433d40` matching the
+  record's name against the CMI enemy table). Dedup on
+  (`enemyIdx`, `spawnId`, exact `pos`) within the arena list.
+  Alloc (`FUN_0045cffc`) → model deep-copy (`FUN_00403720` over the
+  enemy-table record) → `+0x04=enemyIdx`, `+0x146=spawnId`,
+  `+0x10..0x18`=pos, `+0x180..0x188`=pos (prevPos), `+0x60`=arena →
+  init (`FUN_004566f0`) → `+0x11c=7`. Script key
+  `"%s$%s_%d"` = `arena$model_spawnId`.
+- **type 4 "HotPick"** — `fields[0]` = model index (overwrites the
+  field at load). Dedup on (`modelIdx`, `pos`). Same alloc/copy/pos/
+  init; then `+0x08=1`, `+0x148 dword |= 0x2008a0` (bytes:
+  `+0x148=0xa0`, `+0x149=0x08`, `+0x14a=0x20` — the mover bit that
+  routes `FUN_004585c4` inside the update pass; the `0x08a0` low
+  word also makes the sweep's `&0x810` test skip the object — movers
+  don't push the player horizontally, they only carry floors).
+  Script key `"%s$%s"` = `arena$model`. If the model name is
+  `"SW_DUMMY"`, elements named `"SW_DUMMY"` get their bit set in
+  `+0x2c8` (element-disable mask).
+- **type 1/3** — trigger bounds (`FUN_00434b44`); **type 6** —
+  portal partner arena index.
+
+`FUN_004566f0` init (collision subset): `+0x08`=10, `+0x58`=1.0f
+scale, identity matrix, script lookup + one VM run, then
+`FUN_0045612c` transform/AABB rebuild.
+
+## 43. Geometry record format — `FUN_00428400` (OBSERVED)
+
+ONE layout shared by both source paths. The record base carries a
+flag u32 the callers pass separately
+(`FUN_00428400(data=base+4, flag=*(base), out)`) — verified at both
+call sites (`FUN_004286c8` CMI, `FUN_00403498` MTO):
+
+```text
+record base: u32 flag                    (register arg, not parsed)
+stream +4:   u32 nameCount               (unconditional)
+             nameCount x {char[12] name, u32 tag}   (16B records)
+             if flag != 0:
+               u32 elemCount
+               elemCount x element:
+                 char[12] name     -> runtime elem +0x00
+                 byte[12] field2   -> runtime elem +0x20
+                 u32 vertCount     -> runtime elem +0x0c
+                 f32 verts[vc*3]   -> runtime elem +0x14;
+                                      FUN_00459d54 min/max -> +0x2c
+                 u32 triCount      -> runtime elem +0x10
+                 byte tris[tc*0x24]-> runtime elem +0x18
+                 byte[0x18] trailer — skipped ONLY on this path
+             else (flag == 0):
+               ONE anonymous element (elemCount forced 1; no
+               name/field2 copies, no trailer):
+                 u32 vertCount, verts, u32 triCount, tris
+             byte[0x18] gap               (always)
+             u32 refPointCount            (<= 8; else error)
+             f32 refPoints[rc][3] -> record +0x24..0x84
+```
+
+Tail (always): `record+0xb` = 0xff body-element index, then each
+element named `"XG1_BODY"` stores its index; each `"XG1_HEAD"` sets
+`record+0xc |= 1<<index`.
+
+Boundary-validated against BUILD_A: XGS ends exactly at the next
+record (`0x4680c`); same for XGEN, SW_GATT, BULLET. SW_GATT proves
+`flag==0` still carries a name table (nameCount=1 `"SW_GATT"`).
+
+## 44. Model resolution paths (OBSERVED)
+
+`FUN_004286c8` builds the enemy table (0x88-stride records,
+`DAT_004edcc0`, cap 0x50 = `"Overflowed enemy table"`) from CMI
+table[1] `{name, u32 value}`:
+
+- `value != 0` → geometry record at `image + value` (file offset
+  `4 + value`), parsed immediately.
+- `value == 0` → `record+0xa = 1` unresolved; later
+  `FUN_00403498` resolves from the level `.MTO`: each overlay
+  block's region-A array-B records `{name[8], u32 off}` are matched
+  by name; the record base is `tA + off` (verified: LEVEL6 `XT` at
+  `tA+0xa8` = `0xc2eec`, flag=1, nameCount=5, 19 elements).
+
+`FUN_00403720` deep-copies the model per spawned object: new 0xb0
+record, fresh element array, fresh per-element vertex storage —
+each spawn owns an independent copy (later damage/deform affects
+one instance only). `FUN_00403538` builds a parametric box model
+for enemy index `0xffff` (1 element, 8 verts, 12 tris) — runtime
+collision objects need not come from file data.
+
+## 45. Transform + world-AABB rebuild — `FUN_0045612c` (OBSERVED)
+
+Called from init/spawn, from the mover path inside the update loop
+(`FUN_004585c4`/`FUN_0045897c`), and from the render traversal
+(`FUN_00431300`). Collision-relevant core:
+
+1. **AABB seed quirk**: `obj+0x198` is seeded degenerately — min =
+   {old minZ x3}, max = {old maxZ x3} (the previous z bounds
+   broadcast into every component). On a zeroed object the first
+   build seeds {0,0,0}/{0,0,0}, so positive extents clamp at 0 on
+   the first frame — OBSERVED, reproduced.
+2. **Matrix path select**: `+0x148 & 0x40` → `xform[3x3] =
+   +0x302..0x322 x +0x58`, origin `{x, y, z + zBias(+0x5c)}`;
+   else Euler via `FUN_0046b2f8(+0x54 pitch, +0x13c bank,
+   +0x4c yaw, +0x58 scale, +0x10/14/18 pos)` — translation is the
+   raw position (NO zBias on this path).
+3. **Element world AABBs**: for each element not masked by
+   `+0x2c8`, `FUN_00459e40` transforms the 8 local-AABB corners by
+   the matrix and `FUN_00459d54` writes min/max into `elem+0x44`;
+   each is unioned into `obj+0x198`. Masked elements keep stale
+   world bounds (original behavior).
+4. Render-only tail (skipped natively): parent-matrix compose into
+   `+0x7c`, screen-space bounds `+0x64..0x78`, `FUN_0046afe4`
+   reference-point transform.
+
+`+0x148 & 1` / `& 0x80` gate a steering/easing pre-pass (yaw-rate
+smoothing into `+0x54`, velocity-heading bank into `+0x13c` via
+`FUN_004301bc`) that only derives the angle fields — behavior
+state, not collision state; objects with `+0x148` bit7 set (e.g.
+type-4 `0x2008a0`) skip it entirely. Documented seam, not
+implemented (the mover objects Phase 5E targets never take it).
+
+`FUN_0046b2f8` verified at instruction level: angles are DEGREES
+(`FUN_00437f98` = `angle x pi/180 -> {sin,cos}`, constant
+`0x497924`), row-major 3x3 with the uniform scale baked in:
+
+```text
+row0: c2c3   -s1s2c3-c1s3   -c1s2c3+s1s3
+row1: c2s3   -s1s2s3+c1c3   -c1s2s3-s1c3
+row2: s2      s1c2           c1c2
+translation: {x, y, z}   ((s1,c1)=+0x54, (s2,c2)=+0x13c, (s3,c3)=+0x4c)
+```
+
+— exactly the `world = M.local + origin` / `local = M^T.d / scale^2`
+contract the Phase 5D query consumes.
+
+## 46. Per-frame update + ride displacement — `FUN_004572ac` (OBSERVED)
+
+Per named object inside the per-arena update (before the floor
+probe — same-frame following):
+
+1. Flag dispatches (`0x10` portal-follow, `0x40` update,
+   `0x14b&0x40`).
+2. `+0x2bc` pending arena → `FUN_004574d0` transfer.
+3. Script VM → pose interpolation (`FUN_00456d28`) → physics
+   (`FUN_004533d4`/`FUN_0045b9fc`/`FUN_0045bac0`) → mover
+   (`FUN_0045897c` or `FUN_004585c4` per `+0x149&0x10` /
+   `+0x14a&0x20`) → `FUN_004555bc`.
+4. Velocity cache `+0x18c..0x194` = `(pos - prevPos) / dt`.
+5. **Ride displacement**: if `obj == DAT_00540dc0` (the player's
+   carrier): `pos += pos - prevPos` component-wise on the player
+   position, and player yaw `+= +0x4c - +0x50` (yaw delta).
+6. `prevPos = pos`, `prevYaw = yaw` (end of update).
+
+`FUN_004585c4` (the `+0x14a&0x20` mover path — SW_H150/SW_SEAL/
+SW_SBONE switch-objects) writes `+0x18` position and `+0x5c` z-bias
+directly and calls `FUN_0045612c` inside the update — movers get
+same-frame collision refresh; ordinary objects refresh in the
+render traversal (`FUN_00431300`) → their collision AABB lags one
+frame.
+
+`FUN_00467180` (vertical landing) establishes the ride:
+`dc0 = contactObj`, `dc4 = elemMask`, `dc8 = 1` only when
+`contactObj+0x14a & 0x80` — the mountable gate. `+0x14a&0x80` has
+NO direct writer: it is script-assigned — tr_alcmd opcode `0x29`
+(handler `0x443de0`, dispatch entry `0x438afc`): arg 2 →
+`+0x14a|=0x80` mountable; arg 1 → `+0x149|=1` solid non-mountable;
+arg 0 → non-solid; leaving solid while ridden fires
+`FUN_00461878` dismount. A second opcode (`0x4f647` site) sets
+`+0x14a|0x40` (update flag).
+
+Frame order (`FUN_00436100`): player dispatch (`FUN_00463608`
+including `FUN_004630d4`) → targeting (`FUN_00432f84`) → object
+update (`FUN_004572ac` + `FUN_0045cf18` per arena) → scripts
+(`FUN_004388d8`) → portal test (`FUN_00435178`) → **floor probe**
+(`FUN_00435eec`) → render (`FUN_00431300` transform refresh).
+
+## 47. Native implementation (`src/core/dynamic_objects.*`)
+
+- `RuntimeModel` — owned model record: name table, per-element
+  name/field2/vert/tri storage, `CollisionElement` views (world
+  `aabb` = +0x44, `localAabb` = +0x2c — field added to the Phase 5D
+  struct for the rebuild), ref points, body/head bookkeeping.
+  `rebind()` re-points views after parse/copy.
+- `parseGeometryRecord` — `FUN_00428400`, bounds-checked.
+- `deepCopyModel` — `FUN_00403720` (copy + rebind = fresh storage).
+- `EnemyTable` / `buildEnemyTable` / `enemyModelData` —
+  `FUN_004286c8` product + the CMI-direct / MTO-deferred
+  (`FUN_00403498`) geometry lookup.
+- `DynamicObject` — runtime record: `CollisionObject col` (the
+  +0x68 node) + owned `RuntimeModel` + update-side fields
+  (`pos/prevPos/yawDeg/prevYawDeg/pitchDeg/bankDeg/zBias/
+  rawMatrix/enemyIndex/spawnId/health/behaviorByte/arena/
+  pendingArena`). `pos[2]` mirrors `col.baseZ` (+0x18).
+- `DynamicArena` — owns `CollisionArena` + object storage
+  (`std::list`, stable addresses); `allocFront`/`detach`/`transfer`
+  = `FUN_0045cffc`/`FUN_0045cf90`/`FUN_004574d0`.
+- `buildObjectMatrix` — `FUN_0046b2f8`.
+- `rebuildObjectTransform` — `FUN_0045612c` collision core (matrix
+  select + element world AABBs + degenerate-seeded union).
+- `initObjectCollision` — `FUN_004566f0` subset (script VM out).
+- `resolveArenaRecordNames` — the `FUN_00433d40` load-time rewrite.
+- `spawnArenaObjects` — `FUN_00456808` type-2/type-4 (dedup, model
+  deep-copy, flags, `SW_DUMMY` mask, push-front attach).
+- `applyRideDisplacement` / `latchObjectPrevState` /
+  `updateMoverCollision` — the `FUN_004572ac` tail (carrier delta →
+  player pos + yaw, then latch), in the proven order.
+
+## 48. Phase 5E diagnostics and tests
+
+- Native tests: 3257 checks, 0 failures (3166 baseline + 91 Phase
+  5E): geometry parse (named + anonymous + bounds rejection), deep
+  copy independence, matrix identity/yaw90/scale, transform rebuild
+  (Euler, z-seed quirk, elemMaskB skip, raw-matrix + zBias), enemy
+  table + DTI name rewrite, type-2/type-4 spawn fields + dedup +
+  push-front, attach/detach/transfer, floor-probe consumption,
+  ride displacement + moving-floor carry, sweep element-AABB
+  blocking.
+- `mdk-inspect --arena-objects <path/LEVELn.DTI>`: BUILD_A smoke —
+  loads the `.DTI` + sibling `.CMI` + `<stem>O.MTO`, resolves the
+  enemy table, spawns every arena's type-2/4 records and reports
+  the `+0x68` list. Results: LEVEL3 — the HMO_9 `XGS` (idx 30,
+  spawn 9, 25 elements) spawns and a floor probe hits its real
+  geometry (`floorZ -290.794`); LEVEL6 — MTO-resolved `XT`
+  (idx 40, 19 elems) floor-probes at `-2917.57`; LEVEL8 — 21
+  objects (mixed HotGen/HotPick incl. SW_* movers), 17 models
+  resolved, 0 failures.
+
+## 49. Remaining Phase 5E unknowns / boundary
+
+- Steering/easing pre-pass inside `FUN_0045612c` (`+0x148&1` path):
+  `+0x54`/`+0x13c` derivation from yaw-rate and velocity heading —
+  behavior-layer state; not needed by type-4 movers (bit7 skips it).
+- `+0x302` dual role (raw-matrix element 0 AND transition flag) —
+  the layout is reproduced; the countdown semantics are a behavior
+  detail.
+- Script VM (`FUN_004388d8`) — opcode `0x29`'s mountable/solid
+  writes are proven; executing init scripts is a later system.
+- `+0x2bc` arena assignment beyond portal-follow (`FUN_0045bac0`
+  portal test) — trigger-side, not collision-side.
+- Surface effects (`FUN_0040b5d0`) and `FUN_00461878` dismount
+  internals — unchanged hook boundaries from Phase 5D.
