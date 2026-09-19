@@ -260,6 +260,15 @@ struct DynamicObject {
   int health = 0;                     // +0x08 — nonzero gates col.model
   int behaviorByte = 0;               // +0x11c (=7 for type-2)
 
+  // Script-spawn metadata (tr_alcmd 0x95/0x56/0xa1/0xce/0xe6 family,
+  // FUN_00454894). The original binds a class-table index + name
+  // record + script offset; this port preserves them as strings/off
+  // while the class's native behavior stays a documented seam.
+  std::string scriptClass;            // class name (XCORDOOR/XTUR/…)
+  std::string scriptName;             // object/arena name (s2)
+  std::uint32_t scriptOff = 0;        // CMI image offset of its script
+  int scriptVariant = 0;              // which spawn opcode created it
+
   DynamicArena* arena = nullptr;        // +0x60
   DynamicArena* pendingArena = nullptr; // +0x2bc
 

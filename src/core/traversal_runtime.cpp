@@ -555,6 +555,18 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
     a->dyn.name = a->name;
     a->scalar = rt.level.work[i].scalar();
     a->hasScriptObject = cmiTable3Has(rt.level.cmi, a->name);
+    // FUN_00458550 bind — +0x220 = image-relative code offset (the
+    // VM's persisted gate + entry PC; 0 when no record / codeOff==0).
+    a->script.pcImageOff = cmiScriptCodeOffset(
+        rt.level.cmi,
+        std::span<const std::byte>(rt.level.cmiBytes.data(),
+                                   rt.level.cmiBytes.size()),
+        a->name);
+    a->script.active = (a->script.pcImageOff != 0);
+    // FUN_004546ac — surface-contact handler scripts route through
+    // the VM; scriptUser carries the runtime for env construction.
+    a->surface.scriptFn = traversalScriptSurfaceHandler;
+    a->surface.scriptUser = &rt;
     rt.arenas.push_back(std::move(a));
   }
 
@@ -834,11 +846,42 @@ TraversalFrameResult stepTraversalRuntime(
     }
   }
 
-  // FUN_004388d8 script-object calls — counted, not emulated.
-  // OBSERVED gates: current on +0x220; partner on ca8 && ca4+0x220.
-  if (cur->hasScriptObject) ++rt.seams.scriptObjectCalls;
-  if (rt.partnerActive && rt.partner && rt.partner->hasScriptObject)
-    ++rt.seams.scriptObjectCalls;
+  // FUN_004388d8 script-object calls — Phase 5H tr_alcmd VM.
+  // OBSERVED gates/order: FUN_004388d8(c48+0x118) when c48+0x220
+  // nonzero, then FUN_004388d8(ca4+0x118) when ca8 && ca4+0x220.
+  // The VM reads the persisted PC each frame; checkpoint(0x01)
+  // retargets it, wait(0x40) suspends to +0x230, stop(0x09) clears it.
+  {
+    TraversalScriptEnv env;
+    env.image = std::span<const std::byte>(rt.level.cmiBytes.data(),
+                                           rt.level.cmiBytes.size());
+    env.imageBase = 4;
+    env.playerPos = rt.cs.pos;
+    env.rt = &rt;
+    env.currentArena = cur;
+    env.dt = dt;
+    env.slideChannel = rt.slideChannel;
+    env.slideMode = (rt.slideChannel != 0);
+    env.hasContactNormal = (rt.lastContactPoly != nullptr);
+    env.diagLog = &rt.scriptDiag;
+
+    TraversalArena* run[2] = {cur, nullptr};
+    int nrun = 1;
+    if (rt.partnerActive && rt.partner) { run[1] = rt.partner; nrun = 2; }
+    for (int ai = 0; ai < nrun; ++ai) {
+      TraversalArena* a = run[ai];
+      if (a->script.pcImageOff == 0) continue;   // +0x220 gate
+      env.selfArena = a;
+      ++rt.seams.scriptObjectCalls;
+      ++rt.scriptRuns;
+      TraversalScriptResult sr = traversalScriptRun(env);
+      rt.scriptInsnTotal += sr.instructions;
+      if (env.slideClear) { rt.slideChannel = 0; rt.slideAux = 0;
+                            env.slideClear = false; }
+      rt.slideChannel = env.slideChannel;
+    }
+    rt.scriptSpawned += env.seamsSpawned;
+  }
   ++rt.seams.profilerHooks; // FUN_0042fecc rdtsc probe (0x43632d)
 
   // 0x540ebc pending view snap — OBSERVED consumer is a teleport

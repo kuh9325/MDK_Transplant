@@ -71,6 +71,7 @@
 #include "core/cmi_directory.h"
 #include "core/collision_query.h"
 #include "core/dti_structure.h"
+#include "core/traversal_script.h"
 #include "core/dynamic_objects.h"
 #include "core/frontend_machines.h"
 #include "core/gameplay_input.h"
@@ -105,6 +106,16 @@ struct TraversalArena {
                                        // consumed by the FUN_004388d8
                                        // tr_alcmd VM (PC=+0x108,
                                        // wait=+0x22c, altPC=+0x230)
+  TraversalScriptState script;         // +0x118 ctx block — the
+                                       // FUN_004388d8 interpreter
+                                       // state (pc=+0x108/+0x220
+                                       // gate+PC, wait=+0x22c,
+                                       // resume=+0x230, stack +0x248+)
+  std::uint32_t flags58 = 0;           // +0x58 — bound-object flag
+                                       // dword (script flag group 1)
+  std::uint8_t objFlag148 = 0;         // +0x148 — script byte (0x61)
+  float objVars48[4] = {};             // +0x48 — object f32 vars
+                                       // (operand mode 1)
   float scalar = 0.0f;                 // +0x462 — view scalar blended
                                        // into 0x540b54 by FUN_004301e0
   TraversalArena() = default;
@@ -286,6 +297,13 @@ struct TraversalRuntime {
   // surface the player most recently touched (0x540e4c's EAX is the
   // same token; contactObj on `vert` carries the u32 form).
   const CollisionPoly* lastContactPoly = nullptr;
+
+  // tr_alcmd script VM (Phase 5H) — bounded diagnostics + spawn
+  // accounting collected across the frame's arena invocations.
+  std::vector<std::string> scriptDiag;
+  int scriptSpawned = 0;             // objects created by 0x95 family
+  int scriptInsnTotal = 0;           // instructions executed (total)
+  int scriptRuns = 0;                // FUN_004388d8 invocations
 
   TraversalSeams seams;
 };

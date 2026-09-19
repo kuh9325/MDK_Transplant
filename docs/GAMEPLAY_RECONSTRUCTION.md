@@ -1639,3 +1639,173 @@ unresolved spawn/script/portal behavior stays an explicit seam.
   is mapped; type-5/type-8 records remain UNKNOWN; `+0x44e`'s
   zero-init is proven via the creation memset for MDK95 — DOS build
   parity unchecked.
+
+# Phase 5H — the tr_alcmd arena script VM
+
+Phase 5H reconstructs the bounded `tr_alcmd` interpreter
+(`FUN_004388d8`) that the traversal frame runs once for the current
+arena and once for the active partner arena. Corridor arenas carry no
+static collision geometry (Phase 5G), so their doors, triggers and
+forced motion are script-driven — this VM is what advances real
+corridor traversal.
+
+## 65. Interpreter context + frame entry (OBSERVED)
+
+The VM context is the arena record `+0x118`. The frame driver calls
+`FUN_004388d8(c48+0x118)` for the current arena and
+`FUN_004388d8(ca4+0x118)` for the partner whenever that arena's
+`+0x220` field is nonzero. The proven ctx fields (all offsets are
+`arena_base + 0x118 + off`, i.e. ctx-relative shown):
+
+| ctx off | arena off | role |
+|---------|-----------|------|
+| `+0x108` | `+0x220` | script gate + persisted entry/resume PC (image-relative code offset; 0 = no script / stopped). Written by checkpoint `0x01`, by call/goto targets, restored by `0xfd`, cleared by `0x09`. |
+| `+0x22c` | `+0x344` | wait timer in seconds; decremented by `1/30` (`0x49b6f4`) once per frame entry |
+| `+0x230` | `+0x348` | wait-resume PC (image offset) |
+| `+0x60`  | `+0x178` | bound object — the arena record itself (self) |
+| `+0x0c`  | `+0x12c` | arena name ptr (diagnostics) |
+| `+0x21d` | — | event byte (the `FUN_004546ac` synthetic ctx) |
+| `+0x21e` | — | running flag; opcode `0xff` clears it |
+| `+0x244` | — | ctx-local flag dword (flag group 2) |
+| `+0x248/24c/25c/26c` | — | call-stack depth (cap 4), return-PC slots, saved-`+0x108` slots, per-depth u16 markers |
+| `+0x2b8` | — | caller/parent ctx (operand mode 4, flag-group else) |
+| `+0x312` | — | child flag dword (flag group 5) |
+| `+0x30e` | — | f32 field written by opcode `0x99` |
+| `+0x11a` | — | u8 written by `0x0b`, read by `0x0a` |
+
+Frame-entry semantics: if `+0x22c > 0` the interpreter decrements it
+by `1/30` and, while still `>0`, exits (the script is asleep); on
+lapse it resumes at `+0x230`. Otherwise it reads `+0x108` as the
+entry PC — so a script that ends at `0xff` without a `0x09` stop or a
+wait **re-enters at its checkpointed PC next frame**. This is the
+spawn-once-then-poll design the corridor setup scripts use.
+
+## 66. Bytecode encoding + linkage (OBSERVED)
+
+All PCs and jump/call operands are **image-relative code offsets**
+(`file offset = imageBase + off`, image base `= file+4`). The dispatch
+is `jmp [opcode*4 + 0x438a5c]`; legal range is opcode `1..0xfd`
+(253 slots), `0xff` is the loop-head end-of-stream byte, `0xfe` is
+not a standalone opcode but a linkage *mode* byte. Unknown opcodes
+take the default branch `0x451e03` → `"Unrecognised controlalien"`.
+
+Typed scalar operands carry a `mode:u8` prefix resolved by
+`FUN_00438654`: `0` = global f32 array `0x540d88`, `1` = bound-object
+f32 `+0x48`, `2` = ctx f32 locals `+0x234`, `3` = inline `f32`,
+`>=4` = caller-ctx `+0x234`. Flag operands select a dword via
+`FUN_00438744`: group `2` = ctx `+0x244`, `1` = bound-object `+0x58`,
+`0` = global `0x540d98`, `5` = ctx `+0x312`, else = caller ctx
+`+0x244`.
+
+Several opcodes take a **linkage tail** — a mode byte followed by
+offset operand(s) — instead of branching inline. The shared tail
+reader implements: `0xfc`/`0xfe` = call (push `{retPC, saved+0x108}`
+onto the 4-deep stack), `0xfd` = return, `0x0c` = goto. `0xfc` and
+`0x0c` as *standalone* opcodes are indexed/random-pick forms —
+`{u8 n; n×u32 offs}` with `FUN_00401ed4` = `rand()*n>>15` selecting
+the target (`n=1` is deterministic).
+
+## 67. Call/return stack + diagnostics (OBSERVED)
+
+The call stack is 4 deep (`+0x248` depth). A call pushes
+`{returnPC, saved +0x108}` and clears a u16 marker at
+`+0x26c + 2*depth`. `0xfd` pops: depth 0 → `FUN_00438010`
+`"Gosub underflow/overflow on %s ID %d"` + kills the script
+(`+0x108 = 0`); else `--depth`, `pc = retPC`, `+0x108 = savedPC`.
+Overflow (call at depth 4) is the same diagnostic + kill.
+
+The dispatch loop counts instructions; exceeding **1000** in one
+invocation reports `"Alien %s looped %d commands, off %lx"` and
+halts. The native port enforces the same cap.
+
+## 68. Implemented opcode set (OBSERVED → CORROBORATED)
+
+A CFG-aware census over all six BUILD_A levels' arena scripts (entry
+records plus reachable call/goto subroutine targets) yields ~25 live
+opcodes. The native interpreter implements the proven traversal subset:
+
+| op | form | effect |
+|----|------|--------|
+| `0x01` | — | checkpoint: `+0x108 = pc` (persist resume) |
+| `0x09` | — | stop: clear `+0x108` gate + call stack |
+| `0x40` | operand | wait: `+0x22c = seconds`, `+0x230 = resume`, suspend |
+| `0x44/45` | grp,bit | set / clear a flag bit |
+| `0x46/47/48` | grp,bit,link | branch if flag bit set/clear |
+| `0x60` | f32×4,link | 2D player-in-box conditional |
+| `0x67` | f32×6,link | 3D player-in-box conditional |
+| `0x62` | surfId,op | `FUN_0040a704` poly op + `+0x10c/+0x110` masks |
+| `0x63` | mask,surfId,off | surface handler bind `+0x7c/+0x8c` |
+| `0xa8` | surfId,mask | surface config `+0x6c` (+ set-`0x10` if `0x80`) |
+| `0x8e` | u8,str,u8,u8,f32 | type-7 volume activation `FUN_00412d04` |
+| `0x95/56/a1/e6` | spawn forms | create dormant object (Phase 5E seam) |
+| `0xca` | u8 | write global byte `0x541534` |
+| `0x99` | f32 | write ctx `+0x30e` |
+| `0x05` | f32 | write global `0x540b58` |
+| `0x0b` | u8 | write ctx `+0x11a` |
+| `0x0a` | obj | test `+0x11a` against a named object |
+| `0x61` | u8 | bound-object flag `+0x148` |
+| `0x0d` | link | linkage gated on `0x54b5e0 & 0x5414e8` |
+| `0x7b` | link | linkage only when ctx-obj ≠ current arena (partner-only) |
+| `0xe0` | flag[,f32,f32] | type-9 slide/deflect-zone; flag 0 clears `0x540e24/cbc` |
+| `0xfc/0x0c` | n,offs | indexed/random call / goto |
+| `0xfd` | — | return |
+| `0xff` | — | end-of-frame (clears running flag) |
+
+Spawning routes through the existing `DynamicArena`/`DynamicObject`
+abstractions (`allocFront` + `spawnRecord`); the spawned object's
+class behavior (e.g. XCORDOOR teleport) stays a Phase 5E native seam
+— the VM creates the dormant record, the class drives it. Rare
+subroutine opcodes (`0x04`, `0x64`, `0x87`, `0xad`, `0xdf`) are
+mechanically identified as object/spawn-family but their bounded
+native effect is less complete — they remain explicit seams that
+diagnose rather than guess.
+
+## 69. `FUN_004546ac` surface-handler seam (OBSERVED)
+
+Surface contact handlers are invoked through `FUN_004546ac`, which
+builds a **synthetic ctx** at `0x54c6d0` (memset `0x32e` each call),
+sets `+0x60` = bound object, `+0x21d` = event byte, `+0x108` =
+`scriptBase + handlerOff`, runs `FUN_004388d8` **synchronously once**,
+then `FUN_00458204` cleanup. No per-event VM state persists. The
+native port wires this via `SurfaceObjectState::scriptFn` →
+`traversalScriptSurfaceHandler`, which builds a transient
+`TraversalScriptState` (env `stateOverride`) so the gate is never
+written back to the arena.
+
+## 70. Native integration + validation (Phase 5H)
+
+`stepTraversalRuntime` replaces the Phase 5G counted `scriptObj` seam
+with real VM invocation at the proven frame position — current arena
+before partner arena, partner only when active with a script. The
+runtime tracks `scriptRuns`/`scriptInsnTotal`/`scriptSpawned` and a
+bounded `scriptDiag` log. The deterministic traversal digest now
+folds in the current arena's persisted PC/wait/call-depth plus a
+surface-state summary — no script bytes.
+
+Verified on real BUILD_A data:
+
+- `--script-disasm` decodes every LEVEL3–LEVEL8 corridor entry script
+  (CHMO/CMEAT/COLYM/CDANT/CGUNT) with zero undecoded bytes; LEVEL5
+  (MUSE) has no corridor records, consistent with `+0x220 = 0`.
+- LEVEL3 HMO_1: `runs=8 insn=68 spawned=0` — the checkpointed box2d
+  trigger re-enters each frame, faithful to the spawn-once-then-poll
+  design. Spawn arenas emit `spawned=11` objects once on frame 0.
+- Portal side-6 (HMO_2→CHMO_2) and side-2 (CHMO_1→HMO_1) regressions
+  hold with the VM live; type-1 attach/detach and type-3 cold
+  prefetch unchanged.
+- Digest is deterministic across runs (`947098fb82f45826`, 8-frame
+  CHMO_1).
+
+## 71. Phase 5H boundary
+
+- Object/spawn-family opcodes `0x04/0x64/0x87/0xad/0xdf` and a few
+  object-script opcodes (`0x74`, `0x8a`, `0x8b`, `0x98`, `0x49/4a`)
+  are partially decoded — retained as bounded seams.
+- The spawned door object's teleport/class behavior (XCORDOOR etc.)
+  is native object code, not VM — the VM only creates the record.
+- AI, camera, audio, combat and rendering opcodes are mapped in the
+  dispatch table but intentionally not implemented — out of scope.
+- DOS-build parity for opcode numbering is unchecked.
+- Malformed-stream policy is NATIVE SAFETY POLICY: the port
+  bounds-checks every fetch and halts the script rather than reading
+  out of range; valid BUILD_A streams never reach the bound.

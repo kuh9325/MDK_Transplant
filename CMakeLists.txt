@@ -58,6 +58,7 @@ add_library(mdk_core STATIC
   src/core/sound_menu.cpp
   src/core/stream_context.cpp
   src/core/traversal_runtime.cpp
+  src/core/traversal_script.cpp
   src/core/viewport.cpp
   src/input/input_state.cpp
 )

@@ -34,6 +34,7 @@
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
 #include "core/traversal_runtime.h"
+#include "core/traversal_script.h"
 #include "core/viewport.h"
 #include "input/input_state.h"
 
@@ -11465,6 +11466,200 @@ void test_traversal_deep_floor() {
   CHECK(arena.deepFloorZ == 0.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5H — tr_alcmd arena script VM
+// ---------------------------------------------------------------------------
+
+namespace {
+// Build a synthetic CMI image: file bytes where the script bytecode
+// sits at image offset `codeOff` (file offset 4+codeOff). The image
+// base is file+4, so image[4+off] is byte `off`.
+struct ScriptFixture {
+  std::vector<std::byte> image;
+  mdk::TraversalRuntime rt;
+  mdk::TraversalArena* arena = nullptr;
+  mdk::TraversalScriptEnv env;
+  std::vector<std::string> diag;
+
+  ScriptFixture() {
+    image.assign(0x4000, std::byte{0});
+    arena = travArenaAdd(rt, "TEST_1");
+    rt.cur = arena;
+    env.image = std::span<const std::byte>(image.data(), image.size());
+    env.imageBase = 4;
+    env.rt = &rt;
+    env.currentArena = arena;
+    env.selfArena = arena;
+    env.playerPos = rt.cs.pos;
+    env.diagLog = &diag;
+  }
+  void write(std::uint32_t off, std::initializer_list<int> bytes) {
+    std::uint32_t p = off;
+    for (int b : bytes) image[env.imageBase + p++] = std::byte(b & 0xff);
+  }
+  void writeF(std::uint32_t off, float f) {
+    std::uint32_t v;
+    std::memcpy(&v, &f, 4);
+    for (int k = 0; k < 4; ++k)
+      image[env.imageBase + off + k] = std::byte((v >> (8 * k)) & 0xff);
+  }
+  void writeW(std::uint32_t off, std::uint32_t v) {
+    for (int k = 0; k < 4; ++k)
+      image[env.imageBase + off + k] = std::byte((v >> (8 * k)) & 0xff);
+  }
+  void writeStr(std::uint32_t off, const char* s) {
+    std::size_t n = std::strlen(s) + 1;   // counted incl NUL
+    image[env.imageBase + off] = std::byte(n & 0xff);
+    for (std::size_t i = 0; i < n; ++i)
+      image[env.imageBase + off + 1 + i] = std::byte(s[i]);
+  }
+};
+} // namespace
+
+void test_traversal_script() {
+  const std::uint32_t C = 0x200;    // code image offset
+
+  // --- checkpoint + end: PC persists at the post-ckpt byte ---------
+  {
+    ScriptFixture f;
+    f.write(C, {0x01, 0xff});                 // ckpt; end
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->script.pcImageOff == C + 1);  // ckpt wrote +0x220
+  }
+
+  // --- stop clears the gate -----------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x09, 0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && f.arena->script.pcImageOff == 0);
+  }
+
+  // --- wait suspends, then resumes ----------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x40, 0x03});                 // wait, mode3 inline f32
+    f.writeF(C + 2, 0.01f);                    // 0.01 s < 1/30 step
+    f.write(C + 6, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r1 = mdk::traversalScriptRun(f.env);   // hits wait, exits
+    CHECK(r1.waited && f.arena->script.waitSeconds > 0.0f);
+    CHECK(f.arena->script.waitResumeImageOff == C + 6);
+    auto r2 = mdk::traversalScriptRun(f.env);   // decrements, resumes
+    CHECK(r2.halted);                            // ran the ff at C+6
+  }
+
+  // --- call/return (0xfe two-way) via a flag branch -----------------
+  {
+    ScriptFixture f;
+    // 47 grp bit link  — branch if bit set. grp=0 (global),bit=0.
+    // set bit first: 44 00 00 then 47 00 00 fe <callT> <elseT>
+    f.write(C, {0x44, 0x00, 0x00});           // set global bit0
+    f.write(C + 3, {0x47, 0x00, 0x00, 0xfe}); // brIfSet g0 b0 fe
+    f.writeW(C + 7, 0x300);                    // call target
+    f.writeW(C + 0xb, 0x000);                  // else target
+    f.write(C + 0xf, {0xff});                  // end
+    // call target @0x300: 62 surfop 1 2; fd return
+    f.write(0x300, {0x62, 0x01, 0x02, 0xfd});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.env.gFlags & 1);                    // bit0 set
+    CHECK(f.arena->script.callDepth == 0);      // returned
+    CHECK(f.arena->surface.opMaskB & (1u << 1)); // surfop ran
+  }
+
+  // --- runaway loop hits the 1000 cap --------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x0c, 0x01});                 // rgoto n1
+    f.writeW(C + 2, C);                        // -> C (self loop)
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.error && r.instructions == 1000);
+    CHECK(r.diag.find("looped") != std::string::npos);
+    CHECK(f.arena->script.pcImageOff == 0);
+  }
+
+  // --- box2d fires linkage only inside ------------------------------
+  {
+    ScriptFixture f;
+    // 60 box2d x0 y0 x1 y1 link. Put player inside -> call runs.
+    f.write(C, {0x60});
+    f.writeF(C + 1, 0.0f); f.writeF(C + 5, 0.0f);
+    f.writeF(C + 9, 10.0f); f.writeF(C + 0xd, 10.0f);
+    f.write(C + 0x11, {0xfc});                  // call mode
+    f.writeW(C + 0x12, 0x300);
+    f.write(C + 0x16, {0xff});
+    f.write(0x300, {0x09});                     // target: stop
+    f.rt.cs.pos[0] = 5.f; f.rt.cs.pos[1] = 5.f;
+    f.env.playerPos = f.rt.cs.pos;
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped);                           // call ran the 09
+  }
+
+  // --- malformed read: opcode fetch out of bounds --------------------
+  {
+    ScriptFixture f;
+    f.arena->script.pcImageOff = 0x3fff;        // near image end
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.error);                             // bounded, no OOB
+  }
+
+  // --- spawn records a dormant object --------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x95});                          // spawn
+    f.writeF(C + 1, 1.0f); f.writeF(C + 5, 2.0f); f.writeF(C + 9, 3.0f);
+    f.writeF(C + 0xd, 90.0f);                    // yaw
+    f.writeW(C + 0x11, 0x7ce);                   // flags
+    const std::uint32_t s1 = C + 0x15;           // lenstr "XCORDOOR" (10B)
+    const std::uint32_t s2 = s1 + 10;            // lenstr "HMO_3" (7B)
+    const std::uint32_t so = s2 + 7;             // u32 scriptOff
+    f.writeStr(s1, "XCORDOOR");
+    f.writeStr(s2, "HMO_3");
+    f.writeW(so, 0x777);
+    f.write(so + 4, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.env.seamsSpawned == 1);
+    CHECK(!f.arena->dyn.storage.empty());
+    const auto& o = *f.arena->dyn.storage.front();
+    CHECK(o.scriptClass == "XCORDOOR");
+    CHECK(o.scriptName == "HMO_3");
+    CHECK(o.scriptOff == 0x777);
+    CHECK(o.pos[0] == 1.0f && o.pos[2] == 3.0f);
+  }
+
+  // --- surfbind writes handler table ----------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x63, 0x05, 0x03});             // surfbind mask5 sid3
+    f.writeW(C + 3, 0xabc);                      // handlerOff
+    f.write(C + 7, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted);
+    CHECK(f.arena->surface.handlerMask[2] == 5);   // slot (3-1)
+    CHECK(f.arena->surface.handlerOff[2] == 0xabc);
+  }
+
+  // --- unknown opcode halts with diagnostic ---------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x02, 0xff});                    // 0x02 not implemented
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.error);
+    CHECK(r.diag.find("Unrecognised") != std::string::npos);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -11512,6 +11707,7 @@ int main() {
   test_traversal_portal_test();
   test_traversal_trigger_scan();
   test_traversal_deep_floor();
+  test_traversal_script();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

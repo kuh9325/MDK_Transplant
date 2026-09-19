@@ -589,6 +589,32 @@ named `"C"` followed by the 10 main arenas plus a SUBSET of the
 corridor arenas — LEVEL5 has zero corridor entries, the other levels
 have 7–8 of 9 (e.g. LEVEL3 lacks `CHMO_3`/`CHMO_7`).
 
+#### tr_alcmd bytecode encoding (OBSERVED, Phase 5H)
+
+The `+0x220` pointer addresses the script's bytecode inside the CMI
+image. All program counters and call/goto operands are
+**image-relative** code offsets (`file offset = imageBase + off`,
+image base `= file+4`). Opcodes are a single byte dispatched through
+`jmp [opcode*4 + 0x438a5c]`; the legal range is `1..0xfd` (253
+slots), `0xff` is the end-of-stream byte, and `0xfe` is a linkage
+mode rather than a standalone opcode. Unknown opcodes take the
+default branch → `"Unrecognised controlalien"`.
+
+Scalar operands use a typed `mode:u8` prefix (resolver
+`FUN_00438654`): `0` = global f32 array `0x540d88`, `1` =
+bound-object `+0x48`, `2` = ctx locals `+0x234`, `3` = inline `f32`,
+`>=4` = caller ctx `+0x234`. Flag operands select a dword via
+`FUN_00438744` (`0` = global `0x540d98`, `1` = bound-obj `+0x58`,
+`2` = ctx `+0x244`, `5` = ctx `+0x312`, else = caller `+0x244`).
+
+Conditional opcodes (`0x46/47/48` flag tests, `0x60/0x67` player-in-
+box, `0x0d/0x7b` gates) take a **linkage tail** — a mode byte then
+offset operand(s) — resolved by the shared tail reader: `0xfc`/`0xfe`
+= call (4-deep stack `+0x248`), `0xfd` = return, `0x0c` = goto.
+Strings are length-prefixed (`u8 len` including the NUL, then bytes).
+See GAMEPLAY_RECONSTRUCTION.md §65–68 for the interpreter state,
+stack/diagnostic semantics and the implemented opcode table.
+
 ### Model geometry record — table[1] data targets (OBSERVED, Phase 5E)
 
 `FUN_00428400` parses ONE layout at every table[1] `blob+value` — and

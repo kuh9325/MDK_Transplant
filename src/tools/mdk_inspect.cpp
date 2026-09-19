@@ -833,6 +833,8 @@ int main(int argc, char** argv) {
   bool arenaObjects = false;
   bool surfaceCensus = false;
   bool traversalRuntime = false;
+  bool scriptDisasm = false;
+  std::string scriptDisasmName;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
   bool travStartGiven = false;
@@ -940,6 +942,14 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       traversalRuntime = true;
+    } else if (!std::strcmp(a, "--script-disasm")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;                 // .CMI path
+      scriptDisasm = true;
+      const char* n = value(a);   // arena/script record name
+      if (!n) return usage();
+      scriptDisasmName = n;
     } else if (!std::strcmp(a, "--arena")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -1087,7 +1097,7 @@ int main(int argc, char** argv) {
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
       !spriteInfoName && !collisionProbe && !arenaObjects &&
-      !surfaceCensus && !traversalRuntime) {
+      !surfaceCensus && !traversalRuntime && !scriptDisasm) {
     return 0;
   }
 
@@ -1421,6 +1431,24 @@ int main(int argc, char** argv) {
       mix(static_cast<std::uint64_t>(out.locoState));
       mix(static_cast<std::uint64_t>(out.slideChannel));
       mix(out.currentArenaSwapped ? 1 : 0);
+      // Phase 5H — fold tr_alcmd VM derived state into the digest:
+      // current-arena persisted PC/wait, cumulative instruction +
+      // spawn counters, and a surface-state summary. No script bytes.
+      if (rt.cur) {
+        mix(static_cast<std::uint64_t>(rt.cur->script.pcImageOff));
+        std::uint32_t wbits;
+        std::memcpy(&wbits, &rt.cur->script.waitSeconds, 4);
+        mix(wbits);
+        mix(static_cast<std::uint64_t>(rt.cur->script.callDepth));
+        mix(static_cast<std::uint64_t>(rt.cur->surface.opMaskA));
+        mix(static_cast<std::uint64_t>(rt.cur->surface.opMaskB));
+        for (int i = 0; i < mdk::kSurfaceSlots; ++i)
+          mix(static_cast<std::uint64_t>(rt.cur->surface.handlerOff[i]));
+      }
+      mix(static_cast<std::uint64_t>(rt.scriptInsnTotal));
+      mix(static_cast<std::uint64_t>(rt.scriptSpawned));
+      mix(static_cast<std::uint64_t>(rt.arenas.empty()
+                                        ? 0 : rt.arenas.size()));
     }
     const auto& s = rt.seams;
     std::printf("digest:    %016llx  (%d frames)\n",
@@ -1439,6 +1467,11 @@ int main(int argc, char** argv) {
                 s.pendingViewSnaps, s.objectMigrations,
                 s.type1Triggers, s.type3Prefetches,
                 s.portalsCrossed, s.deepFloorFallbacks);
+    std::printf("script:    runs=%d insn=%d spawned=%d diag=%d\n",
+                rt.scriptRuns, rt.scriptInsnTotal, rt.scriptSpawned,
+                static_cast<int>(rt.scriptDiag.size()));
+    for (const std::string& m : rt.scriptDiag)
+      std::printf("           ! %s\n", m.c_str());
     // Bounded checks: gates + at least one grounded frame. Arenas
     // with their own MTO collision blob must also show a collision
     // contact. 'C*' corridor arenas carry no blob (OBSERVED: the MTO
@@ -1487,6 +1520,54 @@ int main(int argc, char** argv) {
   // consume: the poly surface byte (+0x23) and flag bits (+0x20) across
   // each arena's region-C collision blob, and the type-7 (fan/volume) /
   // type-9 (slide-zone) DTI sub-records. Metadata only — no payloads.
+  if (scriptDisasm) {
+    // Phase 5H — decode one CMI table-3 arena script record
+    // (FUN_00458550 lookup) and print its tr_alcmd instructions.
+    const auto cmiFile = root->readFile(*target, kEntriesMaxBytes, &err);
+    if (!cmiFile) {
+      std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
+      return 1;
+    }
+    std::span<const std::byte> img(
+        reinterpret_cast<const std::byte*>(cmiFile->data()),
+        cmiFile->size());
+    const auto cmi = mdk::inspectCmiDirectory(img);
+    if (cmi.status != mdk::CmiDirectoryStatus::kOk) {
+      std::fprintf(stderr, "cmi: parse FAILED (%s)\n",
+                   std::string(mdk::cmiDirectoryStatusName(cmi.status))
+                       .c_str());
+      return 1;
+    }
+    const std::uint32_t code =
+        mdk::cmiScriptCodeOffset(cmi, img, scriptDisasmName);
+    std::printf("cmi:   %s — %zu tables, %zu t3 records\n",
+                target->c_str(), cmi.tables.size(),
+                cmi.tables.size() > 3 ? cmi.tables[3].records.size()
+                                      : 0);
+    // "*" lists every table-3 record's resolved script offset.
+    if (scriptDisasmName == "*") {
+      if (cmi.tables.size() > 3)
+        for (const auto& r : cmi.tables[3].records)
+          std::printf("  t3 %-12s codeOff=0x%x\n", r.name().c_str(),
+                      mdk::cmiScriptCodeOffset(cmi, img, r.name()));
+      return 0;
+    }
+    std::printf("script: %s  codeOff=0x%x\n", scriptDisasmName.c_str(),
+                code);
+    if (code == 0) {
+      std::printf("  (no script record / zero code offset — the "
+                  "+0x220 gate stays cleared)\n");
+      return 0;
+    }
+    const auto insns =
+        mdk::traversalScriptDisasm(img, 4, code, 256);
+    for (const auto& in : insns) {
+      std::printf("  +%04x  %02x  %s\n",
+                  in.off - code, in.opcode, in.text.c_str());
+    }
+    return 0;
+  }
+
   if (surfaceCensus) {
     const std::string dtiPath = *target;
     const auto slash = dtiPath.find_last_of("/\\");
