@@ -712,6 +712,41 @@ void SdlHost::pushVerticalSelfTestStep(std::uint64_t frameIndex) {
   }
 }
 
+void SdlHost::pushLookSelfTestStep(std::uint64_t frameIndex) {
+  constexpr std::uint64_t lastStep = 18;
+  if (!window_ || frameIndex > lastStep) {
+    return;
+  }
+  const SDL_WindowID id = SDL_GetWindowID(window_);
+  auto key = [&](SDL_Scancode sc, SDL_Keycode kc, bool down) {
+    SDL_Event e{};
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.key.windowID = id;
+    e.key.which = kSelftestKeyboardID;
+    e.key.scancode = sc;
+    e.key.key = kc;
+    e.key.down = down;
+    SDL_PushEvent(&e);
+  };
+  switch (frameIndex) {
+  case 0:  // 'A' down: factory KeyLookUp=30 (DIK 0x1e). Level set now,
+         // integrated next frame — the one-frame control latency.
+    key(SDL_SCANCODE_A, SDLK_A, true);
+    break;
+  case 5:  // 'A' up: the release lands in the merged block next frame.
+    key(SDL_SCANCODE_A, SDLK_A, false);
+    break;
+  case 10: // 'Z' down: factory KeyLookDown=44 (DIK 0x2c).
+    key(SDL_SCANCODE_Z, SDLK_Z, true);
+    break;
+  case 13: // 'Z' up.
+    key(SDL_SCANCODE_Z, SDLK_Z, false);
+    break;
+  default: // held / idle.
+    break;
+  }
+}
+
 void SdlHost::windowSizeInPixels(int* w, int* h) const {
   if (window_) {
     SDL_GetWindowSizeInPixels(window_, w, h);

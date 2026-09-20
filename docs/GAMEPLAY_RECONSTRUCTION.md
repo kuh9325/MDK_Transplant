@@ -1928,3 +1928,228 @@ collision only needs the latch.
   conditional/string opcodes not yet decoded (`0x07` yaw-normalize,
   `0x3c`, `0x55`, `0xd4`, `0xe8`); they halt with a diagnostic per the
   safety policy — the spawn completes regardless.
+
+# Phase 5J — Player Look and Camera Orientation
+
+Phase 5J pins down the normal traversal look/orientation path. The
+headline result is a **negative proof**: normal traversal has NO raw
+mouse look. The raw-delta consumer `FUN_00464624` is the sniper-mode
+update, and `FUN_00465228` (the normal movement path) never reads the
+raw deltas. Normal look is semantic-key driven through
+`FUN_00465c4c`.
+
+## 77. Call order (OBSERVED, FUN_00436100 / FUN_00463608)
+
+Per traversal frame, in original order:
+
+1. `FUN_00402388` — `consumeGameplayInput` produces the frame-N+1
+   merged control block (raw deltas land at `0x54b644`/`0x54b648`;
+   `0x4ce780`/`0x4ce784` carry the level-triggered look flags).
+2. `FUN_00463608` dispatch head — the pending-event slots
+   `0x54cb00`/`0x54cb08` are cleared; `0x540cbc` (cbc) is reset while
+   `cac` sits in the transient set `{300, 400, 500, 600, 601}`.
+3. Normal branch (`cac < 800`): `FUN_00465228` → horizontal
+   integration → `FUN_004630d4` collision → `FUN_0046603c` slide
+   helper → `FUN_00466740` jump machine → `FUN_00465c4c` look →
+   `FUN_00469cd0` deferred ops.
+4. Scripted branch (`cac >= 800`): semantic channels `d48`/`d4c`/
+   `d50`/`d54` cleared (no horizontal motion), then the same
+   `FUN_0046603c`/`FUN_00466740`/`FUN_00465c4c` tail. The look state
+   `0x324` is the only >=800 state whose exit path is proven.
+5. `FUN_00406f14` merges the frame-N+1 block into `0x4ce6xx` —
+   the one-frame latency hand-off (movement AND look share it).
+6. Idle restore: when `cbc == 0` and the pending priority is also 0,
+   the dispatcher posts `cb00=1 / cb08=0x65` (unmounted idle; the
+   `0x64` mounted variant is deferred). Then the latch:
+   `cbc < cb00 -> cac = cb08, cbc = cb00`.
+7. `FUN_00461954` (render pass): the `0x324` handler clears `cbc`
+   once `d58` has re-centred to exactly 0 — the look-state exit.
+8. `FUN_004301e0` view tail: arena-scalar blend → z-delta follower →
+   lookEff clamp → view yaw → pitch lift → effective pitch.
+
+## 78. `FUN_00464624` — sniper mode (OBSERVED, boundary)
+
+Dispatched only when `c9c != 0 && ca0 != 0` — the sniper-mode latch
+pair (`c9c` set by the sniper-enter event `0x323` path; `ca0`
+stepped by `FUN_00436100`'s head through scope phases 1→2→3). The
+function body is the sniper update: strafe slide, semantic aim
+channels `d48`/`d4c`, sniper-exit on the `0x4ce76c` pulse, fire and
+zoom handling, plus the raw-mouse aim fallback:
+
+```
+pitch (0x540b54) += dy * 0.12 * f0 * b58 * (5/12)   clamp [-50, +50]
+yaw   (0x540c2c) -= dx * 0.12 * f0 * b58 * (5/12)   wrap  [0, 360)
+```
+
+gated on `MouseOn` (0x541472) AND only when neither semantic aim
+channel is active; `MouseYReversed` (0x541476) negates the scaled
+dy. All sniper-side — NOT ported (Phase 5J boundary). The mounted
+reticle path is `FUN_004691c4` (raw dx/dy -> reticle pixels
+[128,472]/[64,296], no YReversed) — also deferred.
+
+## 79. `FUN_00465c4c` — semantic look integrator (OBSERVED,
+instruction-level)
+
+```
+eligible = (cbc < 8 || cac == 0x324)      // priority/state gate
+           && (c78 & 0x7fffffff) == 0     // vertVel == ±0
+           && (c54 & 1)                   // grounded
+```
+
+- `eligible && lookUp`   → `d58 -= f4 * 90`, clamp `>= -60 - a462`
+- `eligible && lookDown` → `d58 += f4 * 90`, clamp `<= +90 - a462`
+- otherwise              → `d58 -> 0` at `f4 * 200`, sign-snapped
+
+`lookUp` is tested first — it wins a press-conflict. `a462` is
+`[0x540c48]+0x462`, the current arena's rest-pitch scalar, so the
+ABSOLUTE pitch `a462 + d58` stays in `[-60, +90]`. Every driving or
+draining frame posts `cb00=8 / cb08=0x324` into the shared slots;
+when `d58` sits at exactly 0 the function rewrites the slots with
+their entry values — a self-store, no observable post. The look is
+momentary: release (or any gate failure) drains it at 200 deg/s.
+
+Note the recenter branch is reached on ANY eligibility failure —
+there is no early-out; a blocked look still drains the offset.
+
+## 80. `playerObj + 0x462` resolved (OBSERVED)
+
+The earlier tentative "pitch limit" label is resolved: `+0x462` is a
+field of the ARENA record (`[0x540c48]` — the current arena object),
+not the player object. It is the arena rest-pitch scalar that both
+`FUN_00465c4c`'s clamp bounds and `FUN_004301e0`'s `b54` blend
+target are relative to. Debug keys write `b54 = a462` directly; the
+port models it as `TraversalArena::scalar`.
+
+## 81. Angle units + pitch limits (OBSERVED)
+
+All orientation state is DEGREES — `FUN_00437f98` (the shared
+trig helper) takes degrees (`out1=sin(deg), out2=cos(deg)`), and the
+clamp constants decode as `+90`/`-60`/`40`. Limits: `d58` is bounded
+to `[-60 - a462, +90 - a462]`; the effective sum in `FUN_004301e0`
+re-clamps `b54 + lookEff` to the same range while `b54` is
+mid-blend. No ±89 — the original asymmetry (-60/+90) is preserved.
+
+## 82. Persistent orientation state (OBSERVED)
+
+| address      | native field            | proven semantic                    |
+|--------------|-------------------------|------------------------------------|
+| 0x540d58     | `PlayerLookState::lookPitchOffset` | semantic look offset (deg) |
+| 0x540b54     | `TraversalRuntime::viewScalar`     | blended arena scalar (init 6.0, `FUN_00433c4c`) |
+| 0x540b50     | `PlayerViewTail::viewYawDeg`       | view yaw = 90 - yaw (deg)  |
+| 0x540be0     | `PlayerViewTail::viewPitchDeg`     | effective pitch (deg)      |
+| 0x49b718     | `PlayerViewTail::viewZDelta`       | smoothed z-delta follower  |
+| 0x49b71c     | `PlayerViewTail::viewPitchLift`    | air-charge pitch lift      |
+| 0x540c2c     | `PlayerMotionState::yawDeg`        | locomotion yaw (deg)       |
+| 0x540cac     | `TraversalRuntime::locoState`      | dispatched state (cac)     |
+| 0x540cbc     | `TraversalRuntime::eventPriority`  | current event pri (cbc)    |
+| 0x54cb00/08  | `TraversalRuntime::eventType/eventMag` | pending event slots    |
+| 0x540bec     | `TraversalRuntime::flagBec`        | scalar blend gate          |
+| 0x540c9c/a0  | — (sniper latch pair)              | sniper-mode gate, deferred |
+| 0x540c84     | `PlayerMotionState::airCharge`     | air-charge counter         |
+
+## 83. View yaw + coupling (OBSERVED)
+
+`0x540b50 = 90 - yaw` — the view yaw is a pure function of the
+locomotion yaw. There is NO independent free-look yaw in normal
+traversal (the independent aim yaw exists only inside the sniper
+branch, writing `c2c` directly). Movement yaw semantics are
+untouched — no double yaw integration.
+
+## 84. `FUN_004301e0` view tail (OBSERVED, ported slice)
+
+Runs in the render pass after the traversal dispatch. Ported:
+
+- `c9c == 0 && 0x49b740 != 0` → `FUN_00431100` view-snap seam +
+  prev-pos commit only (seam counted, not emulated).
+- `c9c != 0` → `bec = 0`. Else `b54 != a462 && bec == 0` →
+  `b54 = b54*0.85 + a462*0.15` (the blend); else `bec = 0`.
+- `dz = clamp(posZ - prevPosZ, ±0.5)`; `b718 = b718*0.97 + dz*0.03`;
+  then a sign-disagreement slew at `f0*0.02` that never crosses the
+  raw value (the EMA alone decays too slowly to flip sign).
+- `lookEff = d58`; while `d58 != 0 && b54 != a462`, the sum
+  `b54 + lookEff` is bounded to `[-60 - a462, +90 - a462]` —
+  `lookEff` takes the excess.
+- `b71c = c84 * 2/3` capped at 40 while `c84 != 0` (negative c84 is
+  NOT capped — OBSERVED asymmetry); else decays to 0 at `f4 * 40`,
+  clamped at 0.
+- effective pitch `0x540be0 = b54 + lookEff - b718*40 + b71c`.
+- prev-pos commit (`0x540c08..0x540c10 = 0x540bfc..0x540c04`) runs
+  every frame on all paths.
+
+The matrix rows / camera position / FOV writes that follow
+(`0x540b28..`) are the renderer boundary — NOT ported.
+
+## 85. Timing (OBSERVED)
+
+- `FUN_00465c4c` integrates with `f4` (`0x49b6f4`, delta-seconds
+  ~1/30) — NOT `f0`. 90 deg/s look rate, 200 deg/s recenter.
+- The `b718` sign-slew is `f0`-scaled (`0x49b6f0`, frame-units);
+  the `b71c` lift decay is `f4`-scaled. The asymmetry is preserved.
+
+## 86. Raw vs semantic, MouseYReversed, MouseOn (OBSERVED)
+
+- Raw `dx`/`dy` (`0x54b644`/`0x54b648`): consumed ONLY by
+  `FUN_00464624` (sniper) and `FUN_004691c4` (mounted reticle).
+  `FUN_00465228` never reads them — normal traversal has no raw
+  mouse look. Phase 5A carries the fields as input state only.
+- Semantic `0x4ce780`/`0x4ce784`: keyboard level | button-mask bits
+  (LookUp bit 0x8, LookDown bit 0x10) — merged with the same
+  one-frame latency as movement.
+- `MouseYReversed`/`MouseOn` gate the SNIPER raw path only; the
+  semantic path ignores both (a semantic "mouse turn" axes-map
+  product would arrive as key-level look flags — unchanged by
+  either flag). Not reproduced in normal look.
+
+## 87. Native implementation
+
+`src/core/player_look.{h,cpp}`:
+
+- `integratePlayerLook(ctrl, env, state)` — `FUN_00465c4c`. Returns
+  the post flag; the runtime owns the shared pending slots.
+- `updatePlayerViewTail(env, tail)` — the `FUN_004301e0` orientation
+  tail (z-delta follower, lookEff clamp, view yaw, lift, effective
+  pitch). The `b54` blend + `bec` gate stay in the runtime.
+
+`stepTraversalRuntime` dispatch restructure (OBSERVED ordering):
+pending-slot clear + transient `cbc` reset at the head; the
+`cac >= 800` scripted-branch model (channels cleared, no horizontal
+motion) scoped to `0x324`; motion/vertical/look posts all write the
+pending slots in producer order; the `FUN_00406f14` merge; then
+idle restore + the `cbc < cb00` latch; the `FUN_00461954` fold runs
+in the render pass before `FUN_004301e0`'s tail.
+
+## 88. Phase 5J validation
+
+- `tests/native/test_main.cpp` `test_player_look`: 61 checks —
+  idle/up/down/both-pressed integration, arena-relative clamps,
+  200 deg/s recenter with the exact-zero snap, all four eligibility
+  gates (cbc>=8, vertVel, grounded, the `cac==0x324` override), f4
+  timing, the view-tail clamp/EMA/slew/lift math, a golden
+  press-hold-release-settle sequence, and a `stepTraversalRuntime`
+  end-to-end test (real floor: raw-key latency, `0x324` entry,
+  scripted-branch motion suppression, recenter, fold, idle exit).
+- `--selftest-player-look`: 'A'/'Z' SDL script through the real
+  input seam; verifies the offset, posts, and the latched state
+  sequence per frame. PASS.
+- `--traversal-runtime` on LEVEL3-8: all PASS; `CHMO_2 -> HMO_3`
+  still completes `portals=1`, `teleport=0` — the look path does
+  not perturb the corridor route. The digest folds the deterministic
+  look/view fields; `59db780d09689c7b` (120f) is stable across runs.
+- 3481 native checks / 0 failures; CTest 1/1; Python 17/17.
+
+## 89. Phase 5J boundary / remaining unknowns
+
+- `FUN_00464624` (sniper mode: strafe slide, semantic+raw aim, exit,
+  fire, zoom) — decoded but NOT ported; the `c9c`/`ca0` latch pair
+  and scope-phase stepping live in `FUN_00436100`'s head (seam).
+- `FUN_004691c4` mounted reticle (`e70 & 0x40000` branch) — decoded
+  boundary, not ported.
+- The generic animation machine `FUN_00461954` — only its `0x324`
+  `cbc`-clear write is folded; the full machine is deferred, so
+  other `cac >= 800` states (806 hard-land, `0x323`/`0x384` sniper,
+  `0x385` slide) keep the normal dispatch path for now.
+- `FUN_004301e0`'s camera matrix/position/FOV block (`0x540b28..`)
+  and `FUN_00431100` view-snap — renderer boundary, counted seams.
+- `0x540c84` air-charge semantics belong to the vertical model
+  (Phase 5C); its `b71c` lift consumption is ported, its production
+  is unchanged.

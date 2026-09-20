@@ -11830,6 +11830,328 @@ void test_traversal_object_init() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5J — player look and view orientation
+// ---------------------------------------------------------------------------
+
+namespace {
+mdk::PlayerLookEnvironment lookEnv(float scalar = 0.0f) {
+  mdk::PlayerLookEnvironment e;
+  e.deltaSeconds = 1.0f / 30.0f;
+  e.arenaScalar = scalar;
+  e.eventPriority = 0;
+  e.locoState = 0;
+  e.vertVelZero = true;
+  e.grounded = true;
+  return e;
+}
+mdk::GameplayInputFrame lookCtl(bool up, bool down) {
+  mdk::GameplayInputFrame c{};
+  c.lookUp = up ? 1u : 0u;
+  c.lookDown = down ? 1u : 0u;
+  return c;
+}
+} // namespace
+
+void test_player_look() {
+  // ---- idle at zero: the d58==0 self-store posts nothing ---------
+  {
+    mdk::PlayerLookState s;
+    auto f = mdk::integratePlayerLook(lookCtl(false, false),
+                                      lookEnv(), s);
+    CHECK(!f.eventPosted);
+    CHECK(s.lookPitchOffset == 0.0f);
+  }
+
+  // ---- LookUp held: -90 deg/s, event 8/0x324 each frame ----------
+  {
+    mdk::PlayerLookState s;
+    for (int i = 1; i <= 3; ++i) {
+      auto f = mdk::integratePlayerLook(lookCtl(true, false),
+                                        lookEnv(), s);
+      CHECK(f.eventPosted);
+      CHECK(near(s.lookPitchOffset, -3.0 * i, 1e-5));
+    }
+  }
+
+  // ---- LookDown held: +90 deg/s ----------------------------------
+  {
+    mdk::PlayerLookState s;
+    auto f = mdk::integratePlayerLook(lookCtl(false, true),
+                                      lookEnv(), s);
+    CHECK(f.eventPosted);
+    CHECK(near(s.lookPitchOffset, 3.0, 1e-5));
+  }
+
+  // ---- both pressed: lookUp is tested first, it wins -------------
+  {
+    mdk::PlayerLookState s;
+    auto f = mdk::integratePlayerLook(lookCtl(true, true),
+                                      lookEnv(), s);
+    CHECK(f.eventPosted);
+    CHECK(near(s.lookPitchOffset, -3.0, 1e-5));
+  }
+
+  // ---- clamps are arena-scalar relative: [-60-a462, +90-a462] ----
+  {
+    mdk::PlayerLookState s;
+    for (int i = 0; i < 40; ++i)
+      mdk::integratePlayerLook(lookCtl(false, true), lookEnv(), s);
+    CHECK(near(s.lookPitchOffset, 90.0, 1e-4));       // +90 - 0
+    for (int i = 0; i < 60; ++i)
+      mdk::integratePlayerLook(lookCtl(true, false), lookEnv(), s);
+    CHECK(near(s.lookPitchOffset, -60.0, 1e-4));      // -60 - 0
+    // scalar=10 shifts both bounds: absolute pitch stays [-60,+90].
+    mdk::PlayerLookState s2;
+    for (int i = 0; i < 40; ++i)
+      mdk::integratePlayerLook(lookCtl(false, true), lookEnv(10), s2);
+    CHECK(near(s2.lookPitchOffset, 80.0, 1e-4));      // +90 - 10
+    for (int i = 0; i < 60; ++i)
+      mdk::integratePlayerLook(lookCtl(true, false), lookEnv(10), s2);
+    CHECK(near(s2.lookPitchOffset, -70.0, 1e-4));     // -60 - 10
+  }
+
+  // ---- release: recenter at 200 deg/s, sign-snapped to 0 ---------
+  {
+    mdk::PlayerLookState s;
+    s.lookPitchOffset = -30.0f;
+    auto f = mdk::integratePlayerLook(lookCtl(false, false),
+                                      lookEnv(), s);
+    CHECK(f.eventPosted);              // posts while draining
+    CHECK(near(s.lookPitchOffset, -30.0 + 200.0 / 30.0, 1e-4));
+    while (s.lookPitchOffset != 0.0f)
+      f = mdk::integratePlayerLook(lookCtl(false, false),
+                                   lookEnv(), s);
+    CHECK(s.lookPitchOffset == 0.0f);  // exact zero, no overshoot
+    f = mdk::integratePlayerLook(lookCtl(false, false),
+                                 lookEnv(), s);
+    CHECK(!f.eventPosted);             // settled: self-store only
+    // Same from the positive side.
+    s.lookPitchOffset = 5.0f;
+    mdk::integratePlayerLook(lookCtl(false, false), lookEnv(), s);
+    CHECK(s.lookPitchOffset == 0.0f);  // 5 - 6.67 -> snapped to 0
+  }
+
+  // ---- eligibility gates route to the recenter branch ------------
+  {
+    mdk::PlayerLookState s;
+    s.lookPitchOffset = -20.0f;
+    // Airborne (vertVel nonzero): holding lookUp still recenters.
+    auto e = lookEnv();
+    e.vertVelZero = false;
+    auto f = mdk::integratePlayerLook(lookCtl(true, false), e, s);
+    CHECK(f.eventPosted);
+    CHECK(near(s.lookPitchOffset, -20.0 + 200.0 / 30.0, 1e-4));
+    // Not grounded: same.
+    s.lookPitchOffset = -20.0f;
+    e = lookEnv();
+    e.grounded = false;
+    mdk::integratePlayerLook(lookCtl(true, false), e, s);
+    CHECK(near(s.lookPitchOffset, -20.0 + 200.0 / 30.0, 1e-4));
+    // cbc >= 8 with a non-look cac: ineligible.
+    s.lookPitchOffset = -20.0f;
+    e = lookEnv();
+    e.eventPriority = 8;
+    e.locoState = 0x323;
+    mdk::integratePlayerLook(lookCtl(true, false), e, s);
+    CHECK(near(s.lookPitchOffset, -20.0 + 200.0 / 30.0, 1e-4));
+    // cbc >= 8 but cac == 0x324: the state override keeps it live.
+    s.lookPitchOffset = -20.0f;
+    e.locoState = mdk::kLookEventCode;
+    f = mdk::integratePlayerLook(lookCtl(true, false), e, s);
+    CHECK(f.eventPosted);
+    CHECK(near(s.lookPitchOffset, -20.0 - 3.0, 1e-4));
+  }
+
+  // ---- non-default timing: the integrator is f4-scaled -----------
+  {
+    mdk::PlayerLookState s;
+    auto e = lookEnv();
+    e.deltaSeconds = 2.0f / 30.0f;
+    mdk::integratePlayerLook(lookCtl(true, false), e, s);
+    CHECK(near(s.lookPitchOffset, -6.0, 1e-5));
+  }
+
+  // ---- view tail: z-delta clamp + EMA ----------------------------
+  {
+    mdk::PlayerViewTail t;
+    mdk::PlayerViewTailEnvironment e;
+    e.dz = 2.0f;                          // clamps to +0.5
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.viewZDelta, 0.5 * 0.03, 1e-6));
+    // EMA converges toward the clamped input.
+    for (int i = 0; i < 600; ++i) mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.viewZDelta, 0.5, 1e-3));
+  }
+
+  // ---- view tail: sign-disagreement slew never crosses the raw ---
+  {
+    mdk::PlayerViewTail t;
+    mdk::PlayerViewTailEnvironment e;
+    t.viewZDelta = 0.4f;
+    e.dz = -0.1f;                          // opposite sign -> slew
+    mdk::updatePlayerViewTail(e, t);
+    // EMA: 0.4*0.97 - 0.1*0.03 = 0.385, then -0.02 slew = 0.365.
+    CHECK(near(t.viewZDelta, 0.365, 1e-6));
+    // With dz = 0 held, the slew drains to exactly 0 (snap, never
+    // crosses the raw value).
+    t.viewZDelta = 0.03f;
+    e.dz = 0.0f;
+    for (int i = 0; i < 4; ++i) mdk::updatePlayerViewTail(e, t);
+    CHECK(t.viewZDelta == 0.0f);
+  }
+
+  // ---- view tail: lookEff arena-relative clamp -------------------
+  {
+    mdk::PlayerViewTail t;
+    mdk::PlayerViewTailEnvironment e;
+    e.arenaScalar = 10.0f;
+    e.viewScalar = 20.0f;                  // mid-blend (!= scalar)
+    e.lookOffset = 80.0f;
+    mdk::updatePlayerViewTail(e, t);
+    // sum = 100 > hi (90-10=80) -> lookEff = 80 - 20 = 60.
+    CHECK(near(t.lookEffDeg, 60.0, 1e-5));
+    // viewScalar == arenaScalar: the clamp is skipped entirely.
+    e.viewScalar = 10.0f;
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.lookEffDeg, 80.0, 1e-5));
+  }
+
+  // ---- view tail: view yaw mirrors locomotion yaw about +90 ------
+  {
+    mdk::PlayerViewTail t;
+    mdk::PlayerViewTailEnvironment e;
+    e.yawDeg = 96.0f;
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.viewYawDeg, -6.0, 1e-6));
+  }
+
+  // ---- view tail: air-charge lift, cap and decay -----------------
+  {
+    mdk::PlayerViewTail t;
+    mdk::PlayerViewTailEnvironment e;
+    e.airCharge = 30.0f;
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.viewPitchLift, 20.0, 1e-5));   // 30 * 2/3
+    e.airCharge = 90.0f;
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.viewPitchLift, 40.0, 1e-5));   // capped at 40
+    e.airCharge = 0.0f;
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(near(t.viewPitchLift, 40.0 - 40.0 / 30.0, 1e-4));
+    t.viewPitchLift = 0.5f;
+    mdk::updatePlayerViewTail(e, t);
+    CHECK(t.viewPitchLift == 0.0f);             // snapped, no neg
+  }
+
+  // ---- view tail: effective pitch = scalar + look - dip + lift ---
+  {
+    mdk::PlayerViewTail t;
+    mdk::PlayerViewTailEnvironment e;
+    e.arenaScalar = 6.0f;
+    e.viewScalar = 6.0f;
+    e.lookOffset = -30.0f;
+    e.airCharge = 15.0f;
+    t.viewZDelta = 0.1f;
+    // EMA keeps sign (dz=0 -> slew applies: 0.1*0.97 - 0.02).
+    mdk::updatePlayerViewTail(e, t);
+    const float zd = 0.1f * 0.97f - 0.02f;
+    CHECK(near(t.viewPitchDeg,
+               6.0 + (-30.0) - zd * 40.0 + 15.0 * (2.0 / 3.0), 1e-4));
+  }
+
+  // ---- golden sequence: press -> hold -> release -> settle -------
+  {
+    mdk::PlayerLookState s;
+    const mdk::PlayerLookEnvironment e = lookEnv();
+    const mdk::GameplayInputFrame up = lookCtl(true, false);
+    const mdk::GameplayInputFrame idle = lookCtl(false, false);
+    // f0 idle: nothing.
+    CHECK(!mdk::integratePlayerLook(idle, e, s).eventPosted);
+    // f1..f4 lookUp: -3 per frame, posting.
+    for (int i = 1; i <= 4; ++i) {
+      CHECK(mdk::integratePlayerLook(up, e, s).eventPosted);
+      CHECK(near(s.lookPitchOffset, -3.0 * i, 1e-5));
+    }
+    // f5..f6 release: +6.667 per frame, still posting while nonzero.
+    CHECK(mdk::integratePlayerLook(idle, e, s).eventPosted);
+    CHECK(near(s.lookPitchOffset, -12.0 + 200.0 / 30.0, 1e-4));
+    CHECK(mdk::integratePlayerLook(idle, e, s).eventPosted);
+    CHECK(s.lookPitchOffset == 0.0f);   // snapped on this frame
+    // f7: settled.
+    CHECK(!mdk::integratePlayerLook(idle, e, s).eventPosted);
+  }
+
+  // ---- dispatch: the look state's entry, scripted gate, exit -----
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "TEST");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    rt.cur = a;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1;
+    rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 12.0f;
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const mdk::RawGameplayInput idle{};
+
+    // Land: gravity settles the player onto the z=10 floor.
+    for (int i = 0; i < 30 && !(rt.vert.contactFlags & 1); ++i)
+      mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK((rt.vert.contactFlags & 1) != 0);
+    CHECK(rt.vert.vertVel == 0.0f);
+    CHECK(rt.locoState == 0x65);       // idle restore latched
+
+    // Hold lookUp through the raw key path (factory code 30) — the
+    // merged control lands in prevFrame ONE step later (latency).
+    mdk::RawGameplayInput lookKey{};
+    lookKey.keyLevel[30 >> 5] |= 1u << (30 & 31);
+    mdk::stepTraversalRuntime(rt, lookKey, bindings, timing);
+    CHECK(rt.locoState != mdk::kLookEventCode); // still idle: N-1
+    const float preX = rt.cs.pos[0], preY = rt.cs.pos[1];
+    auto out = mdk::stepTraversalRuntime(rt, lookKey, bindings, timing);
+    CHECK(out.locoState == mdk::kLookEventCode);
+    CHECK(rt.eventPriority == mdk::kLookEventPri);
+    CHECK(near(rt.look.lookPitchOffset, -3.0, 1e-5));
+    CHECK(near(out.lookOffsetDeg, -3.0, 1e-5));
+    // The 0x324 scripted branch suppresses horizontal motion: a
+    // nonzero move request in the merged block produces no
+    // displacement while the look state is dispatched.
+    rt.prevFrame.moveVel = -1.0f;
+    rt.prevFrame.moveVelBoosted = -1.0f;
+    out = mdk::stepTraversalRuntime(rt, lookKey, bindings, timing);
+    CHECK(rt.cs.pos[0] == preX && rt.cs.pos[1] == preY);
+    CHECK(near(rt.look.lookPitchOffset, -6.0, 1e-5));
+    rt.prevFrame.moveVel = 0.0f;
+    rt.prevFrame.moveVelBoosted = 0.0f;
+
+    // Release: one frame of latency — the merged block still holds
+    // lookUp for one more step before the release lands.
+    out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.locoState == mdk::kLookEventCode);
+    CHECK(near(rt.look.lookPitchOffset, -9.0, 1e-5));
+    // Now the released block arrives: recenter at 200 deg/s.
+    out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(near(rt.look.lookPitchOffset, -9.0 + 200.0 / 30.0, 1e-4));
+    // Next frame snaps to exactly 0; the FUN_00461954 fold clears
+    // the priority while cac is still 0x324.
+    out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.look.lookPitchOffset == 0.0f);
+    CHECK(rt.eventPriority == 0);      // the anim-end fold ran
+    CHECK(out.locoState == mdk::kLookEventCode);
+    // The NEXT dispatch's idle restore returns cac.
+    out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.locoState == 0x65);      // idle restore returned cac
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -11879,6 +12201,7 @@ int main() {
   test_traversal_deep_floor();
   test_traversal_script();
   test_traversal_object_init();
+  test_player_look();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -72,6 +72,11 @@ void usage(const char* argv0) {
       "                        jump hold/release script and drive the\n"
       "                        real collision query on a synthetic\n"
       "                        flat-floor arena each frame\n"
+      "  --selftest-player-look\n"
+      "                        inject the deterministic Phase 5J\n"
+      "                        look-up/look-down key script and verify\n"
+      "                        the semantic look offset and 0x324 state\n"
+      "                        each frame\n"
       "  --no-relative-mouse   do not capture the mouse\n"
       "  -h, --help            this message\n",
       argv0);

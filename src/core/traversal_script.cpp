@@ -1262,7 +1262,7 @@ void traversalScriptSurfaceHandler(SurfaceObjectState& ctx,
 
   TraversalScriptResult sr = traversalScriptRun(env);
   rt->scriptInsnTotal += sr.instructions;
-  if (env.slideClear) { rt->slideChannel = 0; rt->slideAux = 0; }
+  if (env.slideClear) { rt->slideChannel = 0; rt->eventPriority = 0; }
   rt->slideChannel = env.slideChannel;
   if (sr.error) result |= 0x0;      // diagnostics already logged
 }

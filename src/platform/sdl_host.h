@@ -147,6 +147,21 @@ public:
   //                     c84 clears the frame AFTER landing (quirk)
   void pushVerticalSelfTestStep(std::uint64_t frameIndex);
 
+  // --selftest-player-look (Phase 5J) deterministic look script.
+  // 'A' (factory KeyLookUp=30) and 'Z' (factory KeyLookDown=44) holds
+  // drive the FUN_00465c4c semantic integrator through the same
+  // one-frame-latency control seam:
+  //   0:  'A' down    -> lookUp flag set (integrates next frame)
+  //   1..4: held      -> d58 -3 deg/frame, event 8/0x324
+  //   5:  'A' up      -> release still in flight (latency)
+  //   6..8: idle      -> recenter 200 deg/s, snap to 0, state exits
+  //   9:  idle        -> settled (no post)
+  //   10: 'Z' down    -> lookDown flag set (integrates next frame)
+  //   11..13: held    -> d58 +3 deg/frame
+  //   14..15: idle    -> recenter, snap to 0
+  //   16..18: idle    -> settled
+  void pushLookSelfTestStep(std::uint64_t frameIndex);
+
   // Install an SDL event filter that drops all REAL key/button/motion
   // events — injected events carry a sentinel device ID and pass
   // through. Without this the physical mouse/keyboard race the script

@@ -75,6 +75,7 @@
 #include "core/dynamic_objects.h"
 #include "core/frontend_machines.h"
 #include "core/gameplay_input.h"
+#include "core/player_look.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
 #include "core/player_surface.h"
@@ -215,7 +216,9 @@ struct TraversalFrameResult {
   float contactNormal[3] = {0, 0, 0};
   float playerBox[6] = {0, 0, 0, 0, 0, 0}; // 0x540c30..44
   int locoState = 0;                 // 0x540cac
-  int eventType = 0, eventMag = 0;   // 0x54cb00/08
+  int eventType = 0, eventMag = 0;   // 0x54cb00/08 — the pending
+                                     // event slots (cleared each
+                                     // dispatch head, OBSERVED)
   int slideChannel = 0;              // 0x540e24
   bool viewOnPartner = false;        // 0x49b714
   bool partnerActive = false;        // 0x540ca8
@@ -223,6 +226,11 @@ struct TraversalFrameResult {
   int portalCandidate = -1;          // dest arena idx (fields[0])
   float eventTimer = 0.0f;           // 0x540eb0
   float viewScalar = 0.0f;           // 0x540b54
+  float lookOffsetDeg = 0.0f;        // 0x540d58 — look offset
+  float viewYawDeg = 0.0f;           // 0x540b50 — 90 - yaw
+  float viewPitchDeg = 0.0f;         // 0x540be0 — effective pitch
+  float viewZDelta = 0.0f;           // 0x49b718
+  float viewPitchLift = 0.0f;        // 0x49b71c
   TraversalSeams seams;              // cumulative snapshot
 };
 
@@ -263,13 +271,23 @@ struct TraversalRuntime {
   int slideChannel = 0;           // 0x540e24 — slide-mode channel;
                                   // portal pass sets it to -15
                                   // when positive (OBSERVED)
-  int slideAux = 0;               // 0x540cbc — slide aux word; the
-                                  // writer is UNKNOWN (not portal)
+  int eventPriority = 0;          // 0x540cbc — current event
+                                  // priority (cbc): the dispatcher
+                                  // latches cac/cbc = cb08/cb00
+                                  // when cbc < cb00; cleared for the
+                                  // transient states 300/400/500/
+                                  // 600/601 at the dispatch head, by
+                                  // the slide clear, and by the
+                                  // look-anim end (OBSERVED set of
+                                  // writers — the earlier "slide
+                                  // aux" guess is resolved)
   bool viewOnPartner = false;     // 0x49b714 — surface-update select
   int flag49b740 = 0;             // 0x49b740 — FUN_004301e0 gate
-  float viewScalar = 0.0f;        // 0x540b54 — blended arena scalar
-  float viewRoll = 0.0f;          // 0x49b718 — smoothed z-delta
-                                  // scalar (old*0.97 + dz*0.03)
+  float viewScalar = 6.0f;        // 0x540b54 — blended arena scalar;
+                                  // FUN_00433c4c inits it to 6.0
+  PlayerLookState look;           // Phase 5J — 0x540d58 (FUN_00465c4c)
+  PlayerViewTail view;            // Phase 5J — 0x49b718/0x49b71c/
+                                  // 0x540b50/0x540be0 (FUN_004301e0)
   int flagBec = 0;                // 0x540bec — blend gate
   int pendingViewSnap = 0;        // 0x540ebc
   float pendingView[4] = {0, 0, 0, 0}; // 0x540ec0..0x540ecc

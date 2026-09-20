@@ -22,6 +22,7 @@
 #include "core/log.h"
 #include "core/mode_dispatch.h"
 #include "core/options_menu.h"
+#include "core/player_look.h"
 #include "core/player_motion.h"
 #include "core/player_vertical.h"
 #include "core/sni_directory.h"
@@ -1903,6 +1904,115 @@ VerticalCollisionResult adaptCollisionSelftest(
 
 } // namespace
 
+// --selftest-player-look (Phase 5J) per-frame verifier. The SDL
+// script holds 'A' (factory KeyLookUp=30) frames 0-4 and 'Z'
+// (factory KeyLookDown=44) frames 10-12; expectations are
+// hand-computed from the reconstructed FUN_00465c4c semantics
+// (f4=1/30, look rate 90 deg/s, recenter 200 deg/s sign-snapped to
+// exactly 0) plus the dispatcher contract the runtime reproduces:
+// the 8/0x324 pending post, the cbc/cac latch, the FUN_00461954
+// priority fold on recenter, and the idle restore (1/0x65).
+static bool verifyLookSelfTestFrame(
+    std::uint64_t i, const PlayerLookFrame& lk,
+    const PlayerLookState& ls, int locoState, int eventPriority,
+    const GameplayInputBindings& b) {
+  bool ok = true;
+  auto expect = [&](bool cond, const char* what) {
+    if (!cond) {
+      log::warn(kTag, "look selftest f%llu: %s",
+                (unsigned long long)i, what);
+      ok = false;
+    }
+  };
+  auto near = [](float a, double e, double eps = 1e-4) {
+    return std::fabs((double)a - e) < eps;
+  };
+  const bool aIsLookUp = (b.keys[10] == 30);   // factory 'A'
+  const bool zIsLookDown = (b.keys[11] == 44); // factory 'Z'
+  const double step = 90.0 / 30.0;             // f4 * 90
+  const double recent = 200.0 / 30.0;          // f4 * 200
+  switch (i) {
+  case 0:  // 'A' consumed this frame; the integrator still sees the
+         // zero control — OBSERVED one-frame input latency.
+    expect(ls.lookPitchOffset == 0.0f && !lk.eventPosted,
+           "f0: look before the merge (latency broken)");
+    expect(locoState == 0x65, "f0: idle restore did not latch 0x65");
+    break;
+  case 1:
+  case 2:
+  case 3:
+  case 4:
+  case 5:  // held (f5's release lands next frame — latency).
+    if (aIsLookUp) {
+      expect(near(ls.lookPitchOffset, -step * (double)i),
+             "f1-5: look-up rate wrong");
+      expect(lk.eventPosted, "f1-5: no 8/0x324 post");
+      expect(locoState == kLookEventCode && eventPriority == 8,
+             "f1-5: 0x324 state/latch wrong");
+    } else {
+      expect(ls.lookPitchOffset == 0.0f, "f1-5: unbound 'A' looked");
+    }
+    break;
+  case 6:
+    if (aIsLookUp)
+      expect(near(ls.lookPitchOffset, -15.0 + recent),
+             "f6: recenter rate wrong");
+    break;
+  case 7:
+    if (aIsLookUp)
+      expect(near(ls.lookPitchOffset, -15.0 + 2.0 * recent),
+             "f7: recenter rate wrong");
+    break;
+  case 8:  // the drain snaps to exactly 0; the FUN_00461954 fold
+         // clears the priority while cac is still 0x324.
+    if (aIsLookUp) {
+      expect(ls.lookPitchOffset == 0.0f, "f8: recenter did not snap");
+      expect(locoState == kLookEventCode && eventPriority == 0,
+             "f8: anim-end fold wrong");
+    }
+    break;
+  case 9:  // the dispatch's idle restore returns cac.
+    if (aIsLookUp)
+      expect(locoState == 0x65, "f9: idle restore did not fire");
+    break;
+  case 10: // 'Z' consumed this frame (latency).
+    expect(ls.lookPitchOffset == 0.0f && !lk.eventPosted,
+           "f10: look-down before the merge (latency broken)");
+    break;
+  case 11:
+  case 12:
+  case 13: // held (f13's release lands next frame).
+    if (zIsLookDown) {
+      expect(near(ls.lookPitchOffset, step * (double)(i - 10)),
+             "f11-13: look-down rate wrong");
+      expect(lk.eventPosted, "f11-13: no 8/0x324 post");
+      expect(locoState == kLookEventCode, "f11-13: 0x324 not latched");
+    } else {
+      expect(ls.lookPitchOffset == 0.0f, "f11-13: unbound 'Z' looked");
+    }
+    break;
+  case 14:
+    if (zIsLookDown)
+      expect(near(ls.lookPitchOffset, 9.0 - recent),
+             "f14: recenter rate wrong");
+    break;
+  case 15:
+    if (zIsLookDown) {
+      expect(ls.lookPitchOffset == 0.0f, "f15: recenter did not snap");
+      expect(eventPriority == 0, "f15: anim-end fold wrong");
+    }
+    break;
+  default: // f16..18: settled idle.
+    if (i <= 18) {
+      expect(ls.lookPitchOffset == 0.0f && !lk.eventPosted,
+             "f16+: look not settled");
+      expect(locoState == 0x65, "f16+: not back at idle");
+    }
+    break;
+  }
+  return ok;
+}
+
 Application::Application(AppConfig cfg) : cfg_(std::move(cfg)) {}
 
 int Application::run() {
@@ -1924,7 +2034,8 @@ int Application::run() {
 
   ModeDispatcher dispatcher;
   if ((cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
-       cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) &&
+       cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision ||
+       cfg_.selftestPlayerLook) &&
       cfg_.interactiveFrontend) {
     // The diagnostics own the raw-key machine per frame; combining
     // them with the front-end would double-poll the latch/edge
@@ -1935,12 +2046,13 @@ int Application::run() {
   }
   if ((int)cfg_.selftestGameplayInput + (int)cfg_.selftestPlayerMotion +
           (int)cfg_.selftestPlayerVertical +
-          (int)cfg_.selftestPlayerCollision >
+          (int)cfg_.selftestPlayerCollision +
+          (int)cfg_.selftestPlayerLook >
       1) {
     // Each selftest injects its own script; running two would
     // interleave two incompatible event streams.
-    log::error(kTag, "gameplay/motion/vertical/collision selftests "
-                     "are mutually exclusive");
+    log::error(kTag, "gameplay/motion/vertical/collision/look "
+                     "selftests are mutually exclusive");
     return 2;
   }
   host.onQuit = [&] { dispatcher.requestQuit(); };
@@ -2395,8 +2507,19 @@ int Application::run() {
     collisionState.floorZ = 10.0f;
   }
   bool collisionLandingChecked = false;
+  // Phase 5J: the semantic look integrator runs on the previous-frame
+  // control seam; the dispatcher's pending-event slots, the cbc/cac
+  // latch and the FUN_00461954 anim-end fold are simulated with two
+  // ints so the state contract is exercised end to end.
+  PlayerLookState lookState;
+  PlayerLookEnvironment lookEnv; // scalar 0, f4 = 1/30 defaults
+  lookEnv.vertVelZero = true;
+  lookEnv.grounded = true;
+  int lookLocoState = 0;
+  int lookEventPriority = 0;
   if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
-      cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
+      cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision ||
+      cfg_.selftestPlayerLook) {
     host.isolateHardwareInputForSelftest();
     FrontendSettings gs;
     if (cfg_.settingsFile) {
@@ -2424,12 +2547,14 @@ int Application::run() {
     gameplayBindings = gameplayBindingsFromSettings(gs);
     if (cfg_.frames == 0) {
       // Scripts: 17 gameplay steps (0..16) / 24 motion steps
-      // (0..23) / 56 vertical steps (0..55) — quit right after the
-      // last injected step.
+      // (0..23) / 56 vertical steps (0..55) / 19 look steps
+      // (0..18) — quit right after the last injected step.
       cfg_.frames = (cfg_.selftestPlayerVertical ||
                      cfg_.selftestPlayerCollision)
                         ? 56
-                        : cfg_.selftestPlayerMotion ? 24 : 17;
+                        : cfg_.selftestPlayerMotion
+                              ? 24
+                              : cfg_.selftestPlayerLook ? 19 : 17;
     }
   }
 
@@ -2453,6 +2578,10 @@ int Application::run() {
       // Phase 5C/5D script: one deterministic jump hold/release step.
       host.pushVerticalSelfTestStep(clock.frameCount());
     }
+    if (cfg_.selftestPlayerLook) {
+      // Phase 5J script: one deterministic look-key step.
+      host.pushLookSelfTestStep(clock.frameCount());
+    }
     host.pumpEvents(input);
     const FrameTick t = clock.tick();
 
@@ -2463,7 +2592,8 @@ int Application::run() {
     }
 
     if (cfg_.selftestGameplayInput || cfg_.selftestPlayerMotion ||
-        cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision) {
+        cfg_.selftestPlayerVertical || cfg_.selftestPlayerCollision ||
+        cfg_.selftestPlayerLook) {
       // frontendInputFromSdl runs the raw-key machine (level/latch/
       // prev — the FUN_0046b688 analogue) and the DIMOUSESTATE-domain
       // mouse fields; the bindings snapshot carries the loaded
@@ -2591,6 +2721,40 @@ int Application::run() {
           }
         }
         prevGameplayFrame = gf;
+      }
+      if (cfg_.selftestPlayerLook) {
+        // Phase 5J dispatch contract (FUN_00463608 + FUN_00465c4c):
+        // the integrator consumes the PREVIOUS frame's merged block
+        // and posts into the pending slots; the tail below replays
+        // the idle restore, the cbc/cac latch and the FUN_00461954
+        // anim-end fold in the original's order.
+        int evType = 0, evMag = 0;      // the cleared pending slots
+        lookEnv.eventPriority = lookEventPriority;
+        lookEnv.locoState = lookLocoState;
+        const PlayerLookFrame lk = integratePlayerLook(
+            prevGameplayFrame, lookEnv, lookState);
+        if (lk.eventPosted) {
+          evType = kLookEventPri;
+          evMag = kLookEventCode;
+        }
+        prevGameplayFrame = gf;         // the FUN_00406f14 merge
+        if (lookEventPriority == 0 && evType == 0) {
+          evType = 1;                   // idle restore (unmounted)
+          evMag = 0x65;
+        }
+        if (lookEventPriority < evType) {
+          lookLocoState = evMag;
+          lookEventPriority = evType;
+        }
+        // FUN_00461954's 0x324 handler: re-centred -> release cbc.
+        if (lookLocoState == kLookEventCode &&
+            lookState.lookPitchOffset == 0.0f)
+          lookEventPriority = 0;
+        selftestOk_ =
+            verifyLookSelfTestFrame(t.index, lk, lookState,
+                                    lookLocoState, lookEventPriority,
+                                    gameplayBindings) &&
+            selftestOk_;
       }
     }
 
@@ -3418,6 +3582,10 @@ int Application::run() {
     log::info(kTag, "player-collision selftest: %s",
               selftestOk_ ? "PASS" : "FAIL");
   }
+  if (cfg_.selftestPlayerLook) {
+    log::info(kTag, "player-look selftest: %s",
+              selftestOk_ ? "PASS" : "FAIL");
+  }
   return selftestOk_ ? 0 : 3;
 }
 
@@ -3503,6 +3671,8 @@ bool parseArgs(int argc, char** argv, AppConfig& cfg, std::string& error,
       cfg.selftestPlayerVertical = true;
     } else if (!std::strcmp(a, "--selftest-player-collision")) {
       cfg.selftestPlayerCollision = true;
+    } else if (!std::strcmp(a, "--selftest-player-look")) {
+      cfg.selftestPlayerLook = true;
     } else if (!std::strcmp(a, "--no-relative-mouse")) {
       cfg.relativeMouse = false;
     } else {

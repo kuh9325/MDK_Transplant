@@ -119,6 +119,15 @@ struct AppConfig {
   // floor probe runs at frame end). Verifies the observable jump/
   // fall/land sequence plus the 9.99 (floorZ - 0.01) landing quirk.
   bool selftestPlayerCollision = false;
+  // --selftest-player-look (Phase 5J): an 'A'/'Z' press script
+  // (factory KeyLookUp=30 / KeyLookDown=44) drives the
+  // FUN_00465c4c semantic look integrator on the same
+  // previous-frame control seam; the event-priority latch and the
+  // 0x324 state are simulated per the FUN_00463608 dispatch
+  // contract. Verifies the offset, event posts and state entry/exit
+  // each frame. Exits non-zero on mismatch. No front-end or
+  // --data-path required.
+  bool selftestPlayerLook = false;
   bool relativeMouse = true;  // --no-relative-mouse to disable
   int windowWidth = 960;      // logical points; drawable may be 2x (Retina)
   int windowHeight = 720;     // 4:3 default

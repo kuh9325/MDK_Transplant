@@ -208,6 +208,26 @@ Boundary notes (intentions, not commitments):
 > `--selftest-player-collision` drives the real seam through the
 > LALT script; `mdk-inspect --collision-probe` runs one real query
 > on original data.
+>
+> Phase 5J adds the normal-traversal look/orientation layer:
+> `player_look.*` reproduces `FUN_00465c4c` — the semantic
+> look-up/look-down integrator over `0x540d58` (the grounded +
+> stationary + priority gates, the arena-relative `[-60, +90]`
+> pitch bounds, the 200 deg/s sign-snapped recenter, and the
+> `8/0x324` pending-event post) — plus the ported slice of
+> `FUN_004301e0`'s view tail (the `0x49b718` z-delta follower, the
+> consumer-side look clamp, `0x540b50 = 90 - yaw`, the `0x49b71c`
+> air-charge lift, and the `0x540be0` effective pitch). The runtime
+> dispatch gained the observed pending-event slots
+> (`0x54cb00`/`0x54cb08`), the `cbc` priority latch, the
+> `cac >= 800` scripted branch scoped to the look state, and the
+> idle restore. The negative proof matters more than the code:
+> normal traversal has NO raw-mouse look — the raw-delta consumer
+> `FUN_00464624` is the sniper update, an explicit boundary (as are
+> `FUN_004691c4` and the renderer-side camera matrix). There is no
+> camera component or spring-arm — just the proven globals.
+> `--selftest-player-look` verifies the full SDL→bindings→consume→
+> integrate→dispatch contract.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

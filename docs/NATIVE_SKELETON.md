@@ -258,6 +258,34 @@ src/
                                   the opcode-0xe0 type-9
                                   slide-zone trigger, and the
                                   FUN_004546ac script seam (5F)
+             traversal_runtime.*— Phase 5G/5I/5J headless traversal:
+                                  FUN_00436100 traversal-active
+                                  section — arena streaming seams,
+                                  FUN_00463608 dispatch (pending
+                                  event slots + cbc latch + cac
+                                  state), portal/trigger scans,
+                                  connector state + anim, the
+                                  FUN_00465c4c look integrator call
+                                  and the FUN_004301e0 view tail
+             traversal_script.* — Phase 5H/5I tr_alcmd arena VM:
+                                  FUN_004388d8 bytecode interpreter
+                                  (call stack, waits, field/flag/
+                                  connector opcodes) + FUN_004566f0
+                                  object-init + FUN_00457738
+                                  connector machine +
+                                  FUN_004555bc anim latch
+             player_look.*      — Phase 5J look/view orientation:
+                                  FUN_00465c4c semantic look
+                                  integrator (0x540d58 offset, the
+                                  grounded/stationary gates, the
+                                  arena-relative [-60,+90] clamps,
+                                  200 deg/s recenter, the 8/0x324
+                                  event post) + the FUN_004301e0
+                                  orientation tail (0x49b718 z-delta
+                                  follower, lookEff clamp, 0x540b50
+                                  view yaw, 0x49b71c pitch lift,
+                                  0x540be0 effective pitch) — stops
+                                  at the renderer boundary (5J)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

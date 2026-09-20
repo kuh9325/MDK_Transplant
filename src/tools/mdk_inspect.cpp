@@ -1448,6 +1448,16 @@ int main(int argc, char** argv) {
       mix(static_cast<std::uint64_t>(out.locoState));
       mix(static_cast<std::uint64_t>(out.slideChannel));
       mix(out.currentArenaSwapped ? 1 : 0);
+      // Phase 5J — fold the deterministic look/view derived state
+      // into the digest (offset, view yaw, effective pitch, the
+      // z-delta follower and the pitch lift). No original bytes.
+      for (float v : {out.lookOffsetDeg, out.viewYawDeg,
+                      out.viewPitchDeg, out.viewZDelta,
+                      out.viewPitchLift, out.viewScalar}) {
+        std::uint32_t vbits;
+        std::memcpy(&vbits, &v, 4);
+        mix(vbits);
+      }
       // Phase 5H — fold tr_alcmd VM derived state into the digest:
       // current-arena persisted PC/wait, cumulative instruction +
       // spawn counters, and a surface-state summary. No script bytes.

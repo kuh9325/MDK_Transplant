@@ -871,6 +871,26 @@ TraversalFrameResult stepTraversalRuntime(
 
   // FUN_00437e80 (frontend) + FUN_0042534 stream-drain — seams.
   // ======================= player dispatch (FUN_00463608) =========
+  // OBSERVED dispatch head (0x463608): the pending-event slots
+  // 0x54cb00/0x54cb08 are cleared every frame; the current event
+  // priority 0x540cbc is reset while the dispatched state sits in
+  // the transient set {300, 400, 500, 600, 601}.
+  rt.eventType = 0;
+  rt.eventMag = 0;
+  if (rt.locoState == 300 || rt.locoState == 400 ||
+      rt.locoState == 500 || rt.locoState == 600 ||
+      rt.locoState == 601)
+    rt.eventPriority = 0;
+
+  // OBSERVED (0x463608): cac >= 800 takes the scripted branch —
+  // semantic channels cleared, no horizontal motion/collision; the
+  // slide helper, jump machine and look integrator still run. The
+  // port models the branch only for the look state 0x324 — the one
+  // >=800 state whose exit path is fully proven (d58 -> 0 ->
+  // FUN_00461954 clears cbc -> the idle restore returns cac). Other
+  // >=800 states (hard-land 806, sniper 0x323/0x384, slide 0x385)
+  // keep the normal path until the animation machine arrives.
+  const bool scriptedLook = rt.locoState == kLookEventCode;
   PlayerMotionEnvironment motionEnv;
   motionEnv.smoothed = timing.smoothed;
   motionEnv.masterGate = rt.masterMoveGate;
@@ -888,24 +908,38 @@ TraversalFrameResult stepTraversalRuntime(
   motionEnv.conveyorY = conv[1];
   motionEnv.conveyorZ = conv[2];
 
-  PlayerMotionOutput mo =
-      integratePlayerMotion(rt.prevFrame, motionEnv, rt.motion);
+  PlayerMotionOutput mo{};
+  bool positionChanged = false;
+  if (!scriptedLook) {
+    mo = integratePlayerMotion(rt.prevFrame, motionEnv, rt.motion);
 
-  // Horizontal collision — FUN_004630d4(disp, scale 0.75).
-  const float preX = rt.cs.pos[0], preY = rt.cs.pos[1],
-              preZ = rt.cs.pos[2];
-  const CollisionPoly* hContact = collisionApply(
-      rt.cs, mo.dispX, mo.dispY, mo.dispZ, 0.75f, nullptr, nullptr);
-  const bool positionChanged =
-      rt.cs.pos[0] != preX || rt.cs.pos[1] != preY ||
-      rt.cs.pos[2] != preZ;
-  playerMotionPostStep(motionEnv, positionChanged, rt.motion, mo);
-  // 0x540e4c — every apply's EAX is stored (0 clears).
-  rt.vert.contactObj = asToken(hContact);
-  rt.lastContactPoly = hContact;
+    // Horizontal collision — FUN_004630d4(disp, scale 0.75).
+    const float preX = rt.cs.pos[0], preY = rt.cs.pos[1],
+                preZ = rt.cs.pos[2];
+    const CollisionPoly* hContact = collisionApply(
+        rt.cs, mo.dispX, mo.dispY, mo.dispZ, 0.75f, nullptr, nullptr);
+    positionChanged = rt.cs.pos[0] != preX || rt.cs.pos[1] != preY ||
+                      rt.cs.pos[2] != preZ;
+    playerMotionPostStep(motionEnv, positionChanged, rt.motion, mo);
+    // 0x540e4c — every apply's EAX is stored (0 clears).
+    rt.vert.contactObj = asToken(hContact);
+    rt.lastContactPoly = hContact;
+    // The motion post feeds the shared pending slots (cb00/cb08).
+    if (mo.eventMag != 0) {
+      rt.eventType = mo.eventType;
+      rt.eventMag = mo.eventMag;
+    }
+  } else {
+    // OBSERVED scripted-branch write (0x463705..): the semantic
+    // channels d48/d4c/d50/d54 are cleared to e6c (= 0 unmounted).
+    // d54 is the sniper zoom channel — unported.
+    rt.motion.moveVel = 0.0f;
+    rt.motion.strafeVel = 0.0f;
+    rt.motion.turnVel = 0.0f;
+  }
 
-  // SEAM: FUN_0046603c slide helper — the slope-assist vector the
-  // vertical integrator would consume. Deferred; counted.
+  // SEAM: FUN_0046603c slide helper — runs on both dispatch
+  // branches in the original. Deferred; counted.
   ++rt.seams.slideHelperCalls;
 
   // --------------------------- vertical --------------------------
@@ -978,14 +1012,52 @@ TraversalFrameResult stepTraversalRuntime(
   rt.vert.posX = rt.cs.pos[0];
   rt.vert.posY = rt.cs.pos[1];
   rt.vert.posZ = rt.cs.pos[2];
-  if (vf.eventMag != 0) rt.locoState = vf.eventMag;
-  rt.eventType = vf.eventType != 0 ? vf.eventType : mo.eventType;
-  rt.eventMag = vf.eventMag != 0 ? vf.eventMag : mo.eventMag;
+  // The vertical post overwrites the pending slots — OBSERVED
+  // producer order inside FUN_00465228 (motion events, then
+  // FUN_00466740's jump/landing events, then the look integrator).
+  if (vf.eventMag != 0) {
+    rt.eventType = vf.eventType;
+    rt.eventMag = vf.eventMag;
+  }
   if (vf.deepFloorReset) ++rt.seams.deepFloorFallbacks;
   if (mo.forwardIntent) ++rt.seams.mantleCalls;
 
-  // Commit the N+1 merge — the latency hand-off.
+  // FUN_00465c4c — the semantic look integrator; OBSERVED call
+  // order is after the jump machine on BOTH dispatch branches. It
+  // consumes the PREVIOUS frame's merged look controls (the same
+  // one-frame latency as movement) and posts 8/0x324 while driving
+  // or draining the offset.
+  PlayerLookEnvironment lookEnv;
+  lookEnv.deltaSeconds = dt;
+  lookEnv.arenaScalar = cur->scalar;
+  lookEnv.eventPriority = rt.eventPriority;
+  lookEnv.locoState = rt.locoState;
+  lookEnv.vertVelZero = rt.vert.vertVel == 0.0f;
+  lookEnv.grounded = (rt.vert.contactFlags & 1) != 0;
+  const PlayerLookFrame lk =
+      integratePlayerLook(rt.prevFrame, lookEnv, rt.look);
+  if (lk.eventPosted) {
+    rt.eventType = kLookEventPri;
+    rt.eventMag = kLookEventCode;
+  }
+
+  // Commit the N+1 merge — the latency hand-off (FUN_00406f14 runs
+  // at dispatch end in the original, before the tail below).
   rt.prevFrame = nextFrame;
+
+  // Dispatcher tail (OBSERVED 0x4638xx): with no latched event and
+  // no post this frame, the idle restore posts the idle state —
+  // code 0x65 on the unmounted path (the 100 variant needs the
+  // mount/mounted-idle path — deferred). Then the priority latch
+  // adopts the frame's winning event.
+  if (rt.eventPriority == 0 && rt.eventType == 0) {
+    rt.eventType = 1;
+    rt.eventMag = 0x65;
+  }
+  if (rt.eventPriority < rt.eventType) {
+    rt.locoState = rt.eventMag;
+    rt.eventPriority = rt.eventType;
+  }
 
   // ================= traversal-active section =====================
   // 0x540c30..0x540c44 — the per-query player AABB (the original
@@ -1080,7 +1152,7 @@ TraversalFrameResult stepTraversalRuntime(
       ++rt.scriptRuns;
       TraversalScriptResult sr = traversalScriptRun(env);
       rt.scriptInsnTotal += sr.instructions;
-      if (env.slideClear) { rt.slideChannel = 0; rt.slideAux = 0;
+      if (env.slideClear) { rt.slideChannel = 0; rt.eventPriority = 0;
                             env.slideClear = false; }
       rt.slideChannel = env.slideChannel;
     }
@@ -1127,14 +1199,25 @@ TraversalFrameResult stepTraversalRuntime(
   // FUN_00434b44 — trigger scan on the (possibly new) current arena.
   traversalTriggerScan(rt);
 
+  // FUN_00461954's 0x324 handler (render pass, OBSERVED): once the
+  // look offset has re-centred to exactly 0 the look state's event
+  // priority is released — the NEXT dispatch's idle restore then
+  // returns cac to the idle state. (The full animation machine is
+  // deferred; this is the write the look exit depends on.)
+  if (rt.locoState == kLookEventCode &&
+      rt.look.lookPitchOffset == 0.0f)
+    rt.eventPriority = 0;
+
   // FUN_004301e0 — OBSERVED structure:
   //   flagC9c==0 && flag49b740!=0 → call FUN_00431100 + commit only.
   //   flagC9c!=0                  → flagBec=0 → shared tail.
   //   else  viewScalar!=scalar && flagBec==0 → blend 0.85/0.15 → tail;
   //         otherwise flagBec=0 → tail.
-  //   tail: z-delta clamp +/-0.5 → [0x49b718] = old*0.97 + dz*0.03,
-  //         then 0x540c08 = pos — the prev-pos commit runs EVERY
-  //         frame on all paths (0x430272 / 0x4309ed movsd x3).
+  //   tail: z-delta clamp +/-0.5 → 0x49b718 EMA+sign-slew, the
+  //         lookEff arena-relative clamp, viewYaw = 90 - yaw, the
+  //         c84 pitch lift, effective pitch — then the prev-pos
+  //         commit which runs EVERY frame on all paths
+  //         (0x430272 / 0x4309ed movsd x3).
   if (rt.flagC9c == 0 && rt.flag49b740 != 0) {
     ++rt.seams.pendingViewSnaps; // FUN_00431100 — view-snap seam
   } else {
@@ -1145,10 +1228,16 @@ TraversalFrameResult stepTraversalRuntime(
     } else {
       rt.flagBec = 0;
     }
-    float dz = rt.cs.pos[2] - rt.cs.entryPos[2];
-    if (dz > 0.5f) dz = 0.5f;
-    else if (dz < -0.5f) dz = -0.5f;
-    rt.viewRoll = rt.viewRoll * 0.97f + dz * 0.03f; // 0x49b718
+    PlayerViewTailEnvironment vte;
+    vte.smoothed = timing.smoothed;
+    vte.deltaSeconds = dt;
+    vte.arenaScalar = cur->scalar;
+    vte.yawDeg = rt.motion.yawDeg;
+    vte.lookOffset = rt.look.lookPitchOffset;
+    vte.viewScalar = rt.viewScalar;
+    vte.dz = rt.cs.pos[2] - rt.cs.entryPos[2];
+    vte.airCharge = rt.motion.airCharge;
+    updatePlayerViewTail(vte, rt.view);
   }
   for (int i = 0; i < 3; ++i) rt.cs.entryPos[i] = rt.cs.pos[i];
   // bankIdle -> 0x5414b4; FUN_0046ae60(0x5414bc != 0) — OBSERVED.
@@ -1249,6 +1338,11 @@ TraversalFrameResult stepTraversalRuntime(
   out.portalCandidate = portalCand;
   out.eventTimer = rt.eventTimer;
   out.viewScalar = rt.viewScalar;
+  out.lookOffsetDeg = rt.look.lookPitchOffset;
+  out.viewYawDeg = rt.view.viewYawDeg;
+  out.viewPitchDeg = rt.view.viewPitchDeg;
+  out.viewZDelta = rt.view.viewZDelta;
+  out.viewPitchLift = rt.view.viewPitchLift;
   out.seams = rt.seams;
   return out;
 }
