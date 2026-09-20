@@ -228,6 +228,28 @@ Boundary notes (intentions, not commitments):
 > camera component or spring-arm — just the proven globals.
 > `--selftest-player-look` verifies the full SDL→bindings→consume→
 > integrate→dispatch contract.
+>
+> Phase 5K adds the normal-traversal camera pose: `player_camera.*`
+> reproduces the `FUN_004301e0` tail after the `0x540be0` write —
+> the pitch-branched pullback position (`pullback` 8.0 / `eyeHeight`
+> 4.5 anchors, the `(1-cosP)*5` rise term on positive pitch, the
+> linear arm-shrink below −20), the shake add, the banked up/back
+> basis rows, the `0x540b80` projection-folded world→camera matrix
+> (row-major 3×4, `scaleX*right | scaleY*down | scaleZ*back`,
+> `t = scale*(-(row·cam))`), the `0x540bb0` unscaled basis snapshot
+> (`basis*|basis|`, proven by the live-FPU-stack translations), the
+> `1/(zoom*0.5)` / `1/(zoom*(H/W)*0.5)` projection scalars, the
+> view-rect write, and the `FUN_00435178` eye→camPos portal tail
+> driving `viewOnPartner`. `FUN_00431100` — the `0x49b740` overhead
+> block (scripted `0x40031`/cheat latch, raw-yaw trig,
+> `scaleZ=+1.0`, stale basis fields) — is ported as its own call.
+> `FUN_00430bf8` camera obstruction is a counted seam at its
+> proven call point (post-basis, pre-commit, may move both player
+> and camera). Still platform-neutral scalar math — no camera
+> component, no spring-arm, no renderer dependency; the sniper
+> pose stays deferred. `mdk-inspect --selftest-camera-pose` verifies
+> the pose/matrix contract; the traversal digest folds the pose as
+> f32 bit patterns.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

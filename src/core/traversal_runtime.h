@@ -3,8 +3,9 @@
 //
 // Assembles the proven 5A–5F systems over a real BUILD_A traversal
 // level (LEVELn.DTI + LEVELn.CMI + LEVELnO.MTO) and drives them in
-// the original per-frame order. Headless: no SDL, renderer, camera,
-// or script VM.
+// the original per-frame order. Headless: no SDL or renderer — the
+// Phase 5K camera pose (player_camera.*) is pure scalar math and the
+// 5H script VM is platform-neutral.
 //
 // Original ownership (MDK95.EXE, OBSERVED via disassembly):
 //
@@ -28,7 +29,9 @@
 //                 FUN_00435178 portal test -> partner/current swap +
 //                 FUN_00432d9c attach -> FUN_00434b44 type-1/3
 //                 trigger scan -> FUN_004301e0 view blend +
-//                 0x540c08 commit -> timers -> primary/secondary
+//                 orientation tail + 0x540c08 commit + camera pose/
+//                 matrix pair + eye->camPos portal tail (5K) ->
+//                 timers -> primary/secondary
 //                 surface updates (FUN_0040e19c scripted-move gate,
 //                 FUN_00404cd4 event list, FUN_004134a0 +0x45e
 //                 records) -> FUN_00436d60 world tick ->
@@ -59,6 +62,8 @@
 //   FUN_00436d60 world tick (particles/HUD/event machinery)
 //   FUN_0046603c slide helper, FUN_0046a5b8 mantle,
 //   FUN_0046ae60 timers, FUN_00432f84 object prepass,
+//   FUN_00430bf8 camera obstruction (5K — call site proven,
+//   gated 0x49b710 && |0x540d58|==0, may move player AND camera),
 //   0x540cdc teleport block, 0x540ebc pending view snap.
 
 #include <cstdint>
@@ -75,6 +80,7 @@
 #include "core/dynamic_objects.h"
 #include "core/frontend_machines.h"
 #include "core/gameplay_input.h"
+#include "core/player_camera.h"
 #include "core/player_look.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
@@ -195,6 +201,11 @@ struct TraversalSeams {
   int objectMigrations = 0;     // FUN_004574d0 pending transfers
   int portalsCrossed = 0;       // FUN_00435178 passes
   int deepFloorFallbacks = 0;   // sweep failsafe fired
+  int overheadViewCalls = 0;    // FUN_00431100 overhead view block
+                                // (0x49b740 path — Phase 5K)
+  int cameraObstructionCalls = 0; // FUN_00430bf8 gate fired
+                                // (0x49b710 && |0x540d58|==0 —
+                                // Phase 5K boundary seam)
 };
 
 struct TraversalFrameResult {
@@ -231,6 +242,10 @@ struct TraversalFrameResult {
   float viewPitchDeg = 0.0f;         // 0x540be0 — effective pitch
   float viewZDelta = 0.0f;           // 0x49b718
   float viewPitchLift = 0.0f;        // 0x49b71c
+  bool overheadViewActive = false;   // FUN_00431100 ran this frame
+                                     // (0x540c9c==0 && 0x49b740!=0)
+  PlayerCameraPose camera;           // Phase 5K — 0x540b28..0x540bdc
+                                     // pose + matrix pair + scalars
   TraversalSeams seams;              // cumulative snapshot
 };
 
@@ -283,11 +298,18 @@ struct TraversalRuntime {
                                   // aux" guess is resolved)
   bool viewOnPartner = false;     // 0x49b714 — surface-update select
   int flag49b740 = 0;             // 0x49b740 — FUN_004301e0 gate
-  float viewScalar = 6.0f;        // 0x540b54 — blended arena scalar;
-                                  // FUN_00433c4c inits it to 6.0
+  float viewScalar = 4.0f;        // 0x540b54 — blended arena scalar;
+                                  // FUN_00433c4c inits it to 4.0
+                                  // (0x433c9d: MOV EAX,0x40800000 —
+                                  // Phase 5K evidence correction)
   PlayerLookState look;           // Phase 5J — 0x540d58 (FUN_00465c4c)
   PlayerViewTail view;            // Phase 5J — 0x49b718/0x49b71c/
                                   // 0x540b50/0x540be0 (FUN_004301e0)
+  PlayerCameraState camera;       // Phase 5K — 0x540b58/0x540db4/
+                                  // 0x540db8/0x540b5c/0x49b74c/
+                                  // 0x540ce4..0x540cfc/0x49b710 +
+                                  // the 0x540b28..0x540bdc pose
+                                  // (FUN_004301e0/FUN_00431100)
   int flagBec = 0;                // 0x540bec — blend gate
   int pendingViewSnap = 0;        // 0x540ebc
   float pendingView[4] = {0, 0, 0, 0}; // 0x540ec0..0x540ecc
@@ -379,9 +401,17 @@ void traversalPrefetchPartner(TraversalRuntime& rt, TraversalArena& a);
 // FUN_00432bf8 — detach partner (type-1 fields[0]==-1).
 void traversalDetachPartner(TraversalRuntime& rt);
 
-// FUN_00435178 — scan current arena type-6 records; returns the
-// partner arena when the portal test passes (position clamped to
-// the portal plane as the original does), else nullptr.
+// FUN_00435178 — scan an arena's type-6 records for a portal
+// crossing of the from->to segment; returns the destination arena
+// on pass, else nullptr. OBSERVED pure-read: the original writes
+// neither endpoint. The camera tail calls it with
+// (cur, eye=pos+3z, camPos); the player path uses (cur, prev, pos).
+TraversalArena* traversalPortalScanSegment(TraversalRuntime& rt,
+                                           const TraversalArena& arena,
+                                           const float from[3],
+                                           const float to[3]);
+
+// Player-call wrapper — (cur, entryPos -> pos) as the original does.
 TraversalArena* traversalPortalTest(TraversalRuntime& rt);
 
 // FUN_00457738 — arena-connector (door) state update, gated by

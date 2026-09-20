@@ -78,7 +78,8 @@ int usage() {
                "                            Options: --arena NAME --start X Y Z\n"
                "                            --yaw DEG --frames N)\n"
                "       mdk-inspect --selftest\n"
-               "       mdk-inspect --selftest-player-surface\n");
+               "       mdk-inspect --selftest-player-surface\n"
+               "       mdk-inspect --selftest-camera-pose\n");
   return 2;
 }
 
@@ -819,6 +820,97 @@ int selftestPlayerSurface() {
   return ok ? 0 : 1;
 }
 
+// Phase 5K — camera-pose selftest. Verifies the reconstructed
+// FUN_004301e0 tail + FUN_00431100 against hand-computed values from
+// the OBSERVED formulas (position branches, basis, the M1/M2 matrix
+// pair, projection scalars, view config, the overhead block). No
+// --data-path required.
+int selftestCameraPose() {
+  bool ok = true;
+  auto check = [&](bool c, const char* what) {
+    if (!c) ok = false;
+    std::fprintf(stderr, "  %-56s %s\n", what, c ? "ok" : "FAIL");
+  };
+  auto near = [](float a, double e, double eps = 1e-4) {
+    return std::fabs((double)a - e) < eps;
+  };
+
+  // Neutral pose: player at origin, viewYaw 90 (yaw 0), pitch 0.
+  {
+    mdk::PlayerCameraState st;
+    mdk::PlayerCameraEnvironment e = {};
+    e.viewYawDeg = 90.0f;
+    mdk::updatePlayerCamera(e, st);
+    check(near(st.pose.pos[0], -8.0) && near(st.pose.pos[1], 0.0) &&
+              near(st.pose.pos[2], 4.5),
+          "pitch=0 pullback pose (-8, 0, +4.5)");
+    check(near(st.pose.back[0], -1.0) && near(st.pose.back[2], 0.0),
+          "back row = -forward (yaw 0 -> +X)");
+    check(near(st.pose.up[2], 1.0), "bank 0 -> up = +Z");
+    check(near(st.pose.scaleX, 0.8333333) &&
+              near(st.pose.scaleY, 1.3888889) && st.pose.scaleZ == -1.0f,
+          "projection scalars 0.8333/1.3889/-1");
+    check(near(st.pose.view[0][1], -0.8333333) &&
+              near(st.pose.view[1][2], -1.3888889) &&
+              near(st.pose.view[2][0], 1.0),
+          "M1 rows fold scaleX/scaleY/scaleZ");
+    check(near(st.pose.view[2][3], 8.0) &&
+              near(st.pose.basis[2][3], -8.0),
+          "M1/M2 translations (scaleZ sign split)");
+    check(st.pose.modeZoom == 2.4f && st.pose.viewW == 600 &&
+              st.pose.viewH == 360 && st.pose.viewCX == 300 &&
+              st.pose.viewCY == 180 && st.pose.viewOX == 0 &&
+              st.pose.viewOY == 0,
+          "normal view config 2.4 / 600x360 @ (300,180)");
+  }
+
+  // pitch > 0 branch: T = (1-cosP)*5 rise term + pullback*cosP.
+  {
+    mdk::PlayerCameraState st;
+    mdk::PlayerCameraEnvironment e = {};
+    e.playerPos[0] = 10.0f;
+    e.playerPos[1] = 20.0f;
+    e.playerPos[2] = 5.0f;
+    e.viewYawDeg = 90.0f;
+    e.effPitchDeg = 30.0f;
+    mdk::updatePlayerCamera(e, st);
+    check(near(st.pose.pos[0], 3.7417) && near(st.pose.pos[2], 13.5),
+          "pitch +30 -> rise + inward pullback");
+    check(st.pose.pos[2] > 5.0f + 4.5f,
+          "positive pitch lifts the camera above the anchor");
+    // pitch < -20: D = (pitch+100)*pullback*0.0125 shrinks the arm.
+    mdk::PlayerCameraState st2;
+    e.effPitchDeg = -50.0f;
+    mdk::updatePlayerCamera(e, st2);
+    check(near(st2.pose.pos[0], 6.7861) && near(st2.pose.pos[2], 5.6698),
+          "pitch -50 -> D = 5.0 shrunk pullback");
+  }
+
+  // Overhead block: FUN_00431100 — raw yaw, +1 scaleZ, no tail.
+  {
+    mdk::PlayerCameraState st;
+    st.overheadHeight = 50.0f;
+    st.pose.back[0] = 7.0f;   // stale sentinel — must survive
+    mdk::PlayerCameraEnvironment e = {};
+    e.playerPos[0] = 1.0f;
+    e.playerPos[1] = 2.0f;
+    e.playerPos[2] = 3.0f;
+    e.yawDeg = 0.0f;          // raw 0x540c2c (not 90-yaw)
+    mdk::updatePlayerCameraOverhead(e, st);
+    check(near(st.pose.pos[2], 53.0) && near(st.pose.pos[0], 1.0),
+          "overhead camPos = player + (0,0,h)");
+    check(st.pose.scaleZ == 1.0f, "overhead scaleZ = +1");
+    check(st.pose.back[0] == 7.0f, "overhead leaves basis rows stale");
+    check(near(st.pose.basis[2][2], -1.0) &&
+              near(st.pose.basis[0][1], -1.0),
+          "overhead M2 rows (down-look basis)");
+  }
+
+  std::fprintf(stderr, "selftest camera-pose: %s\n",
+               ok ? "PASS" : "FAIL");
+  return ok ? 0 : 3;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -990,6 +1082,8 @@ int main(int argc, char** argv) {
       return selftest();
     } else if (!std::strcmp(a, "--selftest-player-surface")) {
       return selftestPlayerSurface();
+    } else if (!std::strcmp(a, "--selftest-camera-pose")) {
+      return selftestCameraPose();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
       return usage();
     } else if (a[0] == '-') {
@@ -1403,13 +1497,18 @@ int main(int argc, char** argv) {
       partnerSeen |= out.partnerArenaIndex >= 0;
       std::printf(
           "f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "
-          "mv=%5.2f sv=%5.2f vv=%6.2f gnd=%d ctc=%08x sld=%d ev=%d/%d\n",
+          "mv=%5.2f sv=%5.2f vv=%6.2f gnd=%d ctc=%08x sld=%d ev=%d/%d "
+          "cam=(%8.2f,%8.2f,%8.2f)%s%s\n",
           out.frame, out.curArenaIndex, out.partnerArenaIndex,
           (double)out.pos[0], (double)out.pos[1], (double)out.pos[2],
           (double)out.yawDeg, (double)out.moveVel,
           (double)out.strafeVel, (double)out.vertVel,
           out.grounded ? 1 : 0, out.contactObj, out.slideChannel,
-          out.eventType, out.eventMag);
+          out.eventType, out.eventMag,
+          (double)out.camera.pos[0], (double)out.camera.pos[1],
+          (double)out.camera.pos[2],
+          out.overheadViewActive ? " OVH" : "",
+          out.viewOnPartner ? " VP" : "");
       // Connector (door) state dump — connState/anim/flags per frame.
       for (const auto& ap : rt.arenas)
         for (const auto& up : ap->dyn.storage) {
@@ -1458,6 +1557,35 @@ int main(int argc, char** argv) {
         std::memcpy(&vbits, &v, 4);
         mix(vbits);
       }
+      // Phase 5K — fold the derived camera pose into the digest:
+      // position, basis rows, both 3x4 matrices, projection scalars
+      // and the overhead/view-on-partner selects. Floats are mixed
+      // as bit patterns — deterministic, no original bytes.
+      {
+        const mdk::PlayerCameraPose& c = out.camera;
+        auto mixf = [&](float v) {
+          std::uint32_t vbits;
+          std::memcpy(&vbits, &v, 4);
+          mix(vbits);
+        };
+        for (float v : c.pos) mixf(v);
+        for (float v : c.back) mixf(v);
+        for (float v : c.up) mixf(v);
+        mixf(c.sinPitch);
+        mixf(c.cosPitch);
+        for (const auto& r : c.view)
+          for (float v : r) mixf(v);
+        for (const auto& r : c.basis)
+          for (float v : r) mixf(v);
+        for (float v : {c.scaleX, c.scaleY, c.scaleZ, c.modeZoom})
+          mixf(v);
+        mix(static_cast<std::uint64_t>(c.viewCX));
+        mix(static_cast<std::uint64_t>(c.viewCY));
+        mix(static_cast<std::uint64_t>(c.viewW));
+        mix(static_cast<std::uint64_t>(c.viewH));
+        mix(out.overheadViewActive ? 1 : 0);
+        mix(out.viewOnPartner ? 1 : 0);
+      }
       // Phase 5H — fold tr_alcmd VM derived state into the digest:
       // current-arena persisted PC/wait, cumulative instruction +
       // spawn counters, and a surface-state summary. No script bytes.
@@ -1484,7 +1612,7 @@ int main(int argc, char** argv) {
                 "move=%d evlist=%d slide=%d mantle=%d timers=%d "
                 "world=%d xworld=%d prof=%d tail=%d teleport=%d "
                 "vsnap=%d migrations=%d t1=%d t3=%d portals=%d "
-                "deep=%d\n",
+                "deep=%d overhead=%d camcol=%d\n",
                 s.streamStageCalls, s.objectPrepass,
                 s.scriptObjectCalls, s.scriptedMoveCalls,
                 s.arenaEventListCalls, s.slideHelperCalls,
@@ -1493,7 +1621,8 @@ int main(int argc, char** argv) {
                 s.postTailCalls, s.teleportCalls,
                 s.pendingViewSnaps, s.objectMigrations,
                 s.type1Triggers, s.type3Prefetches,
-                s.portalsCrossed, s.deepFloorFallbacks);
+                s.portalsCrossed, s.deepFloorFallbacks,
+                s.overheadViewCalls, s.cameraObstructionCalls);
     std::printf("script:    runs=%d insn=%d spawned=%d diag=%d\n",
                 rt.scriptRuns, rt.scriptInsnTotal, rt.scriptSpawned,
                 static_cast<int>(rt.scriptDiag.size()));

@@ -2034,7 +2034,7 @@ mid-blend. No ±89 — the original asymmetry (-60/+90) is preserved.
 | address      | native field            | proven semantic                    |
 |--------------|-------------------------|------------------------------------|
 | 0x540d58     | `PlayerLookState::lookPitchOffset` | semantic look offset (deg) |
-| 0x540b54     | `TraversalRuntime::viewScalar`     | blended arena scalar (init 6.0, `FUN_00433c4c`) |
+| 0x540b54     | `TraversalRuntime::viewScalar`     | blended arena scalar (init 4.0, `FUN_00433c4c` — corrected Phase 5K) |
 | 0x540b50     | `PlayerViewTail::viewYawDeg`       | view yaw = 90 - yaw (deg)  |
 | 0x540be0     | `PlayerViewTail::viewPitchDeg`     | effective pitch (deg)      |
 | 0x49b718     | `PlayerViewTail::viewZDelta`       | smoothed z-delta follower  |
@@ -2153,3 +2153,245 @@ in the render pass before `FUN_004301e0`'s tail.
 - `0x540c84` air-charge semantics belong to the vertical model
   (Phase 5C); its `b71c` lift consumption is ported, its production
   is unchanged.
+
+# Phase 5K — Normal Camera Pose and View Matrix
+
+Phase 5K reconstructs the remainder of `FUN_004301e0` — everything
+after the Phase 5J effective-pitch write at `0x540be0` — plus the
+`FUN_00431100` overhead block. The result: the original's full
+normal-traversal camera pose (world position, orientation basis, the
+two 3x4 view matrices, projection scalars, viewport rect) is now
+produced by native code every frame, with an explicit seam where the
+unported camera-collision call sits.
+
+## 90. Ordered instruction map (OBSERVED, 0x43042b..0x4309dd)
+
+After the `0x540be0` store the block runs, in original order:
+
+1. `FUN_00437f98(viewYaw)` / `FUN_00437f98(effPitch)` — sin/cos pairs
+   (locals, plus the `0x540be4`/`0x540be8` cache written earlier in
+   the prefix).
+2. Position branch on `effPitch` sign (`FCOMP` at `0x430437`).
+3. Shake add: `|0x540ce4| != 0` -> `camX += 0x540cf8*0.2`,
+   `camY += 0x540cfc*0.2` (f64 `0x497280`).
+4. Banked up-vector: `bank = 0x540b4c + 0x540b60`, trig call.
+5. `right = up x back`; `down = -(back x right)` (f32 locals).
+6. Projection scalars `0x540bf0/bf4/bf8` (`bf8 = -1.0` normal).
+7. `0x49b710 && 0x540d58 == 0` -> `FUN_00430bf8` obstruction call
+   (seam — may move BOTH `0x540b28` and `0x540bfc`).
+8. `0x540b80` M1 commit (rows `bf0*right | bf4*down | bf8*back`,
+   `t = scale*(-(row.cam))`); the unscaled `t` stays live on the FPU
+   stack.
+9. `0x540bb0` M2 commit (rows `basis*|basis|`, `t = t_unscaled*|row|`;
+   `FSQRT` lengths never stored f32).
+10. View-config write (`0x540b64..0x540b7c`): normal vs sniper rect.
+11. Tail: `0x49b714 = 0`; `eye = player + (0,0,3.0)`;
+    `FUN_00435178(cur, eye -> camPos)`; `hit == 0x540ca4` ->
+    `0x49b714 = 1`. `FUN_00435178` is a pure segment scan (verified
+    read-only on both endpoints) — the same routine used for the
+    player prev->pos portal test.
+
+`prevPos <- pos` commits at `0x430272` (normal path, inside the tail
+before the camera block) and `0x4309ed` (overhead path, after
+`FUN_00431100`).
+
+## 91. Camera globals (OBSERVED — writers/readers xref-verified)
+
+| Address | Field | Notes |
+| --- | --- | --- |
+| `0x540b28..30` | camera world pos | written here; read by `FUN_00430bf8`, the portal tail, render |
+| `0x540b34..3c` | view row0 "back" | `(-sinY*cosP, -cosY*cosP, sinP)` — prefix write |
+| `0x540b40..48` | view row1 "up" | banked up (below) |
+| `0x540b4c` | player bank deg | writer: dispatch/state machine (`rt.motion.bank`) |
+| `0x540b50` | viewYaw | `90 - yaw` (Phase 5J) |
+| `0x540b54` | view scalar / rest-pitch blend | init 4.0 (`0x433c9d`), blend 0.85/0.15 gated by `bec` |
+| `0x540b58` | zoom | init 2.4; level `ZOOM_%4.4d` + debug keys scale it |
+| `0x540b5c` | height offset | init 0; debug +-25 (`FUN_00464d10`) |
+| `0x540b60` | aux bank term | adds into bank; feeds `bankIdle` test |
+| `0x540b64..7c` | view rect config | zoom-mode copy / W/H / centre / origin |
+| `0x540b80..ac` | M1 view matrix | projection-folded world->camera |
+| `0x540bb0..dc` | M2 basis matrix | unscaled snapshot (`*|row|` lengths) |
+| `0x540be4/e8` | sin/cos pitch cache | prefix writes |
+| `0x540bec` | blend gate | `FUN_0045e590` focus-aim sets it one frame |
+| `0x540bf0/f4/f8` | scaleX/scaleY/scaleZ | `1/(zoom*.5)`, `1/(zoom*(H/W)*.5)`, `-1`/`+1` |
+| `0x540ce4` | shake magnitude | decays in `FUN_00436100` head |
+| `0x540cf8/cfc` | shake XY | written by sniper branch; consumed here |
+| `0x540db4` | pullback | init 8.0 (`0x433c93`); `FUN_00461878` resets |
+| `0x540db8` | eye height | init 4.5; `FUN_00461954`/`FUN_00464624` adjust |
+| `0x49b710` | obstruction enable | cheat toggle (`FUN_00423ca0`, gated `0x5414e4`) |
+| `0x49b714` | view-on-partner | portal tail output; render select at `0x436405` |
+| `0x49b740` | overhead gate | `0x40031` script event + cheat; latch |
+| `0x49b74c` | overhead height | default 50.0; clamp 20..200 debug |
+| `0x5414bc` | alt aspect | swaps the 360/600 pair for 280/384 |
+| `0x540c9c/0x540ca0` | mode gates | both set -> sniper rect write only |
+| `0x540d58` | semantic look offset | `|d58|==0` gates the obstruction call |
+
+`0x540d00` is resolved: read+written ONLY inside `FUN_00463608` — a
+state-machine field, not camera state. `FUN_00401ed4` is a generic
+helper called from ~30 sites, none in the camera block — removed
+from the concern list.
+
+## 92. Camera position (OBSERVED)
+
+Anchor: the player position `0x540bfc..0x540c04` itself (no bone/
+tooth lookup in the normal path — `"Bones tooth not found"` lives in
+`FUN_0045897c`, the mover/bone resolver, unrelated to the camera).
+
+```
+height = eyeHeight - heightOffset            // shared
+if effPitch > 0:
+    rise = (1 - cosP) * 5.0                  // 0x497278
+    camX = px + sinYaw*(rise - pullback*cosP)
+    camY = py + cosYaw*(rise - pullback*cosP)
+    camZ = pz + height + pullback*sinP
+else:
+    D = pullback                             // pitch >= -20
+    D = (pitch + 100)*pullback*0.0125        // pitch < -20 (cont. at -20)
+    camX = px - sinYaw*D*cosP
+    camY = py - cosYaw*D*cosP
+    camZ = pz + height + D*sinP
+if |shakeMag| != 0: camX += shakeX*0.2; camY += shakeY*0.2
+```
+
+Two quirks preserved: the `pitch>0` branch adds a `(1-cosP)*5` rise
+term that pulls the camera INWARD as pitch grows, and the `pitch<=-20`
+branch shrinks the arm linearly to zero at `-100`. `viewZDelta` /
+`viewPitchLift` do NOT feed position — they only shape `effPitch`
+(Phase 5J); raw `pz` anchors Z directly.
+
+## 93. Basis and matrix (OBSERVED)
+
+Coordinate convention (Phase 5B, CONFIRMED): +X forward at yaw 0,
++Y left, +Z up; `viewYaw = 90 - yaw`.
+
+```
+back  = (-sinYaw*cosP, -cosYaw*cosP, sinP)   // 0x540b34 row
+up    = (sinY*cosB*sinP + cosY*sinB,
+         cosY*cosB*sinP - sinY*sinB,
+         cosB*cosP)                          // 0x540b40 row, bank b4c+b60
+right = up x back                            // locals
+down  = -(back x right)                      // == -up when orthonormal
+```
+
+Both matrices are row-major 3x4, `[x y z t]` per row,
+`out_i = row_i.xyz . p + t_i` (consumer `FUN_0046b4f8`: row0 ->
+screenX numerator, row1 -> screenY numerator, row2 -> depth):
+
+- `0x540b80` M1 (world->camera, projection folded):
+  rows `scaleX*right`, `scaleY*down`, `scaleZ*back`,
+  `t_i = scale_i * (-(row_i . cam))`. `scaleZ=-1` flips the back row
+  to forward-facing, so depth `= fwd.(p - cam) > 0` in front.
+- `0x540bb0` M2 (unscaled snapshot): rows `basis_i*|basis_i|`,
+  `t_i = (-(row_i . cam))*|basis_i|` — the sqrt lengths multiply BOTH
+  the coefficients and the translation (the `t` values stay on the
+  FPU stack across the sqrt block). Readers: `FUN_0042b0c0` (camera
+  nudge API — shifts camPos along M2's row0 and re-folds M1),
+  `FUN_0042e684` (framebuffer rotate/blit — renderer), `FUN_004691c4`
+  (sniper reticle — Phase 5L boundary).
+
+## 94. Projection / FOV (OBSERVED)
+
+There is NO stored FOV angle. Projection is the folded scale pair:
+`scaleX = 1/(zoom*0.5)` (= 0.8333 at zoom 2.4) and
+`scaleY = 1/(zoom*(H/W)*0.5)` (= 1.3889 normal, 1.1429 alt aspect).
+`scaleZ = -1.0` normal / `+1.0` overhead (row-sign flip, not a
+depth scale). The viewport rect write is part of this block: normal
+`600x360@(0,0)` centre `(300,180)` mode-zoom `2.4`; the sniper rect
+`384x280@(107,79)` centre `(299,219)` mode-zoom `1.0` is written when
+`c9c && ca0` — the rect write is ported (it's in this block) but the
+sniper POSE is Phase 5L scope.
+
+`zoom` (`0x540b58`) is loaded from the level `ZOOM_%4.4d` MTI record
+(`FUN_0040ef28` writes both `b58` and `b64`) and scaled by debug
+keys in `FUN_00464d10`.
+
+## 95. FUN_00431100 — overhead view (OBSERVED, ported)
+
+Gate: `0x540c9c == 0 && 0x49b740 != 0` (early path at `0x4301f4`).
+`0x49b740` is a LATCH: set to 1 (with `0x49b74c = 50.0`) by the
+scripted `0x40031` spawn event inside `FUN_00463608`, cleared on
+completion; also toggled by the cheat dispatcher `FUN_00423ca0`
+(gated by cheat flag `0x5414e0`). Persistent across saves
+(`FUN_00427218`).
+
+The block writes: `camPos = (px, py, pz + overheadHeight)`; the same
+scale triple except `scaleZ = +1.0`; trig on the RAW locomotion yaw
+`0x540c2c` (not `viewYaw`); M1 rows `[scaleX*(sinY,-cosY,0) |
+scaleY*(-cosY,-sinY,0) | (0,0,-1)]` with `t = scale*(-(row.cam))`;
+M2 the same rows unscaled. It does NOT touch the basis rows
+(`b34..b48` go stale), the trig cache, the view config, `b714`, or
+the portal tail — and `prevPos` commits after it (`0x4309ed`).
+
+## 96. Camera collision boundary (OBSERVED, seam)
+
+`FUN_00430bf8` is a genuine obstruction subsystem, called between
+basis compute and the matrix commit when `0x49b710 != 0 &&
+0x540d58 == +-0`: arena collision query `FUN_00407fc0` on camPos, up
+to three slide-sample retries through `FUN_00418c60`, then
+`FUN_004630d4` applies the resulting delta to BOTH the player and
+the camera; an object-list pass gated by `0x540c68` follows. The
+native port exposes the call site as `PlayerCameraFrame::
+obstructionSeam` (counted in `seams.cameraObstructionCalls`) with
+`env.playerPos` in/out — the call contract is real, the internals
+are deferred (needs the arena collision query against the camera
+point, not a spring-arm guess).
+
+## 97. Native implementation
+
+`src/core/player_camera.{h,cpp}`:
+
+- `PlayerCameraState` — the persistent camera globals (zoom 2.4,
+  pullback 8.0, eyeHeight 4.5, heightOffset 0, overheadHeight,
+  shake triple, obstruction gate) with `FUN_00433c4c`-proven
+  initializers. NOTE: `viewScalar` init corrected 6.0 -> 4.0 to
+  match `0x433c9d` (`0x40800000`) — no writer ever stores 6.0.
+- `PlayerCameraPose` — the per-frame `0x540b28..` block: pos, back,
+  up, pitch trig cache, M1 `view[3][4]`, M2 `basis[3][4]`, scalars,
+  view rect. Stale fields persist across frames like the original.
+- `updatePlayerCamera` — the `FUN_004301e0` tail in original order.
+- `updatePlayerCameraOverhead` — `FUN_00431100`.
+- `cameraTrigDeg` reproduces `FUN_00437f98`: `deg * 0x497924` (the
+  stored f64 `0x3f91df46a2529d35`, 4 ULP below correctly-rounded
+  pi/180), `sin`/`cos` on the same f64 product, f32 stores.
+- x87: the port accumulates each FLD/FMUL/FADD chain in double and
+  rounds once per FSTP — matching the original's store points.
+
+Runtime (`stepTraversalRuntime`): after `updatePlayerViewTail`, the
+`entryPos <- pos` commit runs at the original `0x430272` point; the
+normal path calls `updatePlayerCamera`, counts the obstruction seam,
+then runs the portal tail via the new `traversalPortalScanSegment`
+(eye `pos+3z` -> `pose.pos`; `hit == partner` -> `viewOnPartner`).
+The `flag49b740` early path calls `updatePlayerCameraOverhead` and
+commits `entryPos` after it (`0x4309ed` ordering). `TraversalFrame`
+now carries `camera` + `overheadViewActive` + `viewOnPartner`.
+
+## 98. Validation
+
+- `test_player_camera` in `test_main.cpp`: 109 checks — exact-value
+  oracle cases (pitch-0 pose, +30 rise branch, -50 shrunk pullback,
+  -20 boundary continuity, bank rotation, alt aspect, zoom, shake
+  gate, overhead block), basis orthogonality/unit-length, M1/M2
+  layout + translation signs, stale-field persistence.
+- `mdk-inspect --selftest-camera-pose`: 14-step diagnostic — PASS.
+- The traversal digest now folds the pose (pos, basis rows, both
+  matrices, scalars, rect, overhead/viewOnPartner selects) as f32
+  bit patterns — deterministic across runs.
+- LEVEL3-8 `--traversal-runtime`: all PASS; `CHMO_2 -> HMO_3`
+  regression unchanged (`0x18->0x12->0x11`, `flags148 0x8000->0x8010`,
+  `portals=1`, `teleport=0`), camera stays finite through the portal.
+- 3590 native checks / 0 failures; CTest 1/1; Python 17/17; all
+  app selftests PASS.
+
+## 99. Phase 5K boundary / remaining unknowns
+
+- `FUN_00430bf8` internals (arena query + slide retries + object
+  pass) — call site + contract proven, internals deferred.
+- `FUN_0042b0c0` camera nudge (world-tick + event writers) — the M2
+  consumer that mutates camPos post-pose; decode noted, not ported.
+- Sniper pose/zoom (`FUN_00464624`, `FUN_004691c4` reticle) — the
+  rect write inside this block is ported; the pose path is Phase 5L.
+- Renderer consumption of M1 (`FUN_0046b4f8` clip codes and onward)
+  — transform convention proven at the boundary; drawing itself is
+  out of scope.
+- Whether the original expresses an equivalent FOV angle anywhere —
+  UNKNOWN; only the scale pair is evidenced.

@@ -286,6 +286,17 @@ src/
                                   view yaw, 0x49b71c pitch lift,
                                   0x540be0 effective pitch) — stops
                                   at the renderer boundary (5J)
+             player_camera.*    — Phase 5K normal camera pose: the
+                                  FUN_004301e0 tail (pitch-branched
+                                  pullback position + shake add,
+                                  banked basis, the 0x540b80 M1
+                                  projection-folded world->camera
+                                  matrix + 0x540bb0 M2 basis
+                                  snapshot, scaleX/scaleY/scaleZ,
+                                  view-rect write, the FUN_00430bf8
+                                  obstruction seam point) +
+                                  FUN_00431100 overhead block (raw
+                                  yaw, scaleZ=+1, stale basis) (5K)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

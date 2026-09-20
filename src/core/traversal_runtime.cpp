@@ -469,17 +469,22 @@ void traversalObjectAnimUpdate(DynamicObject& o) {
 }
 
 // ---------------------------------------------------------------------------
-// FUN_00435178 — portal scan on the current arena's type-6 records.
+// FUN_00435178 — portal scan on an arena's type-6 records.
 // fields[0] = partner arena index (rewritten by connect pairing),
 // fields[1] = side code, fields[2..7] = box {x0,y0,z0,x1,y1,z1}.
-// Position source ebx = 0x540bfc, previous = ecx = 0x540c08.
+// OBSERVED call sites (FUN_00436100 + FUN_004301e0 tail):
+//   player:  arena=0x540c48, q=0x540c08 (prev), p=0x540bfc (pos)
+//   camera:  arena=0x540c48, q=eye(0x540bfc+3z), p=0x540b28 (camPos)
 // ---------------------------------------------------------------------------
 
-TraversalArena* traversalPortalTest(TraversalRuntime& rt) {
-  TraversalArena* cur = rt.cur;
-  if (!cur || !cur->rec) return nullptr;
-  const float* p = rt.cs.pos;
-  const float* q = rt.cs.entryPos;
+TraversalArena* traversalPortalScanSegment(TraversalRuntime& rt,
+                                           const TraversalArena& arena,
+                                           const float from[3],
+                                           const float to[3]) {
+  if (!arena.rec) return nullptr;
+  const float* p = to;
+  const float* q = from;
+  const TraversalArena* cur = &arena;
   constexpr float kSlabMargin = -5.0f;  // 0x497778 — z-slab low margin
   constexpr float kZPlane = -0.5f;      // 0x497780 — z-portal plane
   for (const DtiSubRecord& r : cur->rec->subRecords) {
@@ -549,6 +554,12 @@ TraversalArena* traversalPortalTest(TraversalRuntime& rt) {
     return rt.arenas[dst].get();
   }
   return nullptr;
+}
+
+TraversalArena* traversalPortalTest(TraversalRuntime& rt) {
+  if (!rt.cur) return nullptr;
+  return traversalPortalScanSegment(rt, *rt.cur, rt.cs.entryPos,
+                                    rt.cs.pos);
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,11 +1226,23 @@ TraversalFrameResult stepTraversalRuntime(
   //         otherwise flagBec=0 → tail.
   //   tail: z-delta clamp +/-0.5 → 0x49b718 EMA+sign-slew, the
   //         lookEff arena-relative clamp, viewYaw = 90 - yaw, the
-  //         c84 pitch lift, effective pitch — then the prev-pos
-  //         commit which runs EVERY frame on all paths
-  //         (0x430272 / 0x4309ed movsd x3).
+  //         c84 pitch lift, effective pitch — then the Phase 5K
+  //         camera block (position/basis/matrix pair, obstruction
+  //         seam, view-config write) and the eye->camPos portal
+  //         tail, then the prev-pos commit which runs EVERY frame
+  //         on all paths (0x430272 / 0x4309ed movsd x3).
+  bool overheadView = false;
   if (rt.flagC9c == 0 && rt.flag49b740 != 0) {
-    ++rt.seams.pendingViewSnaps; // FUN_00431100 — view-snap seam
+    // FUN_00431100 — overhead view block (scripted 0x40031 / cheat).
+    ++rt.seams.overheadViewCalls;
+    overheadView = true;
+    PlayerCameraEnvironment ce;
+    for (int i = 0; i < 3; ++i) ce.playerPos[i] = rt.cs.pos[i];
+    ce.yawDeg = rt.motion.yawDeg;       // raw 0x540c2c — not viewYaw
+    ce.altAspect = rt.flag5414bc;
+    updatePlayerCameraOverhead(ce, rt.camera);
+    // 0x4309ed — the overhead path commits prevPos after the call.
+    for (int i = 0; i < 3; ++i) rt.cs.entryPos[i] = rt.cs.pos[i];
   } else {
     if (rt.flagC9c != 0) {
       rt.flagBec = 0;
@@ -1237,9 +1260,43 @@ TraversalFrameResult stepTraversalRuntime(
     vte.viewScalar = rt.viewScalar;
     vte.dz = rt.cs.pos[2] - rt.cs.entryPos[2];
     vte.airCharge = rt.motion.airCharge;
+    // 0x430272 — prevPos commit sits INSIDE the tail, right after
+    // the dz read and before the camera block (the FUN_00430bf8
+    // seam, when ported, moves the player — the original commits
+    // the pre-move position here).
+    for (int i = 0; i < 3; ++i) rt.cs.entryPos[i] = rt.cs.pos[i];
     updatePlayerViewTail(vte, rt.view);
+
+    // FUN_004301e0 camera block (0x43042b..0x4309dd) — pose, basis,
+    // M1/M2 matrix pair, view-config write. The FUN_00430bf8
+    // obstruction seam sits inside (post-basis, pre-commit) and may
+    // move the camera AND the player when ported — env.playerPos is
+    // the in/out channel for that contract.
+    PlayerCameraEnvironment ce;
+    for (int i = 0; i < 3; ++i) ce.playerPos[i] = rt.cs.pos[i];
+    ce.viewYawDeg = rt.view.viewYawDeg;
+    ce.effPitchDeg = rt.view.viewPitchDeg;
+    ce.bankDeg = rt.motion.bank + rt.bankAux;   // b4c + b60
+    ce.yawDeg = rt.motion.yawDeg;
+    ce.altAspect = rt.flag5414bc;
+    ce.sniperViewport = (rt.flagC9c != 0 && rt.transitionPhase != 0);
+    ce.lookActive = (rt.look.lookPitchOffset != 0.0f);
+    const PlayerCameraFrame cf = updatePlayerCamera(ce, rt.camera);
+    if (cf.obstructionSeam) ++rt.seams.cameraObstructionCalls;
+    // FUN_00430bf8 writes BOTH endpoints when it runs — the seam is
+    // not ported, but keep the in/out contract real for the future
+    // port (no-op today: the seam only counts).
+    for (int i = 0; i < 3; ++i) rt.cs.pos[i] = ce.playerPos[i];
+
+    // 0x43097f..0x4309ce — portal tail: b714 <- 0; eye = pos+3z;
+    // FUN_00435178(cur, eye -> camPos); hit == ca4 → b714 = 1.
+    rt.viewOnPartner = false;
+    float eye[3] = {rt.cs.pos[0], rt.cs.pos[1],
+                    static_cast<float>(rt.cs.pos[2] + 3.0)};
+    if (TraversalArena* hit = traversalPortalScanSegment(
+            rt, *cur, eye, rt.camera.pose.pos))
+      if (hit == rt.partner) rt.viewOnPartner = true;
   }
-  for (int i = 0; i < 3; ++i) rt.cs.entryPos[i] = rt.cs.pos[i];
   // bankIdle -> 0x5414b4; FUN_0046ae60(0x5414bc != 0) — OBSERVED.
   rt.bankIdle = (rt.motion.bank + rt.bankAux) == 0.0f;
   ++rt.seams.timersCalls;
@@ -1343,6 +1400,8 @@ TraversalFrameResult stepTraversalRuntime(
   out.viewPitchDeg = rt.view.viewPitchDeg;
   out.viewZDelta = rt.view.viewZDelta;
   out.viewPitchLift = rt.view.viewPitchLift;
+  out.overheadViewActive = overheadView;
+  out.camera = rt.camera.pose;
   out.seams = rt.seams;
   return out;
 }

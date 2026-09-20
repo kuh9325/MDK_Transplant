@@ -27,6 +27,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/options_menu.h"
+#include "core/player_camera.h"
 #include "core/player_motion.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
@@ -39,6 +40,7 @@
 #include "input/input_state.h"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -12152,6 +12154,418 @@ void test_player_look() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5K — normal traversal camera pose and view matrix.
+// FUN_004301e0 tail (position branches, basis, M1/M2 pair, view
+// config) + FUN_00431100 (overhead). Expected values are computed
+// from the OBSERVED formulas; the trig helper's degree constant is
+// the stored f64 0x497924 (4 ULP below pi/180).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr double kCamDegToRad =
+    std::bit_cast<double>(0x3f91df46a2529d35ULL);
+
+float camTrigSin(float deg) {
+  return static_cast<float>(
+      std::sin(static_cast<double>(deg) * kCamDegToRad));
+}
+float camTrigCos(float deg) {
+  return static_cast<float>(
+      std::cos(static_cast<double>(deg) * kCamDegToRad));
+}
+
+mdk::PlayerCameraEnvironment camEnv(float px, float py, float pz,
+                                    float viewYawDeg,
+                                    float effPitchDeg) {
+  mdk::PlayerCameraEnvironment e;
+  e.playerPos[0] = px;
+  e.playerPos[1] = py;
+  e.playerPos[2] = pz;
+  e.viewYawDeg = viewYawDeg;
+  e.effPitchDeg = effPitchDeg;
+  e.bankDeg = 0.0f;
+  e.yawDeg = 90.0f - viewYawDeg;
+  return e;
+}
+
+} // namespace
+
+void test_player_camera() {
+  // ---- pose: pitch = 0 (D branch, D = pullback = 8.0) -----------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f); // yaw 0 -> vY 90
+    mdk::updatePlayerCamera(e, st);
+    // camX = px - sin(90)*8*cos(0); camY = py - cos(90)*8; z = +4.5.
+    CHECK(near(st.pose.pos[0], -8.0, 1e-5));
+    CHECK(near(st.pose.pos[1], 0.0, 1e-5));
+    CHECK(near(st.pose.pos[2], 4.5, 1e-5));
+    // back = (-sinY*cosP, -cosY*cosP, sinP) ~ (-1, 0, 0) -> fwd +X.
+    CHECK(near(st.pose.back[0], -1.0, 1e-5));
+    CHECK(near(st.pose.back[1], 0.0, 1e-5));
+    CHECK(near(st.pose.back[2], 0.0, 1e-5));
+    // bank 0 -> up = +Z; right = up x back ~ (0,-1,0); down = -up.
+    CHECK(near(st.pose.up[0], 0.0, 1e-6));
+    CHECK(near(st.pose.up[1], 0.0, 1e-6));
+    CHECK(near(st.pose.up[2], 1.0, 1e-6));
+    CHECK(near(st.pose.view[0][0], 0.0, 1e-6));
+    CHECK(near(st.pose.view[0][1], -0.8333333, 1e-6));
+    CHECK(near(st.pose.view[0][2], 0.0, 1e-6));
+    CHECK(near(st.pose.view[1][0], 0.0, 1e-6));
+    CHECK(near(st.pose.view[1][1], 0.0, 1e-6));
+    CHECK(near(st.pose.view[1][2], -1.3888889, 1e-5));
+    // row2 = scaleZ*back = -1 * (-1,0,0) = (1,0,0); t = -(back.cam)
+    // = -((-1)(-8)) = -8 -> scaleZ*t = +8.
+    CHECK(near(st.pose.view[2][0], 1.0, 1e-6));
+    CHECK(near(st.pose.view[2][1], 0.0, 1e-6));
+    CHECK(near(st.pose.view[2][2], 0.0, 1e-6));
+    CHECK(near(st.pose.view[2][3], 8.0, 1e-4));
+    // view[1][3] = scaleY * -(down.cam) = 1.3889 * 4.5 = 6.25.
+    CHECK(near(st.pose.view[1][3], 6.25, 1e-4));
+    // M2 = basis*|basis| with t = -(row.cam)*|row| (|row|=1 here).
+    CHECK(near(st.pose.basis[0][1], -1.0, 1e-5));
+    CHECK(near(st.pose.basis[1][2], -1.0, 1e-5));
+    CHECK(near(st.pose.basis[2][0], -1.0, 1e-5));
+    CHECK(near(st.pose.basis[2][3], -8.0, 1e-4));
+    // Scales + view config (normal viewport).
+    CHECK(near(st.pose.scaleX, 0.8333333, 1e-6));
+    CHECK(near(st.pose.scaleY, 1.3888889, 1e-5));
+    CHECK(st.pose.scaleZ == -1.0f);
+    CHECK(st.pose.modeZoom == 2.4f);
+    CHECK(st.pose.viewW == 600 && st.pose.viewH == 360);
+    CHECK(st.pose.viewCX == 300 && st.pose.viewCY == 180);
+    CHECK(st.pose.viewOX == 0 && st.pose.viewOY == 0);
+  }
+
+  // ---- pose: yaw 90 (viewYaw 0) ---------------------------------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(10.0f, 20.0f, 5.0f, 0.0f, 0.0f);
+    mdk::updatePlayerCamera(e, st);
+    // facing +Y -> camera 8 behind along -Y.
+    CHECK(near(st.pose.pos[0], 10.0, 1e-5));
+    CHECK(near(st.pose.pos[1], 12.0, 1e-5));
+    CHECK(near(st.pose.pos[2], 9.5, 1e-5));
+    CHECK(near(st.pose.back[0], 0.0, 1e-6));
+    CHECK(near(st.pose.back[1], -1.0, 1e-5));
+    CHECK(near(st.pose.back[2], 0.0, 1e-5));
+  }
+
+  // ---- pose: pitch > 0 branch -----------------------------------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(10.0f, 20.0f, 5.0f, 90.0f, 30.0f);
+    mdk::updatePlayerCamera(e, st);
+    const double sP = camTrigSin(30.0f), cP = camTrigCos(30.0f);
+    const double T = (1.0 - cP) * 5.0;
+    const double sY = camTrigSin(90.0f), cY = camTrigCos(90.0f);
+    CHECK(near(st.pose.pos[0],
+               10.0 - sY * 8.0 * cP + T * sY, 1e-5));
+    CHECK(near(st.pose.pos[1],
+               20.0 - cY * 8.0 * cP + T * cY, 1e-5));
+    CHECK(near(st.pose.pos[2], 5.0 + 4.5 + 8.0 * sP, 1e-5));
+    CHECK(near(st.pose.back[0], -sY * cP, 1e-6));
+    CHECK(near(st.pose.back[2], sP, 1e-6));
+    // Orthonormal basis at nonzero pitch.
+    const double rl =
+        std::sqrt(st.pose.view[0][0] * st.pose.view[0][0] +
+                  st.pose.view[0][1] * st.pose.view[0][1] +
+                  st.pose.view[0][2] * st.pose.view[0][2]);
+    CHECK(near(rl, st.pose.scaleX, 1e-5));
+    // right . back == 0, up . back == 0.
+    const double rb =
+        st.pose.view[0][0] / st.pose.scaleX * st.pose.back[0] +
+        st.pose.view[0][1] / st.pose.scaleX * st.pose.back[1] +
+        st.pose.view[0][2] / st.pose.scaleX * st.pose.back[2];
+    CHECK(near(rb, 0.0, 1e-5));
+    const double ub = st.pose.up[0] * st.pose.back[0] +
+                      st.pose.up[1] * st.pose.back[1] +
+                      st.pose.up[2] * st.pose.back[2];
+    CHECK(near(ub, 0.0, 1e-5));
+    CHECK(near(std::sqrt(st.pose.up[0] * st.pose.up[0] +
+                         st.pose.up[1] * st.pose.up[1] +
+                         st.pose.up[2] * st.pose.up[2]),
+               1.0, 1e-5));
+  }
+
+  // ---- pose: -20 < pitch < 0 (D = pullback) ---------------------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(10.0f, 20.0f, 5.0f, 90.0f, -10.0f);
+    mdk::updatePlayerCamera(e, st);
+    const double sP = camTrigSin(-10.0f), cP = camTrigCos(-10.0f);
+    CHECK(near(st.pose.pos[0], 10.0 - 8.0 * cP, 1e-5));
+    CHECK(near(st.pose.pos[2], 5.0 + 4.5 + 8.0 * sP, 1e-5));
+  }
+
+  // ---- pose: pitch < -20 (D shrinks toward 0 at pitch = -100) ---
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(10.0f, 20.0f, 5.0f, 90.0f, -50.0f);
+    mdk::updatePlayerCamera(e, st);
+    // D = (-50 + 100) * 8 * 0.0125 = 5.0 — continuous at -20.
+    const double cP = camTrigCos(-50.0f), sP = camTrigSin(-50.0f);
+    CHECK(near(st.pose.pos[0], 10.0 - 5.0 * cP, 1e-5));
+    CHECK(near(st.pose.pos[2], 5.0 + 4.5 + 5.0 * sP, 1e-5));
+    // Boundary: pitch = -20 -> D = pullback on both sides.
+    mdk::PlayerCameraState st2;
+    auto e2 = camEnv(10.0f, 20.0f, 5.0f, 90.0f, -20.0f);
+    mdk::updatePlayerCamera(e2, st2);
+    CHECK(near(st2.pose.pos[0],
+               10.0 - 8.0 * camTrigCos(-20.0f), 1e-5));
+    mdk::PlayerCameraState st3;
+    auto e3 = camEnv(10.0f, 20.0f, 5.0f, 90.0f, -20.001f);
+    mdk::updatePlayerCamera(e3, st3);
+    CHECK(near(st3.pose.pos[0], st2.pose.pos[0], 1e-3));
+  }
+
+  // ---- bank rolls the up/right vectors, not the position --------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    e.bankDeg = 45.0f;
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(st.pose.pos[0], -8.0, 1e-5));
+    const double s45 = camTrigSin(45.0f);
+    CHECK(near(st.pose.up[1], -s45, 1e-5));
+    CHECK(near(st.pose.up[2], s45, 1e-5));
+    // right = up x back — banked: (0, -cos45, -sin45)-ish.
+    CHECK(near(st.pose.view[0][2] / st.pose.scaleX, -s45, 1e-5));
+  }
+
+  // ---- projection: alt aspect + zoom -----------------------------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    e.altAspect = true;
+    mdk::updatePlayerCamera(e, st);
+    // 1/(2.4 * 280 * (1/384) * 0.5) = 1/0.875.
+    CHECK(near(st.pose.scaleY, 1.1428571, 1e-5));
+    mdk::PlayerCameraState st2;
+    st2.zoom = 1.2f;
+    auto e2 = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e2, st2);
+    CHECK(near(st2.pose.scaleX, 1.0 / 0.6, 1e-5));
+    CHECK(near(st2.pose.scaleY,
+               1.0 / (1.2 * 360.0 * (1.0 / 600.0) * 0.5), 1e-5));
+  }
+
+  // ---- shake: |ce4| gate + 0.2 scale ----------------------------
+  {
+    mdk::PlayerCameraState st;
+    st.shakeMag = 1.0f;
+    st.shakeX = 10.0f;
+    st.shakeY = -5.0f;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(st.pose.pos[0], -8.0 + 10.0 * 0.2, 1e-5));
+    CHECK(near(st.pose.pos[1], 0.0 - 5.0 * 0.2, 1e-5));
+    // Gate: shakeMag == 0 suppresses the add.
+    mdk::PlayerCameraState st2;
+    st2.shakeX = 10.0f;
+    auto e2 = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e2, st2);
+    CHECK(near(st2.pose.pos[0], -8.0, 1e-5));
+  }
+
+  // ---- world->camera: player lands at (0, +6.25, +8) in view ----
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e, st);
+    // FUN_0046b4f8 convention: out_i = row_i . p + t_i.
+    const float pt[3] = {0.0f, 0.0f, 0.0f};
+    const double ox = st.pose.view[0][0] * pt[0] +
+                      st.pose.view[0][1] * pt[1] +
+                      st.pose.view[0][2] * pt[2] + st.pose.view[0][3];
+    const double oy = st.pose.view[1][0] * pt[0] +
+                      st.pose.view[1][1] * pt[1] +
+                      st.pose.view[1][2] * pt[2] + st.pose.view[1][3];
+    const double oz = st.pose.view[2][0] * pt[0] +
+                      st.pose.view[2][1] * pt[1] +
+                      st.pose.view[2][2] * pt[2] + st.pose.view[2][3];
+    CHECK(near(ox, 0.0, 1e-5));
+    CHECK(near(oy, 6.25, 1e-4));   // screenY numerator (scaled down)
+    CHECK(near(oz, 8.0, 1e-4));    // positive depth ahead
+  }
+
+  // ---- obstruction seam gate ------------------------------------
+  {
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = true;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    CHECK(mdk::updatePlayerCamera(e, st).obstructionSeam);
+    // |d58| != 0 suppresses the call (OBSERVED).
+    e.lookActive = true;
+    CHECK(!mdk::updatePlayerCamera(e, st).obstructionSeam);
+    // b710 == 0 suppresses the call.
+    mdk::PlayerCameraState st2;
+    e.lookActive = false;
+    CHECK(!mdk::updatePlayerCamera(e, st2).obstructionSeam);
+  }
+
+  // ---- sniper viewport rect (state write only) -------------------
+  {
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    e.sniperViewport = true;
+    mdk::updatePlayerCamera(e, st);
+    CHECK(st.pose.modeZoom == 1.0f);
+    CHECK(st.pose.viewW == 384 && st.pose.viewH == 280);
+    CHECK(st.pose.viewCX == 299 && st.pose.viewCY == 219);
+    CHECK(st.pose.viewOX == 107 && st.pose.viewOY == 79);
+  }
+
+  // ---- FUN_00431100 overhead path --------------------------------
+  {
+    mdk::PlayerCameraState st;
+    st.overheadHeight = 50.0f;
+    st.pose.back[0] = 7.0f;        // stale sentinel — must survive
+    auto e = camEnv(1.0f, 2.0f, 3.0f, 90.0f, 0.0f);
+    e.yawDeg = 0.0f;               // raw 0x540c2c, NOT viewYaw
+    mdk::updatePlayerCameraOverhead(e, st);
+    CHECK(near(st.pose.pos[0], 1.0, 1e-6));
+    CHECK(near(st.pose.pos[1], 2.0, 1e-6));
+    CHECK(near(st.pose.pos[2], 53.0, 1e-5));
+    CHECK(st.pose.scaleZ == 1.0f);
+    CHECK(st.pose.back[0] == 7.0f);      // not written by overhead
+    // M2 rows verbatim: right=(sin,-cos,0), down=(-cos,-sin,0),
+    // back=(0,0,-1); tA = py*cos - px*sin, tB = px*cos + py*sin.
+    CHECK(near(st.pose.basis[0][0], 0.0, 1e-6));
+    CHECK(near(st.pose.basis[0][1], -1.0, 1e-5));
+    CHECK(near(st.pose.basis[0][2], 0.0, 1e-6));
+    CHECK(near(st.pose.basis[0][3], 2.0, 1e-5));    // tA
+    CHECK(near(st.pose.basis[1][0], -1.0, 1e-5));
+    CHECK(near(st.pose.basis[1][1], 0.0, 1e-6));
+    CHECK(near(st.pose.basis[1][3], 1.0, 1e-5));    // tB
+    CHECK(near(st.pose.basis[2][2], -1.0, 1e-6));
+    CHECK(near(st.pose.basis[2][3], 53.0, 1e-4));   // tC = camZ
+    // M1 folds the scales; row2 = (0,0,-1,camZ) with scaleZ=+1.
+    CHECK(near(st.pose.view[0][1], -0.8333333, 1e-5));
+    CHECK(near(st.pose.view[1][0], -1.3888889, 1e-4));
+    CHECK(near(st.pose.view[2][2], -1.0, 1e-6));
+    CHECK(near(st.pose.view[2][3], 53.0, 1e-4));
+    // Raw yaw 45 vs viewYaw — proves the overhead path does NOT use
+    // 90-yaw: with yaw=45 raw, right = (sin45,-cos45,0).
+    mdk::PlayerCameraState st2;
+    st2.overheadHeight = 50.0f;
+    auto e2 = camEnv(1.0f, 2.0f, 3.0f, 90.0f, 0.0f);
+    e2.yawDeg = 45.0f;
+    mdk::updatePlayerCameraOverhead(e2, st2);
+    CHECK(near(st2.pose.basis[0][0], camTrigSin(45.0f), 1e-6));
+  }
+
+  // ---- runtime: camera produced per frame + portal tail ---------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "CAM_A");
+    mdk::TraversalArena* b = travArenaAdd(rt, "CAM_B");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    // Type-6 side-0 portal at x = -4: the settled camera sits at
+    // x ~ -8 behind a player at x ~ 0 facing +X (viewYaw = 90).
+    rt.level.work[0].subRecords.push_back(mdk::DtiSubRecord{});
+    rt.level.work[0].subRecords.back() = travSub(
+        6, {1, 0, fbits(-4.f), fbits(-10.f), fbits(5.f),
+            fbits(-4.f), fbits(10.f), fbits(25.f)});
+    rt.cur = a;
+    rt.partner = b;
+    rt.partnerActive = true;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1;
+    rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 12.0f;
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const mdk::RawGameplayInput idle{};
+    mdk::TraversalFrameResult out;
+    for (int i = 0; i < 40; ++i)
+      out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    // Settled on the z=10 floor: camera behind at -X, ~+4.5 z.
+    CHECK(out.grounded);
+    CHECK(std::isfinite(out.camera.pos[0]) &&
+          std::isfinite(out.camera.pos[1]) &&
+          std::isfinite(out.camera.pos[2]));
+    CHECK(out.camera.pos[0] < out.pos[0] - 4.0f);
+    CHECK(near(out.camera.pos[1], out.pos[1], 1e-3));
+    CHECK(out.camera.pos[2] > out.pos[2]);
+    CHECK(near(out.camera.scaleX, 0.8333333, 1e-5));
+    CHECK(out.camera.scaleZ == -1.0f);
+    CHECK(out.camera.viewW == 600 && out.camera.viewH == 360);
+    // The eye->camPos segment crosses x=-4 going -x -> viewOnPartner.
+    CHECK(out.viewOnPartner);
+    CHECK(!out.overheadViewActive);
+    // Overhead path: flag49b740 routes to FUN_00431100.
+    rt.flag49b740 = 1;
+    rt.camera.overheadHeight = 50.0f;
+    out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.overheadViewActive);
+    CHECK(out.seams.overheadViewCalls >= 1);
+    CHECK(near(out.camera.pos[2], out.pos[2] + 50.0f, 1e-3));
+    CHECK(out.camera.scaleZ == 1.0f);
+    // OBSERVED: the overhead path does NOT run the portal tail —
+    // viewOnPartner keeps its previous value.
+    CHECK(out.viewOnPartner);
+    rt.flag49b740 = 0;
+    out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(!out.overheadViewActive);
+    CHECK(out.camera.scaleZ == -1.0f);
+  }
+
+  // ---- golden sequence: deterministic across identical runs -----
+  {
+    auto runSeq = []() -> std::uint64_t {
+      CollisionFixture f = makeFloorArena();
+      mdk::TraversalRuntime rt;
+      mdk::TraversalArena* a = travArenaAdd(rt, "CAM_A");
+      a->dyn.col.verts = f.verts.data();
+      a->dyn.col.polys = f.polys.data();
+      a->dyn.col.nodes = f.nodes.data();
+      a->dyn.col.deepFloorZ = -1000.0f;
+      rt.cur = a;
+      rt.cs.arena = &a->dyn.col;
+      rt.cs.queryEnabled = 1;
+      rt.cs.arenaValid = 1;
+      rt.cs.objectDataLoaded = 1;
+      rt.cs.pos[2] = 12.0f;
+      rt.cs.entryPos[2] = 12.0f;
+      const mdk::GameplayInputBindings bindings;
+      const mdk::FrontendTimingState timing;
+      const mdk::RawGameplayInput idle{};
+      mdk::RawGameplayInput lookKey{};
+      lookKey.keyLevel[30 >> 5] |= 1u << (30 & 31);
+      std::uint64_t h = 1469598103934665603ull;
+      auto mix = [&](float v) {
+        std::uint32_t b;
+        std::memcpy(&b, &v, 4);
+        h ^= b;
+        h *= 1099511628211ull;
+      };
+      for (int i = 0; i < 60; ++i) {
+        const auto& key = (i >= 20 && i < 40) ? lookKey : idle;
+        const auto out =
+            mdk::stepTraversalRuntime(rt, key, bindings, timing);
+        for (int k = 0; k < 3; ++k) mix(out.camera.pos[k]);
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 4; ++c) mix(out.camera.view[r][c]);
+        mix(out.camera.scaleX);
+        mix(out.camera.scaleY);
+        mix(out.viewPitchDeg);
+        mix(out.viewYawDeg);
+      }
+      return h;
+    };
+    CHECK(runSeq() == runSeq());
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -12202,6 +12616,7 @@ int main() {
   test_traversal_script();
   test_traversal_object_init();
   test_player_look();
+  test_player_camera();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
