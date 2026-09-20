@@ -52,6 +52,7 @@
 #ifndef MDK_CORE_PLAYER_VERTICAL_H
 #define MDK_CORE_PLAYER_VERTICAL_H
 
+#include "core/collision_query.h"
 #include "core/player_motion.h"
 
 namespace mdk {
@@ -255,6 +256,16 @@ PlayerVerticalFrame integratePlayerVertical(
     const PlayerVerticalEnvironment& env, PlayerMotionState& ms,
     PlayerVerticalState& vs);
 
+// FUN_00467180 alone — the vertical gravity + collision request with
+// NO jump machine. The normal path reaches it through
+// integratePlayerVertical (jump machine first); the sniper path
+// (FUN_00464624) calls it directly (OBSERVED 0x464637). `frame`
+// accumulates any events the caller seeded (empty for the sniper
+// path); returns the FUN_004630d4 request.
+PlayerVerticalFrame integratePlayerGravity(
+    const PlayerVerticalEnvironment& env, PlayerMotionState& ms,
+    PlayerVerticalState& vs, PlayerVerticalFrame frame = {});
+
 // FUN_00467180's post-collision half: applies the seam result and
 // runs the landing/ceiling/no-contact/blocker/deep-floor rules in
 // original order. Mutates `frame` (outcome fields + landing events).
@@ -262,6 +273,19 @@ void applyPlayerVerticalCollision(
     const PlayerVerticalEnvironment& env, PlayerMotionState& ms,
     PlayerVerticalState& vs, const VerticalCollisionResult& res,
     PlayerVerticalFrame& frame);
+
+// Shared vertical-collision plumbing — collisionApply for the frame's
+// dispZ (scale 0.5, outAux -> normal) then applyPlayerVerticalCollision
+// on the semantic result. Mirrors what the original does inside
+// FUN_004630d4's caller; used by both the normal path and the sniper
+// path (FUN_00464624's embedded FUN_00467180 call). Updates cs.pos,
+// vs.contactObj/posX..Z/contactNormal/contactFlags/floorZ/blockers and
+// the frame outcome; returns the contact poly (nullptr = none) and
+// writes *appliedDispZ when non-null.
+const CollisionPoly* playerVerticalApplyCollision(
+    const PlayerVerticalEnvironment& env, CollisionState& cs,
+    PlayerMotionState& ms, PlayerVerticalState& vs,
+    PlayerVerticalFrame& frame, float* appliedDispZ);
 
 // FUN_00466740's tail: the deferred FUN_00466aec mantle boundary and
 // the unconditional e28 clear — skipped entirely in slide mode.

@@ -180,6 +180,21 @@ PlayerVerticalFrame integratePlayerVertical(
   frame.sustain = vs.jumpSustain != 0;
 
   // ================= FUN_00467180 =================
+  return integratePlayerGravity(env, ms, vs, frame);
+}
+
+// FUN_00467180 — the vertical gravity + collision request. Extracted
+// from integratePlayerVertical because the sniper path (FUN_00464624)
+// calls it WITHOUT the FUN_00466740 jump machine (OBSERVED 0x464637).
+// Runs the gravity integration, the ribbon-volume check, the rise cap
+// and the pre-land clamp, then hands the caller a FUN_004630d4 request.
+PlayerVerticalFrame integratePlayerGravity(
+    const PlayerVerticalEnvironment& env, PlayerMotionState& ms,
+    PlayerVerticalState& vs, PlayerVerticalFrame frame) {
+  const float f0 = env.smoothed;
+  const float f4 = env.deltaSeconds;
+  float& airCharge = ms.airCharge;   // the shared 0x540c84
+
   // 0x46718b/0x467198 — the vertical master gate and the
   // mantle/vertical-skip gate return before any work.
   if (!env.vertEnable || vs.vertSkip != 0) return frame;
@@ -268,6 +283,45 @@ PlayerVerticalFrame integratePlayerVertical(
   frame.collisionIssued = true;
   frame.sustain = vs.jumpSustain != 0;
   return frame;
+}
+
+const CollisionPoly* playerVerticalApplyCollision(
+    const PlayerVerticalEnvironment& env, CollisionState& cs,
+    PlayerMotionState& ms, PlayerVerticalState& vs,
+    PlayerVerticalFrame& frame, float* appliedDispZ) {
+  // FUN_004630d4(ctx, mode, 0, 0, dispZ, 0.5, 0, &e50) — the vertical
+  // sweep. appliedDispZ is measured against the PRE-call posZ (the
+  // snapshot vs.posZ still holds — the apply writes cs.pos, not vs).
+  const CollisionNode* node = nullptr;
+  const CollisionPoly* vContact =
+      collisionApply(cs, 0.0f, 0.0f, frame.dispZ, 0.5f, nullptr, &node);
+  if (appliedDispZ) *appliedDispZ = cs.pos[2] - vs.posZ;
+  // 0x540e4c — every apply's EAX is stored (0 clears). The contact
+  // normal feeds the slope-assist + hard-landing consumers.
+  vs.contactObj = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(vContact));
+  VerticalCollisionResult vres;
+  vres.contactObj = vs.contactObj;
+  vres.posX = cs.pos[0];
+  vres.posY = cs.pos[1];
+  vres.posZ = cs.pos[2];
+  if (vContact) {
+    vres.normalX = node->nx;
+    vres.normalY = node->ny;
+    vres.normalZ = node->nz;
+    vs.contactNormal[0] = node->nx;
+    vs.contactNormal[1] = node->ny;
+    vs.contactNormal[2] = node->nz;
+  }
+  vres.hasFloor = (cs.contactFlags & 2) != 0;
+  vres.floorZ = cs.floorZ;
+  vres.blocker0 = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(cs.floorObj));
+  vres.blocker1 = cs.floorElemMask;
+  vres.blocker0Flag80 =
+      cs.floorObj && (cs.floorObj->flags14a & 0x80);
+  applyPlayerVerticalCollision(env, ms, vs, vres, frame);
+  return vContact;
 }
 
 void applyPlayerVerticalCollision(

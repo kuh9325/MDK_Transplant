@@ -3,6 +3,8 @@
 
 #include "core/player_motion.h"
 
+#include "core/motion_channels.h"
+
 #include <cmath>
 
 namespace mdk {
@@ -30,56 +32,6 @@ constexpr float kAirDrainCeil = 60.0f;  // 0x42700000 literal
 constexpr int kEventTurn = 4, kEventTurnMag = 400;   // 4 / 0x190
 constexpr int kEventStrafe = 5, kEventStrafeMag = 500;  // 5 / 0x1f4
 constexpr int kEventMove = 6, kEventMoveMag = 600;      // 6 / 0x258
-
-// FUN_00465b54 — frame-scaled accelerate-toward-cap. A sign reversal
-// REPLACES the velocity with the increment (no brake-through-zero).
-void accelChannel(float& vel, float rate, float cap, float f0) {
-  const float inc = rate * f0;
-  if (rate >= 0.0f) {
-    vel = vel >= 0.0f ? vel + inc : inc;
-    if (cap < vel) vel = cap;
-  } else {
-    vel = vel <= 0.0f ? vel + inc : inc;
-    if (vel < cap) vel = cap;
-  }
-}
-
-// FUN_00465bd8 — identical shape but the increment is the raw rate
-// (the keyboard-turn path is NOT frame-scaled — OBSERVED quirk).
-void directChannel(float& vel, float rate, float cap) {
-  if (rate >= 0.0f) {
-    vel = vel >= 0.0f ? vel + rate : rate;
-    if (cap < vel) vel = cap;
-  } else {
-    vel = vel <= 0.0f ? vel + rate : rate;
-    if (vel < cap) vel = cap;
-  }
-}
-
-// FUN_00465a84 — decay toward 0; rIn inside +-bound, rOut outside,
-// both frame-scaled; snaps to 0 on crossing.
-void decelChannel(float& vel, float rIn, float rOut, float bound,
-                  float f0) {
-  if (vel <= bound) {
-    if (vel <= 0.0f) {
-      if (-bound <= vel) {
-        if (vel < 0.0f) {
-          vel += rIn * f0;
-          if (vel > 0.0f) vel = 0.0f;
-        }
-      } else {
-        vel += rOut * f0;
-        if (vel > 0.0f) vel = 0.0f;
-      }
-    } else {
-      vel -= rIn * f0;
-      if (vel < 0.0f) vel = 0.0f;
-    }
-  } else {
-    vel -= rOut * f0;
-    if (vel < 0.0f) vel = 0.0f;
-  }
-}
 
 } // namespace
 

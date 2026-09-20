@@ -116,6 +116,9 @@ struct CollisionObject {
   std::uint16_t flags148;            // +0x148 — sweep skips &0x810, floor skips &0x10
   std::uint8_t flags149;             // +0x149 — bit0 = has standable geometry
   std::uint8_t flags14a;             // +0x14a — bit4 = elemMaskA enable; bit7 = mountable
+  std::uint8_t flags14b;             // +0x14b — bit1 = mount-scan gate
+                                     // (FUN_00463608), bit2 = reticle
+                                     // disabled (FUN_004691c4)
   float aabb[6];                     // +0x198
   float xform[9];                    // +0xac..0xd4 — row-major 3x3 (scale baked)
   float origin[3];                   // +0xb8, +0xc8, +0xd8

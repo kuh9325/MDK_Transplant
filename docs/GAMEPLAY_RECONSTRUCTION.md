@@ -2395,3 +2395,215 @@ now carries `camera` + `overheadViewActive` + `viewOnPartner`.
   out of scope.
 - Whether the original expresses an equivalent FOV angle anywhere —
   UNKNOWN; only the scale pair is evidenced.
+
+# Phase 5L — Sniper Scope and Mounted Reticle
+
+Phase 5L reconstructs the original's two aim modes: the sniper scope
+(`FUN_00464624` core + `FUN_00464b50` zoom + `FUN_00461878` reset) and
+the mounted reticle / bomb-sight (`FUN_00463608` mount-scan + class
+entries + `FUN_004691c4` update). They are SEPARATE state paths that
+share only the semantic-channel globals and the `FUN_00467a00` drain —
+the executable gives no evidence of a unified weapon system, and none
+was introduced. Oracle: `MDK95.EXE` BUILD_A only.
+
+## 100. Dispatch order (OBSERVED, FUN_00463608)
+
+Each frame the dispatcher picks exactly one branch:
+
+1. `e6c != 0 && +0x14b & 2` — the mounted-class dispatch (byte2 of the
+   `e70` dword selects: `1` XD/XD2 -> `FUN_00467ac4`, `2` XSNOWB ->
+   `FUN_00467ed0`, `4` X_STRIKE/XE -> `FUN_004691c4`). Recognised
+   classes then run the `FUN_00469cd0` weapon-slot seam; an
+   unrecognised class logs "Unrecognised controlalien" and unmounts.
+2. else `c9c != 0` — sniper. `ca0 == 0` clears the four semantic
+   channels; `ca0 != 0` runs `FUN_00464624` then the `FUN_00469b98`
+   weapon-select seam.
+3. else `c9c == 0` — `cac >= 800` scripted (channels cleared, no
+   horizontal motion) or the `FUN_00465228` normal path (whose tail
+   runs the mount-scan + class entry + sniper entry + normal-fire
+   latch).
+
+The mount outranks the sniper and the normal path. This is the order
+now wired into `stepTraversalRuntime`.
+
+## 101. Sniper entry (OBSERVED, FUN_00465228 tail)
+
+`itemUse` is checked first (seam), then the sniper pulse:
+
+- Gate: `ce76c (sniperPulse) && cbc < 8 && cb00 < 8`.
+- Eligibility: `c6c == 0` (vertical disabled) -> free; else requires
+  `vertVel == +-0 && grounded && no dying-surface record` under the
+  contact poly (`FUN_0041342c` — kind -1, rate > 0, surfType match).
+- Writes: `c74 = 0`, `c9c = 1`, `ca0 = 0`, all four channels = 0,
+  `cb08 = 0x323` / `cb00 = 8` (scope-in state at priority 8).
+
+The entry reads the N-1 merged frame — the same one-frame latency as
+movement.
+
+## 102. Scope phase (OBSERVED, FUN_00436100 head)
+
+`sniperScopePhaseAdvance` runs after the input consume, before the
+dispatch — one phase per frame, committed then requested:
+
+- `ca0 == 2` -> overlay commit (`FUN_00416700`), `e74 = 0`, `ca0 = 3`.
+- `ca0 == 1` -> overlay request (`FUN_0041664c` when unlatched),
+  `5414bc = 1`, `b54 = 0`, `d58 = 0`, `ccc..cd4 = 0`, `e94 = e98 = 1.0`,
+  `ca0 = 2`.
+
+The `ca0 = 1` trigger is the `0x323` anim first-frame write below, so
+the full scope-in spans several frames: entry -> `0x323` anim sets
+`ca0 = 1` -> head walks `1 -> 2 -> 3`.
+
+## 103. `FUN_00464624` — sniper core (OBSERVED, ported)
+
+Original order inside the scoped frame:
+
+1. `c74 = 0`; `FUN_00467180` gravity + vertical collision DIRECTLY —
+   no jump machine (the normal path reaches gravity through
+   `FUN_00466740`; the sniper skips it). `integratePlayerGravity` is
+   the extracted callable.
+2. Last contact (`e4c`) picks the lateral surface multiplier; the
+   `d50` channel (semantic strafe, `accelChannel`/`decelChannel`,
+   `kLateralCapK = 0.25`, inner `0.0888..`, outer `0.1777..`, bound
+   `0.6667`) feeds a swept strafe `FUN_004630d4(d50*f0*sin,
+   -d50*f0*cos, 0, 0.75)`.
+3. Abort: `vertEnable && !grounded && (vertVel < -30 || vertVel > 0)`
+   -> `FUN_00461878` (the `-30..0` band does NOT abort).
+4. Semantic aim from the N-1 frame through `directChannel` (NOT
+   frame-scaled): `yawNorm -> d4c` (suppressed while strafing),
+   `moveNorm -> d48`.
+5. Raw mouse from the CURRENT frame (zero latency) — only when no
+   semantic channel fired, `mouseOn != 0`, not strafing. `kMouseK =
+   0.12`; `MouseYReversed` flips dy.
+6. Non-fired channels decay via `decelChannel` (16/15 inside +-4.0,
+   0.8 outside).
+7. Apply: `b54 += d48*f0*b58*0.4167` clamped `+-50`; `c2c -=
+   d4c*f0*b58*0.4167` wrapped to `[0,360)`.
+8. Post-abort guard `ca0 == 0 -> RET` (the aim above already ran).
+9. Manual unscope `ce76c != 0` OR dying-surface contact -> the
+   `0x464986` block (`c9c = 0`, `cb08 = 0x384`/`cb00 = 9`, camera
+   restored, `ca0` LEFT — only the abort reset clears it).
+10. Fire gate `ce770 != 0 && d0c >= 5 && 54161b == 0` -> `FUN_0045f138`
+    (d0c = 0 only on the NON-sniper branch).
+11. Zoom tail `FUN_00464b50`.
+
+## 104. `FUN_00464b50` zoom + `FUN_00461878` reset (OBSERVED, ported)
+
+- Zoom: scoped `b58` stays in `[floor, 1.0]`; `floor =
+  min(focus-derived or 1000, 0.25)`. `d54 < 0` zooms in
+  (`b58 /= 1 - d54`), `d54 > 0` zooms out while `b58 > 1.0`; the
+  channel decays `0.0147/frame` when no zoom input. Entry snaps
+  `2.4 -> 1.0`.
+- Reset `FUN_00461878` (runs only while `c9c != 0`): `c9c = 0`, scope
+  latch released, `b54 =` arena scalar, `5414bc = 0`, all channels = 0,
+  `b58 = 2.4`, `db8 = 4.5`, `db4 = 8.0`, `ca0 = 0`, `d34 = -101`,
+  `d58 = 0`, `cbc = 0`, `cac = 0x64`.
+
+## 105. `FUN_00467a00` — shared drain (OBSERVED, ported)
+
+Difficulty-scaled energy/health drain shared by the sniper zoom drain
+and the mounted reticle: `easy -> max(1, 2a/3)`, `normal -> a`,
+`hard -> 2a`; `dac += 25*scaled` clamped `[75,180]`; `541554 -=
+scaled`; `d5c += scaled`. Runs only while `health` or the health gate
+is nonzero.
+
+## 106. Anim subset (OBSERVED gate, bounded port)
+
+`FUN_00436ea8 -> FUN_00431300 -> FUN_00461954` runs the player anim
+job only when `(!c9c || ca0 == 0) && (!e6c || !(e70 & 0x20))` and is
+suppressed entirely while `0x4999d0 && 0x541548`. The ported subset
+`playerAnimAdvance` handles the sniper-lifecycle states only; the full
+frame-table machine stays deferred:
+
+- `0x323` (scope-in): first-frame resets `cb4`, steady advances it by
+  `frameStep`; `d34 = rint(scopeScale*eyeHeight + 29)` (FUN_0047d59a
+  round), `pullback = 0`, `eyeHeight = 4.0`, `ca0 = 1` on the pending
+  frame.
+- `0x384` (unscope): steady releases the overlay + `cbc`, advances
+  `cb4`; both write `pullback = 8.0`, `eyeHeight = 4.5`, `d34 = -101`.
+- Tail: `cb0 = cac` (first-frame latch) every dispatched state.
+
+## 107. Mounted reticle (OBSERVED, ported — separate from sniper)
+
+`FUN_00463608` mount-scan (normal-path tail): `e68 = rideObj` when
+`rideObj && rideActive`, then mounts `e68` when `named && +0x14b&2 &&
+!e6c && !c74`. Class dword `e70` byte2 selects the entry:
+
+- XD/XD2 -> `e70 = 0x10039`, `+0x14a |= 8`, yaw/pos pinned, channels
+  cleared (requires `c74 == 0 && airCharge == 0`).
+- XSNOWB -> `e70 = 0x20002`, `+0x148 |= 0x80800` then `&= ~0x80100`,
+  `FUN_00461878(0)` if riding.
+- X_STRIKE/XE -> `e70 = 0x40031`, overhead cam `b740 = 1`, aux fields
+  cleared, `b74c = 50`, `d48 = 300`/`d4c = 180`, `ea0 = 10`,
+  `ea4 = 1.0`, channels cleared.
+
+`FUN_004691c4` per frame: yaw/pos pinned to the mount; overhead settle
+`-= f4*25` (obj `+0x148 |= 0x10` on expiry); semantic `accelChannel`
+or raw mouse `dx/3`, `dy/3` (no MouseYReversed, no zoom gain);
+channels decay `0.6667`; integrate then clamp `x [128,472]`,
+`y [64,296]`; semi-auto latch `fire == 0 -> d0c = 999`, held fire
+spawns only on the armed frame then `d0c -= frameStep` (negative
+allowed); recharge one bomb/second to 10; energy deficit off the
+`10000` sentinel drains through `FUN_00467a00` and empty health kills
+the mount.
+
+## 108. World-tick internals (OBSERVED, FUN_00436d60)
+
+Wired at the `FUN_00436d60(1)` seam (after the extra `flag541548`
+tick, before `FUN_0040b4dc`/`FUN_00435eec`):
+
+- `FUN_00436f08 -> FUN_00436088`: `d0c++` while `5414d4 (hudActive)`,
+  saturated at 999 — the SAME `0x540d0c` the reticle uses as its fire
+  latch (OBSERVED shared; the refill re-arms the latch each frame).
+- `FUN_00437660`: `54161b` blends up `f4*8.0` to 3.0 during a weapon
+  switch (then `wpnSel0` adopts + `54161a` resets), else decays
+  `f4*4.0` floored at 0 (the fire cadence the sniper gate reads).
+  Skipped while `0x4999d0 && 0x541548`.
+- `FUN_00436ea8 -> FUN_00431300`: the anim subset (sec. 106).
+
+## 109. Native implementation
+
+- `src/core/motion_channels.h` — `accelChannel`/`decelChannel`/
+  `directChannel`/`linearDecay` single-sourced for motion, sniper and
+  reticle.
+- `src/core/player_sniper.{h,cpp}` — `sniperScopePhaseAdvance`,
+  `sniperCoreUpdate` (FUN_00464624), `sniperZoomUpdate` (FUN_00464b50),
+  `sniperReset` (FUN_00461878), `sniperDamageDrain` (FUN_00467a00),
+  `sniperFireSeam` (FUN_0045f138), `sniperDyingSurface` (FUN_0041342c),
+  `playerAnimAdvance` (FUN_00461954 subset).
+- `src/core/player_reticle.{h,cpp}` — `playerReticleMountScan`
+  (FUN_00463608 + class entries), `playerReticleDispatchMounted`
+  (class dispatch), `playerReticleUpdate` (FUN_004691c4).
+- `integratePlayerGravity`/`playerVerticalApplyCollision` extracted in
+  `player_vertical` so the sniper runs gravity without the jump
+  machine.
+- `stepTraversalRuntime` wires mounted > sniper > normal, the scope
+  phase at the head, the normal-path tail (entry + mount-scan), and
+  the world-tick internals.
+
+## 110. Validation
+
+`tests/native/test_main.cpp::test_player_sniper` — floor-arena golden
+checks: entry latency (`c9c`/`cac 0x323`/`cbc 8`/channels cleared),
+scope-in camera pin (`pullback 0`, `eyeHeight 4.0`), `ca0` 1->2->3
+(latch request/commit, `zoom -> 1.0`), raw-mouse aim (`dx*0.12*f0*zoom
+*0.41667`), manual unscope (camera restore, `cac 0x384 -> 0x65`), and
+the X_STRIKE mount (`e70 0x40031`, reticle `300/180`, `ea0 10`,
+overhead settle `-25/s`, pos/yaw pinned, semi-auto latch, recharge).
+
+## 111. Phase 5L boundary / remaining unknowns
+
+- Full `FUN_00461954` frame-table machine + the non-sniper anim
+  handlers — only the `0x323`/`0x384`/`cb0` latch subset is ported.
+- `FUN_00467ac4`/`FUN_00467ed0` (XD/XSNOWB per-frame updates),
+  `FUN_0046603c` slide helper, `FUN_00469cd0`/`FUN_00469b98` weapon
+  seams, `FUN_0045f138` projectile spawn, the reticle spawn/unproject
+  internals — counted seams, not ported.
+- `0x540ccc..0x540cd4`, `0x540e94/e98` scope channels — written on the
+  request, consumers UNKNOWN.
+- Whether `0x5414d4` (hudActive) is cleared during the mounted
+  reticle in the original — UNKNOWN; the shared `d0c` refill means the
+  reticle auto-fires while it stays up and is semi-auto while down.
+- `0x540eb0`/`0x540eb4` event-timer gate (`c9c != 0 || !liveTimerObj`)
+  — the `eb0 = 0` clear is gated in the original; the native countdown
+  model predates Phase 5L and is left unchanged.

@@ -206,6 +206,26 @@ struct TraversalSeams {
   int cameraObstructionCalls = 0; // FUN_00430bf8 gate fired
                                 // (0x49b710 && |0x540d58|==0 —
                                 // Phase 5K boundary seam)
+  // --- Phase 5L — sniper + mounted reticle seams (counted stubs) ---
+  int scopeOverlayCalls = 0;      // FUN_0041664c scope-overlay anim
+  int sniperExitCalls = 0;        // FUN_0046ca84 unscope seam
+  int weaponScanCalls = 0;        // FUN_00469b98 scoped weapon-select
+  int hudEventCalls = 0;          // FUN_0040210c/FUN_00402388/
+                                // FUN_00402014 HUD-resource seams
+  int sniperFireCalls = 0;        // FUN_0045f138 projectile spawn
+  int animEventCalls = 0;         // FUN_00469668 anim-event seam
+  int itemUseCalls = 0;           // FUN_00459d28 item activation
+  int reticleSpawnCalls = 0;      // FUN_0046153c + FUN_00454794 +
+                                // FUN_00454af8 + FUN_0045612c +
+                                // FUN_00402fe8 + FUN_00402160
+                                // (ballistic-object spawn seams)
+  int reticleDrawCalls = 0;       // FUN_0046911c reticle HUD seam
+  int reticleDeathCalls = 0;      // FUN_004581a4 mount-death seam
+  int animDriverCalls = 0;        // FUN_00431300/FUN_00461954
+  int mountUpdateCalls = 0;       // FUN_00467ac4/FUN_00467ed0 class 1/2
+  int weaponSlotCalls = 0;        // FUN_00469cd0 inventory scanner
+  int mountUnmountCalls = 0;      // unrecognised-class unmount log
+                                  // (FUN_00408eb0) + e6c release
 };
 
 struct TraversalFrameResult {
@@ -319,19 +339,74 @@ struct TraversalRuntime {
   int transitionPhase = 0;        // 0x540ca0
   bool flag541548 = false;        // 0x541548 — extra world-tick gate
   bool flag5414bc = false;        // 0x5414bc — FUN_0046ae60 arg
+  bool flag4999d0 = false;        // 0x4999d0 — pause/debug gate; with
+                                  // flag541548 it suppresses the anim
+                                  // machine + the 54161b world-tick decay
   int fieldCc8 = 0;               // 0x540cc8 — cleared per frame
   int fieldE14 = 0;               // 0x540e14 — cleared per frame
   bool masterMoveGate = false;    // 0x540d9c — FUN_0040e19c gate
+  bool vertEnable = true;         // 0x540c6c — vertical master gate;
+                                  // set at traversal init. Read by the
+                                  // sniper abort/entry gates and fed
+                                  // to vert env.
   int fieldC74 = 0;               // 0x540c74 — FUN_00432f84 gate
   int teleportFlag = 0;           // 0x540cdc — teleport block gate
   float teleportVec[6] = {0, 0, 0, 0, 0, 0}; // 0x540ce0..0x540cf4
-  int flagE72 = 0;                // 0x540e72 — bit1 silences hard
-                                  // landing (fed to vert env)
   float bankAux = 0.0f;           // 0x540b60 — aux bank term (the
                                   // writer is UNKNOWN; folded into
                                   // the bankIdle test)
   bool bankIdle = false;          // 0x540bcc — bank+aux == 0
   int frameCounter = 0;           // 0x540ce0 — step counter
+
+  // --- Phase 5L — sniper mode + mounted reticle (OBSERVED globals) ---
+  // Shared counter + fire cadence (0x540d0c family): the sniper fire
+  // gate reads d0c>=5 && 54161b==0; the reticle uses d0c as its
+  // semi-auto latch (999 armed, drains by frameStep while held).
+  int fieldD0c = 0;               // 0x540d0c — fire cadence counter
+  float fireCadence = 0.0f;       // 0x54161b — fire-cadence/blend timer
+  int burstIndex = 0;             // 0x54161a — burst counter (FUN_0045f138)
+  int wpnSel0 = 0;                // 0x541618 — weapon-select current
+  int wpnSel1 = 0;                // 0x541619 — weapon-select pending
+  // Scope-phase + HUD (FUN_00436100 head / FUN_00461954 / FUN_00461878):
+  int scopeAnimLatch = 0;         // 0x540e74 — scope overlay anim latch
+  float scopeBlend94 = 0.0f;      // 0x540e94 — scope overlay blends
+  float scopeBlend98 = 0.0f;      // 0x540e98
+  float scopeChanC = 0.0f;        // 0x540ccc — scope-request channels
+  float scopeChanD0 = 0.0f;       // 0x540cd0   (consumers UNKNOWN)
+  float scopeChanD4 = 0.0f;       // 0x540cd4
+  int scopeHudOffset = -101;      // 0x540d34 — scope HUD y-offset / the
+                                  // anim machine's d34 write target
+  int scopeScale = 0;             // 0x540dbc — scope FOV multiplier
+                                  // (FILD'd by the 0x323 anim handler)
+  const DynamicObject* focusObj = nullptr; // 0x540cd8 — zoom-floor focus
+  float focusDist = 0.0f;         // 0x540cdc — focus distance (also the
+                                  // 0x540cdc teleport-block writer alias —
+                                  // kept distinct by teleportFlag)
+  // Mounted/reticle (FUN_00463608 mount-scan + FUN_004691c4):
+  std::uint32_t mountClass = 0;   // 0x540e70 — mounted class dword
+  float mountYaw = 0.0f;          // 0x540e64 — mount yaw (class-1 entry)
+  int reticleAux = 0;             // 0x540d08 — reticle aux / FUN_00461954
+                                  // tail gate
+  int bombs = 0;                  // 0x540ea0 — reticle bomb count
+  float bombRecharge = 0.0f;      // 0x540ea4 — bomb recharge timer
+  float overheadAux744 = 0.0f;    // 0x49b744 — overhead-view aux; the
+  float overheadAux748 = 0.0f;    // 0x49b748   X_STRIKE mount entry
+  float overheadAux76c = 0.0f;    // 0x49b76c   clears all three to 0
+  // Damage/energy (FUN_00467a00 difficulty-scaled drain):
+  int fieldDac = 0;               // 0x540dac — damage accumulator (cap 180)
+  int fieldHealth = 0;            // 0x541554 — player health (drained)
+  int fieldHealthGate = 0;        // 0x541510 — health/difficulty gate
+  int difficulty = 1;             // 0x54147a — difficulty (0 easy/1/2 hard)
+  int hudActive = 0;              // 0x5414d4 — HUD gate for d0c++/blit
+  // Animation machine (FUN_00461954) + slide vector + scripted gates:
+  int animPrev = -1;              // 0x540cb0 — previous anim state (the
+                                  // first-frame detect latch)
+  int animFrame = 0;              // 0x540cb4 — anim frame counter
+  float animE44 = 0.0f;           // 0x540e44 — slide vector X
+  float animE48 = 0.0f;           // 0x540e48 — slide vector Y
+  int fieldDa0 = 0;               // 0x540da0 — scripted transition gate
+  int fieldDa4 = 0;               // 0x540da4 — post-tick decay target
+  int fieldEb8 = 0;               // 0x540eb8 — death-fade mode byte
 
   // The last collisionApply contact token as a poly pointer — the
   // surface the player most recently touched (0x540e4c's EAX is the

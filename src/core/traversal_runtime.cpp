@@ -14,6 +14,8 @@
 
 #include "core/data_root.h"
 #include "core/frontend_machines.h"
+#include "core/player_reticle.h"
+#include "core/player_sniper.h"
 
 namespace mdk {
 namespace {
@@ -880,6 +882,11 @@ TraversalFrameResult stepTraversalRuntime(
   const GameplayInputFrame nextFrame =
       consumeGameplayInput(raw, bindings, inputEnv, rt.inputState);
 
+  // FUN_00436100 head — the scope-phase advance (ca0): one phase per
+  // frame, committed (2 -> 3) then requested (1 -> 2). Runs after the
+  // frontend input consume and before the dispatch, as in the original.
+  sniperScopePhaseAdvance(rt);
+
   // FUN_00437e80 (frontend) + FUN_0042534 stream-drain — seams.
   // ======================= player dispatch (FUN_00463608) =========
   // OBSERVED dispatch head (0x463608): the pending-event slots
@@ -893,163 +900,204 @@ TraversalFrameResult stepTraversalRuntime(
       rt.locoState == 601)
     rt.eventPriority = 0;
 
-  // OBSERVED (0x463608): cac >= 800 takes the scripted branch —
-  // semantic channels cleared, no horizontal motion/collision; the
-  // slide helper, jump machine and look integrator still run. The
-  // port models the branch only for the look state 0x324 — the one
-  // >=800 state whose exit path is fully proven (d58 -> 0 ->
-  // FUN_00461954 clears cbc -> the idle restore returns cac). Other
-  // >=800 states (hard-land 806, sniper 0x323/0x384, slide 0x385)
-  // keep the normal path until the animation machine arrives.
-  const bool scriptedLook = rt.locoState == kLookEventCode;
-  PlayerMotionEnvironment motionEnv;
-  motionEnv.smoothed = timing.smoothed;
-  motionEnv.masterGate = rt.masterMoveGate;
-  motionEnv.groundContact = rt.vert.contactObj != 0;
-  motionEnv.lowFriction =
-      rt.vert.contactObj != 0 && rt.lastContactPoly != nullptr &&
-      (rt.lastContactPoly->flags & 4) != 0;
-  motionEnv.moveBlocked =
-      rt.vert.moveBlocker0 != 0 && rt.vert.moveBlockerFlag != 0;
-  // Conveyor contribution — FUN_00412ef0 on the standing surface.
-  float conv[3] = {0, 0, 0};
-  if (rt.lastContactPoly)
-    surfaceConveyorDelta(cur->surface, rt.lastContactPoly, dt, conv);
-  motionEnv.conveyorX = conv[0];
-  motionEnv.conveyorY = conv[1];
-  motionEnv.conveyorZ = conv[2];
-
+  // OBSERVED (0x463608): the dispatch picks ONE branch per frame —
+  // mounted object (e6c && +0x14b&2) > sniper (c9c) > unscoped
+  // (cac >= 800 scripted, else the FUN_00465228 normal path).
+  const bool mounted = rt.cs.excludeObj != nullptr &&
+                       (rt.cs.excludeObj->flags14b & 0x02) != 0;
   PlayerMotionOutput mo{};
+  PlayerVerticalFrame vf{};
+  float appliedZ = 0.0f;
   bool positionChanged = false;
-  if (!scriptedLook) {
-    mo = integratePlayerMotion(rt.prevFrame, motionEnv, rt.motion);
 
-    // Horizontal collision — FUN_004630d4(disp, scale 0.75).
-    const float preX = rt.cs.pos[0], preY = rt.cs.pos[1],
-                preZ = rt.cs.pos[2];
-    const CollisionPoly* hContact = collisionApply(
-        rt.cs, mo.dispX, mo.dispY, mo.dispZ, 0.75f, nullptr, nullptr);
-    positionChanged = rt.cs.pos[0] != preX || rt.cs.pos[1] != preY ||
-                      rt.cs.pos[2] != preZ;
-    playerMotionPostStep(motionEnv, positionChanged, rt.motion, mo);
-    // 0x540e4c — every apply's EAX is stored (0 clears).
-    rt.vert.contactObj = asToken(hContact);
-    rt.lastContactPoly = hContact;
-    // The motion post feeds the shared pending slots (cb00/cb08).
-    if (mo.eventMag != 0) {
-      rt.eventType = mo.eventType;
-      rt.eventMag = mo.eventMag;
+  // The shared vertical environment — the sniper's gravity-only call
+  // (FUN_00467180) and the normal/scripted jump+gravity (FUN_00466740)
+  // both read it. vec/cvec hold the ribbon-query out-vectors and must
+  // outlive the calls below (ribbonVelZ points into them).
+  float vec[3] = {0, 0, rt.vert.vertVel};
+  float cvec[3] = {0, 0, rt.vert.vertVel};
+  const auto makeVertEnv = [&](bool moveConsumed) {
+    PlayerVerticalEnvironment ve;
+    ve.smoothed = timing.smoothed;
+    ve.deltaSeconds = dt;
+    ve.frameStep = timing.frameStep;
+    ve.jumpHeld = rt.prevFrame.jump != 0;
+    ve.moveConsumed = moveConsumed;
+    ve.locoState = rt.locoState;
+    ve.eventWordType = rt.eventType;
+    ve.vertEnable = rt.vertEnable;   // 0x540c6c — set at traversal init
+    ve.slideMode = rt.slideChannel != 0;
+    ve.sharedGateE6C = rt.cs.excludeObj != nullptr;
+    // 0x540e72 = byte2 of the e70 mount-class dword; bit1 silences the
+    // hard-landing flash (set for class 2/XSNOWB, e70 = 0x20002).
+    ve.flagE72bit1 = ((rt.mountClass >> 16) & 2) != 0;
+    ve.carrierObj = rt.cs.carrier != nullptr;
+    ve.carrierCheckGate = rt.cs.carrierBusy != 0;
+    // FUN_00412e94(player,1,&pos,&vec) — real type-7 volume query.
+    const bool inRibbon =
+        surfaceVolumeQuery(cur->surface, 1, rt.cs.pos, dt, vec) != 0;
+    ve.insideRibbonVolume = inRibbon;
+    ve.ribbonVelZ = inRibbon ? &vec[2] : nullptr;
+    if (ve.carrierObj && !ve.carrierCheckGate && rt.partner &&
+        rt.partnerActive) {
+      ve.carrierInsideRibbonVolume = surfaceVolumeQuery(
+          rt.partner->surface, 1, rt.cs.pos, dt, cvec) != 0;
+    }
+    ve.slideVec = nullptr;   // FUN_0046603c's leftover — deferred
+    ve.deepFloorZ = cur->dyn.col.deepFloorZ;
+    return ve;
+  };
+
+  if (mounted) {
+    // 0x463a6a — the mounted-class dispatch (byte2 of the e70 dword).
+    // The per-class update is self-contained; no normal vertical/look.
+    playerReticleDispatchMounted(rt, raw, bindings, rt.prevFrame,
+                                 timing.smoothed, dt, timing.frameStep);
+  } else if (rt.flagC9c != 0) {
+    // 0x463ad7 — the sniper branch.
+    if (rt.transitionPhase == 0) {
+      // 0x463ae9 — ca0==0 (scope-in pending): the semantic channels
+      // are cleared; the sniper core stays idle until ca0 != 0.
+      rt.motion.moveVel = 0.0f;
+      rt.motion.strafeVel = 0.0f;
+      rt.motion.turnVel = 0.0f;
+      rt.motion.zoomChannel = 0.0f;
+    } else {
+      // 0x463b06 — FUN_00464624 (gravity-only vertical + the lateral
+      // sweep + aim + zoom), then the FUN_00469b98 weapon-select seam.
+      // The gravity frame / applied Z / lateral move are surfaced so the
+      // out-diagnostics match the normal branch's reporting.
+      const PlayerVerticalEnvironment sEnv = makeVertEnv(false);
+      sniperCoreUpdate(rt, raw, bindings, rt.prevFrame, sEnv,
+                       timing.smoothed, &vf, &appliedZ, &positionChanged);
+      ++rt.seams.weaponScanCalls;   // FUN_00469b98
     }
   } else {
-    // OBSERVED scripted-branch write (0x463705..): the semantic
-    // channels d48/d4c/d50/d54 are cleared to e6c (= 0 unmounted).
-    // d54 is the sniper zoom channel — unported.
-    rt.motion.moveVel = 0.0f;
-    rt.motion.strafeVel = 0.0f;
-    rt.motion.turnVel = 0.0f;
-  }
+    // Unscoped + unmounted — the >=800 scripted branch or the
+    // FUN_00465228 normal path.
+    const bool scripted = rt.locoState >= 0x320;
+    PlayerMotionEnvironment motionEnv;
+    motionEnv.smoothed = timing.smoothed;
+    motionEnv.masterGate = rt.masterMoveGate;
+    motionEnv.groundContact = rt.vert.contactObj != 0;
+    motionEnv.lowFriction =
+        rt.vert.contactObj != 0 && rt.lastContactPoly != nullptr &&
+        (rt.lastContactPoly->flags & 4) != 0;
+    motionEnv.moveBlocked =
+        rt.vert.moveBlocker0 != 0 && rt.vert.moveBlockerFlag != 0;
+    // Conveyor contribution — FUN_00412ef0 on the standing surface.
+    float conv[3] = {0, 0, 0};
+    if (rt.lastContactPoly)
+      surfaceConveyorDelta(cur->surface, rt.lastContactPoly, dt, conv);
+    motionEnv.conveyorX = conv[0];
+    motionEnv.conveyorY = conv[1];
+    motionEnv.conveyorZ = conv[2];
 
-  // SEAM: FUN_0046603c slide helper — runs on both dispatch
-  // branches in the original. Deferred; counted.
-  ++rt.seams.slideHelperCalls;
-
-  // --------------------------- vertical --------------------------
-  PlayerVerticalEnvironment vertEnv;
-  vertEnv.smoothed = timing.smoothed;
-  vertEnv.deltaSeconds = dt;
-  vertEnv.frameStep = timing.frameStep;
-  vertEnv.jumpHeld = rt.prevFrame.jump != 0;
-  vertEnv.moveConsumed = mo.moveConsumed;
-  vertEnv.locoState = rt.locoState;
-  vertEnv.eventWordType = rt.eventType;
-  vertEnv.vertEnable = true; // 0x540c6c — set at traversal init
-  vertEnv.slideMode = rt.slideChannel != 0;
-  vertEnv.sharedGateE6C = rt.cs.excludeObj != nullptr;
-  vertEnv.flagE72bit1 = (rt.flagE72 & 2) != 0;
-  vertEnv.carrierObj = rt.cs.carrier != nullptr;
-  vertEnv.carrierCheckGate = rt.cs.carrierBusy != 0;
-  // FUN_00412e94(player,1,&pos,&vec) — real type-7 volume query.
-  float vec[3] = {0, 0, rt.vert.vertVel};
-  const bool inRibbon =
-      surfaceVolumeQuery(cur->surface, 1, rt.cs.pos, dt, vec) != 0;
-  vertEnv.insideRibbonVolume = inRibbon;
-  vertEnv.ribbonVelZ = inRibbon ? &vec[2] : nullptr;
-  if (vertEnv.carrierObj && !vertEnv.carrierCheckGate &&
-      rt.partner && rt.partnerActive) {
-    float cvec[3] = {0, 0, rt.vert.vertVel};
-    vertEnv.carrierInsideRibbonVolume =
-        surfaceVolumeQuery(rt.partner->surface, 1, rt.cs.pos, dt,
-                           cvec) != 0;
-  }
-  vertEnv.slideVec = nullptr; // FUN_0046603c's leftover — deferred
-  vertEnv.deepFloorZ = cur->dyn.col.deepFloorZ;
-  rt.vert.posX = rt.cs.pos[0];
-  rt.vert.posY = rt.cs.pos[1];
-  rt.vert.posZ = rt.cs.pos[2];
-  PlayerVerticalFrame vf =
-      integratePlayerVertical(vertEnv, rt.motion, rt.vert);
-  float appliedZ = 0.0f;
-  if (vf.collisionIssued) {
-    const CollisionNode* node = nullptr;
-    const CollisionPoly* vContact = collisionApply(
-        rt.cs, 0.0f, 0.0f, vf.dispZ, 0.5f, nullptr, &node);
-    appliedZ = rt.cs.pos[2] - rt.vert.posZ;
-    rt.vert.contactObj = asToken(vContact);
-    if (vContact) {
-      rt.lastContactPoly = vContact;
-      rt.vert.contactNormal[0] = node->nx;
-      rt.vert.contactNormal[1] = node->ny;
-      rt.vert.contactNormal[2] = node->nz;
+    if (!scripted) {
+      mo = integratePlayerMotion(rt.prevFrame, motionEnv, rt.motion);
+      // Horizontal collision — FUN_004630d4(disp, scale 0.75).
+      const float preX = rt.cs.pos[0], preY = rt.cs.pos[1],
+                  preZ = rt.cs.pos[2];
+      const CollisionPoly* hContact = collisionApply(
+          rt.cs, mo.dispX, mo.dispY, mo.dispZ, 0.75f, nullptr, nullptr);
+      positionChanged = rt.cs.pos[0] != preX || rt.cs.pos[1] != preY ||
+                        rt.cs.pos[2] != preZ;
+      playerMotionPostStep(motionEnv, positionChanged, rt.motion, mo);
+      // 0x540e4c — every apply's EAX is stored (0 clears).
+      rt.vert.contactObj = asToken(hContact);
+      rt.lastContactPoly = hContact;
+      // The motion post feeds the shared pending slots (cb00/cb08).
+      if (mo.eventMag != 0) {
+        rt.eventType = mo.eventType;
+        rt.eventMag = mo.eventMag;
+      }
+    } else {
+      // OBSERVED scripted-branch write (0x463705..): the semantic
+      // channels d48/d4c/d50/d54 are cleared to e6c (= 0 unmounted).
+      rt.motion.moveVel = 0.0f;
+      rt.motion.strafeVel = 0.0f;
+      rt.motion.turnVel = 0.0f;
+      rt.motion.zoomChannel = 0.0f;
     }
-    VerticalCollisionResult vres;
-    vres.contactObj = rt.vert.contactObj;
-    vres.posX = rt.cs.pos[0];
-    vres.posY = rt.cs.pos[1];
-    vres.posZ = rt.cs.pos[2];
-    if (vContact) {
-      vres.normalX = node->nx;
-      vres.normalY = node->ny;
-      vres.normalZ = node->nz;
-    }
-    vres.hasFloor = (rt.cs.contactFlags & 2) != 0;
-    vres.floorZ = rt.cs.floorZ;
-    vres.blocker0 = asToken(rt.cs.floorObj);
-    vres.blocker1 = rt.cs.floorElemMask;
-    vres.blocker0Flag80 =
-        rt.cs.floorObj && (rt.cs.floorObj->flags14a & 0x80);
-    applyPlayerVerticalCollision(vertEnv, rt.motion, rt.vert, vres, vf);
-  }
-  playerVerticalPostStep(vertEnv, rt.vert);
-  rt.vert.posX = rt.cs.pos[0];
-  rt.vert.posY = rt.cs.pos[1];
-  rt.vert.posZ = rt.cs.pos[2];
-  // The vertical post overwrites the pending slots — OBSERVED
-  // producer order inside FUN_00465228 (motion events, then
-  // FUN_00466740's jump/landing events, then the look integrator).
-  if (vf.eventMag != 0) {
-    rt.eventType = vf.eventType;
-    rt.eventMag = vf.eventMag;
-  }
-  if (vf.deepFloorReset) ++rt.seams.deepFloorFallbacks;
-  if (mo.forwardIntent) ++rt.seams.mantleCalls;
 
-  // FUN_00465c4c — the semantic look integrator; OBSERVED call
-  // order is after the jump machine on BOTH dispatch branches. It
-  // consumes the PREVIOUS frame's merged look controls (the same
-  // one-frame latency as movement) and posts 8/0x324 while driving
-  // or draining the offset.
-  PlayerLookEnvironment lookEnv;
-  lookEnv.deltaSeconds = dt;
-  lookEnv.arenaScalar = cur->scalar;
-  lookEnv.eventPriority = rt.eventPriority;
-  lookEnv.locoState = rt.locoState;
-  lookEnv.vertVelZero = rt.vert.vertVel == 0.0f;
-  lookEnv.grounded = (rt.vert.contactFlags & 1) != 0;
-  const PlayerLookFrame lk =
-      integratePlayerLook(rt.prevFrame, lookEnv, rt.look);
-  if (lk.eventPosted) {
-    rt.eventType = kLookEventPri;
-    rt.eventMag = kLookEventCode;
+    // SEAM: FUN_0046603c slide helper — runs on both branches.
+    ++rt.seams.slideHelperCalls;
+
+    // ------------------------- vertical --------------------------
+    const PlayerVerticalEnvironment vertEnv =
+        makeVertEnv(mo.moveConsumed);
+    rt.vert.posX = rt.cs.pos[0];
+    rt.vert.posY = rt.cs.pos[1];
+    rt.vert.posZ = rt.cs.pos[2];
+    vf = integratePlayerVertical(vertEnv, rt.motion, rt.vert);
+    if (vf.collisionIssued) {
+      const CollisionPoly* vContact = playerVerticalApplyCollision(
+          vertEnv, rt.cs, rt.motion, rt.vert, vf, &appliedZ);
+      if (vContact) rt.lastContactPoly = vContact;
+    }
+    playerVerticalPostStep(vertEnv, rt.vert);
+    rt.vert.posX = rt.cs.pos[0];
+    rt.vert.posY = rt.cs.pos[1];
+    rt.vert.posZ = rt.cs.pos[2];
+    // The vertical post overwrites the pending slots — OBSERVED
+    // producer order inside FUN_00465228 (motion events, then
+    // FUN_00466740's jump/landing events, then the look integrator).
+    if (vf.eventMag != 0) {
+      rt.eventType = vf.eventType;
+      rt.eventMag = vf.eventMag;
+    }
+    if (vf.deepFloorReset) ++rt.seams.deepFloorFallbacks;
+    if (mo.forwardIntent) ++rt.seams.mantleCalls;
+
+    // FUN_00465c4c — the semantic look integrator; runs after the jump
+    // machine on both dispatch branches (N-1 merged look controls).
+    PlayerLookEnvironment lookEnv;
+    lookEnv.deltaSeconds = dt;
+    lookEnv.arenaScalar = cur->scalar;
+    lookEnv.eventPriority = rt.eventPriority;
+    lookEnv.locoState = rt.locoState;
+    lookEnv.vertVelZero = rt.vert.vertVel == 0.0f;
+    lookEnv.grounded = (rt.vert.contactFlags & 1) != 0;
+    const PlayerLookFrame lk =
+        integratePlayerLook(rt.prevFrame, lookEnv, rt.look);
+    if (lk.eventPosted) {
+      rt.eventType = kLookEventPri;
+      rt.eventMag = kLookEventCode;
+    }
+
+    if (!scripted) {
+      // FUN_00465228 tail — itemUse (ce774) seam, then the sniper
+      // entry, then the normal-fire latch (a deferred seam).
+      if (rt.prevFrame.itemUse != 0) ++rt.seams.itemUseCalls;
+      if (rt.prevFrame.sniperPulse != 0 && rt.eventPriority < 8 &&
+          rt.eventType < 8) {
+        // eligibility: c6c == 0 -> free; else vertVel == +-0 &&
+        // grounded && no dying-surface record under the contact.
+        const bool eligible =
+            !rt.vertEnable ||
+            (rt.vert.vertVel == 0.0f &&
+             (rt.vert.contactFlags & 1) != 0 &&
+             !sniperDyingSurface(rt, rt.lastContactPoly));
+        if (eligible) {
+          rt.fieldC74 = 0;
+          ++rt.seams.hudEventCalls;   // FUN_00469668(0)
+          rt.flagC9c = 1;
+          rt.transitionPhase = 0;
+          rt.motion.moveVel = 0.0f;
+          rt.motion.strafeVel = 0.0f;
+          rt.motion.turnVel = 0.0f;
+          rt.motion.zoomChannel = 0.0f;
+          rt.eventMag = 0x323;
+          rt.eventType = 8;
+        }
+      }
+      // normal-fire latch (0x465717+): the 0x258/0x259/0x12c event
+      // mapping is a deferred seam — the sniper core owns scoped fire.
+      ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
+      playerReticleMountScan(rt);   // the mount-scan + class entry
+    } else {
+      ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
+    }
   }
 
   // Commit the N+1 merge — the latency hand-off (FUN_00406f14 runs
@@ -1345,6 +1393,34 @@ TraversalFrameResult stepTraversalRuntime(
     ++rt.seams.extraWorldTickCalls; // FUN_0042b20c + 36d60(-1)
   }
   ++rt.seams.worldTickCalls;        // FUN_00436d60(1, prim, sec)
+
+  // ---- world-tick internals (FUN_00436d60, OBSERVED) ----
+  // FUN_00436ea8 -> FUN_00431300 -> FUN_00461954: the animation/state
+  // machine. The bounded subset handles the sniper-lifecycle states
+  // (0x323 scope-in, 0x384 unscope) + the cb0 first-frame latch; the
+  // rest of the machine is deferred.
+  ++rt.seams.animDriverCalls;
+  playerAnimAdvance(rt, timing.frameStep);
+  // FUN_00436f08 -> FUN_00436088: the shared fire cadence counter d0c
+  // increments while the HUD gate (0x5414d4) is up, saturating at 999.
+  if (rt.hudActive != 0 && rt.fieldD0c < 999) ++rt.fieldD0c;
+  // FUN_00437660: the 54161b timer — during a weapon switch it blends
+  // up (f4*8.0 to 3.0, then wpnSel0 adopts + burstIndex resets); else
+  // it's the fire cadence, decaying f4*4.0 floored at 0. Skipped while
+  // (0x4999d0 && 0x541548).
+  if (!(rt.flag4999d0 && rt.flag541548)) {
+    if (rt.wpnSel0 != rt.wpnSel1) {
+      rt.fireCadence += dt * 8.0f;
+      if (rt.fireCadence >= 3.0f) {
+        rt.burstIndex = 0;
+        rt.wpnSel0 = rt.wpnSel1;
+      }
+    } else if (rt.fireCadence > 0.0f) {
+      rt.fireCadence -= dt * 4.0f;
+      if (rt.fireCadence < 0.0f) rt.fireCadence = 0.0f;
+      // 54161a burst-advance + the HUD seams — deferred.
+    }
+  }
 
   // FUN_0040b4dc(0) — pending surface-op re-arms, current then
   // partner (when the partner is active).

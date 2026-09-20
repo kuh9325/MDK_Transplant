@@ -12566,6 +12566,164 @@ void test_player_camera() {
   }
 }
 
+// Phase 5L — sniper scope lifecycle + mounted reticle. OBSERVED
+// constants and ordering from MDK95.EXE BUILD_A disassembly: the
+// dispatch picks mounted > sniper > normal each frame, the scope
+// phase advances one step per frame at the frame head, and the
+// mounted reticle stays a SEPARATE state path from the sniper.
+void test_player_sniper() {
+  auto setBit = [](std::array<std::uint32_t, 4>& bm, int code) {
+    bm[code >> 5] |= 1u << (code & 31);
+  };
+  auto press = [&](mdk::RawGameplayInput& r, int code) {
+    setBit(r.keyLevel, code);
+    setBit(r.keyEdge, code);
+  };
+  auto makeRt = [](mdk::TraversalRuntime& rt, CollisionFixture& f) {
+    mdk::TraversalArena* a = travArenaAdd(rt, "SNP_A");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    rt.cur = a;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1;
+    rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 12.0f;
+  };
+  const mdk::GameplayInputBindings bindings;   // factory: Sniper=57 Fire=29
+  const mdk::FrontendTimingState timing;       // step1 smoothed1 dt=1/30
+  const mdk::RawGameplayInput idle{};
+
+  // ---- sniper entry + scope-in + raw-mouse aim + unscope ----------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    makeRt(rt, f);
+    rt.hudActive = 1;      // the d0c++ world-tick counter needs this up
+    mdk::TraversalFrameResult out;
+    for (int i = 0; i < 40; ++i)
+      out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.grounded);
+
+    mdk::RawGameplayInput snip{};
+    press(snip, 57);       // KeySniper — the entry gate reads it N-1.
+    mdk::stepTraversalRuntime(rt, snip, bindings, timing);
+    CHECK(rt.flagC9c == 0);   // not yet — one-frame input latency
+
+    // Next frame: prevFrame.sniperPulse -> the FUN_00465228 entry.
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.flagC9c == 1);
+    CHECK(rt.locoState == 0x323);       // scope-in anim state
+    CHECK(rt.eventPriority == 8);
+    CHECK(rt.motion.moveVel == 0.0f && rt.motion.strafeVel == 0.0f &&
+          rt.motion.turnVel == 0.0f && rt.motion.zoomChannel == 0.0f);
+    // The 0x323 anim (world-tick) pins the scope camera + advances
+    // ca0 to 1 on the pending frame.
+    CHECK(rt.transitionPhase == 1);
+    CHECK(rt.camera.pullback == 0.0f);
+    CHECK(rt.camera.eyeHeight == 4.0f);
+    CHECK(rt.scopeHudOffset != -101);   // HUD offset computed
+
+    // ca0 walks 1->2->3, one phase per frame at the frame head.
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.transitionPhase == 2);     // overlay requested
+    CHECK(rt.scopeAnimLatch == 1);
+    CHECK(rt.flag5414bc);
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.transitionPhase == 3);     // overlay committed
+    CHECK(rt.scopeAnimLatch == 0);
+    CHECK(rt.camera.zoom == 1.0f);      // b58 clamps to the ceiling
+
+    // Raw mouse aim — CURRENT frame, zero latency (0x464795): only
+    // with no semantic channel + mouseOn. yaw -= dx*0.12*f0*zoom*0.41667.
+    rt.motion.yawDeg = 90.0f;   // mid-range so the -5 delta can't wrap
+    mdk::RawGameplayInput look{};
+    look.mouseDx = 100;
+    mdk::stepTraversalRuntime(rt, look, bindings, timing);
+    CHECK(near(rt.motion.yawDeg, 85.0, 0.05));   // 90 - 100*0.12*1*1*0.41667
+
+    // Manual unscope — sniperPulse (N-1) -> the 0x464986 unscope block
+    // (ca0 is left; only the abort reset clears it).
+    mdk::stepTraversalRuntime(rt, snip, bindings, timing);
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.flagC9c == 0);
+    CHECK(rt.locoState == 0x384);       // the unscope anim state
+    CHECK(rt.camera.pullback == 8.0f);
+    CHECK(rt.camera.eyeHeight == 4.5f);
+    CHECK(rt.camera.zoom == 2.4f);
+    CHECK(rt.scopeHudOffset == -101);
+    // The 0x384 anim steady-state then the idle restore -> idle 0x65.
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x65);
+  }
+
+  // ---- mounted reticle (X_STRIKE, class 4) ------------------------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    makeRt(rt, f);
+    mdk::TraversalFrameResult out;
+    for (int i = 0; i < 40; ++i)
+      out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.grounded);
+
+    // A standalone mount object: named + +0x14b&2 + the X_STRIKE
+    // model name. Standalone (not in col.objects) so the object
+    // prepass can't touch it; lastObjContact is the mount candidate.
+    mdk::DynamicObject mount;
+    mount.col.named = true;
+    mount.col.flags14b |= 0x02;
+    mount.model = makePlatformModel("X_STRIKE", "ELEM", 0.0f);
+    mount.yawDeg = 90.0f;
+    mount.pos[0] = 3.0f;
+    mount.pos[1] = 4.0f;
+    mount.pos[2] = 10.0f;
+    mount.health = 10000;    // the reticle energy sentinel -> no drain
+    rt.cs.lastObjContact = &mount.col;
+
+    // The mount-scan (normal-path tail) -> class4Entry -> MOUNT.
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.cs.excludeObj == &mount.col);
+    CHECK(rt.mountClass == 0x40031u);
+    CHECK(rt.flag49b740 == 1);                // overhead-cam gate
+    CHECK(near(rt.camera.overheadHeight, 50.0, 1e-4));
+    CHECK(near(rt.motion.moveVel, 300.0, 1e-4));    // reticle X
+    CHECK(near(rt.motion.strafeVel, 180.0, 1e-4));  // reticle Y
+    CHECK(rt.bombs == 10);
+    CHECK(near(rt.bombRecharge, 1.0, 1e-4));
+    CHECK(near(rt.motion.yawDeg, 90.0, 1e-4));      // pinned to mount
+    CHECK(near(rt.cs.pos[0], 3.0, 1e-4) &&
+          near(rt.cs.pos[2], 10.0, 1e-4));          // pos pinned
+
+    // The mounted dispatch outranks normal/sniper: the reticle update
+    // decays the overhead settle (25/s -> -0.8333/frame) and pins the
+    // player to the mount each frame.
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.cs.excludeObj == &mount.col);
+    CHECK(near(rt.camera.overheadHeight, 50.0 - 25.0 / 30.0, 1e-3));
+    CHECK(near(rt.motion.moveVel, 300.0, 1e-3));    // reticle stays clamped
+
+    // The semi-auto latch (0x46935b): with hudActive down the shared
+    // d0c counter isn't refilled by the world-tick, so held fire
+    // spawns once on the armed frame then drains negative.
+    const int bombsArmed = rt.bombs;    // 10
+    mdk::RawGameplayInput fire{};
+    press(fire, 29);                    // KeyFire — held for 4 frames
+    for (int i = 0; i < 4; ++i)
+      mdk::stepTraversalRuntime(rt, fire, bindings, timing);
+    CHECK(rt.bombs == bombsArmed - 1);  // one spawn per press
+    CHECK(rt.fieldD0c < 999);           // latch drained past armed
+    // Releasing re-arms (d0c=999); recharge refills one bomb/second.
+    for (int i = 0; i < 40; ++i)
+      mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.bombs == 10);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -12617,6 +12775,7 @@ int main() {
   test_traversal_object_init();
   test_player_look();
   test_player_camera();
+  test_player_sniper();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

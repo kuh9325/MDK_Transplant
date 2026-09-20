@@ -60,9 +60,19 @@ struct PlayerMotionState {
   // displacement per frame-unit (d48/d4c capped at +-2/3 normal,
   // +-4/3 turbo; d50 is deg/frame-unit, capped at +-4 normal,
   // +-6 turbo, +-12+ under mouse impulse).
-  float moveVel = 0.0f;    // DAT_00540d48 — forward/back channel
-  float strafeVel = 0.0f;  // DAT_00540d4c — strafe channel (+ = right)
-  float turnVel = 0.0f;    // DAT_00540d50 — yaw-rate channel
+  float moveVel = 0.0f;    // DAT_00540d48 — forward/back channel.
+                          // REMAPPED in sniper mode -> pitch rate, in
+                          // the mounted reticle -> X pixel coord.
+  float strafeVel = 0.0f;  // DAT_00540d4c — strafe channel (+ = right).
+                          // REMAPPED in sniper mode -> yaw rate, in the
+                          // mounted reticle -> Y pixel coord.
+  float turnVel = 0.0f;    // DAT_00540d50 — yaw-rate channel. REMAPPED
+                          // in sniper mode -> lateral strafe channel,
+                          // in the mounted reticle -> X velocity.
+  float zoomChannel = 0.0f;// DAT_00540d54 — the fourth shared channel.
+                          // Unused by normal movement; the sniper zoom
+                          // input (FUN_00464b50) and the reticle's Y
+                          // velocity channel (FUN_004691c4) drive it.
   // DAT_00540c2c — persistent yaw, DEGREES, wrapped to [0,360) by
   // the +-360 float constants at 0x498910/0x498914. The basis is
   // sin/cos(yaw*pi/180); positive turnVel DECREASES yaw.
