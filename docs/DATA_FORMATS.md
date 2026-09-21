@@ -434,8 +434,9 @@ selects a name slot, resolved against the material banks by
 `FUN_0041a694` "matlkup"), and the `c3` poly record's interior is
 the render data: `{u16 v[3]@0, s16 materialIdx@+0x06, f32 uv0@+0x08,
 f32 uv1@+0x10, f32 uv2@+0x18, u8 flags@+0x20 (bit4 render-skip,
-bit0 two-sided gate), u8 @+0x21 UNKNOWN, u8 @+0x22 (bits
-0x10/0x20/0x40 per-vertex mask, bit7 gated path), u8 surface+1@+0x23}`.
+bit0 alt span-drawer half when unbanked), u8 @+0x21 UNKNOWN, u8
+@+0x22 (bit7 edge-overlay enable; bits 0x10/0x20/0x40 select edges
+v1→v0/v2→v1/v2→v0), u8 surface+1@+0x23}`.
 Negative material indices are pen/effect dispatch codes, not table
 indices (see ARENA_RENDER_PIPELINE.md).
 

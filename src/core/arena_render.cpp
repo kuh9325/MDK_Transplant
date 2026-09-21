@@ -277,7 +277,7 @@ bool arenaRenderDataBuild(std::span<const std::byte> fileBytes,
 }
 
 void arenaRenderOrder(const CollisionArena& arena,
-                      const float camPos[3], bool mirror,
+                      const float camPos[3], bool frontToBack,
                       std::vector<std::uint32_t>* outOrder) {
   if (!outOrder || !arena.nodes || !arena.polys || !camPos) return;
   outOrder->clear();
@@ -289,7 +289,7 @@ void arenaRenderOrder(const CollisionArena& arena,
     const std::uint32_t first = span >> 16;
     for (std::uint32_t i = 0; i < count; ++i) {
       const std::uint32_t pi = first + i;
-      if (arena.polys[pi].flags & 0x10) continue;
+      if (arena.polys[pi].flags & kArenaPolySkip) continue;
       outOrder->push_back(pi);
     }
   };
@@ -299,15 +299,18 @@ void arenaRenderOrder(const CollisionArena& arena,
            n->d;
   };
 
-  // Per dist sign (and the dead mirror flag), which child is entered
-  // first, which span is submitted, and which child is descended last.
+  // Per dist sign (and the dead front-to-back variant — the
+  // flag==0 branch of DAT_00499f8c, never taken since the flag is
+  // initialized to 1 and has no writers), which child is entered
+  // first, which span is submitted, and which child is descended
+  // last. Live order: far-side subtree first (painter's).
   const auto firstChild = [&](const CollisionNode* n, bool pos) {
-    return pos ? (mirror ? n->childFar : n->childNear)
-               : (mirror ? n->childNear : n->childFar);
+    return pos ? (frontToBack ? n->childNear : n->childFar)
+               : (frontToBack ? n->childFar : n->childNear);
   };
   const auto lastChild = [&](const CollisionNode* n, bool pos) {
-    return pos ? (mirror ? n->childNear : n->childFar)
-               : (mirror ? n->childFar : n->childNear);
+    return pos ? (frontToBack ? n->childFar : n->childNear)
+               : (frontToBack ? n->childNear : n->childFar);
   };
   const auto span = [&](const CollisionNode* n, bool pos) {
     return pos ? n->polysPos : n->polysNeg;

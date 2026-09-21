@@ -2552,8 +2552,10 @@ the mount.
 Wired at the `FUN_00436d60(1)` seam (after the extra `flag541548`
 tick, before `FUN_0040b4dc`/`FUN_00435eec`):
 
-- `FUN_00436f08 -> FUN_00436088`: `d0c++` while `5414d4 (hudActive)`,
-  saturated at 999 — the SAME `0x540d0c` the reticle uses as its fire
+- `FUN_00436f08 -> FUN_00436088`: `d0c++` while `5414d4 (hudActive)` —
+  resolved in Phase 6B as the frame-skip draw gate written by the
+  `FUN_0042fb68` limiter (1 = frame is drawn) — saturated at 999 —
+  the SAME `0x540d0c` the reticle uses as its fire
   latch (OBSERVED shared; the refill re-arms the latch each frame).
 - `FUN_00437660`: `54161b` blends up `f4*8.0` to 3.0 during a weapon
   switch (then `wpnSel0` adopts + `54161a` resets), else decays

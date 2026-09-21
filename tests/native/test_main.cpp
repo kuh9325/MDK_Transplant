@@ -13397,7 +13397,7 @@ void test_arena_render() {
     putf(0x18, 64.0f); putf(0x1c, 128.0f);      // uv2
     rec[0x20] = 0x11;                           // flags: bit4 skip+bit0
     rec[0x21] = 0xab;                           // aux21
-    rec[0x22] = 0x90;                           // aux22: 0x10 mask + 0x80
+    rec[0x22] = 0x90;                           // aux22: edge v10 + b7
     rec[0x23] = 0x07;                           // surface
 
     CollisionPoly cp;
@@ -13412,6 +13412,15 @@ void test_arena_render() {
     CHECK(rp.surface == 0x07);
     CHECK(arenaMatClassFor(rp.material) == ArenaMatClass::kPen);
     CHECK(arenaPenIndex(rp.material) == 16);
+    // +0x22 bit7 = edge-overlay enable; 0x10/0x20/0x40 select edges
+    // v1->v0 / v2->v1 / v2->v0 (FUN_00409860 -> FUN_0040da54).
+    CHECK((rp.aux22 & kArenaEdgeOverlay) != 0);
+    CHECK((rp.aux22 & kArenaEdgeV10) != 0);
+    CHECK((rp.aux22 & (kArenaEdgeV21 | kArenaEdgeV20)) == 0);
+    // +0x20: bit4 render-skip + bit0 alt-span gate (with the unbanked
+    // view flag DAT_005414b4 -> DAT_005414b8).
+    CHECK((rp.flags & kArenaPolySkip) != 0);
+    CHECK((rp.flags & kArenaPolyAltSpan) != 0);
   }
 
   // ---- dispatch classification boundaries (FUN_0040c860) ---------
@@ -13519,28 +13528,36 @@ void test_arena_render() {
     arena.nodes = nodes;
     arena.polys = polys;
 
-    // Camera on the +z side: positive-halfspace subtree (node1, poly2)
-    // first, then the node's own camera-side span (poly0), then the
-    // far subtree (node2 — camera sees its +side, which is empty).
+    // Camera on the +z side, live order (DAT_00499f8c == 1, painter's
+    // back-to-front): far-side subtree first — node2 (negative
+    // halfspace; its camera-side +span is empty) — then the node's
+    // own camera-side span (poly0), then the near subtree (node1,
+    // poly2).
     float camPos[3] = {0, 0, 10};
     std::vector<std::uint32_t> order;
     arenaRenderOrder(arena, camPos, false, &order);
-    CHECK(order.size() == 2 && order[0] == 2 && order[1] == 0);
+    CHECK(order.size() == 2 && order[0] == 0 && order[1] == 2);
 
-    // Camera on -z: negative-halfspace subtree first (poly3), then the
-    // node's -side span (poly1); node1's -side span is empty.
+    // Camera on -z: far side is now the positive halfspace (node1 —
+    // empty -span), then the node's -side span (poly1), then the near
+    // subtree node2 (poly3).
     camPos[2] = -10;
     arenaRenderOrder(arena, camPos, false, &order);
-    CHECK(order.size() == 2 && order[0] == 3 && order[1] == 1);
+    CHECK(order.size() == 2 && order[0] == 1 && order[1] == 3);
 
-    // Mirror variant (dead flag 0x499f8c in BUILD_A): child order
-    // swaps, span selection stays tied to the camera side.
+    // Dead front-to-back variant (0x499f8c == 0 — never taken since
+    // the flag is image-initialized to 1 with zero writers): child
+    // order swaps, span selection stays tied to the camera side.
     camPos[2] = 10;
     arenaRenderOrder(arena, camPos, true, &order);
-    CHECK(order.size() == 2 && order[0] == 0 && order[1] == 2);
+    CHECK(order.size() == 2 && order[0] == 2 && order[1] == 0);
+    camPos[2] = -10;
+    arenaRenderOrder(arena, camPos, true, &order);
+    CHECK(order.size() == 2 && order[0] == 3 && order[1] == 1);
 
     // +0x20 bit4 (0x10) is the render-skip (FUN_00409860, OBSERVED):
     // flagging poly2 drops it from the submission.
+    camPos[2] = 10;
     polys[2].flags = 0x10;
     arenaRenderOrder(arena, camPos, false, &order);
     CHECK(order.size() == 1 && order[0] == 0);

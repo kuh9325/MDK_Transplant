@@ -2623,21 +2623,33 @@ xverts/nodes/polys/camPos) → `FUN_00409a6c` BSP submission walk →
 Sutherland–Hodgman clipper (interpolates the embedded UV triples) →
 `FUN_0040c860` material dispatch + scanline rasterizer.
 
-## Visibility order (OBSERVED + open caveat)
+## Visibility order (OBSERVED — Phase 6B resolved)
 
-The BSP walker recurses the camera-side subtree FIRST
-(front-to-back), flushes the camera-side dynamic-entry list, submits
+The BSP walker recurses the FAR-side subtree first (painter's
+back-to-front), flushes the far-side dynamic-entry list, submits
 the node's `{lo16 count, hi16 firstIdx}` poly span (`+0x14` when
 `dist>0`, `+0x18` otherwise — the facing-camera set), flushes the
-far-side list, then tail-descends the far subtree. `+0x20&0x10`
-skips a poly; `+0x20&1 && DAT_005414b4` gates a two-sided path.
-The `0x499f8c` mirror flag (never written in BUILD_A) selects the
-far-side-first — painter-correct — order. All 24 span-drawer
+near-side list, then tail-descends the near subtree. `+0x20&0x10`
+skips a poly; `+0x20&1 && DAT_005414b4` (the per-frame
+unbanked-view flag `(bank+auxBank)==0`) derives `DAT_005414b8`,
+selecting the `|4` half of the installed span-drawer table.
+The `0x499f8c` flag that selects this order is image-initialized
+to 1 (DGROUP file offset 0x9838c) with zero writers — the
+front-to-back `flag==0` variant is dead code. All 24 span-drawer
 variants write the framebuffer unconditionally; no z-buffer or
-coverage mask was found. Whether a resolve mechanism hides in the
-clipper's deferred path (`DAT_005414d4` branch) or the artifact is
-real remains UNKNOWN — flagged P0 for oracle verification; the port
-reproduces the observed order verbatim (`arenaRenderOrder`).
+coverage mask was found, and none is needed — last-write-wins
+under far→near submission is the occlusion mechanism. Dynamic
+entries share the convention through the 4096-entry depth-keyed
+deferred list (`DAT_00541500 = 1`), sorted far-first.
+`DAT_005414d4` (formerly suspected of hiding a deferred path) is
+the frame-skip draw gate written by `FUN_0042fb68`; it suppresses
+the clipper wholesale on dropped frames. `+0x22 bit7` + the
+`0x70` mask draw the poly's edges as clipped screen lines
+(`FUN_0040da54` → `FUN_00415450` flat pen / `FUN_004154f0`
+LUT-remap for `matIdx <= -1024`) — in real data only the
+FUN_00412970 remap-effect polys (-1027..-1024) carry it.
+The port reproduces the observed order verbatim
+(`arenaRenderOrder`; `frontToBack` exposes the dead variant).
 
 ## Geometry + materials (OBSERVED)
 
@@ -2665,7 +2677,7 @@ raw10, pixels@+0x24, name@+0x28}`; index records leave `+0x24 = 0`
   buffers; it owns only decoded records.
 - `arenaRenderOrder()` reproduces `FUN_00409a6c`'s submission order
   iteratively (pending-resume stack models recursion+tail-descend);
-  `mirror` exposes the dead 0x499f8c variant.
+  `frontToBack` exposes the dead 0x499f8c==0 variant.
 - `ArenaRenderData::materialFor`/`polyMaterialClass` reproduce the
   `FUN_0040c860` dispatch classification including the NULL→`0xff`
   fallback.

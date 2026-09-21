@@ -11,27 +11,38 @@
 //   entries into per-node lists, binds the render globals via
 //   FUN_0040a688 and walks the BSP with FUN_00409a6c.
 //
-//   The walk (OBSERVED, mirror-flag 0x499f8c is never written in this
-//   build so the normal order is always taken):
+//   The walk (OBSERVED — the order flag DAT_00499f8c is initialized
+//   to 1 in DGROUP (image offset 0x9838c) and has exactly one code
+//   reference, the reader at 0x409a9d, so the flag!=0 branch is the
+//   live path and is taken on every frame):
 //     dist = node.plane . camPos + node.d
-//     dist > 0  : recurse childNear (+0x12, the positive-halfspace
+//     dist > 0  : recurse childFar (+0x10, the negative-halfspace
 //                 subtree — VERIFIED against subtree geometry), flush
-//                 the +0x24 entry list, submit the +0x14 poly span,
-//                 flush the +0x28 list, tail-descend childFar (+0x10,
-//                 the negative-halfspace subtree)
-//     dist <= 0 : the symmetric mirror (childFar first, +0x18 span,
-//                 childNear last)
-//   i.e. the camera-side subtree is submitted FIRST (front-to-back in
-//   BSP terms). The rasterizer performs unconditional indexed-byte
-//   stores with no depth test (OBSERVED in both span-drawer tables) —
-//   submission order is the visibility contract and is reproduced
-//   verbatim by arenaRenderOrder().
+//                 the +0x28 entry list, submit the +0x14 poly span,
+//                 flush the +0x24 list, tail-descend childNear (+0x12,
+//                 the positive-halfspace subtree)
+//     dist <= 0 : the symmetric mirror (childNear first, +0x18 span,
+//                 childFar last)
+//   i.e. the far-side subtree is submitted FIRST (back-to-front in
+//   BSP terms — a painter's-algorithm walk). The rasterizer performs
+//   unconditional indexed-byte stores with no depth test (OBSERVED
+//   in both installed span-drawer tables) — correct because under
+//   painter's order the LAST write wins and nearer geometry is always
+//   submitted later. The dead flag==0 variant is the child-swapped
+//   front-to-back order; it is never reachable in this build. Dynamic
+//   draw entries follow the same convention through a 4096-entry
+//   depth-keyed deferred list (DAT_00541500 = 1 from init): entries
+//   are sorted descending depth and drained far-first. Submission
+//   order is the visibility contract and is reproduced verbatim by
+//   arenaRenderOrder().
 //
 //   Poly submission (FUN_00409860) iterates the node's {lo16 count,
-//   hi16 firstIdx} span, skips polys with +0x20 bit4 (0x10), gates
-//   two-sided shading on +0x20 bit0 && global DAT_005414b4, and calls
-//   the clipper FUN_0040ca00 with the three transformed verts, the
-//   poly's UV pairs, and the signed material index.
+//   hi16 firstIdx} span, skips polys with +0x20 bit4 (0x10), derives
+//   DAT_005414b8 = (+0x20 bit0 && DAT_005414b4) where DAT_005414b4 is
+//   the per-frame unbanked-view flag ((bank + auxBank) == 0.0,
+//   computed in FUN_00436100), draws the +0x22-bit7 edge overlay,
+//   and calls the clipper FUN_0040ca00 with the three transformed
+//   verts, the poly's UV pairs, and the signed material index.
 //
 //   The raster dispatcher (FUN_0040c860) sorts verts by screen Y and
 //   selects on the s16 material index:
@@ -98,15 +109,39 @@ struct ArenaRenderPoly {
                             //       <0: pen/effect dispatch (below)
   float uv[3][2];           // +0x08/+0x10/+0x18 — per-vertex {u,v}
   std::uint8_t flags;       // +0x20 — bit4 (0x10) render skip;
-                            //         bit0 (0x01) two-sided gate
+                            //         bit0 (0x01) selects the |4 half
+                            //         of the installed span-drawer
+                            //         table when the view is unbanked
+                            //         (DAT_005414b8 = bit0 &&
+                            //         DAT_005414b4; OBSERVED mechanism,
+                            //         visual role PARTIAL)
   std::uint8_t aux21;       // +0x21 — UNKNOWN (preserved raw)
-  std::uint8_t aux22;       // +0x22 — bits 0x10/0x20/0x40 per-vertex
-                            //         debug-normal mask; bit7 gate
+  std::uint8_t aux22;       // +0x22 — bit7 (0x80) enables the clipped
+                            //         edge-line overlay; bits
+                            //         0x10/0x20/0x40 select edges
+                            //         v1->v0 / v2->v1 / v2->v0 drawn
+                            //         by FUN_0040da54 (flat pen line
+                            //         or LUT-remap line for matIdx
+                            //         <= -1024). OBSERVED; in real
+                            //         data only remap-effect polys
+                            //         (-1027..-1024) carry bit7.
   std::uint8_t surface;     // +0x23 — collision surface index + 1
 };
 
 // Extract the render view of one region-C poly record.
 ArenaRenderPoly arenaRenderPolyDecode(const CollisionPoly& poly);
+
+// +0x20 flag bits (OBSERVED in FUN_00409860):
+inline constexpr std::uint8_t kArenaPolyAltSpan = 0x01;  // |4 drawer
+                                                        // when unbanked
+inline constexpr std::uint8_t kArenaPolySkip    = 0x10;  // render skip
+// +0x22 edge-overlay bits (OBSERVED in FUN_00409860 ->
+// FUN_0040da54): bit7 enables the overlay, the 0x70 mask selects
+// which clipped edges are drawn as screen-space lines.
+inline constexpr std::uint8_t kArenaEdgeV10 = 0x10;  // edge v1->v0
+inline constexpr std::uint8_t kArenaEdgeV21 = 0x20;  // edge v2->v1
+inline constexpr std::uint8_t kArenaEdgeV20 = 0x40;  // edge v2->v0
+inline constexpr std::uint8_t kArenaEdgeOverlay = 0x80;
 
 // ---------------------------------------------------------------------------
 // Decoded material — the platform-neutral view of the original's
@@ -224,12 +259,15 @@ bool arenaRenderDataBuild(std::span<const std::byte> fileBytes,
 // render-skip bit (poly +0x20 bit4) exactly as FUN_00409860 does. The
 // +0x24/+0x28 dynamic-entry flushes are out of scope (they interleave
 // the dynamic objects; the static poly order is what a frontend
-// consumes). `mirror` selects the never-written-in-BUILD_A reversed
-// variant (0x499f8c != 0). Iterative equivalent of the original's
-// recursion+tail loop.
+// consumes). The live order is painter's back-to-front (far-side
+// subtree first) — DAT_00499f8c is initialized to 1 and never
+// written, OBSERVED. `frontToBack` selects the dead flag==0 variant
+// (camera-side subtree first) — never taken in this build; it exists
+// only to document the binary's alternate path. Iterative equivalent
+// of the original's recursion+tail loop.
 // ---------------------------------------------------------------------------
 void arenaRenderOrder(const CollisionArena& arena,
-                      const float camPos[3], bool mirror,
+                      const float camPos[3], bool frontToBack,
                       std::vector<std::uint32_t>* outOrder);
 
 } // namespace mdk

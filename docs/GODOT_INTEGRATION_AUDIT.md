@@ -478,7 +478,7 @@ Findings / gotchas recorded for G0:
 
 | Risk | Assessment |
 |---|---|
-| Arena visual geometry/material format — RESOLVED (Phase 6A/G1-RE: poly records, material pipeline, BSP submission order proven; `src/core/arena_render.*` + `mdk-inspect --arena-render`) | Closed. Remaining UNKNOWNs for G1 implementation: the front-to-back/unconditional-writes occlusion question, effect-drawer semantics (fx770/fx12970/fxe94), texture-anim frame selection — see `reverse-engineering/ARENA_RENDER_PIPELINE.md` census. |
+| Arena visual geometry/material format — RESOLVED (Phase 6A/6B: poly records, material pipeline, BSP submission order proven painter's back-to-front via `DAT_00499f8c`=1; `src/core/arena_render.*` + `mdk-inspect --arena-render`) | Closed. Remaining P1 fidelity items for G1: effect-drawer semantics (fx770/fx12970/fxe94), `|4` span-variant role, texture-anim frame selection — none block rendering static arenas; see `reverse-engineering/ARENA_RENDER_PIPELINE.md` census. |
 | Animation format UNKNOWN | Models parse; how they animate is unreconstructed — gates enemies/player mesh (G5). |
 | Enemy AI / projectile flight / damage UNKNOWN | Gates G4/G5. Pure RE; Godot cannot shortcut it. |
 | godot-cpp 4.7 tag absent | Pin `master` commit hash in the build docs; switch to tag when released. Low risk. |

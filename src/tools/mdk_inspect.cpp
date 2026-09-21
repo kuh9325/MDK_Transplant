@@ -2234,9 +2234,13 @@ int main(int argc, char** argv) {
         }
       }
       std::uint32_t cls[6] = {};
-      std::uint32_t skipped = 0;
+      std::uint32_t skipped = 0, altSpan = 0, edgeOverlay = 0,
+                    edgeMasked = 0;
       for (std::size_t p = 0; p < rd.polys.size(); ++p) {
-        if (rd.polys[p].flags & 0x10) ++skipped;
+        if (rd.polys[p].flags & mdk::kArenaPolySkip) ++skipped;
+        if (rd.polys[p].flags & mdk::kArenaPolyAltSpan) ++altSpan;
+        if (rd.polys[p].aux22 & mdk::kArenaEdgeOverlay) ++edgeOverlay;
+        if (rd.polys[p].aux22 & 0x70) ++edgeMasked;
         using mdk::ArenaMatClass;
         switch (rd.polyMaterialClass(p)) {
         case ArenaMatClass::kTextured: ++cls[0]; break;
@@ -2248,7 +2252,8 @@ int main(int argc, char** argv) {
         }
       }
 
-      // Render-order digest at the probe camera.
+      // Render-order digest at the probe camera — live order is
+      // painter's back-to-front (DAT_00499f8c = 1, never written).
       float cam[3];
       if (travStartGiven) {
         cam[0] = travStart[0];
@@ -2268,11 +2273,14 @@ int main(int argc, char** argv) {
           "    bankA=%zu bankB=%zu names resolved=%u missing=%u\n"
           "    polys textured=%u unresolved=%u pen=%u fx770=%u "
           "fxe94=%u fx12970=%u skip-flag=%u\n"
+          "    flags alt-span(bit0)=%u edge-overlay(b7)=%u "
+          "edge-mask(0x70)=%u\n"
           "    palette=%zuB digest=%016llx order n=%zu digest=%016llx\n",
           blkName.c_str(), rd.vertCount, rd.nodeCount, rd.polys.size(),
           rd.materialNames.size(), bb[0], bb[1], bb[2], bb[3], bb[4],
           bb[5], rd.bankA.size(), rd.bankB.size(), resolved, missing,
           cls[0], cls[1], cls[2], cls[3], cls[4], cls[5], skipped,
+          altSpan, edgeOverlay, edgeMasked,
           rd.paletteRgb.size(), (unsigned long long)h, order.size(),
           (unsigned long long)oh);
       if (missing) {
