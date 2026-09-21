@@ -38,9 +38,10 @@ frontend/godot/
     src/arena_presenter.{h,cpp}     bundle -> Image/ArrayMesh
     src/mdk_bridge.{h,cpp}          RefCounted bridge class
     src/register_types.cpp          GDExtension init/terminate
-  build.sh                          configure+build wrapper
+  build.sh                          configure+build wrapper (+ ext list)
+  run.sh                            canonical launcher (Godot discovery)
   bin/<platform>/libmdkbridge.*     generated output (ignored)
-  .godot/                           editor cache (ignored)
+  .godot/                           editor cache + extension_list (ignored)
 ```
 
 ## Toolchain
@@ -57,48 +58,102 @@ godot-cpp is pinned in `gdextension/CMakeLists.txt`
 reuses an existing checkout via `-DGODOT_CPP_DIR=...` or fetches the
 pinned tarball via `FetchContent` otherwise.
 
+### Prerequisite: a Godot 4.7.x binary
+
+The frontend needs a *Godot binary* (the official macOS build is an
+editor+runtime in one). Resolution order used by `run.sh` and the
+pytest orchestration:
+
+1. `MDK_GODOT_BIN=/path/to/Godot` (explicit override);
+2. `godot` on `PATH`;
+3. `/Applications/Godot.app/Contents/MacOS/Godot`.
+
+Godot.app itself is never committed and no game data is downloaded.
+
 ## Build
 
 ```sh
-# one-shot (downloads the pinned godot-cpp tarball):
+# canonical clean build (downloads the pinned godot-cpp tarball):
 frontend/godot/build.sh
 
 # reuse an existing godot-cpp checkout (much faster):
 GODOT_CPP_DIR=/path/to/godot-cpp frontend/godot/build.sh
 ```
 
-Output: `frontend/godot/bin/Darwin-arm64/libmdkbridge.dylib`.
-`mdk_core` is recompiled from `src/core/*.cpp` as PIC and linked
-statically — the extension does not depend on the SDL root build.
+Outputs (all ignored by git):
+
+- `frontend/godot/bin/Darwin-arm64/libmdkbridge.dylib` — arm64
+  extension (mdk_core + godot-cpp statically linked);
+- `frontend/godot/gdextension/build/` — CMake tree incl. the
+  fetched godot-cpp;
+- `frontend/godot/.godot/extension_list.cfg` — see below.
+
+`mdk_core` is recompiled from `src/core/*.cpp` as PIC — the
+extension does not depend on the SDL root build.
 
 ## Run
 
+`run.sh` is the single entry point. It resolves Godot, checks the
+dylib exists, seeds `.godot/extension_list.cfg` if missing, and
+defaults `--data-path` to `<repo>/original/installed` (or
+`$MDK_DATA_ROOT`).
+
 ```sh
-# interactive acceptance scene (WASD move, Q/E strafe, R/F look,
+# interactive HMO_1 view (WASD move, Q/E strafe, R/F look,
 # Space jump, Shift turbo, Esc quit):
-Godot --path frontend/godot -- --data-path /path/to/installed
+frontend/godot/run.sh
 
 # deterministic headless smoke (dummy renderer):
-Godot --headless --rendering-driver dummy --audio-driver Dummy \
-    --path frontend/godot -- --smoke --data-path /path/to/installed
+frontend/godot/run.sh --smoke
+
+# startup proof — N real frames, then exit 0:
+frontend/godot/run.sh --frames 30
 
 # framebuffer capture (real renderer, brief window):
-Godot --rendering-driver metal --audio-driver Dummy \
-    --path frontend/godot -- --screenshot /tmp/shot.png \
-    --data-path /path/to/installed
+frontend/godot/run.sh --screenshot /tmp/shot.png
+
+# overrides — forwarded verbatim:
+frontend/godot/run.sh --data-path /path/to/installed \
+    --level TRAVERSE/LEVEL4/LEVEL4.DTI --arena SOME_ARENA
 ```
 
-User args after `--`: `--data-path DIR` (default `$MDK_DATA_ROOT`,
+Direct Godot invocation works identically; `run.sh` only adds
+discovery + defaults. `--data-path DIR` (default `$MDK_DATA_ROOT`,
 else `<repo>/original/installed` relative to the project),
 `--level RELDTI`, `--arena NAME` (default `HMO_1`; `""` = spawn
-arena), `--smoke`, `--screenshot PATH`. Relative paths resolve
-against the launch directory (`$PWD`) because Godot chdirs into the
-project directory.
+arena), `--smoke`, `--screenshot PATH`, `--frames N`. Relative
+paths resolve against the launch directory (`$PWD`) because Godot
+chdirs into the project directory.
+
+### GDExtension discovery (important)
+
+Godot **game mode** loads GDExtensions listed in
+`.godot/extension_list.cfg` — a file normally produced by an
+*editor* filesystem scan. `build.sh` and `run.sh` both seed it
+(`res://gdextension/mdk_bridge.gdextension`) so no editor pass is
+ever required. If it is missing, the scene reports
+
+```
+MdkBridge class missing — the GDExtension is not loaded. Run
+frontend/godot/build.sh ..., then relaunch.
+```
+
+and exits 1 (the script is deliberately untyped on the bridge so a
+missing extension never becomes a GDScript parse error).
 
 Headless editor caveat (known upstream): `--headless --editor`
 crashes inside MoltenVK shader conversion on Apple Silicon. Use
 `--rendering-driver dummy` for editor-side scans; game mode is
 unaffected.
+
+## Screenshot semantics
+
+`--screenshot PATH` waits 8 frames then reads back the viewport
+texture and saves a PNG, exiting 0 on success. `--headless`
+**always** selects the dummy rendering server — there is no
+viewport texture to read, so the command fails intentionally with
+exit 2 and an explanatory message (no null dereference). Run it in
+game mode (no `--headless`); the window opens briefly.
 
 ## Bridge API (`MdkBridge`, RefCounted)
 
@@ -213,7 +268,7 @@ original data are absent.
 cd frontend/godot/gdextension && cmake --build build --target mdk_frontend_tests
 ./build/mdk_frontend_tests            # 16 checks
 
-# headless in-engine smoke:
+# headless in-engine smoke (canonical launcher path):
 MDK_GODOT_BIN=/path/to/Godot python3 -m pytest tests/test_godot_frontend.py
 
 # native regression (unchanged):
@@ -236,8 +291,9 @@ python3 -m pytest tests/
 - Atlas rebuild per `load_arena` only; painter-order rebuilds reuse
   the atlas. Draw calls: one ordered surface (correctness first —
   batching is a later optimization).
-- Framebuffer capture requires a real driver run (headless = dummy
-  renderer). `--screenshot` works in game mode.
+- Framebuffer capture requires a real driver run — under `--headless`
+  `--screenshot` exits 2 by design (dummy renderer, no viewport
+  texture). Game-mode capture works.
 - Human QA items (texture orientation, palette plausibility,
   occlusion, camera feel) need eyes on a real run.
 

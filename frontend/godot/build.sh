@@ -18,3 +18,14 @@ fi
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $EXTRA
 cmake --build build --parallel --target mdkbridge mdk_frontend_tests
 echo "built: $(ls ../bin/*/libmdkbridge.dylib)"
+
+# Godot game mode discovers GDExtensions via .godot/extension_list.cfg,
+# a file normally produced by an EDITOR filesystem scan. Writing the
+# entry here keeps the whole runtime path editor-free; a later real
+# editor scan rewrites/extends the same file harmlessly.
+mkdir -p ../.godot
+if ! grep -qs 'res://gdextension/mdk_bridge.gdextension' \
+    ../.godot/extension_list.cfg 2>/dev/null; then
+  printf 'res://gdextension/mdk_bridge.gdextension\n' \
+    >> ../.godot/extension_list.cfg
+fi

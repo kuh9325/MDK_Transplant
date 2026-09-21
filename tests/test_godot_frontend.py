@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Phase 7 (G1) — deterministic Godot-frontend smoke orchestration.
 
-Runs the in-repo Godot 4 project headless with the dummy renderer
-(the audit's proven path on Apple Silicon) and asserts the bridge's
-self-check output. Skipped unless all three preconditions exist:
+Drives the CANONICAL launcher (`frontend/godot/run.sh --smoke`) so the
+test exercises the same path users run: Godot discovery, dylib check,
+editor-free extension-list seeding, headless dummy-renderer launch.
+Skipped unless all preconditions exist:
 
-  * a Godot 4.7 binary — $MDK_GODOT_BIN, else `godot` on PATH;
+  * a Godot 4.7 binary — $MDK_GODOT_BIN, `godot` on PATH, or
+    /Applications/Godot.app;
   * the built extension — frontend/godot/bin/*/libmdkbridge.dylib
     (build via frontend/godot/build.sh);
   * local original data — original/installed (ignored, never
@@ -22,12 +24,12 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GODOT_PROJECT = ROOT / "frontend" / "godot"
+RUN_SH = GODOT_PROJECT / "run.sh"
 DYLIB_GLOB = "bin/*/libmdkbridge.dylib"
 DEFAULT_DATA = ROOT / "original" / "installed"
 INSPECT = ROOT / "build" / "mdk-inspect"
@@ -39,12 +41,18 @@ def find_godot():
     env = os.environ.get("MDK_GODOT_BIN")
     if env and Path(env).exists():
         return env
-    return shutil.which("godot")
+    on_path = shutil.which("godot")
+    if on_path:
+        return on_path
+    app = "/Applications/Godot.app/Contents/MacOS/Godot"
+    return app if Path(app).exists() else None
 
 
 def have_prereqs():
     if not find_godot():
-        return False, "no Godot binary (set MDK_GODOT_BIN)"
+        return False, "no Godot binary (MDK_GODOT_BIN/PATH//Applications)"
+    if not RUN_SH.exists():
+        return False, "frontend/godot/run.sh missing"
     if not list(GODOT_PROJECT.glob(DYLIB_GLOB)):
         return False, "extension not built (frontend/godot/build.sh)"
     data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
@@ -55,23 +63,17 @@ def have_prereqs():
 
 @unittest.skipUnless(*have_prereqs())
 class GodotFrontendSmoke(unittest.TestCase):
-    def run_smoke(self) -> subprocess.CompletedProcess:
-        godot = find_godot()
-        data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
-        cmd = [
-            godot,
-            "--headless",
-            "--rendering-driver", "dummy",
-            "--audio-driver", "Dummy",
-            "--path", str(GODOT_PROJECT),
-            "--", "--smoke", "--data-path", str(data),
-        ]
+    def run_smoke(self):
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120)
+            [str(RUN_SH), "--smoke"],
+            capture_output=True, text=True, timeout=120)
 
     def test_headless_smoke(self):
         proc = self.run_smoke()
         out = proc.stdout + proc.stderr
+        # A parse error here means the extension did not load —
+        # fail loudly rather than pattern-matching around it.
+        self.assertNotIn("SCRIPT ERROR", out)
         m = re.search(r"smoke: (\d+) failure", out)
         self.assertIsNotNone(m, f"no smoke verdict in output:\n{out}")
         self.assertEqual(
@@ -79,14 +81,14 @@ class GodotFrontendSmoke(unittest.TestCase):
             f"godot exited {proc.returncode}:\n{out}")
         self.assertEqual(m.group(1), "0", f"smoke failures:\n{out}")
         # The digest must match the mdk-inspect fold for the same
-        # camera — the C++ bridge prints it as order_digest_hex.
+        # camera — the bridge prints it as order_digest_hex.
         self.assertIn(GOLDEN_GEOM, out)
         self.assertIn(GOLDEN_ORDER, out)
 
     def test_inspect_crosscheck(self):
         """mdk-inspect prints the same digests for the same camera."""
         if not INSPECT.exists():
-            self.skipTest("mdk_inspect not built")
+            self.skipTest("mdk-inspect not built")
         data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
         proc = subprocess.run(
             [str(INSPECT), "--data-path", data, "--arena-render",

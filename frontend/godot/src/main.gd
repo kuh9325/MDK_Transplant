@@ -10,18 +10,23 @@ extends Node3D
 #   --level RELDTI    default TRAVERSE/LEVEL3/LEVEL3.DTI
 #   --arena NAME      default HMO_1 ("" -> spawn arena)
 #   --smoke           headless deterministic check, then quit
-#   --screenshot P    after N frames, save a PNG capture then quit
-#                     (needs a real rendering driver, not dummy)
+#   --screenshot P    after 8 frames, save a PNG capture then quit
+#                     (requires a real renderer — not --headless)
+#   --frames N        run N process frames then quit (startup proof)
 #
 # Keys: WASD move, Q/E strafe, R/F look up/down, Space jump,
 # Shift turbo, Esc quit.
 
-var bridge: MdkBridge
+# Variant on purpose: keeping the MdkBridge reference untyped lets
+# the script still parse when the GDExtension is missing, so the
+# failure surfaces as an actionable error instead of a parse abort.
+var bridge = null
 var last_order_digest := -1
 var smoke := false
 var failures := 0
 var shot_path := ""
 var shot_frames_left := 0
+var frames_left := 0
 
 const ACT_TURN_LEFT := 1
 const ACT_TURN_RIGHT := 2
@@ -71,8 +76,18 @@ func _ready() -> void:
 		var launch_dir := OS.get_environment("PWD")
 		if not launch_dir.is_empty():
 			shot_path = launch_dir.path_join(shot_path).simplify_path()
+	frames_left = int(_arg_value(args, "--frames", "0"))
 
-	bridge = MdkBridge.new()
+	# Gate on the extension BEFORE touching it — game mode only
+	# discovers GDExtensions listed in .godot/extension_list.cfg
+	# (written by an editor scan or by build.sh/run.sh).
+	if not ClassDB.class_exists("MdkBridge"):
+		printerr("MdkBridge class missing — the GDExtension is not ",
+			"loaded. Run frontend/godot/build.sh (it also writes ",
+			".godot/extension_list.cfg), then relaunch.")
+		get_tree().quit(1)
+		return
+	bridge = ClassDB.instantiate("MdkBridge")
 	if not bridge.initialize(data_root):
 		printerr("MdkBridge.initialize failed: ", bridge.get_last_error())
 		get_tree().quit(1)
@@ -96,6 +111,16 @@ func _ready() -> void:
 		get_tree().quit(0 if failures == 0 else 1)
 		return
 	if not shot_path.is_empty():
+		# --headless forces the dummy rendering server: no viewport
+		# texture exists to read back. Fail intentionally instead of
+		# dereferencing null later.
+		if DisplayServer.get_name() == "headless":
+			printerr("--screenshot needs a real renderer; ",
+				"--headless always selects the dummy one. Run ",
+				"without --headless (game mode opens a window ",
+				"briefly).")
+			get_tree().quit(2)
+			return
 		shot_frames_left = 8  # let the pipeline settle first
 
 	print("mdk-godot: arena=%s arenas=%d  (WASD/QE/RF move, Esc quit)" %
@@ -145,14 +170,35 @@ func _input_mask() -> int:
 
 
 func _process(delta: float) -> void:
+	if bridge == null:
+		# Extension missing — _ready already quit(1); quit() still
+		# pumps one more iteration before the engine exits.
+		return
 	if shot_frames_left > 0:
 		shot_frames_left -= 1
 		if shot_frames_left == 0:
-			var img := get_viewport().get_texture().get_image()
+			var vt := get_viewport().get_texture()
+			if vt == null:
+				printerr("screenshot: no viewport texture — ",
+					"renderer does not expose a framebuffer ",
+					"(dummy/headless).")
+				get_tree().quit(2)
+				return
+			var img := vt.get_image()
+			if img == null or img.is_empty():
+				printerr("screenshot: framebuffer readback empty")
+				get_tree().quit(2)
+				return
 			var err := img.save_png(shot_path)
 			print("screenshot -> ", shot_path, " err=", err,
 				" size=", img.get_width(), "x", img.get_height())
 			get_tree().quit(0 if err == OK else 1)
+			return
+	if frames_left > 0:
+		frames_left -= 1
+		if frames_left == 0:
+			print("frames: startup proof complete")
+			get_tree().quit(0)
 			return
 	if Input.is_key_pressed(KEY_ESCAPE):
 		get_tree().quit(0)
@@ -163,7 +209,7 @@ func _process(delta: float) -> void:
 	_apply_camera_snapshot()
 	# Rebuild the ordered mesh only when the BSP submission order
 	# actually changed (camera-dependent painter's order).
-	var d := bridge.get_arena_order_digest()
+	var d = bridge.get_arena_order_digest()
 	if d != last_order_digest:
 		_apply_arena_snapshot()
 
