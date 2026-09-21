@@ -59,6 +59,33 @@ inline BasisCols mdkCameraBasisToGodot(const float rows[3][4]) {
            {back.x, back.y, back.z}}};
 }
 
+// Locomotion yaw (PlayerMotionState::yawDeg, 0x540c2c) -> the upright
+// Godot basis for the player presentation. MDK forward at yaw t is
+// (cos t, sin t, 0), right is (sin t, -cos t, 0), up is +Z, so the
+// converted columns are
+//   X = P(right) = (cos t, 0, -sin t)
+//   Y = P(up)    = (0, 1, 0)
+//   Z = P(-fwd)  = (sin t, 0,  cos t)
+// which is exactly a Godot +Y rotation by t radians — the same value
+// as rotation.y = deg_to_rad(yaw_mdk). Positive yaw turns left,
+// matching the documented same-sign yaw rule.
+inline BasisCols mdkYawToGodotBasisDeg(float yawDeg) {
+  const float t = yawDeg * (3.14159265358979323846f / 180.0f);
+  const float c = std::cos(t), s = std::sin(t);
+  return {{{c, 0.0f, -s}, {0.0f, 1.0f, 0.0f}, {s, 0.0f, c}}};
+}
+
+// MDK {minx,miny,minz,maxx,maxy,maxz} AABB (e.g. the player collision
+// box 0x540c30..44) -> Godot {min,max}. P negates x/y, so each Godot
+// axis min/max pair comes from the opposite MDK axis endpoint.
+struct Aabb3 {
+  Vec3 min, max;
+};
+inline Aabb3 mdkBoxToGodot(const float box6[6]) {
+  return {{-box6[4], box6[2], -box6[3]},
+          {-box6[1], box6[5], -box6[0]}};
+}
+
 // tan(fovY/2) = viewHalfH / (scaleY * yDivisor). The pixel divisors
 // default to the normal 600x360 viewport (299.95 / 180.4).
 inline float mdkCameraTanHalfFovY(float scaleY, float viewH,

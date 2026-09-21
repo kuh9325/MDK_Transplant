@@ -261,7 +261,13 @@ struct TraversalFrameResult {
   std::uint32_t contactObj = 0;      // 0x540e4c token
   const CollisionPoly* contactPoly = nullptr;
   float contactNormal[3] = {0, 0, 0};
-  float playerBox[6] = {0, 0, 0, 0, 0, 0}; // 0x540c30..44
+  float playerBox[6] = {0, 0, 0, 0, 0, 0}; // 0x540c30..44 — the LAST
+                                         // per-query AABB collisionApply
+                                         // wrote this frame (volatile)
+  float playerBodyBox[6] = {0, 0, 0, 0, 0, 0}; // 0x540c30..44 captured at
+                                             // the mode-3 tail rebuild —
+                                             // the standing {pos+-1.25,
+                                             // pos.z, +1.25, +4.25} box
   int locoState = 0;                 // 0x540cac
   int eventType = 0, eventMag = 0;   // 0x54cb00/08 — the pending
                                      // event slots (cleared each

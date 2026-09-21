@@ -126,6 +126,59 @@ int main() {
     CHECK(near(det, 1.0, 1e-5));
   }
 
+  // ---- player yaw basis: upright presentation columns ----
+  {
+    // yaw 0: MDK forward +X -> Godot -Z; MDK right (0,-1,0) -> +X;
+    // up +Z -> +Y. The whole basis is the identity.
+    const BasisCols b0 = mdkYawToGodotBasisDeg(0.0f);
+    CHECK(near(b0.cols[0][0], 1) && near(b0.cols[0][2], 0) &&
+          near(b0.cols[2][0], 0) && near(b0.cols[2][2], 1));
+    // yaw 90: MDK forward +Y -> Godot -X, so -colZ == (-1,0,0).
+    const BasisCols b90 = mdkYawToGodotBasisDeg(90.0f);
+    CHECK(near(-b90.cols[2][0], -1, 1e-6) &&
+          near(-b90.cols[2][2], 0, 1e-6));
+    // right = MDK (sin90,-cos90,0)=(1,0,0) -> Godot (0,0,-1).
+    CHECK(near(b90.cols[0][2], -1, 1e-6) &&
+          near(b90.cols[0][0], 0, 1e-6));
+    // LEVEL3 spawn yaw 96: forward = (-sin96, 0, -cos96);
+    // right = (cos96, 0, -sin96); det +1.
+    const double t = 96.0 * M_PI / 180.0;
+    const BasisCols b96 = mdkYawToGodotBasisDeg(96.0f);
+    CHECK(near(-b96.cols[2][0], -std::sin(t), 1e-6) &&
+          near(-b96.cols[2][2], -std::cos(t), 1e-6));
+    CHECK(near(b96.cols[0][0], std::cos(t), 1e-6) &&
+          near(b96.cols[0][2], -std::sin(t), 1e-6));
+    const double det =
+        b96.cols[0][0] * (b96.cols[1][1] * b96.cols[2][2] -
+                          b96.cols[1][2] * b96.cols[2][1]) -
+        b96.cols[0][1] * (b96.cols[1][0] * b96.cols[2][2] -
+                          b96.cols[1][2] * b96.cols[2][0]) +
+        b96.cols[0][2] * (b96.cols[1][0] * b96.cols[2][1] -
+                          b96.cols[1][1] * b96.cols[2][0]);
+    CHECK(near(det, 1.0, 1e-6));
+    // The basis equals a pure +Y rotation: column Y stays +Y.
+    CHECK(b96.cols[1][0] == 0 && b96.cols[1][1] == 1 &&
+          b96.cols[1][2] == 0);
+  }
+
+  // ---- player collision AABB conversion ----
+  {
+    // 0x540c30..44 at the spawn pos (-4,0,190): x/y +-1.25, z..z+4.25.
+    const float box[6] = {-5.25f, -1.25f, 190.0f,
+                          -2.75f, 1.25f, 194.25f};
+    const Aabb3 a = mdkBoxToGodot(box);
+    // godot min = (-maxy, minz, -maxx) = (-1.25, 190, 2.75);
+    // godot max = (-miny, maxz, -minx) = (1.25, 194.25, 5.25).
+    CHECK(near(a.min.x, -1.25) && near(a.min.y, 190.0) &&
+          near(a.min.z, 2.75));
+    CHECK(near(a.max.x, 1.25) && near(a.max.y, 194.25) &&
+          near(a.max.z, 5.25));
+    // Footprint 2.5x2.5, height 4.25; pos (0,190,4) sits inside.
+    CHECK(near(a.max.x - a.min.x, 2.5) &&
+          near(a.max.y - a.min.y, 4.25) &&
+          near(a.max.z - a.min.z, 2.5));
+  }
+
   // ---- projection: normal-viewport fov/aspect goldens ----
   {
     // scaleY = 1/(zoom*(H/W)*0.5) with zoom=2.4, H/W=360/600:

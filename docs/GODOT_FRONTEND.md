@@ -1,9 +1,9 @@
-# GODOT_FRONTEND.md — Phase 7 (G1) Godot 4 frontend
+# GODOT_FRONTEND.md — Phase 7/8 (G1+G2) Godot 4 frontend
 
 Status: **implemented and validated** — static LEVEL3 arena rendering
-through a retained GDExtension bridge. Dynamic objects, animation,
-HUD, audio, and the fx drawers remain out of scope (see
-"Limitations").
+plus a snapshot-driven player presentation through a retained
+GDExtension bridge. Dynamic objects, animation, HUD, audio, and the
+fx drawers remain out of scope (see "Limitations").
 
 This document covers the in-repo frontend. The architecture
 rationale and the disposable-spike evidence live in
@@ -27,7 +27,9 @@ MDK file is parsed and no game rule is evaluated outside the core.
 ```
 frontend/godot/
   project.godot                     engine config only (no data)
-  main.tscn                         Node3D + MeshInstance3D + Camera3D
+  main.tscn                         Node3D + ArenaMesh + PlayerRoot +
+                                    PlayerBoxWire + CollisionDebug +
+                                    Camera3D + DebugUI
   src/main.gd                       driver + --smoke / --screenshot
   shaders/arena_unshaded.gdshader   unshaded masked-fetch shader
   gdextension/
@@ -99,8 +101,9 @@ defaults `--data-path` to `<repo>/original/installed` (or
 `$MDK_DATA_ROOT`).
 
 ```sh
-# interactive HMO_1 view (WASD move, Q/E strafe, R/F look,
-# Space jump, Shift turbo, Esc quit):
+# interactive HMO_1 view (WASD move, Q/E strafe, A/D turn,
+# R/F look, Space jump, Shift turbo, mouse captured, F1 collision
+# wire, F3 debug text, Esc release-then-quit):
 frontend/godot/run.sh
 
 # deterministic headless smoke (dummy renderer):
@@ -163,8 +166,15 @@ b.initialize(data_root)        # bool — DataRoot open (no writes)
 b.load_level(dti_rel_path)     # bool — DTI+CMI+MTO via the runtime
 b.load_arena(arena_name)       # bool — "" selects the spawn arena
 b.step_frame(dt_ms, mask)      # one traversal frame; QA input bits
-b.get_player_snapshot()        # pos (Godot), yaw/pitch, grounded...
+b.step_frame_input(dt_ms, {    # same, with raw device state:
+    "actions": mask,           #   QA action bits -> bound key codes
+    "keys": [codes...],        #   held internal key codes (0..127)
+    "mouse_dx": n, "mouse_dy": n, "mouse_dz": n,  # DIMOUSESTATE
+    "mouse_buttons": nibble})  #   4 device buttons -> core masks
+b.get_player_snapshot()        # pos/transform/box, channels, state
 b.get_camera_snapshot()        # Transform3D, fov_deg, aspect, rect
+b.get_collision_snapshot()     # poly/vert counts + debug line soup
+b.get_input_config()           # mouse axes map, scales, btn masks
 b.get_arena_render_snapshot()  # mesh, material, atlas, arrays, stats
 b.get_arena_order_digest()     # cheap painter-order digest (poll)
 b.get_arena_names()            # level arena list
@@ -175,6 +185,144 @@ b.shutdown()
 Only copy-safe values cross the boundary — packed arrays,
 dictionaries, Godot resources. No core pointers, spans, or mutable
 ownership escape into GDScript.
+
+`step_frame_input` returns the frame result plus an `input` echo of
+the just-consumed `GameplayInputFrame` (the 0x4ce control block —
+fire/jump/sniper-pulse/look flags, turn/move/strafe axes, turbo,
+zoom accumulator) so tests can verify which semantic action a raw
+device state produced without guessing at the internals. The frame
+itself also feeds `last_` for all snapshot getters.
+
+## Player presentation (G2)
+
+`PlayerRoot : Node3D` is a retained presentation node. Every frame
+the script applies `get_player_snapshot()["transform"]` verbatim —
+a `Transform3D` built in C++ from the core's position and yaw-only
+basis. The scene tree:
+
+```
+Main (Node3D, src/main.gd)
+  ArenaMesh        — ordered static geometry (G1)
+  PlayerRoot       — snapshot transform, nothing writes back
+    DebugBody      — capsule, green grounded / amber airborne
+    ForwardMarker  — blue nose box on local -Z (facing)
+  PlayerBoxWire    — 12-edge AABB of the standing collision box
+  CollisionDebug   — arena collision-poly line soup (F1)
+  Camera3D         — core PlayerCameraPose, sibling not child
+  DebugUI          — tiny QA label (F3): pos, yaw, channels
+```
+
+There is no `CharacterBody3D`, no `RigidBody3D`, and no Godot
+physics or raycast anywhere on the gameplay path — the smoke test
+proves `PlayerRoot` writes cannot reach core state (position is
+sampled before/after deliberately corrupting the node transform).
+
+### Player snapshot fields
+
+`get_player_snapshot()` — every value a verbatim copy of a proven
+core output (`TraversalFrameResult` / collision state); `*_mdk`
+keys carry the raw MDK-space numbers for diagnostics:
+
+| Key | Source |
+|---|---|
+| `pos`, `pos_mdk` | `cs.pos` (0x540c40-ish) |
+| `transform` | `pos` + yaw-only basis (presentation) |
+| `yaw_deg`, `pitch_deg` | `PlayerMotionState.yawDeg`, view pitch |
+| `grounded` | `contactFlags & 1` |
+| `arena`, `arena_display`, `frame` | core arena, shown arena, tick |
+| `box`, `box_mdk` | `playerBodyBox` — standing extents |
+| `query_box`, `query_box_mdk` | `playerBox` — last query AABB (volatile) |
+| `loco_state` | `rt.locoState` (0x540cac dispatched code) |
+| `move_vel`, `strafe_vel` | 0x540d48 / 0x540d4c channels |
+| `turn_vel`, `vert_vel` | 0x540d50 / 0x540c78 channels |
+| `contact`, `contact_normal` | 0x540e4c token + swept normal |
+| `position_changed` | horizontal apply moved the player |
+| `look_offset_deg` | 0x540d58 look offset |
+| `event_type`, `event_mag` | 0x54cb00/08 pending event slots |
+
+Two box fields because the original reuses 0x540c30..44: each
+traversal-active frame's tail rebuilds the *standing* box
+(`pos +- 1.25 x/y`, `pos.z .. pos.z+4.25`), then the in-frame
+collision queries overwrite it with per-probe AABBs. The core now
+snapshots the standing value into `TraversalFrameResult.
+playerBodyBox` at the rebuild point; `box` presents that for the
+wire, `query_box` keeps the last query AABB for diagnostics.
+
+### Player orientation
+
+`mdkYawToGodotBasisDeg(yawDeg)` treats the MDK yaw as a same-sign
+Godot Y rotation: converted right = `(cos t, 0, -sin t)`, up =
+`(0,1,0)`, back = `(sin t, 0, cos t)`. The smoke asserts the
+`PlayerRoot` basis columns against the converted MDK forward/right
+and orthonormality, and that `-Z` agrees with movement direction
+and camera orientation.
+
+### Player collision debug
+
+- `PlayerBoxWire` — the standing body box (`box` above) drawn as a
+  12-edge line box in world space every frame.
+- `CollisionDebug` — `get_collision_snapshot()` returns the loaded
+  arena's collision polys as a PRIMITIVE_LINES vertex soup (6
+  vertices per poly, one per edge) plus poly/vert counts; F1
+  toggles visibility. Visualization only — no Godot collision
+  bodies are created.
+- `contact` / `contact_normal` / `grounded` surface the per-frame
+  contact state for the QA overlay.
+
+## Raw mouse input route (G2)
+
+Godot `InputEventMouseMotion.relative` accumulates into per-frame
+deltas; the 4 device buttons form a nibble (`MOUSE_BUTTON_XBUTTON1`
+is the 4th). Per frame GDScript forwards `{actions, keys, mouse_dx,
+mouse_dy, mouse_dz, mouse_buttons}` into `step_frame_input`, which
+fills `RawGameplayInput` — nothing is pre-interpreted:
+
+```
+Godot mouse event -> raw deltas/buttons -> RawGameplayInput
+  -> consumeGameplayInput (FUN_00406f14 merge)
+     W-set axes "ABG", scales 16/16/50, button masks 1/4/2/0
+  -> existing player/camera semantics
+```
+
+The configured W-set mapping stays entirely in core: axis A turns,
+axis B moves, G feeds the zoom path; button masks map LMB=fire,
+RMB=jump, MMB=sniper, 4th=unmapped — all OBSERVED factory values,
+verified in the smoke via the consumed-frame `input` echo (no
+button semantics are hardcoded in GDScript). Raw one-frame input
+latency is preserved exactly as the original consumes the previous
+frame's merged block.
+
+Interactive runs capture the mouse at startup (`MOUSE_MODE_
+CAPTURED`); a click re-captures after release; Esc releases once,
+then quits. F1 toggles the collision wire, F3 the debug text.
+
+### Keyboard path
+
+`"keys"` accepts held internal key codes (the FUN_0046b688 domain)
+so the frontend can drive bindings directly; the legacy `actions`
+mask still maps QA bits onto the configured bound codes. Both feed
+the same `RawGameplayInput.keyLevel`, and the bridge computes
+`keyEdge = level & ~prev` per frame like the original's poll diff.
+WASD/QE/AD/RF/Space/Shift behavior is unchanged.
+
+### Optional real Kurt model — status
+
+Not used: the `K_*` records in `TRAVSPRT.BNI` use a different
+container layout (length/count/offset-table) than the proven
+`FUN_00428400` geometry-record layout the model parser handles, so
+no validated static pose exists today. Missing evidence for a real
+mesh: the K-record container decode, the per-part transform/bone
+mapping, and the animation semantics (all UNKNOWN — G5 territory).
+The capsule proxy is therefore the honest G2 visual.
+
+## Arena transitions (G2 partial)
+
+`stepCore_` compares `last_.curArenaIndex` against the displayed
+arena each frame and calls `load_arena` on the new arena when a
+render block exists, so normal traversal through arena boundaries
+keeps the view synchronized. Corridor arenas (`CHMO_*`, no MTO
+block) keep the previous display and mark the desync instead of
+failing. Full portal/object streaming remains G3 scope.
 
 ## Coordinate conversion (`mdk_math.h`)
 
@@ -245,10 +393,10 @@ drawn.
 
 ## Deterministic smoke
 
-`--smoke` asserts (26 checks): extension load, LEVEL3 load, arena
-count, HMO_1 counts (verts 234 / polys 399 / names 20 / resolved
-20 / textured 193 / pen 203 / unresolved 3 / submitted 296 /
-textures 11), array alignment, atlas sizing, palette size,
+`--smoke` asserts (61 checks). G1: extension load, LEVEL3 load,
+arena count, HMO_1 counts (verts 234 / polys 399 / names 20 /
+resolved 20 / textured 193 / pen 203 / unresolved 3 / submitted 296
+/ textures 11), array alignment, atlas sizing, palette size,
 coordinate goldens, camera basis/FOV, and both FNV-1a digests
 matching `mdk-inspect --arena-render` verbatim:
 
@@ -256,6 +404,27 @@ matching `mdk-inspect --arena-render` verbatim:
 geom  f1cc72cbe4056174   (camera-independent)
 order 9ff16337ea1582ec   (frame-0 spawn camera)
 ```
+
+G2 additions: player pos/yaw goldens, snapshot transform ==
+`PlayerRoot`, basis columns == converted MDK forward/right,
+standing-box extents/base, grounded state, arena display sync,
+collision snapshot counts + line soup, input-config echo (axes map
+"ABG", button masks 1/4/2/0), `PlayerRoot`-write isolation, W move
+channel + forward-dominant displacement, Q/E strafe channels +
+lateral displacement (accumulated over grounded frames — the spawn
+platform's perpendicular edges are bounded by climbable steps, so
+the checks turn ~90 deg first to run the corridor axis), Space jump
+rise, A turn sign, mouse dx -> yaw sign, mouse dy -> moveVel sign,
+and configured button masks (LMB fire echo, RMB visible jump, MMB
+sniper pulse edge + hold-no-repeat, 4th button unmapped).
+
+Jump-check ordering note: the original's jump gate requires
+`vertVel == 0` exactly plus grounded, and after a SOFT landing no
+event posts — `locoState` stays latched on a jump code and
+`jumpActive` holds until a priority-8+ event (look/hard-land/
+sniper) moves the dispatched state. The smoke re-arms with a held
+look key before the second (RMB) jump check — all within proven
+semantics.
 
 `tests/test_godot_frontend.py` orchestrates the headless run and
 the inspect cross-check; it skips cleanly when Godot, the dylib, or
@@ -266,7 +435,7 @@ original data are absent.
 ```sh
 # frontend native tests (pure math, no engine):
 cd frontend/godot/gdextension && cmake --build build --target mdk_frontend_tests
-./build/mdk_frontend_tests            # 16 checks
+./build/mdk_frontend_tests            # 26 checks
 
 # headless in-engine smoke (canonical launcher path):
 MDK_GODOT_BIN=/path/to/Godot python3 -m pytest tests/test_godot_frontend.py
@@ -278,10 +447,16 @@ python3 -m pytest tests/
     TRAVERSE/LEVEL3/LEVEL3.DTI   # .. LEVEL8 for the sweep
 ```
 
-## Limitations / remaining G1 fidelity items
+## Limitations / remaining fidelity items
 
-- Static arena geometry only — no models, dynamic objects, or
-  animation (by design).
+- Static arena geometry plus a *debug-proxy* player — no real Kurt
+  mesh (K-record layout UNKNOWN, see above), no models, dynamic
+  objects, enemies, or animation (by design).
+- The player capsule is a presentation stand-in; pitch/bank are
+  snapshot-only (the proxy applies yaw — matching the traversal
+  channels the frontend can show honestly).
+- Arena display follows the core's current arena per frame, but
+  portal/streaming presentation and objects remain G3.
 - fx770/fxE94/fx12970 are tagged placeholder colors, not the
   original effect drawers (UNKNOWN semantics — P1 reverse
   engineering).
@@ -295,7 +470,9 @@ python3 -m pytest tests/
   `--screenshot` exits 2 by design (dummy renderer, no viewport
   texture). Game-mode capture works.
 - Human QA items (texture orientation, palette plausibility,
-  occlusion, camera feel) need eyes on a real run.
+  occlusion, camera feel, player proxy legibility, mouse feel vs.
+  the original, RMB jump, landing/contact feedback) need eyes on a
+  real run.
 
 ## Proprietary boundary
 

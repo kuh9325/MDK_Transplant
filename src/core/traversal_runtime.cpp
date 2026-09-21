@@ -1129,6 +1129,11 @@ TraversalFrameResult stepTraversalRuntime(
   rt.cs.playerBox[3] = rt.cs.pos[0] + 1.25f;
   rt.cs.playerBox[4] = rt.cs.pos[1] + 1.25f;
   rt.cs.playerBox[5] = rt.cs.pos[2] + 4.25f;
+  // Snapshot the standing-box extents before the in-frame collision
+  // queries rewrite 0x540c30..44 with per-query probe AABBs.
+  for (int i = 0; i < 6; ++i) {
+    out.playerBodyBox[i] = rt.cs.playerBox[i];
+  }
 
   // FUN_00432f84 runs unconditionally (0x43627a); the 0x540c74 gate
   // lives inside it. The punch target scan + hitscan boundary.

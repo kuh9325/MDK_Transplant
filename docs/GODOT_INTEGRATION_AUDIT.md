@@ -2,10 +2,11 @@
 
 Status: DESIGN SUPERSEDED BY IMPLEMENTATION — the audit/design below
 was recorded 2026-09-21 against MDK-Native `3f23778` (Phase 5N) and is
-retained as the decision record. Phase 7 (G1) implemented the designed
-boundary: the retained frontend lives in `frontend/godot/` and is
-documented in `docs/GODOT_FRONTEND.md`. Where the two disagree, the
-frontend doc describes what actually shipped.
+retained as the decision record. Phase 7 (G1, arena rendering) and
+Phase 8 (G2, player presentation) implemented the designed boundary:
+the retained frontend lives in `frontend/godot/` and is documented in
+`docs/GODOT_FRONTEND.md`. Where the two disagree, the frontend doc
+describes what actually shipped.
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`. Claims
 about original MDK behavior remain as marked in
@@ -497,7 +498,7 @@ before/within them. Those are the ones that matter for the
 |---|---|---|---|---|
 | **G0** — frontend skeleton | `frontend/godot/` project + `mdk_bridge` GDExtension target (versioned API: `initialize`/`load_level`/`step_frame`/`shutdown`), input adapter (Godot keycodes→internal 0..127 table), snapshot dict, headless digest test | this audit; godot-cpp pin | no | ordinary coding (spike already proves it) |
 | **G1** — level geometry + camera | `ArenaRenderData` (Phase 6A — DONE: decode + submission order in `mdk_core`) → Godot `ArrayMesh`/`MeshInstance3D` per arena consuming the ordered snapshot; camera node driven by pose snapshot; palette-index materials → 8bpp/RGBA expansion, original-look unshaded | G0 | **PARTIAL** — pipeline proven in Phase 6A; remaining RE tail = occlusion question + effect-drawer semantics (P0/P1 in ARENA_RENDER_PIPELINE.md) | coding + bounded RE |
-| **G2** — player presentation | Node3D player driven by traversal snapshots; move/jump/collision all core-side; debug wireframe of the proven collision world | G0 (+G1 for real geometry) | no (movement/collision already proven) | ordinary coding |
+| **G2** — player presentation — **DONE** | Node3D player driven by traversal snapshots; move/jump/collision all core-side; debug wireframe of the proven collision world | G0 (+G1 for real geometry) | no (movement/collision already proven) | ordinary coding |
 | **G3** — dynamic objects / doors / portals | Object snapshot enumeration (id, model, transform, AABB); connector anim display; portal/arena transitions visible | G1, G2 | no for known types (5E/5I proven); unknown record types 5/8 remain UNKNOWN | mostly coding, small RE tail |
 | **G4** — combat presentation | Shot-pool snapshot → projectile visuals; fire/impact sounds; hit feedback | G2 | **YES — projectile flight + damage/death internals** | RE + coding |
 | **G5** — enemies + AI | Enemy spawn→visual models, animation, AI behavior driven by core | G1, G3 | **YES — AI, animation format (large)** | RE + coding |

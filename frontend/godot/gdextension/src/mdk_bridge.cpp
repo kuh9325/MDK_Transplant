@@ -57,10 +57,16 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::load_arena);
   ClassDB::bind_method(D_METHOD("step_frame", "dt_ms", "action_mask"),
                        &MdkBridge::step_frame);
+  ClassDB::bind_method(D_METHOD("step_frame_input", "dt_ms", "input"),
+                       &MdkBridge::step_frame_input);
   ClassDB::bind_method(D_METHOD("get_player_snapshot"),
                        &MdkBridge::get_player_snapshot);
   ClassDB::bind_method(D_METHOD("get_camera_snapshot"),
                        &MdkBridge::get_camera_snapshot);
+  ClassDB::bind_method(D_METHOD("get_collision_snapshot"),
+                       &MdkBridge::get_collision_snapshot);
+  ClassDB::bind_method(D_METHOD("get_input_config"),
+                       &MdkBridge::get_input_config);
   ClassDB::bind_method(D_METHOD("get_arena_order_digest"),
                        &MdkBridge::get_arena_order_digest);
   ClassDB::bind_method(D_METHOD("get_arena_render_snapshot"),
@@ -247,6 +253,28 @@ bool MdkBridge::load_arena(const String& arena_name) {
   }
 
   arenaCol_ = col;
+  // Collision debug line soup — every poly edge of the proven
+  // collision blob, converted once per arena (presentation only;
+  // nothing here feeds back into collision queries).
+  colNodeCount_ = counts[1];
+  colPolyCount_ = counts[2];
+  colVertCount_ = counts[3];
+  colLines_.clear();
+  colLines_.resize(int64_t(colPolyCount_) * 6);
+  for (std::uint32_t p = 0; p < colPolyCount_; ++p) {
+    const mdk::CollisionPoly& cp = arenaCol_.polys[p];
+    Vector3 v[3];
+    for (int k = 0; k < 3; ++k) {
+      v[k] = mdkToGodotVec(arenaCol_.verts + std::size_t(cp.v[k]) * 3);
+    }
+    const int64_t o = int64_t(p) * 6;
+    colLines_.set(o + 0, v[0]);
+    colLines_.set(o + 1, v[1]);
+    colLines_.set(o + 2, v[1]);
+    colLines_.set(o + 3, v[2]);
+    colLines_.set(o + 4, v[2]);
+    colLines_.set(o + 5, v[0]);
+  }
   rd_ = std::move(rd);
   atlasImage_.unref();
   atlasTex_.unref();
@@ -290,6 +318,16 @@ bool MdkBridge::rebuildOrder_() {
 }
 
 Dictionary MdkBridge::step_frame(double dt_ms, int64_t action_mask) {
+  return stepCore_(dt_ms, action_mask, nullptr);
+}
+
+Dictionary MdkBridge::step_frame_input(double dt_ms,
+                                       const Dictionary& input) {
+  return stepCore_(dt_ms, int64_t(input.get("actions", 0)), &input);
+}
+
+Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
+                                const Dictionary* input) {
   Dictionary out;
   if (!rt_) {
     setError_("no level loaded");
@@ -297,22 +335,83 @@ Dictionary MdkBridge::step_frame(double dt_ms, int64_t action_mask) {
   }
   mdk::frontendTimingUpdate(timing_, dt_ms);
   mdk::RawGameplayInput raw{};
+  // QA action mask -> the bound internal key codes (level state).
   for (std::uint32_t bit = 1; bit; bit <<= 1) {
     if (!(action_mask & bit)) continue;
     const int slot = slotForAction(bit);
     if (slot < 0) continue;
     const int gi = mdk::kKeyboardSlotToGlobal[slot];
     const int code = bindings_.keys[gi];
-    if (code > 0 && code < 128) {
+    if (code > 0 && code < mdk::kGameplayKeyCount) {
       raw.keyLevel[code >> 5] |= 1u << (code & 31);
     }
   }
+  if (input != nullptr) {
+    // "keys" — held internal key codes (0..127, the original
+    // FUN_0046b688 domain). The frontend translates its device key
+    // events into these codes; configured bindings stay in core.
+    if (input->has("keys")) {
+      const Variant kv = (*input)["keys"];
+      PackedInt32Array codes;
+      if (kv.get_type() == Variant::PACKED_INT32_ARRAY) {
+        codes = kv;
+      } else if (kv.get_type() == Variant::ARRAY) {
+        const Array arr = kv;
+        codes.resize(arr.size());
+        for (int64_t i = 0; i < arr.size(); ++i) {
+          codes.set(i, int64_t(arr[i]));
+        }
+      }
+      for (int64_t i = 0; i < codes.size(); ++i) {
+        const int code = codes[i];
+        if (code > 0 && code < mdk::kGameplayKeyCount) {
+          raw.keyLevel[code >> 5] |= 1u << (code & 31);
+        }
+      }
+    }
+    // DIMOUSESTATE deltas + the 4-button nibble — forwarded raw;
+    // the core's W-set axis letters/scales and per-button action
+    // masks own all semantics (FUN_00406f14).
+    raw.mouseDx = int32_t(int64_t(input->get("mouse_dx", 0)));
+    raw.mouseDy = int32_t(int64_t(input->get("mouse_dy", 0)));
+    raw.mouseDz = int32_t(int64_t(input->get("mouse_dz", 0)));
+    raw.mouseButtons =
+        uint32_t(int64_t(input->get("mouse_buttons", 0))) & 0xf;
+  }
+  // keyEdge = level & ~prev — the original's per-poll new-press
+  // bitmap (FUN_0046b688 latch diff).
+  for (int w = 0; w < mdk::kGameplayKeyBitmapWords; ++w) {
+    raw.keyEdge[w] = raw.keyLevel[w] & ~prevKeyLevel_[w];
+    prevKeyLevel_[w] = raw.keyLevel[w];
+  }
+
   last_ = mdk::stepTraversalRuntime(*rt_, raw, bindings_, timing_);
   hasFrame_ = true;
+
+  // Traversal may portal the player into a different arena — swap
+  // the displayed static arena to match when a block exists. A
+  // corridor (CHMO_*, no MTO block) leaves the previous display in
+  // place and marks the desync instead of failing the frame.
+  if (last_.curArenaIndex != arenaIndex_ &&
+      last_.curArenaIndex != arenaSwitchAttempt_) {
+    arenaSwitchAttempt_ = last_.curArenaIndex;
+    for (auto& a : rt_->arenas) {
+      if (a->index == last_.curArenaIndex) {
+        if (!load_arena(a->name.c_str())) {
+          UtilityFunctions::printerr(
+              "MdkBridge: arena switch to '", a->name.c_str(),
+              "' unavailable — keeping '", arenaName_.c_str(),
+              "' displayed (desync)");
+        }
+        break;
+      }
+    }
+  }
   if (arenaLoaded_) rebuildOrder_();
 
   out["frame"] = last_.frame;
-  out["arena"] = last_.curArenaIndex;
+  out["arena"] = last_.curArenaIndex;      // core arena
+  out["arena_display"] = arenaIndex_;      // displayed arena (-1 none)
   out["player_pos"] = mdkToGodotVec(last_.pos);
   out["yaw_deg"] = last_.yawDeg;
   out["pitch_deg"] = last_.pitchDeg;
@@ -320,6 +419,29 @@ Dictionary MdkBridge::step_frame(double dt_ms, int64_t action_mask) {
   out["camera"] = mdkToGodotCameraTransform(last_.camera);
   out["order_digest"] =
       static_cast<int64_t>(mdk::arenaOrderDigest(order_));
+
+  // Merged-control echo — the just-consumed GameplayInputFrame
+  // (0x4ce block), for tests/QA that need to observe which semantic
+  // action the raw input produced. Proven fields only.
+  const mdk::GameplayInputFrame& cf = rt_->prevFrame;
+  Dictionary inp;
+  inp["fire"] = cf.fire != 0;
+  inp["jump"] = cf.jump != 0;
+  inp["sniper_pulse"] = cf.sniperPulse != 0;
+  inp["item_use"] = cf.itemUse != 0;
+  inp["item_next"] = cf.itemNext != 0;
+  inp["item_prev"] = cf.itemPrev != 0;
+  inp["look_up"] = cf.lookUp != 0;
+  inp["look_down"] = cf.lookDown != 0;
+  inp["turn_axis"] = cf.turnAxis;
+  inp["move_axis"] = cf.moveAxis;
+  inp["move_digital"] = cf.moveDigital;
+  inp["strafe_axis"] = cf.strafeAxis;
+  inp["side_step_held"] = cf.sideStepHeld;
+  inp["turbo_latched"] = cf.turboLatched;
+  inp["zoom_accumulator"] = cf.zoomAccumulator;
+  inp["mouse_turn_active"] = cf.mouseTurnActive != 0;
+  out["input"] = inp;
   return out;
 }
 
@@ -333,6 +455,34 @@ Dictionary MdkBridge::get_player_snapshot() const {
   out["grounded"] = last_.grounded;
   out["arena"] = last_.curArenaIndex;
   out["frame"] = last_.frame;
+  // G2 presentation fields — every value a verbatim copy of a
+  // proven core output (TraversalFrameResult / collision state).
+  out["transform"] = mdkToGodotPlayerTransform(last_.pos,
+                                               last_.yawDeg);
+  // box = the standing body extents (0x540c30..44 as the mode-3 tail
+  // rebuilt it); query_box = the LAST per-query AABB collisionApply
+  // wrote — volatile, exposed for diagnostics only.
+  out["box"] = mdkToGodotAabb(last_.playerBodyBox);
+  out["box_mdk"] = Array::make(
+      last_.playerBodyBox[0], last_.playerBodyBox[1],
+      last_.playerBodyBox[2], last_.playerBodyBox[3],
+      last_.playerBodyBox[4], last_.playerBodyBox[5]);
+  out["query_box"] = mdkToGodotAabb(last_.playerBox);
+  out["query_box_mdk"] = Array::make(
+      last_.playerBox[0], last_.playerBox[1], last_.playerBox[2],
+      last_.playerBox[3], last_.playerBox[4], last_.playerBox[5]);
+  out["loco_state"] = last_.locoState;              // 0x540cac
+  out["move_vel"] = last_.moveVel;                  // 0x540d48
+  out["strafe_vel"] = last_.strafeVel;              // 0x540d4c
+  out["turn_vel"] = last_.turnVel;                  // 0x540d50
+  out["vert_vel"] = last_.vertVel;                  // 0x540c78
+  out["contact"] = last_.contactObj != 0;           // 0x540e4c != 0
+  out["contact_normal"] = mdkToGodotVec(last_.contactNormal);
+  out["position_changed"] = last_.positionChanged;
+  out["look_offset_deg"] = last_.lookOffsetDeg;     // 0x540d58
+  out["event_type"] = last_.eventType;              // 0x54cb00
+  out["event_mag"] = last_.eventMag;                // 0x54cb08
+  out["arena_display"] = arenaIndex_;               // shown arena
   return out;
 }
 
@@ -359,6 +509,39 @@ Dictionary MdkBridge::get_camera_snapshot() const {
   out["zoom"] = st.zoom;
   out["view_rect"] =
       Rect2i(p.viewOX, p.viewOY, p.viewW, p.viewH);
+  return out;
+}
+
+Dictionary MdkBridge::get_collision_snapshot() {
+  Dictionary out;
+  if (!arenaLoaded_) {
+    setError_("load_arena() first");
+    return out;
+  }
+  out["arena"] = arenaName_.c_str();
+  out["arena_index"] = arenaIndex_;
+  out["poly_count"] = int64_t(colPolyCount_);
+  out["vert_count"] = int64_t(colVertCount_);
+  out["node_count"] = int64_t(colNodeCount_);
+  // Pairs of points -> Mesh.PRIMITIVE_LINES.
+  out["lines"] = colLines_;
+  return out;
+}
+
+Dictionary MdkBridge::get_input_config() const {
+  Dictionary out;
+  out["mouse_on"] = bindings_.mouseOn;
+  out["mouse_axes_map"] = bindings_.mouseAxesMap.c_str();
+  out["mouse_y_reversed"] = bindings_.mouseYReversedBits != 0;
+  PackedFloat32Array scales;
+  scales.resize(3);
+  for (int i = 0; i < 3; ++i) scales.set(i, bindings_.mouseScale[i]);
+  out["mouse_scale"] = scales;
+  PackedInt32Array masks;
+  masks.resize(4);
+  for (int i = 0; i < 4; ++i) masks.set(i, bindings_.mouseButtMask[i]);
+  out["mouse_button_masks"] = masks;
+  out["joy_on"] = bindings_.joyOn;
   return out;
 }
 
@@ -472,18 +655,22 @@ Array MdkBridge::get_arena_names() const {
 void MdkBridge::shutdown() {
   arenaLoaded_ = false;
   arenaIndex_ = -1;
+  arenaSwitchAttempt_ = -1;
   arenaName_.clear();
   tris_.clear();
   order_.clear();
   texs_ = mdk::ArenaMeshTextures{};
   rd_ = mdk::ArenaRenderData{};
   arenaCol_ = mdk::CollisionArena{};
+  colNodeCount_ = colPolyCount_ = colVertCount_ = 0;
+  colLines_.clear();
   sharedMtiBytes_.clear();
   ftiBytes_.clear();
   sysPalHead_ = {};
   atlasImage_.unref();
   atlasTex_.unref();
   arenaMat_.unref();
+  prevKeyLevel_ = {};
   rt_.reset();
   hasFrame_ = false;
 }

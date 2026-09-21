@@ -7,5 +7,27 @@ script = ExtResource("1")
 
 [node name="ArenaMesh" type="MeshInstance3D" parent="."]
 
+[node name="PlayerRoot" type="Node3D" parent="."]
+
+[node name="DebugBody" type="MeshInstance3D" parent="PlayerRoot"]
+
+[node name="ForwardMarker" type="MeshInstance3D" parent="PlayerRoot"]
+
+[node name="PlayerBoxWire" type="MeshInstance3D" parent="."]
+
+[node name="CollisionDebug" type="MeshInstance3D" parent="."]
+visible = false
+
 [node name="Camera3D" type="Camera3D" parent="."]
 far = 20000.0
+
+[node name="DebugUI" type="CanvasLayer" parent="."]
+
+[node name="DebugLabel" type="Label" parent="DebugUI"]
+offset_left = 8.0
+offset_top = 8.0
+theme_override_colors/font_color = Color(0.55, 1, 0.55, 1)
+theme_override_colors/font_shadow_color = Color(0, 0, 0, 1)
+theme_override_constants/shadow_offset_x = 1
+theme_override_constants/shadow_offset_y = 1
+theme_override_font_sizes/font_size = 13
