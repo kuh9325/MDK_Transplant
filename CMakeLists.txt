@@ -25,6 +25,7 @@ find_package(SDL3 REQUIRED CONFIG)
 
 # --- core library: platform-neutral, unit-testable, no SDL/Metal headers ----
 add_library(mdk_core STATIC
+  src/core/arena_mesh.cpp
   src/core/arena_render.cpp
   src/core/bni_directory.cpp
   src/core/bni_image.cpp

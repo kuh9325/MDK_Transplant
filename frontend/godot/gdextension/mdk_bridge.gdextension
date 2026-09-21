@@ -1,0 +1,10 @@
+[configuration]
+
+entry_symbol = "mdk_godot_library_init"
+compatibility_minimum = "4.3"
+reloadable = true
+
+[libraries]
+
+macos.debug.arm64 = "res://bin/Darwin-arm64/libmdkbridge.dylib"
+macos.release.arm64 = "res://bin/Darwin-arm64/libmdkbridge.dylib"

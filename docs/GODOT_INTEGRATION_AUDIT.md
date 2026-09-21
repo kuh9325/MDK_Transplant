@@ -1,11 +1,11 @@
 # Godot 4 Integration Audit — prior-art survey + boundary design
 
-Status: AUDIT + DESIGN ONLY (recorded 2026-09-21 against MDK-Native
-`3f23778`, Phase 5N). Nothing in this document changes gameplay code or
-commits the project to Godot work. It records the prior-art audit of the
-public `godot-mdk` project, the license/reuse decision, the designed
-core↔frontend boundary, and the result of a minimal GDExtension
-feasibility spike performed in a disposable `/tmp` project.
+Status: DESIGN SUPERSEDED BY IMPLEMENTATION — the audit/design below
+was recorded 2026-09-21 against MDK-Native `3f23778` (Phase 5N) and is
+retained as the decision record. Phase 7 (G1) implemented the designed
+boundary: the retained frontend lives in `frontend/godot/` and is
+documented in `docs/GODOT_FRONTEND.md`. Where the two disagree, the
+frontend doc describes what actually shipped.
 
 Evidence levels follow `reverse-engineering/EVIDENCE_POLICY.md`. Claims
 about original MDK behavior remain as marked in

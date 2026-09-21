@@ -16,6 +16,12 @@ out/
 *.o
 *.obj
 
+# --- Godot frontend generated artifacts ---
+frontend/godot/.godot/
+frontend/godot/bin/
+frontend/godot/gdextension/build/
+frontend/godot/**/*.uid
+
 # --- Directories reserved for user-supplied ORIGINAL MDK material ---
 # These must NEVER be committed. They exist only as local drop-zones.
 original/

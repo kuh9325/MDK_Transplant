@@ -1,6 +1,7 @@
 // Phase 3A unit tests for platform-neutral logic. No SDL, no Metal —
 // those paths are exercised by the runtime smoke test instead.
 
+#include "core/arena_mesh.h"
 #include "core/arena_render.h"
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
@@ -13677,6 +13678,135 @@ void test_arena_render() {
   }
 }
 
+// Phase 7 (G1) — src/core/arena_mesh.h. Palette composition, the
+// palette-expanded masked-addressable texture images, and the
+// painter-ordered triangle soup.
+void test_arena_mesh() {
+  using namespace mdk;
+
+  // ---- palette composition: SYS_PAL head + region B + s3 tail ----
+  {
+    std::uint8_t sysPal[192], levelPal[768], regionB[336], out[768];
+    for (int i = 0; i < 192; ++i) sysPal[i] = std::uint8_t(i);       // R=0..63
+    for (int i = 0; i < 768; ++i) levelPal[i] = std::uint8_t(255);   // all 0xff
+    for (int i = 0; i < 336; ++i) regionB[i] = std::uint8_t(7);      // all 7
+    CHECK(arenaPaletteCompose(sysPal, levelPal, regionB, 112, out));
+    CHECK(out[0] == 0 && out[1] == 0 && out[2] == 0);   // entry0 black
+    CHECK(out[3] == 3 && out[4] == 4 && out[5] == 5);   // SYS_PAL[1]
+    CHECK(out[189] == 189);                            // SYS_PAL[63].r
+    CHECK(out[192] == 7 && out[527] == 7);             // region B[0..111]
+    CHECK(out[528] == 255 && out[765] == 255);         // s3 tail [176..]
+    // count=64: only region B[0..64) lands; s3 keeps [128,256).
+    CHECK(arenaPaletteCompose(sysPal, levelPal, regionB, 64, out));
+    CHECK(out[192] == 7 && out[383] == 7);
+    CHECK(out[384] == 255);
+    // Missing SYS_PAL leaves the head black (degraded, flagged by
+    // the caller); count clamps to the supplied region-B triplets.
+    CHECK(arenaPaletteCompose({}, levelPal, regionB, 112, out));
+    CHECK(out[0] == 0 && out[192] == 7 && out[528] == 255);
+    // Empty levelPal is tolerated too (black tail) — short non-empty
+    // tables are rejected.
+    std::uint8_t shortPal[100] = {};
+    CHECK(!arenaPaletteCompose(sysPal, shortPal, regionB, 112, out));
+  }
+
+  // ---- mesh bundle: order verbatim, classes -> tex/flat slots ----
+  {
+    // Synthetic render data: 4 verts, 3 polys (textured, pen,
+    // unresolved), one 2x2 material in bank A.
+    static float verts[12] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
+    ArenaRenderData rd;
+    rd.verts = verts;
+    rd.vertCount = 4;
+    rd.materialNames = {"TEX", "UNUSED"};
+    rd.materialOfName = {0, -1};
+    ArenaRenderMaterial m;
+    m.name = "TEX";
+    m.width = m.height = 2;
+    m.shift = 1;
+    m.uMask = 1;
+    m.vMask = 1u << 1;  // bucket(2)=1 << shift
+    static std::uint8_t px[4] = {5, 6, 7, 8};
+    m.pixels = std::span<const std::uint8_t>(px, 4);
+    rd.bankA.push_back(m);
+    ArenaRenderPoly p{};
+    p.v[0] = 0; p.v[1] = 1; p.v[2] = 2;
+    p.material = 0;                 // textured (name slot 0 -> A0)
+    p.uv[0][0] = 0; p.uv[0][1] = 0;
+    p.uv[1][0] = 1; p.uv[1][1] = 0;
+    p.uv[2][0] = 0; p.uv[2][1] = 1;
+    rd.polys.push_back(p);          // poly0 textured
+    p.material = -37;               // pen 37
+    p.v[2] = 3;
+    rd.polys.push_back(p);          // poly1 pen
+    p.material = 1;                 // unresolved (slot 1 -> -1)
+    rd.polys.push_back(p);          // poly2 unresolved
+    p.material = -1028;             // fxe94
+    rd.polys.push_back(p);          // poly3 fx placeholder
+
+    std::uint8_t pal[768];
+    for (int i = 0; i < 768; ++i) pal[i] = std::uint8_t(i & 0xff);
+
+    // Submit order 2,0,1,3 — arbitrary; the bundle must emit in
+    // exactly this sequence.
+    const std::uint32_t order[4] = {2, 0, 1, 3};
+    ArenaMeshBundle b;
+    CHECK(arenaMeshBuild(rd, order, pal, &b));
+    CHECK(b.submitted == 4 && b.tris.size() == 4);
+    CHECK(b.tris[0].poly == 2 && b.tris[1].poly == 0 &&
+          b.tris[2].poly == 1 && b.tris[3].poly == 3);
+    CHECK(b.tris[0].cls == ArenaMatClass::kUnresolved &&
+          b.tris[0].tex == -1 && b.tris[0].flatSlot == 0xff);
+    CHECK(b.tris[1].cls == ArenaMatClass::kTextured &&
+          b.tris[1].tex == 0);
+    CHECK(b.tris[2].cls == ArenaMatClass::kPen &&
+          b.tris[2].tex == -1 && b.tris[2].flatSlot == 37);
+    CHECK(b.tris[3].cls == ArenaMatClass::kEffectE94 &&
+          b.tris[3].flatSlot == kArenaLutFxE94);
+    // Vertex positions copied in poly order (poly2 uses v0,v1,v3).
+    CHECK(near(b.tris[0].pos[2][2], 1.0));
+    CHECK(near(b.tris[1].pos[1][0], 1.0));
+    // Texture expansion: pitch=2, bucketH=2, palette-expanded.
+    CHECK(b.texs.textures.size() == 1);
+    CHECK(b.texs.textures[0].pitch == 2 &&
+          b.texs.textures[0].bucketH == 2);
+    CHECK(b.texs.textures[0].rgba.size() == 16);
+    // palette[idx] expands to pal[3*idx..3*idx+2]: px[0]=5 -> 15,16,17.
+    CHECK(b.texs.textures[0].rgba[0] == 15 &&
+          b.texs.textures[0].rgba[1] == 16 &&
+          b.texs.textures[0].rgba[2] == 17 &&
+          b.texs.textures[0].rgba[3] == 255);
+    CHECK(b.texs.textures[0].rgba[4] == 18 &&
+          b.texs.textures[0].rgba[12] == 24);
+    // Census over ALL polys (unresolved=1 pen=1 textured=1 fxe94=1).
+    CHECK(b.clsCount[0] == 1 && b.clsCount[1] == 1 &&
+          b.clsCount[2] == 1 && b.clsCount[4] == 1);
+    // Digests: order digest = FNV over the submitted order.
+    CHECK(b.orderDigest == arenaOrderDigest(order));
+    // Atlas: 2x2 texture at (0,0); LUT strip on the next row.
+    CHECK(b.texs.textures[0].atlasX == 0 &&
+          b.texs.textures[0].atlasY == 0);
+    CHECK(b.texs.lutY == 2 && b.texs.atlasH == 3 &&
+          b.texs.atlasW == 2048);
+
+    // Malformed order index -> build fails.
+    const std::uint32_t bad[1] = {9};
+    CHECK(!arenaMeshBuild(rd, bad, pal, &b));
+  }
+
+  // ---- order digest matches the mdk-inspect fold -----------------
+  {
+    const std::uint32_t order[3] = {5, 1, 7};
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    for (std::uint32_t i : order) {
+      for (int k = 0; k < 4; ++k) {
+        h = (h ^ std::uint8_t(i >> (k * 8))) * 0x100000001b3ull;
+      }
+    }
+    CHECK(arenaOrderDigest(order) == h);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -13733,6 +13863,7 @@ int main() {
   test_player_sniper();
   test_player_fire();
   test_arena_render();
+  test_arena_mesh();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

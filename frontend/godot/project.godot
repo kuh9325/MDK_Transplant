@@ -1,0 +1,20 @@
+; MDK Phase 7 (G1) — Godot 4 frontend. Engine config only; all game
+; data is resolved at runtime through the GDExtension bridge.
+
+config_version=5
+
+[application]
+
+config/name="MDK-Native (Godot frontend)"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=768
+
+[rendering]
+
+; Textures arrive palette-expanded; keep the default nearest-friendly
+; configuration — the arena shader uses texelFetch regardless.
