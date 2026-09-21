@@ -13,7 +13,7 @@ same date for 2A.1/2A.2, finalized 2026-09-21.
 |---|---|---|
 | **DOS arm64 fallback** | **stable practical playback** — native DOSBox-X | everyday play + runtime oracle + long-term fallback |
 | **C++ MDK-Native** | Phase 5N reference/gameplay core | evidence-backed native core; future Godot integration source |
-| **Godot 4 frontend** | NOT STARTED | future Apple-Silicon-native full-game implementation |
+| **Godot 4 frontend** | AUDIT + BOUNDARY DESIGN DONE — see `docs/GODOT_INTEGRATION_AUDIT.md` | future Apple-Silicon-native full-game implementation |
 
 Everything in this document describes runtime behavior of **BUILD_A**
 (`original/installed/`), a third-party repack with self-described

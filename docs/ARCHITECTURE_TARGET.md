@@ -54,6 +54,7 @@ Boundary notes (intentions, not commitments):
 | Data access | IMPLEMENTED (Phase 3B): `DataRoot` read-only resolver + `BinaryReader` + container envelope — see `DATA_ACCESS.md` |
 | Resource decoding | STARTED (Phase 4A/4B/4C/4D): `IndexedImage` + four proven decoders (BNI paletted bitmap; BNI indexed-only bitmap with the STREAM context palette; FTI FONTSML/FONTBIG glyph table; FTI ARROW sprite table) + the first static front-end composition — see `ENGINE_RECONSTRUCTION.md` |
 | Audio backend | PROJECT DECISION (open) — no audio in Phase 3A/3B/4A–4I; the Sound screen emits proven trigger semantics (`SoundAudioEvent`) but no playback backend exists yet |
+| Godot 4 frontend | AUDIT + BOUNDARY DESIGN (2026-09-21): future presentation host of `mdk_core` via GDExtension — Godot owns window/render/input-acquisition/audio/UI, the C++ core stays authoritative for all reconstructed semantics — see `GODOT_INTEGRATION_AUDIT.md` |
 
 > Phase 3A implements the bottom two layers (`platform`, `renderer`
 > presentation boundary) plus a neutral input seam and a mode-dispatch
