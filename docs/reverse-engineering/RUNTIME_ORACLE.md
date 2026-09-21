@@ -1,9 +1,19 @@
 # Runtime Oracle — Phase 2A/2A.1/2A.2
 
-Status: DOS lane interactive baseline complete — automated input, gameplay
-entry, in-game save, controlled quit, automatic mouse capture, and wheel
-passthrough configuration all verified under DOSBox-X. Win95 lane blocked
-(see below). Recorded 2026-09-17 (2A), updated same date for 2A.1/2A.2.
+Status: DOS lane **finalized as the everyday-play fallback** on Apple
+Silicon — automated input, gameplay entry, in-game save, controlled quit,
+automatic mouse capture, wheel passthrough, and a deterministic WASD
+control layout all verified under native-arm64 DOSBox-X, with reproducible
+setup. Win95 lane blocked (see below). Recorded 2026-09-17 (2A), updated
+same date for 2A.1/2A.2, finalized 2026-09-21.
+
+**Three-track status** (current architecture):
+
+| Track | Status | Purpose |
+|---|---|---|
+| **DOS arm64 fallback** | **stable practical playback** — native DOSBox-X | everyday play + runtime oracle + long-term fallback |
+| **C++ MDK-Native** | Phase 5N reference/gameplay core | evidence-backed native core; future Godot integration source |
+| **Godot 4 frontend** | NOT STARTED | future Apple-Silicon-native full-game implementation |
 
 Everything in this document describes runtime behavior of **BUILD_A**
 (`original/installed/`), a third-party repack with self-described
@@ -45,8 +55,8 @@ permission-blocked, DOS-lane observation uses a **guest-side observer**
 | Emulator | DOSBox-X **2026.08.31** SDL2, Homebrew formula, arm64 (`/opt/homebrew/bin/dosbox-x`) |
 | Executable | `MDKDOS.EXE` (LE, DOS/4GW-bound; SHA-256 `7471fa6a…df591b`) |
 | Runtime copy | `runtime-private/dos/mdk/` — full copy of BUILD_A (ignored) |
-| Config | `scripts/runtime/dosbox-x-mdkdos.conf` (`machine=svga_s3`, `memsize=32`, `sbtype=sb16` 220/5/1, `cycles=max`, `autolock=true`, `mouse_emulation=locked`, `mouse_wheel_key=0`, `auxdevice=intellimouse`, `CAPMOUSE /C` in autoexec) |
-| Copied-config change | `MDK.CFG` in the COPY only: `SoundID=0xE015`, `SoundIRQ=5`, `SoundDMA=1`, `SoundPort=0x220` (SB16 for HMI SOS; see `scripts/runtime/setup-runtime.sh`) |
+| Config | `scripts/runtime/dosbox-x-mdkdos.conf` (`machine=svga_s3`, `memsize=32`, `sbtype=sb16` 220/5/1, `cycles=max`, `autolock=true`, `mouse_emulation=locked`, `mouse_wheel_key=0`, `auxdevice=intellimouse`, `windowresolution=1280x960`, `CAPMOUSE /C` in autoexec) |
+| Copied-config change | `MDK.CFG` in the COPY only (see `scripts/runtime/setup-runtime.sh`): `SoundID=0xE015`, `SoundIRQ=5`, `SoundDMA=1`, `SoundPort=0x220` (SB16 for HMI SOS) **plus the everyday WASD control block** — `KeyUp=17` W, `KeyDown=31` S, `KeySideL=30` A, `KeySideR=32` D, `KeyLookUp=20` T, `KeyLookDown=34` G, `KeyZoomIn=19` R, `KeyZoomOut=33` F, `KeyItemNext=18` E, `KeyItemUse=16` Q, `MouseDButtMapC=0`. Values are MDK internal key codes = DOS set-1 scancodes |
 
 ### Launch procedure
 
@@ -202,9 +212,12 @@ above were caused by injected input, not timers.
   the strongest current evidence.
 - What ends the traversal session (death vs quit key vs timeout) is not
   fully separated — the quit keys land near the same window.
-- `MDK.CFG` in BUILD_A maps movement to WASD-style scancodes
-  (`KeyUp=17` W, `KeyDown=31` S, `KeySideL=30` A, `KeySideR=32` D);
-  arrows still drive menus.
+- The **everyday WASD layout is a runtime-copy patch, not BUILD_A data.**
+  BUILD_A's `MDK.CFG` carries **no `Key*` lines**, so factory defaults apply
+  (arrows move; `A`/`Z` are shared by *both* look and zoom — a factory
+  duplicate). `setup-runtime.sh` writes the verified WASD+R/F block into
+  the copy on every build, so `reset-dos.sh` is now deterministic. Arrows
+  still drive menus.
 
 ## Phase 2A.2 — mouse capture, wheel passthrough, audio, stability
 
@@ -239,9 +252,10 @@ MDKDOS.EXE.** Wheel→sniper-zoom is therefore **not** a DOS-runtime
 requirement and is not a Phase 2A blocker; `mouse_wheel_key=0` is kept as
 the correct generic passthrough but no Z axis can surface in this build.
 Sniper zoom remains available on the original keyboard controls
-(documented default A/Z; BUILD_A's `MDK.CFG` maps `KeyZoomIn=19` R,
-`KeyZoomOut=33` F). No wheel-injection TSRs, drivers, or patches will be
-built for the DOS lane.
+(documented factory default A/Z — which collides with look on the same
+keys; the runtime copy remaps `KeyZoomIn=19` R, `KeyZoomOut=33` F for a
+clean WASD-friendly layout). No wheel-injection TSRs, drivers, or patches
+will be built for the DOS lane.
 
 **Deferred — Win95 lane:** whether `MDK95.EXE` (or renderer variants)
 exposes a native Z-axis/wheel sniper-zoom binding; historical
@@ -284,6 +298,118 @@ exit (`int21 ah=4c`, text mode restored, emulator idle at DOS prompt).
 - Full smoke session: ~11 min wall, clean exit, no termination anomaly.
 - No recurrence of the earlier rare descriptor faults or slideshow hangs
   this run; they remain documented emulated-edge flakes with retry budget.
+
+## Phase 2A.3 — fallback finalization (2026-09-21)
+
+The DOS lane is now finalized as the **stable practical playback path /
+everyday-play fallback** on Apple Silicon, and the runtime oracle for the
+native reconstruction. This section records the productized state; it adds
+no new gameplay findings.
+
+### Reproducible setup (deterministic)
+
+- `scripts/runtime/setup-runtime.sh` copies `original/installed/` (BUILD_A)
+  → `runtime-private/dos/mdk/` (ignored, writable) and applies two
+  **copy-only** `MDK.CFG` patches:
+  - sound → SB16 `0xE015` @ `220/5/1` (HMI SOS matches `[sblaster]`);
+  - **everyday WASD control block** (below). BUILD_A ships *no* `Key*`
+    lines, so without this the factory table (arrows move; `A`/`Z` shared
+    by look *and* zoom) applies — the block is what makes reset/build
+    deterministic. Written with CRLF endings to match the DOS file.
+- `original/installed/` is **never** modified. Verified: after
+  `reset-dos.sh`, the copy = BUILD_A (141 files) minus the 2 shipped
+  `SAVES/*.SAV` (intentionally cleared) with a patched `MDK.CFG`; all other
+  bytes identical. BUILD_A manifest integrity: **141/141, missing 0,
+  added 0, changed 0** — unchanged by all DOS-lane work.
+- Instrumentation TSRs (`INJKEY`/`SNAP`) are **not** copied by setup —
+  they're oracle tools, regenerated into the copy only for automated runs
+  via `analysis-private/scripts/` and auto-loaded `if exist`.
+
+### Final control layout (writable copy `MDK.CFG`)
+
+Internal key codes = DOS set-1 scancodes. Verified to drive traversal
+cleanly; no WASD conflict.
+
+| Action | Key | `MDK.CFG` line |
+|---|---|---|
+| Move forward / back | **W / S** | `KeyUp=17`, `KeyDown=31` |
+| Strafe left / right | **A / D** | `KeySideL=30`, `KeySideR=32` |
+| Look up / down | T / G | `KeyLookUp=20`, `KeyLookDown=34` |
+| Sniper zoom in / out | **R / F** | `KeyZoomIn=19`, `KeyZoomOut=33` |
+| Next item / use item | E / Q | `KeyItemNext=18`, `KeyItemUse=16` |
+| Turn / aim | mouse X/Y | `Mouse*AxesMap` (shipped) |
+| Mouse buttons | fire / actions | `Mouse*ButtMap*` (shipped) + `MouseDButtMapC=0` |
+| Menus | arrow keys, Enter, Esc | unchanged |
+
+### Display
+
+`fullscreen=false`, `output=default`, `aspect=false`, `scaler=none`,
+`windowresolution=1280x960`, `frameskip=0`. MDK renders 640×480
+(VESA `0x4101`, already 4:3), so the fixed window is an exact 2× integer
+scale — crisp pixels, correct aspect, no stretching. `Alt+Enter` toggles
+fullscreen; `windowresolution=original` restores the native 640×480 window.
+Widescreen fullscreen pillarboxing is **unverified headless** (human QA).
+
+### Launch
+
+```sh
+scripts/runtime/setup-runtime.sh    # first time only: build the copy
+scripts/runtime/run-mdk-dos.sh      # terminal launch (logs to logs/)
+scripts/runtime/run-mdk-dos.command # Finder double-click (same path)
+```
+
+`run-mdk-dos.sh` resolves the repo root, errors clearly if `dosbox-x` is
+absent (`brew install dosbox-x`), builds the copy if missing, and launches
+with the canonical conf. No paths are hardcoded to a specific user.
+
+### Audio
+
+- **Automated (hardware-path): REPRODUCIBLE** — `SBLASTER:Raising IRQ` +
+  DSP/DMA activity streams through menu and gameplay (676 IRQs in the
+  reference smoke run). `sbtype=sb16` @ `220/5/1`/`hdma=5`.
+- **Human audible: NOT VERIFIED** — headless uses the dummy audio driver;
+  WAV/AVI capture is unreachable without host input perms. Requires the
+  manual QA step below.
+
+### Save / load
+
+- **Save: REPRODUCIBLE** — `F2` in traversal opens the save dialog; text
+  entry + Enter writes `SAVES\<name>.SAV` (33,041 B, `SAVE` magic) in the
+  writable copy. Observed across multiple runs. `LASTGAME.SAV` /
+  `EXIT.TXT` are also written by the game on quit.
+- **Load: PARTIAL** — `F3` opens the load dialog and the menu offers
+  *Saved Game*; a written `.SAV` is enumerated. Full load→resume→continue
+  correctness is **human QA** (not separately automated). `F2`/`F3` are
+  traversal-only per `MDKDOS.TXT`; no load exists from the intro/menu
+  outside that path.
+
+### Automated smoke (this finalization)
+
+Headless (`SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`,
+`-debug -log-int21`, `serial1=file`, `INJKEY`+`SNAP` auto-loaded):
+attract slideshow → main menu → New Game → LEVEL7 traversal load → `F2`
+save (`SAVES\SMKT.SAV`) → serial VESA frame dump → clean `int21 ah=4c`
+exit to the DOS prompt. Confirms config loads, no crash, save written,
+clean exit. See run log under `runtime-private/logs/`.
+
+### Manual QA checklist (human-verified items)
+
+These are **not** asserted as passing until the user confirms them:
+
+1. New Game launches and reaches gameplay.
+2. W/S move forward/back correctly.
+3. A/D strafe left/right correctly.
+4. Mouse turn/aim feels natural.
+5. Mouse buttons perform expected actions.
+6. Sniper mode enters correctly.
+7. R/F zoom in/out work without disturbing movement or aim.
+8. Save works (F2).
+9. Load works (F3 / Saved Game).
+10. Sound/music are audible and acceptable.
+11. Fullscreen (Alt+Enter) is visually correct.
+12. Mouse capture / release (Ctrl+F10) / recapture behave correctly.
+13. A representative traversal section plays for several minutes without
+    instability.
 
 ## Win95 lane — BLOCKED
 

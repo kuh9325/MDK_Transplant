@@ -9,6 +9,12 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT"
 
+if ! command -v dosbox-x >/dev/null 2>&1; then
+    echo "error: dosbox-x not found on PATH" >&2
+    echo "install the native ARM64 build, e.g.: brew install dosbox-x" >&2
+    exit 1
+fi
+
 if [ ! -f "$ROOT/runtime-private/dos/mdk/MDKDOS.EXE" ]; then
     echo "runtime copy missing — running setup first" >&2
     "$ROOT/scripts/runtime/setup-runtime.sh"
