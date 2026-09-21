@@ -258,6 +258,21 @@ Boundary notes (intentions, not commitments):
 > `--selftest-camera-obstruction` verify the pose/matrix and
 > obstruction/nudge contracts; the traversal digest folds the pose as
 > f32 bit patterns.
+>
+> Phase 6A (G1-RE) adds the arena render-data boundary:
+> `arena_render.*` decodes the shared region-C tables into a
+> platform-neutral `ArenaRenderData` — the poly render view (vertex
+> indices, UVs, signed material index, flags), the material name
+> table, both material banks in the original's `FUN_0041a694` search
+> order (shared `LEVELnS.MTI` first, embedded `.MAT` second, NULL →
+> flat `0xff` on miss), the region-B palette triplets, and
+> `arenaRenderOrder` — the `FUN_00409a6c` BSP submission order
+> (camera-side subtree first, span, far subtree; render-skip bit
+> honored; the dead mirror flag exposed as a parameter). It is data +
+> order only — no rasterization; `FUN_0040c860` is the replacement
+> boundary a frontend consumes. Verified on all 60 MTO blocks of
+> LEVEL3–8 via `mdk-inspect --arena-render` with deterministic
+> digests. See `reverse-engineering/ARENA_RENDER_PIPELINE.md`.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they
 > say nothing about what the original game used. Do not conflate the two.

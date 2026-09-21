@@ -2603,3 +2603,96 @@ POLICY**, not original behavior.
    blocker for keyboard+mouse play.
 4. **Frontend sound events on other screens** — `SND_PUSH`
    edges engine-wide; cosmetic.
+
+# Phase 6A — arena render pipeline reconstruction (G1-RE)
+
+Evidence: `docs/reverse-engineering/ARENA_RENDER_PIPELINE.md`.
+Boundary: `src/core/arena_render.{h,cpp}` (mdk_core, platform-neutral).
+Diagnostic: `mdk-inspect --arena-render`.
+
+## Call chain (OBSERVED, BUILD_A)
+
+`FUN_00436d60` (frame driver) → `FUN_00436ea8` (per-arena; current
++ partner) → `FUN_00431300` draw_arena → `FUN_0046b4f8` vertex
+transform (region-C verts through the M1 projection-folded matrix
+into 24-byte `{x',y',z',sx,sy,clipFlags}` records) + 48-byte
+draw-entry insertion into node `+0x24`/`+0x28` lists →
+`FUN_0040a688` binder (globals `0x4a2458/60/64/68` =
+xverts/nodes/polys/camPos) → `FUN_00409a6c` BSP submission walk →
+`FUN_00409860` per-node span submitter → `FUN_0040ca00`
+Sutherland–Hodgman clipper (interpolates the embedded UV triples) →
+`FUN_0040c860` material dispatch + scanline rasterizer.
+
+## Visibility order (OBSERVED + open caveat)
+
+The BSP walker recurses the camera-side subtree FIRST
+(front-to-back), flushes the camera-side dynamic-entry list, submits
+the node's `{lo16 count, hi16 firstIdx}` poly span (`+0x14` when
+`dist>0`, `+0x18` otherwise — the facing-camera set), flushes the
+far-side list, then tail-descends the far subtree. `+0x20&0x10`
+skips a poly; `+0x20&1 && DAT_005414b4` gates a two-sided path.
+The `0x499f8c` mirror flag (never written in BUILD_A) selects the
+far-side-first — painter-correct — order. All 24 span-drawer
+variants write the framebuffer unconditionally; no z-buffer or
+coverage mask was found. Whether a resolve mechanism hides in the
+clipper's deferred path (`DAT_005414d4` branch) or the artifact is
+real remains UNKNOWN — flagged P0 for oracle verification; the port
+reproduces the observed order verbatim (`arenaRenderOrder`).
+
+## Geometry + materials (OBSERVED)
+
+Render consumes the shared region-C tables — no second geometry
+format: 0x2c nodes / 0x24 polys / f32 verts. The poly's collision
+"padding" is the render payload: `s16 materialIdx@+0x06`,
+`f32 uv[3]@+0x08/+0x10/+0x18`, `flags@+0x20`, `+0x21`/`+0x22` aux.
+`materialIdx >= 0` selects a region-C `char[10]` name slot;
+`FUN_0041a694` "matlkup" resolves each name against bank A
+(`LEVELnS.MTI`, shared level bank) FIRST then bank B (the arena's
+embedded `.MAT`) by exact case-sensitive compare; a miss logs
+"Texture %s not in material list" once and stores NULL → flat pen
+`0xff` at draw. `materialIdx < 0` dispatches flat pens
+(`(-idx)&0xff`) or effect drawers (`FUN_0047a770`/`FUN_0046e940`/
+`FUN_00412970` — UNKNOWN semantics). MTI payloads decode to the
+0x34 record `{shift, w, h, flags, uMask, vMask, ~uMask, raw0c,
+raw10, pixels@+0x24, name@+0x28}`; index records leave `+0x24 = 0`
+(zero-filled table) → flat 0xff. Region B = 112 RGB triplets via
+`FUN_0046d490`.
+
+## Native architecture (NATIVE PORT)
+
+- `arena_render` is DATA + ORDER ONLY — no rasterization. It
+  aliases the parsed `CollisionArena` tables and the level file
+  buffers; it owns only decoded records.
+- `arenaRenderOrder()` reproduces `FUN_00409a6c`'s submission order
+  iteratively (pending-resume stack models recursion+tail-descend);
+  `mirror` exposes the dead 0x499f8c variant.
+- `ArenaRenderData::materialFor`/`polyMaterialClass` reproduce the
+  `FUN_0040c860` dispatch classification including the NULL→`0xff`
+  fallback.
+- A future frontend draws the submitted triangles — the submission
+  order is the visibility contract and must be preserved even under
+  a hardware depth buffer.
+
+## Digests and verification
+
+- `mdk_tests`: synthetic coverage for poly decode, material decode
+  (plain/extended/index records), matlkup bank order +
+  case-sensitivity, pen/effect classes, BSP order + `0x10` skip,
+  bounds/malformed inputs.
+- `mdk-inspect --arena-render`: 60/60 MTO blocks across LEVEL3–8
+  decode cleanly; deterministic geometry/order FNV-1a digests per
+  block; material resolution census (OLYM_9's live `O3_*` misses →
+  the original's own fallback path; unused names in DANT_1/GUNT_4).
+
+## Explicit non-goals (Phase 6A)
+
+- No rasterization / no pixel output — `FUN_0040c860` is the
+  replacement boundary.
+- No Godot frontend, no `ArrayMesh` — presentation stays future
+  work.
+- No animation reconstruction (texture-anim frame selection is
+  documented, not driven).
+- No dynamic draw-entry emission (the `+0x24`/`+0x28` lists and
+  their handlers are out of scope for static arena data).
+- No redesign of the visibility order to "fix" the painter
+  question — the observed order is the contract.

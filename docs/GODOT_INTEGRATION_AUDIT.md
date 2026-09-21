@@ -123,8 +123,8 @@ binary verification.
 | `.FTI` | ABSENT | PROVEN directory + FONTSML/FONTBIG glyph + ARROW sprite decode | us | — |
 | `.CMI` | ABSENT | PROVEN directory + enemy/model table + arena script records | us | — |
 | `.DTI` | ABSENT | PROVEN five-section structure + arena table + palette + grid | us | — |
-| Geometry (arena visual) | ABSENT | PARTIAL — collision blob proven; **visual mesh/material pipeline UNKNOWN** | us | RE needed (G1) |
-| Textures/materials | PARTIAL — L8→RGBA via hand palette, unfiltered | PROVEN for decoded records; level texture binding UNKNOWN | us | RE needed (G1) |
+| Geometry (arena visual) | ABSENT | PROVEN — shared region-C poly records + BSP submission order (`src/core/arena_render.*`, Phase 6A) | us | — |
+| Textures/materials | PARTIAL — L8→RGBA via hand palette, unfiltered | PROVEN — MTI records → 0x34 material records, matlkup bank-A-then-B name resolution, NULL→0xff fallback, region-B palette | us | — |
 | Models | ABSENT | PARTIAL — `FUN_00428400` geometry record parsed; **animation UNKNOWN** | us | RE needed (G5) |
 | Sprites | PARTIAL — BNI sprites as flat textures | PROVEN BNI/FTI sprite decode into indexed fb | us | — |
 | Animations | ABSENT | PARTIAL — connector anim player `FUN_004555bc`; skeletal/anim format UNKNOWN | us | RE needed |
@@ -478,7 +478,7 @@ Findings / gotchas recorded for G0:
 
 | Risk | Assessment |
 |---|---|
-| Arena **visual** geometry/material format UNKNOWN | The biggest open dependency — gates real level rendering (G1). RE task, not Godot work. |
+| Arena visual geometry/material format — RESOLVED (Phase 6A/G1-RE: poly records, material pipeline, BSP submission order proven; `src/core/arena_render.*` + `mdk-inspect --arena-render`) | Closed. Remaining UNKNOWNs for G1 implementation: the front-to-back/unconditional-writes occlusion question, effect-drawer semantics (fx770/fx12970/fxe94), texture-anim frame selection — see `reverse-engineering/ARENA_RENDER_PIPELINE.md` census. |
 | Animation format UNKNOWN | Models parse; how they animate is unreconstructed — gates enemies/player mesh (G5). |
 | Enemy AI / projectile flight / damage UNKNOWN | Gates G4/G5. Pure RE; Godot cannot shortcut it. |
 | godot-cpp 4.7 tag absent | Pin `master` commit hash in the build docs; switch to tag when released. Low risk. |
@@ -496,7 +496,7 @@ before/within them. Those are the ones that matter for the
 | Phase | Deliverable | Depends on | New RE? | Effort type |
 |---|---|---|---|---|
 | **G0** — frontend skeleton | `frontend/godot/` project + `mdk_bridge` GDExtension target (versioned API: `initialize`/`load_level`/`step_frame`/`shutdown`), input adapter (Godot keycodes→internal 0..127 table), snapshot dict, headless digest test | this audit; godot-cpp pin | no | ordinary coding (spike already proves it) |
-| **G1** — level geometry + camera | Arena visual mesh/material reconstruction notes → mesh decode in core → Godot `ArrayMesh`/`MeshInstance3D` per arena; camera node driven by pose snapshot; original-look unshaded materials | G0 | **YES — draw_arena/texture pipeline (large)** | RE + coding |
+| **G1** — level geometry + camera | `ArenaRenderData` (Phase 6A — DONE: decode + submission order in `mdk_core`) → Godot `ArrayMesh`/`MeshInstance3D` per arena consuming the ordered snapshot; camera node driven by pose snapshot; palette-index materials → 8bpp/RGBA expansion, original-look unshaded | G0 | **PARTIAL** — pipeline proven in Phase 6A; remaining RE tail = occlusion question + effect-drawer semantics (P0/P1 in ARENA_RENDER_PIPELINE.md) | coding + bounded RE |
 | **G2** — player presentation | Node3D player driven by traversal snapshots; move/jump/collision all core-side; debug wireframe of the proven collision world | G0 (+G1 for real geometry) | no (movement/collision already proven) | ordinary coding |
 | **G3** — dynamic objects / doors / portals | Object snapshot enumeration (id, model, transform, AABB); connector anim display; portal/arena transitions visible | G1, G2 | no for known types (5E/5I proven); unknown record types 5/8 remain UNKNOWN | mostly coding, small RE tail |
 | **G4** — combat presentation | Shot-pool snapshot → projectile visuals; fire/impact sounds; hit feedback | G2 | **YES — projectile flight + damage/death internals** | RE + coding |

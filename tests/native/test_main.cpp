@@ -1,6 +1,7 @@
 // Phase 3A unit tests for platform-neutral logic. No SDL, no Metal —
 // those paths are exercised by the runtime smoke test instead.
 
+#include "core/arena_render.h"
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
 #include "core/bni_image.h"
@@ -13373,6 +13374,292 @@ void test_player_sniper() {
   }
 }
 
+// Phase 6A (G1-RE) — arena render-data boundary tests. All fixtures
+// are synthetic; layouts follow the instruction-level observations in
+// src/core/arena_render.h.
+void test_arena_render() {
+  using namespace mdk;
+
+  // ---- poly decode: the render fields of the shared 0x24 record ---
+  {
+    std::uint8_t rec[0x24] = {};
+    const auto put16 = [&](std::size_t o, std::uint16_t v) {
+      rec[o] = std::uint8_t(v & 0xff);
+      rec[o + 1] = std::uint8_t(v >> 8);
+    };
+    const auto putf = [&](std::size_t o, float v) {
+      std::memcpy(rec + o, &v, 4);
+    };
+    put16(0, 5); put16(2, 9); put16(4, 2);      // v[3]
+    put16(6, 0xfff0);                           // material s16 = -16
+    putf(0x08, 1.5f); putf(0x0c, -2.0f);        // uv0
+    putf(0x10, 3.25f); putf(0x14, 0.5f);        // uv1
+    putf(0x18, 64.0f); putf(0x1c, 128.0f);      // uv2
+    rec[0x20] = 0x11;                           // flags: bit4 skip+bit0
+    rec[0x21] = 0xab;                           // aux21
+    rec[0x22] = 0x90;                           // aux22: 0x10 mask + 0x80
+    rec[0x23] = 0x07;                           // surface
+
+    CollisionPoly cp;
+    std::memcpy(&cp, rec, sizeof(cp));
+    const ArenaRenderPoly rp = arenaRenderPolyDecode(cp);
+    CHECK(rp.v[0] == 5 && rp.v[1] == 9 && rp.v[2] == 2);
+    CHECK(rp.material == -16);
+    CHECK(near(rp.uv[0][0], 1.5) && near(rp.uv[0][1], -2.0));
+    CHECK(near(rp.uv[1][0], 3.25) && near(rp.uv[1][1], 0.5));
+    CHECK(near(rp.uv[2][0], 64.0) && near(rp.uv[2][1], 128.0));
+    CHECK(rp.flags == 0x11 && rp.aux21 == 0xab && rp.aux22 == 0x90);
+    CHECK(rp.surface == 0x07);
+    CHECK(arenaMatClassFor(rp.material) == ArenaMatClass::kPen);
+    CHECK(arenaPenIndex(rp.material) == 16);
+  }
+
+  // ---- dispatch classification boundaries (FUN_0040c860) ---------
+  {
+    CHECK(arenaMatClassFor(0) == ArenaMatClass::kTextured);
+    CHECK(arenaMatClassFor(5) == ArenaMatClass::kTextured);
+    CHECK(arenaMatClassFor(-1) == ArenaMatClass::kPen);
+    CHECK(arenaMatClassFor(-255) == ArenaMatClass::kPen);
+    CHECK(arenaMatClassFor(-1023) == ArenaMatClass::kPen);
+    CHECK(arenaMatClassFor(-990) == ArenaMatClass::kEffect770);
+    CHECK(arenaMatClassFor(-1010) == ArenaMatClass::kEffect770);
+    CHECK(arenaMatClassFor(-989) == ArenaMatClass::kPen);
+    CHECK(arenaMatClassFor(-1011) == ArenaMatClass::kPen);
+    CHECK(arenaMatClassFor(-1024) == ArenaMatClass::kEffect12970);
+    CHECK(arenaMatClassFor(-1027) == ArenaMatClass::kEffect12970);
+    CHECK(arenaMatClassFor(-1028) == ArenaMatClass::kEffectE94);
+    CHECK(arenaMatClassFor(-1029) == ArenaMatClass::kEffect12970);
+    CHECK(arenaMatClassFor(-4096) == ArenaMatClass::kEffect12970);
+  }
+
+  // ---- material decode: ordinary + extended payload headers ------
+  {
+    // Ordinary payload record: w=64, h=32 -> shift=6, uMask=63,
+    // vMask = bucket(32)=0x1f << 6.
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"TEX64", 0x00000000, 0x11111111, 0x22222222, 4 + 64 * 32}});
+    const auto dir = inspectMtiDirectory(s.buf);
+    CHECK(dir.status == MtiDirectoryStatus::kOk);
+    const auto& e = dir.entries[0];
+    s.put16(static_cast<std::size_t>(e.payloadFileOffset()), 64);
+    s.put16(static_cast<std::size_t>(e.payloadFileOffset() + 2), 32);
+    ArenaRenderMaterial m;
+    CHECK(arenaRenderMaterialDecode(s.buf, e.payloadFileOffset(),
+                                    e.fieldAt0x08, e.fieldAt0x0C,
+                                    e.fieldAt0x10, e.nameField, &m));
+    CHECK(m.name == "TEX64");
+    CHECK(m.width == 64 && m.height == 32);
+    CHECK(m.shift == 6 && m.uMask == 63);
+    CHECK(m.vMask == (0x1fu << 6));
+    CHECK(m.invUMask == ~63u);
+    CHECK(m.frameCount == 0);
+    CHECK(m.pixels.size() == 64 * 32);
+    CHECK(m.param0c == 0x11111111u && m.param10 == 0x22222222u);
+    CHECK(!m.isIndexRecord);
+    // pixels alias the payload's post-header bytes
+    CHECK(m.pixels.data() ==
+          reinterpret_cast<const std::uint8_t*>(s.buf.data()) +
+              e.payloadFileOffset() + 4);
+  }
+  {
+    // Extended header: u16 frameCount @+0, dims @+4/+6; pixels span
+    // frameCount*w*h (OBSERVED: EXPLODE = 26 x 128x128).
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"ANIM", 0x00010000, 0, 0, 8 + 3 * 8 * 8}});
+    const auto dir = inspectMtiDirectory(s.buf);
+    CHECK(dir.status == MtiDirectoryStatus::kOk);
+    const auto& e = dir.entries[0];
+    CHECK(e.hasExtendedHeader());
+    const std::size_t po = static_cast<std::size_t>(e.payloadFileOffset());
+    s.put16(po, 3);       // frameCount
+    s.put16(po + 4, 8);   // width
+    s.put16(po + 6, 8);   // height
+    ArenaRenderMaterial m;
+    CHECK(arenaRenderMaterialDecode(s.buf, e.payloadFileOffset(),
+                                    e.fieldAt0x08, e.fieldAt0x0C,
+                                    e.fieldAt0x10, e.nameField, &m));
+    CHECK(m.frameCount == 3 && m.width == 8 && m.height == 8);
+    CHECK(m.pixels.size() == 3 * 8 * 8);
+    // flags = low16 of class word | frameCount<<16 (OBSERVED merge).
+    CHECK(m.flags == (0x0000u | (3u << 16)));
+    // square -> vMask == uMask << shift; shift = ceil(log2 8) = 3.
+    CHECK(m.shift == 3 && m.uMask == 7 && m.vMask == (7u << 3));
+  }
+  {
+    // Index record: no payload dereference; the index value lands in
+    // the +0x08 (height) slot and every other field stays zero — the
+    // original's table buffer is memset(0) before the record loop
+    // (FUN_0041a1e0 index path).
+    auto s = SyntheticMti::build("TEST.MTI",
+        {{"IDX", 0xffffffffu, 0x1234, 0, 0}});
+    const auto dir = inspectMtiDirectory(s.buf);
+    const auto& e = dir.entries[0];
+    ArenaRenderMaterial m;
+    CHECK(arenaRenderMaterialDecode(s.buf, e.payloadFileOffset(),
+                                    e.fieldAt0x08, e.fieldAt0x0C,
+                                    e.fieldAt0x10, e.nameField, &m));
+    CHECK(m.isIndexRecord && m.width == 0 && m.height == 0x1234 &&
+          m.flags == 0xffffffffu && m.pixels.empty());
+  }
+
+  // ---- FUN_00409a6c submission order on a synthetic BSP -----------
+  {
+    // Root plane z=0 splits node1 (+halfspace) from node2 (-halfspace).
+    // Spans are {lo16 count | hi16 firstIdx} into the poly table.
+    CollisionNode nodes[3] = {};
+    nodes[0] = {0, 0, 1, 0,   /*far*/2, /*near*/1,
+                /*polysPos*/(0u << 16) | 1u, /*polysNeg*/(1u << 16) | 1u,
+                0, 0, 0, 0};
+    nodes[1] = {0, 0, 1, -5,  -1, -1,
+                /*polysPos*/(2u << 16) | 1u, 0, 0, 0, 0, 0};
+    nodes[2] = {0, 0, 1, 5,   -1, -1,
+                0, /*polysNeg*/(3u << 16) | 1u, 0, 0, 0, 0};
+    CollisionPoly polys[4] = {};
+    CollisionArena arena;
+    arena.nodes = nodes;
+    arena.polys = polys;
+
+    // Camera on the +z side: positive-halfspace subtree (node1, poly2)
+    // first, then the node's own camera-side span (poly0), then the
+    // far subtree (node2 — camera sees its +side, which is empty).
+    float camPos[3] = {0, 0, 10};
+    std::vector<std::uint32_t> order;
+    arenaRenderOrder(arena, camPos, false, &order);
+    CHECK(order.size() == 2 && order[0] == 2 && order[1] == 0);
+
+    // Camera on -z: negative-halfspace subtree first (poly3), then the
+    // node's -side span (poly1); node1's -side span is empty.
+    camPos[2] = -10;
+    arenaRenderOrder(arena, camPos, false, &order);
+    CHECK(order.size() == 2 && order[0] == 3 && order[1] == 1);
+
+    // Mirror variant (dead flag 0x499f8c in BUILD_A): child order
+    // swaps, span selection stays tied to the camera side.
+    camPos[2] = 10;
+    arenaRenderOrder(arena, camPos, true, &order);
+    CHECK(order.size() == 2 && order[0] == 0 && order[1] == 2);
+
+    // +0x20 bit4 (0x10) is the render-skip (FUN_00409860, OBSERVED):
+    // flagging poly2 drops it from the submission.
+    polys[2].flags = 0x10;
+    arenaRenderOrder(arena, camPos, false, &order);
+    CHECK(order.size() == 1 && order[0] == 0);
+    polys[2].flags = 0;
+  }
+
+  // ---- matlkup: bank A first, then bank B; miss -> -1 --------------
+  {
+    // Region-C names: c1=3 -> "RC00000","RC00001","RC00002" fields
+    // poked to SHARED, LOCAL, MISSING below. c2=1 node, c3=1 poly,
+    // c4=3 verts satisfy the collision blob walk.
+    auto sm = SyntheticMto::build("TEST.MTO",
+        {{"OV1", "OV1.MAT",
+          {{"LOCAL", 0x00000000, 0, 0, 4 + 4 * 4},
+           {"SHARED", 0x00000000, 0, 0, 4 + 8 * 8}},
+          0, 0, 0, 3, 1, 1, 3, 0x150, 0}});
+    {
+      // Pass 1: locate the interior fields to poke, then re-parse so
+      // the block view carries the poked names.
+      const auto mto0 = inspectMtoDirectory(sm.buf);
+      CHECK(mto0.status == MtoDirectoryStatus::kOk);
+      const auto& b0 = mto0.blocks[0];
+      const auto putCName = [&](std::size_t off, const char* s) {
+        for (int i = 0; i < 10; ++i) sm.buf[off + i] = std::byte{0};
+        sm.putName(off, s, 10);
+      };
+      putCName(static_cast<std::size_t>(b0.regionCOffset + 4), "SHARED");
+      putCName(static_cast<std::size_t>(b0.regionCOffset + 14), "LOCAL");
+      putCName(static_cast<std::size_t>(b0.regionCOffset + 24), "MISSING");
+      const auto putf = [&](std::size_t o, float v) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &v, 4);
+        sm.put32(o, bits);
+      };
+      // The collision blob validates interior invariants: give the
+      // node a unit plane + leaf children and the poly valid indices.
+      const std::size_t nodeBase =
+          static_cast<std::size_t>(b0.regionCOffset) + 4 + 3 * 10 + 2 + 4;
+      putf(nodeBase + 8, 1.0f);                 // nz = 1 (unit plane)
+      sm.put16(nodeBase + 0x10, 0xffff);        // childFar = -1
+      sm.put16(nodeBase + 0x12, 0xffff);        // childNear = -1
+      const std::size_t polyBase = nodeBase + 44 + 4;
+      sm.put16(polyBase + 0, 0);                // v0
+      sm.put16(polyBase + 2, 1);                // v1
+      sm.put16(polyBase + 4, 2);                // v2
+      sm.put16(polyBase + 6, 1);                // material = 1 (LOCAL)
+      // Give the two .MAT payloads their headers (w,h).
+      const std::uint64_t imgBase =
+          b0.fileOffset + kMtoInnerFileOffset + kMtoInnerBlobOffset;
+      sm.put16(static_cast<std::size_t>(imgBase +
+                                        b0.innerRecords[0].fieldAt0x14), 4);
+      sm.put16(static_cast<std::size_t>(imgBase +
+                                        b0.innerRecords[0].fieldAt0x14 + 2),
+               4);
+      sm.put16(static_cast<std::size_t>(imgBase +
+                                        b0.innerRecords[1].fieldAt0x14), 8);
+      sm.put16(static_cast<std::size_t>(imgBase +
+                                        b0.innerRecords[1].fieldAt0x14 + 2),
+               8);
+    }
+    const auto mto = inspectMtoDirectory(sm.buf);
+    CHECK(mto.status == MtoDirectoryStatus::kOk);
+    const auto& b = mto.blocks[0];
+
+    // Shared bank (LEVELnS.MTI shape): a SHARED record (wins over the
+    // bank-B duplicate) plus BANKONLY.
+    auto sb = SyntheticMti::build("LEVELXS.MTI",
+        {{"SHARED", 0x00000000, 0, 0, 4 + 2 * 2},
+         {"BANKONLY", 0x00000000, 0, 0, 4 + 4 * 4}});
+    const auto sdir = inspectMtiDirectory(sb.buf);
+    CHECK(sdir.status == MtiDirectoryStatus::kOk);
+    sb.put16(static_cast<std::size_t>(sdir.entries[0].payloadFileOffset()), 2);
+    sb.put16(static_cast<std::size_t>(sdir.entries[0].payloadFileOffset() + 2), 2);
+    sb.put16(static_cast<std::size_t>(sdir.entries[1].payloadFileOffset()), 4);
+    sb.put16(static_cast<std::size_t>(sdir.entries[1].payloadFileOffset() + 2), 4);
+
+    mdk::CollisionArena arena;
+    std::uint32_t counts[4] = {};
+    CHECK(mdk::collisionBlobParse(
+        reinterpret_cast<const std::uint8_t*>(sm.buf.data()) +
+            b.regionCOffset,
+        sm.buf.size() - b.regionCOffset, &arena, counts));
+    CHECK(counts[0] == 3 && counts[1] == 1 && counts[2] == 1 &&
+          counts[3] == 3);
+
+    ArenaRenderData rd;
+    CHECK(arenaRenderDataBuild(
+        std::span<const std::byte>(sm.buf.data(), sm.buf.size()), b,
+        arena, counts[1], counts[2], counts[3],
+        std::span<const std::byte>(sb.buf.data(), sb.buf.size()), &rd));
+    CHECK(rd.vertCount == 3 && rd.nodeCount == 1 && rd.polys.size() == 1);
+    CHECK(rd.materialNames.size() == 3);
+    CHECK(rd.materialNames[0] == "SHARED" && rd.materialNames[1] == "LOCAL" &&
+          rd.materialNames[2] == "MISSING");
+    CHECK(rd.bankA.size() == 2 && rd.bankB.size() == 2);
+    // SHARED resolves to bank A slot 0 (bank A searched first);
+    // LOCAL to bank B slot 0 -> combined index bankA.size()+0 = 2;
+    // MISSING -> -1 (the original's fallback).
+    CHECK(rd.materialOfName[0] == 0);
+    CHECK(rd.materialOfName[1] == 2);
+    CHECK(rd.materialOfName[2] == -1);
+    CHECK(rd.bankA[0].name == "SHARED" && rd.bankA[0].width == 2);
+    CHECK(rd.bankB[0].name == "LOCAL" && rd.bankB[0].width == 4);
+    CHECK(rd.paletteRgb.size() == 0x150);
+
+    // poly0 carries material index 1 -> LOCAL in bank B (textured).
+    CHECK(rd.polys[0].material == 1);
+    CHECK(rd.polyMaterialClass(0) == ArenaMatClass::kTextured);
+    CHECK(rd.materialFor(0) == &rd.bankB[0]);
+    ArenaRenderData rd2 = rd;
+    rd2.polys[0].material = 2;   // MISSING -> fallback/unresolved
+    CHECK(rd2.polyMaterialClass(0) == ArenaMatClass::kUnresolved);
+    CHECK(rd2.materialFor(0) == nullptr);
+    rd2.polys[0].material = -37; // pen path ignores the table
+    CHECK(rd2.polyMaterialClass(0) == ArenaMatClass::kPen);
+    CHECK(arenaPenIndex(-37) == 37);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -13428,6 +13715,7 @@ int main() {
   test_camera_nudge();
   test_player_sniper();
   test_player_fire();
+  test_arena_render();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

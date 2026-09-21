@@ -225,21 +225,28 @@ header to bound it:
 
 ```
 flags & 0x00030000 == 0  ("plain"):
-  u16 @payload+0   header field A
-  u16 @payload+2   header field B
+  u16 @payload+0   width
+  u16 @payload+2   height
   data             starts at payload+4
-flags & 0x00030000 != 0  ("extended"):
-  u16 @payload+0   header count (merged into the in-memory flags
+flags & 0x00030000 != 0  ("extended" — animated):
+  u16 @payload+0   frame count (merged into the in-memory flags
                    high word by the original)
-  u16 @payload+4   header field A
-  u16 @payload+6   header field B
+  u16 @payload+2   (unused)
+  u16 @payload+4   width
+  u16 @payload+6   height
   data             starts at payload+8
 ```
 
-The original derives a shift count from field A (smallest k with
-`2^k >= A`, capped at 12 iterations) and a family of masks from A and
-B — consistent with A/B being dimensions — but no semantic name is
-proven; they are reported raw as `headerFieldA`/`headerFieldB`.
+Phase 6A proves the field semantics (see
+`reverse-engineering/ARENA_RENDER_PIPELINE.md`): the texture mapper
+`FUN_0046daac` consumes the derived masks as u/v wrap masks, and the
+pixel extent `frameCount*width*height` is verified against real
+payloads (e.g. EXPLODE = 26 frames × 128×128). The original derives
+`shift` = smallest k<12 with `2^k >= width`, `uMask = (1<<shift)-1`,
+`vMask = (w==h ? uMask : bucketMask(h)) << shift` (buckets
+{0x0f,0x1f,0x3f,0x7f,0xff,0x1ff,0x3ff} at heights
+{<0x11,<0x21,<0x41,<0x81,<0x101,<0x201,else}), `~uMask`, and points
++0x24 at the pixel data — single-byte palette indices, width-pitched.
 
 ### OBSERVED invariants (validated by the parser)
 
@@ -393,9 +400,12 @@ tA+0x08  u32le countC → rec24[countC]
 align4(tA + sizeA) == region-B base (OBSERVED 60/60)
 ```
 
-Region B at `off+4+ofsB`: exactly 0x150 bytes in 60/60 blocks; the
-original copies it into a fixed structure (`DAT_00540dcc`-based).
-Palette-like; semantics UNKNOWN — reported as a fixed-size span.
+Region B at `off+4+ofsB`: exactly 0x150 bytes in 60/60 blocks.
+CODE-CORROBORATED palette — the block consumer (`FUN_00432534`)
+copies `DAT_00540dcc * 3` bytes (count 0x70 = 112 RGB triplets) from
+the region-B target into `DAT_005408e0` and calls the shared palette
+uploader `FUN_0046d490(0, count)` — the same function the DTI s3
+palette path uses (4-byte entries at `DAT_0054d7b8`).
 
 Region C at `off+4+ofsC` (CODE-CORROBORATED walk — `FUN_00419ee0`):
 
@@ -416,6 +426,18 @@ records (0x24: `{u16 v[3]@0, u16 flags@0x20, u8 surface+1@0x23}`),
 the sweep — consumer UNKNOWN. Verified live: `LEVEL3O.MTO` blob
 `0xdaa64` (248/399/234) answers a real swept query
 (`mdk-inspect --collision-probe`).
+
+Phase 6A resolves the remaining record consumers — region C is
+shared with the renderer (`FUN_00431300` draw_arena): `c1` = the
+material name table (`char[10]`; a poly's nonnegative material index
+selects a name slot, resolved against the material banks by
+`FUN_0041a694` "matlkup"), and the `c3` poly record's interior is
+the render data: `{u16 v[3]@0, s16 materialIdx@+0x06, f32 uv0@+0x08,
+f32 uv1@+0x10, f32 uv2@+0x18, u8 flags@+0x20 (bit4 render-skip,
+bit0 two-sided gate), u8 @+0x21 UNKNOWN, u8 @+0x22 (bits
+0x10/0x20/0x40 per-vertex mask, bit7 gated path), u8 surface+1@+0x23}`.
+Negative material indices are pen/effect dispatch codes, not table
+indices (see ARENA_RENDER_PIPELINE.md).
 
 ### Field-by-field evidence matrix
 
@@ -1189,12 +1211,16 @@ Two payload layouts are CODE-CORROBORATED inside BNI records:
 - MTO region-A array-C record fields other than the `+0x10` offset:
   semantics UNKNOWN (sound-processing reads them; no field names
   proven).
-- MTO region B contents: fixed 0x150 bytes, palette-like; UNKNOWN.
+- MTO region B contents: RESOLVED in Phase 6A — 112 RGB triplets,
+  copied and uploaded through the shared palette uploader
+  `FUN_0046d490` (see the region B section above).
 - MTO region C record internals: RESOLVED for the collision path —
   Phase 5D proves it is the arena collision blob (44B BSP nodes /
   36B poly records / 12B f32 verts — see the region C section
-  above). The c1 10-byte records' consumer and the trailing data
-  remain UNKNOWN.
+  above). Phase 6A resolves the render consumers: c1 = material
+  name table (matlkup), c3 interior = poly render fields (UVs,
+  material index, render flags). The trailing data after c4 remains
+  UNKNOWN.
 - MTO embedded ".MAT" payloads: same UNKNOWN level as MTI payloads.
 - CMI table[0] consumer path: UNKNOWN (`FUN_004583fc` has no static
   caller; the `OBJ$ANIM`-shaped names suggest a per-object animation

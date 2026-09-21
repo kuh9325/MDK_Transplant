@@ -14,6 +14,7 @@
 //               collision blob, run one swept query + floor probe)
 //   mdk-inspect --selftest        (synthetic in-memory checks)
 
+#include "core/arena_render.h"
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
 #include "core/bni_image.h"
@@ -70,6 +71,11 @@ int usage() {
                "       mdk-inspect --data-path DIR --surface-census "
                "<relative-path>   (a .DTI path; the sibling <stem>O.MTO\n"
                "                            is scanned for surface polys)\n"
+               "       mdk-inspect --data-path DIR --arena-render "
+               "<relative-path>   (a .DTI path; the sibling <stem>O.MTO\n"
+               "                            and <stem>S.MTI are decoded into\n"
+               "                            the Phase 6A render-data view.\n"
+               "                            Options: --arena NAME --start X Y Z)\n"
                "       mdk-inspect --data-path DIR --traversal-runtime "
                "<relative-path>\n"
                "                            (a .DTI path; loads the sibling\n"
@@ -1174,6 +1180,7 @@ int main(int argc, char** argv) {
   bool collisionProbe = false;
   bool arenaObjects = false;
   bool surfaceCensus = false;
+  bool arenaRender = false;
   bool traversalRuntime = false;
   bool scriptDisasm = false;
   std::string scriptDisasmName;
@@ -1279,6 +1286,11 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       surfaceCensus = true;
+    } else if (!std::strcmp(a, "--arena-render")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;
+      arenaRender = true;
     } else if (!std::strcmp(a, "--traversal-runtime")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -1443,7 +1455,8 @@ int main(int argc, char** argv) {
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
       !spriteInfoName && !collisionProbe && !arenaObjects &&
-      !surfaceCensus && !traversalRuntime && !scriptDisasm) {
+      !surfaceCensus && !arenaRender && !traversalRuntime &&
+      !scriptDisasm) {
     return 0;
   }
 
@@ -2098,6 +2111,177 @@ int main(int argc, char** argv) {
     std::printf("poly flag bits (+0x20, all %zu polys): "
                 "0x04=%u 0x10=%u 0x20=%u 0x30=%u\n",
                 totPolys, f04, f10, f20, f30);
+    return 0;
+  }
+
+  // --arena-render: Phase 6A (G1-RE) smoke. Decodes each MTO block's
+  // region-C geometry into the platform-neutral render-data view:
+  // shared collision tables, per-vertex UVs, the material name table,
+  // the embedded .MAT bank resolved against the level's shared MTI
+  // bank (bank A first — the original's matlkup order), the palette
+  // triplets, and the FUN_00409a6c BSP submission order.
+  if (arenaRender) {
+    const std::string& dtiPath = *target;
+    const auto dot = dtiPath.find_last_of('.');
+    const auto slash = dtiPath.find_last_of("/\\");
+    if (dot == std::string::npos ||
+        (slash != std::string::npos && dot < slash)) {
+      std::fprintf(stderr, "--arena-render wants a .DTI path\n");
+      return 1;
+    }
+    const std::string dir =
+        slash == std::string::npos ? "" : dtiPath.substr(0, slash + 1);
+    const std::string stem = dtiPath.substr(
+        slash == std::string::npos ? 0 : slash + 1,
+        dot - (slash == std::string::npos ? 0 : slash + 1));
+    const std::string mtoPath = dir + stem + "O.MTO";
+    const std::string mtiPath = dir + stem + "S.MTI";
+
+    const auto dtiFile = root->readFile(dtiPath, kEntriesMaxBytes, &err);
+    const auto mtoFile = root->readFile(mtoPath, kEntriesMaxBytes, &err);
+    if (!dtiFile || !mtoFile) {
+      std::fprintf(stderr, "read-file: FAILED (%s) — need .DTI + "
+                           "sibling <stem>O.MTO\n",
+                   err.c_str());
+      return 1;
+    }
+    // The shared bank is optional in the file set (all BUILD_A levels
+    // have one); a missing/unreadable file decodes as an empty bank.
+    std::vector<std::byte> mtiStorage;
+    std::span<const std::byte> mtiSpan;
+    if (auto mtiFile = root->readFile(mtiPath, kEntriesMaxBytes, &err)) {
+      mtiStorage = std::move(*mtiFile);
+      mtiSpan = std::span<const std::byte>(mtiStorage.data(),
+                                           mtiStorage.size());
+    }
+
+    const auto mto = mdk::inspectMtoDirectory(
+        std::span<const std::byte>(mtoFile->data(), mtoFile->size()));
+    if (mto.status != mdk::MtoDirectoryStatus::kOk) {
+      std::fprintf(stderr, "parse: FAILED (mto=%s)\n",
+                   std::string(mdk::mtoDirectoryStatusName(mto.status))
+                       .c_str());
+      return 1;
+    }
+    std::printf("mto: %s — %u blocks; shared bank %s (%zu bytes)\n",
+                mtoPath.c_str(), mto.count, mtiPath.c_str(),
+                mtiSpan.size());
+
+    const std::uint8_t* mb =
+        reinterpret_cast<const std::uint8_t*>(mtoFile->data());
+    const std::size_t mn = mtoFile->size();
+    const auto fnv1a = [](std::uint64_t h, const void* p,
+                          std::size_t n) {
+      const auto* b = static_cast<const std::uint8_t*>(p);
+      for (std::size_t i = 0; i < n; ++i) {
+        h = (h ^ b[i]) * 0x100000001b3ull;
+      }
+      return h;
+    };
+
+    std::size_t blocksOk = 0;
+    for (std::size_t bi = 0; bi < mto.blocks.size(); ++bi) {
+      const auto& b = mto.blocks[bi];
+      const std::string blkName =
+          bi < mto.entries.size() ? mto.entries[bi].name() : "?";
+      if (travArena && blkName != *travArena) continue;
+      mdk::CollisionArena arena;
+      std::uint32_t counts[4] = {};
+      if (b.regionCOffset >= mn ||
+          !mdk::collisionBlobParse(mb + b.regionCOffset,
+                                   mn - b.regionCOffset, &arena,
+                                   counts)) {
+        std::printf("  block %-8.8s  collision blob: PARSE FAILED\n",
+                    blkName.c_str());
+        continue;
+      }
+      mdk::ArenaRenderData rd;
+      if (!mdk::arenaRenderDataBuild(
+              std::span<const std::byte>(mtoFile->data(), mn), b, arena,
+              counts[1], counts[2], counts[3], mtiSpan, &rd)) {
+        std::printf("  block %-8.8s  render data: BUILD FAILED\n",
+                    blkName.c_str());
+        continue;
+      }
+      ++blocksOk;
+
+      // Vertex bounds + digest over the decoded view.
+      float bb[6] = {1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
+      std::uint64_t h = 0xcbf29ce484222325ull;
+      h = fnv1a(h, rd.verts, std::size_t(rd.vertCount) * 12);
+      h = fnv1a(h, rd.polys.data(),
+                rd.polys.size() * sizeof(mdk::ArenaRenderPoly));
+      for (std::size_t p = 0; p < rd.vertCount; ++p) {
+        for (int k = 0; k < 3; ++k) {
+          const float v = rd.verts[p * 3 + k];
+          if (v < bb[k]) bb[k] = v;
+          if (v > bb[k + 3]) bb[k + 3] = v;
+        }
+      }
+
+      // Material resolution census.
+      std::uint32_t resolved = 0, missing = 0;
+      std::string missingList;
+      for (std::size_t i = 0; i < rd.materialOfName.size(); ++i) {
+        if (rd.materialOfName[i] >= 0) {
+          ++resolved;
+        } else {
+          ++missing;
+          if (missingList.size() < 200) {
+            if (!missingList.empty()) missingList += ',';
+            missingList += rd.materialNames[i];
+          }
+        }
+      }
+      std::uint32_t cls[6] = {};
+      std::uint32_t skipped = 0;
+      for (std::size_t p = 0; p < rd.polys.size(); ++p) {
+        if (rd.polys[p].flags & 0x10) ++skipped;
+        using mdk::ArenaMatClass;
+        switch (rd.polyMaterialClass(p)) {
+        case ArenaMatClass::kTextured: ++cls[0]; break;
+        case ArenaMatClass::kUnresolved: ++cls[1]; break;
+        case ArenaMatClass::kPen: ++cls[2]; break;
+        case ArenaMatClass::kEffect770: ++cls[3]; break;
+        case ArenaMatClass::kEffectE94: ++cls[4]; break;
+        case ArenaMatClass::kEffect12970: ++cls[5]; break;
+        }
+      }
+
+      // Render-order digest at the probe camera.
+      float cam[3];
+      if (travStartGiven) {
+        cam[0] = travStart[0];
+        cam[1] = travStart[1];
+        cam[2] = travStart[2];
+      } else {
+        for (int k = 0; k < 3; ++k) cam[k] = (bb[k] + bb[k + 3]) * 0.5f;
+      }
+      std::vector<std::uint32_t> order;
+      mdk::arenaRenderOrder(arena, cam, false, &order);
+      std::uint64_t oh = 0xcbf29ce484222325ull;
+      oh = fnv1a(oh, order.data(), order.size() * sizeof(std::uint32_t));
+
+      std::printf(
+          "  block %-8.8s  verts=%u nodes=%u polys=%zu names=%zu\n"
+          "    aabb=[%.1f %.1f %.1f .. %.1f %.1f %.1f]\n"
+          "    bankA=%zu bankB=%zu names resolved=%u missing=%u\n"
+          "    polys textured=%u unresolved=%u pen=%u fx770=%u "
+          "fxe94=%u fx12970=%u skip-flag=%u\n"
+          "    palette=%zuB digest=%016llx order n=%zu digest=%016llx\n",
+          blkName.c_str(), rd.vertCount, rd.nodeCount, rd.polys.size(),
+          rd.materialNames.size(), bb[0], bb[1], bb[2], bb[3], bb[4],
+          bb[5], rd.bankA.size(), rd.bankB.size(), resolved, missing,
+          cls[0], cls[1], cls[2], cls[3], cls[4], cls[5], skipped,
+          rd.paletteRgb.size(), (unsigned long long)h, order.size(),
+          (unsigned long long)oh);
+      if (missing) {
+        std::printf("    missing names: %s%s\n", missingList.c_str(),
+                    missingList.size() >= 200 ? "..." : "");
+      }
+    }
+    std::printf("arena-render: %zu/%zu blocks decoded\n", blocksOk,
+                mto.blocks.size());
     return 0;
   }
 
