@@ -312,6 +312,25 @@ src/
                                   FUN_0042b0c0 camera nudge (M2-row0
                                   pos shift + trunc-mode tick + M1
                                   row0 tilt + full t refold) (5M)
+             player_sniper.*    — Phase 5L sniper scope + mounted
+                                  reticle: scope entry/latch, zoom
+                                  drain, the FUN_00464624 sniper core
+                                  (raw-delta aim), X_STRIKE mount
+                                  reticle — calls playerFireDispatch
+                                  at the FUN_0045f138 boundary (5L/5N)
+             player_fire.*      — Phase 5N player weapon fire:
+                                  FUN_0045f138 dispatch (weapon-5
+                                  charge path + the weapons-0..4
+                                  three-slot shot-pool spawn +
+                                  homing tail), FUN_00432f84 punch
+                                  hitscan (cone select + object/
+                                  element scan + miss stab),
+                                  FUN_00469b98 scoped selector,
+                                  FUN_00437660 cadence/burst/ammo,
+                                  the FUN_00465228 fire latch, and
+                                  the FUN_0045c230 AABB clipper —
+                                  shot creation boundary only; no
+                                  projectile flight or damage (5N)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

@@ -325,6 +325,15 @@ struct DynamicObject {
   float field48 = 0.0f;              // +0x48 — 32.0 default
   std::uint32_t healthMirror2a2 = 0; // +0x2a2 — 0x10's low-16 +0x8 mirror
   std::uint8_t flag21f = 0;          // +0x21f — set when +0x8 >= 0xfde8
+  // Phase 5N — punch/homing fields. +0x21e is the "was punched" mark
+  // (FUN_00432f84 writes 0xff on a hit). +0x302/+0x306 alias the
+  // connector/rawMatrix region for punchable/homing objects: the
+  // original stores a homing name-prefix char* at +0x302 and a digit
+  // offset at +0x306, consumed by the FUN_0045f634 element predicate
+  // (homing weapons 1/3 + the punch element scan).
+  std::uint8_t field21e = 0;         // +0x21e — punch-received mark
+  std::string homingPrefix;          // +0x302 — element-name prefix
+  int homingDigitOfs = 0;            // +0x306 — digit check offset
   std::uint8_t field11a = 0;         // +0x11a — 0x0b target
   std::uint8_t field11b = 0;         // +0x11b — 0x49 target
   const void* field110 = nullptr;    // +0x110 — 0x4c image-ref target

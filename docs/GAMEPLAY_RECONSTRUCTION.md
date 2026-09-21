@@ -2827,3 +2827,215 @@ and loop.
   subsystem.
 - Whether retail DOS builds wire `0x541548` — UNKNOWN (BUILD_A only).
 - Projectile/weapon systems remain deferred per scope.
+
+# Phase 5N — Player Weapon Fire
+
+Phase 5N reconstructs the bounded player weapon-fire transaction —
+the whole path from fire input to the shot/projectile creation
+boundary:
+
+    fire input → eligibility → selected weapon → cadence/burst/ammo
+    → muzzle/aim → original weapon dispatch → shot/projectile
+    creation boundary
+
+It replaces the Phase 5L `sniperFireSeam` placeholder at the
+`FUN_0045f138` callsite with the real dispatch, and wires the
+scoped weapon selector, the normal-path fire latch, and the
+normal-mode punch hitscan into the world tick. Hitscan weapons keep
+their original hitscan boundary — nothing is forced into a
+projectile object.
+
+Everything below is OBSERVED from instruction-level BUILD_A
+disassembly + decompile of `MDK95.EXE` unless tagged otherwise.
+
+## 123. Functions reconstructed (OBSERVED)
+
+- `FUN_0045f138` — the player weapon-fire dispatch. Weapon-5 branch
+  (charge-gated thrown object) plus the weapons-0..4 three-slot
+  shot-pool spawn. `playerFireDispatch`.
+- `FUN_00432f84` — the normal-mode punch hitscan. `playerPunch`.
+- `FUN_004337ac` — the punch cone/target-selection test.
+  `punchConeTest`.
+- `FUN_0045c230` — the AABB segment clipper (Liang–Barsky entry
+  clip). `segClipAabb`.
+- `FUN_0045f634` — the element-name predicate (name starts with
+  `prefix` AND `name[digitOfs]` is a digit). `elemNamePredicate`.
+- `FUN_0047d5dc` — element-name `"HEAD"` substring test.
+- `FUN_00469b98` — the hotkey/itemNext scoped weapon selector.
+  `playerWeaponSelect`.
+- `FUN_00437660` — the scoped cadence/burst/ammo machine.
+  `playerWeaponCadence`.
+- `FUN_00465228` tail — the normal-path fire latch (event posts).
+  `playerFireLatch`.
+- `FUN_00437f30` — bearing `norm360(deg(atan2(dy,dx)))`.
+- `FUN_00437f98` — sincos-deg helper (`arg2 = sin`, `arg3 = cos`).
+- `FUN_00430160` — dist3. `FUN_0047f357` — the FPATAN wrapper.
+- `FUN_0047d20a` — shot-slot init (memset `0xfc`); `FUN_00454794`
+  pool reference (three `0xfc`-stride slots at `0x540ed4`).
+
+## 124. Weapon dispatch — `FUN_0045f138` (OBSERVED, ported)
+
+- Weapon select `0x541618` (`rt.wpnSel0`) is read once at the head.
+- **Weapon 5** (`wpnSel0 == 5`): denied when `0x540e14 == 0` (charge
+  probe) or `0x54163b != 0` (fire latch) → no-fire seam. Else
+  `0x54163b = 1` when `0x541498 > 3`, `burstIndex -= 1`,
+  `fireCadence += 1.0`, `0x541633 -= 1`, `fireCadence = 3.0` if
+  `burstIndex == 0`, then the weapon-5 spawn seam `FUN_0045a4dc`.
+  `0x540e80` (`shotSerial`) is **not** incremented on this path.
+- **Weapons 0..4**: scan the 3-slot pool for `state == 0`; return
+  silently if all busy. `0x540d0c = 0`, fire-sound seam, slot memset,
+  `state = 1`, `classIdx = -1`, `pos ← 0x540b28` (camera pos),
+  `yawDeg ← 0x540c2c`, `pitchDeg ← 0x540b54 + 0x540d58`,
+  `arena ← 0x540c48`, `fieldCc = 2.0`. Then the per-weapon
+  lifetime/type/flyKind/speed/ammo table, the shared cadence/burst
+  tail (`fireCadence += 1.0`, `burstIndex -= 1`, `= 3.0` at 0), and
+  the homing tail.
+- Per-weapon fields (OBSERVED): w0 `life=0x4b type=0 tracer
+  speedH=1100`; w1 `life=0xf0 type=1 grenade ammo-1 speedH=400`;
+  w2 `life=0x4b type=2 tracer ammo-1 speedH=1100`; w3 `life=0xf0
+  type=3 grenade ammo-1 speedH=400`; w4 `life=0x1c2 type=4 lobbed
+  ammo-1`, `speedH = cos(pitch)·150` / `speedV = sin(pitch)·-150`
+  (`0x4984e8`/`0x4984ec`). The class index for w1..w4 resolves
+  through the enemy table (`SW_HOME`/`SW_SGREN`/`SW_HGREN`/`SW_LGREN`).
+- `shotSerial` (`0x540e80 += 1`) fires only on the weapons-0..4
+  exits (no-target, non-homing-weapon, null-target, and the shared
+  tail) — never on weapon 5.
+
+## 125. Homing tail (OBSERVED, ported — weapons 1/3)
+
+- `0x540cc8 != 0` gates a lock target; `homeObj ← 0x540cd8`
+  (`focusObj`) for **all** weapons. For non-1/3 weapons the shot
+  keeps the target but picks no element.
+- Weapons 1/3 walk the target's element set: the first `"HEAD"`
+  element wins immediately; other candidates need the target's
+  standable bit (`flags149 & 0x20`) and the prefix/digit predicate
+  (`0x302` prefix, `0x306` digit offset).
+- The ray runs `shot.pos → shot.pos − camera.basis[2]·10000`
+  (`basis[2]` = `0x540bd0`, M2 row-2). `FUN_0045c230` clips it to
+  each candidate element AABB; the score is `|clippedHit|` (distance
+  from world origin), and the nearest valid hit wins. The shot
+  stores the element pointer and index.
+
+## 126. `FUN_0045c230` — the AABB segment clipper (OBSERVED, ported)
+
+- `__fastcall`: `ECX = param_1` = primary out point, `EDX =
+  param_2` = segment end, `EAX` = segment start, `EBX` = AABB, one
+  stack arg `param_3` = optional secondary out (`0` at the homing
+  callsite → its `MOV [EDX],…` writes are skipped).
+- The entry point is computed into callee locals then copied to
+  `*param_1` via `MOVSD ×3`. `param_3` is a separate optional out —
+  not the flag bitmask.
+- `flags` (`local_10`) is the outside-sides bitmask: X `1`/`2`,
+  Y `4`/`8`, Z `0x10`/`0x20`.
+- OBSERVED asymmetry: the X faces compare `t < 0x4982b0` (constant
+  `1.1`) while the Y/Z faces compare `t < tEnter` (the running best,
+  init `1.1`). Equivalent because X is always tested first while
+  `tEnter` is still `1.1` — reproduced verbatim (`kClipInit` for X,
+  `tEnter` for Y/Z).
+- Return: `flags != 0` → `tEnter > 1 ? 0 : 1`; `flags == 0` (start
+  inside) → `out = start`, return `2`.
+
+## 127. Punch — `FUN_00432f84` (OBSERVED, ported)
+
+- Gates: `0x540c74 != 0`, `excludeObj`/`mountClass & 2` exclusion.
+- `aimPt = {pos.x, pos.y, pos.z + 5}` (`0x4973b0`).
+- Charge drain: `ammo[0] <= 0` → `punchStep = frameStep`, state `-1`;
+  else `ammo[0] -= frameStep`, `punchStep = frameStep·6`, state `-2`.
+- Reload path (`ammo[0]` reaches 0): `ammo[0] = 0` and the
+  `FUN_00469668(1)` notify are **unconditional**; `FUN_0046a3d8`
+  (item reload) runs only when a type-6 inventory entry exists —
+  the inventory table is not modelled, so it stays a seam and does
+  **not** bump `itemUseCalls` (that counter is the separate
+  `FUN_00459d28` item-use input path).
+- Object scan iterates the current arena `0x540c48`, then the
+  partner/carrier `0x540ca4` when `partnerActive` and
+  `carrierBusy == 0`. Filters: named, has model, `flags148 & 0x10`
+  and `& 0x20` clear.
+- Element scan on `flags149 & 0x20` objects, `elemMaskB` exclusion,
+  element-name predicate, whole-object AABB fallback when no element
+  wins. `CollisionObject` offsets verified: `aabb +0x198`,
+  `elemMaskB +0x2c8`, `elements +0x0c` (stride `0x5c`, element
+  `aabb +0x44`), `objects +0x68`.
+- Cone test (`FUN_004337ac`): `d = center − aimPt`,
+  `dist1 = diag < 140 ? 10 : diag`, `reach = dist1 − 2`,
+  `score = dx² + dy² + 20·dz²`, `coneLimit = (dist1+90)·360 /
+  (dist1+90+dist2)`, accept `rel <= cone || rel >= 360 − cone`.
+  `bestScore = −1.0` sentinel accepts the first candidate
+  (nearest-tracking). Occlusion stab on `cur`, partner gated on
+  `carrierBusy == 0`.
+- Hit: `field21e = 0xff`, `punchHitTime += frameStep`; damage/
+  knockback stay deferred seams (`punchHitCalls`). Miss stab:
+  `missPt = {pos.x + cos(yaw)·40, pos.y + sin(yaw)·40, aimPt.z}`
+  (`0x4973c0`), current arena then partner (gated `carrierBusy == 0`).
+
+## 128. Selector + cadence + fire latch (OBSERVED, ported)
+
+- `FUN_00469b98` (`playerWeaponSelect`): scoped hotkey scan —
+  hotkey `i` selects weapon `i` when `ammo[i] != 0` (JNZ);
+  `itemNext`/`itemPrev` wrap-scan with `ammo > 0` (JG). Wired at the
+  `weaponScanCalls` site.
+- `FUN_00437660` (`playerWeaponCadence`): the scoped cadence/burst
+  machine — burst-recharge gated on `wpnSel1 == 0 ||
+  burstIndex < ammo[wpnSel1]`, `burstIndex == 0 → wpn0` reload,
+  skipped when `flag4999d0 && flag541548`.
+- `FUN_00465228` tail (`playerFireLatch`): normal-path fire latch —
+  gate `fire && eventPriority <= 7 && eventType <= 7`, busy set
+  `{0x2bd, 0x2bc, 0x190, 0x1f4, 0x2bf, 0x2be}`, anim posts
+  `0x258 → 0x259/0x256` else `0x12c/0x123`.
+
+## 129. World-tick scope correction (OBSERVED)
+
+- `FUN_00436d60` — both scope gates are `0x540c9c && 0x540ca0 > 1`
+  (not `ca0 != 0`). `d0c++` (`FUN_00436f08`) and the cadence machine
+  sit inside gate B; `FUN_0045f030(0)` + the charge probe
+  `FUN_00437aa8` sit inside gate A. `FUN_00469f7c` (inventory-icon
+  HUD) is unconditional and stays outside fire scope.
+
+## 130. Native implementation
+
+- `src/core/player_fire.cpp` / `.h` — `playerFireDispatch`,
+  `playerPunch`, `playerWeaponSelect`, `playerWeaponCadence`,
+  `playerFireLatch`, `segClipAabb`, `punchConeTest`,
+  `elemNamePredicate`. `src/core/player_sniper.cpp` calls
+  `playerFireDispatch` at the `FUN_0045f138` callsite;
+  `traversal_runtime.cpp` wires the selector, the normal fire latch,
+  the punch callsite, and the corrected `36d60` scope gates.
+- `TraversalRuntime` gains the `PlayerShot` pool (3 × `0xfc`-stride
+  slots), the cadence/ammo/weapon/target fields, and the seam
+  counters.
+
+## 131. Validation
+
+- `tests/native/test_main.cpp::test_player_fire`: 40 checks —
+  weapon-5 deny/latch/cadence, weapons-0..4 pool scan + spawn fields,
+  per-weapon lifetime/type/speed/ammo, `shotSerial` on 0..4 vs not
+  on 5, homing HEAD/predicate/nearest-element selection, clipper
+  entry/inside/miss returns, punch gates/cone/hit/miss arenas.
+- `mdk_tests`: **3711 checks / 0 failures**; CTest **1/1**; Python
+  **17/17**.
+- `mdk-inspect --selftest*` — all PASS.
+- LEVEL3–8 `--traversal-runtime` (400f each): all PASS — real
+  contact+grounded, `teleport=0`, no crash. `CHMO_2 → HMO_3` digest
+  `8ecf2d101a3b5c70` (400f) **bit-identical** to the Phase 5L/5M
+  baseline — the fire path does not perturb the corridor route.
+- BUILD_A manifest: **141/141, missing 0, added 0, changed 0** —
+  `original/installed/` untouched; no proprietary/analysis files
+  tracked.
+
+## 132. Phase 5N boundary / remaining unknowns
+
+- Deliberately out of scope: projectile world flight beyond the
+  creation boundary, enemy damage/death/AI, explosions, HUD weapon
+  UI, and exotic weapons not required by the dispatch. These stay
+  seams (`shotSpawnCalls`, `weapon5SpawnCalls`, `fireSoundCalls`,
+  `fireDenyCalls`, `fireNotifyCalls`, `classLookupCalls`,
+  `punchHitCalls`, `itemUseCalls`) or unimplemented code.
+- `FUN_0046a3d8` type-6 inventory reload — the inventory table is
+  not modelled; only the unconditional `ammo[0] = 0` +
+  `FUN_00469668(1)` notify are ported.
+- `FUN_0045f030` shot render, `FUN_0045a4dc` weapon-5 spawn,
+  `FUN_004022b8`/`FUN_00402388` fire/deny sounds, `FUN_00469668`
+  notify — counted seams, not ported.
+- The fire transaction is a **state/mutation reconstruction**, not
+  a rendered projectile sim — shots enter the pool with correct
+  fields but nothing integrates their motion or impact yet.

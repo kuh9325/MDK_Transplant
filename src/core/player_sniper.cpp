@@ -10,6 +10,7 @@
 
 #include "core/collision_query.h"
 #include "core/motion_channels.h"
+#include "core/player_fire.h"
 #include "core/player_camera.h"
 #include "core/player_look.h"
 #include "core/player_surface.h"
@@ -311,7 +312,7 @@ void sniperCoreUpdate(TraversalRuntime& rt, const RawGameplayInput& raw,
   // 0x464a56 — the fire gate: ce770 != 0 && d0c >= 5 &&
   // 54161b == 0 -> FUN_0045f138.
   if (ctrl.fire != 0 && rt.fieldD0c >= 5 && rt.fireCadence == 0.0f) {
-    sniperFireSeam(rt);
+    playerFireDispatch(rt);
   }
 
   // 0x464a7c — the zoom tail.
@@ -422,15 +423,6 @@ void sniperDamageDrain(TraversalRuntime& rt, int amount) {
   rt.fieldHealth -= scaled;
   if (rt.fieldHealth < 0) rt.fieldHealth = 0;
   rt.vert.landingAccum += static_cast<float>(scaled);   // d5c += scaled
-}
-
-void sniperFireSeam(TraversalRuntime& rt) {
-  // FUN_0045f138 — the observable writes only (the projectile spawn
-  // is a counted seam): 54161b += 1.0 (the cadence/blend timer),
-  // 54161a -= 1, 541633 -= 1. d0c = 0 only on the NON-sniper branch.
-  rt.fireCadence += 1.0f;
-  rt.burstIndex -= 1;
-  ++rt.seams.sniperFireCalls;
 }
 
 void playerAnimAdvance(TraversalRuntime& rt, int frameStep) {

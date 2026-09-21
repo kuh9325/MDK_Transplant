@@ -14,6 +14,7 @@
 
 #include "core/data_root.h"
 #include "core/frontend_machines.h"
+#include "core/player_fire.h"
 #include "core/player_reticle.h"
 #include "core/player_sniper.h"
 
@@ -970,7 +971,7 @@ TraversalFrameResult stepTraversalRuntime(
       const PlayerVerticalEnvironment sEnv = makeVertEnv(false);
       sniperCoreUpdate(rt, raw, bindings, rt.prevFrame, sEnv,
                        timing.smoothed, &vf, &appliedZ, &positionChanged);
-      ++rt.seams.weaponScanCalls;   // FUN_00469b98
+      playerWeaponSelect(rt, rt.prevFrame);   // FUN_00469b98
     }
   } else {
     // Unscoped + unmounted — the >=800 scripted branch or the
@@ -1091,8 +1092,9 @@ TraversalFrameResult stepTraversalRuntime(
           rt.eventType = 8;
         }
       }
-      // normal-fire latch (0x465717+): the 0x258/0x259/0x12c event
-      // mapping is a deferred seam — the sniper core owns scoped fire.
+      // normal-fire latch (0x465717+) — FUN_00465228's tail: the
+      // 0x540c74 punch gate + the 0x12c/0x259 fire anim event.
+      playerFireLatch(rt, rt.prevFrame);
       ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
       playerReticleMountScan(rt);   // the mount-scan + class entry
     } else {
@@ -1129,8 +1131,9 @@ TraversalFrameResult stepTraversalRuntime(
   rt.cs.playerBox[5] = rt.cs.pos[2] + 4.25f;
 
   // FUN_00432f84 runs unconditionally (0x43627a); the 0x540c74 gate
-  // lives inside it. Counted as a call, not a fire.
+  // lives inside it. The punch target scan + hitscan boundary.
   ++rt.seams.objectPrepass;
+  playerPunch(rt, timing.frameStep);
   ++rt.seams.profilerHooks; // FUN_0042fecc rdtsc probe (0x43627f)
 
   // Object updates — FUN_004572ac subset (transform/ride/latch only;
@@ -1413,26 +1416,23 @@ TraversalFrameResult stepTraversalRuntime(
     // sniper-lifecycle states (0x323 scope-in, 0x384 unscope) + the
     // cb0 first-frame latch; the rest of the machine is deferred.
     playerAnimAdvance(rt, timing.frameStep);
-    // FUN_00436f08 -> FUN_00436088: the shared fire cadence counter
-    // d0c increments while the HUD gate (0x5414d4) is up, saturating
-    // at 999.
-    if (rt.hudActive != 0 && rt.fieldD0c < 999) ++rt.fieldD0c;
-    // FUN_00437660: the 54161b timer — during a weapon switch it
-    // blends up (f4*8.0 to 3.0, then wpnSel0 adopts + burstIndex
-    // resets); else it's the fire cadence, decaying f4*4.0 floored
-    // at 0. Skipped while (0x4999d0 && 0x541548).
-    if (!(rt.flag4999d0 && rt.flag541548)) {
-      if (rt.wpnSel0 != rt.wpnSel1) {
-        rt.fireCadence += dt * 8.0f;
-        if (rt.fireCadence >= 3.0f) {
-          rt.burstIndex = 0;
-          rt.wpnSel0 = rt.wpnSel1;
-        }
-      } else if (rt.fireCadence > 0.0f) {
-        rt.fireCadence -= dt * 4.0f;
-        if (rt.fireCadence < 0.0f) rt.fireCadence = 0.0f;
-        // 54161a burst-advance + the HUD seams — deferred.
-      }
+    // Scope gate A (0x436dd3): c9c != 0 && ca0 > 1 -> the shot-pool
+    // render pass FUN_0045f030(0) + the charge probe FUN_00437aa8
+    // (which writes the 0x540e14 live flag).
+    if (rt.flagC9c != 0 && rt.transitionPhase > 1) {
+      ++rt.seams.shotRenderCalls;   // FUN_0045f030(0)
+      playerChargeProbe(rt);         // FUN_00437aa8
+    }
+    // FUN_00469f7c — the unconditional inventory/HUD icon updater.
+    // Out of the fire scope; counted as a HUD seam.
+    ++rt.seams.hudEventCalls;
+    // Scope gate B (0x436e1c): c9c != 0 && ca0 > 1 -> FUN_0045f030(1)
+    // + FUN_00436f08 (the shared d0c fire-cadence counter) +
+    // FUN_00437660 (the cadence/burst/ammo machine).
+    if (rt.flagC9c != 0 && rt.transitionPhase > 1) {
+      ++rt.seams.shotRenderCalls;   // FUN_0045f030(1)
+      if (rt.hudActive != 0 && rt.fieldD0c < 999) ++rt.fieldD0c;
+      playerWeaponCadence(rt, dt);
     }
   };
   if (rt.flag541548) {

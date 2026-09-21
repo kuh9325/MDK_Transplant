@@ -28,6 +28,7 @@
 #include "core/mto_directory.h"
 #include "core/options_menu.h"
 #include "core/player_camera.h"
+#include "core/player_fire.h"
 #include "core/player_motion.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
@@ -10521,6 +10522,40 @@ mdk::RuntimeModel makePlatformModel(const char* modelName,
   return m;
 }
 
+// Multi-element target for the homing/punch element scans. Each
+// element is a 10-unit cube named `name`, centred at height zC.
+mdk::RuntimeModel makeHomingModel(
+    std::initializer_list<std::pair<const char*, float>> elems) {
+  mdk::RuntimeModel m;
+  m.flag = 1;
+  mdk::RuntimeModel::NameRec nr;
+  std::snprintf(nr.name.data(), nr.name.size(), "HOMING");
+  m.names.push_back(nr);
+  const std::size_t n = elems.size();
+  m.elems.resize(n);
+  m.elemNames.resize(n);
+  m.elemField2.resize(n);
+  m.elemVerts.resize(n);
+  m.elemTris.resize(n);
+  std::size_t i = 0;
+  for (const auto& pr : elems) {
+    std::snprintf(m.elemNames[i].data(), m.elemNames[i].size(), "%s",
+                  pr.first);
+    m.elemVerts[i] = {-5, -5, 0, 5, -5, 0, 5, 5, 0};
+    m.elemTris[i].assign(0x24, 0);
+    auto* idx = reinterpret_cast<std::uint16_t*>(m.elemTris[i].data());
+    idx[0] = 0;
+    idx[1] = 1;
+    idx[2] = 2;
+    m.elems[i].triCount = 1;
+    const float lb[6] = {-5, -5, pr.second - 5, 5, 5, pr.second + 5};
+    std::memcpy(m.elems[i].localAabb, lb, sizeof(lb));
+    ++i;
+  }
+  m.rebind();
+  return m;
+}
+
 // Model-source callback over a small table of models.
 struct TestModelSrc {
   std::vector<const mdk::RuntimeModel*> byIndex;
@@ -12882,6 +12917,304 @@ void test_camera_nudge() {
   }
 }
 
+// Phase 5N — player weapon fire. Direct unit tests on the bounded
+// functions: the FUN_0045f138 dispatch (the sniper-scoped spawn), the
+// FUN_00432f84 punch hitscan, the FUN_00437660 cadence machine, the
+// FUN_00469b98 selector, the FUN_00465228 fire latch, and the
+// FUN_00437aa8 charge probe — all ported from BUILD_A.
+void test_player_fire() {
+  const mdk::GameplayInputBindings bindings;
+  const mdk::FrontendTimingState timing;
+  const mdk::RawGameplayInput idle{};
+
+  // ---- FUN_00437660 cadence/burst/ammo machine --------------------
+  {
+    mdk::TraversalRuntime rt;
+    // Pending weapon -> the blend leg: cadence += dt*8, adopt at 3.0.
+    rt.wpnSel0 = 0; rt.wpnSel1 = 2; rt.fireCadence = 2.9f;
+    rt.burstIndex = 5; rt.ammo[2] = 9;
+    mdk::playerWeaponCadence(rt, 0.02f);    // 2.9 + 0.16 = 3.06 >= 3.0
+    CHECK(rt.wpnSel0 == 2 && rt.burstIndex == 0);
+    // Same weapon -> the cadence decays then a burst pip recharges.
+    rt.wpnSel0 = rt.wpnSel1 = 2; rt.fireCadence = 1.0f;
+    rt.burstIndex = 1; rt.ammo[2] = 4;
+    mdk::playerWeaponCadence(rt, 0.1f);     // 1.0 - 0.4 = 0.6
+    CHECK(near(rt.fireCadence, 0.6, 1e-5) && rt.burstIndex == 2);
+    // Empty weapon stuck at 0 -> reloads to weapon 0.
+    rt.wpnSel0 = rt.wpnSel1 = 3; rt.fireCadence = 1.0f;
+    rt.burstIndex = 0; rt.ammo[3] = 0;
+    mdk::playerWeaponCadence(rt, 0.1f);
+    CHECK(rt.wpnSel1 == 0 && rt.burstIndex == 1);
+    // (0x4999d0 && 0x541548) -> the machine is skipped entirely.
+    rt.flag4999d0 = true; rt.flag541548 = true;
+    rt.wpnSel0 = rt.wpnSel1 = 0; rt.fireCadence = 1.0f; rt.burstIndex = 0;
+    mdk::playerWeaponCadence(rt, 0.1f);
+    CHECK(rt.burstIndex == 0 && near(rt.fireCadence, 1.0, 1e-5));
+  }
+
+  // ---- FUN_00469b98 scoped weapon selector ------------------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::GameplayInputFrame ctrl{};
+    rt.ammo = {0, 5, 0, 3, 0, 7};
+    ctrl.weaponSelect[1] = 1;
+    mdk::playerWeaponSelect(rt, ctrl);
+    CHECK(rt.wpnSel1 == 1);                  // ammo[1] > 0 -> 1
+    ctrl = mdk::GameplayInputFrame{};
+    ctrl.weaponSelect[2] = 1;
+    mdk::playerWeaponSelect(rt, ctrl);
+    CHECK(rt.wpnSel1 == 1);                  // ammo[2]==0 -> unchanged
+    ctrl = mdk::GameplayInputFrame{};
+    ctrl.weaponSelect[0] = 1;
+    mdk::playerWeaponSelect(rt, ctrl);
+    CHECK(rt.wpnSel1 == 0);                  // weapon 0 unconditional
+    // itemNext wrap-scan skipping empty slots: 0 -> 2 (1 empty).
+    ctrl = mdk::GameplayInputFrame{};
+    ctrl.itemNext = 1; rt.wpnSel1 = 0;
+    rt.ammo = {0, 0, 2, 4, 0, 6};
+    mdk::playerWeaponSelect(rt, ctrl);
+    CHECK(rt.wpnSel1 == 2);
+    // itemPrev from 0 wraps to the top non-empty slot (5).
+    ctrl = mdk::GameplayInputFrame{};
+    ctrl.itemPrev = 1; rt.wpnSel1 = 0;
+    mdk::playerWeaponSelect(rt, ctrl);
+    CHECK(rt.wpnSel1 == 5);
+  }
+
+  // ---- FUN_00465228 normal-mode fire latch ------------------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::GameplayInputFrame ctrl{};
+    // Press with a free event slot -> latch + the 0x12c/3 fire event.
+    ctrl.fire = 1;
+    mdk::playerFireLatch(rt, ctrl);
+    CHECK(rt.fieldC74 == 1 && rt.eventMag == 0x12c && rt.eventType == 3);
+    // A busy pending event (eventMag=400) suppresses the fire event.
+    rt.eventMag = 400; rt.eventType = 1;
+    mdk::playerFireLatch(rt, ctrl);
+    CHECK(rt.eventMag == 400 && rt.fieldC74 == 1);
+    // Release -> the latch clears (notify off).
+    ctrl.fire = 0; rt.eventPriority = 0; rt.eventType = 0;
+    mdk::playerFireLatch(rt, ctrl);
+    CHECK(rt.fieldC74 == 0);
+  }
+
+  // ---- FUN_00437aa8 charge-probe flag ------------------------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.weapon5Probe = 1; rt.fieldE14 = 0;
+    mdk::playerChargeProbe(rt);
+    CHECK(rt.fieldE14 == 1 && rt.seams.chargeProbeCalls == 1);
+  }
+
+  // ---- FUN_0045f138 dispatch — weapons 0..4 shot spawn ------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.enemies.entries = {{"SW_HOME", 7, false},
+                                {"SW_SGREN", 8, false},
+                                {"SW_HGREN", 9, false},
+                                {"SW_LGREN", 10, false}};
+    rt.camera.pose.pos[0] = 1; rt.camera.pose.pos[1] = 2;
+    rt.camera.pose.pos[2] = 3;
+    rt.motion.yawDeg = 45.0f;
+    rt.viewScalar = 10.0f; rt.look.lookPitchOffset = -5.0f;
+    rt.fieldD0c = 9; rt.burstIndex = 2;
+    // weapon 0 — the tracer, no ammo decrement, default class record.
+    rt.wpnSel0 = 0;
+    mdk::playerFireDispatch(rt);
+    const mdk::PlayerShot& s0 = rt.shots[0];
+    CHECK(s0.state == 1 && s0.type == 0 &&
+          s0.flyKind == mdk::kShotFlyTracer);
+    CHECK(s0.lifetime == 0x4b && near(s0.speedH, 1100.0, 1e-5));
+    CHECK(s0.classIdx == -1);                // 0x4edd48 default
+    CHECK(near(s0.yawDeg, 45.0, 1e-5) && near(s0.pitchDeg, 5.0, 1e-5));
+    CHECK(near(s0.pos[0], 1.0, 1e-5) && near(s0.fieldCc, 2.0, 1e-5));
+    CHECK(rt.fieldD0c == 0 && rt.burstIndex == 1 &&
+          near(rt.fireCadence, 1.0, 1e-5) && rt.shotSerial == 1);
+    CHECK(rt.seams.shotSpawnCalls == 1 && rt.seams.fireSoundCalls == 1);
+
+    // Busy pool -> silent return (no spawn, no serial, no ammo drain).
+    rt.shots[0].state = rt.shots[1].state = rt.shots[2].state = 1;
+    const int serial = rt.shotSerial, ammo1 = rt.ammo[1];
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.shotSerial == serial && rt.ammo[1] == ammo1);
+
+    // weapon 1 — homing grenade: ammo[1]-- + the SW_HOME class index.
+    rt = mdk::TraversalRuntime{};
+    rt.level.enemies.entries = {{"SW_HOME", 7, false}};
+    rt.wpnSel0 = 1; rt.ammo[1] = 6; rt.burstIndex = 1;
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.shots[0].type == 1 &&
+          rt.shots[0].flyKind == mdk::kShotFlyGrenade &&
+          rt.shots[0].lifetime == 0xf0 &&
+          near(rt.shots[0].speedH, 400.0, 1e-5));
+    CHECK(rt.ammo[1] == 5 && rt.shots[0].classIdx == 0);
+    CHECK(rt.seams.classLookupCalls == 1);
+
+    // weapon 4 — the lobbed shot: speedH/V derive from the pitch.
+    rt = mdk::TraversalRuntime{};
+    rt.level.enemies.entries = {{"SW_LGREN", 10, false}};
+    rt.wpnSel0 = 4; rt.ammo[4] = 8;
+    rt.viewScalar = 0.0f; rt.look.lookPitchOffset = 30.0f;
+    mdk::playerFireDispatch(rt);
+    const mdk::PlayerShot& s4 = rt.shots[0];
+    CHECK(s4.type == 4 && s4.flyKind == mdk::kShotFlyLobbed &&
+          s4.lifetime == 0x1c2 && rt.ammo[4] == 7 && s4.classIdx == 0);
+    CHECK(near(s4.speedH, std::cos(30.0 * M_PI / 180.0) * 150.0, 1e-3));
+    CHECK(near(s4.speedV, -std::sin(30.0 * M_PI / 180.0) * 150.0, 1e-3));
+  }
+
+  // ---- FUN_0045f138 weapon 5 — the thrown-object path -------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.wpnSel0 = 5; rt.ammo[5] = 9; rt.burstIndex = 2;
+    // Dead probe -> the can't-fire notify, no spawn, no ammo drain.
+    rt.fieldE14 = 0; rt.field54163b = 0;
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.seams.fireDenyCalls == 1 &&
+          rt.seams.weapon5SpawnCalls == 0 && rt.ammo[5] == 9);
+    // Live probe + charge >= 4 -> latches AND still fires this shot.
+    rt.fieldE14 = 1; rt.field541498 = 4;
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.field54163b == 1 && rt.ammo[5] == 8 &&
+          rt.seams.weapon5SpawnCalls == 1 && rt.burstIndex == 1);
+    // The latch now blocks the next shot.
+    const int spawns = rt.seams.weapon5SpawnCalls;
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.seams.fireDenyCalls == 2 &&
+          rt.seams.weapon5SpawnCalls == spawns);
+  }
+
+  // ---- FUN_0045f138 homing tail — HEAD + predicate elements -------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.enemies.entries = {{"SW_HOME", 7, false}};
+    // Lock target: standable, "0"-prefix/digit elements, one HEAD.
+    mdk::DynamicObject target;
+    target.col.named = true; target.health = 10;
+    target.model = makeHomingModel({{"0PQR", 50.0f}, {"XHEADZ", 100.0f}});
+    target.setPosition(0, 0, 0);
+    mdk::initObjectCollision(target);
+    target.col.flags149 |= 0x20;
+    target.homingPrefix = "0"; target.homingDigitOfs = 0;
+    rt.focusObj = &target; rt.fieldCc8 = 1;
+    rt.wpnSel0 = 1; rt.ammo[1] = 5;
+    rt.camera.pose.basis[2][0] = 0; rt.camera.pose.basis[2][1] = 0;
+    rt.camera.pose.basis[2][2] = -1;   // the homing ray goes +z
+    mdk::playerFireDispatch(rt);
+    // The HEAD element short-circuits (index 1) over the nearer
+    // predicate candidate (index 0) — OBSERVED priority.
+    CHECK(rt.shots[0].homeObj == &target);
+    CHECK(rt.shots[0].homeElem == &target.model.elems[1] &&
+          rt.shots[0].homeElemIdx == 1);
+
+    // No HEAD -> the nearest predicate+clip element wins.
+    rt = mdk::TraversalRuntime{};
+    rt.level.enemies.entries = {{"SW_HOME", 7, false}};
+    mdk::DynamicObject t2;
+    t2.col.named = true; t2.health = 10;
+    t2.model = makeHomingModel({{"0PQR", 50.0f}, {"0PQR", 100.0f}});
+    t2.setPosition(0, 0, 0);
+    mdk::initObjectCollision(t2);
+    t2.col.flags149 |= 0x20;
+    t2.homingPrefix = "0"; t2.homingDigitOfs = 0;
+    rt.focusObj = &t2; rt.fieldCc8 = 1;
+    rt.wpnSel0 = 1; rt.ammo[1] = 5;
+    rt.camera.pose.basis[2][0] = 0; rt.camera.pose.basis[2][1] = 0;
+    rt.camera.pose.basis[2][2] = -1;
+    mdk::playerFireDispatch(rt);
+    // z=50 element is nearer to the ray (|out| = 45 < 95).
+    CHECK(rt.shots[0].homeElem == &t2.model.elems[0] &&
+          rt.shots[0].homeElemIdx == 0);
+
+    // Non-homing weapons store the lock object but skip the scan.
+    rt = mdk::TraversalRuntime{};
+    rt.level.enemies.entries = {{"SW_SGREN", 8, false}};
+    rt.focusObj = &t2; rt.fieldCc8 = 1;
+    rt.wpnSel0 = 2; rt.ammo[2] = 5;
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.shots[0].homeObj == &t2 && rt.shots[0].homeElem == nullptr);
+  }
+
+  // ---- FUN_00432f84 punch — the hit mark + the wall seam ----------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "PNCH");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    rt.cur = a; rt.cs.arena = &a->dyn.col;
+    rt.cs.pos[0] = 0; rt.cs.pos[1] = 0; rt.cs.pos[2] = 10;
+    rt.motion.yawDeg = 0;
+    rt.fieldC74 = 1; rt.ammo[0] = 20;
+    // Nearest-candidate tracking: farObj is the list head (scanned
+    // first) but the nearer nearObj wins on score.
+    mdk::DynamicObject& nearObj = a->dyn.allocFront();
+    nearObj.model = makePlatformModel("T", "E", 0.0f);
+    nearObj.setPosition(6, 0, 15);
+    mdk::initObjectCollision(nearObj);
+    mdk::DynamicObject& farObj = a->dyn.allocFront();
+    farObj.model = makePlatformModel("T", "E", 0.0f);
+    farObj.setPosition(8, 0, 15);
+    mdk::initObjectCollision(farObj);
+    // rebuildObjectTransform seeds the object AABB from its prior
+    // aabb[0]/aabb[5] (the {0,0,0,0,0,0} of a fresh record) — set the
+    // clean world AABBs for a deterministic whole-object test.
+    const float nb[6] = {1, -5, 15, 11, 5, 15};
+    const float fb[6] = {3, -5, 15, 13, 5, 15};
+    std::memcpy(nearObj.col.aabb, nb, sizeof(nb));
+    std::memcpy(farObj.col.aabb, fb, sizeof(fb));
+    const int pt = rt.punchTime;
+    mdk::playerPunch(rt, 1);
+    CHECK(nearObj.field21e == 0xff && farObj.field21e == 0);
+    CHECK(rt.seams.punchHitCalls == 1 && rt.punchHitTime == 1);
+    CHECK(rt.punchTime == pt + 6 && rt.ammo[0] == 19);   // charged *6
+    // The 0x540c74 gate off -> no scan at all.
+    nearObj.field21e = 0; rt.fieldC74 = 0;
+    mdk::playerPunch(rt, 1);
+    CHECK(nearObj.field21e == 0);
+  }
+  {
+    // Miss into a wall -> the wall-impact seam.
+    CollisionFixture f = makeWallArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "PNCH");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    rt.cur = a; rt.cs.arena = &a->dyn.col;
+    rt.cs.pos[0] = 0; rt.cs.pos[1] = 0; rt.cs.pos[2] = 10;
+    rt.motion.yawDeg = 0;                 // +x, into the x=5 wall
+    rt.fieldC74 = 1; rt.ammo[0] = 20;
+    mdk::playerPunch(rt, 1);
+    CHECK(rt.seams.punchWallCalls == 1 && rt.seams.punchHitCalls == 0);
+  }
+
+  // ---- scope gating: d0c++/cadence only under (c9c && ca0 > 1) ----
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "GATE");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    rt.cur = a; rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1; rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.cs.pos[2] = 12.0f; rt.cs.entryPos[2] = 12.0f;
+    rt.hudActive = 1;
+    rt.fieldD0c = 5; rt.fireCadence = 1.0f; rt.burstIndex = 0;
+    rt.wpnSel0 = rt.wpnSel1 = 0;
+    for (int i = 0; i < 5; ++i)
+      mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    // Unscoped: the shared d0c counter and the cadence machine are
+    // both gated by (c9c && ca0 > 1) — neither advances.
+    CHECK(rt.fieldD0c == 5 && rt.burstIndex == 0 &&
+          near(rt.fireCadence, 1.0, 1e-5));
+  }
+}
+
 // Phase 5L — sniper scope lifecycle + mounted reticle. OBSERVED
 // constants and ordering from MDK95.EXE BUILD_A disassembly: the
 // dispatch picks mounted > sniper > normal each frame, the scope
@@ -13094,6 +13427,7 @@ int main() {
   test_camera_obstruction();
   test_camera_nudge();
   test_player_sniper();
+  test_player_fire();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

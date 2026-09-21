@@ -66,6 +66,7 @@
 //   gated 0x49b710 && |0x540d58|==0, may move player AND camera),
 //   0x540cdc teleport block, 0x540ebc pending view snap.
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -81,6 +82,7 @@
 #include "core/frontend_machines.h"
 #include "core/gameplay_input.h"
 #include "core/player_camera.h"
+#include "core/player_fire.h"
 #include "core/player_look.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
@@ -226,6 +228,20 @@ struct TraversalSeams {
   int weaponSlotCalls = 0;        // FUN_00469cd0 inventory scanner
   int mountUnmountCalls = 0;      // unrecognised-class unmount log
                                   // (FUN_00408eb0) + e6c release
+  // --- Phase 5N — player weapon fire (see player_fire.h) ---
+  int shotSpawnCalls = 0;         // FUN_0045f138 0..4 pool spawns
+  int weapon5SpawnCalls = 0;      // FUN_0045a4dc thrown-object spawn
+  int fireDenyCalls = 0;          // FUN_00402388(1,0x54c650) no-fire
+  int fireNotifyCalls = 0;        // FUN_00469668 fire on/off seam
+  int fireSoundCalls = 0;         // FUN_004022b8(0x54c5d0) fire sound
+  int classLookupCalls = 0;       // FUN_00454794 class-name lookups
+  int punchHitCalls = 0;          // punch target hit -> damage tail
+  int punchWallCalls = 0;         // punch miss -> wall impact seam
+  int chargeProbeCalls = 0;       // FUN_00437aa8 -> FUN_0046145c
+  int shotRenderCalls = 0;        // FUN_0045f030 shot-pool render pass
+  int shotPoolTickCalls = 0;      // FUN_004572ac shot-pool update seam
+  int punchDeathCalls = 0;        // FUN_0042ac90 punch-kill seam
+  int punchEffectCalls = 0;       // FUN_00437444/FUN_00458140/etc fx
 };
 
 struct TraversalFrameResult {
@@ -392,6 +408,20 @@ struct TraversalRuntime {
   float overheadAux744 = 0.0f;    // 0x49b744 — overhead-view aux; the
   float overheadAux748 = 0.0f;    // 0x49b748   X_STRIKE mount entry
   float overheadAux76c = 0.0f;    // 0x49b76c   clears all three to 0
+
+  // --- Phase 5N — player weapon fire (player_fire.h) ---
+  // 0x54161f..0x541633 — the six-dword ammo block: ammo[0] doubles
+  // as the punch-charge resource; ammo[1..5] gate the weapons.
+  std::array<int, 6> ammo = {};
+  int field541498 = 0;            // 0x541498 — weapon-5 charge level
+  int field54163b = 0;            // 0x54163b — weapon-5 fire latch
+  int weapon5Probe = 0;           // the FUN_0046145c charge-probe
+                                  // liveness the FUN_00437aa8 seam
+                                  // copies into 0x540e14 each frame
+  int shotSerial = 0;             // 0x540e80 — per-spawn serial
+  std::array<PlayerShot, 3> shots{};  // 0x540ed4 — the 3-slot pool
+  int punchTime = 0;              // 0x540e78 — punch jitter accum
+  int punchHitTime = 0;           // 0x540e7c — hit-time accumulator
   // Damage/energy (FUN_00467a00 difficulty-scaled drain):
   int fieldDac = 0;               // 0x540dac — damage accumulator (cap 180)
   int fieldHealth = 0;            // 0x541554 — player health (drained)

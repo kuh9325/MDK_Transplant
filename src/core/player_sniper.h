@@ -151,10 +151,6 @@ void sniperReset(TraversalRuntime& rt);
 // is the raw drain (mounted-reticle energy deficit or land damage).
 void sniperDamageDrain(TraversalRuntime& rt, int amount);
 
-// FUN_0045f138 — the sniper fire seam. Observable writes only
-// (54161b/54161a/541633); the projectile spawn is a counted seam.
-void sniperFireSeam(TraversalRuntime& rt);
-
 // FUN_00461954 subset — the animation/state machine's sniper-lifecycle
 // states (0x323 scope-in, 0x384 unscope). The full machine (frame-table
 // pointers 0x54cb14/0x54cb18 and the movement/idle handlers) is
