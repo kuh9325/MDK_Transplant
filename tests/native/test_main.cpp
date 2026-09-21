@@ -12400,8 +12400,10 @@ void test_player_camera() {
     // |d58| != 0 suppresses the call (OBSERVED).
     e.lookActive = true;
     CHECK(!mdk::updatePlayerCamera(e, st).obstructionSeam);
-    // b710 == 0 suppresses the call.
+    // b710 == 0 suppresses the call (the field now defaults to the
+    // OBSERVED image init 1 — clear it explicitly to test the gate).
     mdk::PlayerCameraState st2;
+    st2.obstructionEnabled = false;
     e.lookActive = false;
     CHECK(!mdk::updatePlayerCamera(e, st2).obstructionSeam);
   }
@@ -12563,6 +12565,320 @@ void test_player_camera() {
       return h;
     };
     CHECK(runSeq() == runSeq());
+  }
+}
+
+// Phase 5M — camera obstruction (FUN_00430bf8) + camera nudge
+// (FUN_0042b0c0). Expected values are computed from the OBSERVED
+// disassembly: eye = pos + (0,0,5.5), swept-box {0.1,0.1,0.1},
+// flag=0; displacement = 2D |hitPos - camPos| * flipped plane XY;
+// the PLAYER is moved by FUN_004630d4 and the camera follows the
+// applied delta.
+namespace {
+
+// Vertical wall at x = -4 facing +x (the eye->camera segment of a
+// player at the origin facing +X crosses it at ~(-3.9, 0, 10)).
+CollisionFixture makeCamWallArena() {
+  CollisionFixture f;
+  f.verts = {-4, -10, 0, -4, 10, 0, -4, 0, 20};
+  f.polys = {makePoly(0, 1, 2)};
+  f.nodes = {makeNode(1, 0, 0, 4, polySet(1, 0), 0, -1, -1)};
+  f.finish();
+  return f;
+}
+
+// Wall at x = -4 whose far side holds a partial floor at z = 5
+// covering only x in [3,6] x y in [1.5,3]: candidate (4.1, 0) and
+// retry1 (4.1, -2.05) miss it; retry2 (4.1, +2.05) lands inside.
+CollisionFixture makeCamWallFloorArena() {
+  CollisionFixture f;
+  f.verts = {-4, -10, 0, -4, 10, 0, -4, 0, 20,
+             3, 1.5f, 5, 6, 1.5f, 5, 4, 3, 5};
+  f.polys = {makePoly(0, 1, 2), makePoly(3, 4, 5)};
+  f.nodes = {makeNode(1, 0, 0, 4, polySet(1, 0), 0, 1, -1),
+             makeNode(0, 0, 1, -5, polySet(1, 1), 0, -1, -1)};
+  f.finish();
+  return f;
+}
+
+} // namespace
+
+void test_camera_obstruction() {
+  // ---- static hit: wall clips the arm; player pushed +4.1, camera
+  //      follows the applied delta to the box margin --------------
+  {
+    CollisionFixture f = makeCamWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[0] = 0.0f;
+    cs.pos[1] = 0.0f;
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    e.contactToken = nullptr;
+    const mdk::PlayerCameraFrame fr = mdk::updatePlayerCamera(e, st);
+    CHECK(fr.obstructionSeam);
+    // eye (0,0,10.5) -> cam (-8,0,9.5) crosses x=-4; the swept box
+    // face stops 0.1 short: hitPos.x = -3.9, dist = 4.1 along +x.
+    CHECK(near(cs.pos[0], 4.1, 1e-4) && near(cs.pos[1], 0.0, 1e-6) &&
+          near(cs.pos[2], 5.0, 1e-6));
+    CHECK(near(st.pose.pos[0], -3.9, 1e-4) &&
+          near(st.pose.pos[1], 0.0, 1e-6) &&
+          near(st.pose.pos[2], 9.5, 1e-4));
+    // The env channel returns the post-obstruction player pos.
+    CHECK(near(e.playerPos[0], cs.pos[0], 1e-6));
+    // The M1 commit ran AFTER the shift: view[2][3] folds the new
+    // camPos — -(back . cam) * scaleZ = -(-1 * -3.9) * -1 = +3.9.
+    CHECK(near(st.pose.view[2][3], 3.9, 1e-4));
+  }
+
+  // ---- miss: no geometry on the segment -> no displacement -------
+  {
+    CollisionFixture f = makeEmptyArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(cs.pos[0], 0.0) && near(cs.pos[2], 5.0));
+    CHECK(near(st.pose.pos[0], -8.0, 1e-5) &&
+          near(st.pose.pos[2], 9.5, 1e-5));
+  }
+
+  // ---- gates: disabled flag / look-active suppress the pass ------
+  {
+    CollisionFixture f = makeCamWallArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = false;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(cs.pos[0], 0.0) && near(st.pose.pos[0], -8.0, 1e-5));
+
+    mdk::PlayerCameraState st2;
+    auto e2 = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e2.collision = &cs;
+    e2.lookActive = true;
+    mdk::updatePlayerCamera(e2, st2);
+    CHECK(near(cs.pos[0], 0.0) && near(st2.pose.pos[0], -8.0, 1e-5));
+  }
+
+  // ---- carrier retry: primary misses, carrier arena hits ---------
+  {
+    CollisionFixture fp = makeEmptyArena();
+    CollisionFixture fc = makeCamWallArena();
+    mdk::CollisionState cs = makeCollisionState(&fp.arena);
+    cs.carrier = &fc.arena;
+    cs.carrierBusy = 0;
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(cs.pos[0], 4.1, 1e-4));
+    CHECK(near(st.pose.pos[0], -3.9, 1e-4));
+    // carrierBusy (0x540d3c) suppresses the retry.
+    mdk::CollisionState cs2 = makeCollisionState(&fp.arena);
+    cs2.carrier = &fc.arena;
+    cs2.carrierBusy = 1;
+    cs2.pos[2] = 5.0f;
+    mdk::PlayerCameraState st2;
+    auto e2 = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e2.collision = &cs2;
+    mdk::updatePlayerCamera(e2, st2);
+    CHECK(near(cs2.pos[0], 0.0) && near(st2.pose.pos[0], -8.0, 1e-5));
+  }
+
+  // ---- grounding probe: 0x540e4c != 0 requires the +-4 stab to
+  //      land on primary-arena geometry; perpendicular retries ----
+  {
+    CollisionFixture f = makeCamWallFloorArena();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    e.contactToken = &f.polys[0];  // last-contact token nonzero
+    mdk::updatePlayerCamera(e, st);
+    // h = 0.5 * 4.1 = 2.05; candidate (4.1,0) misses the partial
+    // floor, retry1 (4.1,-2.05) misses, retry2 (4.1,+2.05) lands —
+    // the mirrored perpendicular displacement is applied.
+    CHECK(near(cs.pos[0], 4.1, 1e-4) && near(cs.pos[1], 2.05, 1e-4));
+    CHECK(near(st.pose.pos[0], -3.9, 1e-4) &&
+          near(st.pose.pos[1], 2.05, 1e-4));
+  }
+
+  // ---- grounding probe exhausted: all three stabs miss -> early
+  //      return, no apply AND no object pass -----------------------
+  {
+    CollisionFixture f = makeCamWallFloorArena();
+    // Move the floor tri where no candidate reaches it.
+    f.verts = {-4, -10, 0, -4, 10, 0, -4, 0, 20,
+               8, 8, 5, 10, 8, 5, 9, 10, 5};
+    f.finish();
+    // An object that WOULD clamp the segment if the pass ran.
+    ObjectFixture o;
+    float eb[6] = {-6, -1, 8, -5, 1, 11};
+    std::memcpy(o.elem.aabb, eb, sizeof(eb));
+    o.elemSet.count = 1;
+    o.elemSet.elems = &o.elem;
+    o.obj.named = true;
+    o.obj.model = &o.modelDummy;
+    o.obj.elements = &o.elemSet;
+    o.obj.flags14b = 1;
+    std::memcpy(o.obj.aabb, eb, sizeof(eb));
+    f.arena.objects = &o.obj;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    e.contactToken = &f.polys[0];
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(cs.pos[0], 0.0) && near(cs.pos[1], 0.0));
+    CHECK(near(st.pose.pos[0], -8.0, 1e-5) &&
+          near(st.pose.pos[1], 0.0, 1e-6));
+  }
+
+  // ---- object pass: AABB clamp pulls the camera in front of the
+  //      box; the player is pushed by (clamp - camPos).xy ----------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    float eb[6] = {-6, -1, 8, -5, 1, 11};
+    std::memcpy(o.elem.aabb, eb, sizeof(eb));
+    o.elemSet.count = 1;
+    o.elemSet.elems = &o.elem;
+    o.obj.named = true;
+    o.obj.model = &o.modelDummy;
+    o.obj.elements = &o.elemSet;
+    o.obj.flags14b = 1;
+    std::memcpy(o.obj.aabb, eb, sizeof(eb));
+    f.arena.objects = &o.obj;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    mdk::updatePlayerCamera(e, st);
+    // Segment enters the box at x = -5 (t = 0.625): clamp
+    // (-5, 0, 9.875); delta = clamp.xy - camPos.xy = (+3, 0).
+    CHECK(near(cs.pos[0], 3.0, 1e-4) && near(cs.pos[1], 0.0, 1e-6));
+    CHECK(near(st.pose.pos[0], -5.0, 1e-4) &&
+          near(st.pose.pos[2], 9.5, 1e-4));
+  }
+
+  // ---- object flag filters: 0x810 and !bit0 skip the object ------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    float eb[6] = {-6, -1, 8, -5, 1, 11};
+    std::memcpy(o.elem.aabb, eb, sizeof(eb));
+    o.elemSet.count = 1;
+    o.elemSet.elems = &o.elem;
+    o.obj.named = true;
+    o.obj.model = &o.modelDummy;
+    o.obj.elements = &o.elemSet;
+    std::memcpy(o.obj.aabb, eb, sizeof(eb));
+    f.arena.objects = &o.obj;
+
+    // flags148 & 0x800 -> skipped.
+    o.obj.flags148 = 0x800;
+    o.obj.flags14b = 1;
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 5.0f;
+    mdk::PlayerCameraState st;
+    auto e = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e.collision = &cs;
+    mdk::updatePlayerCamera(e, st);
+    CHECK(near(cs.pos[0], 0.0) && near(st.pose.pos[0], -8.0, 1e-5));
+
+    // flags14b bit0 clear -> skipped.
+    o.obj.flags148 = 0;
+    o.obj.flags14b = 0;
+    mdk::CollisionState cs2 = makeCollisionState(&f.arena);
+    cs2.pos[2] = 5.0f;
+    mdk::PlayerCameraState st2;
+    auto e2 = camEnv(0.0f, 0.0f, 5.0f, 90.0f, 0.0f);
+    e2.collision = &cs2;
+    mdk::updatePlayerCamera(e2, st2);
+    CHECK(near(cs2.pos[0], 0.0) && near(st2.pose.pos[0], -8.0, 1e-5));
+  }
+}
+
+// Phase 5M — FUN_0042b0c0 nudge + FUN_0042b20c mode->scale.
+void test_camera_nudge() {
+  // ---- arg=+1: pos += M2row0*0.25; tick=20; M1 row0 += row2*r ----
+  {
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = false;   // isolate the nudge math
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e, st);
+    // Baseline: camPos (-8,0,4.5); M2 row0 = right*|right| = (0,-1,0);
+    // M1 rows: (0,-5/6,0) / (0,0,-25/18) / (1,0,0).
+    CHECK(near(st.pose.basis[0][1], -1.0, 1e-5));
+    mdk::cameraNudge(1, st);
+    // pos += (0,-1,0) * (1 * 0.25).
+    CHECK(near(st.pose.pos[0], -8.0, 1e-5) &&
+          near(st.pose.pos[1], -0.25, 1e-5) &&
+          near(st.pose.pos[2], 4.5, 1e-5));
+    // tick = trunc(1 * 20.0) = 20; r = 20/600 = 1/30.
+    CHECK(st.nudgeTick == 20);
+    const double r = 20.0 / 600.0;
+    // M1[0] += M1[2] * r: (0,-5/6,0) + (1,0,0)*r -> (r, -5/6, 0).
+    CHECK(near(st.pose.view[0][0], r, 1e-6));
+    CHECK(near(st.pose.view[0][1], -0.8333333, 1e-6));
+    CHECK(near(st.pose.view[0][2], 0.0, 1e-6));
+    // Translations refolded against the UPDATED row0 + camPos:
+    //   t0 = -(r*-8 + (-5/6)*-0.25 + 0*4.5) = -(-8r + 5/24).
+    CHECK(near(st.pose.view[0][3], -(-8.0 * r + 5.0 / 24.0), 1e-5));
+    CHECK(near(st.pose.view[1][3], 6.25, 1e-4));
+    CHECK(near(st.pose.view[2][3], 8.0, 1e-4));
+    // M2 untouched.
+    CHECK(near(st.pose.basis[2][3], -8.0, 1e-4));
+  }
+
+  // ---- arg=-1 mirrors the shift and the tick sign ----------------
+  {
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = false;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e, st);
+    mdk::cameraNudge(-1, st);
+    CHECK(near(st.pose.pos[1], 0.25, 1e-5));
+    CHECK(st.nudgeTick == -20);
+    CHECK(near(st.pose.view[0][0], -20.0 / 600.0, 1e-6));
+  }
+
+  // ---- truncation: FRNDINT under the trunc control word ----------
+  {
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = false;
+    st.nudgeScale = 12.7f;
+    auto e = camEnv(0.0f, 0.0f, 0.0f, 90.0f, 0.0f);
+    mdk::updatePlayerCamera(e, st);
+    mdk::cameraNudge(1, st);
+    CHECK(st.nudgeTick == 12);   // toward zero, not round-nearest 13
+    mdk::cameraNudge(-1, st);
+    CHECK(st.nudgeTick == -12);  // toward zero, not floor -13
+  }
+
+  // ---- FUN_0042b20c mode -> nudgeScale map -----------------------
+  {
+    mdk::PlayerCameraState st;
+    mdk::cameraNudgeApplyMode(st, 0);
+    CHECK(st.nudgeScale == 12.0f);
+    mdk::cameraNudgeApplyMode(st, 1);
+    CHECK(st.nudgeScale == 20.0f);
+    mdk::cameraNudgeApplyMode(st, 2);
+    CHECK(st.nudgeScale == 15.0f);
+    mdk::cameraNudgeApplyMode(st, 3);
+    CHECK(st.nudgeScale == 20.0f);
+    mdk::cameraNudgeApplyMode(st, 9);
+    CHECK(st.nudgeScale == 20.0f);
   }
 }
 
@@ -12775,6 +13091,8 @@ int main() {
   test_traversal_object_init();
   test_player_look();
   test_player_camera();
+  test_camera_obstruction();
+  test_camera_nudge();
   test_player_sniper();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

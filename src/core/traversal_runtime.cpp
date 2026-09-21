@@ -1329,11 +1329,18 @@ TraversalFrameResult stepTraversalRuntime(
     ce.altAspect = rt.flag5414bc;
     ce.sniperViewport = (rt.flagC9c != 0 && rt.transitionPhase != 0);
     ce.lookActive = (rt.look.lookPitchOffset != 0.0f);
+    // Phase 5M — the FUN_00430bf8 collision context: cs carries the
+    // player pos (0x540bfc), the arenas (c48/ca4), the carrier gate
+    // (d3c) and the object-pass gate (c68); contactToken is the last
+    // gameplay apply's 0x540e4c token (the obstruction's own applies
+    // do not write it — the original stores it only in the
+    // locomotion callers FUN_00467180/FUN_00467ed0).
+    ce.collision = &rt.cs;
+    ce.contactToken = rt.lastContactPoly;
     const PlayerCameraFrame cf = updatePlayerCamera(ce, rt.camera);
     if (cf.obstructionSeam) ++rt.seams.cameraObstructionCalls;
-    // FUN_00430bf8 writes BOTH endpoints when it runs — the seam is
-    // not ported, but keep the in/out contract real for the future
-    // port (no-op today: the seam only counts).
+    // FUN_00430bf8 writes BOTH endpoints when it runs — env.playerPos
+    // returns the post-obstruction 0x540bfc (already == rt.cs.pos).
     for (int i = 0; i < 3; ++i) rt.cs.pos[i] = ce.playerPos[i];
 
     // 0x43097f..0x4309ce — portal tail: b714 <- 0; eye = pos+3z;
@@ -1386,40 +1393,66 @@ TraversalFrameResult stepTraversalRuntime(
       rt.eventTimer = 0.0f;
   }
   rt.fieldE14 = 0;
-  // OBSERVED (0x43649e..0x4364d9): the extra tick pair runs only
-  // when flag541548 != 0 — FUN_0042b20c(flagC9c && phase>1) then
-  // FUN_00436d60(-1, prim, sec); FUN_00436d60(1, prim, sec) always.
-  if (rt.flag541548) {
-    ++rt.seams.extraWorldTickCalls; // FUN_0042b20c + 36d60(-1)
-  }
-  ++rt.seams.worldTickCalls;        // FUN_00436d60(1, prim, sec)
-
-  // ---- world-tick internals (FUN_00436d60, OBSERVED) ----
-  // FUN_00436ea8 -> FUN_00431300 -> FUN_00461954: the animation/state
-  // machine. The bounded subset handles the sniper-lifecycle states
-  // (0x323 scope-in, 0x384 unscope) + the cb0 first-frame latch; the
-  // rest of the machine is deferred.
-  ++rt.seams.animDriverCalls;
-  playerAnimAdvance(rt, timing.frameStep);
-  // FUN_00436f08 -> FUN_00436088: the shared fire cadence counter d0c
-  // increments while the HUD gate (0x5414d4) is up, saturating at 999.
-  if (rt.hudActive != 0 && rt.fieldD0c < 999) ++rt.fieldD0c;
-  // FUN_00437660: the 54161b timer — during a weapon switch it blends
-  // up (f4*8.0 to 3.0, then wpnSel0 adopts + burstIndex resets); else
-  // it's the fire cadence, decaying f4*4.0 floored at 0. Skipped while
-  // (0x4999d0 && 0x541548).
-  if (!(rt.flag4999d0 && rt.flag541548)) {
-    if (rt.wpnSel0 != rt.wpnSel1) {
-      rt.fireCadence += dt * 8.0f;
-      if (rt.fireCadence >= 3.0f) {
-        rt.burstIndex = 0;
-        rt.wpnSel0 = rt.wpnSel1;
+  // OBSERVED (0x436491..0x4364dd): EAX = 0; when flag541548 == 0 the
+  // single call is FUN_00436d60(0) — body only, no bracket. When
+  // flag541548 != 0 the caller first runs FUN_0042b20c(c9c != 0 &&
+  // ca0 > 1 ? 1 : 0), then FUN_00436d60(-1) and falls through to
+  // FUN_00436d60(+1) — the shared body runs TWICE per frame, once
+  // inside each call's save/nudge/restore bracket.
+  // FUN_00436d60(arg): arg != 0 -> save the 212-byte camera block
+  // (FUN_0042b060) -> FUN_0042b0c0(arg) -> shared body -> restore
+  // (FUN_0042b090); arg == 0 -> body only. Each call's flag541548
+  // tail rewrites the same nudgeTick via FUN_0042b248(arg) — no
+  // observable delta. OBSERVED: 0x541548 is BSS and has NO writer in
+  // BUILD_A (all 27 xrefs are reads) — the dual-call bracket is a
+  // dead second-viewport path in this build.
+  const auto run36d60Body = [&]() {
+    ++rt.seams.animDriverCalls;
+    // FUN_00436ea8 -> FUN_00431300 -> FUN_00461954: the
+    // animation/state machine. The bounded subset handles the
+    // sniper-lifecycle states (0x323 scope-in, 0x384 unscope) + the
+    // cb0 first-frame latch; the rest of the machine is deferred.
+    playerAnimAdvance(rt, timing.frameStep);
+    // FUN_00436f08 -> FUN_00436088: the shared fire cadence counter
+    // d0c increments while the HUD gate (0x5414d4) is up, saturating
+    // at 999.
+    if (rt.hudActive != 0 && rt.fieldD0c < 999) ++rt.fieldD0c;
+    // FUN_00437660: the 54161b timer — during a weapon switch it
+    // blends up (f4*8.0 to 3.0, then wpnSel0 adopts + burstIndex
+    // resets); else it's the fire cadence, decaying f4*4.0 floored
+    // at 0. Skipped while (0x4999d0 && 0x541548).
+    if (!(rt.flag4999d0 && rt.flag541548)) {
+      if (rt.wpnSel0 != rt.wpnSel1) {
+        rt.fireCadence += dt * 8.0f;
+        if (rt.fireCadence >= 3.0f) {
+          rt.burstIndex = 0;
+          rt.wpnSel0 = rt.wpnSel1;
+        }
+      } else if (rt.fireCadence > 0.0f) {
+        rt.fireCadence -= dt * 4.0f;
+        if (rt.fireCadence < 0.0f) rt.fireCadence = 0.0f;
+        // 54161a burst-advance + the HUD seams — deferred.
       }
-    } else if (rt.fireCadence > 0.0f) {
-      rt.fireCadence -= dt * 4.0f;
-      if (rt.fireCadence < 0.0f) rt.fireCadence = 0.0f;
-      // 54161a burst-advance + the HUD seams — deferred.
     }
+  };
+  if (rt.flag541548) {
+    ++rt.seams.extraWorldTickCalls; // FUN_0042b20c + the -1/+1 calls
+    cameraNudgeApplyMode(
+        rt.camera,
+        (rt.flagC9c != 0 && rt.transitionPhase > 1) ? 1 : 0);
+    ++rt.seams.worldTickCalls;    // 36d60(-1): save, nudge, body, restore
+    PlayerCameraPose saved = rt.camera.pose;
+    cameraNudge(-1, rt.camera);
+    run36d60Body();
+    rt.camera.pose = saved;
+    ++rt.seams.worldTickCalls;    // 36d60(+1): save, nudge, body, restore
+    saved = rt.camera.pose;
+    cameraNudge(1, rt.camera);
+    run36d60Body();
+    rt.camera.pose = saved;
+  } else {
+    ++rt.seams.worldTickCalls;    // 36d60(0): body only
+    run36d60Body();
   }
 
   // FUN_0040b4dc(0) — pending surface-op re-arms, current then

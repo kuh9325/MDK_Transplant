@@ -2607,3 +2607,223 @@ overhead settle `-25/s`, pos/yaw pinned, semi-auto latch, recharge).
 - `0x540eb0`/`0x540eb4` event-timer gate (`c9c != 0 || !liveTimerObj`)
   — the `eb0 = 0` clear is gated in the original; the native countdown
   model predates Phase 5L and is left unchanged.
+
+# Phase 5M — Camera Obstruction and Camera Nudge
+
+Phase 5M closes the two normal-camera seams Phase 5K left open:
+`FUN_00430bf8` (the obstruction/displacement call inside the pose
+tail) and `FUN_0042b0c0` (the bracketed render-pass nudge). Both are
+fully reconstructed from OBSERVED disassembly; no spring-arm or
+generic camera-collision abstraction is introduced.
+
+## 112. `FUN_00430bf8` — signature, gate, call site (OBSERVED)
+
+- Signature: `FUN_00430bf8(EAX)` — `EAX = &0x540b28` (the camera
+  position inside the 212-byte camera block). All other inputs are
+  globals: player pos `0x540bfc`, arenas `0x540c48`/`0x540ca4`,
+  carrier gate `0x540d3c`, object gate `0x540c68`, contact token
+  `0x540e4c`.
+- Call gate (proven in Phase 5K): `0x49b710 != 0 && |0x540d58| == 0`,
+  fired after the basis rows exist and before the M1/M2 commit.
+- `0x49b710` defaults to **1** in the BUILD_A image — obstruction is
+  ON by default. The only writer found is the cheat-string table
+  handler `FUN_00423ca0` (also sets it to 1); the earlier
+  "default-off" note was wrong.
+- `0x540d58` gate: semantic-look offset — while look is active the
+  whole call is skipped (no alternate obstruction path).
+
+## 113. Static query — `FUN_00407fc0` (OBSERVED)
+
+- `eye = playerPos + (0, 0, 5.5)` (f64 const `0x4972a8`), segment
+  `eye -> camPos`, box extents `0x49b780 = {0.1, 0.1, 0.1}`,
+  `flag = 0` (single contact pass — no slide iterations),
+  `scale = 0`, callback 0. This is the same swept-box-vs-BSP query
+  as the player move — a swept AABB, not a raycast.
+- On a primary-arena miss the query is retried against
+  `0x540ca4` (the carrier/partner arena) when `0x540ca4 != 0 &&
+  0x540d3c == 0`.
+- `FUN_00408254` returns the sweep's hit BSP node (`0x4a20c8`) —
+  the displacement derives from that node's split plane, not the
+  poly.
+
+## 114. Displacement + grounding probe (OBSERVED)
+
+On a hit:
+
+1. `dist = |hitPos.xy - camPos.xy|` (FUN_004301bc — 2D XY Euclidean
+   distance, f64 sqrt, f32 store).
+2. `nx, ny` = the hit node's plane XY. The eye is re-derived from the
+   live `0x540bfc` (+5.5) and its plane distance `pd` is folded as
+   `(x*nx + z*nz) + (y*ny + d)`; `pd < 0` flips `nx, ny` (the
+   original XORs the float sign bytes).
+3. `dx = dist * nx`, `dy = dist * ny` (f64 products, f32 stores).
+4. If `0x540e4c != 0` (the last locomotion contact token — written
+   only by `FUN_00467180`/`FUN_00467ed0`, never by the camera's own
+   applies), the displacement is gated by `FUN_00418c60`: a vertical
+   stab from `pos + (dx, dy, +4.0)` to `pos + (dx, dy, -4.0)`
+   (`0x4972b0`/`0x4972b4`) against the PRIMARY arena `0x540c48` —
+   even after a carrier hit.
+5. Retry 1 (`h = dist * 0.5`, f64 const `0x4972b8`):
+   `dx = dx0 + h*ny`, `dy = dy0 - h*nx`. Retry 2:
+   `dx = dx0 - h*ny`, `dy = dy0 + h*nx`. Three stabs total.
+6. All three missing -> `JMP 0x430e8e`: the function returns with NO
+   apply AND no object pass — the object pass is skipped too.
+7. Surviving displacement: `FUN_004630d4(dx, dy, 0, 0.75, 0, 0)` —
+   the PLAYER is moved through the full collision apply (scale
+   `0x3f400000`); the camera then follows the APPLIED player delta:
+   `camPos += (0x540bfc - snapshot)`. The snapshot is taken
+   immediately before the call — the moved player position becomes
+   the frame's committed position (the `entryPos` commit already ran
+   earlier in the tail, so obstruction does not leak into prevPos).
+
+## 115. `FUN_00418c60` — the grounding stab (OBSERVED, ported)
+
+Bounded helper chain: `FUN_00418c60` (verts-null bail, `mode = 0`,
+copies the crossing point to the caller on hit) -> `FUN_00418a50`
+recursive BSP walk -> `FUN_004189c8` (crossing-point interpolator:
+`t = -dStart / ((cand2-cand1).plane)`, `t = 1` when the denominator
+is 0) -> `FUN_00418930` (poly-set scan; skips `flags & 0x20`;
+`FUN_00425600` point-in-triangle — the dominant-axis ray-cast already
+ported as `pointInTri`).
+
+Walk semantics (byte-verified): at each node compute
+`dStart/dEnd = (ny*p.y + nx*p.x) + nz*p.z + d`; descend the side
+containing cand1 first (`dStart < 0 -> childFar`, else `childNear`);
+on a strict crossing (`dStart*dEnd < 0`) interpolate the crossing and
+scan `polysPos` then `polysNeg`; on a double miss iterate the
+OPPOSITE side (`dStart >= 0 -> childFar`, `dStart < 0 -> childNear`)
+and loop.
+
+## 116. Dynamic-object pass (OBSERVED, `0x430db2..0x430e8b`)
+
+- Gate: `0x540c68 != 0` — the arena object-data validity flag
+  (`CollisionState::arenaValid`; the same gate `collisionApply` uses
+  for its object pass).
+- `eye` rebuilt from live `0x540bfc + 5.5`; `target` starts at the
+  live `0x540b28` camPos (post-static-displacement when one applied).
+- Object list: `arena + 0x68`. Per object:
+  `named(+0x6) != 0 && model(+0x8) != 0 && !(flags148 & 0x810) &&
+   (flags14b & 0x01) != 0`.
+- Prefilter `FUN_0045cd38(eye, target, obj+0x198, ext=0.1)` — the
+  non-strict per-axis segment/AABB overlap.
+- Element scan: `obj+0xc` -> `{count @ +0x1c, elems @ +0x20}`,
+  stride `0x5c`, element AABB at `+0x44`. Per element
+  `FUN_0045c838(eye, target, elemAABB, clamp, outAlt=0)` — on a
+  face-clamp (`rc == 1`) `target` adopts the clamp point; `rc == 2`
+  is ignored here (unlike the player apply, which prefers `altPt`).
+- Tail — runs UNCONDITIONALLY when the gate passed:
+  `FUN_004630d4(target.xy - camPos.xy, 0, 0.75, 0, 0)`; the camera
+  follows the applied player delta (same snapshot pattern). A zero
+  delta still runs the apply.
+
+## 117. Position ownership + ordering (OBSERVED)
+
+- `0x540bfc` (player pos) and `0x540b28` (camPos) are the only
+  written endpoints; `entryPos` committed BEFORE the camera block
+  (Phase 5K order), so the obstruction push does not enter prevPos.
+- The M1/M2 commit runs AFTER the call, so both matrices fold the
+  displaced camPos; the eye->camPos portal tail
+  (`FUN_00435178`) then consumes the displaced camPos — obstruction
+  feeds the `0x49b714` view-on-partner select.
+
+## 118. `FUN_0042b0c0` — camera nudge (OBSERVED, byte-verified)
+
+`FUN_0042b0c0(EAX arg)`:
+
+1. `camPos += M2row0 * (arg * 0x49b570)` — `0x49b570 = 0.25f`, M2
+   row0 = the unscaled `right*|right|` basis row. NO writer for
+   `0x49b570` was found (image const).
+2. `0x49b578 = FRNDINT(arg * 0x49b574)` under the trunc control word
+   (`FUN_0047d59a`) — toward zero, not round-nearest.
+   `0x49b574` is written by `FUN_0042b20c` (init 20.0).
+3. `r = tick * 0x496e0c` (`= 1/600` f32); `M1row0 += M1row2 * r`
+   — including `M1[0][2] += M1[2][2]*r` (the `dc cb` = `FMUL ST3,ST0`
+   byte pair at `0x42b163` + `FXCH ST3` confirmed symmetric).
+4. All three M1 translations refolded against the UPDATED row0 and
+   camPos: `t_r = -(row[1]*cy + row[0]*cx + row[2]*cz)`, f32 stores.
+   M2 and `camPos` itself are NOT re-refolded; row1/row2 rotations
+   are untouched.
+
+## 119. Nudge callers + `FUN_0042b20c` (OBSERVED)
+
+- `FUN_0042b20c(mode)` writes `0x49b574`: `{0 -> 12.0, 2 -> 15.0,
+  else -> 20.0}` (jump table `0x42b1fc`); called from level init
+  `FUN_0040ef28` and the `FUN_00436100` world-tick head.
+- `FUN_0042b060`/`FUN_0042b090` save/restore the whole 212-byte
+  camera block `0x540b28..0x540bdb` — the nudge is a bracketed
+  per-pass perturbation; `0x49b578` sits OUTSIDE the saved range, so
+  `nudgeTick` is the bracket's only persistent footprint.
+- World-tick site (`0x436491`, inside `FUN_00436100`):
+  `flag541548 == 0` -> `FUN_00436d60(0)` (body only, NO nudge);
+  `flag541548 != 0` -> `FUN_0042b20c(c9c && ca0>1 ? 1 : 0)` then
+  `FUN_00436d60(-1)` AND `FUN_00436d60(+1)` — the shared body runs
+  TWICE per frame, once inside each call's save/nudge/restore
+  bracket. Each `36d60` tails with `FUN_0042b248(arg)` when
+  `flag541548` (re-writes the same `nudgeTick` — no delta).
+- `0x541548` is BSS and has **zero writers** in BUILD_A (all 27
+  xrefs are reads) — a dead second-viewport/stereo path in this
+  build; the nudge is unreachable in normal play.
+- `FUN_0047c504` contains the same `nudge(-1) -> render ->
+  nudge(+1)` bracket on its second-pass path — same pattern, same
+  inert-in-BUILD_A flag family.
+- Nudge vs shake: `0x540ce4/cf8/cfc` is the Phase 5K pose shake
+  (added pre-basis); `FUN_0042b0c0` is a post-pose M2-row0
+  translation + M1 row0 tilt driven by `0x49b578`'s int accumulator —
+  a separate mechanism (viewport wobble for the dual-viewport path),
+  kept separate.
+
+## 120. Native implementation
+
+- `applyCameraObstruction(env, st)` — the `FUN_00430bf8` core; reads
+  `env.collision` (`CollisionState` = `0x540bfc`/`c48`/`ca4`/`d3c`/
+  `c68`) and `env.contactToken` (`0x540e4c`); syncs `env.playerPos`
+  on exit. Called from `updatePlayerCamera` at the original seam
+  point (post-basis, pre-M1-commit).
+- `collisionStab(arena, from, to, outPos)` — the `FUN_00418c60`
+  mode-0 chain (exported from `collision_query.cpp` alongside
+  `collisionSegAabbOverlap`/`collisionSegAabbResolve`).
+- `cameraNudge(arg, st)` — `FUN_0042b0c0`;
+  `cameraNudgeApplyMode(st, mode)` — `FUN_0042b20c`.
+- `PlayerCameraState`: `obstructionEnabled` (`0x49b710`, default
+  true per the image), `nudgeShift`/`nudgeScale`/`nudgeTick`
+  (`0x49b570/574/578`).
+- `stepTraversalRuntime`: `ce.collision = &rt.cs`,
+  `ce.contactToken = rt.lastContactPoly` (the locomotion apply's
+  `0x540e4c`); the `0x436491` site mirrors the original — the shared
+  body runs once via `36d60(0)` when `flag541548 == 0`, twice inside
+  the `-1`/`+1` brackets when set.
+
+## 121. Validation
+
+- `test_camera_obstruction` + `test_camera_nudge`: 40 checks —
+  miss, static hit (+4.1 player push, camera follows to the box
+  margin, M1 refolds the displaced pos), gates (b710 off, look
+  active), carrier retry + `d3c` suppression, grounding-probe retry2
+  (+2.05 perpendicular), all-probes-miss early return (object pass
+  skipped too), object AABB clamp (+3 push, camera to x=-5), object
+  flag filters (`0x810`, `flags14b bit0`), nudge pos/tick/row0/
+  refold/truncation/mode-map.
+- `mdk-inspect --selftest-camera-obstruction`: 21 checks — PASS.
+- `mdk_tests`: 3671 checks / 0 failures; CTest 1/1; Python 17/17.
+- LEVEL3-8 `--traversal-runtime`: all PASS; `camcol` now counts the
+  seam firing each frame (was a bare count before).
+- `CHMO_2 -> HMO_3`: `portals=1`, `teleport=0`, door
+  `0x18->0x12->0x11`, `flags148 0x8000->0x8010` — unchanged; the
+  deterministic digest `8ecf2d101a3b5c70` (400f) is stable across
+  runs AND bit-identical to the Phase 5L baseline — the seam fires
+  every frame (`camcol=400`) but the corridor camera never clips
+  geometry, so no displacement is produced on this route.
+- BUILD_A manifest: 141/141, missing 0, added 0, changed 0.
+
+## 122. Phase 5M boundary / remaining unknowns
+
+- `0x541548` producer — UNKNOWN (no writer in BUILD_A; likely a
+  stereo/second-viewport config written via a computed pointer or an
+  absent subsystem). The dual `36d60` bracket is dead code here.
+- `FUN_0047c504`'s second-pass nudge bracket — decoded shape only;
+  its caller/gating is a render-path seam.
+- `0x540c9c`/`0x540ca0` mode fields — consumed here as the
+  `b20c(1)`/`b20c(0)` selector; their producers stay with the sniper
+  subsystem.
+- Whether retail DOS builds wire `0x541548` — UNKNOWN (BUILD_A only).
+- Projectile/weapon systems remain deferred per scope.

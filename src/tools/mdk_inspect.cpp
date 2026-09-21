@@ -79,7 +79,8 @@ int usage() {
                "                            --yaw DEG --frames N)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
-               "       mdk-inspect --selftest-camera-pose\n");
+               "       mdk-inspect --selftest-camera-pose\n"
+               "       mdk-inspect --selftest-camera-obstruction\n");
   return 2;
 }
 
@@ -911,6 +912,255 @@ int selftestCameraPose() {
   return ok ? 0 : 3;
 }
 
+// Phase 5M — camera-obstruction + nudge selftest. Exercises
+// FUN_00430bf8 (synthetic wall/floor/object fixtures) and
+// FUN_0042b0c0 against hand-computed values from the OBSERVED
+// disassembly. No --data-path required.
+int selftestCameraObstruction() {
+  bool ok = true;
+  auto check = [&](bool c, const char* what) {
+    if (!c) ok = false;
+    std::fprintf(stderr, "  %-56s %s\n", what, c ? "ok" : "FAIL");
+  };
+  auto near = [](float a, double e, double eps = 1e-4) {
+    return std::fabs((double)a - e) < eps;
+  };
+  auto mkPoly = [](std::uint16_t a, std::uint16_t b, std::uint16_t c) {
+    mdk::CollisionPoly p = {};
+    p.v[0] = a;
+    p.v[1] = b;
+    p.v[2] = c;
+    return p;
+  };
+  auto mkNode = [](float nx, float ny, float nz, float d,
+                   std::uint32_t pos, std::uint32_t neg,
+                   std::int16_t cn, std::int16_t cf) {
+    mdk::CollisionNode n = {};
+    n.nx = nx;
+    n.ny = ny;
+    n.nz = nz;
+    n.d = d;
+    n.polysPos = pos;
+    n.polysNeg = neg;
+    n.childNear = cn;
+    n.childFar = cf;
+    return n;
+  };
+  auto pset = [](std::uint32_t count, std::uint32_t first) {
+    return (first << 16) | count;
+  };
+
+  // Wall at x=-4 facing +x; a player at the origin facing +X puts
+  // the eye->camera segment through it (crossing ~(-3.9, 0, 10)).
+  float wallVerts[9] = {-4, -10, 0, -4, 10, 0, -4, 0, 20};
+  mdk::CollisionPoly wallPoly[1] = {mkPoly(0, 1, 2)};
+  mdk::CollisionNode wallNode[1] = {
+      mkNode(1, 0, 0, 4, pset(1, 0), 0, -1, -1)};
+  mdk::CollisionArena wallArena = {};
+  wallArena.verts = wallVerts;
+  wallArena.polys = wallPoly;
+  wallArena.nodes = wallNode;
+
+  // Empty arena (node, no polys) — the sweep misses.
+  mdk::CollisionNode emptyNode[1] = {
+      mkNode(0, 0, 1, -10, 0, 0, -1, -1)};
+  mdk::CollisionArena emptyArena = {};
+  emptyArena.nodes = emptyNode;
+
+  auto mkState = [](const mdk::CollisionArena* a) {
+    mdk::CollisionState cs;
+    cs.arena = a;
+    cs.queryEnabled = 1;
+    cs.arenaValid = 1;
+    cs.objectDataLoaded = 1;
+    cs.pos[0] = 0.0f;
+    cs.pos[1] = 0.0f;
+    cs.pos[2] = 5.0f;
+    return cs;
+  };
+  auto mkEnv = [](mdk::CollisionState& cs) {
+    mdk::PlayerCameraEnvironment e = {};
+    e.playerPos[2] = 5.0f;
+    e.viewYawDeg = 90.0f;
+    e.yawDeg = 0.0f;
+    e.collision = &cs;
+    return e;
+  };
+
+  // 1. Miss: empty arena -> nothing moves.
+  {
+    mdk::CollisionState cs = mkState(&emptyArena);
+    mdk::PlayerCameraState st;
+    auto e = mkEnv(cs);
+    const mdk::PlayerCameraFrame fr = mdk::updatePlayerCamera(e, st);
+    check(fr.obstructionSeam, "gate fires the obstruction seam");
+    check(near(cs.pos[0], 0.0) && near(st.pose.pos[0], -8.0),
+          "miss -> player/camera unchanged");
+  }
+
+  // 2. Static hit: box face stops 0.1 short of the wall ->
+  //    dist=4.1; the PLAYER is pushed and the camera follows.
+  {
+    mdk::CollisionState cs = mkState(&wallArena);
+    mdk::PlayerCameraState st;
+    auto e = mkEnv(cs);
+    mdk::updatePlayerCamera(e, st);
+    check(near(cs.pos[0], 4.1), "hit -> player pushed +4.1");
+    check(near(st.pose.pos[0], -3.9) && near(st.pose.pos[2], 9.5),
+          "camera follows to the box margin");
+    check(near(st.pose.view[2][3], 3.9),
+          "M1 commit folds the displaced camPos");
+  }
+
+  // 3. Gates: b710 == 0 and |d58| != 0 suppress the pass.
+  {
+    mdk::CollisionState cs = mkState(&wallArena);
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = false;
+    auto e = mkEnv(cs);
+    mdk::updatePlayerCamera(e, st);
+    check(near(cs.pos[0], 0.0) && near(st.pose.pos[0], -8.0),
+          "b710 == 0 -> no obstruction");
+    mdk::CollisionState cs2 = mkState(&wallArena);
+    mdk::PlayerCameraState st2;
+    auto e2 = mkEnv(cs2);
+    e2.lookActive = true;
+    mdk::updatePlayerCamera(e2, st2);
+    check(near(cs2.pos[0], 0.0) && near(st2.pose.pos[0], -8.0),
+          "look-active -> no obstruction");
+  }
+
+  // 4. Grounding probe (0x540e4c != 0): candidate (4.1,0) and
+  //    retry1 (4.1,-2.05) miss the partial floor; retry2
+  //    (4.1,+2.05) lands -> the mirrored displacement applies.
+  {
+    float verts[18] = {-4, -10, 0, -4, 10, 0, -4, 0, 20,
+                       3, 1.5f, 5, 6, 1.5f, 5, 4, 3, 5};
+    mdk::CollisionPoly polys[2] = {mkPoly(0, 1, 2), mkPoly(3, 4, 5)};
+    mdk::CollisionNode nodes[2] = {
+        mkNode(1, 0, 0, 4, pset(1, 0), 0, 1, -1),
+        mkNode(0, 0, 1, -5, pset(1, 1), 0, -1, -1)};
+    mdk::CollisionArena a = {};
+    a.verts = verts;
+    a.polys = polys;
+    a.nodes = nodes;
+    mdk::CollisionState cs = mkState(&a);
+    mdk::PlayerCameraState st;
+    auto e = mkEnv(cs);
+    e.contactToken = &polys[0];
+    mdk::updatePlayerCamera(e, st);
+    check(near(cs.pos[0], 4.1) && near(cs.pos[1], 2.05),
+          "probe retry2 -> player (4.1, +2.05)");
+    check(near(st.pose.pos[0], -3.9) && near(st.pose.pos[1], 2.05),
+          "camera follows the retried delta");
+  }
+
+  // 5. All probes miss -> early return skips BOTH the apply and
+  //    the object pass (an overlapping object stays inert).
+  {
+    float verts[18] = {-4, -10, 0, -4, 10, 0, -4, 0, 20,
+                       8, 8, 5, 10, 8, 5, 9, 10, 5};
+    mdk::CollisionPoly polys[2] = {mkPoly(0, 1, 2), mkPoly(3, 4, 5)};
+    mdk::CollisionNode nodes[2] = {
+        mkNode(1, 0, 0, 4, pset(1, 0), 0, 1, -1),
+        mkNode(0, 0, 1, -5, pset(1, 1), 0, -1, -1)};
+    mdk::CollisionArena a = {};
+    a.verts = verts;
+    a.polys = polys;
+    a.nodes = nodes;
+    int model = 0;
+    mdk::CollisionElement elem = {};
+    float eb[6] = {-6, -1, 8, -5, 1, 11};
+    std::memcpy(elem.aabb, eb, sizeof(eb));
+    mdk::CollisionElementSet set = {};
+    set.count = 1;
+    set.elems = &elem;
+    mdk::CollisionObject obj = {};
+    obj.named = true;
+    obj.model = &model;
+    obj.elements = &set;
+    obj.flags14b = 1;
+    std::memcpy(obj.aabb, eb, sizeof(eb));
+    a.objects = &obj;
+    mdk::CollisionState cs = mkState(&a);
+    mdk::PlayerCameraState st;
+    auto e = mkEnv(cs);
+    e.contactToken = &polys[0];
+    mdk::updatePlayerCamera(e, st);
+    check(near(cs.pos[0], 0.0) && near(st.pose.pos[0], -8.0),
+          "probes exhausted -> early return, no object pass");
+  }
+
+  // 6. Object pass: the AABB clamps the segment at x=-5; the
+  //    player is pushed by (clamp - camPos).xy = (+3, 0).
+  {
+    int model = 0;
+    mdk::CollisionElement elem = {};
+    float eb[6] = {-6, -1, 8, -5, 1, 11};
+    std::memcpy(elem.aabb, eb, sizeof(eb));
+    mdk::CollisionElementSet set = {};
+    set.count = 1;
+    set.elems = &elem;
+    mdk::CollisionObject obj = {};
+    obj.named = true;
+    obj.model = &model;
+    obj.elements = &set;
+    obj.flags14b = 1;
+    std::memcpy(obj.aabb, eb, sizeof(eb));
+    mdk::CollisionArena a = emptyArena;
+    a.objects = &obj;
+    mdk::CollisionState cs = mkState(&a);
+    mdk::PlayerCameraState st;
+    auto e = mkEnv(cs);
+    mdk::updatePlayerCamera(e, st);
+    check(near(cs.pos[0], 3.0) && near(st.pose.pos[0], -5.0),
+          "object clamp -> player +3, camera to x=-5");
+    obj.flags14b = 0;
+    mdk::CollisionState cs2 = mkState(&a);
+    mdk::PlayerCameraState st2;
+    auto e2 = mkEnv(cs2);
+    mdk::updatePlayerCamera(e2, st2);
+    check(near(cs2.pos[0], 0.0) && near(st2.pose.pos[0], -8.0),
+          "flags14b bit0 clear -> object skipped");
+  }
+
+  // 7. Nudge: pos += M2row0 * (arg*0.25); tick = trunc(arg*scale);
+  //    M1 row0 += row2 * (tick/600); all three M1 t's refold.
+  {
+    mdk::PlayerCameraState st;
+    st.obstructionEnabled = false;
+    mdk::PlayerCameraEnvironment e = {};
+    e.viewYawDeg = 90.0f;
+    e.yawDeg = 0.0f;
+    mdk::updatePlayerCamera(e, st);
+    mdk::cameraNudge(1, st);
+    check(near(st.pose.pos[1], -0.25) && near(st.pose.pos[0], -8.0),
+          "nudge(+1) shifts camPos -0.25 along M2row0");
+    check(st.nudgeTick == 20, "tick = trunc(1 * 20.0) = 20");
+    const double r = 20.0 / 600.0;
+    check(near(st.pose.view[0][0], r, 1e-6) &&
+              near(st.pose.view[0][1], -0.8333333, 1e-6),
+          "M1 row0 += row2 * (tick/600)");
+    check(near(st.pose.view[0][3], -(-8.0 * r + 5.0 / 24.0), 1e-5) &&
+              near(st.pose.view[2][3], 8.0, 1e-4),
+          "all three M1 translations refolded");
+    check(near(st.pose.basis[2][3], -8.0), "M2 untouched");
+    st.nudgeScale = 12.7f;
+    mdk::cameraNudge(-1, st);
+    check(st.nudgeTick == -12, "tick truncates toward zero");
+    mdk::cameraNudgeApplyMode(st, 0);
+    check(st.nudgeScale == 12.0f, "mode 0 -> scale 12");
+    mdk::cameraNudgeApplyMode(st, 2);
+    check(st.nudgeScale == 15.0f, "mode 2 -> scale 15");
+    mdk::cameraNudgeApplyMode(st, 7);
+    check(st.nudgeScale == 20.0f, "default mode -> scale 20");
+  }
+
+  std::fprintf(stderr, "selftest camera-obstruction: %s\n",
+               ok ? "PASS" : "FAIL");
+  return ok ? 0 : 3;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1084,6 +1334,8 @@ int main(int argc, char** argv) {
       return selftestPlayerSurface();
     } else if (!std::strcmp(a, "--selftest-camera-pose")) {
       return selftestCameraPose();
+    } else if (!std::strcmp(a, "--selftest-camera-obstruction")) {
+      return selftestCameraObstruction();
     } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
       return usage();
     } else if (a[0] == '-') {

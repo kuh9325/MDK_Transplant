@@ -243,12 +243,19 @@ Boundary notes (intentions, not commitments):
 > driving `viewOnPartner`. `FUN_00431100` — the `0x49b740` overhead
 > block (scripted `0x40031`/cheat latch, raw-yaw trig,
 > `scaleZ=+1.0`, stale basis fields) — is ported as its own call.
-> `FUN_00430bf8` camera obstruction is a counted seam at its
-> proven call point (post-basis, pre-commit, may move both player
-> and camera). Still platform-neutral scalar math — no camera
-> component, no spring-arm, no renderer dependency; the sniper
-> pose stays deferred. `mdk-inspect --selftest-camera-pose` verifies
-> the pose/matrix contract; the traversal digest folds the pose as
+> Phase 5M adds the two remaining normal-camera mechanisms at their
+> proven points: `FUN_00430bf8` obstruction runs inside the seam
+> (post-basis, pre-commit — the eye→camPos swept-box query, the
+> hit-plane 2D displacement gated by the `0x540e4c` grounding probe
+> and its two perpendicular retries, the `FUN_004630d4` player push
+> with the camera following the applied delta, then the `0x540c68`
+> object AABB pass), and `FUN_0042b0c0` nudge runs inside the
+> world-tick `FUN_00436d60` save/restore bracket (inert in BUILD_A —
+> `0x541548` has no writer). Still platform-neutral scalar math — no
+> camera component, no spring-arm, no renderer dependency; the sniper
+> pose stays deferred. `mdk-inspect --selftest-camera-pose` and
+> `--selftest-camera-obstruction` verify the pose/matrix and
+> obstruction/nudge contracts; the traversal digest folds the pose as
 > f32 bit patterns.
 
 > SDL3/Metal/CMake are **engineering choices for the reimplementation** — they

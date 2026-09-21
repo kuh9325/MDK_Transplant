@@ -413,15 +413,152 @@ void objectProbe(const CollisionObject* obj, const float* start, float* end,
   }
 }
 
+// forward decls — defined below alongside the sweep internals.
+int pointInTri(const float* p, const float* v0, const float* v1,
+               const float* v2, const float* nrm);
+int segAabbResolve(const float* start, const float* target,
+                   const float* box, float* outClamp, float* outAlt);
+
 // ---------------------------------------------------------------------------
-// FUN_00408820 — leaf polygon-set scan (sweep callback)
-//   set: the node's {lo16 count, hi16 firstIdx} dword
+// FUN_0045cd38 — segment-vs-inflated-AABB overlap prefilter
+//   per axis: segMax >= boxMin - ext  &&  segMin <= boxMax + ext
+//   (non-strict — touching counts as overlap)
 // ---------------------------------------------------------------------------
 
-struct SweepState;
+int segAabbOverlap(const float* a, const float* b, const float* box,
+                   const float* ext) {
+  for (int i = 0; i < 3; ++i) {
+    const float lo = (a[i] < b[i]) ? a[i] : b[i];
+    const float hi = (a[i] < b[i]) ? b[i] : a[i];
+    if (box[i] - ext[i] > hi) return 0;
+    if (box[i + 3] + ext[i] < lo) return 0;
+  }
+  return 1;
+}
 
-int polyScan(SweepState& s, std::uint32_t set, const float* contact,
-             const CollisionPoly** out);
+// ---------------------------------------------------------------------------
+// FUN_00418c60 stab internals — globals 0x54b6c8..0x54b6f8.
+//   cand1/cand2: the probed segment; hitPt: the node-plane crossing
+//   point (written unconditionally at each crossed node, consumed by
+//   the poly scan); hitPoly/hitNode: the containing records.
+//   The 0x54b6f8 mode byte is always 0 through FUN_00418c60 — modes
+//   1/2 come from FUN_00418ce8 (a different caller set, not ported).
+// ---------------------------------------------------------------------------
+
+struct StabState {
+  const float* verts;            // 0x54b6cc
+  const CollisionPoly* polys;    // 0x54b6dc
+  const CollisionNode* nodes;    // 0x54b6d8
+  const float* cand1;            // 0x54b6f0 — segment start
+  const float* cand2;            // 0x54b6ec — segment end
+  float hitPt[3];                // 0x54b6e0 — crossing point
+  const CollisionPoly* hitPoly;  // 0x54b6d4
+  const CollisionNode* hitNode;  // 0x54b6f4
+};
+
+// FUN_004189c8 — interpolate the cand1->cand2 segment to the node
+// plane: t = -dStart / dot(cand2-cand1, n) (t=1 on a degenerate
+// denominator); out = cand1 + t*(cand2-cand1). The dot accumulates
+// in the original's order: (dy*ny + dx*nx) + dz*nz.
+void stabPlanePoint(StabState& s, float dStart, const CollisionNode* n) {
+  const float f = (s.cand2[1] - s.cand1[1]) * n->ny +
+                  (s.cand2[0] - s.cand1[0]) * n->nx +
+                  (s.cand2[2] - s.cand1[2]) * n->nz;
+  const float t = (f == 0.0f) ? 1.0f : -dStart / f;
+  for (int i = 0; i < 3; ++i)
+    s.hitPt[i] = s.cand1[i] + t * (s.cand2[i] - s.cand1[i]);
+}
+
+// FUN_00418930 — scan a node's {lo16 count, hi16 firstIdx} poly set
+// for containment of the crossing point (skips flags&0x20 polys).
+int stabPolyScan(StabState& s, const CollisionNode* node,
+                 std::uint32_t set) {
+  const int count = static_cast<int>(set & 0xffff);
+  const CollisionPoly* rec = s.polys + (set >> 16);
+  const float n[3] = {node->nx, node->ny, node->nz};
+  for (int i = 0; i < count; ++i, ++rec) {
+    if (rec->flags & 0x20) continue;
+    const float* v0 = s.verts + (std::uint32_t)rec->v[0] * 3;
+    const float* v1 = s.verts + (std::uint32_t)rec->v[1] * 3;
+    const float* v2 = s.verts + (std::uint32_t)rec->v[2] * 3;
+    if (pointInTri(s.hitPt, v0, v1, v2, n)) {
+      s.hitPoly = rec;
+      s.hitNode = node;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// FUN_00418a50 — recursive BSP stab traversal. Descends the side
+// containing cand1 first; on a strict plane crossing (dStart*dEnd < 0)
+// interpolates the crossing point and scans polysPos then polysNeg;
+// then iterates the opposite side. Returns the containing node.
+const CollisionNode* stabWalk(StabState& s, const CollisionNode* node) {
+  while (node) {
+    // Original accumulation order: (ny*p.y + nx*p.x) + nz*p.z + d.
+    const float dStart = s.cand1[1] * node->ny + s.cand1[0] * node->nx +
+                         s.cand1[2] * node->nz + node->d;
+    const float dEnd = s.cand2[1] * node->ny + s.cand2[0] * node->nx +
+                       s.cand2[2] * node->nz + node->d;
+    const CollisionNode* r = nullptr;
+    if (dStart < 0.0f) {
+      if (node->childFar >= 0)
+        r = stabWalk(s, s.nodes + node->childFar);
+    } else {
+      if (node->childNear >= 0)
+        r = stabWalk(s, s.nodes + node->childNear);
+    }
+    if (r) return r;
+    if (dStart * dEnd >= 0.0f) return nullptr;
+    stabPlanePoint(s, dStart, node);
+    if (stabPolyScan(s, node, node->polysPos) ||
+        stabPolyScan(s, node, node->polysNeg)) {
+      return node;
+    }
+    node = (dStart >= 0.0f)
+               ? (node->childFar >= 0 ? s.nodes + node->childFar : nullptr)
+               : (node->childNear >= 0 ? s.nodes + node->childNear : nullptr);
+  }
+  return nullptr;
+}
+
+} // namespace
+
+// FUN_0045cd38 / FUN_0045c838 / FUN_00418c60 — exported wrappers over
+// the file-local originals (the object pass + grounding probe of the
+// Phase 5M camera obstruction call FUN_00430bf8).
+int collisionSegAabbOverlap(const float* a, const float* b,
+                            const float* box6, const float* ext) {
+  return segAabbOverlap(a, b, box6, ext);
+}
+
+int collisionSegAabbResolve(const float* start, const float* target,
+                            const float* box6, float* outClamp,
+                            float* outAlt) {
+  return segAabbResolve(start, target, box6, outClamp, outAlt);
+}
+
+const CollisionNode* collisionStab(const CollisionArena& arena,
+                                   const float* from, const float* to,
+                                   float* outPos) {
+  if (!arena.verts || !arena.nodes) return nullptr;
+  StabState s;
+  s.verts = arena.verts;
+  s.polys = arena.polys;
+  s.nodes = arena.nodes;
+  s.cand1 = from;
+  s.cand2 = to;
+  s.hitPt[0] = s.hitPt[1] = s.hitPt[2] = 0.0f;
+  s.hitPoly = nullptr;
+  s.hitNode = nullptr;
+  const CollisionNode* r = stabWalk(s, arena.nodes);
+  if (r) std::memcpy(outPos, s.hitPt, 3 * sizeof(float));
+  return r;
+}
+
+namespace {
+
 
 // Sweep scratch — the original's globals block at 0x4a2098..0x4a2120.
 struct SweepState {

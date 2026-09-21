@@ -233,7 +233,13 @@ src/
                                   FUN_0045c838), carrier retry,
                                   FUN_00435eec per-frame object
                                   floor probe, FUN_00419ee0
-                                  level-stream blob parse (5D)
+                                  level-stream blob parse (5D);
+                                  Phase 5M adds FUN_00418c60
+                                  mode-0 segment stab (FUN_00418a50
+                                  BSP walk + FUN_004189c8 crossing
+                                  interpolate + FUN_00418930 poly
+                                  scan) for the camera grounding
+                                  probe (5M)
              dynamic_objects.*  — Phase 5E dynamic collision
                                   objects: FUN_00428400 model
                                   geometry parser, FUN_00403720
@@ -293,10 +299,19 @@ src/
                                   projection-folded world->camera
                                   matrix + 0x540bb0 M2 basis
                                   snapshot, scaleX/scaleY/scaleZ,
-                                  view-rect write, the FUN_00430bf8
-                                  obstruction seam point) +
+                                  view-rect write) +
                                   FUN_00431100 overhead block (raw
                                   yaw, scaleZ=+1, stale basis) (5K)
+                                  + Phase 5M: FUN_00430bf8 camera
+                                  obstruction at its original seam
+                                  point (swept-box eye->camPos query,
+                                  plane-normal displacement with the
+                                  0x540e4c grounding-probe retries,
+                                  FUN_004630d4 player push + camera
+                                  follow, 0x540c68 object pass) and
+                                  FUN_0042b0c0 camera nudge (M2-row0
+                                  pos shift + trunc-mode tick + M1
+                                  row0 tilt + full t refold) (5M)
              keyboard_menu.*    — Keyboard child controller +
                                   static/dynamic renderers +
                                   DIK→internal translation +

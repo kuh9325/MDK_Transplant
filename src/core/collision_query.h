@@ -116,7 +116,9 @@ struct CollisionObject {
   std::uint16_t flags148;            // +0x148 — sweep skips &0x810, floor skips &0x10
   std::uint8_t flags149;             // +0x149 — bit0 = has standable geometry
   std::uint8_t flags14a;             // +0x14a — bit4 = elemMaskA enable; bit7 = mountable
-  std::uint8_t flags14b;             // +0x14b — bit1 = mount-scan gate
+  std::uint8_t flags14b;             // +0x14b — bit0 = camera
+                                     // obstruction gate (FUN_00430bf8),
+                                     // bit1 = mount-scan gate
                                      // (FUN_00463608), bit2 = reticle
                                      // disabled (FUN_004691c4)
   float aabb[6];                     // +0x198
@@ -254,8 +256,33 @@ bool collisionBlobParse(const std::uint8_t* blob, std::size_t size,
 const CollisionPoly* collisionSweep(CollisionState& cs,
                                     const float* start, const float* target,
                                     int flag, const CollisionArena& arena,
-                                    float scale, float* outPos,
+                                    const float* ext, float scale,
+                                    float* outPos,
                                     const CollisionNode** outNode);
+
+// FUN_0045cd38 — segment-vs-inflated-AABB overlap prefilter.
+//   a/b: segment endpoints; box6: {minx,miny,minz,maxx,maxy,maxz};
+//   ext: per-axis box inflation. Returns 1 on overlap (non-strict
+//   inequalities — touching counts).
+int collisionSegAabbOverlap(const float* a, const float* b,
+                            const float* box6, const float* ext);
+
+// FUN_0045c838 — segment vs element AABB, 2.5D resolver.
+//   outClamp: earliest face-crossing point; outAlt: face-clamped
+//   target. Returns 0 = no interaction, 1 = face clamp, 2 = inside.
+int collisionSegAabbResolve(const float* start, const float* target,
+                            const float* box6, float* outClamp,
+                            float* outAlt);
+
+// FUN_00418c60 — BSP segment stab (the camera-obstruction grounding
+// probe). Walks `arena`'s node tree from `from` to `to`; returns the
+// containing node (0 = no non-skip polygon crossed the segment) and,
+// on a hit, the plane-crossing point via outPos. The mode byte is
+// always 0 on this entry (FUN_00418ce8's modes 1/2 are a different
+// caller set — not used by the camera path).
+const CollisionNode* collisionStab(const CollisionArena& arena,
+                                   const float* from, const float* to,
+                                   float* outPos);
 
 } // namespace mdk
 
