@@ -9,11 +9,13 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <span>
 
 #include "core/data_root.h"
 #include "core/frontend_machines.h"
+#include "core/object_animation.h"
 #include "core/player_fire.h"
 #include "core/player_projectiles.h"
 #include "core/player_reticle.h"
@@ -98,6 +100,29 @@ bool cmiTable3Has(const CmiDirectory& cmi, const std::string& name) {
   for (const auto& rec : cmi.tables[3].records)
     if (rec.name() == name) return true;
   return false;
+}
+
+// FUN_00456808 — CMI table-0 "%s$%s_%u" per-object script lookup:
+// the record value is the script's code offset within the image
+// (file offset = value + 4; OBSERVED LEVEL3 HMO_1$XGS_9). Returns an
+// image pointer for +0x108, or nullptr when the record is absent or
+// out of bounds (bounds-checked per the safety policy).
+const void* traversalObjectScriptFor(const char* arenaName,
+                                     const char* modelName,
+                                     std::uint16_t spawnId, void* ctx) {
+  const TraversalLevel* lv = static_cast<const TraversalLevel*>(ctx);
+  if (!lv || lv->cmi.tables.empty()) return nullptr;
+  char key[96];
+  std::snprintf(key, sizeof key, "%s$%s_%u", arenaName, modelName,
+                static_cast<unsigned>(spawnId));
+  for (const auto& rec : lv->cmi.tables[0].records) {
+    if (rec.name() != key) continue;
+    const std::uint64_t fo =
+        4 + static_cast<std::uint64_t>(rec.value);
+    if (fo >= lv->cmiBytes.size()) return nullptr;
+    return lv->cmiBytes.data() + fo;
+  }
+  return nullptr;
 }
 
 } // namespace
@@ -202,7 +227,10 @@ static void traversalEnsureLoaded(TraversalRuntime& rt,
   // FUN_00432d9c's tail: the +0x44 bit-2 spawn-once gate. The original
   // calls FUN_00456808 only when the bit is clear, then sets it.
   if (!arena.objectsSpawned && arena.rec) {
+    // The script source binds each spawn's +0x108 — the persistent
+    // per-object VM PC (table-0 "%s$%s_%u" record, FUN_00456808).
     spawnArenaObjects(arena.dyn, *arena.rec, traversalModelFor,
+                      &rt.level, nullptr, traversalObjectScriptFor,
                       &rt.level);
     arena.objectsSpawned = true;
   }
@@ -331,7 +359,7 @@ void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt) {
   // Anim latch (0x457764..0x4577a1). +0x114==0 or +0x118==0xff00 means
   // "no active anim / complete". With the init script bound the door
   // animates: +0x118 stays -1 while running, 0xff00 when done.
-  const bool animDone = o.connAnimDone();
+  const bool animDone = o.animDone();
   if ((o.connState & 2) == 0) {
     if ((o.connState & 4) != 0 && animDone) {
       o.connState = static_cast<std::uint8_t>((o.connState & 0xf0) | 8);
@@ -355,12 +383,12 @@ void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt) {
     // transition writes +0xdc=-1.0, +0xe4=0xffff, +0x118=0xffff,
     // +0xe0=30, clears +0x148 bit3 (loop) and binds +0x114=+0x30a.
     if ((o.connState & 0x2c) == 0) {
-      o.connAnimFrame = -1.0f;                  // +0xdc
-      o.connAnimCurFrame = -1;                  // +0xe4 = 0xffff
-      o.connAnimLatch = -1;                     // +0x118 = 0xffff
-      o.connAnimRate = 30.0f;                   // +0xe0
+      o.animAcc = -1.0f;                  // +0xdc
+      o.animFrame = -1;                  // +0xe4 = 0xffff
+      o.animLatch = -1;                     // +0x118 = 0xffff
+      o.animRate = 30.0f;                   // +0xe0
       o.col.flags148 &= ~0x8u;                  // +0x148 &= 0xf7
-      o.connAnim = o.connAnimFar;               // +0x114 = +0x30a
+      o.animRec = o.animRecFar;               // +0x114 = +0x30a
       o.connState = static_cast<std::uint8_t>((o.connState & 0xf0) | 4);
       // play +0x322 (seam)
     }
@@ -369,13 +397,13 @@ void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt) {
     // (0x4577f0..0x4579a5). Transition writes +0x114=+0x306, +0xdc=-1,
     // +0xe4=0xffff, +0x118=0xffff, clears +0x148 bit3, +0xe0=30.
     if ((o.connState & 0x43) == 0) {
-      o.connAnim = o.connAnimNear;              // +0x114 = +0x306
-      o.connAnimFrame = -1.0f;                  // +0xdc
-      o.connAnimCurFrame = -1;                  // +0xe4 = 0xffff
-      o.connAnimLatch = -1;                     // +0x118 = 0xffff
+      o.animRec = o.animRecNear;              // +0x114 = +0x306
+      o.animAcc = -1.0f;                  // +0xdc
+      o.animFrame = -1;                  // +0xe4 = 0xffff
+      o.animLatch = -1;                     // +0x118 = 0xffff
       o.col.flags148 &= ~0x8u;                  // +0x148 &= 0xf7
       o.connState = static_cast<std::uint8_t>((o.connState & 0xf0) | 2);
-      o.connAnimRate = 30.0f;                   // +0xe0
+      o.animRate = 30.0f;                   // +0xe0
       // FUN_00432d9c — attach whichever of {dest,home} is on the far
       // side of the door from the player and not already the partner.
       // Primary target is +0x302; the +0x60 home is the secondary when
@@ -417,59 +445,18 @@ void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt) {
 }
 
 // ---------------------------------------------------------------------------
-// FUN_004555bc — per-object animation advance (the +0x114 connector
-// anim subset). Runs for every named object in FUN_004572ac's update
-// dispatch, after the connector update.
-//
-// The +0x114 record is a float array: [0] = rate, [2] = frameCount
-// (i32). Each frame +0xdc += rate * +0xe0 * (1/30); the applied frame
-// +0xe4 = FRNDINT(+0xdc) (round-to-nearest). Reaching frameCount-1 on
-// a non-looping anim (+0x148 bit3 clear) clamps +0xdc and latches
-// +0x118 = 0xff00 — the connector's "done" gate. +0x118==-1 (0xffff)
-// while running; a +0x118 >= 0 target frame holds/clamps the advance.
-// FUN_00455890 applies the frame to the model's element transforms —
-// render-side, a documented seam (collision only needs the latch).
+// FUN_004555bc — per-object animation advance. The full driver + the
+// FUN_00455890 vertex/ref-point applier + the FUN_00455c48 rigid
+// channel decode now live in object_animation.cpp (Phase 11A/G5 port —
+// OBSERVED): +0xdc accumulator advance (rate * +0xe0 * 1/30), target
+// clamp at +0x118, loop/clamp at frameCount-1, then
+// FUN_00455890(obj, rec, FRNDINT(+0xdc) - +0xe4) applies each pending
+// frame (delta keys are cumulative — intermediate frames must apply),
+// latching +0x118 = 0xff00 on completion of a non-looping anim.
 // ---------------------------------------------------------------------------
-void traversalObjectAnimUpdate(DynamicObject& o) {
-  if (o.connAnim == nullptr) return;              // +0x114 == 0 -> inert
-  // +0x118 >= 0 (i16) && +0xe4 == +0x118  -> idle at target frame.
-  // +0x118 == 0xff00 (i16 -256)          -> done latch. Either way the
-  // accumulator resyncs to the applied frame and the anim holds.
-  if ((o.connAnimLatch >= 0 && o.connAnimCurFrame == o.connAnimLatch) ||
-      static_cast<std::uint16_t>(o.connAnimLatch) == 0xff00u) {
-    o.connAnimFrame = static_cast<float>(o.connAnimCurFrame);
-    return;
-  }
-  float rate = 0.0f;
-  std::int32_t frameCount = 0;
-  std::memcpy(&rate, o.connAnim, 4);                          // [0]
-  std::memcpy(&frameCount,
-              static_cast<const char*>(o.connAnim) + 8, 4);   // [2]
-  if (frameCount <= 0) return;
-  // +0xdc += rate * +0xe0 * (1/30)  (DAT_0049b6f4 = 1/30 s)
-  o.connAnimFrame += rate * o.connAnimRate * (1.0f / 30.0f);
-  // Target clamp: when +0x118 >= 0 is a real target frame and the
-  // running frame hasn't reached it, cap the accumulator at the
-  // target. The door runs with +0x118==-1 so this is inert for it.
-  if (o.connAnimLatch >= 0 && o.connAnimCurFrame < o.connAnimLatch &&
-      static_cast<int>(lroundf(o.connAnimFrame)) > o.connAnimLatch)
-    o.connAnimFrame = static_cast<float>(o.connAnimLatch);
-  const bool loop = (o.col.flags148 & 0x8u) != 0;   // +0x148 bit3
-  if (o.connAnimFrame >= static_cast<float>(frameCount - 1)) {
-    if (loop) {
-      if (o.connAnimFrame >= static_cast<float>(frameCount))
-        o.connAnimFrame -= static_cast<float>(frameCount);
-    } else {
-      o.connAnimFrame = static_cast<float>(frameCount - 1);   // clamp
-    }
-  }
-  // FUN_00455890(local_20 = FRNDINT(+0xdc)) applies the frame; record
-  // the applied index for the completion-latch test.
-  o.connAnimCurFrame =
-      static_cast<std::int16_t>(lroundf(o.connAnimFrame));    // +0xe4
-  if (o.connAnimCurFrame == frameCount - 1 && !loop &&
-      o.connAnimCurFrame != o.connAnimLatch)
-    o.connAnimLatch = static_cast<std::int16_t>(0xff00);      // +0x118
+void traversalObjectAnimUpdate(DynamicObject& o,
+                               const std::uint8_t* recLimit) {
+  objectAnimTick(o, recLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,9 +1129,31 @@ TraversalFrameResult stepTraversalRuntime(
   playerPunch(rt, timing.frameStep);
   ++rt.seams.profilerHooks; // FUN_0042fecc rdtsc probe (0x43627f)
 
-  // Object updates — FUN_004572ac subset (transform/ride/latch only;
-  // behavior scripts stay a seam) then FUN_0045cf18 transfers.
+  // Object updates — FUN_004572ac subset. Per-object order (OBSERVED):
+  // +0x07==1 view latch -> connector (0x14a&0x10) -> orbit (0x14a&0x40,
+  // seam) -> command runner (0x14b&0x40, seam) -> pendingArena transfer
+  // -> +0x108 object script VM -> path follower (+0xec, seam) ->
+  // FUN_004533d4 subtype (seam) -> gravity+collide (seam) ->
+  // FUN_0045897c enemy dispatch (0x149&0x10, seam) / mover (0x14a&0x20)
+  // -> FUN_004555bc anim -> ride/latch tail.
   if (rt.cs.arenaValid) {
+    // Shared script env — built once per frame; the per-object tick
+    // rebinds selfArena per object inside the call.
+    TraversalScriptEnv objEnv;
+    objEnv.image = std::span<const std::byte>(rt.level.cmiBytes.data(),
+                                              rt.level.cmiBytes.size());
+    objEnv.imageBase = 4;
+    objEnv.playerPos = rt.cs.pos;
+    objEnv.rt = &rt;
+    objEnv.currentArena = cur;
+    objEnv.modelFor = traversalModelFor;
+    objEnv.modelCtx = &rt.level;
+    objEnv.dt = dt;
+    objEnv.slideChannel = rt.slideChannel;
+    objEnv.slideMode = (rt.slideChannel != 0);
+    objEnv.hasContactNormal = (rt.lastContactPoly != nullptr);
+    objEnv.diagLog = &rt.scriptDiag;
+
     TraversalArena* updateArenas[2] = {cur, nullptr};
     int updateCount = 1;
     if (rt.partnerActive && rt.partner) {
@@ -1168,15 +1177,30 @@ TraversalFrameResult stepTraversalRuntime(
         // connector update (0x4572f4): the last named +0x07==1 object
         // becomes the camera view-anchor source.
         if (o.col.named && o.col.field07 == 1) rt.fieldB85c = &o;
-        // FUN_004555bc — per-object animation advance (+0x114 connector
-        // anim): runs after the connector update for every named object.
-        if (o.col.named && o.connAnim != nullptr)
-          traversalObjectAnimUpdate(o);
-        if (o.col.flags14a & 0x20) {
-          updateMoverCollision(o, rt.cs, &rt.motion.yawDeg);
-        } else {
-          applyRideDisplacement(o, rt.cs, &rt.motion.yawDeg);
-          latchObjectPrevState(o);
+        // FUN_004388d8(obj) — the persistent per-object tr_alcmd VM
+        // (+0x108 gate). OBSERVED position: after the transfer gate,
+        // before the path follower / subtype / gravity / anim section.
+        if (o.col.named && o.field108 != nullptr) {
+          TraversalScriptResult sr =
+              traversalObjectScriptTick(objEnv, o);
+          rt.scriptInsnTotal += sr.instructions;
+        }
+        // FUN_004555bc — per-object animation advance. OBSERVED
+        // ordering: the original re-checks +0x06 after the script VM
+        // and again after the anim driver (either can kill the
+        // object) before the velocity/ride tail.
+        if (o.col.named)
+          traversalObjectAnimUpdate(
+              o, reinterpret_cast<const std::uint8_t*>(
+                     rt.level.cmiBytes.data()) +
+                     rt.level.cmiBytes.size());
+        if (o.col.named) {
+          if (o.col.flags14a & 0x20) {
+            updateMoverCollision(o, rt.cs, &rt.motion.yawDeg);
+          } else {
+            applyRideDisplacement(o, rt.cs, &rt.motion.yawDeg);
+            latchObjectPrevState(o);
+          }
         }
       }
       // FUN_0045cf18 — pending-arena transfers (the splice mutates

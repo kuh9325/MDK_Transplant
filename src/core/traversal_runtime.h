@@ -567,11 +567,15 @@ TraversalArena* traversalPortalTest(TraversalRuntime& rt);
 // mask rebuild, +0x148 bit4 collision toggle.
 void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt);
 
-// FUN_004555bc — per-object animation advance for the +0x114
-// connector anim record. Advances +0xdc by rate*+0xe0/30 per frame,
-// applies FRNDINT(+0xdc) to +0xe4, latches +0x118=0xff00 at
-// frameCount-1 (non-looping). Inert when +0x114 == nullptr.
-void traversalObjectAnimUpdate(DynamicObject& o);
+// FUN_004555bc — per-object animation advance (the generic driver —
+// any object may bind +0x114 via ops 0x03/0x3b). Advances +0xdc by
+// rate*+0xe0/30, applies FRNDINT(+0xdc)-+0xe4 steps through
+// FUN_00455890 (vertex deltas + ref points + root impulse), latches
+// +0x118=0xff00 at frameCount-1 (non-looping). `recLimit` bounds the
+// record walk — pass the containing image end (nullptr = unchecked,
+// test path). Full implementation: object_animation.cpp.
+void traversalObjectAnimUpdate(DynamicObject& o,
+                               const std::uint8_t* recLimit);
 
 // FUN_00434b44 — type-1/3 trigger scan on the current arena.
 void traversalTriggerScan(TraversalRuntime& rt);

@@ -51,6 +51,7 @@ add_library(mdk_core STATIC
   src/core/mode_dispatch.cpp
   src/core/mouse_menu.cpp
   src/core/mti_directory.cpp
+  src/core/object_animation.cpp
   src/core/mto_directory.cpp
   src/core/options_menu.cpp
   src/core/player_camera.cpp

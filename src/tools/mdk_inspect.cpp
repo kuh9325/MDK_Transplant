@@ -1785,11 +1785,11 @@ int main(int argc, char** argv) {
               o.scriptClass.c_str(),
               o.arena && o.arena->owner ? o.arena->owner->name.c_str()
                                         : "?",
-              o.connState, o.connAnim ? 'Y' : 'n',
-              (double)o.connAnimFrame, (int)o.connAnimCurFrame,
-              (unsigned)(std::uint16_t)o.connAnimLatch,
+              o.connState, o.animRec ? 'Y' : 'n',
+              (double)o.animAcc, (int)o.animFrame,
+              (unsigned)(std::uint16_t)o.animLatch,
               (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
-              (double)o.connRadius, o.connAnimDone() ? 1 : 0);
+              (double)o.connRadius, o.animDone() ? 1 : 0);
         }
       // The digest mixes only deterministic state — raw contact
       // tokens are process addresses and are mixed as booleans.

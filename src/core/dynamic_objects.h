@@ -250,6 +250,11 @@ struct DynamicObject {
   // keep them equal (setPosition does; the original has one field).
   float pos[3] = {0, 0, 0};
   float prevPos[3] = {0, 0, 0};       // +0x180..0x188
+  // +0x18c/+0x190/+0x194 — per-frame velocity: the FUN_004572ac tail
+  // writes (pos - prevPos) * (1.0/DAT_0049b6f0) post-anim, before the
+  // prevPos latch. DAT_0049b6f0 = 1.0, so this is the raw frame
+  // displacement. OBSERVED 0x45737b.
+  float field18c[3] = {0, 0, 0};
   // +0x28/+0x2c — display-position accumulators (the FUN_00432f84
   // charged-kill displaces the corpse by {20*cos,20*sin}(yaw) here;
   // the sim position +0x10 is untouched). Consumers are render-side.
@@ -293,22 +298,48 @@ struct DynamicObject {
                                       //    gates the closed-state LOCK
                                       //    mask choice)
   float connRadius = 0.0f;              // +0x30e — proximity radius
-  const void* connAnimNear = nullptr;   // +0x306 — open anim record
-  const void* connAnimFar = nullptr;    // +0x30a — close anim record
-  const void* connAnim = nullptr;       // +0x114 — active anim record
-  float connAnimFrame = 0.0f;           // +0xdc — anim frame counter
-  float connAnimRate = 0.0f;            // +0xe0 — anim rate (30.0f)
-  // +0xe4 = applied frame index; +0x118 = target/done word. The
-  // connector transition writes both to 0xffff (-1: run-to-end); the
-  // anim player latches +0x118 = 0xff00 on completion. "done" ==
-  // (connAnimLatch == -256) i.e. (u16)+0x118 == 0xff00.
-  std::int16_t connAnimCurFrame = 0;    // +0xe4
-  std::int16_t connAnimLatch = 0;       // +0x118
+  const void* animRecNear = nullptr;   // +0x306 — open anim record
+                                      // (connector union member)
+  const void* animRecFar = nullptr;    // +0x30a — close anim record
+                                      // (connector union member)
+
+  // Generic object animation state — FUN_004555bc driver +
+  // FUN_00455890 applier (OBSERVED, Phase 11A/G5). These fields are
+  // NOT connector-specific: any object may bind an anim record via
+  // script ops 0x03 (one-shot) / 0x3b (loop) — the connector path was
+  // simply the first consumer. The record view itself is the image
+  // span pointed at by animRec (see object_animation.h).
+  const void* animRec = nullptr;       // +0x114 — active anim record
+  float animAcc = 0.0f;                // +0xdc — frame accumulator;
+                                       // op 0x03/0x3b arm it at -1.0
+  float animRate = 0.0f;               // +0xe0 — rate mult (30.0f)
+  // +0xe4 = applied frame index (i16; the original reads it as the
+  // hi16 of the +0xe2 dword — the low half is never independently
+  // written). +0x118 = target/done word (hi16 of the +0x116 dword —
+  // low half likewise unused). The connector transition writes both
+  // to 0xffff (-1: run-to-end); the player latches +0x118 = 0xff00 on
+  // completion. "done" == (animLatch == -256) i.e. 0xff00.
+  std::int16_t animFrame = 0;          // +0xe4
+  std::int16_t animLatch = 0;          // +0x118
   // FUN_004555bc anim-done test: +0x114 null OR +0x118 == 0xff00.
-  bool connAnimDone() const {
-    return connAnim == nullptr ||
-           static_cast<std::uint16_t>(connAnimLatch) == 0xff00u;
+  bool animDone() const {
+    return animRec == nullptr ||
+           static_cast<std::uint16_t>(animLatch) == 0xff00u;
   }
+  // +0x140/+0x144 — animation sound marker (OBSERVED, FUN_004555bc):
+  // op 0x18 {u8 mark, str name} stores the bytecode string pointer at
+  // +0x140 and mark-1 at +0x144. When the +0xdc accumulator crosses
+  // the mark the original emits the named sound once and clears
+  // +0x140. Audio is a documented seam; the port keeps the name text
+  // and the consume-on-cross state so timing/flow stay faithful.
+  std::string animSoundName;           // +0x140 ("" = none)
+  std::int16_t animSoundMark = 0;      // +0x144 — trigger frame-1
+  // +0x294/+0x298/+0x29c — animation root-motion impulse accumulator
+  // (OBSERVED, FUN_00455890): each applied frame's rootKey (a model-
+  // space displacement) is rotated by the object 3x3 and accumulated
+  // here scaled by 1/DT (x30). FUN_0045bac0's integration consumes
+  // the impulse — suppressed while +0x14b bit7 is set.
+  float animImpulse[3] = {0, 0, 0};
   std::uint32_t connMaskLock = 0;       // +0x326 — "LOCK"-named elems
   std::uint32_t connMaskHC = 0;         // +0x32a — "HC*"-named elems
   // 0x97 sound-name slots (+0x316/+0x31a/+0x31e/+0x322). The original
@@ -383,7 +414,7 @@ struct DynamicObject {
   // event-latch arm). Same 0xc6 provenance as elemHp.
   std::vector<std::int16_t> elemThresh;
   // +0x30a — the 0xc6 opcode's second dword operand (role UNKNOWN;
-  // no consumer found). Aliases connAnimFar on connectors.
+  // no consumer found). Aliases animRecFar on connectors.
   std::uint32_t field30a = 0;
   // +0x150 — per-object impact-sound name pointer (OBSERVED): the
   // FUN_00437444 survived-hit callsites pass it as the EBX arg; a
@@ -395,13 +426,54 @@ struct DynamicObject {
   // the object keeps a deferred script — field11e cleared, health
   // zeroed, wait cleared, +0x148 |= 0x20 (the dead flag the update
   // scans skip), and +0x110 is copied to BOTH script PCs before the
-  // gate clears. The +0x108/+0x230 consumers are the tr_alcmd VM —
-  // the object-script execution itself stays a seam.
-  const void* field108 = nullptr;    // +0x108 — object script PC
+  // gate clears. +0x108/+0x230/+0x22c are consumed by the per-object
+  // tr_alcmd VM tick (traversalObjectScriptTick — FUN_004388d8's
+  // object-bound form).
+  const void* field108 = nullptr;    // +0x108 — object script PC+gate
   const void* field230 = nullptr;    // +0x230 — resume/wait PC
-  float field22c = 0.0f;             // +0x22c — script wait (cleared
-                                     // on death)
-  std::uint8_t field11e = 0;         // +0x11e — cleared on death
+  float field22c = 0.0f;             // +0x22c — script wait seconds
+                                     // (cleared on death)
+  std::uint8_t field11e = 0;         // +0x11e — subtype; cleared on
+                                     // death, set to the op's id by
+                                     // op 0x4e (OBSERVED 0x44879e)
+
+  // --- Phase 11A — persistent object-script ctx (+0x234..+0x26c
+  // inside the object; the +0x108/+0x22c/+0x230 PCs and the +0x21d/
+  // +0x21e event+running marks are the fields above / field21d /
+  // field21e). Stack PCs are image pointers like +0x108 itself.
+  // OBSERVED from the FUN_004388d8 opcode handlers. ---
+  float scriptLocals[16] = {};       // +0x234 — ctx f32 locals
+                                     // (var mode 2)
+  std::uint32_t scriptFlagsLocal = 0;// +0x244 — ctx flag dword
+                                     // (flag group 2 / 'else')
+  int scriptCallDepth = 0;           // +0x248 — event-call depth
+                                     // (cap 4; overflow reports
+                                     // "Gosub underflow/overflow")
+  const void* scriptRetPc[4] = {};   // +0x24c — return PCs
+  const void* scriptSavedPc[4] = {}; // +0x25c — saved +0x108 per level
+  std::uint16_t scriptMark[4] = {};  // +0x26c — per-level marks
+  std::uint32_t scriptFlagsChild = 0;// +0x312 dword — flag group 5;
+                                     // aliases connState's byte on
+                                     // connectors (the ctx and
+                                     // connector layouts overlap)
+
+  // --- Phase 11A — path binding (op 0x02, handler 0x438e7c) ---
+  // +0xec is the bound path record (image ptr); nonzero gates the
+  // FUN_00456d28 follower and selects op 0x66's else-linkage.
+  const void* fieldEC = nullptr;     // +0xec — path record
+  float fieldF0 = 0.0f;              // +0xf0 — path frame
+  float fieldF4[3] = {0, 0, 0};      // +0xf4..0xfc — lateral offset
+  std::int16_t fieldE6 = -1;         // +0xe6 — path cursor (0xffff
+                                     // reset by op 0x02)
+
+  // --- op 0x4e (handler 0x448741): subtype set — three dwords to
+  // +0x120..+0x128, +0x11e = 0x4e, path unbound (+0xec = 0), and the
+  // +0x2a0/+0x2a1/+0x2a8/+0x2ac mover block cleared (OBSERVED). ---
+  std::uint32_t field120[3] = {0, 0, 0}; // +0x120..0x128
+  std::uint8_t field2a0 = 0;           // +0x2a0
+  std::uint8_t field2a1 = 0;           // +0x2a1
+  float field2a8 = 0.0f;               // +0x2a8
+  float field2ac = 0.0f;               // +0x2ac
 
   // Write +0x10..0x18 and mirror +0x18 into col.baseZ.
   void setPosition(float x, float y, float z);
@@ -458,12 +530,20 @@ void initObjectCollision(DynamicObject& obj);
 // `arena`'s +0x68 list. `modelFor` must return the SOURCE model for a
 // CMI enemy-table index (or nullptr) — each spawn deep-copies it.
 // `spawned` (optional) receives the created objects in record order.
+// `scriptFor` (optional) resolves the persistent object script — the
+// CMI table-0 "%s$%s_%d" record — to an image pointer stored in
+// +0x108 (nullptr when no record matches; OBSERVED FUN_00456808).
 // Returns the number of objects spawned.
 using DynamicModelSource =
     const RuntimeModel* (*)(int modelIndex, void* ctx);
+using DynamicObjectScriptSource =
+    const void* (*)(const char* arenaName, const char* modelName,
+                    std::uint16_t spawnId, void* ctx);
 int spawnArenaObjects(DynamicArena& arena, const DtiArenaRecord& rec,
                       DynamicModelSource modelFor, void* ctx,
-                      std::vector<DynamicObject*>* spawned = nullptr);
+                      std::vector<DynamicObject*>* spawned = nullptr,
+                      DynamicObjectScriptSource scriptFor = nullptr,
+                      void* scriptCtx = nullptr);
 
 // FUN_00433d40's load-time record rewrite: match each type-2 record's
 // name against the enemy table -> fields[0] |= idx<<16; each type-4

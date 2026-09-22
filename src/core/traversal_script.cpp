@@ -88,11 +88,27 @@ struct Reader {
 // array: 0 -> globals 0x540d88, 1 -> boundObj+0x48, 2 -> ctx+0x234,
 // >=3 -> caller ctx +0x234 (or the sink 0x49b81c when no caller —
 // the arena ctx has none, so the bounded fallback targets locals).
+// The ctx-bound slots the resolvers touch — +0x234 locals, +0x244
+// flag dword, +0x312 flag dword. The arena ctx maps them to
+// TraversalScriptState members; the object ctx maps them to the
+// DynamicObject script block (same offsets — the ctx is the object).
+struct ScriptCtxSlots {
+  float* locals;
+  std::uint32_t* flagsLocal;
+  std::uint32_t* flagsChild;
+};
+ScriptCtxSlots ctxSlots(TraversalScriptState& st) {
+  return {st.locals, &st.flagsLocal, &st.flagsChild};
+}
+ScriptCtxSlots ctxSlots(DynamicObject& o) {
+  return {o.scriptLocals, &o.scriptFlagsLocal, &o.scriptFlagsChild};
+}
+
 static inline int varIndex(std::uint8_t idx) { return idx < 4 ? idx : 0; }
 // Resolve a var-operand given an already-read mode byte. mode 3 =
 // inline f32; otherwise a u8 index selects a slot via FUN_00438654.
 float resolveVarMode(std::uint8_t mode, Reader& r,
-                     TraversalScriptEnv& env, TraversalScriptState& st) {
+                     TraversalScriptEnv& env, const ScriptCtxSlots& ctx) {
   if (mode == 3) return r.f32();          // inline f32 (read-op form)
   const int idx = varIndex(r.u8());
   switch (mode) {
@@ -100,12 +116,12 @@ float resolveVarMode(std::uint8_t mode, Reader& r,
   case 1:                                        // boundObj+0x48
     return env.selfArena ? env.selfArena->objVars48[idx] : 0.0f;
   case 2:                                        // ctx+0x234 locals
-  default: return st.locals[idx];                // >=3: caller +0x234
+  default: return ctx.locals[idx];               // >=3: caller +0x234
   }                                              // -> local (bounded)
 }
 float resolveVar(Reader& r, TraversalScriptEnv& env,
-                 TraversalScriptState& st) {
-  return resolveVarMode(r.u8(), r, env, st);
+                 const ScriptCtxSlots& ctx) {
+  return resolveVarMode(r.u8(), r, env, ctx);
 }
 
 // Var-operand WRITE resolver — FUN_00438654's pointer form. Returns
@@ -113,29 +129,29 @@ float resolveVar(Reader& r, TraversalScriptEnv& env,
 // resolveVar reads). A write op has no inline mode — mode selects
 // the array, index the slot.
 float* resolveVarRef(std::uint8_t mode, std::uint8_t idx,
-                     TraversalScriptEnv& env, TraversalScriptState& st) {
+                     TraversalScriptEnv& env, const ScriptCtxSlots& ctx) {
   const int i = varIndex(idx);
   switch (mode) {
   case 0: return &env.gVars[i];
   case 1:
     return env.selfArena ? &env.selfArena->objVars48[i] : nullptr;
   case 2:
-  default: return &st.locals[i];
+  default: return &ctx.locals[i];
   }
 }
 
 // Flag-group resolver. Returns a reference to the flag dword the
 // 0x44..0x48 family operates on.
 std::uint32_t& resolveFlag(std::uint32_t group, TraversalScriptEnv& env,
-                           TraversalScriptState& st) {
+                           const ScriptCtxSlots& ctx) {
   switch (group) {
   case 0: return env.gFlags;                    // 0x540d98
   case 1:                                        // boundObj+0x58
     if (env.selfArena) return env.selfArena->flags58;
     return env.gFlags;                           // bounded fallback
-  case 5: return st.flagsChild;                 // ctx+0x312
+  case 5: return *ctx.flagsChild;               // ctx+0x312
   case 2:                                        // ctx+0x244
-  default: return st.flagsLocal;                // 'else' = caller ctx
+  default: return *ctx.flagsLocal;              // 'else' = caller ctx
   }                                             // +0x244 -> local here
 }
 
@@ -338,7 +354,7 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       return res;
 
     case 0x40: {                            // wait: +0x22c=secs,
-      float secs = resolveVar(r, env, st);  // +0x230=resume, exit
+      float secs = resolveVar(r, env, ctxSlots(st));  // +0x230=resume, exit
       if (!r.ok) { fail("wait operand"); return res; }
       if (secs <= 0.0f) secs = 1.0e-5f;     // 0x3727c5ac epsilon
       st.waitSeconds = secs;
@@ -380,7 +396,7 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
     case 0x44: case 0x45: {                 // bitset / bitclr {grp,bit}
       std::uint8_t grp = r.u8(), bit = r.u8();
       if (!r.ok) { fail("bit op"); return res; }
-      std::uint32_t& f = resolveFlag(grp, env, st);
+      std::uint32_t& f = resolveFlag(grp, env, ctxSlots(st));
       if (op == 0x44) f |= (1u << (bit & 31));
       else f &= ~(1u << (bit & 31));
       break;
@@ -389,7 +405,7 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       std::uint8_t grp = r.u8(), bit = r.u8();
       Linkage L;
       if (!readLinkage(r, L)) { fail("flag branch"); return res; }
-      const std::uint32_t f = resolveFlag(grp, env, st);
+      const std::uint32_t f = resolveFlag(grp, env, ctxSlots(st));
       const bool set = (f >> (bit & 31)) & 1u;
       // 0x46/0x47 fire the linkage on SET; 0x48 on CLEAR.
       const bool cond = (op == 0x48) ? !set : set;
@@ -443,7 +459,7 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       std::uint8_t idx = r.u8();
       std::uint32_t v = r.u32();
       if (!r.ok) { fail("setVar"); return res; }
-      if (float* slot = resolveVarRef(mode, idx, env, st)) {
+      if (float* slot = resolveVarRef(mode, idx, env, ctxSlots(st))) {
         float f;
         std::memcpy(&f, &v, 4);           // raw u32 -> f32 slot
         *slot = f;
@@ -667,24 +683,45 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
 }
 
 // ---------------------------------------------------------------------------
-// Object-init interpreter — the FUN_004566f0 table-2 "%s$%s" script.
-// Same VM bytecode + linkage rules as FUN_004388d8, but the bound
-// object is a DynamicObject (field ops write its +0xNN fields, not the
-// arena ctx's). Runs synchronously to completion at spawn.
+// Object-bound script pass — FUN_004388d8(ctx=object). The same VM
+// bytecode + linkage rules as the arena form, but the bound object is
+// a DynamicObject: field ops write its +0xNN fields and the persistent
+// ctx block is the object's own (+0x234 locals, +0x244/+0x312 flag
+// dwords, +0x248..+0x26c call stack, +0x108/+0x22c/+0x230 PCs/wait —
+// image POINTERS, matching the original's cmiBase+offset storage).
 //
-// OBSERVED opcode set implemented (MDK95.EXE handler disassembly):
-//   control:  0x01 ckpt / 0x09 stop / 0xff end / 0xfd ret /
-//             0x0c rgoto / 0xfc rcall (random-pick -> first, seam)
+// Two drivers share the instruction set:
+//   traversalObjectInitScript — the FUN_004566f0 table-2 "%s$%s"
+//     record, run synchronously at spawn; +0x108 is cleared on exit
+//     (OBSERVED 0x4567f9) so the script never persists.
+//   traversalObjectScriptTick — the persistent per-object script
+//     (table-0 "%s$%s_%d" record or the +0x110 death handoff): the
+//     +0x108 gate/+0x22c wait are honored, ckpt/call/goto write +0x108
+//     and 0xff suspends to the next frame.
+//
+// OBSERVED opcode set (MDK95.EXE handler disassembly):
+//   control:  0x01 ckpt(+0x108=pc)  0x09 stop(+0x108=0,depth=0,
+//             mark[0]=0)  0xff suspend(+0x21e=0)  0xfd return
+//             0x0c rgoto / 0xfc rcall {u8 n,n×u32} (RNG -> first, seam)
+//             0x5f wcall {u8 n,n×{u8 w,u32}} (weighted RNG -> first
+//             positive weight, seam)  0x66 condlink {u8 mode,...}
+//             gated on +0xec==0   0x40 wait {varop} -> +0x22c/+0x230
 //   fields:   0x08 +0x4c yaw(i16,neg+360)  0x0b +0x11a  0x49 +0x11b
 //             0x10 +0x8/+0x2a2/+0x21f health(u16)  0x6f +0x146(u16)
 //             0x32/0x33/0x34 +0x38/+0x3c/+0x40     0x53 +0x58 scale
 //             0x54 +0x5c zBias   0x5a +0xe8        0xc7 +0x104
-//             0x75 +0x118 anim-target(u16-1)     0x4c +0x110 imgref
+//             0x75 +0x148 &= ~u32               0x76 +0x118 tgt(u16-1)
+//             0x03/0x3b +0x114 anim bind (one-shot/loop, reset state)
+//             0x18 +0x140/+0x144 anim-sound marker   0x4c +0x110 imgref
 //             0xc6 elem-set decl -> +0x149|0x20, +0x302 prefix,
 //                +0x306 digitOfs, +0x30a extra, +0x30e/+0x31e pools
+//             0x02 path bind -> +0xec/+0x149/+0x14b/+0xe8/+0xf0/+0xf4
+//             0x4e subtype set -> +0x120..+0x128, +0x11e=0x4e
+//             0xcd +0x21f = u8
 //   flags:    0x23 +0x148|2   0x24 +0x148|1  0x29 +0x149|1/+0x14a|0x80
 //             0x3f +0x148^0x10(inv)  0x61 +0x148^0x80(inv,+0x54=0)
-//             0x74 +0x148 dword |=
+//             0x74 +0x148 dword |=   0x44/45/46 +0xNN group |=/&=~/^=
+//             1<<(bit&31)          0x47 test bit + linkage
 //   masks:    0x1f {count,strings} -> +0x2c8 element-name/"ALL" mask
 //   vars:     0x41 {mode,idx,u32} -> *FUN_00438654 slot
 //   connect:  0x96 {u32,u32}->+0x306/+0x30a anim recs
@@ -693,97 +730,270 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
 // Unknown/other opcodes halt with a diagnostic (native safety policy —
 // the original would desync on a mis-framed stream).
 // ---------------------------------------------------------------------------
-TraversalScriptResult traversalObjectInitScript(
-    TraversalScriptEnv& env, DynamicObject& obj, std::uint32_t codeOff) {
-  TraversalScriptResult res;
-  if (codeOff == 0) return res;
+namespace {
 
-  // Var mode 1 resolves the bound object's home arena (+0x48). Rebind
-  // selfArena to the object's actual home so resolveVar/resolveVarRef
-  // hit the right arena even if env.selfArena differs.
-  TraversalScriptEnv oenv = env;
-  if (obj.arena && obj.arena->owner) oenv.selfArena = obj.arena->owner;
+struct ObjScriptPass {
+  TraversalScriptEnv& env;
+  DynamicObject& obj;
+  Reader& r;
+  TraversalScriptResult& res;
+  const char* name;
+  bool done = false;            // pass must return to caller
 
-  TraversalScriptState st;                 // transient ctx (locals+stack)
-  st.pcImageOff = codeOff;
-  Reader r{oenv.image, oenv.imageBase, codeOff};
-  const char* name =
-      oenv.selfArena ? oenv.selfArena->name.c_str() : "<obj>";
-
-  auto fail = [&](const char* why) {
+  void fail(const char* why) {
     res.error = true;
     char buf[160];
     std::snprintf(buf, sizeof buf, "%s: %s", name, why);
     res.diag = buf;
-    if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
-  };
-  auto doCall = [&](std::uint32_t target) -> bool {
-    if (target == 0) return true;
-    if (st.callDepth >= 4) { fail("Gosub overflow"); return false; }
-    st.retPc[st.callDepth] = r.pc;
-    ++st.callDepth;
+    if (env.diagLog) env.diagLog->push_back(res.diag);
+    obj.field108 = nullptr;            // error path: +0x108 = 0
+    done = true;
+  }
+  // Image-relative ref (cmiBase + off) — pointer form, matching the
+  // original's arithmetic. off==0 -> nullptr (bounded; the original
+  // would point at the image base).
+  const void* ptrAt(std::uint32_t off, std::size_t n = 1) {
+    if (off == 0) return nullptr;
+    return r.ptr(off, n);
+  }
+  std::uint32_t offAt(const void* p) const {
+    const std::byte* base = env.image.data() + env.imageBase;
+    const std::byte* q = static_cast<const std::byte*>(p);
+    if (!p || q < base || q >= env.image.data() + env.image.size())
+      return 0;
+    return static_cast<std::uint32_t>(q - base);
+  }
+  // OBSERVED call/return (0x43bb57..0x43bc2c shared tail): push
+  // {retPc=pc, savedPc=+0x108}, +0x248++, +0x108=pc=target,
+  // mark[depth]=0; return pops the frame and restores +0x108.
+  bool doCall(std::uint32_t target) {
+    if (obj.scriptCallDepth >= 4) { fail("Gosub overflow"); return false; }
+    const int d = obj.scriptCallDepth;
+    obj.scriptRetPc[d] = ptrAt(r.pc);
+    obj.scriptSavedPc[d] = obj.field108;
+    ++obj.scriptCallDepth;
+    obj.scriptMark[d] = 0;
+    obj.field108 = ptrAt(target);
     r.pc = target;
     return true;
-  };
-  auto doGoto = [&](std::uint32_t target) { r.pc = target; };
-  // Image-relative ref (cmiBase + off). operand==0 -> the image base
-  // (cmiBase+0), matching the original's unconditional add.
+  }
+  bool doReturn() {
+    if (obj.scriptCallDepth <= 0) { fail("Gosub underflow"); return false; }
+    --obj.scriptCallDepth;
+    r.pc = offAt(obj.scriptRetPc[obj.scriptCallDepth]);
+    obj.field108 = obj.scriptSavedPc[obj.scriptCallDepth];
+    return true;
+  }
+  // OBSERVED goto (0x4393b6): +0x108 = target AND pc = target — the
+  // goto checkpoints as it jumps.
+  void doGoto(std::uint32_t target) {
+    obj.field108 = ptrAt(target);
+    r.pc = target;
+  }
+  // Random-pick seam: FUN_00401ed4's RNG is deterministic here —
+  // index 0 / first positive weight, matching the arena VM's rcall
+  // convention.
+  std::uint32_t pickList(std::uint8_t n) {
+    std::uint32_t tgt = 0;
+    for (std::uint8_t k = 0; k < n; ++k) {
+      std::uint32_t o = r.u32();
+      if (k == 0) tgt = o;
+    }
+    return tgt;
+  }
+};
+
+void objScriptInsn(ObjScriptPass& v) {
+  Reader& r = v.r;
+  DynamicObject& obj = v.obj;
+  TraversalScriptEnv& env = v.env;
+  TraversalScriptResult& res = v.res;
+  const ScriptCtxSlots ctx = ctxSlots(obj);
   auto imageRef = [&](std::uint32_t off, std::size_t n) -> const void* {
     return r.ptr(off, n);
   };
 
-  for (int i = 0; i < 1000; ++i) {
-    if (!r.ok) { fail("init read out of bounds"); return res; }
-    const std::uint32_t insnOff = r.pc;
-    const std::uint8_t op = r.u8();
-    ++res.instructions;
-    if (!r.ok) { fail("init opcode fetch out of bounds"); return res; }
+  if (!r.ok) { v.fail("script read out of bounds"); return; }
+  const std::uint32_t insnOff = r.pc;
+  const std::uint8_t op = r.u8();
+  ++res.instructions;
+  if (!r.ok) { v.fail("opcode fetch out of bounds"); return; }
 
-    switch (op) {
-    case 0xff:                              // end
-      res.halted = true; return res;
-    case 0x09:                              // stop
-      res.stopped = true; return res;
-    case 0xfd:                              // standalone return
-      if (st.callDepth <= 0) { fail("Gosub underflow"); return res; }
-      --st.callDepth; r.pc = st.retPc[st.callDepth];
-      break;
-    case 0x01:                              // ckpt: transient in init
-      break;
-    case 0x0c: {                            // rgoto {u8 n, n×u32}
-      std::uint8_t n = r.u8();
-      if (!r.ok || n == 0) { fail("init rgoto"); return res; }
-      std::uint32_t tgt = 0;
-      for (std::uint8_t k = 0; k < n; ++k) {
-        std::uint32_t o = r.u32();
-        if (k == 0) tgt = o;
-      }
-      if (!r.ok) { fail("init rgoto offs"); return res; }
-      doGoto(tgt);
-      break;
+  switch (op) {
+  case 0xff:                              // suspend — end of pass
+    obj.field21e = 0;                     // +0x21e = 0 (OBSERVED
+    res.halted = true;                    //  0x451e7c)
+    v.done = true; return;
+  case 0x09:                              // stop — +0x108=0, depth=0,
+    obj.field108 = nullptr;               // mark[0]=0 (0x43f57a)
+    obj.scriptCallDepth = 0;
+    obj.scriptMark[0] = 0;
+    res.stopped = true; v.done = true; return;
+  case 0xfd:                              // return — pop event frame
+    v.doReturn(); return;
+  case 0x01:                              // ckpt: +0x108 = pc
+    obj.field108 = v.ptrAt(r.pc);         // (OBSERVED 0x43bcbc)
+    return;
+  case 0x40: {                            // wait {varop} — +0x22c secs,
+    float secs = resolveVar(r, env, ctx); // +0x230=resume (0x43bcd0)
+    if (!r.ok) { v.fail("wait"); return; }
+    std::uint32_t bits;
+    std::memcpy(&bits, &secs, 4);
+    if ((bits & 0x7fffffffu) == 0) {      // zero -> 1-frame nudge
+      std::uint32_t nudge = 0x3727c5acu;  //   (OBSERVED constant)
+      std::memcpy(&secs, &nudge, 4);
     }
-    case 0xfc: {                            // rcall {u8 n, n×u32}
-      std::uint8_t n = r.u8();
-      if (!r.ok || n == 0) { fail("init rcall"); return res; }
-      std::uint32_t tgt = 0;
-      for (std::uint8_t k = 0; k < n; ++k) {
-        std::uint32_t o = r.u32();
-        if (k == 0) tgt = o;
-      }
-      if (!r.ok) { fail("init rcall offs"); return res; }
-      if (!doCall(tgt)) return res;
-      break;
+    obj.field22c = secs;
+    obj.field230 = v.ptrAt(r.pc);
+    res.waited = true; v.done = true; return;
+  }
+  case 0x0c: {                            // rgoto {u8 n, n×u32}
+    std::uint8_t n = r.u8();
+    if (!r.ok || n == 0) { v.fail("rgoto"); return; }
+    const std::uint32_t tgt = v.pickList(n);
+    if (!r.ok) { v.fail("rgoto offs"); return; }
+    v.doGoto(tgt);
+    return;
+  }
+  case 0xfc: {                            // rcall {u8 n, n×u32}
+    std::uint8_t n = r.u8();
+    if (!r.ok || n == 0) { v.fail("rcall"); return; }
+    const std::uint32_t tgt = v.pickList(n);
+    if (!r.ok) { v.fail("rcall offs"); return; }
+    v.doCall(tgt);
+    return;
+  }
+  case 0x5f: {                            // wcall {u8 n, n×{u8 w,u32}}
+    // OBSERVED (0x43b9c7): weights summed, FUN_00401ed4(sum) picks a
+    // weight index, the first entry whose cumulative weight exceeds
+    // the pick is called. Deterministic seam: pick = 0 -> the first
+    // positive-weight entry (all-zero -> no call).
+    std::uint8_t n = r.u8();
+    if (!r.ok || n == 0) { v.fail("wcall"); return; }
+    std::uint32_t tgt = 0;
+    std::uint32_t accum = 0;
+    for (std::uint8_t k = 0; k < n; ++k) {
+      std::uint8_t w = r.u8();
+      std::uint32_t o = r.u32();
+      accum += w;
+      if (tgt == 0 && accum > 0) tgt = o;  // first cum weight > pick
     }
+    if (!r.ok) { v.fail("wcall offs"); return; }
+    if (tgt != 0) v.doCall(tgt);
+    return;
+  }
+  case 0x66: {                            // condlink — +0xec gate
+    // OBSERVED (0x4391db..0x43949e): {u8 mode; 0xfe -> two u32,
+    // 0xfc/0x0c -> one u32}. With NO path bound (+0xec==0): 0xfe/0xfc
+    // call the first target, 0xfd returns, 0x0c goto-checkpoints it.
+    // With a path bound only 0xfe acts — and calls the SECOND (else)
+    // target.
+    Linkage L;
+    if (!readLinkage(r, L)) { v.fail("condlink"); return; }
+    const bool pathFree = (obj.fieldEC == nullptr);
+    if (pathFree) {
+      if (L.mode == 0xfe || L.mode == 0xfc) v.doCall(L.a);
+      else if (L.mode == 0xfd) v.doReturn();
+      else if (L.mode == 0x0c) v.doGoto(L.a);
+    } else if (L.mode == 0xfe) {
+      v.doCall(L.b);
+    }
+    return;
+  }
+  case 0x02: {                            // path bind (0x438e7c)
+    // {u32 pathRef, u8 f1, u8 f2, u16 frame, u8 mode, [f32×3]}
+    std::uint32_t ref = r.u32();
+    std::uint8_t f1 = r.u8(), f2 = r.u8();
+    std::uint16_t frame = r.u16();
+    std::uint8_t mode = r.u8();
+    if (!r.ok) { v.fail("pathbind"); return; }
+    obj.fieldEC = v.ptrAt(ref, 8);
+    if (f1 & 1) obj.col.flags149 |= 0x2; else obj.col.flags149 &= ~0x2;
+    // f1&2 -> +0x14b|8 (ghost); +0x14b byte is unmodelled.
+    if (f2 & 1) obj.col.flags149 |= 0x4; else obj.col.flags149 &= ~0x4;
+    const bool marked = (f2 & 2) != 0;
+    if (marked) obj.fieldE8 = -1.0f;       // +0xe8 = -1.0
+    if (frame != 0) obj.fieldF0 = static_cast<float>(frame);
+    else if (marked && obj.fieldEC) {
+      // OBSERVED (0x438f96): +0xf0 = last path entry's u32 - 1 —
+      // path {u32 count, u32, entry[count]×10 dwords}.
+      const std::byte* p =
+          static_cast<const std::byte*>(obj.fieldEC);
+      std::uint32_t cnt;
+      std::memcpy(&cnt, p, 4);
+      const std::byte* base = env.image.data() + env.imageBase;
+      const std::byte* lim = env.image.data() + env.image.size();
+      const std::byte* slot = p + 4 + (cnt ? cnt - 1 : 0) * 0x28;
+      if (cnt && slot + 4 <= lim && slot >= base) {
+        std::uint32_t v0;
+        std::memcpy(&v0, slot, 4);
+        obj.fieldF0 = static_cast<float>(v0 - 1);
+      } else {
+        obj.fieldF0 = 0.0f;
+      }
+    } else {
+      obj.fieldF0 = 0.0f;
+    }
+    if (mode == 0) {
+      for (int i = 0; i < 3; ++i) obj.fieldF4[i] = r.f32();
+    } else {
+      // FUN_00456bc8(path, +0xf0, &pt); +0xf4 = pos - pt — the path
+      // sampler is a seam; keep the offset zeroed.
+      obj.fieldF4[0] = obj.fieldF4[1] = obj.fieldF4[2] = 0.0f;
+    }
+    obj.fieldE6 = -1;                      // +0xe6 = 0xffff
+    // FUN_00457264(obj) — path-start snap; a seam.
+    return;
+  }
+  case 0x44: case 0x45: case 0x46: {      // flag bit ops (0x447d99+)
+    std::uint8_t grp = r.u8(), bit = r.u8();
+    if (!r.ok) { v.fail("flagop"); return; }
+    std::uint32_t& f = resolveFlag(grp, env, ctx);
+    const std::uint32_t m = 1u << (bit & 0x1f);
+    if (op == 0x44) f |= m;
+    else if (op == 0x45) f &= ~m;
+    else f ^= m;
+    return;
+  }
+  case 0x47: {                            // flag bit test + linkage
+    std::uint8_t grp = r.u8(), bit = r.u8();
+    Linkage L;
+    if (!readLinkage(r, L)) { v.fail("flagtest"); return; }
+    const bool cond = (resolveFlag(grp, env, ctx) >> (bit & 0x1f)) & 1;
+    switch (L.mode) {
+    case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+               break;
+    case 0xfc: if (cond) v.doCall(L.a); break;
+    case 0x0c: if (cond) v.doGoto(L.a); break;
+    case 0xfd: if (cond) v.doReturn(); break;
+    default: break;
+    }
+    return;
+  }
+  case 0x4e: {                            // subtype set (0x448741)
+    for (int i = 0; i < 3; ++i) obj.field120[i] = r.u32();
+    if (!r.ok) { v.fail("subtype4e"); return; }
+    obj.field11e = 0x4e;
+    obj.fieldEC = nullptr;                 // unbind path
+    obj.field2a0 = 0; obj.field2a1 = 0;
+    obj.field2a8 = 0.0f; obj.field2ac = 0.0f;
+    // FUN_00451ee8(obj) — subtype helper; a seam.
+    return;
+  }
+  case 0xcd:                              // +0x21f = u8 (0x451151)
+    obj.flag21f = r.u8();
+    return;
 
+    // ----- object field writes -----
     // ----- object field writes -----
     case 0x08: {                            // +0x4c yaw (MOVSX u16)
       std::int16_t v = static_cast<std::int16_t>(r.u16());
       obj.yawDeg = static_cast<float>(v);
       if (obj.yawDeg < 0.0f) obj.yawDeg += 360.0f;   // normalize to [0,360)
-      break;
+      return;
     }
-    case 0x0b: obj.field11a = r.u8(); break;         // +0x11a
-    case 0x49: obj.field11b = r.u8(); break;         // +0x11b
+    case 0x0b: obj.field11a = r.u8(); return;         // +0x11a
+    case 0x49: obj.field11b = r.u8(); return;         // +0x11b
     case 0x10: {                            // +0x8 health (MOVZX u16)
       std::uint16_t v = r.u16();
       obj.health = static_cast<int>(v);
@@ -794,13 +1004,13 @@ TraversalScriptResult traversalObjectInitScript(
         obj.health = 0;                              //   remove (seam — the
         obj.syncCollisionView();                     //   list detach is not
       }                                              //   modelled; health=0
-      break;                                         //   makes it inert)
+      return;                                         //   makes it inert)
     }
     case 0x6f: obj.spawnId =                    // +0x146 (u16 of u32)
-        static_cast<std::uint16_t>(r.u32() & 0xffff); break;
-    case 0x32: obj.field38 = resolveVar(r, oenv, st); break;  // +0x38
-    case 0x33: obj.field3c = resolveVar(r, oenv, st); break;  // +0x3c
-    case 0x34: obj.field40 = resolveVar(r, oenv, st); break;  // +0x40
+        static_cast<std::uint16_t>(r.u32() & 0xffff); return;
+    case 0x32: obj.field38 = resolveVar(r, env, ctx); return;  // +0x38
+    case 0x33: obj.field3c = resolveVar(r, env, ctx); return;  // +0x3c
+    case 0x34: obj.field40 = resolveVar(r, env, ctx); return;  // +0x40
     case 0x53: {                              // +0x58 scale
       std::uint8_t mode = r.u8();
       if (mode == 0xff) {                     // ramp form {u8,u32,u32}:
@@ -808,12 +1018,12 @@ TraversalScriptResult traversalObjectInitScript(
         // +0x58 toward a target — a runtime behavior; no init script
         // uses it, so consume operands only (HYPOTHESIS: single step).
       } else {
-        obj.col.scale = resolveVarMode(mode, r, oenv, st);
+        obj.col.scale = resolveVarMode(mode, r, env, ctx);
       }
-      break;
+      return;
     }
-    case 0x54: obj.zBias = resolveVar(r, oenv, st); break;    // +0x5c
-    case 0x5a: obj.fieldE8 = resolveVar(r, oenv, st); break;  // +0xe8
+    case 0x54: obj.zBias = resolveVar(r, env, ctx); return;    // +0x5c
+    case 0x5a: obj.fieldE8 = resolveVar(r, env, ctx); return;  // +0xe8
     case 0xc6: {                            // element-set declaration
       // OBSERVED (handler 0x4394d0, dispatch-table slot 0xc6):
       //   {str8 prefix, u8 digitOfs, u32 hpThresh, u32 extra}
@@ -828,52 +1038,96 @@ TraversalScriptResult traversalObjectInitScript(
       obj.homingDigitOfs = r.u8();
       const std::uint32_t hp = r.u32();
       obj.field30a = r.u32();
-      if (!r.ok) { fail("init elemset"); return res; }
+      if (!r.ok) { v.fail("elemset"); return; }
       const std::int16_t v = static_cast<std::int16_t>(hp & 0xffffu);
       obj.elemThresh.assign(8, v);
       obj.elemHp.assign(8, v);
-      break;
+      return;
     }
-    case 0xc7: obj.field104 = resolveVar(r, oenv, st); break; // +0x104
+    case 0xc7: obj.field104 = resolveVar(r, env, ctx); return; // +0x104
     case 0x4c: {                              // +0x110 image ref (0->null)
       std::uint32_t off = r.u32();
       obj.field110 = (off == 0) ? nullptr : imageRef(off, 4);
-      break;
+      return;
     }
-    case 0x75:                                // +0x118 anim target word
-      // {u32 slot, low u16 used}: +0x118 = (i16)low16 - 1. Shared
-      // anim-status word — for XM3 etc. it pre-loads the frame the
-      // anim player (FUN_004555bc) runs toward before latching done.
-      obj.connAnimLatch = static_cast<std::int16_t>(
+    case 0x75: {                              // +0x148 &= ~u32
+      // OBSERVED (handler 0x44d025): reads a u32 mask and ANDs the
+      // complement into the +0x148 flag dword. (An earlier draft
+      // mislabeled this slot as the +0x118 writer — that handler is
+      // op 0x76.)
+      std::uint32_t v = r.u32();
+      std::uint32_t nv = ~v;
+      obj.col.flags148 = static_cast<std::uint16_t>(
+          obj.col.flags148 & (nv & 0xffffu));
+      obj.col.flags149 = static_cast<std::uint8_t>(obj.col.flags148 >> 8);
+      obj.col.flags14a &= static_cast<std::uint8_t>((nv >> 16) & 0xff);
+      return;                                  // +0x14b byte unmodelled
+    }
+    case 0x76:                                // +0x118 anim target word
+      // OBSERVED (handler 0x43976b): {u32 slot, low u16 used} — writes
+      // +0x118 = (i16)low16 - 1. Shared anim-status word: pre-loads
+      // the frame the anim player (FUN_004555bc) runs toward before
+      // latching done.
+      obj.animLatch = static_cast<std::int16_t>(
           static_cast<std::int16_t>(r.u32() & 0xffff) - 1);
-      break;
+      return;
+    case 0x03: case 0x3b: {                   // bind +0x114 anim record
+      // OBSERVED (handlers 0x4395bb/0x439663): {u32 imgref} resolved
+      // through FUN_00438898 (lazy image ref). On rebind — or when the
+      // done latch is set — resets +0xe4=0xffff, +0xdc=-1.0f,
+      // +0x118=0xffff; then 0x03 clears +0x148 bit3 (one-shot) and
+      // 0x3b sets it (loop).
+      std::uint32_t off = r.u32();
+      const void* rec = imageRef(off, 12);
+      if (!r.ok) { v.fail("animbind"); return; }
+      if (obj.animRec != rec ||
+          static_cast<std::uint16_t>(obj.animLatch) == 0xff00u) {
+        obj.animRec = rec;
+        obj.animFrame = -1;                    // +0xe4 = 0xffff
+        obj.animAcc = -1.0f;                   // +0xdc = -1.0
+        obj.animLatch = -1;                    // +0x118 = 0xffff
+      }
+      if (op == 0x03) obj.col.flags148 &= ~0x8u;
+      else            obj.col.flags148 |= 0x8u;
+      return;
+    }
+    case 0x18: {                              // anim sound marker
+      // OBSERVED (handler 0x43a01f): {u8 mark, str name} ->
+      // +0x144 = mark-1, +0x140 = name pointer. FUN_004555bc emits
+      // the sound once when +0xdc crosses the mark (seam) — we keep
+      // the text + marker so the consume state stays faithful.
+      obj.animSoundMark = static_cast<std::int16_t>(r.u8() - 1);
+      obj.animSoundName = r.str();
+      if (!r.ok) { v.fail("animsnd"); return; }
+      return;
+    }
     case 0x41: {                              // setVar {mode,idx,u32}
       std::uint8_t mode = r.u8(), idx = r.u8();
-      std::uint32_t v = r.u32();
-      if (!r.ok) { fail("init setVar"); return res; }
-      if (float* slot = resolveVarRef(mode, idx, oenv, st)) {
-        float f; std::memcpy(&f, &v, 4); *slot = f;
+      std::uint32_t bits = r.u32();
+      if (!r.ok) { v.fail("setVar"); return; }
+      if (float* slot = resolveVarRef(mode, idx, env, ctx)) {
+        float f; std::memcpy(&f, &bits, 4); *slot = f;
       }
-      break;
+      return;
     }
 
     // ----- +0x148/+0x149/+0x14a flag ops (byte-addressed) -----
     case 0x23: {                              // +0x148 bit2
       if (r.u8()) obj.col.flags148 |= 0x4; else obj.col.flags148 &= ~0x4u;
-      break;
+      return;
     }
     case 0x24: {                              // +0x148 bit1
       if (r.u8()) obj.col.flags148 |= 0x2; else obj.col.flags148 &= ~0x2u;
-      break;
+      return;
     }
     case 0x3f: {                              // +0x148 bit4 INVERTED
       if (r.u8()) obj.col.flags148 &= ~0x10u; else obj.col.flags148 |= 0x10u;
-      break;
+      return;
     }
     case 0x61: {                              // +0x148 bit7 INVERTED
       if (r.u8()) { obj.col.flags148 &= ~0x80u; }
       else { obj.col.flags148 |= 0x80u; obj.pitchDeg = 0.0f; }  // +0x54=0
-      break;
+      return;
     }
     case 0x29: {                              // +0x149 bit0 / +0x14a bit7
       std::uint8_t v = r.u8();
@@ -881,7 +1135,7 @@ TraversalScriptResult traversalObjectInitScript(
       else   { obj.col.flags148 &= ~0x100u; obj.col.flags149 &= ~0x1; }
       if (v == 2) obj.col.flags14a |= 0x80; else obj.col.flags14a &= ~0x80;
       // +0x149 bit0 clear while ridden -> FUN_00461878 dismount (seam).
-      break;
+      return;
     }
     case 0x74: {                              // +0x148 dword |= operand
       std::uint32_t v = r.u32();
@@ -889,7 +1143,7 @@ TraversalScriptResult traversalObjectInitScript(
           obj.col.flags148 | (v & 0xffffu));
       obj.col.flags149 = static_cast<std::uint8_t>(obj.col.flags148 >> 8);
       obj.col.flags14a |= static_cast<std::uint8_t>((v >> 16) & 0xff);
-      break;                                  // +0x14b byte unmodelled
+      return;                                  // +0x14b byte unmodelled
     }
 
     // ----- element-name mask -> +0x2c8 -----
@@ -897,25 +1151,25 @@ TraversalScriptResult traversalObjectInitScript(
       std::uint8_t n = r.u8();
       for (std::uint8_t k = 0; k < n; ++k) {
         std::string s = r.str();
-        if (!r.ok) break;
+        if (!r.ok) return;
         for (int e = 0; e < obj.elemSet.count; ++e) {
           const std::string en = obj.model.elemName(e);
           if (en == s || s == "ALL")            // FUN_0042fa50 match /
             obj.col.elemMaskB |= (1u << (e & 31)); //  "ALL" wildcard
         }
       }
-      if (!r.ok) { fail("init elemmask"); return res; }
-      break;
+      if (!r.ok) { v.fail("elemmask"); return; }
+      return;
     }
 
     // ----- connector config family -----
     case 0x96: {                              // {u32,u32}->+0x306/+0x30a
       std::uint32_t a = r.u32(), b = r.u32();
-      obj.connAnimNear = imageRef(a, 12);      // +0x306 (open anim)
-      obj.connAnimFar  = imageRef(b, 12);      // +0x30a (close anim)
+      obj.animRecNear = imageRef(a, 12);      // +0x306 (open anim)
+      obj.animRecFar  = imageRef(b, 12);      // +0x30a (close anim)
       // FUN_00438898 lazy-resolve (*ptr==0 -> symbol) is a seam — the
       // door's records carry rate=1.0 (nonzero) so no resolve occurs.
-      break;
+      return;
     }
     case 0x97: {                              // {4 strs}->+0x316..+0x322
       std::string s[4];
@@ -924,28 +1178,44 @@ TraversalScriptResult traversalObjectInitScript(
       // op3->+0x31e (scrambled). "NONE" sentinel clears the slot.
       obj.connSound31a = s[0]; obj.connSound322 = s[1];
       obj.connSound316 = s[2]; obj.connSound31e = s[3];
-      break;
+      return;
     }
     case 0x98: {                              // +0x312 hi nibble
       std::uint32_t v = r.u32();
       obj.connState = static_cast<std::uint8_t>(
           (obj.connState & 0x0f) | (v & 0xf0));
-      break;
+      return;
     }
-    case 0x99: obj.connRadius = r.f32(); break; // +0x30e
+    case 0x99: obj.connRadius = r.f32(); return; // +0x30e
 
     default: {
       char buf[160];
       std::snprintf(buf, sizeof buf,
-                    "Unrecognised objinit op 0x%02x at +%x",
+                    "Unrecognised object op 0x%02x at +%x",
                     op, insnOff);
-      fail(buf);
-      return res;
-    }
+      v.fail(buf);
+      return;
     }
   }
+}
 
-  {
+} // namespace
+
+TraversalScriptResult traversalObjectInitScript(
+    TraversalScriptEnv& env, DynamicObject& obj, std::uint32_t codeOff) {
+  TraversalScriptResult res;
+  if (codeOff == 0) return res;
+  // Var mode 1 resolves the bound object's home arena (+0x48). Rebind
+  // selfArena to the object's actual home so resolveVar/resolveVarRef
+  // hit the right arena even if env.selfArena differs.
+  TraversalScriptEnv oenv = env;
+  if (obj.arena && obj.arena->owner) oenv.selfArena = obj.arena->owner;
+  Reader r{oenv.image, oenv.imageBase, codeOff};
+  const char* name =
+      oenv.selfArena ? oenv.selfArena->name.c_str() : "<obj>";
+  ObjScriptPass v{oenv, obj, r, res, name};
+  for (int i = 0; i < 1000 && !v.done; ++i) objScriptInsn(v);
+  if (!v.done && !res.error) {
     char buf[160];
     std::snprintf(buf, sizeof buf,
                   "Objinit %s looped %d commands, off %lx", name,
@@ -953,6 +1223,69 @@ TraversalScriptResult traversalObjectInitScript(
     res.diag = buf;
     if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
     res.error = true;
+  }
+  obj.field108 = nullptr;   // FUN_004566f0 clears +0x108 post-run
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent per-object script tick — FUN_004388d8(obj) gated on
+// +0x108 (OBSERVED FUN_004572ac body: the VM runs before the path
+// follower / subtype / gravity / anim driver each frame). The wait
+// gate at 0x438971..0x4389be: +0x22c decrements by 1/30 per entry;
+// while positive the fetch is skipped entirely; on crossing zero the
+// pass resumes at +0x230. Entry pc = +0x108 — the last checkpoint
+// (0x01), call target (0xfc/0x5f/0x66) or wait-resume target.
+// ---------------------------------------------------------------------------
+TraversalScriptResult traversalObjectScriptTick(
+    TraversalScriptEnv& env, DynamicObject& obj) {
+  TraversalScriptResult res;
+  if (obj.field108 == nullptr) return res;
+  TraversalScriptEnv oenv = env;
+  if (obj.arena && obj.arena->owner) oenv.selfArena = obj.arena->owner;
+
+  const std::byte* base = oenv.image.data() + oenv.imageBase;
+  auto offIn = [&](const void* p) -> std::uint32_t {
+    const std::byte* q = static_cast<const std::byte*>(p);
+    if (!q || q < base ||
+        q >= oenv.image.data() + oenv.image.size())
+      return 0;
+    return static_cast<std::uint32_t>(q - base);
+  };
+
+  std::uint32_t entryOff;
+  if (obj.field22c > 0.0f) {
+    obj.field22c -= 1.0f / 30.0f;       // 0x49b6f4 (OBSERVED)
+    if (obj.field22c > 0.0f) { res.waited = true; return res; }
+    obj.field22c = 0.0f;
+    entryOff = offIn(obj.field230);
+  } else {
+    entryOff = offIn(obj.field108);
+  }
+  if (entryOff == 0) {                  // pc outside the image — the
+    res.error = true;                   // original would fault; the
+    res.diag = "object script PC out of bounds";  // port kills it
+    if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
+    obj.field108 = nullptr;
+    return res;
+  }
+
+  Reader r{oenv.image, oenv.imageBase, entryOff};
+  const char* name =
+      oenv.selfArena ? oenv.selfArena->name.c_str() : "<obj>";
+  ObjScriptPass v{oenv, obj, r, res, name};
+  for (int i = 0; i < 1000 && !v.done; ++i) objScriptInsn(v);
+  if (!v.done && !res.error) {
+    // "Alien %s looped %d commands, off %lx" (OBSERVED diagnostic);
+    // the original then clears +0x108.
+    char buf[160];
+    std::snprintf(buf, sizeof buf,
+                  "Alien %s looped %d commands, off %lx", name,
+                  res.instructions, static_cast<unsigned long>(r.pc));
+    res.diag = buf;
+    if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
+    res.error = true;
+    obj.field108 = nullptr;
   }
   return res;
 }
@@ -1046,8 +1379,8 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
     o.connRadius = 20.0f;                    // +0x30e
     o.connState = 8;                         // +0x312 = closed
     o.connStateHi = 0;                       // +0x313
-    o.connAnimNear = nullptr;                // +0x306
-    o.connAnimFar = nullptr;                 // +0x30a
+    o.animRecNear = nullptr;                // +0x306
+    o.animRecFar = nullptr;                 // +0x30a
     o.col.flags148 = 0x8000;                 // +0x148=0x00 +0x149=0x80
     o.col.flags149 = 0x80;                   // +0x149
     o.col.flags14a = 0x10;                   // +0x14a (connector)
@@ -1075,6 +1408,17 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
     }
     o.syncCollisionView();                   // presence-gate re-check
     rebuildObjectTransform(o);               // FUN_0045612c (+0x58/+0x5c)
+  }
+
+  // FUN_00456808 tail — the spawn's script operand binds +0x108, the
+  // persistent per-object VM PC (image pointer; the object-script tick
+  // runs it each frame while nonzero). OBSERVED write order: the
+  // init script runs first (its own +0x108 use is transient).
+  if (scriptOff != 0 && !env.image.empty()) {
+    const std::uint64_t fo =
+        static_cast<std::uint64_t>(env.imageBase) + scriptOff;
+    if (fo < env.image.size())
+      o.field108 = env.image.data() + fo;
   }
 
   if (variant == 0) {
@@ -1124,6 +1468,9 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xc7: return "v";           // obj-init +0x104 var write
   case 0xe0: return "b";           // + conditional ff when flag != 0
   case 0x0a: return "sbl";
+  case 0x03: case 0x3b: return "l";    // anim bind {u32 imgref}
+  case 0x18: return "bs";              // anim sound {u8 mark, str}
+  case 0x75: case 0x76: return "w";    // flag-mask / +0x118 target
   default: return nullptr;
   }
 }
@@ -1147,6 +1494,9 @@ const char* opcodeName(std::uint8_t op) {
   case 0x0a: return "brObj11a";  case 0x0b: return "setVar11a";
   case 0x41: return "setVar";
   case 0xc6: return "elemset"; case 0xc7: return "setF104";
+  case 0x03: return "animBind"; case 0x3b: return "animLoop";
+  case 0x18: return "animSnd";  case 0x75: return "clr148";
+  case 0x76: return "animTgt";
   default: return nullptr;
   }
 }

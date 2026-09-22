@@ -459,7 +459,7 @@ void initObjectDefaults(DynamicObject& obj) {
   obj.field44 = 64.0f;                   // +0x44
   obj.field48 = 32.0f;                   // +0x48
   obj.col.scale = 1.0f;                  // +0x58
-  obj.connAnimRate = 30.0f;              // +0xe0
+  obj.animRate = 30.0f;              // +0xe0
   obj.fieldE8 = 1.0f;                    // +0xe8
   obj.field2c0 = 1.0f;                   // +0x2c0
   obj.field2c4 = 1000.0f;                // +0x2c4
@@ -504,11 +504,13 @@ std::vector<std::size_t> resolveArenaRecordNames(
 namespace {
 
 // Shared tail of the type-2/type-4 spawn paths: dedup, alloc, model
-// deep-copy, position/prevPos, init.
+// deep-copy, position/prevPos, init, +0x108 script binding.
 DynamicObject* spawnRecord(DynamicArena& arena, int modelIndex,
                            std::uint16_t spawnId, const float pos[3],
                            DynamicModelSource modelFor, void* ctx,
-                           bool dedupBySpawnId) {
+                           bool dedupBySpawnId,
+                           DynamicObjectScriptSource scriptFor,
+                           void* scriptCtx) {
   for (const auto& up : arena.storage) {
     const DynamicObject& o = *up;
     if (!o.col.named) continue;
@@ -529,6 +531,13 @@ DynamicObject* spawnRecord(DynamicArena& arena, int modelIndex,
   o.prevPos[2] = pos[2];
   o.prevYawDeg = o.yawDeg;
   initObjectCollision(o);               // FUN_004566f0 subset
+  // FUN_00456808 — the table-0 "%s$%s_%d" record binds +0x108, the
+  // persistent per-object script (the tr_alcmd object tick's gate).
+  if (scriptFor) {
+    const std::string mn = o.model.modelName();
+    o.field108 = scriptFor(arena.name.c_str(), mn.c_str(), spawnId,
+                           scriptCtx);
+  }
   return &o;
 }
 
@@ -536,7 +545,9 @@ DynamicObject* spawnRecord(DynamicArena& arena, int modelIndex,
 
 int spawnArenaObjects(DynamicArena& arena, const DtiArenaRecord& rec,
                       DynamicModelSource modelFor, void* ctx,
-                      std::vector<DynamicObject*>* spawned) {
+                      std::vector<DynamicObject*>* spawned,
+                      DynamicObjectScriptSource scriptFor,
+                      void* scriptCtx) {
   int count = 0;
   for (const auto& sr : rec.subRecords) {
     const float pos[3] = {sr.fieldAsFloat(2), sr.fieldAsFloat(3),
@@ -547,7 +558,8 @@ int spawnArenaObjects(DynamicArena& arena, const DtiArenaRecord& rec,
       const std::uint16_t spawnId =
           static_cast<std::uint16_t>(sr.fields[0] & 0xffffu);
       DynamicObject* o =
-          spawnRecord(arena, enemyIdx, spawnId, pos, modelFor, ctx, true);
+          spawnRecord(arena, enemyIdx, spawnId, pos, modelFor, ctx, true,
+                      scriptFor, scriptCtx);
       if (o) {
         o->behaviorByte = 7;            // +0x11c
         ++count;
@@ -556,7 +568,8 @@ int spawnArenaObjects(DynamicArena& arena, const DtiArenaRecord& rec,
     } else if (sr.type == 4) {
       const int modelIdx = static_cast<int>(sr.fields[0] & 0xffffu);
       DynamicObject* o =
-          spawnRecord(arena, modelIdx, 0, pos, modelFor, ctx, false);
+          spawnRecord(arena, modelIdx, 0, pos, modelFor, ctx, false,
+                      scriptFor, scriptCtx);
       if (o) {
         o->health = 1;                  // +0x08 = 1 (overrides init's 10)
         o->col.flags148 |= 0x08a0;      // +0x148 dword |= 0x2008a0:
@@ -592,6 +605,11 @@ void applyRideDisplacement(const DynamicObject& obj, CollisionState& cs,
 }
 
 void latchObjectPrevState(DynamicObject& obj) {
+  // FUN_004572ac tail (0x45737b): +0x18c velocity = pos - prevPos
+  // (the 1.0/DAT_0049b6f0 scale is x1.0), written BEFORE the latch.
+  obj.field18c[0] = obj.pos[0] - obj.prevPos[0];
+  obj.field18c[1] = obj.pos[1] - obj.prevPos[1];
+  obj.field18c[2] = obj.pos[2] - obj.prevPos[2];
   obj.prevPos[0] = obj.pos[0];
   obj.prevPos[1] = obj.pos[1];
   obj.prevPos[2] = obj.pos[2];

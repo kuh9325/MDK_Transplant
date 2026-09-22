@@ -3460,3 +3460,239 @@ metadata preserves the handles' call context.
   software-render implementations, the `FUN_0045ee08` anim
   driver, type-4 `FUN_00409760` widget, and the handed-off death
   script's execution (G5).
+
+## 147. Per-object update order — `FUN_004572ac` (OBSERVED, disasm)
+
+Instruction-level decomp of the object loop (`/tmp/g5_loop.txt` —
+private artifact, not committed). Per list node:
+
+1. Advance the +0x68 list; nodes with `+0x06 == 0` are skipped at
+   fetch time (the `named`/live gate is a loop condition).
+2. `+0x07 == 1` → `0x49b85c` view-anchor latch.
+3. `+0x14a & 0x10` → connector `FUN_00457738`;
+   `+0x14a & 0x40` → orbit `FUN_00457ab8`.
+4. `+0x14b & 0x40` → command runner `FUN_0045ab44` — the
+   `do…while` wraps back to step 1 when it returns `[2]==0`
+   (the runner can swallow the rest of an object's update).
+5. `+0x2bc != 0` → pending-arena transfer `FUN_004574d0`.
+6. `+0x108 != 0` → **`FUN_004388d8` object script VM** — NOT
+   gated on `+0x06` at this point (the live check already ran at
+   step 1).
+7. `+0x06 != 0` re-checked (the script may have killed the
+   object) → `+0xec != 0` → path follower `FUN_00456d28`;
+   `FUN_004533d4` subtype dispatch.
+8. `+0x06 != 0` → gravity `FUN_0045b9fc` + collide
+   `FUN_0045bac0`.
+9. `+0x06 != 0` → `+0x149 & 0x10` → enemy dispatch
+   `FUN_0045897c` (post-check `+0x06` again — the dispatch can
+   kill), else `+0x14a & 0x20` → mover `FUN_004585c4`.
+10. Anim driver `FUN_004555bc`.
+11. `+0x06 != 0` → velocity write `+0x18c/190/194 =
+    (pos − prevPos)·(1.0/DAT_0049b6f0)` (the constant is 1.0),
+    `+0x148 & 0x40` raw-matrix path, ride displacement for the
+    carrier, `prevPos`/`prevYaw` latch.
+
+Native: `traversal_runtime.cpp` object loop follows this order
+for the ported stages (connector pre-pass + script tick + anim +
+mover/ride tail, each behind the same flag/`+0x06` gates; the
+unported stages — orbit, command runner, path, subtype, gravity,
+enemy dispatch — remain seams). The post-anim `+0x06` re-check
+and the `+0x18c` velocity write are included.
+
+## 148. Persistent object-script VM — `FUN_004388d8` object ctx (OBSERVED, ported)
+
+`FUN_004388d8` is a single interpreter parameterized by a context
+block; the arena ctx (`TraversalScriptState`, Phase 5I) and the
+object ctx (the `DynamicObject` itself) share the opcode set but
+map the ctx fields differently (OBSERVED dispatch head
+`0x4389dd`, jump table `0x438a5c`).
+
+Object-ctx field map (all OBSERVED from handler disasm):
+- `+0x108` — persisted PC (image pointer); entry point and the
+  checkpoint target. Gate: the caller only invokes the VM when
+  it is nonzero.
+- `+0x22c` — wait seconds, decremented by `1/30`
+  (`DAT_0049b6f4`) at the head of every invocation; while the
+  remainder stays positive the fetch is skipped entirely; on
+  crossing zero the pass resumes at `+0x230`.
+- `+0x230` — wait-resume PC (image pointer).
+- `+0x234` — 4×f32 script locals (varop mode 2).
+- `+0x244` — local flag dword (flag group 2).
+- `+0x248` — event-call depth, cap 4 ("Gosub overflow").
+- `+0x24c`/`+0x25c` — per-depth return PC / saved `+0x108`.
+- `+0x26c` — per-depth marker (`0x09` clears slot 0).
+- `+0x312` — child flag dword (flag group 5).
+- `+0x21d` — event byte; `+0x21e` — running/suspend byte
+  (`0xff` clears it).
+- `+0xec` — bound path record; `+0xf0` path frame;
+  `+0xf4..+0xfc` lateral offset; `+0xe6` path cursor
+  (`0xffff` on bind).
+- `+0x11e` — subtype; `+0x120..+0x128` subtype dwords;
+  `+0x2a0/+0x2a1/+0x2a8/+0x2ac` subtype/mover state.
+- `+0x11a`/`+0x11b` — byte fields (ops `0x0b`/`0x49`).
+
+Execution model (OBSERVED): one pass per invocation, max 1000
+fetches ("Alien %s looped %d commands, off %lx" diagnostic +
+`+0x108 = 0`). `+0x108` is NOT rewritten on exit — progression
+is by explicit checkpoint: op `0x01` writes `+0x108 = pc` and
+continues; calls push `{retPc, savedPc}` and set `+0x108` to the
+target; `0xfd` pops and restores `+0x108`; `0x0c` rgoto
+checkpoints the jump target; `0x09` clears `+0x108`/depth/
+`mark[0]`; `0xff` suspends the pass (`+0x21e = 0`). A script
+that suspends without a fresh checkpoint re-enters at the last
+one — matching the observed real scripts (`ckpt; …; ff`).
+
+Native: `traversalObjectScriptTick` (declaration in
+`traversal_script.h`) — pointer-faithful PCs
+(`field108`/`field230`/stack slots are `const void*` image
+pointers; converted to offsets only at the Reader boundary, all
+reads bounds-checked). The same `objScriptInsn` dispatcher
+serves `traversalObjectInitScript` (synchronous, clears
+`+0x108` after — `FUN_004566f0` semantics) and the per-frame
+tick. `ScriptCtxSlots` binds the shared var/flag resolvers to
+the object block.
+
+## 149. Object animation — `FUN_004555bc` / `FUN_00455890` / `FUN_00455c48` (OBSERVED, ported)
+
+`FUN_004555bc` is the per-object animation driver (called at
+update step 10 above). Timing: `+0xdc` accumulator advances by
+`rate·dt` (`+0xe0` = 30); `steps = FRNDINT(+0xdc) − +0xe4`
+(`FSUBR` at `0x45572c`); `FUN_00455890(obj, steps)` advances
+`+0xe4` per step and wraps at `frameCount` when `+0x148 & 8`
+(loop, op `0x3b`) or latches `+0x118 = 0xff00` at the last frame
+(one-shot, op `0x03`). The `+0x140`/`+0x144` sound marker fires
+once when the accumulator crosses the mark.
+
+Record format (OBSERVED — verified against ~1274 real records
+across BUILD_A LEVEL3–8):
+`{f32 rate; u32 chanCount; u32 frameCount; u32 chanOff[chanCount];
+rootKeys[frameCount]×12B; u32 refCount; refKeys[refCount][frameCount]×12B;
+channels…}`. `FUN_00455890` per step: root key is a displacement
+delta rotated by the object matrix (`FUN_0046b048` — pure 3×3,
+no translation) into `+0x294/298/29c` (animation root motion);
+ref points copy `refKeys[r][frame]`; each channel is
+`{name[12]; u32 vertCount; f32 scale; …}` name-matched
+(`FUN_0042fa50` = plain strcmp) to model elements.
+
+Two channel forms (both OBSERVED in real records):
+- scale ≠ 0 — vertex-delta: base pose `vertCount`×12B then
+  per-frame `{i16 tag; i8 delta[3·vc]}` applied as
+  `v[j] += delta[j]·scale` to the element's cloned verts.
+- scale == 0 — rigid (`FUN_00455c48`): `{u8 rotShift, u8
+  trnShift; base pose; i16 xform[12]/frame}` — per-frame
+  fixed-point 3×3+T applied to the base pose.
+
+Native: `src/core/object_animation.{h,cpp}` —
+`objectAnimTick` (driver + frame advance + wrap/latch + sound
+mark), delta and rigid channel appliers, root-motion write.
+`traversalObjectAnimUpdate` calls it at the observed position;
+the former connector-only `connAnim*` fields are generalized to
+`animRec`/`animAcc`/`animFrame`/`animLatch`/`animRate` +
+`animSoundName`/`animSoundMark` on `DynamicObject`.
+
+## 150. Object-script opcode map — corrections + coverage (OBSERVED)
+
+Handler-disasm corrections to the Phase 5I tables:
+- `0x75` is `+0x148 &= ~u32` (handler `0x44d025`) — NOT the
+  anim-target writer; that is `0x76` (handler `0x43976b`:
+  `{u32, low16 used}` → `+0x118 = (i16)low16 − 1`). The earlier
+  `0x75`→`+0x118` label was a mislabel.
+- `0x03`/`0x3b` `{u32 imgref}` — bind `+0x114` via the lazy
+  image-ref resolver; on rebind or when the done latch is set:
+  `+0xe4 = 0xffff`, `+0xdc = −1.0`, `+0x118 = 0xffff`; `0x03`
+  clears `+0x148 & 8` (one-shot), `0x3b` sets it (loop).
+- `0x02` — path bind `{u32 ref, u8 f1, u8 f2, u16 frame,
+  u8 mode, [f32×3 if mode==0]}` → `+0xec`/`+0x149` bits/
+  `+0x14b & 8`/`+0xe8`/`+0xf0`/`+0xf4..fc`/`+0xe6 = −1`.
+  `frame != 0` → `+0xf0 = frame`; else `f2 & 2` → `+0xf0 =
+  *(u32*)(path + 4 + (count−1)·0x28) − 1` (record
+  `{u32 count; entry[count]×0x28}` — 0x438f96); else 0.
+  `mode != 0` → `+0xf4 = pos − FUN_00456bc8(path, +0xf0)` (the
+  sampler stays a seam natively; offset zeroed).
+- `0x4e` — subtype set `{u32×3}` → `+0x120..0x128`,
+  `+0x11e = 0x4e`, unbinds `+0xec`, clears
+  `+0x2a0/2a1/2a8/2ac`; `FUN_00451ee8` tail seam.
+- `0x66` — conditional linkage gated on `+0xec == 0`: unbound →
+  `0xfe`/`0xfc` call target A, `0xfd` return, `0x0c` goto A;
+  bound → only `0xfe` acts, calling target B.
+- `0x5f` — weighted event call `{u8 n; n×{u8 weight, u32 tgt}}`
+  — `FUN_00401ed4(sum)` picks, first cumulative weight above the
+  pick wins (native seam: pick = 0 → first positive weight;
+  all-zero → no call).
+- `0xfc` — random call `{u8 n; n×u32}` (seam: index 0);
+  `0x0c` — same operand form, goto.
+- `0x40` — wait `{varop}` → `+0x22c` (±0 → `0x3727c5ac`
+  ≈ 1e-5 nudge), `+0x230` = post-operand pc.
+- `0x41` — var write `{u8 mode, u8 idx, u32 bits}` → the
+  FUN_00438654-selected slot.
+- `0x44/45/46` — flag-group `|= / &=~ / ^=` `1<<(bit&31)`;
+  `0x47` — test bit + linkage.
+- `0xcd` `{u8}` → `+0x21f`.
+- `0x18` `{u8 mark, str name}` → `+0x144 = mark−1`,
+  `+0x140` = name (the `FUN_004555bc` one-shot sound seam).
+- `0x4c` `{u32 imgref}` → `+0x110` (0 → null) — the
+  death-script reference consumed by `FUN_00458140`.
+- `0x10` `{u16}` → `+0x08`/`+0x2a2` health (+ mirror); ≥ `0xfde8`
+  arms `+0x21f`; `0` → the die-facing removal path.
+- `0x96`/`0x97`/`0x98`/`0x99` — connector data block
+  (`+0x306/+0x30a` anim records, four sound slots, `+0x312` hi
+  nibble, `+0x30e` radius).
+- `0xc6` — element-set decl (§143); `0x1f` — element-name mask
+  → `+0x2c8` ("ALL" wildcard).
+- `0x08` `{i16}` → `+0x4c` yaw (+360 if negative); `0x0b`/`0x49`
+  → `+0x11a`/`+0x11b`; `0x6f` `{u32}` → `+0x146` low16;
+  `0x32/33/34` → `+0x38/3c/40`; `0x53` → `+0x58` scale (`0xff`
+  ramp form consumed, runtime ease is a seam); `0x54` → `+0x5c`;
+  `0x5a` → `+0xe8`; `0xc7` → `+0x104`; `0x23/24/3f/61/29/74` —
+  `+0x148/149/14a` bit writes (§143 family).
+
+Spawn binding (OBSERVED `FUN_00456808`): the CMI table-0 record
+named `arena$model_spawnId` (e.g. `HMO_1$XGS_9`) stores the
+object script's code offset — bound to `+0x108` after the
+synchronous init script. The table-2 `arena$model` init runs
+through the same interpreter and `+0x108` is cleared afterward
+(transient). Verified on LEVEL3: `HMO_1$XGS_9` decodes as
+`3b <anim>` / `02 <path>` / `4c <death>` / `10 fde8` / `01` /
+`66 …` / `ff` — a path-bound looping walker.
+
+## 151. Native implementation + validation (OBSERVED, ported)
+
+- `dynamic_objects.h`: `scriptLocals[16]`/`scriptFlagsLocal`/
+  `scriptCallDepth`/`scriptRetPc[4]`/`scriptSavedPc[4]`/
+  `scriptMark[4]`/`scriptFlagsChild` (+0x234/244/248/24c/25c/
+  26c/312 ctx block), `fieldEC`/`fieldF0`/`fieldF4`/`fieldE6`
+  (+0xec/f0/f4..fc/e6 path state), `field18c[3]` (+0x18c
+  velocity), `animRec`/`animAcc`/`animFrame`/`animLatch`/
+  `animRate`/`animSound*` (generalized from `connAnim*`).
+- `dynamic_objects.cpp`: `spawnArenaObjects`/`spawnRecord` take
+  a `DynamicObjectScriptSource` — binds `+0x108` from the
+  table-0 `arena$model_spawnId` record at DTI spawn;
+  `latchObjectPrevState` writes `+0x18c` before the latch.
+- `traversal_script.{h,cpp}`: `ScriptCtxSlots` resolver adapter,
+  `ObjScriptPass`/`objScriptInsn` shared dispatcher,
+  `traversalObjectScriptTick` (the `FUN_004388d8` object tick),
+  `traversalObjectInitScript` rebuilt on the same dispatcher
+  (still clears `+0x108`), opcode corrections per §150.
+- `traversal_runtime.cpp`: shared `objEnv` per frame; the tick
+  runs at the observed position inside the `+0x06`-gated object
+  loop; `traversalObjectScriptFor` resolves the table-0 key;
+  post-anim `+0x06` re-check added.
+- `object_animation.{h,cpp}`: new subsystem (§149).
+- `mdk_bridge.cpp`: `conn_anim_active` reads `animRec` (field
+  rename only — no presentation change; Godot enemy work stays
+  deferred per scope).
+- `mdk_tests`: **4072 checks / 0 failures** — persistent-VM
+  coverage: ckpt/suspend persistence, wait decrement + resume,
+  `0x09` stop, `0xfc`/`0xfd` call stack, `0x5f` weighted pick,
+  object locals/flags, `0x02` path bind, `0x4e` subtype,
+  death-handoff execution, foreign-PC bounds, 1000-insn cap,
+  init transience, DTI spawn binding; plus the animation record
+  suite (header/delta/rigid/loop/latch/bounds).
+- `mdk_frontend_tests`: 60 checks / 0 failures; Metal startup
+  `--frames 30` clean; BUILD_A manifest 141/141 unchanged.
+- Remaining seams (Phase 11B+): `FUN_00456d28` path follower,
+  `FUN_004533d4` subtype behaviors, `FUN_0045897c` enemy command
+  dispatch, `FUN_0045b9fc`/`FUN_0045bac0` gravity+collide,
+  `FUN_0045ab44` command runner, `FUN_00457ab8` orbit, the
+  `+0x14b` byte, the path sampler `FUN_00456bc8` in script
+  context, RNG-real `FUN_00401ed4` picks.

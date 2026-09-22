@@ -892,7 +892,7 @@ Dictionary MdkBridge::objectSnapshot_(mdk::TraversalArena& arena,
   d["ride_capable"] = (o.col.flags149 & 0x01) != 0;
   d["conn_state"] = int64_t(o.connState);
   d["conn_state_hi"] = int64_t(o.connStateHi);
-  d["conn_anim_active"] = o.connAnim != nullptr;
+  d["conn_anim_active"] = o.animRec != nullptr;   // +0x114 active anim
   d["pending_arena"] = indexOfArena_(o.pendingArena);
   d["elem_count"] = int64_t(o.model.elems.size());
   d["elem_mask"] = int64_t(o.col.elemMaskB);

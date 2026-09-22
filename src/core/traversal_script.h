@@ -219,6 +219,15 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
 // bytes; code offsets are image-relative (file offset = 4 + off).
 TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env);
 
+// Persistent per-object script tick — FUN_004388d8(obj), called by
+// FUN_004572ac for every list object whose +0x108 is nonzero (the
+// table-0 "%s$%s_%d" script or the +0x110 death handoff). Honors the
+// +0x22c wait/+0x230 resume pair; ckpt/call/goto write +0x108 (image
+// pointers); 0xff suspends to the next frame. The op set is the
+// object-bound union documented in traversal_script.cpp.
+TraversalScriptResult traversalObjectScriptTick(TraversalScriptEnv& env,
+                                                DynamicObject& obj);
+
 // Run one table-2 object-init script synchronously — the bound object
 // is `obj` (field ops write its +0xNN fields, not the arena ctx). The
 // object-init run rebinds selfArena to the object's home arena (var

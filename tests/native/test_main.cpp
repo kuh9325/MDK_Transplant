@@ -28,6 +28,7 @@
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
+#include "core/object_animation.h"
 #include "core/options_menu.h"
 #include "core/player_camera.h"
 #include "core/player_fire.h"
@@ -11782,9 +11783,9 @@ void test_traversal_object_init() {
     CHECK(o.healthMirror2a2 == 0xfde8);
     CHECK(o.flag21f == 1);
     CHECK(near(o.col.scale, 1.01021, 1e-5));
-    CHECK(o.connAnimNear ==
+    CHECK(o.animRecNear ==
           static_cast<const void*>(f.image.data() + 4 + 0x600));
-    CHECK(o.connAnimFar ==
+    CHECK(o.animRecFar ==
           static_cast<const void*>(f.image.data() + 4 + 0x620));
     CHECK(o.connState == 0x18);                  // closed | collision-toggle
     CHECK(near(o.connRadius, 20.0, 1e-5));
@@ -11793,24 +11794,29 @@ void test_traversal_object_init() {
   }
 
   // Field-set family beyond the door's: 0x5a->+0xe8, 0xc7->+0x104
-  // (same {mode,[f32|idx]} grammar as 0x53/0x54) and 0x75->+0x118
-  // (u32 slot, low16-1). Confirmed from MDK95.EXE handler disasm —
-  // the +0x104 writer is dispatch-table slot 0xc7 (handler 0x45188f),
-  // not 0xc6.
+  // (same {mode,[f32|idx]} grammar as 0x53/0x54), 0x76->+0x118
+  // (u32 slot, low16-1), and 0x75->+0x148 &= ~u32. Confirmed from
+  // MDK95.EXE handler disasm — the +0x104 writer is dispatch-table
+  // slot 0xc7 (handler 0x45188f), not 0xc6; the +0x118 writer is
+  // 0x76 (handler 0x43976b) and 0x75 is the AND-clear at 0x44d025.
   {
     ScriptFixture f;
     const std::uint32_t C = 0x200;
     f.write(C,      {0x5a, 0x03});  f.writeF(C + 2, 4.5f);   // +0xe8
     f.write(C + 6,  {0xc7, 0x03});  f.writeF(C + 8, 7.25f);  // +0x104
-    f.write(C + 12, {0x75});        f.writeW(C + 13, 9);     // +0x118=8
-    f.write(C + 17, {0xff});
+    f.write(C + 12, {0x76});        f.writeW(C + 13, 9);     // +0x118=8
+    f.write(C + 17, {0x75});        f.writeW(C + 18, 0x10);  // clr bit4
+    f.write(C + 22, {0xff});
     mdk::DynamicObject& o = f.arena->dyn.allocFront();
     mdk::initObjectDefaults(o);
+    o.col.flags148 |= 0x14;                  // set bits 2+4
+    o.col.flags149 = static_cast<std::uint8_t>(o.col.flags148 >> 8);
     auto r = mdk::traversalObjectInitScript(f.env, o, C);
     CHECK(r.halted && !r.error);
     CHECK(near(o.fieldE8, 4.5, 1e-5));
     CHECK(near(o.field104, 7.25, 1e-5));
-    CHECK(o.connAnimLatch == 8);                 // 9 - 1
+    CHECK(o.animLatch == 8);                 // 9 - 1
+    CHECK((o.col.flags148 & 0x14) == 0x4);   // 0x75 cleared bit4
   }
 
   // Opcode 0xc6 — element-set declaration (handler 0x4394d0,
@@ -11909,7 +11915,7 @@ void test_traversal_object_init() {
     CHECK(o.connDest == dst);
     CHECK(o.connState == 0x18);                  // closed | toggle
     CHECK(near(o.connRadius, 20.0, 1e-5));
-    CHECK(o.connAnimNear != nullptr && o.connAnimFar != nullptr);
+    CHECK(o.animRecNear != nullptr && o.animRecFar != nullptr);
     CHECK(o.health == 0xfde8);
     CHECK(near(o.col.scale, 1.01021, 1e-5));
     CHECK((o.col.flags148 & 0x10) == 0);         // born solid
@@ -11922,21 +11928,531 @@ void test_traversal_object_init() {
     f.rt.cs.pos[2] = o.pos[2];
     mdk::traversalConnectorUpdate(o, f.rt);
     CHECK((o.connState & 0xf) == 2);             // opening
-    CHECK(o.connAnim == o.connAnimNear);
+    CHECK(o.animRec == o.animRecNear);
     CHECK(f.rt.partner == dst && f.rt.partnerActive);
 
     // FUN_004555bc: the open anim (16 frames @ rate1, animRate30)
     // advances +0xdc by 1.0/frame to the frameCount-1 latch.
-    for (int i = 0; i < 40 && !o.connAnimDone(); ++i)
-      mdk::traversalObjectAnimUpdate(o);
-    CHECK(o.connAnimDone());
-    CHECK(static_cast<std::uint16_t>(o.connAnimLatch) == 0xff00u);
+    for (int i = 0; i < 40 && !o.animDone(); ++i)
+      mdk::traversalObjectAnimUpdate(o, nullptr);
+    CHECK(o.animDone());
+    CHECK(static_cast<std::uint16_t>(o.animLatch) == 0xff00u);
 
     // Done -> open; the +0x312 bit4 collision toggle sets the
     // sweep-skip bit so the door becomes passable.
     mdk::traversalConnectorUpdate(o, f.rt);
     CHECK((o.connState & 0xf) == 1);             // open
     CHECK(o.col.flags148 & 0x10);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11A — persistent per-object script VM: FUN_004388d8(obj) tick
+// gated on +0x108 (OBSERVED FUN_004572ac body + handler disasm). The
+// object ctx maps the arena VM's +0x220/+0x22c/+0x230 wait-resume trio
+// to +0x108/+0x22c/+0x230 and +0x234/+0x244/+0x312 ctx slots to the
+// DynamicObject script block.
+// ---------------------------------------------------------------------------
+
+void test_traversal_object_script() {
+  const std::uint32_t C = 0x200;    // code image offset
+
+  // --- ckpt + suspend: +0x108 persists across ticks --------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x01, 0xff});                 // ckpt; suspend
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.field108 = f.image.data() + 4 + C;      // entry pc (image ptr)
+    auto r1 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r1.halted && !r1.error);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 1));
+    // Second tick resumes at the checkpoint and suspends again.
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 1));
+  }
+
+  // --- wait: +0x22c decrements 1/30 per tick, resumes at +0x230 --------
+  {
+    ScriptFixture f;
+    f.write(C, {0x40, 0x03});                 // wait, mode3 inline f32
+    f.writeF(C + 2, 0.05f);                    // 0.05 s: 2 wait ticks
+    f.write(C + 6, {0x01, 0xff});              // resume: ckpt; suspend
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r1 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r1.waited && !r1.error);
+    CHECK(near(o.field22c, 0.05, 1e-5));
+    CHECK(o.field230 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 6));
+    // tick2: 0.05 - 1/30 ~= 0.0167 > 0 -> still waiting, no fetch.
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.waited && r2.instructions == 0);
+    // tick3: crosses zero -> resumes at +0x230, runs ckpt+suspend.
+    auto r3 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r3.halted && !r3.error);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 7));
+  }
+
+  // --- stop (0x09) clears +0x108 + call depth --------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x09, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.scriptCallDepth = 2;                     // cleared by the stop
+    o.scriptMark[0] = 7;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.stopped && o.field108 == nullptr);
+    CHECK(o.scriptCallDepth == 0 && o.scriptMark[0] == 0);
+    // Gate cleared -> subsequent ticks are no-ops.
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.instructions == 0 && !r2.error);
+  }
+
+  // --- rcall/return (0xfc/0xfd): 4-deep stack, object locals -----------
+  {
+    ScriptFixture f;
+    f.write(C, {0xfc, 0x01});                  // rcall n=1
+    f.writeW(C + 2, 0x300);                    // -> callee
+    f.write(C + 6, {0x01, 0xff});              // ckpt; suspend after
+    // callee @0x300: flagop grp2 bit3 (obj local flags) ; return
+    f.write(0x300, {0x44, 0x02, 0x03, 0xfd});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 0);             // returned
+    CHECK(o.scriptFlagsLocal & (1u << 3));     // callee's flag write
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 7));
+  }
+
+  // --- wcall (0x5f): pick=0 -> first positive weight -------------------
+  {
+    ScriptFixture f;
+    // 5f 02 {w:0, a:0x320} {w:7, a:0x340} — entry0 weight 0, so the
+    // cumulative>0 pick lands on the second entry.
+    f.write(C, {0x5f, 0x02, 0x00});
+    f.writeW(C + 3, 0x320);
+    f.write(C + 7, {0x07});
+    f.writeW(C + 8, 0x340);
+    f.write(C + 12, {0xff});
+    f.write(0x340, {0x44, 0x02, 0x04, 0xfd});  // callee: set bit4, ret
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptFlagsLocal & (1u << 4));     // the w:7 callee ran
+    CHECK(o.scriptCallDepth == 0);
+  }
+
+  // --- object-bound var write + read-back (0x41 / 0x32) ----------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x41, 0x02, 0x01});            // locals[1] = f32
+    f.writeF(C + 3, 3.5f);
+    f.write(C + 7, {0x32, 0x02, 0x01});        // +0x38 = locals[1]
+    f.write(C + 10, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.scriptLocals[1], 3.5, 1e-5));
+    CHECK(near(o.field38, 3.5, 1e-5));         // read back via varop
+  }
+
+  // --- path bind (0x02): +0xec, flags, frame, offset -------------------
+  {
+    ScriptFixture f;
+    const std::uint32_t P = 0x500;             // path record
+    // OBSERVED record form: {u32 count; entry[count] x 0x28 bytes}.
+    // frame==0 + f2&2 -> +0xf0 = last entry's first u32 - 1
+    // (0x438f96: *(u32*)(path + 4 + (count-1)*0x28) - 1).
+    f.writeW(P, 2);                            // count
+    f.writeW(P + 0x2c, 0x1234);                // entry[1].u32[0]
+    f.write(C, {0x02});
+    f.writeW(C + 1, P);                        // pathRef
+    f.write(C + 5, {0x01, 0x02, 0x00, 0x00, 0x00});  // f1 f2 frame mode
+    f.writeF(C + 10, 1.0f);                    // mode0 -> 3 f32 offsets
+    f.writeF(C + 14, 2.0f);
+    f.writeF(C + 18, 3.0f);
+    f.write(C + 22, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.fieldEC ==
+          static_cast<const void*>(f.image.data() + 4 + P));
+    CHECK((o.col.flags149 & 0x2) != 0);        // f1 bit0
+    CHECK((o.col.flags149 & 0x4) == 0);        // f2 bit0 clear
+    CHECK(o.fieldE8 == -1.0f);                 // f2 bit1 -> -1.0
+    CHECK(o.fieldF0 == 4659.0f);               // 0x1234 - 1
+    CHECK(o.fieldF4[0] == 1.0f && o.fieldF4[2] == 3.0f);
+    CHECK(o.fieldE6 == -1);                    // path cursor reset
+  }
+
+  // --- subtype set (0x4e): +0x120..128, +0x11e, unbinds path -----------
+  {
+    ScriptFixture f;
+    f.write(C, {0x4e});
+    f.writeW(C + 1, 0x111);
+    f.writeW(C + 5, 0x222);
+    f.writeW(C + 9, 0x333);
+    f.write(C + 13, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.fieldEC = f.image.data() + 4;            // path bound -> cleared
+    o.field2a0 = 9; o.field2a1 = 9;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field11e == 0x4e);
+    CHECK(o.field120[0] == 0x111 && o.field120[2] == 0x333);
+    CHECK(o.fieldEC == nullptr);
+    CHECK(o.field2a0 == 0 && o.field2a1 == 0);
+  }
+
+  // --- death handoff: FUN_00458140 -> the tick runs +0x110 --------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x44, 0x02, 0x05, 0x09});      // set local bit5; stop
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.health = 4;
+    o.field110 = f.image.data() + 4 + C;       // pending death script
+    const float hp[3] = {0, 0, 0};
+    mdk::objectDeathBoundary(f.rt, o, hp, 0.0f);
+    CHECK(o.field110 == nullptr);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C));
+    CHECK(o.health == 0 && (o.col.flags148 & 0x20));
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.stopped && !r.error);
+    CHECK(o.scriptFlagsLocal & (1u << 5));     // the death script ran
+    CHECK(o.field108 == nullptr);              // 0x09 cleared it
+  }
+
+  // --- bounds: a foreign PC kills the script with a diagnostic ---------
+  {
+    ScriptFixture f;
+    const std::byte foreign = std::byte(0xff);
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = &foreign;                     // outside the image
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.error && o.field108 == nullptr);
+    CHECK(!f.diag.empty());
+  }
+
+  // --- runaway loop hits the 1000 cap ----------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x0c, 0x01});                  // rgoto n1 -> self
+    f.writeW(C + 2, C);
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.error && r.instructions == 1000);
+    CHECK(r.diag.find("looped") != std::string::npos);
+    CHECK(o.field108 == nullptr);
+  }
+
+  // --- init stays transient: traversalObjectInitScript clears +0x108 ---
+  {
+    ScriptFixture f;
+    f.write(C, {0x01, 0xff});                  // ckpt would set +0x108
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field108 == nullptr);              // FUN_004566f0 clears
+  }
+
+  // --- DTI spawn binds +0x108 via the table-0 script source ------------
+  {
+    mdk::RuntimeModel xg = makePlatformModel("XG", "ELEM", 0.0f);
+    TestModelSrc src{{&xg}};
+    mdk::DynamicArena ar;
+    ar.name = "HMO_1";
+    mdk::DtiArenaRecord rec = {};
+    rec.subRecords = {makeSpawnRec(2, (0u << 16) | 7u, 0, 0, 0, "XG")};
+    std::byte fakeImg[8] = {};
+    auto scriptFor = [](const char* an, const char* mn,
+                        std::uint16_t id, void* ctx) -> const void* {
+      return (std::string(an) == "HMO_1" && std::string(mn) == "XG" &&
+              id == 7)
+                 ? static_cast<const void*>(ctx)
+                 : nullptr;
+    };
+    std::vector<mdk::DynamicObject*> sp;
+    const int n = mdk::spawnArenaObjects(
+        ar, rec, testModelFor, &src, &sp, scriptFor, fakeImg);
+    CHECK(n == 1 && sp.size() == 1);
+    CHECK(sp[0]->field108 == static_cast<const void*>(fakeImg));
+    // No source -> +0x108 stays null.
+    mdk::DynamicArena ar2;
+    ar2.name = "HMO_1";
+    const int n2 =
+        mdk::spawnArenaObjects(ar2, rec, testModelFor, &src, nullptr);
+    CHECK(n2 == 1 && ar2.storage.front()->field108 == nullptr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11A — object animation: FUN_004555bc driver + FUN_00455890
+// vertex/ref-point applier + FUN_00455c48 rigid channel (OBSERVED,
+// BUILD_A disasm + real record bytes). Synthetic records only.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Append helpers for the little-endian record builder.
+void aW(std::vector<std::uint8_t>& b, std::uint32_t v) {
+  b.push_back(static_cast<std::uint8_t>(v));
+  b.push_back(static_cast<std::uint8_t>(v >> 8));
+  b.push_back(static_cast<std::uint8_t>(v >> 16));
+  b.push_back(static_cast<std::uint8_t>(v >> 24));
+}
+void aH(std::vector<std::uint8_t>& b, std::int16_t v) {
+  b.push_back(static_cast<std::uint8_t>(v));
+  b.push_back(static_cast<std::uint8_t>(v >> 8));
+}
+void aF(std::vector<std::uint8_t>& b, float f) {
+  std::uint32_t v; std::memcpy(&v, &f, 4); aW(b, v);
+}
+void aV3(std::vector<std::uint8_t>& b, float x, float y, float z) {
+  aF(b, x); aF(b, y); aF(b, z);
+}
+void aName(std::vector<std::uint8_t>& b, const char* s) {
+  for (int i = 0; i < 12; ++i)
+    b.push_back(static_cast<std::uint8_t>(s[i] ? s[i] : 0));
+}
+
+// Object bound to `rec` the way ops 0x03/0x3b leave it: armed at
+// +0xdc=-1.0 / +0xe4=-1 / +0x118=-1, rate multiplier +0xe0=30.
+mdk::DynamicObject& animObject(mdk::DynamicArena& da,
+                               const std::vector<std::uint8_t>& rec) {
+  da.storage.push_back(std::make_unique<mdk::DynamicObject>());
+  mdk::DynamicObject& o = *da.storage.back();
+  o.col.named = true;
+  o.enemyIndex = 0;                        // +0x04 != -1: normal path
+  o.animRec = rec.data();
+  o.animAcc = -1.0f;
+  o.animFrame = -1;
+  o.animLatch = -1;
+  o.animRate = 30.0f;
+  // Identity object transform for the root-key rotation.
+  o.col.xform[0] = o.col.xform[4] = o.col.xform[8] = 1.0f;
+  return o;
+}
+
+} // namespace
+
+void test_object_animation() {
+  // -- Record header / view accessors ---------------------------------
+  // {rate=1, chanCount=1, frameCount=4, chanOff, rootKeys, refCount,
+  //  refKeys, channel} — matches the OBSERVED XGS record shape.
+  std::vector<std::uint8_t> rec;
+  aF(rec, 1.0f);                            // rate
+  aW(rec, 1);                               // channelCount
+  aW(rec, 4);                               // frameCount
+  const std::size_t offPos = rec.size();
+  aW(rec, 0);                               // chanOff[0] (patched)
+  for (int f = 0; f < 4; ++f)
+    aV3(rec, static_cast<float>(f), 0, 0);  // rootKey[f] = {f,0,0}
+  aW(rec, 2);                               // refCount
+  for (int s = 0; s < 2; ++s)               // refKey[s][f]
+    for (int f = 0; f < 4; ++f)
+      aV3(rec, static_cast<float>(s * 10 + f), 0, 0);
+  // channel at rec+4+chanOff — patch it to land here.
+  const std::size_t chanAt = rec.size();
+  rec[offPos + 0] = static_cast<std::uint8_t>(chanAt - 4);
+  rec[offPos + 1] = static_cast<std::uint8_t>((chanAt - 4) >> 8);
+  rec[offPos + 2] = static_cast<std::uint8_t>((chanAt - 4) >> 16);
+  rec[offPos + 3] = static_cast<std::uint8_t>((chanAt - 4) >> 24);
+  aName(rec, "ELEM");                       // +0x00 name[12]
+  aW(rec, 3);                               // +0x0c vertCount
+  aF(rec, 0.5f);                            // +0x10 scale
+  aV3(rec, 0, 0, 0); aV3(rec, 1, 0, 0); aV3(rec, 2, 0, 0); // basePose
+  aH(rec, 1);                               // key tag = frame 1
+  for (int i = 0; i < 9; ++i) rec.push_back(4);  // i8 deltas +4 x each
+  aH(rec, -1);                              // terminator
+
+  {
+    mdk::ObjectAnimView av{rec.data(), rec.data() + rec.size()};
+    CHECK(av.ok);
+    CHECK(near(av.rate(), 1.0, 1e-6));
+    CHECK(av.channelCount() == 1);
+    CHECK(av.frameCount() == 4);
+    CHECK(av.refCount() == 2);
+    const std::uint8_t* ch = av.channel(0);
+    CHECK(ch == rec.data() + chanAt);
+    CHECK(std::string(mdk::animChannelName(ch)) == "ELEM");
+    CHECK(mdk::animChannelVertCount(ch) == 3);
+    CHECK(near(mdk::animChannelScale(ch), 0.5, 1e-6));
+    CHECK(!mdk::animChannelIsRigid(ch));
+    CHECK(near(av.rootKey(2)[0], 2.0, 1e-6));
+    CHECK(near(av.refKey(1, 3)[0], 13.0, 1e-6));
+  }
+
+  // -- Delta channel + driver (one-shot) ------------------------------
+  {
+    mdk::DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, rec);
+    o.model = makePlatformModel("MDL", "ELEM", 0.0f);   // 3 verts
+    o.col.flags148 &= ~0x8u;               // one-shot (op 0x03 form)
+
+    const std::uint8_t* lim = rec.data() + rec.size();
+    // tick1: acc -1->0 -> frame 0: absolute base pose copy.
+    mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 0);
+    CHECK(near(o.model.elemVerts[0][0], 0.0, 1e-6));
+    CHECK(near(o.model.elemVerts[0][3], 1.0, 1e-6));
+    CHECK(near(o.model.elemVerts[0][6], 2.0, 1e-6));
+    // refPoints[0/1] = refKey[s][0]
+    CHECK(near(o.model.refPoints[0][0], 0.0, 1e-6));
+    CHECK(near(o.model.refPoints[1][0], 10.0, 1e-6));
+
+    // tick2: frame 1 — tagged delta key applies (+4 * 0.5 = +2 x),
+    // root key {1,0,0} rotates by identity into +0x294 *30.
+    mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 1);
+    CHECK(near(o.model.elemVerts[0][0], 2.0, 1e-6));
+    CHECK(near(o.model.elemVerts[0][3], 3.0, 1e-6));
+    CHECK(near(o.model.elemVerts[0][6], 4.0, 1e-6));
+    CHECK(near(o.animImpulse[0], 30.0, 1e-4));
+    CHECK(near(o.model.refPoints[0][0], 1.0, 1e-6));
+    // localAabb recomputed (FUN_00459d54): min.x = 2, max.x = 4.
+    CHECK(near(o.model.elems[0].localAabb[0], 2.0, 1e-6));
+    CHECK(near(o.model.elems[0].localAabb[3], 4.0, 1e-6));
+
+    // tick3: frame 2 — no tagged key; verts hold; impulse adds
+    // rootKey[2]={2,0,0}*30 = +60.
+    mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 2);
+    CHECK(near(o.model.elemVerts[0][0], 2.0, 1e-6));
+    CHECK(near(o.animImpulse[0], 90.0, 1e-3));
+
+    // tick4: frame 3 = frameCount-1 on a one-shot -> 0xff00 latch.
+    mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 3);
+    CHECK(static_cast<std::uint16_t>(o.animLatch) == 0xff00u);
+    CHECK(near(o.animImpulse[0], 180.0, 1e-2));
+    // tick5: latched idle — accumulator resyncs, nothing applies.
+    mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 3);
+    CHECK(near(o.animImpulse[0], 180.0, 1e-2));
+  }
+
+  // -- Looping (op 0x3b form): wrap re-applies the frame-0 base pose --
+  {
+    mdk::DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, rec);
+    o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+    o.col.flags148 |= 0x8u;                // loop bit
+    const std::uint8_t* lim = rec.data() + rec.size();
+    for (int i = 0; i < 4; ++i) mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 3);
+    CHECK(static_cast<std::uint16_t>(o.animLatch) != 0xff00u);
+    // tick5: acc hits 4 -> wraps; frame 0 re-copies the base pose
+    // (verts return to base, undoing the frame-1 delta).
+    mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 0);
+    CHECK(near(o.model.elemVerts[0][0], 0.0, 1e-6));
+    CHECK(near(o.model.elemVerts[0][3], 1.0, 1e-6));
+  }
+
+  // -- Target latch (+0x118 >= 0): hold at the target frame -----------
+  {
+    mdk::DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, rec);
+    o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+    o.col.flags148 &= ~0x8u;
+    o.animLatch = 2;                        // run to frame 2 and hold
+    const std::uint8_t* lim = rec.data() + rec.size();
+    for (int i = 0; i < 10; ++i) mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 2);
+    CHECK(near(o.animAcc, 2.0, 1e-6));
+    CHECK(static_cast<std::uint16_t>(o.animLatch) != 0xff00u);
+  }
+
+  // -- Rigid channel (scale == 0): FUN_00455c48 fixed-point 3x4 ------
+  {
+    std::vector<std::uint8_t> rr;
+    aF(rr, 1.0f); aW(rr, 1); aW(rr, 3);    // rate, 1 chan, 3 frames
+    const std::size_t rop = rr.size();
+    aW(rr, 0);
+    for (int f = 0; f < 3; ++f) aV3(rr, 0, 0, 0);   // root keys
+    aW(rr, 0);                             // refCount 0
+    const std::size_t rchan = rr.size();
+    rr[rop] = static_cast<std::uint8_t>(rchan - 4);
+    aName(rr, "ELEM");
+    aW(rr, 3);                             // vc 3
+    aF(rr, 0.0f);                          // scale 0 -> rigid
+    rr.push_back(1);                       // +0x14 rotShift: /16384
+    rr.push_back(2);                       // +0x15 transShift: /8192
+    aV3(rr, 0, 0, 0); aV3(rr, 1, 0, 0); aV3(rr, 2, 0, 0); // base pose
+    for (int f = 0; f < 3; ++f) {          // i16 xform[f][12]
+      for (int i = 0; i < 12; ++i) {
+        // Record = {r00,r01,r02,tx, r10,r11,r12,ty, r20,r21,r22,tz}.
+        // Frames 0/2 = identity; frame 1 = identity + T {1,2,3}.
+        const bool trans = (i % 4 == 3);
+        std::int16_t v = 0;
+        if (!trans && (i == 0 || i == 5 || i == 10)) v = 16384; // 1.0
+        if (f == 1 && trans)
+          v = static_cast<std::int16_t>(
+              (i == 3 ? 1 : i == 7 ? 2 : 3) * 8192);
+        aH(rr, v);
+      }
+    }
+    mdk::DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, rr);
+    o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+    o.col.flags148 &= ~0x8u;
+    const std::uint8_t* lim = rr.data() + rr.size();
+    mdk::objectAnimTick(o, lim);           // frame 0: identity -> base
+    CHECK(o.animFrame == 0);
+    CHECK(near(o.model.elemVerts[0][3], 1.0, 1e-5));
+    mdk::objectAnimTick(o, lim);           // frame 1: +{1,2,3}
+    CHECK(o.animFrame == 1);
+    CHECK(near(o.model.elemVerts[0][0], 1.0, 1e-5));
+    CHECK(near(o.model.elemVerts[0][1], 2.0, 1e-5));
+    CHECK(near(o.model.elemVerts[0][2], 3.0, 1e-5));
+    CHECK(near(o.model.elemVerts[0][3], 2.0, 1e-5));
+  }
+
+  // -- Unmatched channel name -> element untouched --------------------
+  {
+    std::vector<std::uint8_t> nr = rec;    // copy, rename the channel
+    const std::size_t nm = chanAt;         // channel name field
+    nr[nm] = 'O'; nr[nm + 1] = 'T'; nr[nm + 2] = 'H'; nr[nm + 3] = 'E';
+    nr[nm + 4] = 'R'; nr[nm + 5] = 0;
+    mdk::DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, nr);
+    o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+    o.col.flags148 &= ~0x8u;
+    const std::uint8_t* lim = nr.data() + nr.size();
+    const float keep[9] = {-5,-5,0, 5,-5,0, 5,5,0};
+    for (int i = 0; i < 3; ++i) mdk::objectAnimTick(o, lim);
+    CHECK(o.animFrame == 2);
+    for (int i = 0; i < 9; ++i)
+      CHECK(near(o.model.elemVerts[0][i], keep[i], 1e-6));
+  }
+
+  // -- +0x14b bit7 suppresses the root-motion impulse ------------------
+  {
+    mdk::DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, rec);
+    o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+    o.col.flags148 &= ~0x8u;
+    o.col.flags14b |= 0x80u;
+    const std::uint8_t* lim = rec.data() + rec.size();
+    for (int i = 0; i < 3; ++i) mdk::objectAnimTick(o, lim);
+    CHECK(near(o.animImpulse[0], 0.0, 1e-6));
+    CHECK(o.animFrame == 2);               // verts still applied
+    CHECK(near(o.model.elemVerts[0][0], 2.0, 1e-6));
   }
 }
 
@@ -14454,6 +14970,8 @@ int main() {
   test_traversal_deep_floor();
   test_traversal_script();
   test_traversal_object_init();
+  test_traversal_object_script();
+  test_object_animation();
   test_player_look();
   test_player_camera();
   test_camera_obstruction();
