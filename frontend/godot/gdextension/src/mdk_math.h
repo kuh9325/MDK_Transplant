@@ -47,6 +47,9 @@ inline Vec3 mdkVecToGodot(float x, float y, float z) {
 inline Vec3 mdkVecToGodot(const float v[3]) {
   return mdkVecToGodot(v[0], v[1], v[2]);
 }
+inline Vec3 mdkVecToGodot(const Vec3& v) {
+  return mdkVecToGodot(v.x, v.y, v.z);
+}
 
 // M2 basis rows (right/down/back, MDK world coords) -> Godot basis
 // columns (X = right, Y = up = -down, Z = back).
@@ -102,6 +105,38 @@ inline float mdkCameraAspect(float scaleX, float scaleY, float viewW,
                              float viewH, float xDiv, float yDiv) {
   if (scaleX <= 0.0f || xDiv <= 0.0f || viewH <= 0.0f) return 0.0f;
   return (scaleY * yDiv * viewW) / (scaleX * xDiv * viewH);
+}
+
+// A full MDK rigid transform converted to Godot space (Phase 9, G3).
+//
+// DynamicObject world placement is the reconstructed CollisionObject
+// transform: a row-major 3x3 m[9] (CollisionObject::xform, core
+// +0x54..0x78) plus an origin (CollisionObject::origin, +0x78),
+// applied as   world_mdk = M * local_mdk + org.
+// The core may build M from yaw/pitch/bank/scale or copy a raw
+// script-supplied matrix — either way the COMPLETE 3x3 converts the
+// same. Object local vertices are P-converted like all other
+// geometry, so the Godot transform is the change of basis
+//   B = P * M * P^T,   o = P * org
+// giving  out_godot = B * (P * local) + P * org = P * world_mdk.
+// Expanding B over the flat row-major m[] yields the columns below
+// (Godot Basis columns are the local axes: cols[c][r] = B[r][c]).
+struct MdkTransform {
+  BasisCols basis;
+  Vec3 origin;
+};
+
+inline MdkTransform mdkTransformToGodot(
+    const float m[9], const Vec3& org) {
+  MdkTransform t;
+  t.basis.cols[0][0] = m[4];   t.basis.cols[0][1] = -m[7];
+  t.basis.cols[0][2] = m[1];
+  t.basis.cols[1][0] = -m[5];  t.basis.cols[1][1] = m[8];
+  t.basis.cols[1][2] = -m[2];
+  t.basis.cols[2][0] = m[3];   t.basis.cols[2][1] = -m[6];
+  t.basis.cols[2][2] = m[0];
+  t.origin = mdkVecToGodot(org);
+  return t;
 }
 
 }  // namespace mdkfront

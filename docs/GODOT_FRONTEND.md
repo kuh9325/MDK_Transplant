@@ -1,9 +1,11 @@
-# GODOT_FRONTEND.md — Phase 7/8 (G1+G2) Godot 4 frontend
+# GODOT_FRONTEND.md — Phase 7-9 (G1-G3) Godot 4 frontend
 
-Status: **implemented and validated** — static LEVEL3 arena rendering
-plus a snapshot-driven player presentation through a retained
-GDExtension bridge. Dynamic objects, animation, HUD, audio, and the
-fx drawers remain out of scope (see "Limitations").
+Status: **implemented and validated** — static arena rendering,
+a snapshot-driven player presentation, and dynamic-object
+presentation (real RuntimeModel geometry, movers/doors, portal
+transitions) through a retained GDExtension bridge. Animation,
+combat, enemies/AI, HUD, audio, and the fx drawers remain out of
+scope (see "Limitations").
 
 This document covers the in-repo frontend. The architecture
 rationale and the disposable-spike evidence live in
@@ -15,7 +17,9 @@ authoritative description of what is actually checked in.
 `mdk_core` is authoritative for all game semantics: file parsing
 (DTI/CMI/MTO/MTI/FTI), the traversal runtime, player/camera state,
 `ArenaRenderData` decoding, material classification, BSP painter
-ordering (`arenaRenderOrder`), and palette semantics.
+ordering (`arenaRenderOrder`), palette semantics, dynamic-object
+spawn/update state (transforms, AABBs, mover/connector state, arena
+transfers), and RuntimeModel geometry parsing.
 
 Godot (scene + GDScript + GDExtension glue) is presentation only:
 it converts core-provided snapshots into `ArrayMesh`/`Image`/
@@ -27,7 +31,9 @@ MDK file is parsed and no game rule is evaluated outside the core.
 ```
 frontend/godot/
   project.godot                     engine config only (no data)
-  main.tscn                         Node3D + ArenaMesh + PlayerRoot +
+  main.tscn                         Node3D + ArenaRoot +
+                                    DynamicObjectRoot +
+                                    ObjectDebugRoot + PlayerRoot +
                                     PlayerBoxWire + CollisionDebug +
                                     Camera3D + DebugUI
   src/main.gd                       driver + --smoke / --screenshot
@@ -37,7 +43,9 @@ frontend/godot/
     CMakeLists.txt                  standalone build; pins godot-cpp
     src/mdk_math.h                  pure-scalar MDK->Godot math
     src/mdk_convert.h               godot-cpp adapters over mdk_math
+    src/mdk_objid.h                 opaque stable object IDs
     src/arena_presenter.{h,cpp}     bundle -> Image/ArrayMesh
+    src/object_presenter.{h,cpp}    RuntimeModel -> ArrayMesh
     src/mdk_bridge.{h,cpp}          RefCounted bridge class
     src/register_types.cpp          GDExtension init/terminate
   build.sh                          configure+build wrapper (+ ext list)
@@ -103,7 +111,8 @@ defaults `--data-path` to `<repo>/original/installed` (or
 ```sh
 # interactive HMO_1 view (WASD move, Q/E strafe, A/D turn,
 # R/F look, Space jump, Shift turbo, mouse captured, F1 collision
-# wire, F3 debug text, Esc release-then-quit):
+# wire, F2 object AABB/name debug, F3 debug text,
+# Esc release-then-quit):
 frontend/godot/run.sh
 
 # deterministic headless smoke (dummy renderer):
@@ -176,7 +185,14 @@ b.get_camera_snapshot()        # Transform3D, fov_deg, aspect, rect
 b.get_collision_snapshot()     # poly/vert counts + debug line soup
 b.get_input_config()           # mouse axes map, scales, btn masks
 b.get_arena_render_snapshot()  # mesh, material, atlas, arrays, stats
+                               # for the PRIMARY displayed arena
 b.get_arena_order_digest()     # cheap painter-order digest (poll)
+b.get_arena_render_snapshots() # one snapshot per displayed arena
+b.get_display_snapshot()       # cur/partner/portals/object counts
+b.get_display_digest()         # display-set + order digest (poll)
+b.get_object_snapshots()       # DynamicObjects in the view set
+b.get_object_geometry(id)      # per-object local model mesh
+b.diagnostic_start(idx,pos,yaw)# test-only player re-anchor
 b.get_arena_names()            # level arena list
 b.is_level_loaded() / b.is_arena_loaded() / b.get_last_error()
 b.shutdown()
@@ -202,14 +218,18 @@ basis. The scene tree:
 
 ```
 Main (Node3D, src/main.gd)
-  ArenaMesh        — ordered static geometry (G1)
-  PlayerRoot       — snapshot transform, nothing writes back
-    DebugBody      — capsule, green grounded / amber airborne
-    ForwardMarker  — blue nose box on local -Z (facing)
-  PlayerBoxWire    — 12-edge AABB of the standing collision box
-  CollisionDebug   — arena collision-poly line soup (F1)
-  Camera3D         — core PlayerCameraPose, sibling not child
-  DebugUI          — tiny QA label (F3): pos, yaw, channels
+  ArenaRoot          — one MeshInstance3D per displayed arena (G1/G3)
+  DynamicObjectRoot  — one Node3D per live object id (G3)
+    Object_<id>      — snapshot transform, per-element meshes
+  ObjectDebugRoot    — F2 object AABB wires + Label3D tags (G3)
+  PlayerRoot         — snapshot transform, nothing writes back
+    DebugBody        — capsule, green grounded / amber airborne
+    ForwardMarker    — blue nose box on local -Z (facing)
+  PlayerBoxWire      — 12-edge AABB of the standing collision box
+  CollisionDebug     — display-set collision-poly line soup (F1)
+  Camera3D           — core PlayerCameraPose, sibling not child
+  DebugUI            — tiny QA label (F3): pos, yaw, channels,
+                       cur/partner/portal/migration counters
 ```
 
 There is no `CharacterBody3D`, no `RigidBody3D`, and no Godot
@@ -315,14 +335,157 @@ mesh: the K-record container decode, the per-part transform/bone
 mapping, and the animation semantics (all UNKNOWN — G5 territory).
 The capsule proxy is therefore the honest G2 visual.
 
-## Arena transitions (G2 partial)
+## Dynamic objects (G3)
 
-`stepCore_` compares `last_.curArenaIndex` against the displayed
-arena each frame and calls `load_arena` on the new arena when a
-render block exists, so normal traversal through arena boundaries
-keeps the view synchronized. Corridor arenas (`CHMO_*`, no MTO
-block) keep the previous display and mark the desync instead of
-failing. Full portal/object streaming remains G3 scope.
+`DynamicObject`s spawn in core from DTI arena sub-records (type-2
+HotGen, type-4 HotPick/mover — see `docs/GAMEPLAY_RECONSTRUCTION.md`
+§42-49). The frontend presents the objects living in the **object
+view set** — the same `{cur} + active partner` arenas that drive the
+display set, so a geometry-less corridor's objects (e.g. the
+CHMO_2 connector door) still enumerate while its partner's geometry
+shows. Objects are NOT enumerated level-wide; resident but
+out-of-view arenas contribute nothing.
+
+### Opaque object IDs (`mdk_objid.h`)
+
+GDScript never sees a `DynamicObject*`. `MdkObjectIds` mints dense
+`uint64` ids keyed on the object's (stable, list-owned) address,
+gated by an FNV fingerprint over spawn-stable fields only —
+`enemyIndex`, `spawnId`, `scriptVariant`, `scriptOff`, model and
+script names. Mutable state (position, flags, AABB) is excluded,
+so mover updates and arena transfers keep the same id. A live-set
+pass over every arena's storage precedes each snapshot call:
+despawned objects are pruned, a stale id resolves to an empty
+`get_object_geometry` result forever after, and an address reused
+by a different object re-mints rather than aliasing. Same-address
+same-fingerprint reuse is indistinguishable from a re-spawn of the
+same record — documented edge.
+
+### Object snapshot fields
+
+`get_object_snapshots()` returns one Dictionary per object in the
+view set — all copy-out values:
+
+| Key | Source |
+|---|---|
+| `id` | opaque `MdkObjectIds` id (NOT an address) |
+| `arena`, `arena_name` | owning arena list (index + name) |
+| `model` | `RuntimeModel::modelName()` — internal geometry name (e.g. `XG_BOD`) |
+| `enemy_name` | DTI enemy-table record name (e.g. `XGS`) — a different field from `model` |
+| `enemy_index`, `spawn_id` | spawn record coordinates |
+| `pos`, `pos_mdk` | object position |
+| `transform` | full core transform — see below |
+| `aabb`, `aabb_mdk` | `CollisionObject::aabb` (world) |
+| `yaw_deg`, `pitch_deg`, `bank_deg`, `scale` | diagnostic Euler/scale fields |
+| `health` | core health field |
+| `flags148/149/14a` | raw collision flags |
+| `mover`, `connector`, `mountable`, `ride_capable` | decoded flag bits (14a&0x20/0x10/0x80, 149&0x01) |
+| `conn_state`, `conn_state_hi`, `conn_anim_active` | connector/door state |
+| `pending_arena` | pending transfer target index (-1 none) |
+| `elem_count`, `elem_mask` | element count + disable mask (`elemMaskB`) |
+| `vert_count`, `tri_count`, `geom_key` | geometry census + content digest |
+| `script_class`, `script_name` | script metadata |
+
+### RuntimeModel geometry (`object_presenter.cpp`)
+
+Dynamic-object models parse through the proven `FUN_00428400`
+geometry record: per-element local f32 vertex triples plus
+0x24-byte triangle records whose only established field is the
+`u16 v[3]` index triple at +0. `get_object_geometry(id)` builds
+one indexed `PRIMITIVE_TRIANGLES` surface per element carrying the
+verbatim local verts (P-converted); out-of-range indices are
+clamped and reported, never fatal. `surface_elems` maps mesh
+surface → element index, `elem_names` carries every element name
+(including zero-geometry elements), and `geom_key` is an FNV-1a
+digest over the immutable geometry content — the presentation
+cache key. Two objects whose deep-copied models hold byte-identical
+geometry share cached meshes; any future deformation that mutates
+verts changes the key and forces a rebuild.
+
+The element-disable mask applies per element each frame:
+`elem_mask` bit *set* = element hidden (connector/HC door masks,
+`SW_DUMMY` bits — same semantics as the core's mask consumers).
+`Object_<id>` nodes keep one `MeshInstance3D` child (`E<elem>`)
+per element so visibility toggles without mesh rebuilds.
+
+### Object transform — core-authoritative
+
+`CollisionObject::xform` (3x3, Euler or raw-matrix path, scale
+baked) + `origin` (+0x78) is the COMPLETE authoritative transform:
+`world_mdk = M * local + origin`. The bridge converts it by change
+of basis, `M_godot = P * M_mdk * P^T`, `origin_godot = P *
+origin_mdk`, inside `mdk_math.h`/`mdk_convert.h`; local verts are
+P-converted at mesh build, so the composite reproduces
+`P * world_mdk` exactly. GDScript applies
+`snapshot["transform"]` verbatim and never recomputes
+yaw/pitch/bank — this is what makes raw-matrix movers correct.
+Native frontend tests prove identity, translation, yaw/pitch/bank,
+non-unit scale, arbitrary raw matrices, and the point-equivalence
+`P(M*v + o) == M_g*P(v) + P(o)`.
+
+### Material / UV verdict — debug materials (documented seam)
+
+Audit verdict: the model triangle record's bytes past `v[3]` are
+NOT evidenced for RuntimeModel records — the proven interior layout
+(material index, UV semantics) belongs to the arena region-C poly
+format, a different consumer. Per the evidence gate, objects render
+the real geometry under deterministic unshaded per-element debug
+materials (element-name-hashed hue, cull disabled). This is a
+named fidelity seam, not a claim about original appearance; no
+material semantics were guessed.
+
+### Movers, doors, platforms
+
+Type-4 HotPick movers (flag14a&0x20) and connector doors
+(flag14a&0x10) present through the same snapshot path: core updates
+the object transform/collision per frame, the snapshot carries it,
+`Object_<id>.transform` follows. There is no second integration in
+GDScript — if a mover does not animate it is because its driving
+script opcode is unimplemented in the core script VM (a known seam;
+the LEVEL8 GUNT_9 movers currently sit static in the tested view),
+and the frontend reports rather than fakes motion.
+
+### F2 object debug
+
+`ObjectDebugRoot` (F2) draws per-object world-space AABB wires
+(`ImmediateMesh`, 12 edges from the snapshot `aabb`) plus a
+billboard `Label3D` tag with model name, opaque id, arena index,
+enemy index and spawn id. Wires/tags are keyed by the same opaque
+id and freed with the object node. F1 keeps the arena collision
+soup — now the union of every displayed arena's `collision_lines`.
+
+## Arena transitions + display set (G3)
+
+The old single-arena path (switch `ArenaMesh` to `curArenaIndex`
+when an MTO block exists, else keep the stale display) is replaced
+by a **display set** driven by the traversal view state. After
+every stepped frame (and after `diagnostic_start`) the bridge
+recomputes the view set — `{cur}` plus `{partner}` when
+`rt.partnerActive` — builds an `ArenaSet` per member that has an
+MTO render block, and re-evaluates BSP painter order for each set
+at the current core camera. `get_arena_render_snapshots()` returns
+one snapshot per presented arena, current-first; `ArenaRoot` keeps
+one `MeshInstance3D` (`Arena_<index>`) per displayed arena and
+drops nodes for arenas that leave the set.
+
+`get_display_snapshot()` surfaces the core state that drives the
+set: `cur_arena`/`cur_name`, `partner_arena`/`partner_name`,
+`partner_active`, `view_on_partner`, `swapped`
+(`currentArenaSwapped`), `portal_candidate`, the cumulative
+`portals_crossed`/`object_migrations` counters, the `primary`
+presented index, and two arena lists — `arenas` (rendered set)
+and `object_arenas` (object enumeration set, which can include
+geometry-less corridors). `get_display_digest()` folds the set
+membership plus every member's order digest into one value; the
+frame loop only rebuilds `ArenaRoot` when it changes.
+
+Corridor arenas (`CHMO_*`, no MTO block) now behave correctly
+instead of leaving stale geometry: a corridor current contributes
+no render block, but its active partner stays in the display set,
+so the adjacent arena's geometry remains up while the corridor's
+own objects still enumerate and present. No corridor geometry is
+fabricated — the visible set is exactly what the proven
+current/partner relationship yields.
 
 ## Coordinate conversion (`mdk_math.h`)
 
@@ -330,9 +493,13 @@ failing. Full portal/object streaming remains G3 scope.
 (det +1). MDK: +X forward, +Y left, +Z up, degrees. Godot: -Z
 forward, +X right, +Y up, radians. The camera basis converts the
 core's M2 rows (right/down/back, MDK world) into Godot columns
-(X=right, Y=up=-down, Z=back). The only place axis math exists is
-`mdk_math.h`/`mdk_convert.h`; GDScript sees Godot-space values (raw
-MDK copies ride inside `*_mdk` diagnostic keys).
+(X=right, Y=up=-down, Z=back). Object transforms convert by change
+of basis: `M_godot = P * M_mdk * P^T`, `origin_godot = P *
+origin_mdk` (`mdkTransformToGodot`), so a complete core 3x3 —
+including the raw-matrix mover path — carries over verbatim. The
+only place axis math exists is `mdk_math.h`/`mdk_convert.h`;
+GDScript sees Godot-space values (raw MDK copies ride inside
+`*_mdk` diagnostic keys).
 
 Projection: `scaleY = 1/(zoom*(H/W)*0.5)` folds the original's
 pixel divisors (299.95/180.4 for the 600x360 normal viewport —
@@ -424,7 +591,34 @@ event posts — `locoState` stays latched on a jump code and
 `jumpActive` holds until a priority-8+ event (look/hard-land/
 sniper) moves the dispatched state. The smoke re-arms with a held
 look key before the second (RMB) jump check — all within proven
-semantics.
+semantics. The MMB sniper check is followed by an explicit unscope
+edge: sniper state (loco 0x323) replaces locomotion with aim
+channels, and a second MMB while `transitionPhase==0` is consumed
+without toggling — the unscope needs its own press after the phase
+settles, matching the original's edge semantics.
+
+G3 additions: display snapshot (cur/partner names + indices,
+partner active, portal fields), multi-arena `ArenaRoot` nodes and
+digest-driven rebuild, the real HMO_9 `XGS` object (enemy index 30,
+spawn id 9, `model`=`XG_BOD` vs `enemy_name`=`XGS`), object
+transform/AABB conversion goldens, opaque-id stability across idle
+frames, real geometry resolution (`elem_count` 25, per-element
+meshes), `geom_key` consistency, `Object_<id>` node creation and
+per-element child count, stale/unknown id → empty geometry, F2
+debug wire/tag creation and cleanup, element-mask visibility, the
+CHMO_2→HMO_3 corridor run (connector door enumerated on the
+geometry-less corridor, door `conn_state` transition, portal
+crossing counted, door id stable, no duplicate ids, door leaves
+the view set when its home arena does — reported, not forced), and
+`object_migrations` reported as a counter (0 on that route — the
+door stays homed on CHMO_2 in core).
+
+Cross-level: `--smoke` on LEVEL6/LEVEL8 runs the generic path —
+object enumeration census, per-object geometry resolution, node
+creation, mover transform mirroring against live snapshots
+(reports how many watched movers actually animate; 0 on the
+tested GUNT_9 view — a script-VM seam, wired but undriven), masked
+element visibility, and display-set coherence.
 
 `tests/test_godot_frontend.py` orchestrates the headless run and
 the inspect cross-check; it skips cleanly when Godot, the dylib, or
@@ -435,7 +629,7 @@ original data are absent.
 ```sh
 # frontend native tests (pure math, no engine):
 cd frontend/godot/gdextension && cmake --build build --target mdk_frontend_tests
-./build/mdk_frontend_tests            # 26 checks
+./build/mdk_frontend_tests            # 60 checks
 
 # headless in-engine smoke (canonical launcher path):
 MDK_GODOT_BIN=/path/to/Godot python3 -m pytest tests/test_godot_frontend.py
@@ -449,30 +643,37 @@ python3 -m pytest tests/
 
 ## Limitations / remaining fidelity items
 
-- Static arena geometry plus a *debug-proxy* player — no real Kurt
-  mesh (K-record layout UNKNOWN, see above), no models, dynamic
-  objects, enemies, or animation (by design).
-- The player capsule is a presentation stand-in; pitch/bank are
-  snapshot-only (the proxy applies yaw — matching the traversal
-  channels the frontend can show honestly).
-- Arena display follows the core's current arena per frame, but
-  portal/streaming presentation and objects remain G3.
+- A *debug-proxy* player — no real Kurt mesh (K-record layout
+  UNKNOWN, see above). The capsule is a presentation stand-in;
+  pitch/bank are snapshot-only (the proxy applies yaw — matching
+  the traversal channels the frontend can show honestly).
+- Dynamic objects present real RuntimeModel geometry under
+  per-element debug materials — the model triangle record's
+  material/UV fields are NOT evidenced (named fidelity seam, see
+  "Material / UV verdict").
+- Movers/doors mirror core transforms exactly; whether a mover
+  animates depends on the core script VM — undriven objects sit
+  still (reported, never faked).
+- No enemy limb animation, Kurt animation, or bone semantics —
+  whole-object transforms only (animation boundary).
 - fx770/fxE94/fx12970 are tagged placeholder colors, not the
   original effect drawers (UNKNOWN semantics — P1 reverse
   engineering).
 - The `+0x22` bit7 edge overlay is decoded but not drawn.
 - The `+0x20` bit0 alternate span-drawer selection is preserved on
   the tri but has no frontend expression (renderer-internal).
-- Atlas rebuild per `load_arena` only; painter-order rebuilds reuse
-  the atlas. Draw calls: one ordered surface (correctness first —
-  batching is a later optimization).
+- Per-arena `ArenaSet`s build lazily on first display and cache —
+  painter-order rebuilds reuse the atlas. Draw calls: one ordered
+  surface per displayed arena plus one per object element
+  (correctness first — batching is a later optimization).
 - Framebuffer capture requires a real driver run — under `--headless`
   `--screenshot` exits 2 by design (dummy renderer, no viewport
   texture). Game-mode capture works.
 - Human QA items (texture orientation, palette plausibility,
   occlusion, camera feel, player proxy legibility, mouse feel vs.
-  the original, RMB jump, landing/contact feedback) need eyes on a
-  real run.
+  the original, RMB jump, landing/contact feedback, object/door
+  placement legibility, corridor transitions, F2 tag alignment)
+  need eyes on a real run.
 
 ## Proprietary boundary
 

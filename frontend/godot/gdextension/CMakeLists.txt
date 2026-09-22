@@ -60,6 +60,7 @@ target_compile_options(mdk_core_frontend PRIVATE
 add_library(mdkbridge SHARED
     src/mdk_bridge.cpp
     src/arena_presenter.cpp
+    src/object_presenter.cpp
     src/register_types.cpp)
 target_include_directories(mdkbridge PRIVATE "${MDK_CORE_SRC}" src)
 target_link_libraries(mdkbridge PRIVATE godot::cpp mdk_core_frontend)

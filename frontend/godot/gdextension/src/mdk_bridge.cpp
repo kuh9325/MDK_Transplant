@@ -1,4 +1,4 @@
-// Phase 7 (G1) — retained GDExtension bridge into mdk_core.
+// Phase 7-9 — retained GDExtension bridge into mdk_core.
 // See mdk_bridge.h for ownership and threading notes.
 
 #include "mdk_bridge.h"
@@ -23,6 +23,7 @@
 
 #include "arena_presenter.h"
 #include "mdk_convert.h"
+#include "object_presenter.h"
 
 using namespace godot;
 
@@ -44,6 +45,19 @@ int slotForAction(std::uint32_t bit) {
     case kActStrafeRight: return 18;// KeySideR
     default: return -1;
   }
+}
+
+std::uint64_t fnvAppend(std::uint64_t h, const void* p,
+                        std::size_t n) {
+  const auto* b = static_cast<const std::uint8_t*>(p);
+  for (std::size_t i = 0; i < n; ++i) {
+    h = (h ^ b[i]) * 0x100000001b3ull;
+  }
+  return h;
+}
+
+std::uint64_t fnvU64(std::uint64_t h, std::uint64_t v) {
+  return fnvAppend(h, &v, sizeof(v));
 }
 
 }  // namespace
@@ -80,6 +94,23 @@ void MdkBridge::_bind_methods() {
   ClassDB::bind_method(D_METHOD("get_last_error"),
                        &MdkBridge::get_last_error);
   ClassDB::bind_method(D_METHOD("shutdown"), &MdkBridge::shutdown);
+  // Phase 9 (G3).
+  ClassDB::bind_method(
+      D_METHOD("get_arena_render_snapshots"),
+      &MdkBridge::get_arena_render_snapshots);
+  ClassDB::bind_method(D_METHOD("get_display_snapshot"),
+                       &MdkBridge::get_display_snapshot);
+  ClassDB::bind_method(D_METHOD("get_display_digest"),
+                       &MdkBridge::get_display_digest);
+  ClassDB::bind_method(D_METHOD("get_object_snapshots"),
+                       &MdkBridge::get_object_snapshots);
+  ClassDB::bind_method(
+      D_METHOD("get_object_geometry", "object_id"),
+      &MdkBridge::get_object_geometry);
+  ClassDB::bind_method(
+      D_METHOD("diagnostic_start", "arena_index", "pos_mdk",
+               "yaw_deg"),
+      &MdkBridge::diagnostic_start);
 }
 
 void MdkBridge::setError_(const std::string& msg) {
@@ -169,6 +200,186 @@ bool MdkBridge::load_level(const String& dti_rel_path) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Display set — arenas the traversal view currently presents
+// ---------------------------------------------------------------------------
+
+mdk::TraversalArena* MdkBridge::arenaByIndex_(int idx) {
+  if (!rt_) return nullptr;
+  for (auto& a : rt_->arenas) {
+    if (a->index == idx) return a.get();
+  }
+  return nullptr;
+}
+
+int MdkBridge::indexOfArena_(const mdk::DynamicArena* dyn) const {
+  if (dyn == nullptr || dyn->owner == nullptr) return -1;
+  return dyn->owner->index;
+}
+
+std::vector<mdk::TraversalArena*> MdkBridge::viewArenas_() const {
+  std::vector<mdk::TraversalArena*> out;
+  if (!rt_ || !rt_->cur) return out;
+  out.push_back(rt_->cur);
+  // The original's draw pair is c48+ca4 — partner counts only when
+  // the carrier flag is set (prefetches stay invisible, 0x540ca8).
+  if (rt_->partnerActive && rt_->partner &&
+      rt_->partner != rt_->cur) {
+    out.push_back(rt_->partner);
+  }
+  return out;
+}
+
+MdkBridge::ArenaSet* MdkBridge::ensureArenaSet_(
+    mdk::TraversalArena& a) {
+  const int idx = a.index;
+  if (auto it = arenaSets_.find(idx); it != arenaSets_.end()) {
+    return it->second.get();
+  }
+  if (arenaSetFailed_.count(idx)) return nullptr;   // static failure
+
+  // MTO block lookup by 8-char name — the same search
+  // traversalArenaLoadGeometry performs (FUN_00432404's lookup).
+  const mdk::MtoBlock* block = nullptr;
+  for (std::size_t i = 0; i < rt_->level.mto.entries.size(); ++i) {
+    if (rt_->level.mto.entries[i].name() == a.name) {
+      block = &rt_->level.mto.blocks[i];
+      break;
+    }
+  }
+  if (!block) {
+    arenaSetFailed_.insert(idx);
+    return nullptr;   // corridor — no direct render block
+  }
+
+  // Region-C parse — the same call traversalArenaLoadGeometry /
+  // mdk-inspect run (block->regionCOffset == fileOffset+4+fieldAt0x0C).
+  const std::uint8_t* mb = reinterpret_cast<const std::uint8_t*>(
+      rt_->level.mtoBytes.data());
+  const std::size_t mn = rt_->level.mtoBytes.size();
+  if (block->regionCOffset >= mn) {
+    arenaSetFailed_.insert(idx);
+    return nullptr;
+  }
+  auto set = std::make_unique<ArenaSet>();
+  set->index = idx;
+  set->name = a.name;
+  std::uint32_t counts4[4] = {};
+  if (!mdk::collisionBlobParse(mb + block->regionCOffset,
+                             mn - block->regionCOffset, &set->col,
+                             counts4)) {
+    arenaSetFailed_.insert(idx);
+    return nullptr;
+  }
+  set->counts[0] = counts4[1];
+  set->counts[1] = counts4[2];
+  set->counts[2] = counts4[3];
+
+  if (!mdk::arenaRenderDataBuild(
+          std::span<const std::byte>(rt_->level.mtoBytes.data(), mn),
+          *block, set->col, counts4[1], counts4[2], counts4[3],
+          std::span<const std::byte>(sharedMtiBytes_.data(),
+                                     sharedMtiBytes_.size()),
+          &set->rd)) {
+    arenaSetFailed_.insert(idx);
+    return nullptr;
+  }
+
+  // Effective palette = SYS_PAL head + region B + DTI s3 tail
+  // (arena_mesh.h documents the OBSERVED call chain).
+  const auto& dti = rt_->level.dti;
+  const std::uint8_t* dtiBytes =
+      reinterpret_cast<const std::uint8_t*>(rt_->level.dtiBytes.data());
+  std::span<const std::uint8_t> s3;
+  if (dti.paletteBytes.fileStart + 768 <= rt_->level.dtiBytes.size()) {
+    s3 = std::span<const std::uint8_t>(dtiBytes + dti.paletteBytes.fileStart,
+                                       768);
+  }
+  if (!mdk::arenaPaletteCompose(sysPalHead_, s3, set->rd.paletteRgb,
+                                dti.paletteCount, set->palette.data())) {
+    arenaSetFailed_.insert(idx);
+    return nullptr;
+  }
+
+  // Collision debug line soup — every poly edge of the proven
+  // collision blob, converted once per arena (presentation only;
+  // nothing here feeds back into collision queries).
+  const std::uint32_t polyCount = set->counts[1];
+  set->colLines.resize(int64_t(polyCount) * 6);
+  for (std::uint32_t p = 0; p < polyCount; ++p) {
+    const mdk::CollisionPoly& cp = set->col.polys[p];
+    Vector3 v[3];
+    for (int k = 0; k < 3; ++k) {
+      v[k] = mdkToGodotVec(set->col.verts + std::size_t(cp.v[k]) * 3);
+    }
+    const int64_t o = int64_t(p) * 6;
+    set->colLines.set(o + 0, v[0]);
+    set->colLines.set(o + 1, v[1]);
+    set->colLines.set(o + 2, v[1]);
+    set->colLines.set(o + 3, v[2]);
+    set->colLines.set(o + 4, v[2]);
+    set->colLines.set(o + 5, v[0]);
+  }
+
+  std::fill_n(set->clsCount, 6, 0u);
+  for (std::size_t p = 0; p < set->rd.polys.size(); ++p) {
+    ++set->clsCount[static_cast<int>(set->rd.polyMaterialClass(p))];
+  }
+  {  // geometry digest — the mdk-inspect fold over the decoded view
+    set->geomDigest = fnvAppend(0xcbf29ce484222325ull, set->rd.verts,
+                                std::size_t(set->rd.vertCount) * 12);
+    set->geomDigest = fnvAppend(set->geomDigest, set->rd.polys.data(),
+                                set->rd.polys.size() *
+                                    sizeof(mdk::ArenaRenderPoly));
+  }
+  if (!mdk::arenaMeshTexturesBuild(
+          set->rd, std::span<const std::uint8_t>(set->palette.data(),
+                                                 768),
+          &set->texs)) {
+    arenaSetFailed_.insert(idx);
+    return nullptr;
+  }
+  ArenaSet* out = set.get();
+  arenaSets_[idx] = std::move(set);
+  return out;
+}
+
+void MdkBridge::updateDisplaySet_() {
+  displaySet_.clear();
+  const auto view = viewArenas_();
+  for (mdk::TraversalArena* a : view) {
+    ArenaSet* s = ensureArenaSet_(*a);
+    if (s != nullptr) {
+      s->role = (a == rt_->cur) ? "current" : "partner";
+      displaySet_.push_back(a->index);
+    }
+  }
+  arenaLoaded_ = !displaySet_.empty();
+  if (arenaLoaded_) {
+    mdk::TraversalArena* prim = arenaByIndex_(displaySet_.front());
+    arenaName_ = prim ? prim->name : "";
+    arenaIndex_ = displaySet_.front();
+  } else {
+    arenaIndex_ = -1;
+    arenaName_.clear();
+  }
+}
+
+void MdkBridge::refreshOrders_() {
+  if (!rt_) return;
+  const float* cam = hasFrame_ ? last_.camera.pos
+                             : rt_->camera.pose.pos;
+  for (int idx : displaySet_) {
+    ArenaSet* s = arenaSets_[idx].get();
+    mdk::arenaRenderOrder(s->col, cam, false, &s->order);
+    const std::uint64_t d = mdk::arenaOrderDigest(s->order);
+    if (d != s->orderDigest || s->tris.empty()) {
+      s->orderDigest = d;
+      mdk::arenaMeshTrisEmit(s->rd, s->texs, s->order, &s->tris);
+    }
+  }
+}
+
 bool MdkBridge::load_arena(const String& arena_name) {
   if (!rt_) {
     setError_("load_level() first");
@@ -190,8 +401,8 @@ bool MdkBridge::load_arena(const String& arena_name) {
     setError_("arena not found: '" + name + "'");
     return false;
   }
-  // MTO block lookup by 8-char name — the same search
-  // traversalArenaLoadGeometry performs (FUN_00432404's lookup).
+  // Manual load reports the lookup failure verbatim — a corridor
+  // still surfaces "no MTO block named X" to interactive callers.
   const mdk::MtoBlock* block = nullptr;
   for (std::size_t i = 0; i < rt_->level.mto.entries.size(); ++i) {
     if (rt_->level.mto.entries[i].name() == arena->name) {
@@ -203,118 +414,23 @@ bool MdkBridge::load_arena(const String& arena_name) {
     setError_("no MTO block named " + arena->name);
     return false;
   }
-
-  // Region-C parse — the same call traversalArenaLoadGeometry /
-  // mdk-inspect run (block->regionCOffset == fileOffset+4+fieldAt0x0C).
-  const std::uint8_t* mb = reinterpret_cast<const std::uint8_t*>(
-      rt_->level.mtoBytes.data());
-  const std::size_t mn = rt_->level.mtoBytes.size();
-  if (block->regionCOffset >= mn) {
-    setError_("region-C offset out of file for " + arena->name);
+  // Clear any cached static failure so an explicit request retries.
+  arenaSetFailed_.erase(arena->index);
+  ArenaSet* s = ensureArenaSet_(*arena);
+  if (s == nullptr) {
+    setError_("arena render build failed for " + arena->name);
     return false;
   }
-  std::uint32_t counts[4] = {};
-  mdk::CollisionArena col;
-  if (!mdk::collisionBlobParse(mb + block->regionCOffset,
-                             mn - block->regionCOffset, &col, counts)) {
-    setError_("collision blob parse failed for " + arena->name);
-    return false;
-  }
-
-  mdk::ArenaRenderData rd;
-  if (!mdk::arenaRenderDataBuild(
-          std::span<const std::byte>(rt_->level.mtoBytes.data(), mn),
-          *block, col, counts[1], counts[2], counts[3],
-          std::span<const std::byte>(sharedMtiBytes_.data(),
-                                     sharedMtiBytes_.size()),
-          &rd)) {
-    setError_("arenaRenderDataBuild failed for " + arena->name);
-    return false;
-  }
-
-  // Effective palette = SYS_PAL head + region B + DTI s3 tail
-  // (arena_mesh.h documents the OBSERVED call chain).
-  const auto& dti = rt_->level.dti;
-  const std::uint8_t* dtiBytes =
-      reinterpret_cast<const std::uint8_t*>(rt_->level.dtiBytes.data());
-  std::span<const std::uint8_t> s3;
-  if (dti.paletteBytes.fileStart + 768 <= rt_->level.dtiBytes.size()) {
-    s3 = std::span<const std::uint8_t>(dtiBytes + dti.paletteBytes.fileStart,
-                                       768);
-  }
-  if (!mdk::arenaPaletteCompose(sysPalHead_, s3, rd.paletteRgb,
-                                dti.paletteCount, palette_.data())) {
-    setError_("palette compose failed for " + arena->name);
-    return false;
-  }
-  if (sysPalHead_.empty()) {
-    UtilityFunctions::printerr(
-        "MdkBridge: composing palette without SYS_PAL head");
-  }
-
-  arenaCol_ = col;
-  // Collision debug line soup — every poly edge of the proven
-  // collision blob, converted once per arena (presentation only;
-  // nothing here feeds back into collision queries).
-  colNodeCount_ = counts[1];
-  colPolyCount_ = counts[2];
-  colVertCount_ = counts[3];
-  colLines_.clear();
-  colLines_.resize(int64_t(colPolyCount_) * 6);
-  for (std::uint32_t p = 0; p < colPolyCount_; ++p) {
-    const mdk::CollisionPoly& cp = arenaCol_.polys[p];
-    Vector3 v[3];
-    for (int k = 0; k < 3; ++k) {
-      v[k] = mdkToGodotVec(arenaCol_.verts + std::size_t(cp.v[k]) * 3);
-    }
-    const int64_t o = int64_t(p) * 6;
-    colLines_.set(o + 0, v[0]);
-    colLines_.set(o + 1, v[1]);
-    colLines_.set(o + 2, v[1]);
-    colLines_.set(o + 3, v[2]);
-    colLines_.set(o + 4, v[2]);
-    colLines_.set(o + 5, v[0]);
-  }
-  rd_ = std::move(rd);
-  atlasImage_.unref();
-  atlasTex_.unref();
-  arenaMat_.unref();
-  std::fill_n(clsCount_, 6, 0u);
-  for (std::size_t p = 0; p < rd_.polys.size(); ++p) {
-    ++clsCount_[static_cast<int>(rd_.polyMaterialClass(p))];
-  }
-  {  // geometry digest — the mdk-inspect fold over the decoded view
-    auto fnv = [](std::uint64_t h, const void* p, std::size_t n) {
-      const auto* b = static_cast<const std::uint8_t*>(p);
-      for (std::size_t i = 0; i < n; ++i) {
-        h = (h ^ b[i]) * 0x100000001b3ull;
-      }
-      return h;
-    };
-    geomDigest_ = fnv(0xcbf29ce484222325ull, rd_.verts,
-                      std::size_t(rd_.vertCount) * 12);
-    geomDigest_ = fnv(geomDigest_, rd_.polys.data(),
-                      rd_.polys.size() * sizeof(mdk::ArenaRenderPoly));
-  }
-  if (!mdk::arenaMeshTexturesBuild(
-          rd_, std::span<const std::uint8_t>(palette_.data(), 768),
-          &texs_)) {
-    setError_("texture expansion failed for " + arena->name);
-    return false;
-  }
+  // Pin the display set to this arena until the next stepped frame
+  // recomputes the core view set (pre-step priming path).
+  s->role = (arena == rt_->cur) ? "current" : "partner";
+  displaySet_.clear();
+  displaySet_.push_back(arena->index);
   arenaName_ = arena->name;
   arenaIndex_ = arena->index;
   arenaLoaded_ = true;
-  return rebuildOrder_();
-}
-
-bool MdkBridge::rebuildOrder_() {
-  if (!arenaLoaded_) return false;
-  // Painter order is evaluated at the current core camera position.
-  const float* cam = hasFrame_ ? last_.camera.pos
-                               : rt_->camera.pose.pos;
-  mdk::arenaRenderOrder(arenaCol_, cam, false, &order_);
-  return mdk::arenaMeshTrisEmit(rd_, texs_, order_, &tris_);
+  refreshOrders_();
+  return true;
 }
 
 Dictionary MdkBridge::step_frame(double dt_ms, int64_t action_mask) {
@@ -388,37 +504,24 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
   last_ = mdk::stepTraversalRuntime(*rt_, raw, bindings_, timing_);
   hasFrame_ = true;
 
-  // Traversal may portal the player into a different arena — swap
-  // the displayed static arena to match when a block exists. A
-  // corridor (CHMO_*, no MTO block) leaves the previous display in
-  // place and marks the desync instead of failing the frame.
-  if (last_.curArenaIndex != arenaIndex_ &&
-      last_.curArenaIndex != arenaSwitchAttempt_) {
-    arenaSwitchAttempt_ = last_.curArenaIndex;
-    for (auto& a : rt_->arenas) {
-      if (a->index == last_.curArenaIndex) {
-        if (!load_arena(a->name.c_str())) {
-          UtilityFunctions::printerr(
-              "MdkBridge: arena switch to '", a->name.c_str(),
-              "' unavailable — keeping '", arenaName_.c_str(),
-              "' displayed (desync)");
-        }
-        break;
-      }
-    }
-  }
-  if (arenaLoaded_) rebuildOrder_();
+  // The display set is core-driven every frame: portal swaps,
+  // partner attach/detach, and corridor (geometry-less) arenas all
+  // recompute here — the G1 single-arena desync is gone. A corridor
+  // current arena yields no set of its own; the partner's geometry
+  // stays up and the corridor's objects still present.
+  updateDisplaySet_();
+  refreshOrders_();
 
   out["frame"] = last_.frame;
   out["arena"] = last_.curArenaIndex;      // core arena
-  out["arena_display"] = arenaIndex_;      // displayed arena (-1 none)
+  out["arena_display"] = arenaIndex_;      // primary displayed (-1)
   out["player_pos"] = mdkToGodotVec(last_.pos);
   out["yaw_deg"] = last_.yawDeg;
   out["pitch_deg"] = last_.pitchDeg;
   out["grounded"] = last_.grounded;
   out["camera"] = mdkToGodotCameraTransform(last_.camera);
-  out["order_digest"] =
-      static_cast<int64_t>(mdk::arenaOrderDigest(order_));
+  out["order_digest"] = static_cast<int64_t>(
+      arenaIndex_ >= 0 ? arenaSets_[arenaIndex_]->orderDigest : 0);
 
   // Merged-control echo — the just-consumed GameplayInputFrame
   // (0x4ce block), for tests/QA that need to observe which semantic
@@ -482,7 +585,7 @@ Dictionary MdkBridge::get_player_snapshot() const {
   out["look_offset_deg"] = last_.lookOffsetDeg;     // 0x540d58
   out["event_type"] = last_.eventType;              // 0x54cb00
   out["event_mag"] = last_.eventMag;                // 0x54cb08
-  out["arena_display"] = arenaIndex_;               // shown arena
+  out["arena_display"] = arenaIndex_;               // primary shown
   return out;
 }
 
@@ -514,17 +617,18 @@ Dictionary MdkBridge::get_camera_snapshot() const {
 
 Dictionary MdkBridge::get_collision_snapshot() {
   Dictionary out;
-  if (!arenaLoaded_) {
+  if (!arenaLoaded_ || arenaIndex_ < 0) {
     setError_("load_arena() first");
     return out;
   }
-  out["arena"] = arenaName_.c_str();
-  out["arena_index"] = arenaIndex_;
-  out["poly_count"] = int64_t(colPolyCount_);
-  out["vert_count"] = int64_t(colVertCount_);
-  out["node_count"] = int64_t(colNodeCount_);
+  ArenaSet* s = arenaSets_[arenaIndex_].get();
+  out["arena"] = s->name.c_str();
+  out["arena_index"] = s->index;
+  out["poly_count"] = int64_t(s->counts[1]);
+  out["vert_count"] = int64_t(s->counts[2]);
+  out["node_count"] = int64_t(s->counts[0]);
   // Pairs of points -> Mesh.PRIMITIVE_LINES.
-  out["lines"] = colLines_;
+  out["lines"] = s->colLines;
   return out;
 }
 
@@ -546,100 +650,328 @@ Dictionary MdkBridge::get_input_config() const {
 }
 
 int64_t MdkBridge::get_arena_order_digest() {
-  if (!arenaLoaded_) return -1;
-  return static_cast<int64_t>(mdk::arenaOrderDigest(order_));
+  if (!arenaLoaded_ || arenaIndex_ < 0) return -1;
+  return static_cast<int64_t>(arenaSets_[arenaIndex_]->orderDigest);
 }
 
-Dictionary MdkBridge::get_arena_render_snapshot() {
-  Dictionary out;
-  if (!arenaLoaded_) {
-    setError_("load_arena() first");
-    return out;
+int64_t MdkBridge::get_display_digest() {
+  if (!rt_) return -1;
+  std::uint64_t h = 0xcbf29ce484222325ull;
+  h = fnvU64(h, std::uint64_t(displaySet_.size()));
+  for (int idx : displaySet_) {
+    h = fnvU64(h, std::uint64_t(std::uint32_t(idx)));
+    h = fnvU64(h, arenaSets_[idx]->orderDigest);
   }
+  h = fnvU64(h, std::uint64_t(std::uint32_t(
+      rt_->cur ? rt_->cur->index : -1)));
+  h = fnvU64(h, std::uint64_t(std::uint32_t(
+      (rt_->partnerActive && rt_->partner) ? rt_->partner->index
+                                          : -1)));
+  return static_cast<int64_t>(h);
+}
+
+Dictionary MdkBridge::arenaSnapshotDict_(ArenaSet& s) {
+  Dictionary out;
   PackedVector3Array positions;
   PackedVector2Array uvs;
   PackedFloat32Array matDesc;
-  Ref<ArrayMesh> mesh = arenaArrayMesh(texs_, tris_, &positions, &uvs,
-                                       &matDesc);
-  // Atlas + material are camera-independent — build once per arena
-  // and reuse across painter-order rebuilds.
-  if (atlasImage_.is_null()) {
-    atlasImage_ = arenaAtlasImage(texs_, palette_, &atlasTex_);
+  Ref<ArrayMesh> mesh = arenaArrayMesh(s.texs, s.tris, &positions,
+                                       &uvs, &matDesc);
+  // Atlas + material are camera-independent — built lazily once per
+  // arena set and reused across painter-order rebuilds.
+  if (s.atlasImage.is_null()) {
+    s.atlasImage = arenaAtlasImage(s.texs, s.palette, &s.atlasTex);
   }
-  if (arenaMat_.is_null()) {
-    arenaMat_.instantiate();
+  if (s.mat.is_null()) {
+    s.mat.instantiate();
     Ref<Shader> shader =
         ResourceLoader::get_singleton()->load(
             "res://shaders/arena_unshaded.gdshader");
     if (shader.is_valid()) {
-      arenaMat_->set_shader(shader);
-      if (atlasTex_.is_valid())
-        arenaMat_->set_shader_parameter("atlas", atlasTex_);
+      s.mat->set_shader(shader);
+      if (s.atlasTex.is_valid())
+        s.mat->set_shader_parameter("atlas", s.atlasTex);
     } else {
       UtilityFunctions::printerr(
           "MdkBridge: arena_unshaded.gdshader missing");
     }
   }
 
-  Ref<ShaderMaterial> mat = arenaMat_;
-  Ref<Image> atlas = atlasImage_;
-
   PackedInt32Array polyOrder;
-  polyOrder.resize(static_cast<int64_t>(tris_.size()));
-  for (std::size_t i = 0; i < tris_.size(); ++i) {
+  polyOrder.resize(static_cast<int64_t>(s.tris.size()));
+  for (std::size_t i = 0; i < s.tris.size(); ++i) {
     polyOrder.set(static_cast<int64_t>(i),
-                  static_cast<int32_t>(tris_[i].poly));
+                  static_cast<int32_t>(s.tris[i].poly));
   }
   PackedByteArray palette;
   palette.resize(768);
-  std::memcpy(palette.ptrw(), palette_.data(), 768);
+  std::memcpy(palette.ptrw(), s.palette.data(), 768);
 
-  out["arena"] = arenaName_.c_str();
-  out["arena_index"] = arenaIndex_;
+  out["arena"] = s.name.c_str();
+  out["arena_index"] = s.index;
+  out["role"] = s.role.c_str();
   out["mesh"] = mesh;
-  out["material"] = mat;
-  out["atlas_image"] = atlas;
+  out["material"] = s.mat;
+  out["atlas_image"] = s.atlasImage;
   out["positions"] = positions;
   out["uvs"] = uvs;
   out["matdesc"] = matDesc;
   out["poly_order"] = polyOrder;
   out["palette"] = palette;
+  out["collision_lines"] = s.colLines;
 
   Dictionary stats;
-  stats["vert_count"] = int64_t(rd_.vertCount);
-  stats["node_count"] = int64_t(rd_.nodeCount);
-  stats["poly_count"] = int64_t(rd_.polys.size());
-  stats["submitted_count"] = int64_t(tris_.size());
-  stats["name_count"] = int64_t(rd_.materialNames.size());
-  stats["texture_count"] = int64_t(texs_.textures.size());
+  stats["vert_count"] = int64_t(s.rd.vertCount);
+  stats["node_count"] = int64_t(s.rd.nodeCount);
+  stats["poly_count"] = int64_t(s.rd.polys.size());
+  stats["submitted_count"] = int64_t(s.tris.size());
+  stats["name_count"] = int64_t(s.rd.materialNames.size());
+  stats["texture_count"] = int64_t(s.texs.textures.size());
   std::int64_t resolved = 0;
-  for (int s : rd_.materialOfName) resolved += s >= 0;
+  for (int x : s.rd.materialOfName) resolved += x >= 0;
   stats["resolved"] = resolved;
   stats["missing"] =
-      int64_t(rd_.materialOfName.size()) - resolved;
-  stats["textured"] = int64_t(clsCount_[0]);
-  stats["unresolved"] = int64_t(clsCount_[1]);
-  stats["pen"] = int64_t(clsCount_[2]);
-  stats["fx770"] = int64_t(clsCount_[3]);
-  stats["fxe94"] = int64_t(clsCount_[4]);
-  stats["fx12970"] = int64_t(clsCount_[5]);
-  stats["geom_digest"] = int64_t(geomDigest_);
-  stats["order_digest"] =
-      int64_t(mdk::arenaOrderDigest(order_));
+      int64_t(s.rd.materialOfName.size()) - resolved;
+  stats["textured"] = int64_t(s.clsCount[0]);
+  stats["unresolved"] = int64_t(s.clsCount[1]);
+  stats["pen"] = int64_t(s.clsCount[2]);
+  stats["fx770"] = int64_t(s.clsCount[3]);
+  stats["fxe94"] = int64_t(s.clsCount[4]);
+  stats["fx12970"] = int64_t(s.clsCount[5]);
+  stats["geom_digest"] = int64_t(s.geomDigest);
+  stats["order_digest"] = int64_t(s.orderDigest);
   // Hex forms for display/comparison (the int64 values may read
   // negative in GDScript).
   char hexBuf[24];
   std::snprintf(hexBuf, sizeof(hexBuf), "%016llx",
-                (unsigned long long)geomDigest_);
+                (unsigned long long)s.geomDigest);
   stats["geom_digest_hex"] = hexBuf;
   std::snprintf(hexBuf, sizeof(hexBuf), "%016llx",
-                (unsigned long long)mdk::arenaOrderDigest(order_));
+                (unsigned long long)s.orderDigest);
   stats["order_digest_hex"] = hexBuf;
-  stats["atlas_w"] = int64_t(texs_.atlasW);
-  stats["atlas_h"] = int64_t(texs_.atlasH);
-  stats["lut_x"] = int64_t(texs_.lutX);
-  stats["lut_y"] = int64_t(texs_.lutY);
+  stats["atlas_w"] = int64_t(s.texs.atlasW);
+  stats["atlas_h"] = int64_t(s.texs.atlasH);
+  stats["lut_x"] = int64_t(s.texs.lutX);
+  stats["lut_y"] = int64_t(s.texs.lutY);
   out["stats"] = stats;
+  return out;
+}
+
+Dictionary MdkBridge::get_arena_render_snapshot() {
+  Dictionary out;
+  if (!arenaLoaded_ || arenaIndex_ < 0) {
+    setError_("load_arena() first");
+    return out;
+  }
+  return arenaSnapshotDict_(*arenaSets_[arenaIndex_]);
+}
+
+Array MdkBridge::get_arena_render_snapshots() {
+  Array out;
+  for (int idx : displaySet_) {
+    out.push_back(arenaSnapshotDict_(*arenaSets_[idx]));
+  }
+  return out;
+}
+
+Dictionary MdkBridge::get_display_snapshot() {
+  Dictionary out;
+  if (!rt_) return out;
+  out["cur_arena"] = rt_->cur ? rt_->cur->index : -1;
+  out["cur_name"] = rt_->cur ? String(rt_->cur->name.c_str())
+                           : String();
+  out["partner_arena"] =
+      (rt_->partnerActive && rt_->partner) ? rt_->partner->index
+                                           : -1;
+  out["partner_name"] =
+      (rt_->partnerActive && rt_->partner)
+          ? String(rt_->partner->name.c_str()) : String();
+  out["partner_active"] = rt_->partnerActive;
+  out["view_on_partner"] = rt_->viewOnPartner;
+  out["swapped"] = hasFrame_ ? last_.currentArenaSwapped : false;
+  out["portal_candidate"] =
+      hasFrame_ ? last_.portalCandidate : -1;
+  out["portals_crossed"] = rt_->seams.portalsCrossed;
+  out["object_migrations"] = rt_->seams.objectMigrations;
+  out["primary"] = arenaIndex_;
+  Array arenas;
+  for (int idx : displaySet_) {
+    ArenaSet* s = arenaSets_[idx].get();
+    mdk::TraversalArena* a = arenaByIndex_(idx);
+    Dictionary d;
+    d["index"] = idx;
+    d["name"] = s->name.c_str();
+    d["role"] = s->role.c_str();
+    d["has_geometry"] = true;
+    d["object_count"] =
+        a ? int64_t(a->dyn.storage.size()) : int64_t(0);
+    arenas.push_back(d);
+  }
+  out["arenas"] = arenas;
+  // The object-view set — may include geometry-less corridors that
+  // never appear in `arenas` (their objects still present).
+  Array objArenas;
+  for (mdk::TraversalArena* a : viewArenas_()) {
+    Dictionary d;
+    d["index"] = a->index;
+    d["name"] = a->name.c_str();
+    d["role"] = (a == rt_->cur) ? "current" : "partner";
+    d["has_geometry"] = arenaSets_.count(a->index) != 0;
+    d["object_count"] = int64_t(a->dyn.storage.size());
+    objArenas.push_back(d);
+  }
+  out["object_arenas"] = objArenas;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic objects (G3)
+// ---------------------------------------------------------------------------
+
+std::uint64_t MdkBridge::objectFingerprint_(
+    const mdk::DynamicObject& o) {
+  // Spawn-stable identity only — nothing mutable (pos/flags/AABB)
+  // may feed this or arena transfers/mover updates would re-mint.
+  std::uint64_t h = 0xcbf29ce484222325ull;
+  h = fnvU64(h, o.enemyIndex);
+  h = fnvU64(h, o.spawnId);
+  h = fnvU64(h, o.scriptVariant);
+  h = fnvU64(h, o.scriptOff);
+  const std::string mn = o.model.modelName();
+  h = fnvAppend(h, mn.data(), mn.size());
+  h = fnvAppend(h, o.scriptClass.data(), o.scriptClass.size());
+  h = fnvAppend(h, o.scriptName.data(), o.scriptName.size());
+  return h;
+}
+
+Dictionary MdkBridge::objectSnapshot_(mdk::TraversalArena& arena,
+                                      mdk::DynamicObject& o) {
+  Dictionary d;
+  const std::uint64_t id =
+      objIds_.idFor(&o, objectFingerprint_(o));
+  d["id"] = int64_t(id);
+  d["arena"] = arena.index;
+  d["arena_name"] = String(arena.name.c_str());
+  const std::string mn = o.model.modelName();
+  d["model"] = String(mn.c_str());
+  // Enemy-table (DTI sub-record) name — e.g. the HMO_9 record "XGS"
+  // whose resolved RuntimeModel is internally named XG_BOD.
+  if (rt_ && o.enemyIndex < rt_->level.enemies.entries.size()) {
+    d["enemy_name"] =
+        String(rt_->level.enemies.entries[o.enemyIndex].name.c_str());
+  } else {
+    d["enemy_name"] = String();
+  }
+  d["enemy_index"] = int64_t(o.enemyIndex);
+  d["spawn_id"] = int64_t(o.spawnId);
+  d["pos"] = mdkToGodotVec(o.pos);
+  d["pos_mdk"] = Vector3(o.pos[0], o.pos[1], o.pos[2]);
+  // The COMPLETE core transform — CollisionObject::xform is the
+  // authoritative 3x3 (Euler or raw-matrix path, scale baked) and
+  // origin is +0x78 (pos, or pos+zBias on the raw path). Conversion
+  // is the change of basis P*M*P^T — no Euler recompute here.
+  const mdkfront::Vec3 org =
+      {o.col.origin[0], o.col.origin[1], o.col.origin[2]};
+  d["transform"] = mdkToGodotObjectTransform(
+      mdkfront::mdkTransformToGodot(o.col.xform, org));
+  d["aabb"] = mdkToGodotAabb(o.col.aabb);
+  d["aabb_mdk"] = PackedFloat32Array{
+      o.col.aabb[0], o.col.aabb[1], o.col.aabb[2],
+      o.col.aabb[3], o.col.aabb[4], o.col.aabb[5]};
+  d["yaw_deg"] = o.yawDeg;
+  d["pitch_deg"] = o.pitchDeg;
+  d["bank_deg"] = o.bankDeg;
+  d["scale"] = o.col.scale;
+  d["health"] = int64_t(o.health);
+  d["flags148"] = int64_t(o.col.flags148);
+  d["flags149"] = int64_t(o.col.flags149);
+  d["flags14a"] = int64_t(o.col.flags14a);
+  d["mover"] = (o.col.flags14a & 0x20) != 0;
+  d["connector"] = (o.col.flags14a & 0x10) != 0;
+  d["mountable"] = (o.col.flags14a & 0x80) != 0;
+  d["ride_capable"] = (o.col.flags149 & 0x01) != 0;
+  d["conn_state"] = int64_t(o.connState);
+  d["conn_state_hi"] = int64_t(o.connStateHi);
+  d["conn_anim_active"] = o.connAnim != nullptr;
+  d["pending_arena"] = indexOfArena_(o.pendingArena);
+  d["elem_count"] = int64_t(o.model.elems.size());
+  d["elem_mask"] = int64_t(o.col.elemMaskB);
+  std::int64_t vc = 0, tc = 0;
+  for (std::size_t e = 0; e < o.model.elems.size(); ++e) {
+    vc += int64_t(o.model.elemVerts[e].size() / 3);
+    tc += int64_t(o.model.elemTris[e].size() / 0x24);
+  }
+  d["vert_count"] = vc;
+  d["tri_count"] = tc;
+  d["geom_key"] = int64_t(objectGeomKey(o.model));
+  d["script_class"] = String(o.scriptClass.c_str());
+  d["script_name"] = String(o.scriptName.c_str());
+  return d;
+}
+
+Array MdkBridge::get_object_snapshots() {
+  Array out;
+  if (!rt_) return out;
+  // Live-set pass over EVERY arena's storage — the ID map must see
+  // despawned objects even when their arena leaves the view set.
+  objIds_.beginPass();
+  for (auto& a : rt_->arenas) {
+    for (auto& up : a->dyn.storage) {
+      objIds_.markLive(up.get());
+    }
+  }
+  for (mdk::TraversalArena* a : viewArenas_()) {
+    for (auto& up : a->dyn.storage) {
+      out.push_back(objectSnapshot_(*a, *up));
+    }
+  }
+  objIds_.endPass();
+  return out;
+}
+
+Dictionary MdkBridge::get_object_geometry(int64_t object_id) {
+  Dictionary out;
+  if (!rt_ || object_id <= 0) return out;
+  const void* p = objIds_.find(std::uint64_t(object_id));
+  if (p == nullptr) return out;   // stale/unknown — empty, not error
+  const auto& o = *static_cast<const mdk::DynamicObject*>(p);
+  const ObjectGeometry g = objectGeometryFromModel(o.model);
+  out["mesh"] = g.mesh;
+  out["surface_elems"] = g.surfaceElems;
+  out["elem_names"] = g.elemNames;
+  out["vert_count"] = g.vertCount;
+  out["tri_count"] = g.triCount;
+  out["elem_count"] = int64_t(o.model.elems.size());
+  out["geom_key"] = int64_t(g.geomKey);
+  out["model"] = String(o.model.modelName().c_str());
+  return out;
+}
+
+Dictionary MdkBridge::diagnostic_start(int64_t arena_index,
+                                       const Vector3& pos_mdk,
+                                       double yaw_deg) {
+  Dictionary out;
+  if (!rt_) {
+    setError_("no level loaded");
+    return out;
+  }
+  const float pos[3] = {float(pos_mdk.x), float(pos_mdk.y),
+                        float(pos_mdk.z)};
+  std::string detail;
+  const auto e = mdk::traversalRuntimeDiagnosticStart(
+      *rt_, int(arena_index), pos, float(yaw_deg), &detail);
+  out["ok"] = (e == mdk::TraversalLoadError::kOk);
+  out["detail"] = String(detail.c_str());
+  if (e != mdk::TraversalLoadError::kOk) {
+    setError_(std::string("diagnostic_start: ") +
+              mdk::traversalLoadErrorName(e) + " — " + detail);
+    return out;
+  }
+  // The display set recomputes from the re-anchored cur immediately
+  // so presentation reflects the diagnostic arena before the next
+  // stepped frame.
+  updateDisplaySet_();
+  refreshOrders_();
   return out;
 }
 
@@ -655,22 +987,16 @@ Array MdkBridge::get_arena_names() const {
 void MdkBridge::shutdown() {
   arenaLoaded_ = false;
   arenaIndex_ = -1;
-  arenaSwitchAttempt_ = -1;
   arenaName_.clear();
-  tris_.clear();
-  order_.clear();
-  texs_ = mdk::ArenaMeshTextures{};
-  rd_ = mdk::ArenaRenderData{};
-  arenaCol_ = mdk::CollisionArena{};
-  colNodeCount_ = colPolyCount_ = colVertCount_ = 0;
-  colLines_.clear();
+  arenaSets_.clear();
+  arenaSetFailed_.clear();
+  displaySet_.clear();
+  objIds_ = mdkfront::MdkObjectIds{};
   sharedMtiBytes_.clear();
   ftiBytes_.clear();
   sysPalHead_ = {};
-  atlasImage_.unref();
-  atlasTex_.unref();
-  arenaMat_.unref();
   prevKeyLevel_ = {};
   rt_.reset();
   hasFrame_ = false;
+  lastError_.clear();
 }

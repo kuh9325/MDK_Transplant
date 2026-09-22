@@ -1,13 +1,17 @@
 extends Node3D
 
-# Phase 8 (G2) acceptance scene: load LEVEL3, render the HMO_1 arena
-# through the MdkBridge GDExtension, and show the player as a debug
-# proxy driven purely by traversal-runtime snapshots. mdk_core owns
+# Phase 9 (G3) acceptance scene: load LEVEL3, render the traversal
+# DISPLAY SET (current + active partner arenas) through the
+# MdkBridge GDExtension, present spawned DynamicObjects from real
+# RuntimeModel geometry, and show the player as a debug proxy —
+# all driven purely by traversal-runtime snapshots. mdk_core owns
 # data/semantics; this script only wires returned snapshots into
 # Node3D objects — nothing here integrates motion or drives state.
 #
 # Per frame:
 #   raw device input -> bridge.step_frame_input -> core step
+#   -> arena display digest -> ArenaRoot sync (display set)
+#   -> object snapshots -> DynamicObjectRoot nodes (opaque ids)
 #   -> player snapshot -> PlayerRoot transform (presentation only)
 #
 # CLI (after --):
@@ -15,13 +19,17 @@ extends Node3D
 #                     <repo>/original/installed relative to res://)
 #   --level RELDTI    default TRAVERSE/LEVEL3/LEVEL3.DTI
 #   --arena NAME      default HMO_1 ("" -> spawn arena)
+#   --start X Y Z     diagnostic re-anchor into --arena (native
+#                     diagnostic — test/QA path, not original flow)
+#   --start-yaw DEG   yaw for --start (default 0)
 #   --smoke           headless deterministic check, then quit
 #   --screenshot P    after 8 frames, save a PNG capture then quit
 #                     (requires a real renderer — not --headless)
 #   --frames N        run N process frames then quit (startup proof)
 #
 # Keys: WASD move, Q/E strafe, A/D turn, R/F look up/down, Space
-# jump, Shift turbo, F1 collision wire toggle, F3 debug text toggle.
+# jump, Shift turbo, F1 collision wire toggle, F2 dynamic-object
+# debug toggle (AABB wires + name/id/arena tags), F3 debug text.
 # Interactive runs capture the mouse; Esc releases the capture once,
 # then quits. Mouse deltas/buttons are forwarded to the core raw-
 # input path — the configured W-set mapping (axes "ABG", scales
@@ -31,13 +39,14 @@ extends Node3D
 # the script still parse when the GDExtension is missing, so the
 # failure surfaces as an actionable error instead of a parse abort.
 var bridge = null
-var last_order_digest := -1
+var last_display_digest := -1
 var smoke := false
 var interactive := false
 var failures := 0
 var shot_path := ""
 var shot_frames_left := 0
 var frames_left := 0
+var obj_debug := false
 
 # Raw mouse accumulators — device deltas for the next frame only.
 var mouse_dx := 0
@@ -49,6 +58,15 @@ var body_mat: StandardMaterial3D
 var marker_mat: StandardMaterial3D
 var wire_mat: StandardMaterial3D
 var col_mat: StandardMaterial3D
+var obj_wire_mat: StandardMaterial3D
+
+# Dynamic-object presentation caches — geometry keyed by the core
+# geom_key digest (immutable local geometry may be shared when the
+# digest proves identity), materials keyed by element name.
+var geom_cache := {}        # geom_key -> [{elem:int, mesh:ArrayMesh}]
+var elem_mats := {}         # elem name -> StandardMaterial3D
+var obj_wires := {}         # object id -> MeshInstance3D (AABB wire)
+var obj_tags := {}          # object id -> Label3D
 
 const ACT_TURN_LEFT := 1
 const ACT_TURN_RIGHT := 2
@@ -111,6 +129,8 @@ func _ready() -> void:
 			data_root = launch_dir.path_join(data_root).simplify_path()
 	var level := _arg_value(args, "--level", "TRAVERSE/LEVEL3/LEVEL3.DTI")
 	var arena := _arg_value(args, "--arena", "HMO_1")
+	var start := _arg_value(args, "--start", "")
+	var start_yaw := float(_arg_value(args, "--start-yaw", "0"))
 	shot_path = _arg_value(args, "--screenshot", "")
 	if shot_path.is_relative_path() and not shot_path.is_empty():
 		var launch_dir := OS.get_environment("PWD")
@@ -141,19 +161,49 @@ func _ready() -> void:
 		printerr("MdkBridge.load_arena failed: ", bridge.get_last_error())
 		get_tree().quit(1)
 		return
+	if not start.is_empty():
+		# NATIVE DIAGNOSTIC — re-anchor into --arena at the given MDK
+		# position (mirrors mdk-inspect's --arena/--start selftests).
+		var parts := start.split(" ", false)
+		if parts.size() != 3:
+			printerr("--start needs 'X Y Z'")
+			get_tree().quit(1)
+			return
+		var arena_idx := -1
+		var names: Array = bridge.get_arena_names()
+		for i in names.size():
+			if String(names[i]) == arena:
+				arena_idx = i
+				break
+		if arena_idx < 0:
+			printerr("--arena '", arena, "' not in level")
+			get_tree().quit(1)
+			return
+		var dr: Dictionary = bridge.diagnostic_start(arena_idx,
+			Vector3(float(parts[0]), float(parts[1]), float(parts[2])),
+			start_yaw)
+		if not dr.get("ok", false):
+			printerr("diagnostic_start failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
 
 	_build_player_proxy()
 
 	# One idle frame settles the deterministic spawn camera.
 	bridge.step_frame_input(0.0, {})
-	_apply_arena_snapshot()
-	_apply_collision_snapshot()
+	_apply_arena_snapshots()
+	_apply_object_snapshots()
 	_apply_player_snapshot()
 	_apply_camera_snapshot()
 	_update_debug_label()
 
 	if smoke:
-		_run_smoke(data_root)
+		if level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
+				arena == "HMO_1" and start.is_empty():
+			_run_smoke(data_root)
+		else:
+			_run_smoke_generic(level, arena)
 		get_tree().quit(0 if failures == 0 else 1)
 		return
 	if not shot_path.is_empty():
@@ -173,7 +223,8 @@ func _ready() -> void:
 
 	print(("mdk-godot: arena=%s arenas=%d  (WASD/QE move+strafe, " +
 		"AD turn, RF look, Space jump, mouse=captured, F1 collision, " +
-		"Esc release/quit)") % [arena, bridge.get_arena_names().size()])
+		"F2 object debug, Esc release/quit)") %
+		[arena, bridge.get_arena_names().size()])
 
 
 func _build_player_proxy() -> void:
@@ -206,33 +257,179 @@ func _build_player_proxy() -> void:
 	wire_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	wire_mat.albedo_color = Color(1.0, 0.85, 0.15)
 	$PlayerBoxWire.material_override = wire_mat
-	# CollisionDebug — the arena's collision poly edges (F1 toggles).
+	# CollisionDebug — the display set's collision poly edges
+	# combined (F1 toggles).
 	col_mat = StandardMaterial3D.new()
 	col_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	col_mat.albedo_color = Color(0.9, 0.2, 0.9)
 	$CollisionDebug.material_override = col_mat
 	$CollisionDebug.visible = false
+	# Object AABB wires (F2 toggles ObjectDebugRoot).
+	obj_wire_mat = StandardMaterial3D.new()
+	obj_wire_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	obj_wire_mat.albedo_color = Color(1.0, 0.45, 0.9)
 
 
-func _apply_arena_snapshot() -> void:
-	var snap: Dictionary = bridge.get_arena_render_snapshot()
-	if snap.is_empty():
-		return
-	$ArenaMesh.mesh = snap["mesh"]
-	$ArenaMesh.set_surface_override_material(0, snap["material"])
-	last_order_digest = snap["stats"]["order_digest"]
-
-
-func _apply_collision_snapshot() -> void:
-	var col: Dictionary = bridge.get_collision_snapshot()
-	if col.is_empty():
-		return
+func _apply_arena_snapshots() -> void:
+	# The traversal display set: one MeshInstance3D per presented
+	# arena (current + active partner — a corridor current arena
+	# contributes nothing, its partner's geometry stays up).
+	var snaps: Array = bridge.get_arena_render_snapshots()
+	var live := {}
+	var lines := PackedVector3Array()
+	for s in snaps:
+		var idx := int(s["arena_index"])
+		live[idx] = true
+		var node: MeshInstance3D = $ArenaRoot.get_node_or_null(
+			"Arena_%d" % idx)
+		if node == null:
+			node = MeshInstance3D.new()
+			node.name = "Arena_%d" % idx
+			$ArenaRoot.add_child(node)
+		node.mesh = s["mesh"]
+		node.set_surface_override_material(0, s["material"])
+		lines.append_array(s["collision_lines"])
+	for child in $ArenaRoot.get_children():
+		var idx := int(child.name.trim_prefix("Arena_"))
+		if not live.has(idx):
+			child.queue_free()
+	# Combined collision soup for the F1 debug view.
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = col["lines"]
+	arrays[Mesh.ARRAY_VERTEX] = lines
 	var am := ArrayMesh.new()
-	am.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
+	if not lines.is_empty():
+		am.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
 	$CollisionDebug.mesh = am
+	last_display_digest = bridge.get_display_digest()
+
+
+func _split_elem_meshes(src: ArrayMesh,
+		surface_elems: PackedInt32Array) -> Array:
+	# One single-surface mesh per element — lets the element-disable
+	# mask toggle visibility per element.
+	var out := []
+	for s in src.get_surface_count():
+		var arrays: Array = src.surface_get_arrays(s)
+		var m := ArrayMesh.new()
+		m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		out.append({"elem": int(surface_elems[s]), "mesh": m})
+	return out
+
+
+func _elem_material(elem_name: String) -> StandardMaterial3D:
+	# Deterministic per-element debug material — the model triangle
+	# record's material/UV fields are NOT evidenced, so objects
+	# render unshaded in stable element-name colors. Documented
+	# fidelity seam (docs/GODOT_FRONTEND.md §materials).
+	var key := elem_name if not elem_name.is_empty() else "<anon>"
+	if elem_mats.has(key):
+		return elem_mats[key]
+	var h := 5381
+	for i in key.length():
+		h = ((h * 33) + key.unicode_at(i)) & 0x7fffffff
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	m.albedo_color = Color.from_hsv(float(h % 360) / 360.0, 0.55, 0.95)
+	elem_mats[key] = m
+	return m
+
+
+func _object_geom_meshes(g: Dictionary) -> Array:
+	var key := int(g["geom_key"])
+	if geom_cache.has(key):
+		return geom_cache[key]
+	var split := _split_elem_meshes(g["mesh"], g["surface_elems"])
+	geom_cache[key] = split
+	return split
+
+
+func _apply_object_snapshots() -> void:
+	var snaps: Array = bridge.get_object_snapshots()
+	var live := {}
+	for o in snaps:
+		var oid := int(o["id"])
+		live[oid] = true
+		var node: Node3D = $DynamicObjectRoot.get_node_or_null(
+			"Object_%d" % oid)
+		if node == null:
+			node = Node3D.new()
+			node.name = "Object_%d" % oid
+			$DynamicObjectRoot.add_child(node)
+			node.set_meta("geom_key", -1)
+		# Geometry (re)build only when the core digest changes —
+		# deep-copied models may diverge later; the digest proves it.
+		if int(node.get_meta("geom_key")) != int(o["geom_key"]):
+			for c in node.get_children():
+				node.remove_child(c)
+				c.free()
+			var g: Dictionary = bridge.get_object_geometry(oid)
+			if not g.is_empty():
+				var names: PackedStringArray = g["elem_names"]
+				for sm in _object_geom_meshes(g):
+					var mi := MeshInstance3D.new()
+					mi.name = "E%d" % int(sm["elem"])
+					mi.mesh = sm["mesh"]
+					mi.material_override = _elem_material(
+						names[int(sm["elem"])])
+					mi.set_meta("elem", int(sm["elem"]))
+					node.add_child(mi)
+				node.set_meta("geom_key", int(o["geom_key"]))
+		# Core-authoritative transform — verbatim from the snapshot.
+		node.transform = o["transform"]
+		# Element-disable mask (connMaskLock/HC, SW_DUMMY, +0x2c8).
+		var mask := int(o["elem_mask"])
+		for c in node.get_children():
+			c.visible = (mask & (1 << int(c.get_meta("elem")))) == 0
+		# F2 debug — world-space AABB wire + a Label3D tag.
+		if obj_debug:
+			_update_object_debug(o)
+	for child in $DynamicObjectRoot.get_children():
+		var oid := int(child.name.trim_prefix("Object_"))
+		if not live.has(oid):
+			child.queue_free()
+			_clear_object_debug(oid)
+
+
+func _update_object_debug(o: Dictionary) -> void:
+	var oid := int(o["id"])
+	var wire: MeshInstance3D = obj_wires.get(oid)
+	if wire == null:
+		wire = MeshInstance3D.new()
+		wire.mesh = ImmediateMesh.new()
+		wire.material_override = obj_wire_mat
+		$ObjectDebugRoot.add_child(wire)
+		obj_wires[oid] = wire
+	var box: AABB = o["aabb"]
+	var im: ImmediateMesh = wire.mesh
+	im.clear_surfaces()
+	im.surface_begin(Mesh.PRIMITIVE_LINES)
+	for e in BOX_EDGES:
+		im.surface_add_vertex(box.position + e[0] * box.size)
+		im.surface_add_vertex(box.position + e[1] * box.size)
+	im.surface_end()
+	var tag: Label3D = obj_tags.get(oid)
+	if tag == null:
+		tag = Label3D.new()
+		tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		tag.font_size = 48
+		tag.outline_size = 8
+		$ObjectDebugRoot.add_child(tag)
+		obj_tags[oid] = tag
+	tag.position = box.position + Vector3(box.size.x * 0.5,
+		box.size.y + 0.5, box.size.z * 0.5)
+	tag.text = "%s #%d a:%d e:%d s:%d" % [String(o["model"]), oid,
+		int(o["arena"]), int(o["enemy_index"]), int(o["spawn_id"])]
+
+
+func _clear_object_debug(oid: int) -> void:
+	if obj_wires.has(oid):
+		obj_wires[oid].queue_free()
+		obj_wires.erase(oid)
+	if obj_tags.has(oid):
+		obj_tags[oid].queue_free()
+		obj_tags.erase(oid)
 
 
 func _apply_camera_snapshot() -> void:
@@ -272,6 +469,17 @@ func _update_debug_label() -> void:
 	if p.is_empty():
 		return
 	var mp: Vector3 = p["pos_mdk"]
+	var dsp: Dictionary = bridge.get_display_snapshot()
+	var portal := ""
+	if not dsp.is_empty():
+		portal = ("\ncur %s(%d)  partner %s(%d)  active %s  " +
+			"portal->%d  crossed %d  migrated %d  objs %d") % [
+			String(dsp["cur_name"]), int(dsp["cur_arena"]),
+			String(dsp["partner_name"]), int(dsp["partner_arena"]),
+			dsp["partner_active"], int(dsp["portal_candidate"]),
+			int(dsp["portals_crossed"]),
+			int(dsp["object_migrations"]),
+			bridge.get_object_snapshots().size()]
 	$DebugUI/DebugLabel.text = (
 		"pos_mdk %.2f %.2f %.2f   yaw %.1f  pitch %.1f\n" %
 		[mp.x, mp.y, mp.z, p["yaw_deg"], p["pitch_deg"]] +
@@ -280,7 +488,7 @@ func _update_debug_label() -> void:
 		p["arena_display"]] +
 		"vel move %.2f  strafe %.2f  vert %.2f  turn %.2f" %
 		[p["move_vel"], p["strafe_vel"], p["vert_vel"],
-		p["turn_vel"]])
+		p["turn_vel"]] + portal)
 
 
 func _input_mask() -> int:
@@ -349,6 +557,12 @@ func _input(event: InputEvent) -> void:
 				get_tree().quit(0)
 		elif event.keycode == KEY_F1:
 			$CollisionDebug.visible = not $CollisionDebug.visible
+		elif event.keycode == KEY_F2:
+			obj_debug = not obj_debug
+			$ObjectDebugRoot.visible = obj_debug
+			if not obj_debug:
+				for oid in obj_wires.keys():
+					_clear_object_debug(oid)
 		elif event.keycode == KEY_F3:
 			$DebugUI.visible = not $DebugUI.visible
 
@@ -399,14 +613,14 @@ func _process(delta: float) -> void:
 		bridge.step_frame_input(delta * 1000.0, input)
 	_apply_player_snapshot()
 	_apply_camera_snapshot()
+	_apply_object_snapshots()
 	_update_debug_label()
-	# Rebuild the ordered mesh only when the BSP submission order
-	# actually changed (camera-dependent painter's order), or the
-	# core portal-swapped arenas (the digest changes either way).
-	var d = bridge.get_arena_order_digest()
-	if d != last_order_digest:
-		_apply_arena_snapshot()
-		_apply_collision_snapshot()
+	# Rebuild the presented arena set only when the display digest
+	# changes — a BSP-order change from camera movement, a portal
+	# swap, or a partner attach/detach all fold into it.
+	var d = bridge.get_display_digest()
+	if d != last_display_digest:
+		_apply_arena_snapshots()
 
 
 func _step_n(input: Dictionary, n: int, dt_ms: float = 33.333) -> Dictionary:
@@ -710,6 +924,14 @@ func _run_smoke(data_root: String) -> void:
 	ir = bridge.step_frame_input(0.0, {"mouse_buttons": 4})
 	_check(ir["input"]["sniper_pulse"] == false,
 		"sniper edge held -> no repeat")
+	# Unscope — the entry pulse above leaves the player scoped: the
+	# scope phases advance one per frame and a pulse arriving while
+	# ca0==0 is swallowed, so the held-check's second edge could not
+	# toggle back out. Idle lets the scope settle; a fresh edge then
+	# runs the proven manual-unscope branch (FUN_0046ca84 seam).
+	_step_n({}, 6)
+	_step_n({"mouse_buttons": 4}, 1)
+	_step_n({}, 6)
 	ir = bridge.step_frame_input(0.0, {"mouse_buttons": 8})
 	_check(not ir["input"]["fire"] and not ir["input"]["jump"] and
 		not ir["input"]["sniper_pulse"],
@@ -724,4 +946,251 @@ func _run_smoke(data_root: String) -> void:
 	_check(float(p4["yaw_deg"]) > yaw_a0 + 0.05,
 		"A turns left (yaw increases)")
 
+	# ---- G3: dynamic objects — the HMO_9 XGS (real spawn record,
+	# real RuntimeModel geometry). Diagnostic re-anchor mirrors
+	# mdk-inspect's --arena/--start selftest path.
+	var ds9: Dictionary = bridge.diagnostic_start(8,
+		Vector3(-174.0, 2635.0, -293.0), 0.0)
+	_check(ds9.get("ok", false), "diagnostic_start into HMO_9")
+	_step_n({}, 3)
+	var dsp9: Dictionary = bridge.get_display_snapshot()
+	_check(int(dsp9["cur_arena"]) == 8, "display cur == HMO_9")
+	var objs: Array = bridge.get_object_snapshots()
+	_check(objs.size() == 1, "HMO_9 enumerates 1 object")
+	if objs.size() == 1:
+		var o: Dictionary = objs[0]
+		_check(String(o["enemy_name"]) == "XGS",
+			"enemy-table name == XGS")
+		_check(String(o["model"]) == "XG_BOD",
+			"RuntimeModel name table == XG_BOD")
+		_check(int(o["enemy_index"]) == 30 and
+			int(o["spawn_id"]) == 9, "XGS enemy 30 spawn 9")
+		_check(int(o["arena"]) == 8, "object arena == 8")
+		_check(int(o["elem_count"]) == 25, "XGS elem_count == 25")
+		var oid := int(o["id"])
+		_check(oid > 0 and oid < 0x1000000,
+			"opaque object id (counter, not a pointer)")
+		var t0: Transform3D = o["transform"]
+		_check(abs(t0.basis.determinant() - 1.0) < 1e-3,
+			"object basis orthonormal")
+		var omp: Vector3 = o["pos_mdk"]
+		_check(omp.distance_to(Vector3(-174.0, 2635.0, -293.0)) < 0.5,
+			"XGS pos_mdk == spawn record")
+		# AABB conversion: godot min = (-maxy, minz, -maxx).
+		var ab: PackedFloat32Array = o["aabb_mdk"]
+		var ga: AABB = o["aabb"]
+		_check(abs(ga.position.x + ab[4]) < 1e-3 and
+			abs(ga.position.y - ab[2]) < 1e-3 and
+			abs(ga.position.z + ab[3]) < 1e-3,
+			"object AABB MDK->Godot")
+		# id + transform stability over idle frames.
+		_step_n({}, 5)
+		var o2: Dictionary = bridge.get_object_snapshots()[0]
+		_check(int(o2["id"]) == oid,
+			"object id stable across frames")
+		_check(Transform3D(o2["transform"]).is_equal_approx(t0),
+			"static object transform stable")
+		# Real RuntimeModel geometry — one surface per element.
+		var g: Dictionary = bridge.get_object_geometry(oid)
+		_check(not g.is_empty(), "object geometry resolved")
+		if not g.is_empty():
+			_check(int(g["elem_count"]) == 25,
+				"geometry elem_count == 25")
+			_check(int(g["vert_count"]) == int(o["vert_count"]) and
+				int(g["tri_count"]) == int(o["tri_count"]),
+				"geometry counts == snapshot counts")
+			_check(int(g["geom_key"]) == int(o["geom_key"]),
+				"geom_key == snapshot key")
+			var gm: ArrayMesh = g["mesh"]
+			_check(gm != null and gm.get_surface_count() ==
+				PackedInt32Array(g["surface_elems"]).size(),
+				"mesh surfaces == surface_elems")
+			print("first_model=%s elems=%d verts=%d tris=%d" % [
+				String(g["model"]), int(g["elem_count"]),
+				int(g["vert_count"]), int(g["tri_count"])])
+		# Presentation node mirrors the snapshot transform.
+		_apply_object_snapshots()
+		var onode := $DynamicObjectRoot.get_node_or_null(
+			"Object_%d" % oid)
+		_check(onode != null, "Object_<id> node exists")
+		if onode != null:
+			_check(onode.transform.is_equal_approx(t0),
+				"object node transform == snapshot")
+			_check(onode.get_child_count() ==
+				PackedInt32Array(g["surface_elems"]).size(),
+				"object node has per-element meshes")
+		# Stale/unknown ids resolve to nothing — never an alias.
+		_check(bridge.get_object_geometry(0).is_empty() and
+			bridge.get_object_geometry(999999).is_empty(),
+			"stale/unknown ids -> empty geometry")
+		# F2 object debug — AABB wire + label per object.
+		obj_debug = true
+		_apply_object_snapshots()
+		_check(obj_wires.has(oid) and obj_tags.has(oid),
+			"object debug wire+tag created")
+		obj_debug = false
+		_clear_object_debug(oid)
+		_check(not obj_wires.has(oid) and not obj_tags.has(oid),
+			"object debug cleared")
+		# Element-disable mask: XGS mask is 0 -> every element shows.
+		for c in onode.get_children():
+			_check(c.visible,
+				"elem_mask=0 -> all elements visible")
+
+	# ---- G3: corridor door + portal crossing + arena transfer ----
+	# CHMO_2 has no MTO render block — the partner's geometry carries
+	# the view while its script-spawned XCORDOOR door presents from
+	# the corridor's own object list. Walking +y crosses the proven
+	# y=1237 portal into HMO_3 (arena 11 -> 2). OBSERVED on this
+	# route: the door stays homed on CHMO_2 — the +0x2bc
+	# self-migration needs its home arena in the update set, which
+	# the partner slot no longer provides after the crossing — so
+	# the corridor's objects simply leave the presentation view.
+	var ds11: Dictionary = bridge.diagnostic_start(11,
+		Vector3(3.0, 1230.0, -929.0), 90.0)
+	_check(ds11.get("ok", false), "diagnostic_start into CHMO_2")
+	var door_id := int(-1)
+	var door_arena0 := -1
+	var door_states := {}
+	var door_id_stable := true
+	var corridor_checked := false
+	var crossed := false
+	var dspc: Dictionary = bridge.get_display_snapshot()
+	for i in 90:
+		_step_n({"actions": ACT_FORWARD}, 1)
+		dspc = bridge.get_display_snapshot()
+		for od in bridge.get_object_snapshots():
+			if bool(od["connector"]):
+				if door_id < 0:
+					door_id = int(od["id"])
+				elif int(od["id"]) != door_id:
+					door_id_stable = false
+				if door_arena0 < 0:
+					door_arena0 = int(od["arena"])
+				door_states[int(od["conn_state"])] = true
+		if int(dspc["cur_arena"]) == 11 and not corridor_checked:
+			corridor_checked = true
+			_check(int(dspc["primary"]) != 11,
+				"corridor cur -> partner geometry displayed")
+		if int(dspc["cur_arena"]) == 2:
+			crossed = true
+			break
+	_check(door_id >= 0, "connector door enumerated (XCORDOOR)")
+	_check(door_arena0 == 11, "door starts on corridor list")
+	_check(door_id_stable, "door id stable while enumerated")
+	_check(door_states.size() >= 2, "door conn_state transitions")
+	if crossed:
+		_check(int(dspc["portals_crossed"]) >= 1,
+			"portal crossing counted")
+		# Post-crossing view: cur==HMO_3 and CHMO_2 is no longer the
+		# active partner, so the corridor's object list leaves the
+		# presentation set — the door must not alias onto a new id.
+		for od in bridge.get_object_snapshots():
+			_check(int(od["id"]) != door_id or int(od["arena"]) == 11,
+				"door id never aliases another arena")
+		print("  note: object_migrations=%d (door stays homed on CHMO_2)" %
+			int(dspc["object_migrations"]))
+	else:
+		_check(false, "player crossed CHMO_2 -> HMO_3 portal")
+	# Object presentation survives the arena hops without dupes.
+	_apply_object_snapshots()
+	var seen_ids := {}
+	var dupes := false
+	for od in bridge.get_object_snapshots():
+		var k := int(od["id"])
+		if seen_ids.has(k):
+			dupes = true
+		seen_ids[k] = true
+	_check(not dupes, "no duplicate object ids in snapshot")
+
 	print("smoke: %d failure(s)" % failures)
+
+
+func _run_smoke_generic(level: String, arena: String) -> void:
+	# Cross-level object/display smoke — no golden numbers; verifies
+	# the enumeration contract on whatever the spawn/--start view
+	# holds (used for LEVEL6/LEVEL8 and diagnostic starts).
+	print("smoke(generic): level=%s arena=%s" % [level, arena])
+	_check(bridge.is_level_loaded(), "level loaded")
+	_check(bridge.get_arena_names().size() > 0, "arena count > 0")
+	var dsp: Dictionary = bridge.get_display_snapshot()
+	_check(not dsp.is_empty(), "display snapshot non-empty")
+	_check(int(dsp["cur_arena"]) >= 0, "current arena resolved")
+	var objs0: Array = bridge.get_object_snapshots()
+	var ids := {}
+	for o in objs0:
+		_check(int(o["id"]) > 0 and int(o["id"]) < 0x10000000,
+			"opaque object id (counter, not a pointer)")
+		_check(o.has("transform") and o.has("aabb") and
+			o.has("elem_count"), "object dict shape")
+		ids[int(o["id"])] = true
+	_step_n({}, 5)
+	var objs1: Array = bridge.get_object_snapshots()
+	for oid in ids.keys():
+		var still := false
+		for o in objs1:
+			if int(o["id"]) == oid:
+				still = true
+		_check(still, "object id %d persists across frames" % oid)
+	for o in objs1:
+		var g: Dictionary = bridge.get_object_geometry(int(o["id"]))
+		_check(not g.is_empty(), "geometry resolves for live id")
+		if not g.is_empty():
+			_check(int(g["geom_key"]) == int(o["geom_key"]),
+				"geom key == snapshot key")
+		var t: Transform3D = o["transform"]
+		_check(abs(t.basis.determinant()) > 1e-6,
+			"object basis non-degenerate")
+	# Element-disable mask — when a masked object is present (e.g.
+	# SW_DUMMY), its masked children must be hidden in the node.
+	_apply_object_snapshots()
+	for o in objs1:
+		var mask := int(o["elem_mask"])
+		if mask == 0:
+			continue
+		var mn := $DynamicObjectRoot.get_node_or_null(
+			"Object_%d" % int(o["id"]))
+		if mn != null:
+			for c in mn.get_children():
+				var e := int(c.get_meta("elem"))
+				_check(c.visible == ((mask & (1 << e)) == 0),
+					"elem_mask bit %d -> child visibility" % e)
+	# Object nodes exist for every live id after an apply.
+	_apply_object_snapshots()
+	for o in objs1:
+		var n := $DynamicObjectRoot.get_node_or_null(
+			"Object_%d" % int(o["id"]))
+		_check(n != null, "Object node for id %d" % int(o["id"]))
+		if n != null:
+			_check(n.transform.is_equal_approx(o["transform"]),
+				"object node transform == snapshot")
+	# Mover watch — type-4 flags14a&0x20 objects get their transform
+	# rebuilt by the core each frame (FUN_0045612c in the update
+	# pass); whether they visibly move is the driving script's seam.
+	# Whatever the core transform does, the node must mirror it.
+	var movers := {}
+	for o in objs1:
+		if bool(o["mover"]):
+			movers[int(o["id"])] = o["transform"]
+	if not movers.is_empty():
+		_step_n({}, 20)
+		var moved := 0
+		for o in bridge.get_object_snapshots():
+			var k := int(o["id"])
+			if movers.has(k):
+				if not Transform3D(o["transform"]).is_equal_approx(
+						movers[k]):
+					moved += 1
+		print("  movers: %d watched, %d transform-changed" %
+			[movers.size(), moved])
+		_apply_object_snapshots()
+		for o in bridge.get_object_snapshots():
+			var k := int(o["id"])
+			if movers.has(k):
+				var n := $DynamicObjectRoot.get_node_or_null(
+					"Object_%d" % k)
+				_check(n != null and
+					n.transform.is_equal_approx(o["transform"]),
+					"mover node transform == core snapshot")
+	print("smoke(generic): %d object(s) enumerated, %d failure(s)" %
+		[objs1.size(), failures])

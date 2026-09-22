@@ -62,4 +62,15 @@ inline AABB mdkToGodotAabb(const float box6[6]) {
                       a.max.z - a.min.z));
 }
 
+// Phase 9 (G3) — a full MDK object transform (row-major 3x3 +
+// origin) -> the Godot Transform3D the object's Node3D should
+// carry. The conversion is P*M*P^T inside mdk_math.h; local model
+// verts are P-converted in object_presenter.cpp, so the composite
+// reproduces P * world_mdk exactly.
+inline Transform3D mdkToGodotObjectTransform(
+    const mdkfront::MdkTransform& t) {
+  return Transform3D(mdkToGodotBasis(t.basis),
+                     Vector3(t.origin.x, t.origin.y, t.origin.z));
+}
+
 }  // namespace godot
