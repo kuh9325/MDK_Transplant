@@ -2959,16 +2959,21 @@ disassembly + decompile of `MDK95.EXE` unless tagged otherwise.
   `elemMaskB +0x2c8`, `elements +0x0c` (stride `0x5c`, element
   `aabb +0x44`), `objects +0x68`.
 - Cone test (`FUN_004337ac`): `d = center − aimPt`,
-  `dist1 = diag < 140 ? 10 : diag`, `reach = dist1 − 2`,
-  `score = dx² + dy² + 20·dz²`, `coneLimit = (dist1+90)·360 /
-  (dist1+90+dist2)`, accept `rel <= cone || rel >= 360 − cone`.
+  `dist1 = diag < 10 ? 10 : diag` (`0x4973cc`), reach
+  `dist2 <= dist1 + 140` (`0x4973d0`), `score = dx² + dy² + 4·dz²`
+  (`0x4973e0`), `cone = (dist1−2)·90 / (dist1−2+dist2)`
+  (`0x4973d4`/`0x4973d8`, OBSERVED `fdivrp` order), accept
+  `rel <= cone || rel >= 360 − cone`.
   `bestScore = −1.0` sentinel accepts the first candidate
-  (nearest-tracking). Occlusion stab on `cur`, partner gated on
-  `carrierBusy == 0`.
-- Hit: `field21e = 0xff`, `punchHitTime += frameStep`; damage/
-  knockback stay deferred seams (`punchHitCalls`). Miss stab:
-  `missPt = {pos.x + cos(yaw)·40, pos.y + sin(yaw)·40, aimPt.z}`
-  (`0x4973c0`), current arena then partner (gated `carrierBusy == 0`).
+  (nearest-tracking, `score <= best || best < 0`). Occlusion stab
+  on `cur`, partner gated on `carrier != 0 && carrierBusy == 0`.
+  (Phase 10A re-verified these constants instruction-level; the
+  values listed in the Phase 5N draft of this section were wrong.)
+- Hit: `field21e = 0xff`, `punchHitTime += frameStep`; the full
+  damage/knockback/kill tail is ported in Phase 10A (§133+).
+  Miss stab: `missPt = {pos.x + cos(yaw)·150, pos.y + sin(yaw)·150,
+  aimPt.z}` (`0x4973c0`), current arena then partner (gated
+  `carrier != 0 && carrierBusy == 0`).
 
 ## 128. Selector + cadence + fire latch (OBSERVED, ported)
 
@@ -3041,3 +3046,213 @@ disassembly + decompile of `MDK95.EXE` unless tagged otherwise.
 - The fire transaction is a **state/mutation reconstruction**, not
   a rendered projectile sim — shots enter the pool with correct
   fields but nothing integrates their motion or impact yet.
+  (Projectile world flight, impact, splash damage, and the
+  damage/death boundary are ported in Phase 10A — §133+.)
+
+## 133. Shot pool + per-slot update — `FUN_0045f9b8` (OBSERVED, ported)
+
+- Pool: three `0xfc`-stride `PlayerShot` records at `0x540ed4`.
+  Layout: `+0x00 state` (0 free / 1 flight / 2 kill / 3
+  hit-survived / 4 wall|expire|killz / 5 detonated),
+  `+0x04 yawDeg +0x08 pitchDeg +0x0c spinDeg`, `+0x10 lifetime`
+  and `+0x14 dyingTimer` in `frameStep` units, `+0x18 arena`,
+  `+0x1c classIdx` (`0x4edd48` default record, native `−1`),
+  `+0x20 pos`, `+0xbc tailLen`, `+0xc0..c8 tail`,
+  `+0xcc fieldCc`, `+0xd0 type`, `+0xd4 flyKind`,
+  `+0xd8 homeObj +0xdc homeElem +0xe0 homeElemIdx`,
+  `+0xe4 speedH`, `+0xe8 yawAccum`, `+0xf0 speedV` (type 4),
+  `+0xf4 remnantIdx`, `+0xf8 flags` (bit0 = ribbon-bound).
+- Head: `state > 1 && +0x14 > 0` → dying branch —
+  `+0x10 > 0`: `+0x10 -= frameStep`; type ∉ {4,2,3}:
+  `tailLen -= 5·dt` + tail rebuild (NO clamp on shrink).
+  `+0x14 -= frameStep`; `<= 0` → `state = 0` release. Return.
+  A stale `state > 1` shot with `+0x14 <= 0` **falls through to
+  flight** — the stale-state quirk is preserved.
+- The pool tick sits at the **tail of every `FUN_004572ac`
+  arena update** — once per arena invocation, so the same pool
+  ticks twice per frame while a partner arena is active.
+- Timing split: `+0x10`/`+0x14`/tail-shrink use integer
+  `frameStep`; all flight integration uses the fixed `1/30 s`
+  tick constant (`0x49b6f4`, never written — OBSERVED);
+  the ribbon parameter uses smoothed frame units (`0x49b6f0`).
+
+## 134. Flight callbacks (OBSERVED, ported)
+
+- Tracer `FUN_004601d4` (types 0/1): `pos += sH·dt·dir`,
+  `dir = {cosY·cosP, sinY·cosP, −sinP}`; `tailLen += 10·dt`
+  cap 10; `fieldCc −= 0.5·dt` floor 1.0; tail rebuild.
+- Homing `FUN_004602d8`/`FUN_00460424` (types 2/3): while
+  `homeObj && +0x10 <= 233`: `named == 0 → homeObj = 0`;
+  element masked in `+0x2c8` bit `homeElemIdx → homeElem = 0`;
+  target = element or object AABB centre (`(min+max)·0.5`).
+  Steering: `yawErr = norm180(bearing − yaw)`; accumulator
+  `+0xe8` resets on reversal/zero, `±540·dt` rate, `±270` cap;
+  `yaw += clamp(e8·dt, err)`; `pitchErr = norm180(360 −
+  bearing(dz, hDist) − pitch)`; `pitch += clamp(err, ±120·dt)`;
+  `hDist == 0 → 1` substitution. Speed target `err <= 35 → 250`
+  else 100, eased `−500·dt`/`+200·dt`; then the tracer step.
+- Lobbed `FUN_004608bc` (type 4): `t = |sV| + sH`; `t == 0 → 1`;
+  `sH -= t·60·dt` floor 0; `sV > 0 → sV -= (1−t)·60·dt` floor 0;
+  `sV -= 32·dt` floor −220. Volume query
+  (`surfaceVolumeQuery`, mask 4, vel `{0,0,sV}`) on cur then
+  partner (`ca4 && !d3c`): hit → `sH *= 0.25`, `sV = outVec.z`.
+  `pos += {sH·dt·cosY, sH·dt·sinY, sV·dt}`; tail fields as tracer.
+- Ribbon `FUN_0046075c` (`+0xf8 & 1`): `+0xe4 += smoothed`;
+  cubic Hermite over `0x28`-stride keys `{frame, pos, tanIn,
+  tanOut.xy}` (`FUN_00456bc8`, standard
+  `p0 + m0·u + A·u² + B·u³`); `pos = eval(u)`; `+0x10 = 99`
+  while `u < lastKey − 1` else 0; tail extends away from the
+  player, `z += tailLen·0.25`; `hDist == 0 → 1`. Ribbon-bound
+  shots **skip collision and the object scan entirely**.
+- Binder `FUN_00460860`: `flyKind = ribbon`, `+0xe0 = pathRec`,
+  `+0xe4 = 0`, `+0xf8 |= 1` (`+0xe0`/`+0xe4` alias
+  `homeElemIdx`/`speedH` while bound).
+
+## 135. Impact + collision dispatch (OBSERVED, ported)
+
+- Object scan (non-ribbon): cur arena objects, then partner
+  gated `ca8 && ca4 && !d3c`; gates `named && model &&
+  !(flags148 & (0x10|0x20))` — **no `excludeObj` gate**
+  (OBSERVED). `segAabbOverlap(prev, pos, aabb, ext=0)` then
+  `objectProbe` with `end = shot.pos` writeback (nearest wins
+  by shortening); `hitElem >= 0` records `hitObj`/`hitElem`/
+  `hitTri`.
+- Type 4: `collisionSweep` (ext `{0.5}³`, flag 0, cb 0) cur
+  then partner (`ca4 && !d3c`). On poly: `0x49b8e4 = shot`;
+  `surfaceDispatch(ch1, sec 0, {ev=type, vecA=hitPt, posB=pos,
+  contactPos=prevPos})`; `ret & 2 → restH/restV = 1.05/1.25`
+  else 1.75. Bounce: `vel −= n·(vel·n)·rest` (z uses `restV`),
+  `pos = hitPt`, `speedV = vel.z` (`0 < v < 4 → 0`),
+  `speedH = |vel.xy|` (`sH > 0 && != 0 → yaw = bearing(vel)`),
+  settle `+0x10 > 15 && sH < 0.5 && sV < 1 → +0x10 = 15`.
+- Types 0–3: `collisionStab` (cur then partner). On node:
+  `hitPt += n·sign(prevPos·n + d)·1.0`; `FUN_00460164` →
+  `surfaceDispatch(ch1, sec = type 0/1 ? 8 : 0)`; types 0/1 →
+  state 4 (`+0x10 = 0, +0x14 = 30, +0xf4 = 0`); types 2/3 →
+  `pos = hitPt`; `detonate(150, r 25, direct 0)`.
+- Shared tail: `+0x10 -= frameStep`; `type4 && +0x10 <= 0 →
+  detonate(150, r 50, hitObj)`; `pos.z < arena+0x44e
+  (deepFloorZ) || +0x10 <= 0` → state 4. Object-hit dispatch:
+  type ≥ 2 → `detonate(150, r = type4 ? 50 : 25, hitObj)` then
+  marks `+0x21e <= 0 → +0x21e = +0x21c = elem+1, +0x21d = type;
+  +0x210.. = pos; +0x220 = tri; +0x224 = yaw; +0x228 = pitch`.
+  Types 0/1: `+0x21e = 0xfe; +0x21d = type; +0x21c = elem+1;
+  +0x210.. = pos; +0x220 = tri; +0x224 = yaw; +0x228 = pitch;
+  health -= 8 (gate < 0xfde8); 0x540e84++`; survived → fx seam
+  + state 3; killed → `killTally` + `death` + state 2;
+  `+0x10 = 30; +0x14 = 45; +0xf4 = 0; +0xbc = 15` + tail
+  rebuild. No-hit tail: `type != 4 → +0x0c += 720·dt`.
+
+## 136. Detonation + splash — `FUN_00460b7c`/`00460d44`/`00460c08` (OBSERVED, ported)
+
+- `detonate(shot, dmg, radius, directObj)`: `dmg44(flags 6,
+  dmg, directObj)` then `dmg44(flags 1, round(dmg·0.5))` →
+  remnant + sound seams → `state 5, +0x10 = +0x14 = 30,
+  +0xf4 = 0`.
+- Falloff `FUN_00460c08`: `dist = dist3(centre, blast)`;
+  `effR = 0.5·diag`; occlusion stab cur + partner (`!d3c`)
+  forces out-of-range on the same-surface substitution;
+  `dmg = round(scale·(range−aux)/range)` clamp ≥ 0 —
+  `fdivrp` order and `frndint` (round-half-even) conversion,
+  NOT truncation (corrected during Phase 10A verification).
+- `dmg44(blast, dmgScale, range, tallyGate, directObj, flags,
+  exclMask)`: `flags & 2` objects (cur then partner
+  `ca8 && ca4`, NO `d3c`): standable (`f149 & 0x20`) element
+  pass (`elemMaskB` skip, name predicate, best-dmg tracking)
+  applies **16-bit** `elemHp[e] -= dmg` (wraps before the
+  sign test — OBSERVED `sub word`), `<= 0 → hp 0,
+  deadElem = e+1 (+0x21c), +0x220 = 0`; `directObj == o` →
+  full `dmgScale` at the AABB centre, `aux = 0`; whole-object
+  falloff `aux <= +0x2c4` (default 1000.0) gates application;
+  marks `+0x21e = bestElem+1 (0xfe init), +0x21d = exclMask,
+  +0x210.. = hitPt, +0x228 = 0, +0x224 = bearing`; killed →
+  `tallyGate ? killTally : death(obj, hitPt, bearing+180)`.
+- `flags & 1` player: `d2 = dist²(playerPos+1z, blast)`; cur
+  stab hit → occluded out; `dist = √d2·2`; `dmg =
+  round(scale·(range−dist)/range)` cap 15 → `playerDamage`;
+  `landingAccum *= 2.0`. Partner stab gated on cur miss.
+- `flags & 4` polys (cur then partner `ca8 && ca4`, NO `d3c`):
+  surface mask from arena `+0x6c` byte set | `+0x8c` dword set;
+  per-poly centroid `≤ range²`; same-surface occlusion →
+  partner retry; `dmg = round(falloff)`; `surfaceDispatch`
+  `(ch = dmg != 0 ? 3 : 4, sec = dmg, {ev −7, vecA = contact,
+  posB = contact, contactPos = blast})`; surface bit cleared
+  once fired.
+
+## 137. Damage + death boundary (OBSERVED, ported)
+
+- `playerDamageApply` (`FUN_0046771c`): `health == 0 && gate`
+  return; suppress `fieldE10 > 0 || locoState ∈ {0x326, 0x385,
+  0x3ea} || fieldEb8 == 1` → `landingAccum = 0`, return.
+  `diff 0: dmg = 2d/3 min 1; diff 2: 2d`; `fieldDac += dmg·25`
+  clamp `[75, 180]`; mount path (`excludeObj && mountClass & 1`):
+  `m->hp -= dmg` (gate `< 0xfde8`), `<= 0` → mount death; else
+  `playerHp -= dmg` floor 0, `landingAccum += dmg`.
+- `objectKillTally` (`FUN_0042ac90`): `gate != 0 → 0x540e90++`
+  (the 34-name class table stays a counted seam).
+- `objectDeathBoundary` (`FUN_00458140`): `+0x110 != 0` → script
+  handoff `field11e = 0; +0x08 = 0; +0x22c = 0;
+  flags148 |= 0x20; +0x108 = +0x230 = +0x110; +0x110 = 0`;
+  else `FUN_00457cf4` teardown seam — remnant spawn
+  (`FUN_004575fc`), wipe (`FUN_0045828c` memset keeping
+  next/arena), global-ref clears (`excludeObj` → clear +
+  50 `playerDamage`; `lastObjContact` → clear).
+- `objectDieFacingPlayer` (`FUN_004581a4`): `facing =
+  bearing(player − obj) + 180` — the `+180` lives in the
+  callers/callee, applied once (`hitPt = obj.pos + {0,0,3}`).
+
+## 138. Punch damage/death tail (OBSERVED, ported)
+
+- `FUN_00432f84` now shares the damage/death boundary:
+  charged `dmg = frameStep·6`, state `−2`; uncharged
+  `frameStep`, `−1`.
+- Whole-object hit: `punchHitTime += frameStep`; `hp -= dmg`
+  (gate `< 0xfde8`); `+0x21d = state, +0x228 = 0,
+  +0x224 = bearing` gated `+0x21e == 0xff`. `hp <= 0` →
+  `killTally(obj, charged)` → charged displacement
+  `pos += {20·cos(yaw), 20·sin(yaw)}` on `+0x28`/`+0x2c` →
+  `death(obj, hitPos, bearing + 180)`.
+- Survived: element hits knock back on the **world** element
+  AABB (stride 92), whole-object on `col.aabb` —
+  `hitPt −= dir·0.5·extent`; `+0x2a2 <= 900` (unsigned word)
+  → `eventTimerObj = obj, eventTimer = 1.0`; fx seam.
+- Element hit: `+0x21e = 0xff` set at hit-select; **16-bit**
+  `elemHp[e] -= dmg` (wrap before sign test, same quirk as
+  splash); `<= 0 → hp 0, +0x21d = 0, +0x220 = 0,
+  +0x21e = +0x21c = e+1, +0x224 = bearing, +0x228 = 0`, then
+  **falls through to whole-object damage** (OBSERVED quirk).
+- Element latch `+0x31e <= 900` → pseudo-object `eventLatch`
+  (`+0x08` gets post-decrement `elemHp[e]` via `+0x30c>>16`).
+- Miss: 150-unit stab (`0x4973c0`), wall → `surfaceDispatch`
+  `(ch2, sec = dmg, {ev = state, vecA = missPt, posB = aimPt,
+  contactPos = hitPt})`; handler ran → fx seam ch1 count 2.
+
+## 139. Runtime integration + validation (OBSERVED, ported)
+
+- `src/core/player_projectiles.cpp`/`.h` — `playerShotPoolTick`,
+  `playerDamageApply`, `objectKillTally`, `objectDeathBoundary`,
+  `objectDieFacingPlayer`, `splashDamage`; `player_fire.cpp`
+  includes the shared header so the punch calls the same
+  boundary.
+- `traversal_runtime.cpp` — `playerShotPoolTick` at each
+  `FUN_004572ac` arena tail (double-tick with partner);
+  `fieldB85c` latch inside the named-object loop on
+  `field07 == 1`; per-frame `eventTimer` decay (cleared when
+  the latched object loses `named`), `fieldD2c -= frameStep`,
+  `fieldE10 -= 1/30`.
+- `collision_query` gains `collisionStabFull` (hit polygon out)
+  and `collisionObjectProbe` (object-local segment probe with
+  `end` writeback); `DynamicObject` gains `field28`/`field2c`
+  (corpse displacement), `field150`, `elemThresh` (+0x31e);
+  `TraversalArena` gains the `eventLatch` pseudo-object;
+  `TraversalRuntime` gains `fieldD2c`/`fieldB85c`.
+- `mdk_tests`: **3882 checks / 0 failures** — the
+  `test_player_projectiles` suite covers the pool head/dying
+  branch, stale-state re-flight, tracer flight fields, lifetime/
+  kill-floor state 4, type-4 detonate, wall dispatch, object-hit
+  survived/killed marks, player-damage gates/scaling, tally and
+  death boundary, the int16 element wrap, splash falloff/occlusion,
+  the punch element→whole fallthrough, and the partner double tick.
+- Remaining seams: `FUN_0045f030` shot render, `FUN_004575fc`
+  remnant spawn, `FUN_00437444`/fx callsites, sound calls,
+  the 34-name tally table — counted, not ported.

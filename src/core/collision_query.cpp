@@ -542,6 +542,14 @@ int collisionSegAabbResolve(const float* start, const float* target,
 const CollisionNode* collisionStab(const CollisionArena& arena,
                                    const float* from, const float* to,
                                    float* outPos) {
+  return collisionStabFull(arena, from, to, outPos, nullptr);
+}
+
+const CollisionNode* collisionStabFull(const CollisionArena& arena,
+                                       const float* from, const float* to,
+                                       float* outPos,
+                                       const CollisionPoly** outPoly) {
+  if (outPoly) *outPoly = nullptr;
   if (!arena.verts || !arena.nodes) return nullptr;
   StabState s;
   s.verts = arena.verts;
@@ -553,8 +561,19 @@ const CollisionNode* collisionStab(const CollisionArena& arena,
   s.hitPoly = nullptr;
   s.hitNode = nullptr;
   const CollisionNode* r = stabWalk(s, arena.nodes);
-  if (r) std::memcpy(outPos, s.hitPt, 3 * sizeof(float));
+  if (r) {
+    std::memcpy(outPos, s.hitPt, 3 * sizeof(float));
+    if (outPoly) *outPoly = s.hitPoly;
+  }
   return r;
+}
+
+// FUN_004138d8 export — same body as the file-local floor-probe
+// helper; kept under one implementation so both callers share the
+// original's local-frame tri scan + end-point writeback.
+void collisionObjectProbe(const CollisionObject* obj, const float* start,
+                          float* end, int* outElem, int* outTri) {
+  objectProbe(obj, start, end, outElem, outTri);
 }
 
 namespace {

@@ -11,6 +11,7 @@
 
 #include "core/collision_query.h"
 #include "core/dynamic_objects.h"
+#include "core/player_projectiles.h"
 #include "core/traversal_runtime.h"
 
 namespace mdk {
@@ -18,15 +19,18 @@ namespace {
 
 constexpr double kDegToRad = 0.017453292519943276;  // 0x497924
 constexpr double kRadToDeg = 57.295779513082323;    // 0x497914
-constexpr float kConeFloor = 140.0f;                // 0x4973cc
-constexpr float kConeReach = -2.0f;                 // 0x4973d0
-constexpr float kConeBase = 90.0f;                  // 0x4973d4
-constexpr float kConeWrap = 360.0f;                 // 0x4973d8 / 0x4973dc
-constexpr float kConeZWeight = 20.0f;               // 0x4973e0
-constexpr float kConeScoreFloor = 10.0f;            // (dist1 floor)
+constexpr float kDiagFloor = 10.0f;                 // 0x4973cc — dist1 floor
+constexpr float kConeReach = 140.0f;                // 0x4973d0 — reach add
+constexpr float kConeBase = -2.0f;                  // 0x4973d4 — dist1 bias
+constexpr float kConeScale = 90.0f;                 // 0x4973d8 — cone factor
+constexpr float kConeWrap = 360.0f;                 // 0x4973dc / 0x4973e4
+constexpr float kConeZWeight = 4.0f;                // 0x4973e0
 constexpr float kHomeRayLen = 10000.0f;             // 0x4984f0
-constexpr float kMissRayLen = 40.0f;                // 0x4973c0
+constexpr float kMissRayLen = 150.0f;               // 0x4973c0
 constexpr float kAimZBias = 5.0f;                   // 0x4973b0
+constexpr float kKillPush = 20.0f;                  // 0x4973c4 — corpse push
+constexpr float kKillFacing = 180.0f;               // 0x4973c8 — death face
+constexpr int kLatchThresh = 0x384;                 // 900 — event-latch arm
 constexpr float kClipInit = 1.1f;                   // 0x4982b0
 constexpr int kShotPoolSize = 3;                    // 0x540ed4 slots
 constexpr float kCadenceAdopt = 3.0f;               // 0x497900
@@ -176,7 +180,7 @@ float punchConeTest(const float* aabb, const float* center, float bestScore,
                     float* stabOut, const float* aimPt, float* outBearing,
                     const TraversalRuntime& rt) {
   const float diag = dist3(aabb, aabb + 3);   // min->max diagonal
-  const float dist1 = (diag < kConeFloor) ? kConeScoreFloor : diag;
+  const float dist1 = (diag < kDiagFloor) ? kDiagFloor : diag;
   const float dist2 = dist3(aimPt, center);   // aim->center
   if (!(dist2 <= dist1 + kConeReach)) return -1.0f;
   const float dx = center[0] - aimPt[0];
@@ -186,7 +190,9 @@ float punchConeTest(const float* aabb, const float* center, float bestScore,
   float rel = bearing - rt.motion.yawDeg;      // vs 0x540c2c
   while (rel < 0.0f) rel += kConeWrap;
   while (rel >= kConeWrap) rel -= kConeWrap;
-  const float cone = (dist1 + kConeBase) * kConeWrap / (dist1 + kConeBase + dist2);
+  // cone = (dist1-2)*90 / (dist1-2+dist2) — OBSERVED fdivrp order.
+  const float coneBase = dist1 + kConeBase;
+  const float cone = coneBase * kConeScale / (coneBase + dist2);
   if (!(rel <= cone || kConeWrap - cone <= rel)) return -1.0f;
   const float dz = center[2] - rt.cs.pos[2];   // center.z - 0x540c04
   const float score = dy * dy + dx * dx + dz * kConeZWeight * dz;
@@ -420,8 +426,8 @@ void playerWeaponSelect(TraversalRuntime& rt,
 
 // ---------------------------------------------------------------------------
 // FUN_00432f84 — the normal-mode punch hitscan. `frameStep` is
-// timing.frameStep (0x49b6e8). Bounded to the scan + the +0x21e mark;
-// the damage tail and the impact effects are counted seams.
+// timing.frameStep (0x49b6e8). Phase 10A: the full damage/death tail
+// is ported (shared boundary with player_projectiles).
 // ---------------------------------------------------------------------------
 
 void playerPunch(TraversalRuntime& rt, int frameStep) {
@@ -438,27 +444,31 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
   const float aimPt[3] = {rt.cs.pos[0], rt.cs.pos[1],
                           rt.cs.pos[2] + kAimZBias};
 
-  // Charge drain — ammo[0] doubles as the punch-charge resource.
+  // Charge drain — ammo[0] doubles as the punch-charge resource;
+  // `charged` latches the pre-drain state (the kill tally's gate).
   int punchStep;
   int punchState;
+  int charged;
   if (rt.ammo[0] < 1) {
+    charged = 0;
     punchStep = frameStep;
     punchState = -1;
   } else {
+    charged = 1;
     rt.ammo[0] -= frameStep;
-    if (rt.ammo[0] < 1) {
+    if (rt.ammo[0] <= 0) {
       // Reload — the original scans the 0x54155c inventory table for a
       // type-6 entry and calls FUN_0046a3d8 on it; the inventory isn't
       // modelled, so the scan finds nothing and that call never fires.
-      // ammo[0] = 0 and the FUN_00469668(1) notify are unconditional.
+      // ammo[0] = 0 and the FUN_00469668(1) notify are unconditional;
+      // the charged punch still runs this frame (OBSERVED).
       rt.ammo[0] = 0;
       ++rt.seams.fireNotifyCalls;
     }
     punchStep = frameStep * 6;
     punchState = -2;
   }
-  rt.punchTime += punchStep;
-  (void)punchState;   // carried for the deferred damage tail
+  rt.punchTime += punchStep;   // 0x540e78 += dmg (both branches)
 
   float stabOut[3], bearing = 0.0f;
   // Two-arena scan — cur always, then partner iff (ca8 && ca4).
@@ -533,33 +543,145 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
       }
     }
   }
-  (void)bestElem; (void)bestBearing; (void)bestCenter;
-
   if (bestObj != nullptr) {
-    // Hit — the +0x21e mark and the hit-time accumulator are the
-    // observable writes; the damage/knockback/death tail is deferred.
-    bestObj->field21e = 0xff;
-    rt.punchHitTime += frameStep;
+    // Hit — FUN_00432f84's damage/death tail (OBSERVED ordering:
+    // +0x21e = 0xff latches first; element hits damage the int16 pool
+    // AND fall through to the whole-object damage; the +0x21e == -1
+    // (signed) gate suppresses the state marks when an element death
+    // already wrote them).
+    DynamicObject& obj = *bestObj;
     ++rt.seams.punchHitCalls;
+    obj.field21e = 0xff;
+    if (bestElem >= 0) {
+      // Element damage — the +0x30e+2e int16 pool; `sub word` wraps
+      // on underflow before the sign test (OBSERVED), then clamps.
+      if (bestElem < static_cast<int>(obj.elemHp.size())) {
+        std::int16_t v = static_cast<std::int16_t>(
+            obj.elemHp[bestElem] -
+            static_cast<std::int16_t>(punchStep));
+        if (v <= 0) {
+          // Element death — the death marks, then the whole-object
+          // damage still runs (the +0x21e = e+1 write closes the
+          // -1 gate below).
+          v = 0;
+          obj.field21d = 0;
+          obj.field220 = 0;
+          obj.field21e = obj.field21c =
+              static_cast<std::uint8_t>(bestElem + 1);
+          obj.field224 = bestBearing;
+          obj.field228 = 0.0f;
+        }
+        obj.elemHp[bestElem] = static_cast<std::int16_t>(v);
+      }
+      // The event latch — elemThresh[e] <= 900 plants the arena's
+      // +0x118 pseudo-object (named=1, health=elemHp[e] post-write,
+      // +0x2a2=elemThresh[e]) into 0x540eb4 and arms 0x540eb0 = 1.0.
+      if (bestElem < static_cast<int>(obj.elemThresh.size()) &&
+          obj.elemThresh[bestElem] <= kLatchThresh &&
+          obj.arena != nullptr && obj.arena->owner != nullptr) {
+        TraversalArena& a = *obj.arena->owner;
+        rt.eventTimerObj = &a.eventLatch;
+        rt.eventTimer = 1.0f;
+        a.eventLatch.col.named = true;
+        a.eventLatch.health =
+            (bestElem < static_cast<int>(obj.elemHp.size()))
+                ? obj.elemHp[bestElem]
+                : 0;
+        a.eventLatch.healthMirror2a2 = static_cast<std::uint32_t>(
+            static_cast<std::uint16_t>(obj.elemThresh[bestElem]));
+      }
+    }
+    // Whole-object damage — punchHitTime(0x540e7c) += frameStep,
+    // health -= dmg (the < 0xfde8 gate), then the state marks when
+    // +0x21e still reads -1 (signed — an element death wrote e+1).
+    rt.punchHitTime += frameStep;
+    if (obj.health < 0xfde8) obj.health -= punchStep;
+    if (static_cast<std::int8_t>(obj.field21e) == -1) {
+      obj.field21d = static_cast<std::uint8_t>(punchState);
+      obj.field228 = 0.0f;
+      obj.field224 = bestBearing;
+    }
+    if (obj.health <= 0) {
+      // Kill — tally(charged), the charged-only corpse displacement
+      // {20*cos,20*sin}(obj.field224), then the death boundary at
+      // bearing+180 (the +180 lives HERE, not in FUN_004581a4).
+      objectKillTally(rt, obj, charged);
+      ++rt.seams.punchDeathCalls;
+      if (charged != 0) {
+        float s, c;
+        sincosDeg(obj.field224, &s, &c);
+        obj.field28 += kKillPush * c;
+        obj.field2c += kKillPush * s;
+      }
+      objectDeathBoundary(rt, obj, bestCenter,
+                          bestBearing + kKillFacing);
+      return;
+    }
+    // Survived — knockback: hitPt -= {cos,sin}(bearing) * half the
+    // winning AABB's X/Y extents (element bounds for element hits,
+    // object bounds otherwise — OBSERVED stride-0x5c element aabb).
+    float s, c;
+    sincosDeg(bestBearing, &s, &c);
+    const float* kb = (bestElem >= 0)
+        ? bestObj->col.elements->elems[bestElem].aabb
+        : bestObj->col.aabb;
+    float hitPt[3] = {bestCenter[0], bestCenter[1], bestCenter[2]};
+    hitPt[0] -= static_cast<float>(
+        static_cast<double>(c) * 0.5 * (kb[3] - kb[0]));
+    hitPt[1] -= static_cast<float>(
+        static_cast<double>(s) * 0.5 * (kb[4] - kb[1]));
+    // Whole-object latch — +0x2a2 (unsigned word compare, ja) <= 900
+    // arms the timer with the REAL object (element path: pseudo).
+    if (bestElem == -1 &&
+        static_cast<std::uint16_t>(obj.healthMirror2a2) <=
+            static_cast<std::uint16_t>(kLatchThresh)) {
+      rt.eventTimerObj = bestObj;
+      rt.eventTimer = 1.0f;
+    }
+    // FUN_00437444(obj.arena, &hitPt, obj.field150, 1, flag21f).
+    ++rt.seams.punchEffectCalls;
     return;
   }
 
-  // Miss — the 40-unit forward stab (pos + yawdir*40, z at the aim
-  // point). A hit on either arena is the wall-impact path; a clean
-  // whiff returns without an impact.
+  // Miss — the 150-unit forward stab (pos + yawdir*150, z at the aim
+  // point). A wall hit pulls the contact one unit back along the yaw
+  // dir, dispatches channel 2 secondary=dmg {ev=punchState, vecA=
+  // aimPt, posB=missPt, contactPos=hitPt} and runs the FUN_00437444
+  // seam (handler-ran -> count 1 variant 2, else count 1 variant 1).
   float sinY, cosY;
   sincosDeg(rt.motion.yawDeg, &sinY, &cosY);
   const float missPt[3] = {rt.cs.pos[0] + cosY * kMissRayLen,
                            rt.cs.pos[1] + sinY * kMissRayLen,
                            aimPt[2]};
-  bool occluded = false;
-  if (rt.cs.arena != nullptr &&
-      collisionStab(*rt.cs.arena, aimPt, missPt, stabOut) != nullptr)
-    occluded = true;
-  if (!occluded && rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0 &&
-      collisionStab(*rt.cs.carrier, aimPt, missPt, stabOut) != nullptr)
-    occluded = true;
-  if (occluded) ++rt.seams.punchWallCalls;   // FUN_00437444 wall impact
+  for (int a = 0; a < 2; ++a) {
+    const CollisionArena* arena;
+    TraversalArena* ctx;
+    if (a == 0) {
+      arena = rt.cs.arena;
+      ctx = rt.cur;
+    } else if (rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0) {
+      arena = rt.cs.carrier;
+      ctx = rt.partner;
+    } else {
+      continue;
+    }
+    if (arena == nullptr || ctx == nullptr) continue;
+    const CollisionPoly* poly = nullptr;
+    if (collisionStabFull(*arena, aimPt, missPt, stabOut, &poly) ==
+        nullptr)
+      continue;
+    float hitPt[3] = {stabOut[0] - cosY, stabOut[1] - sinY,
+                      stabOut[2]};
+    SurfaceFxState fx{};
+    const std::uint8_t res = surfaceDispatch(
+        ctx->surface, punchStep, 2, const_cast<CollisionPoly*>(poly),
+        punchState, aimPt, missPt, hitPt, fx, ctx->surface.scriptFn,
+        ctx->surface.scriptUser);
+    ++rt.seams.punchWallCalls;
+    (void)res;   // FUN_00437444: res&1 -> count 1 variant 2 else 1/1
+    ++rt.seams.punchEffectCalls;
+    return;
+  }
 }
 
 // ---------------------------------------------------------------------------

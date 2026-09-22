@@ -15,6 +15,7 @@
 #include "core/data_root.h"
 #include "core/frontend_machines.h"
 #include "core/player_fire.h"
+#include "core/player_projectiles.h"
 #include "core/player_reticle.h"
 #include "core/player_sniper.h"
 
@@ -1163,6 +1164,10 @@ TraversalFrameResult stepTraversalRuntime(
         traversalConnectorUpdate(*o, rt);
       for (auto& up : da.storage) {
         DynamicObject& o = *up;
+        // 0x49b85c latch — inside FUN_004572ac's named gate, BEFORE the
+        // connector update (0x4572f4): the last named +0x07==1 object
+        // becomes the camera view-anchor source.
+        if (o.col.named && o.col.field07 == 1) rt.fieldB85c = &o;
         // FUN_004555bc — per-object animation advance (+0x114 connector
         // anim): runs after the connector update for every named object.
         if (o.col.named && o.connAnim != nullptr)
@@ -1184,6 +1189,10 @@ TraversalFrameResult stepTraversalRuntime(
         da.transfer(*o, *o->pendingArena);
         ++rt.seams.objectMigrations;
       }
+      // FUN_004572ac epilogue — the 3-slot shot pool ticks at the tail
+      // of EACH arena update (0x4572cd), so partner-active frames tick
+      // it twice. OBSERVED quirk, preserved.
+      playerShotPoolTick(rt, timing.frameStep, dt, timing.smoothed);
     }
   }
 
@@ -1400,6 +1409,13 @@ TraversalFrameResult stepTraversalRuntime(
     if (!(rt.eventTimerObj && rt.eventTimerObj->col.named))
       rt.eventTimer = 0.0f;
   }
+  // 0x540d2c — frameStep-decayed countdown (0x431dd8..0x431deb):
+  // decrements while positive, may go negative (no clamp).
+  if (rt.fieldD2c > 0) rt.fieldD2c -= timing.frameStep;
+  // 0x540e10 — the player-damage suppress window; decays by the FIXED
+  // 1/30 tick (0x46404a: fldz; fcomp; else -= DAT_0049b6f4), not
+  // frameStep and not the smoothed units.
+  if (rt.fieldE10 > 0.0f) rt.fieldE10 -= 1.0f / 30.0f;
   rt.fieldE14 = 0;
   // OBSERVED (0x436491..0x4364dd): EAX = 0; when flag541548 == 0 the
   // single call is FUN_00436d60(0) — body only, no bracket. When

@@ -250,6 +250,11 @@ struct DynamicObject {
   // keep them equal (setPosition does; the original has one field).
   float pos[3] = {0, 0, 0};
   float prevPos[3] = {0, 0, 0};       // +0x180..0x188
+  // +0x28/+0x2c — display-position accumulators (the FUN_00432f84
+  // charged-kill displaces the corpse by {20*cos,20*sin}(yaw) here;
+  // the sim position +0x10 is untouched). Consumers are render-side.
+  float field28 = 0.0f;
+  float field2c = 0.0f;
   float yawDeg = 0.0f;                // +0x4c
   float prevYawDeg = 0.0f;            // +0x50
   float pitchDeg = 0.0f;              // +0x54 (matrix arg 1)
@@ -331,16 +336,64 @@ struct DynamicObject {
   // original stores a homing name-prefix char* at +0x302 and a digit
   // offset at +0x306, consumed by the FUN_0045f634 element predicate
   // (homing weapons 1/3 + the punch element scan).
-  std::uint8_t field21e = 0;         // +0x21e — punch-received mark
+  std::uint8_t field21e = 0;         // +0x21e — punch-received mark;
+                                     // Phase 10A: last-hit element+1
   std::string homingPrefix;          // +0x302 — element-name prefix
   int homingDigitOfs = 0;            // +0x306 — digit check offset
   std::uint8_t field11a = 0;         // +0x11a — 0x0b target
   std::uint8_t field11b = 0;         // +0x11b — 0x49 target
-  const void* field110 = nullptr;    // +0x110 — 0x4c image-ref target
+  const void* field110 = nullptr;    // +0x110 — 0x4c image-ref target;
+                                     // the death boundary hands it to
+                                     // the +0x108/+0x230 script PCs
   float field104 = 0.0f;             // +0x104 — 0xc6 target (consumer UNKNOWN)
   float fieldE8 = 0.0f;              // +0xe8 — 1.0 default, 0x5a target
   float field2c0 = 0.0f;             // +0x2c0 — 1.0 default
-  float field2c4 = 0.0f;             // +0x2c4 — 1000.0 default
+  float field2c4 = 0.0f;             // +0x2c4 — 1000.0 default; the
+                                     // FUN_00460d44 whole-object damage
+                                     // gate (aux <= +0x2c4 applies)
+
+  // --- Phase 10A — projectile impact/damage marks (FUN_0045f9b8 /
+  // FUN_00460d44 write set). +0x210..+0x218 is the last-hit point,
+  // +0x21c the last-hit element+1, +0x21d the damage source byte
+  // (shot type / excl mask / punch state), +0x220 the hit tri,
+  // +0x224/+0x228 the incoming yaw/pitch. ---
+  float field210[3] = {0, 0, 0};     // +0x210 — last-hit position
+  std::uint8_t field21c = 0;         // +0x21c — last-hit element+1
+  std::uint8_t field21d = 0;         // +0x21d — damage-source byte
+  int field220 = 0;                  // +0x220 — last-hit tri index
+  float field224 = 0.0f;             // +0x224 — incoming yaw
+  float field228 = 0.0f;             // +0x228 — incoming pitch
+
+  // +0x30e — per-element int16 damage pool (the FUN_00460d44 element
+  // pass decrements it, clamped at 0; a 0 crossing latches the dead
+  // element into +0x21c/+0x220). NOT whole-object health (+0x08) —
+  // the two are independent: element death only marks the element.
+  // The +0x30e region aliases connRadius on connectors — elements
+  // and the connector union never coexist (OBSERVED: connectors are
+  // not standable-geometry objects). The init site is UNKNOWN — the
+  // FUN_004566f0 default block doesn't write it; the loader/script
+  // seam is expected to populate it (sized to the element count).
+  std::vector<std::int16_t> elemHp;
+  // +0x31e — the second inline int16 element pool (parallel to
+  // +0x30e). The punch's element-survived path copies elemThresh[e]
+  // into the +0x118 pseudo-object's +0x2a2 when it is <= 900 (the
+  // event-latch arm). Loader/script populates it like elemHp.
+  std::vector<std::int16_t> elemThresh;
+  // +0x150 — the survived-path effect seam aux (forwarded as the
+  // FUN_00437444 EBX arg on projectile/punch survived hits).
+  std::int32_t field150 = 0;
+
+  // Death-boundary script handoff (FUN_00458140): when +0x110 is set
+  // the object keeps a deferred script — field11e cleared, health
+  // zeroed, wait cleared, +0x148 |= 0x20 (the dead flag the update
+  // scans skip), and +0x110 is copied to BOTH script PCs before the
+  // gate clears. The +0x108/+0x230 consumers are the tr_alcmd VM —
+  // the object-script execution itself stays a seam.
+  const void* field108 = nullptr;    // +0x108 — object script PC
+  const void* field230 = nullptr;    // +0x230 — resume/wait PC
+  float field22c = 0.0f;             // +0x22c — script wait (cleared
+                                     // on death)
+  std::uint8_t field11e = 0;         // +0x11e — cleared on death
 
   // Write +0x10..0x18 and mirror +0x18 into col.baseZ.
   void setPosition(float x, float y, float z);

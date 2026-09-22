@@ -110,6 +110,10 @@ struct CollisionElementSet { // object +0x0c record {+0x1c count, +0x20 elems}
 struct CollisionObject {
   const CollisionObject* next;       // +0x00
   bool named;                        // +0x06 != 0
+  std::uint8_t field07 = 0;          // +0x07 — view-anchor class; the
+                                     // FUN_004572ac update loop latches
+                                     // the last object whose byte is 1
+                                     // into 0x49b85c (camera anchor)
   const void* model;                 // +0x08 != 0 (presence gate)
   const CollisionElementSet* elements;// +0x0c -> element set record
   float baseZ;                       // +0x18 — ride-offset reference
@@ -283,6 +287,26 @@ int collisionSegAabbResolve(const float* start, const float* target,
 const CollisionNode* collisionStab(const CollisionArena& arena,
                                    const float* from, const float* to,
                                    float* outPos);
+
+// FUN_00418c60 + FUN_00418d6c pair — identical walk, additionally
+// reports the containing polygon record (the original exposes it
+// through the 0x54b6d4 global read by FUN_00418d6c; the projectile
+// impact dispatch consumes it as the surfaceDispatch poly).
+const CollisionNode* collisionStabFull(const CollisionArena& arena,
+                                       const float* from, const float* to,
+                                       float* outPos,
+                                       const CollisionPoly** outPoly);
+
+// FUN_004138d8 — object-local segment probe. Transforms the
+// world-space `start`->`end` segment into the object's local frame,
+// scans every unmasked element triangle (segTri shortens `end` to the
+// hit — nearest wins across the whole element set), and writes the
+// world hit point back into `end` when any triangle was hit.
+// `outElem`/`outTri` receive the last (nearest) hit indices; -1 on a
+// miss. The shot path relies on the `end` writeback: successive
+// probes re-clip the segment so the nearest object wins.
+void collisionObjectProbe(const CollisionObject* obj, const float* start,
+                          float* end, int* outElem, int* outTri);
 
 } // namespace mdk
 

@@ -56,9 +56,12 @@
 //   unconditionally from the world tick FUN_00436100 at 0x43627a
 //   (right after the per-frame player AABB rebuild). Gate inside:
 //   0x540c74 (the fire latch) != 0, and NOT (excludeObj != 0 &&
-//   !(mountClass & 2)). Bounded port: the target SCAN + the
-//   +0x21e=0xff hit mark; the damage/knockback/death/effect tail is
-//   a counted seam (enemy damage is out of scope).
+//   !(mountClass & 2)). Port: the target scan, the +0x21e=0xff hit
+//   mark, and — Phase 10A — the full damage/knockback/death tail
+//   (int16 element wrap + element->whole fallthrough + the
+//   +0x2a2/+0x31e event latches + charged corpse displacement +
+//   bearing+180 kill facing) via the shared boundary in
+//   player_projectiles.h. Effect/sound callsites stay counted seams.
 //
 //   FUN_00437660 — the cadence/burst/ammo machine, scoped to
 //   c9c != 0 && ca0 > 1 inside FUN_00436d60 (NOT unconditional —
@@ -92,37 +95,66 @@ struct DynamicObject;
 struct CollisionElement;
 
 // ---------------------------------------------------------------------------
-// The 3-slot player-shot pool (0x540ed4, stride 0xfc). Only the fields
-// the original writes at spawn are modeled; the in-flight update
-// (FUN_0045f9b8 via FUN_004572ac) is a deferred seam.
+// The 3-slot player-shot pool (0x540ed4, stride 0xfc). The in-flight
+// update is FUN_0045f9b8, invoked at the tail of each
+// FUN_004572ac(arena) call — see player_projectiles.h (Phase 10A).
 // ---------------------------------------------------------------------------
 
-// The +0xd4 per-slot fly callback identity — the three original
-// functions are kept as tags (their bodies stay deferred).
+// The +0xd4 per-slot fly callback identity — the four original
+// functions are kept as tags.
 enum PlayerShotFly : int {
   kShotFlyNone = 0,
   kShotFlyTracer = 0x4601d4,  // FUN_004601d4 — w0/w2 ballistic tracer
   kShotFlyGrenade = 0x4602d8, // w1/w3 homing/grenade callback
   kShotFlyLobbed = 0x4608bc,  // w4 lobbed callback
+  kShotFlyRibbon = 0x46075c,  // FUN_0046075c — ribbon path (FUN_00460860
+                            // binds it when the 0x49b8e4 lobbed-shot
+                            // latch is set on a type-4 slot)
 };
 
 struct PlayerShot {
-  int state = 0;          // +0x00 — 0 free / 1 in-flight
-  float yawDeg = 0.0f;    // +0x04 — launch yaw (0x540c2c)
+  int state = 0;          // +0x00 — 0 free / 1 flight / 2,3,4,5 dying
+  float yawDeg = 0.0f;    // +0x04 — launch yaw (0x540c2c); w4 bounce
+                          // rewrites it from the reflected velocity
   float pitchDeg = 0.0f;  // +0x08 — launch pitch (0x540b54+0x540d58)
-  int lifetime = 0;       // +0x10 — per-weapon life ticks
-  TraversalArena* arena = nullptr;   // +0x18 — the 0x540c48 arena
+  float spinDeg = 0.0f;   // +0x0c — streak spin; +720*dt each no-hit
+                          // tick (type != 4 only)
+  int lifetime = 0;       // +0x10 — per-weapon life ticks (frameStep)
+  int dyingTimer = 0;     // +0x14 — state>1 countdown; release at <=0
+  TraversalArena* arena = nullptr;   // +0x18 — the 0x540c48 arena (the
+                          // killZ deep-floor reference is read here)
   int classIdx = -1;      // +0x1c — class record (FUN_00454794 result;
                           // -1 = the 0x4edd48 default record)
-  float pos[3] = {0, 0, 0};  // +0x20 — spawn pos (camera world pos)
-  float fieldCc = 0.0f;      // +0xcc — 2.0f constant
+  float pos[3] = {0, 0, 0};  // +0x20 — current pos; the object probe
+                          // shortens it to the nearest hit point
+  float tailLen = 0.0f;   // +0xbc — tracer tail length: +10*dt (cap
+                          // 10); impact sets 15.0; dying w0/w1 shrink
+                          // 5*dt
+  float tail[3] = {0, 0, 0}; // +0xc0..0xc8 — pos - tailLen*dir,
+                          // rebuilt by FUN_0045f94c
+  float fieldCc = 0.0f;      // +0xcc — 2.0f at spawn, -0.5*dt floor 1.0
   int type = 0;              // +0xd0 — the weapon index 0..4
   int flyKind = 0;           // +0xd4 — PlayerShotFly tag
   const DynamicObject* homeObj = nullptr;      // +0xd8 — 0x540cd8 lock
   const CollisionElement* homeElem = nullptr;  // +0xdc — best element
-  int homeElemIdx = 0;                         // +0xe0 — its index
-  float speedH = 0.0f;    // +0xe4 — horizontal speed
+  int homeElemIdx = 0;                         // +0xe0 — its index;
+                          // the ribbon binder reuses this dword for
+                          // the path record (dead while +0xf8&1)
+  float speedH = 0.0f;    // +0xe4 — horizontal speed; the ribbon
+                          // binder reuses this dword for the Hermite
+                          // param (dead while +0xf8&1)
+  float yawAccum = 0.0f;  // +0xe8 — homing yaw-rate accumulator
+                          // (+-540 deg/s^2, +-270 cap, reset on
+                          // reversal/zero)
   float speedV = 0.0f;    // +0xf0 — vertical speed (w4 lobbed only)
+  int remnantIdx = 0;     // +0xf4 — remnant/effect slot (cleared on
+                          // every impact transition; spawn is a seam)
+  std::uint32_t flags = 0;// +0xf8 — bit0 = ribbon-bound (skips the
+                          // collision + object scan entirely)
+  const void* ribbonPath = nullptr; // +0xe0 alias — the Hermite key
+                          // record while +0xf8&1 (overlaps homeElemIdx)
+  float ribbonT = 0.0f;   // +0xe4 alias — the path param while +0xf8&1
+                          // (overlaps speedH)
 };
 
 // ---------------------------------------------------------------------------
@@ -146,8 +178,10 @@ void playerWeaponSelect(TraversalRuntime& rt,
 
 // FUN_00432f84 — the normal-mode punch hitscan. `frameStep` is
 // timing.frameStep (0x49b6e8). Runs the gate + charge drain + the
-// object/element target scan; on a hit it writes the +0x21e mark and
-// counts the deferred damage seam; on a miss it runs the wall stab.
+// object/element target scan; on a hit it runs the Phase 10A
+// damage/knockback/death tail (the +0x21e mark, int16 element damage,
+// the element->whole fallthrough, the event latches, tally + death);
+// on a miss it runs the 150-unit wall stab + channel-2 dispatch.
 void playerPunch(TraversalRuntime& rt, int frameStep);
 
 // The FUN_00465228 fire latch — the normal-mode fire edge. Sets/

@@ -120,6 +120,11 @@ struct TraversalArena {
                                        // state (pc=+0x108/+0x220
                                        // gate+PC, wait=+0x22c,
                                        // resume=+0x230, stack +0x248+)
+  // +0x118 doubles as a pseudo-object for the punch element event
+  // latch (FUN_00432f84): the latch writes +0x06 named / +0x08 health
+  // / +0x2a2 threshold here when no real object is available, so the
+  // 0x540eb4 timer validation reads them through the object layout.
+  DynamicObject eventLatch;
   std::uint32_t flags58 = 0;           // +0x58 — bound-object flag
                                        // dword (script flag group 1)
   std::uint8_t objFlag148 = 0;         // +0x148 — script byte (0x61)
@@ -242,6 +247,12 @@ struct TraversalSeams {
   int shotPoolTickCalls = 0;      // FUN_004572ac shot-pool update seam
   int punchDeathCalls = 0;        // FUN_0042ac90 punch-kill seam
   int punchEffectCalls = 0;       // FUN_00437444/FUN_00458140/etc fx
+  // --- Phase 10A — projectile lifecycle (player_projectiles.h) ---
+  int shotImpactFxCalls = 0;      // FUN_00437444 wall/impact fx seam
+  int remnantSpawnCalls = 0;      // FUN_004575fc detonation remnant seam
+  int objectDeathCalls = 0;       // FUN_00458140 deaths run
+  int objectTeardownCalls = 0;    // FUN_00457cf4 teardown seam
+  int mountDamageCalls = 0;       // FUN_0046771c mount-redirect hits
 };
 
 struct TraversalFrameResult {
@@ -357,6 +368,16 @@ struct TraversalRuntime {
   float pendingView[4] = {0, 0, 0, 0}; // 0x540ec0..0x540ecc
   float eventTimer = 0.0f;        // 0x540eb0
   const DynamicObject* eventTimerObj = nullptr; // 0x540eb4
+  int fieldD2c = 0;               // 0x540d2c — frameStep-decayed
+                                  // countdown; set to 10 by the
+                                  // teardown when a +0x11e==0xf
+                                  // object dies (FUN_00457cf4 +
+                                  // FUN_0045828c, OBSERVED)
+  const DynamicObject* fieldB85c = nullptr; // 0x49b85c — the last
+                                  // +0x07==1 object seen in the
+                                  // FUN_004572ac update loop (the
+                                  // camera view-anchor source);
+                                  // cleared when that object dies
   int flagC9c = 0;                // 0x540c9c — transition/death gate
   int transitionPhase = 0;        // 0x540ca0
   bool flag541548 = false;        // 0x541548 — extra world-tick gate
@@ -428,6 +449,14 @@ struct TraversalRuntime {
   std::array<PlayerShot, 3> shots{};  // 0x540ed4 — the 3-slot pool
   int punchTime = 0;              // 0x540e78 — punch jitter accum
   int punchHitTime = 0;           // 0x540e7c — hit-time accumulator
+  // Phase 10A — projectile/combat globals (player_projectiles.h):
+  int shotHitCount = 0;           // 0x540e84 — w0/1 direct-hit counter
+  int killTally = 0;              // 0x540e90 — FUN_0042ac90 kill tally
+  PlayerShot* lobbedShot = nullptr; // 0x49b8e4 — last type-4 shot to
+                                  // touch a wall (the ribbon-binder
+                                  // gate); cleared on slot release
+  float fieldE10 = 0.0f;          // 0x540e10 — player-damage suppress
+                                  // window (>0 suppresses, float)
   // Damage/energy (FUN_00467a00 difficulty-scaled drain):
   int fieldDac = 0;               // 0x540dac — damage accumulator (cap 180)
   int fieldHealth = 0;            // 0x541554 — player health (drained)

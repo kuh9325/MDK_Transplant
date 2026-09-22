@@ -32,6 +32,7 @@
 #include "core/player_camera.h"
 #include "core/player_fire.h"
 #include "core/player_motion.h"
+#include "core/player_projectiles.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
 #include "core/sni_directory.h"
@@ -13217,6 +13218,399 @@ void test_player_fire() {
   }
 }
 
+// Phase 10A — FUN_0045f9b8 shot-pool update, the fly callbacks, the
+// FUN_00460b7c/0x60d44/0x60c08 detonate/splash, FUN_0046771c player
+// damage, and the FUN_00458140/0x581a4 death boundary — all OBSERVED
+// in BUILD_A. Quirks preserved by the port are asserted explicitly:
+// the stale-state flight fallthrough, the partner-active double tick,
+// the int16 element wrap, and the punch's element->whole fallthrough.
+void test_player_projectiles() {
+  const float kDt = 1.0f / 30.0f;        // 0x49b6f4 fixed tick
+  auto makeShotRt = [](mdk::TraversalRuntime& rt, CollisionFixture& f,
+                       const char* name) {
+    mdk::TraversalArena* a = travArenaAdd(rt, name);
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    rt.cur = a;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.pos[2] = 20.0f;
+    return a;
+  };
+
+  // ---- pool tick: free slots are skipped, the seam counts --------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(rt.seams.shotPoolTickCalls == 1);
+  }
+
+  // ---- tracer flight (FUN_004601d4) on an empty arena -----------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.yawDeg = 0.0f; s.pitchDeg = 0.0f;
+    s.speedH = 1100.0f; s.fieldCc = 2.0f; s.lifetime = 75;
+    s.pos[2] = 20.0f;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    // +x flight at the fixed 1/30 tick (z=20 stays above the floor).
+    CHECK(near(s.pos[0], 1100.0 / 30.0, 1e-3) &&
+          near(s.pos[2], 20.0, 1e-5));
+    CHECK(near(s.tailLen, 10.0 / 30.0, 1e-4));
+    CHECK(near(s.fieldCc, 2.0 - 0.5 / 30.0, 1e-4));
+    CHECK(near(s.spinDeg, 720.0 / 30.0, 1e-3));   // no-hit spin
+    CHECK(s.lifetime == 74 && s.state == 1);
+    // tail = pos - tailLen*dir (dir = +x at yaw/pitch 0).
+    CHECK(near(s.tail[0], s.pos[0] - s.tailLen, 1e-4));
+  }
+
+  // ---- stale state > 1 with +0x14 <= 0 re-flies (OBSERVED quirk) -
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 5; s.dyingTimer = 0;              // stale detonated
+    s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.speedH = 1100.0f; s.lifetime = 75; s.pos[2] = 20;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(near(s.pos[0], 1100.0 / 30.0, 1e-3) && s.state == 5);
+  }
+
+  // ---- dying branch: lifetime+tail shrink, release at 0 ----------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 4; s.dyingTimer = 2; s.lifetime = 5; s.type = 0;
+    s.tailLen = 15.0f; s.arena = a;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s.lifetime == 4 && s.dyingTimer == 1 && s.state == 4);
+    CHECK(near(s.tailLen, 15.0 - 5.0 / 30.0, 1e-4));  // no clamp
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s.dyingTimer == 0 && s.state == 0);         // released
+  }
+
+  // ---- lifetime expiry -> state 4; kill floor -> state 4 ---------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.speedH = 1100.0f; s.lifetime = 1; s.pos[2] = 20;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s.state == 4 && s.lifetime == 0 && s.dyingTimer == 30 &&
+          s.remnantIdx == 0);
+    // Below the arena deep floor -> the same state-4 transition.
+    mdk::PlayerShot& s2 = rt.shots[1];
+    s2.state = 1; s2.type = 0; s2.flyKind = mdk::kShotFlyTracer;
+    s2.arena = a; s2.speedH = 0.0f; s2.lifetime = 100;
+    s2.pos[2] = -2000.0f;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s2.state == 4 && s2.dyingTimer == 30);
+  }
+
+  // ---- type-4 expiry detonates -> state 5 (FUN_00460b7c) ---------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 4; s.flyKind = mdk::kShotFlyLobbed;
+    s.arena = a; s.lifetime = 1; s.pos[2] = 20;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s.state == 5 && s.lifetime == 30 && s.dyingTimer == 30 &&
+          s.remnantIdx == 0);
+    CHECK(rt.seams.remnantSpawnCalls == 1);
+  }
+
+  // ---- wall impact: type 0 -> state 4; type 2 -> detonate --------
+  {
+    CollisionFixture f = makeWallArena();      // x=5 wall, normal -x
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.yawDeg = 0.0f; s.speedH = 1100.0f; s.lifetime = 75;
+    s.pos[2] = 10.0f;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s.state == 4 && s.lifetime == 0 && s.dyingTimer == 30);
+    CHECK(rt.seams.shotImpactFxCalls == 1);    // FUN_00460164 tail
+    // Types 2/3 detonate at the wall instead.
+    mdk::PlayerShot& s2 = rt.shots[1];
+    s2.state = 1; s2.type = 2; s2.flyKind = mdk::kShotFlyGrenade;
+    s2.arena = a; s2.yawDeg = 0.0f; s2.speedH = 400.0f; s2.lifetime = 75;
+    s2.pos[2] = 10.0f;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s2.state == 5 && s2.dyingTimer == 30);
+  }
+
+  // ---- object hit: survived -> state 3, killed -> state 2 --------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.model = makePlatformModel("PLAT", "ELEM", 0.0f);
+    o.setPosition(8, 2, 15);
+    mdk::initObjectCollision(o);
+    o.health = 20;
+    // Thick AABB for the prefilter — the flat element box is a
+    // degenerate seed like the original's z-seeded union.
+    const float wb[6] = {3, -3, 10, 13, 7, 20};
+    std::memcpy(o.col.aabb, wb, sizeof(wb));
+    // Straight-down tracer (pitch 90 -> dir {0,0,-1}) through the
+    // element tri at world (3,-3) local — inside the quad half.
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.pitchDeg = 90.0f; s.speedH = 1100.0f;
+    s.lifetime = 75; s.pos[0] = 8; s.pos[1] = 2; s.pos[2] = 25;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(o.health == 12);                     // 20 - 8
+    CHECK(s.state == 3 && s.lifetime == 30 && s.dyingTimer == 45);
+    CHECK(near(s.tailLen, 15.0, 1e-5));
+    CHECK(o.field21e == 1 && o.field21c == 1 && o.field21d == 0);
+    CHECK(o.field220 >= 0 && near(o.field228, 90.0, 1e-5));
+    CHECK(rt.shotHitCount == 1);
+    // Killed -> state 2 + the tally/death boundary.
+    mdk::DynamicObject& o2 = a->dyn.allocFront();
+    o2.model = makePlatformModel("PLAT", "ELEM", 0.0f);
+    o2.setPosition(8, 2, 40);
+    mdk::initObjectCollision(o2);
+    o2.health = 8;
+    const float wb2[6] = {3, -3, 35, 13, 7, 45};
+    std::memcpy(o2.col.aabb, wb2, sizeof(wb2));
+    mdk::PlayerShot& s2 = rt.shots[1];
+    s2.state = 1; s2.type = 0; s2.flyKind = mdk::kShotFlyTracer;
+    s2.arena = a; s2.pitchDeg = 90.0f; s2.speedH = 1100.0f;
+    s2.lifetime = 75; s2.pos[0] = 8; s2.pos[1] = 2; s2.pos[2] = 50;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(o2.health <= 0 && s2.state == 2);
+    CHECK(rt.seams.objectDeathCalls == 1);
+    // pitchDeg bits are nonzero -> the tally gate ran, but "PLAT"
+    // is not in the 34-name table -> no tally.
+    CHECK(rt.killTally == 0);
+  }
+
+  // ---- playerDamageApply (FUN_0046771c) gates + scaling ----------
+  {
+    mdk::TraversalRuntime rt;
+    const float pt[3] = {0, 0, 0};
+    rt.fieldHealth = 100; rt.difficulty = 1;
+    mdk::playerDamageApply(rt, 30, pt);
+    CHECK(rt.fieldHealth == 70);
+    CHECK(rt.fieldDac == 180);                 // 30*25 clamped [75,180]
+    CHECK(near(rt.vert.landingAccum, 30.0, 1e-5));
+    // difficulty 0 -> 2d/3 min 1; difficulty 2 -> 2d.
+    rt.fieldHealth = 100; rt.difficulty = 0;
+    mdk::playerDamageApply(rt, 30, pt);
+    CHECK(rt.fieldHealth == 80);
+    rt.fieldHealth = 100; rt.difficulty = 2;
+    mdk::playerDamageApply(rt, 30, pt);
+    CHECK(rt.fieldHealth == 40);
+    // Health floors at 0.
+    rt.fieldHealth = 10;
+    mdk::playerDamageApply(rt, 50, pt);
+    CHECK(rt.fieldHealth == 0);
+    // Suppress window -> landingAccum cleared, no damage.
+    rt.fieldHealth = 50; rt.fieldE10 = 0.5f; rt.vert.landingAccum = 9;
+    mdk::playerDamageApply(rt, 30, pt);
+    CHECK(rt.fieldHealth == 50 && near(rt.vert.landingAccum, 0.0, 1e-5));
+    // health==0 && gate==0 -> dead, no-op.
+    rt = mdk::TraversalRuntime{};
+    mdk::playerDamageApply(rt, 30, pt);
+    CHECK(rt.fieldHealth == 0);
+  }
+
+  // ---- objectKillTally / objectDeathBoundary ---------------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicObject o;
+    o.model = makePlatformModel("XT", "ELEM", 0.0f);   // in table
+    const float pt[3] = {0, 0, 0};
+    mdk::objectKillTally(rt, o, 0);
+    CHECK(rt.killTally == 0);                  // gate off -> no tally
+    mdk::objectKillTally(rt, o, 1);
+    CHECK(rt.killTally == 1);
+    mdk::DynamicObject o2;
+    o2.model = makePlatformModel("PLAT", "ELEM", 0.0f);
+    mdk::objectKillTally(rt, o2, 1);
+    CHECK(rt.killTally == 1);                  // not in table
+    // Death boundary — the +0x110 script handoff.
+    mdk::DynamicObject d;
+    const int sentinel = 0x1234;
+    d.field110 = &sentinel; d.field11e = 7; d.health = 9;
+    d.field22c = 3.0f;
+    mdk::objectDeathBoundary(rt, d, pt, 45.0f);
+    CHECK(d.field11e == 0 && d.health == 0 && d.field22c == 0.0f);
+    CHECK((d.col.flags148 & 0x20) != 0);
+    CHECK(d.field108 == &sentinel && d.field230 == &sentinel &&
+          d.field110 == nullptr);
+    // The teardown path — +0x11e == 0xf arms fieldD2c; the latches
+    // clear; a cleared mount deals 50 to the player.
+    mdk::TraversalRuntime rt2;
+    mdk::DynamicObject t;
+    t.field11e = 0xf;
+    rt2.fieldB85c = &t;
+    rt2.cs.excludeObj = &t.col;
+    rt2.cs.lastObjContact = &t.col;
+    rt2.fieldHealth = 100; rt2.difficulty = 1;
+    mdk::objectDeathBoundary(rt2, t, pt, 0.0f);
+    CHECK(rt2.fieldD2c == 10 && rt2.fieldB85c == nullptr &&
+          rt2.cs.excludeObj == nullptr && rt2.cs.lastObjContact == nullptr);
+    CHECK(rt2.fieldHealth == 50);              // the mount-kill 50
+    CHECK(rt2.seams.objectTeardownCalls == 1);
+  }
+
+  // ---- splash (FUN_00460d44): int16 element wrap + kill ----------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SPL");
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.model = makeHomingModel({{"0E", 0.0f}});
+    o.setPosition(8, 0, 15);
+    mdk::initObjectCollision(o);
+    o.health = 10;
+    o.col.flags149 |= 0x20;
+    o.homingPrefix = "0"; o.homingDigitOfs = 0;
+    o.elemHp = {1}; o.field2c4 = 1000.0f;
+    const float wb[6] = {3, -5, 10, 13, 5, 20};
+    std::memcpy(o.col.aabb, wb, sizeof(wb));
+    // Blast at the element centre: dmg 150 -> int16 1-150 < 0 ->
+    // element death marks + the whole-object kill -> teardown seam.
+    const float blast[3] = {8, 0, 15};
+    mdk::splashDamage(rt, blast, 150.0f, 50.0f, 1, nullptr, 2, -7);
+    CHECK(o.elemHp[0] == 0 && o.field21c == 1 && o.field220 == 0);
+    CHECK(o.health <= 0 && o.field21e == 1 && o.field21d == 0xf9);
+    CHECK(rt.seams.objectDeathCalls == 1 &&
+          rt.seams.objectTeardownCalls == 1);
+  }
+  {
+    // The wrap quirk: 1 - 40000 wraps the int16 to +25537 — the
+    // element SURVIVES a massive hit (OBSERVED `sub word`).
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SPL");
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.model = makeHomingModel({{"0E", 0.0f}});
+    o.setPosition(8, 0, 15);
+    mdk::initObjectCollision(o);
+    o.health = 10;
+    o.col.flags149 |= 0x20;
+    o.homingPrefix = "0"; o.homingDigitOfs = 0;
+    o.elemHp = {1}; o.field2c4 = 1000.0f;
+    const float wb[6] = {3, -5, 10, 13, 5, 20};
+    std::memcpy(o.col.aabb, wb, sizeof(wb));
+    const float blast[3] = {8, 0, 15};
+    mdk::splashDamage(rt, blast, 40000.0f, 50.0f, 1, nullptr, 2, -7);
+    CHECK(o.elemHp[0] == 25537 && o.field21c == 0);
+    CHECK(o.field21e == 0xfe);                 // bestElemMark -2
+  }
+
+  // ---- splash player pass: falloff + cap + occlusion -------------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    makeShotRt(rt, f, "SPL");
+    rt.cs.pos[0] = 0; rt.cs.pos[1] = 0; rt.cs.pos[2] = 10;
+    rt.fieldHealth = 100; rt.difficulty = 1;
+    // blast at (0,0,15): pt=(0,0,11) d2=16, dist=8 -> dmg=126 cap 15.
+    const float blast[3] = {0, 0, 15};
+    mdk::splashDamage(rt, blast, 150.0f, 50.0f, 1, nullptr, 1, -7);
+    CHECK(rt.fieldHealth == 85);
+    CHECK(near(rt.vert.landingAccum, 30.0, 1e-5));  // *2 after +15
+    // Below the floor -> the stab occludes -> out of range, no dmg.
+    const float blast2[3] = {0, 0, 5};
+    mdk::splashDamage(rt, blast2, 150.0f, 50.0f, 1, nullptr, 1, -7);
+    CHECK(rt.fieldHealth == 85);
+  }
+
+  // ---- punch element -> whole-object fallthrough (OBSERVED) -----
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "PNCH");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    rt.cur = a; rt.cs.arena = &a->dyn.col;
+    rt.cs.pos[2] = 10.0f; rt.motion.yawDeg = 0;
+    rt.fieldC74 = 1; rt.ammo[0] = 0;           // uncharged, dmg 1
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.model = makeHomingModel({{"0E", 0.0f}});
+    o.setPosition(8, 0, 15);
+    mdk::initObjectCollision(o);
+    o.col.flags149 |= 0x20;
+    o.homingPrefix = "0"; o.homingDigitOfs = 0;
+    o.elemHp = {3}; o.elemThresh = {3};
+    const float wb[6] = {3, -5, 10, 13, 5, 20};
+    std::memcpy(o.col.aabb, wb, sizeof(wb));
+    mdk::playerPunch(rt, 1);
+    // Element survived -> whole-object marks still run; the event
+    // latch took the pseudo-object (elemThresh <= 900).
+    CHECK(o.elemHp[0] == 2 && o.health == 9);
+    CHECK(o.field21d == 0xff && o.field21e == 0xff);   // state -1
+    CHECK(rt.eventTimerObj == &a->eventLatch && rt.eventTimer == 1.0f);
+    CHECK(a->eventLatch.col.named && a->eventLatch.health == 2);
+    // Element killed -> the e+1 marks close the +0x21e == -1 gate,
+    // so the whole-object state marks are skipped — but the health
+    // subtraction still runs (the fallthrough quirk).
+    mdk::TraversalRuntime rt2;
+    mdk::TraversalArena* a2 = travArenaAdd(rt2, "PNCH");
+    a2->dyn.col.verts = f.verts.data();
+    a2->dyn.col.polys = f.polys.data();
+    a2->dyn.col.nodes = f.nodes.data();
+    rt2.cur = a2; rt2.cs.arena = &a2->dyn.col;
+    rt2.cs.pos[2] = 10.0f; rt2.motion.yawDeg = 0;
+    rt2.fieldC74 = 1; rt2.ammo[0] = 0;
+    mdk::DynamicObject& o2 = a2->dyn.allocFront();
+    o2.model = makeHomingModel({{"0E", 0.0f}});
+    o2.setPosition(8, 0, 15);
+    mdk::initObjectCollision(o2);
+    o2.col.flags149 |= 0x20;
+    o2.homingPrefix = "0"; o2.homingDigitOfs = 0;
+    o2.elemHp = {1}; o2.elemThresh = {5000};   // >900 -> no latch
+    const float wb2[6] = {3, -5, 10, 13, 5, 20};
+    std::memcpy(o2.col.aabb, wb2, sizeof(wb2));
+    mdk::playerPunch(rt2, 1);
+    CHECK(o2.elemHp[0] == 0 && o2.field21e == 1 && o2.field21c == 1);
+    CHECK(o2.field21d == 0);                   // state marks gated off
+    CHECK(o2.health == 9);                     // fallthrough damage
+    CHECK(rt2.eventTimerObj == nullptr);       // thresh > 900
+  }
+
+  // ---- the FUN_004572ac tail: per-arena double tick (OBSERVED) --
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "TICK");
+    mdk::TraversalArena* b = travArenaAdd(rt, "TICK_B");
+    b->dyn.col.verts = f.verts.data();
+    b->dyn.col.polys = f.polys.data();
+    b->dyn.col.nodes = f.nodes.data();
+    rt.partner = b; rt.partnerActive = true;
+    rt.cs.arenaValid = 1;
+    rt.hudActive = 1;
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 4; s.dyingTimer = 100; s.lifetime = 100; s.type = 0;
+    s.arena = a;
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const mdk::RawGameplayInput idle{};
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    // Two arena invocations -> the shared pool ticked twice.
+    CHECK(rt.seams.shotPoolTickCalls == 2);
+    CHECK(s.dyingTimer == 100 - 2 * timing.frameStep);
+  }
+}
+
 // Phase 5L — sniper scope lifecycle + mounted reticle. OBSERVED
 // constants and ordering from MDK95.EXE BUILD_A disassembly: the
 // dispatch picks mounted > sniper > normal each frame, the scope
@@ -13862,6 +14256,7 @@ int main() {
   test_camera_nudge();
   test_player_sniper();
   test_player_fire();
+  test_player_projectiles();
   test_arena_render();
   test_arena_mesh();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
