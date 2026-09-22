@@ -11792,14 +11792,16 @@ void test_traversal_object_init() {
     CHECK(o.connSound316.empty() && o.connSound31e.empty());
   }
 
-  // Field-set family beyond the door's: 0x5a->+0xe8, 0xc6->+0x104
+  // Field-set family beyond the door's: 0x5a->+0xe8, 0xc7->+0x104
   // (same {mode,[f32|idx]} grammar as 0x53/0x54) and 0x75->+0x118
-  // (u32 slot, low16-1). Confirmed from MDK95.EXE handler disasm.
+  // (u32 slot, low16-1). Confirmed from MDK95.EXE handler disasm —
+  // the +0x104 writer is dispatch-table slot 0xc7 (handler 0x45188f),
+  // not 0xc6.
   {
     ScriptFixture f;
     const std::uint32_t C = 0x200;
     f.write(C,      {0x5a, 0x03});  f.writeF(C + 2, 4.5f);   // +0xe8
-    f.write(C + 6,  {0xc6, 0x03});  f.writeF(C + 8, 7.25f);  // +0x104
+    f.write(C + 6,  {0xc7, 0x03});  f.writeF(C + 8, 7.25f);  // +0x104
     f.write(C + 12, {0x75});        f.writeW(C + 13, 9);     // +0x118=8
     f.write(C + 17, {0xff});
     mdk::DynamicObject& o = f.arena->dyn.allocFront();
@@ -11809,6 +11811,74 @@ void test_traversal_object_init() {
     CHECK(near(o.fieldE8, 4.5, 1e-5));
     CHECK(near(o.field104, 7.25, 1e-5));
     CHECK(o.connAnimLatch == 8);                 // 9 - 1
+  }
+
+  // Opcode 0xc6 — element-set declaration (handler 0x4394d0,
+  // OBSERVED): {str8 prefix, u8 digitOfs, u32 hpThresh, u32 extra}.
+  // Sets +0x149 bit5, stores the prefix at +0x302, digitOfs at
+  // +0x306, extra at +0x30a, and fills all eight +0x30e/+0x31e
+  // int16 slots with low16(hpThresh). Operands mirror the real
+  // LEVEL3 HMO_1$XH1_DOOR script (XH1_KEY / 7 / 120 / 0).
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C,      {0xc6});
+    f.writeStr(C + 1, "XH1_KEY");                // 8 incl NUL -> C+9
+    f.write(C + 10, {0x07});                     // digitOfs
+    f.writeW(C + 11, 120);                       // hpThresh
+    f.writeW(C + 15, 0xdead);                    // extra -> +0x30a
+    f.write(C + 19, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK((o.col.flags149 & 0x20) != 0);
+    CHECK(o.homingPrefix == "XH1_KEY");
+    CHECK(o.homingDigitOfs == 7);
+    CHECK(o.field30a == 0xdead);
+    CHECK(o.elemHp.size() == 8 && o.elemThresh.size() == 8);
+    for (int i = 0; i < 8; ++i) {
+      CHECK(o.elemHp[i] == 120);
+      CHECK(o.elemThresh[i] == 120);
+    }
+  }
+
+  // End-to-end: the 0xc6-declared element set drives the punch's
+  // element-damage path — a script-initialised "XH1_KEY" object
+  // (model element XH1_KEY1) takes per-element damage, exactly the
+  // LEVEL3 HMO_1$XH1_DOOR wiring.
+  {
+    ScriptFixture sf;
+    const std::uint32_t C = 0x200;
+    sf.write(C,      {0xc6});
+    sf.writeStr(C + 1, "XH1_KEY");
+    sf.write(C + 10, {0x07});
+    sf.writeW(C + 11, 120);
+    sf.writeW(C + 15, 0);
+    sf.write(C + 19, {0xff});
+
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "PNCH");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    rt.cur = a; rt.cs.arena = &a->dyn.col;
+    rt.cs.pos[2] = 10.0f; rt.motion.yawDeg = 0;
+    rt.fieldC74 = 1; rt.ammo[0] = 0;           // uncharged, dmg 1
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.model = makeHomingModel({{"XH1_KEY1", 0.0f}});
+    o.setPosition(8, 0, 15);
+    mdk::initObjectCollision(o);
+    auto ir = mdk::traversalObjectInitScript(sf.env, o, C);
+    CHECK(ir.halted && !ir.error);
+    CHECK((o.col.flags149 & 0x20) != 0);
+    const float wb[6] = {3, -5, 10, 13, 5, 20};
+    std::memcpy(o.col.aabb, wb, sizeof(wb));
+    mdk::playerPunch(rt, 1);
+    CHECK(o.elemHp[0] == 119);                 // 120 - punchStep 1
+    CHECK(o.elemHp[1] == 120);                 // untouched slots
+    CHECK(o.field21d == 0xff && o.field21e == 0xff);
   }
 
   // End-to-end: traversalScriptSpawn runs the init script on a real
@@ -13192,6 +13262,12 @@ void test_player_fire() {
     rt.fieldC74 = 1; rt.ammo[0] = 20;
     mdk::playerPunch(rt, 1);
     CHECK(rt.seams.punchWallCalls == 1 && rt.seams.punchHitCalls == 0);
+    // Phase 10B — the wall stab posts kPunchWallImpact (mode 1; the
+    // handlerless dispatch result bit0 is 0 -> variant 1).
+    CHECK(rt.combatFx.size() == 1);
+    CHECK(rt.combatFx[0].kind == mdk::CombatFxKind::kPunchWallImpact);
+    CHECK(rt.combatFx[0].mode == 1 && rt.combatFx[0].variant == 1);
+    CHECK(near(rt.combatFx[0].pos[0], 4.0, 1e-4));  // wall x=5, -1 back
   }
 
   // ---- scope gating: d0c++/cadence only under (c9c && ca0 > 1) ----
@@ -13328,6 +13404,113 @@ void test_player_projectiles() {
     CHECK(s.state == 5 && s.lifetime == 30 && s.dyingTimer == 30 &&
           s.remnantIdx == 0);
     CHECK(rt.seams.remnantSpawnCalls == 1);
+    // Phase 10B — the detonation posts a kDetonation presentation
+    // event at the shot position (FUN_004575fc remnant seam).
+    CHECK(rt.combatFx.size() == 1);
+    CHECK(rt.combatFx[0].kind == mdk::CombatFxKind::kDetonation);
+    CHECK(near(rt.combatFx[0].pos[2], s.pos[2], 1e-5));
+  }
+
+  // ---- Phase 10B — the shot-render gate (0x436dd3): only the fully
+  // scoped sniper state renders the pool -----------------------------
+  {
+    mdk::TraversalRuntime rt;
+    CHECK(!mdk::playerShotRenderGate(rt));
+    rt.flagC9c = 1;
+    CHECK(!mdk::playerShotRenderGate(rt));        // transitionPhase 0
+    rt.transitionPhase = 1;
+    CHECK(!mdk::playerShotRenderGate(rt));        // needs > 1
+    rt.transitionPhase = 2;
+    CHECK(mdk::playerShotRenderGate(rt));
+  }
+
+  // ---- Phase 10B — PlayerShotVisual snapshot: type 0 --------------
+  {
+    CollisionFixture f = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.yawDeg = 30.0f; s.pitchDeg = -10.0f;
+    s.spinDeg = 45.0f; s.fieldCc = 1.5f; s.tailLen = 8.0f;
+    s.lifetime = 75;
+    s.pos[0] = 100; s.pos[1] = 50; s.pos[2] = 20;
+    s.tail[0] = 90; s.tail[1] = 45; s.tail[2] = 20;
+    auto vs = mdk::playerShotVisuals(rt);
+    const mdk::PlayerShotVisual& v = vs[0];
+    CHECK(v.slot == 0 && v.state == 1 && v.type == 0);
+    CHECK(v.arena == a);
+    CHECK(near(v.pos[0], 100.0, 1e-6) && near(v.tail[0], 90.0, 1e-6));
+    CHECK(near(v.tailLen, 8.0, 1e-6));
+    // Billboard basis: render yaw = 90 - yawDeg; pitch = pitchDeg.
+    CHECK(near(v.billboardYawDeg, 60.0, 1e-6));
+    CHECK(near(v.billboardPitchDeg, -10.0, 1e-6));
+    CHECK(near(v.spinDeg, 45.0, 1e-6) && near(v.fieldCc, 1.5, 1e-6));
+    CHECK(v.worldRenderable);
+    CHECK(v.hudFrame == -1);                      // active -> no frame
+    // Free + expired slots expose HUD frames (FUN_0045ee7c iVar7).
+    CHECK(vs[1].hudFrame == 0);                   // state 0 -> frame 0
+    CHECK(!vs[1].worldRenderable);
+  }
+
+  // ---- Phase 10B — snapshot: type-4 velocity-derived billboard ----
+  {
+    mdk::TraversalRuntime rt;
+    mdk::PlayerShot& s = rt.shots[2];
+    s.state = 1; s.type = 4; s.lifetime = 100;
+    s.yawDeg = 10.0f;                             // unused for type 4
+    s.speedV = 40.0f;                             // pitch = -40*0.5 = -20
+    s.pos[0] = 10; s.pos[1] = 0; s.pos[2] = 5;
+    s.tail[0] = 0; s.tail[1] = 0; s.tail[2] = 5;  // delta = +x
+    auto vs = mdk::playerShotVisuals(rt);
+    const mdk::PlayerShotVisual& v = vs[2];
+    // atan2deg(dx=10, dy=0) = 90 -> billboardYaw = 90 - 90 = 0.
+    CHECK(near(v.billboardYawDeg, 0.0, 1e-4));
+    CHECK(near(v.billboardPitchDeg, -20.0, 1e-5));
+    // Clamp: speedV -300 -> pitch +150 -> clamped to +60.
+    s.speedV = -300.0f;
+    vs = mdk::playerShotVisuals(rt);
+    CHECK(near(vs[2].billboardPitchDeg, 60.0, 1e-6));
+    // atan2 path: tail +x of pos -> atan2deg(-10, 0) = 270 -> 90-270.
+    s.tail[0] = 20;
+    vs = mdk::playerShotVisuals(rt);
+    CHECK(near(vs[2].billboardYawDeg, 90.0 - 270.0, 1e-4));
+  }
+
+  // ---- Phase 10B — expired-state HUD frame mapping -----------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.shots[0].state = 4; rt.shots[0].lifetime = 0;   // -> frame 3
+    rt.shots[1].state = 3; rt.shots[1].lifetime = 0;   // -> 0x3c
+    rt.shots[2].state = 5; rt.shots[2].lifetime = 0;   // -> 0xf4
+    auto vs = mdk::playerShotVisuals(rt);
+    CHECK(vs[0].hudFrame == 3 && !vs[0].worldRenderable);
+    CHECK(vs[1].hudFrame == 0x3c);
+    CHECK(vs[2].hudFrame == 0xf4);
+    // Dying-but-live records are still world-rendered, no HUD frame.
+    rt.shots[0].lifetime = 5;
+    vs = mdk::playerShotVisuals(rt);
+    CHECK(vs[0].worldRenderable && vs[0].hudFrame == -1);
+    CHECK(mdk::kShotHudRect[0].x == 72 && mdk::kShotHudRect[2].x == 384);
+  }
+
+  // ---- Phase 10B — wall impact posts kShotWallImpact ---------------
+  {
+    CollisionFixture f = makeWallArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = makeShotRt(rt, f, "SHOT");
+    mdk::PlayerShot& s = rt.shots[0];
+    s.state = 1; s.type = 0; s.flyKind = mdk::kShotFlyTracer;
+    s.arena = a; s.yawDeg = 0.0f; s.speedH = 1100.0f; s.lifetime = 75;
+    s.pos[2] = 10.0f;
+    mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
+    CHECK(s.state == 4);
+    CHECK(rt.combatFx.size() == 1);
+    const mdk::CombatFxEvent& ev = rt.combatFx[0];
+    CHECK(ev.kind == mdk::CombatFxKind::kShotWallImpact);
+    // res bit0 of the (handlerless) dispatch is 0 -> mode 3 variant 1.
+    CHECK(ev.mode == 3 && ev.variant == 1 && ev.aux == 0);
+    CHECK(ev.obj == nullptr);
   }
 
   // ---- wall impact: type 0 -> state 4; type 2 -> detonate --------
@@ -13378,6 +13561,12 @@ void test_player_projectiles() {
     CHECK(o.field21e == 1 && o.field21c == 1 && o.field21d == 0);
     CHECK(o.field220 >= 0 && near(o.field228, 90.0, 1e-5));
     CHECK(rt.shotHitCount == 1);
+    // Phase 10B — the survived hit posts kShotObjectImpact carrying
+    // the FUN_00437444 args (mode 3, variant flag21f, aux field150).
+    CHECK(rt.combatFx.size() == 1);
+    CHECK(rt.combatFx[0].kind == mdk::CombatFxKind::kShotObjectImpact);
+    CHECK(rt.combatFx[0].mode == 3 && rt.combatFx[0].obj == &o);
+    CHECK(near(rt.combatFx[0].pos[0], o.field210[0], 1e-5));
     // Killed -> state 2 + the tally/death boundary.
     mdk::DynamicObject& o2 = a->dyn.allocFront();
     o2.model = makePlatformModel("PLAT", "ELEM", 0.0f);
@@ -13393,6 +13582,10 @@ void test_player_projectiles() {
     mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
     CHECK(o2.health <= 0 && s2.state == 2);
     CHECK(rt.seams.objectDeathCalls == 1);
+    // Phase 10B — the kill posts kObjectTeardown (no +0x110 script).
+    CHECK(rt.combatFx.size() == 2);
+    CHECK(rt.combatFx[1].kind == mdk::CombatFxKind::kObjectTeardown);
+    CHECK(rt.combatFx[1].obj == &o2);
     // pitchDeg bits are nonzero -> the tally gate ran, but "PLAT"
     // is not in the 34-name table -> no tally.
     CHECK(rt.killTally == 0);
@@ -13452,6 +13645,10 @@ void test_player_projectiles() {
     CHECK((d.col.flags148 & 0x20) != 0);
     CHECK(d.field108 == &sentinel && d.field230 == &sentinel &&
           d.field110 == nullptr);
+    // Phase 10B — the script handoff posts kObjectDeathScript.
+    CHECK(rt.combatFx.size() == 1 &&
+          rt.combatFx[0].kind == mdk::CombatFxKind::kObjectDeathScript &&
+          rt.combatFx[0].obj == &d);
     // The teardown path — +0x11e == 0xf arms fieldD2c; the latches
     // clear; a cleared mount deals 50 to the player.
     mdk::TraversalRuntime rt2;
@@ -13466,6 +13663,8 @@ void test_player_projectiles() {
           rt2.cs.excludeObj == nullptr && rt2.cs.lastObjContact == nullptr);
     CHECK(rt2.fieldHealth == 50);              // the mount-kill 50
     CHECK(rt2.seams.objectTeardownCalls == 1);
+    CHECK(rt2.combatFx.size() == 1 &&
+          rt2.combatFx[0].kind == mdk::CombatFxKind::kObjectTeardown);
   }
 
   // ---- splash (FUN_00460d44): int16 element wrap + kill ----------
@@ -13559,6 +13758,11 @@ void test_player_projectiles() {
     CHECK(o.field21d == 0xff && o.field21e == 0xff);   // state -1
     CHECK(rt.eventTimerObj == &a->eventLatch && rt.eventTimer == 1.0f);
     CHECK(a->eventLatch.col.named && a->eventLatch.health == 2);
+    // Phase 10B — the survived punch posts kPunchObjectImpact with
+    // the FUN_00437444 args (mode 1, variant flag21f, aux field150).
+    CHECK(rt.combatFx.size() == 1);
+    CHECK(rt.combatFx[0].kind == mdk::CombatFxKind::kPunchObjectImpact);
+    CHECK(rt.combatFx[0].mode == 1 && rt.combatFx[0].obj == &o);
     // Element killed -> the e+1 marks close the +0x21e == -1 gate,
     // so the whole-object state marks are skipped — but the health
     // subtraction still runs (the fallthrough quirk).

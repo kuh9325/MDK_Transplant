@@ -339,13 +339,15 @@ struct DynamicObject {
   std::uint8_t field21e = 0;         // +0x21e — punch-received mark;
                                      // Phase 10A: last-hit element+1
   std::string homingPrefix;          // +0x302 — element-name prefix
+                                     // (init opcode 0xc6 writes it)
   int homingDigitOfs = 0;            // +0x306 — digit check offset
+                                     // (init opcode 0xc6 byte operand)
   std::uint8_t field11a = 0;         // +0x11a — 0x0b target
   std::uint8_t field11b = 0;         // +0x11b — 0x49 target
   const void* field110 = nullptr;    // +0x110 — 0x4c image-ref target;
                                      // the death boundary hands it to
                                      // the +0x108/+0x230 script PCs
-  float field104 = 0.0f;             // +0x104 — 0xc6 target (consumer UNKNOWN)
+  float field104 = 0.0f;             // +0x104 — 0xc7 target (consumer UNKNOWN)
   float fieldE8 = 0.0f;              // +0xe8 — 1.0 default, 0x5a target
   float field2c0 = 0.0f;             // +0x2c0 — 1.0 default
   float field2c4 = 0.0f;             // +0x2c4 — 1000.0 default; the
@@ -368,19 +370,25 @@ struct DynamicObject {
   // pass decrements it, clamped at 0; a 0 crossing latches the dead
   // element into +0x21c/+0x220). NOT whole-object health (+0x08) —
   // the two are independent: element death only marks the element.
-  // The +0x30e region aliases connRadius on connectors — elements
-  // and the connector union never coexist (OBSERVED: connectors are
-  // not standable-geometry objects). The init site is UNKNOWN — the
-  // FUN_004566f0 default block doesn't write it; the loader/script
-  // seam is expected to populate it (sized to the element count).
+  // Provenance (OBSERVED): object-init opcode 0xc6 fills all eight
+  // slots with the low 16 bits of its dword operand; it is the only
+  // writer found. The +0x30e region aliases connRadius (0x99) and the
+  // 0x97 sound-name pointers on connectors — elements and the
+  // connector union never coexist (OBSERVED: the only real 0xc6 user,
+  // LEVEL3 HMO_1$XH1_DOOR, is not a connector).
   std::vector<std::int16_t> elemHp;
   // +0x31e — the second inline int16 element pool (parallel to
   // +0x30e). The punch's element-survived path copies elemThresh[e]
   // into the +0x118 pseudo-object's +0x2a2 when it is <= 900 (the
-  // event-latch arm). Loader/script populates it like elemHp.
+  // event-latch arm). Same 0xc6 provenance as elemHp.
   std::vector<std::int16_t> elemThresh;
-  // +0x150 — the survived-path effect seam aux (forwarded as the
-  // FUN_00437444 EBX arg on projectile/punch survived hits).
+  // +0x30a — the 0xc6 opcode's second dword operand (role UNKNOWN;
+  // no consumer found). Aliases connAnimFar on connectors.
+  std::uint32_t field30a = 0;
+  // +0x150 — per-object impact-sound name pointer (OBSERVED): the
+  // FUN_00437444 survived-hit callsites pass it as the EBX arg; a
+  // null/empty name falls back to the random RICO1/2/3 pick. Stored
+  // as an int32 marker — the name data itself is not ported.
   std::int32_t field150 = 0;
 
   // Death-boundary script handoff (FUN_00458140): when +0x110 is set

@@ -3256,3 +3256,207 @@ disassembly + decompile of `MDK95.EXE` unless tagged otherwise.
 - Remaining seams: `FUN_0045f030` shot render, `FUN_004575fc`
   remnant spawn, `FUN_00437444`/fx callsites, sound calls,
   the 34-name tally table — counted, not ported.
+
+# Phase 10B — Combat Presentation Semantics
+
+Bounded tail over the Phase 10A seam list. Nothing below mutates
+gameplay state on the original; the native side records a
+presentation-neutral contract (`PlayerShotVisual` snapshot +
+`CombatFxEvent` log) instead of porting the software renderer,
+particle pool or sound engine.
+
+## 140. Shot render path — `FUN_0045f030`/`FUN_0045ee7c`/`FUN_0045e9a0` (OBSERVED)
+
+- `FUN_0045f030` snapshots the `0x540b28` camera block (0xd4 bytes)
+  to a local, sets render guard `0x540d44 = 1`, calls
+  `FUN_0045ee7c` once per pool slot with that slot's HUD-window
+  constants, then restores the block and clears the guard.
+  Sole caller is the world tick at `0x436dd3` (mode 0) /
+  `0x436e33` (mode 1), both gated `flagC9c != 0 &&
+  transitionPhase > 1` — the fully scoped sniper state. There is
+  NO unscoped shot-render path (OBSERVED; no other xrefs).
+- `FUN_0045ee7c(slot, x, y, x2, y2, w, h, mode)` computes a frame
+  select: `state == 0` → `0`; `lifetime < 1` → state 4 → `3`,
+  state 3 → `0x3c`, other → `0xf4`; active (`lifetime >= 1`) → `-1`.
+- Mode 0 (world): active records only — `FUN_0045e9a0` builds the
+  billboard, `FUN_0042b0c0` may run when `0x541548` is set (the
+  dead dual-viewport path), `FUN_0046ec60` under the `0x5414d4`
+  HUD gate, then `FUN_0045ee08` drives animation.
+- Mode 1 (HUD): `hudActive && frame != -1` — non-type-4 slots
+  `FUN_00416aa8` rect-fill over the per-slot window; type 4 uses
+  `FUN_00409760` and advances `+0xf4` by `min(frameStep, 2)` capped
+  at `*0x54c66c·2 − 1`.
+- `FUN_0045e9a0` billboard (OBSERVED): anchored at the tail
+  endpoint `+0xc0..+0xc8` written into `0x540b34..0x540b48`;
+  render yaw `0x540b50 = 90 − yawDeg`; render pitch `= pitchDeg`;
+  `+0xcc` feeds scalars `0x540b58`/`0x540b64`. Type 4 instead
+  derives yaw from the horizontal tail→pos delta
+  (`90 − atan2deg(dx, dy)`) and pitch `= −speedV·0.5` clamped
+  `[−60, +60]` (doubles `0x4984a0`/`0x4984a8`/`0x4984ac`).
+- Per-slot image window written to `0x540b78..` — slot 0
+  `{0x48,10,0x8d,0x2c}`, slot 1 `{0xe4,0,0x129,0x22}`, slot 2
+  `{0x180,10,0x1c5,0x2c}`; `0x540b68/0x540b6c = {140,70}`.
+- HUD tables (OBSERVED data): positions `0x49b900` =
+  `{72,10},{228,0},{384,10}`, sizes `0x49b8e8` = `{140,70}` ×3.
+- Native: `playerShotRenderGate(rt)` reproduces the
+  `flagC9c && transitionPhase > 1` gate; `playerShotVisuals(rt)`
+  fills `PlayerShotVisual` per slot (state, type, arena, pos,
+  tail endpoint/length, yaw/pitch/spin, `fieldCc`, ribbon flag,
+  `worldRenderable`, `hudFrame`); `kShotHudRect` carries the HUD
+  rects. No renderer code is ported.
+
+## 141. `FUN_00437444` — impact presentation dispatch (OBSERVED callsites)
+
+Signature `(EAX ctx, EDX &pos, EBX sndName, ECX paletteMode,
+stack count)`. Internally: `paletteMode` selects
+`{life|color, scale}` — `0 → {0xd or 3 (0x54150c gate), 3, 1.0}`,
+`1 → {0x25, 0xf0, 0.5}`, `else → {10, 3, 1.0}`; `sndName` null or
+empty-string → random RICO1/2/3 handle (`FUN_00401ed4` bounded
+pick → `0x54c5e8/0x54c5ec/0x54c5f0`), else the name is resolved
+via `FUN_00402fe8` and played (`FUN_00402288`); `count` particles
+spawn through the `FUN_00403f6c`/`FUN_00404108` pool
+(presentation-only, depth-evicted).
+
+- Shot wall (`FUN_00460164` tail, `0x4601a8`/`0x4601c3`):
+  `surfaceDispatch` bit0 set → `{mode 1, count 2}` else
+  `{mode 3, count 1}`; EBX `0`.
+- Shot object survived (`FUN_0045ff9d`, `0x460059`):
+  `{mode 3, count flag21f}`, EBX `= obj+0x150`, pos `=&obj+0x210`.
+- Punch object survived (`0x4334b0`): `{mode 1, count flag21f}`,
+  EBX `= obj+0x150`, pos `=&hitPt` (element or whole-object).
+- Punch wall (`0x43371f`/`0x43377e` vs `0x43379b`): `{mode 1,
+  count 2}` when the surface handler ran else `{mode 1, count 1}`;
+  EBX `0`.
+- `FUN_0045bec8` water splash (`0x45c068`/`0x45c087`):
+  `{mode 1, count 1|0}` — sits on the generic `FUN_004533d4`
+  sweep chain, not the shot path; classified, not emitted.
+- Native: one `CombatFxEvent` per callsite carrying
+  `kind/mode(palette)/variant(count)/aux(sndName)/pos/obj` on
+  `rt.combatFx`. `field150` is kept as an int32 marker — the
+  pointed-at name data is not ported.
+
+## 142. `FUN_004575fc` — detonation remnant (OBSERVED, gameplay-inert)
+
+- Allocates a real DynamicObject through `FUN_0045cffc` (LRU
+  eviction over the arena `+0x68` list; class names `XG`, `XF`,
+  `BOLT`, `BIGBOLT` are eviction-protected), sets class record
+  `0x4edcc0`, `+0x08 = 0`, `flags148 |= 0x20` (the dead flag that
+  excludes it from combat scans), `+0xe4 = 0xffff` (no model
+  frame), `+0x60 = arena`, pos + prevPos = the impact point,
+  `+0x4c/+0x50` = camera-relative yaw, `+0x13c` = pitch,
+  `+0xdc = −1.0`, `+0x58 = param_3` (scale `2.0` at the
+  `FUN_00460b7c` callsite `0x460bd8`), then plays `EXPLODE`
+  (`0x54c61c`, `FUN_00402160` vol `0x7fff` rate `200.0`).
+- Two other callers exist inside VM opcode handlers `0xac`/`0xb2`
+  (script-driven effect spawns) — same record family.
+- The remnant is a render/update-side corpse marker: `health 0`
+  and the `0x20` flag make it invisible to every combat scan —
+  presentation-only. Native keeps it as the `kDetonation` event
+  plus `seams.remnantSpawnCalls`; no object is spawned.
+
+## 143. Element HP/threshold init — opcode `0xc6` (OBSERVED, ported)
+
+- The tr_alcmd jump table (`jmp [0x438a5c + (op−1)·4]`) maps
+  opcode `0xc6` → handler `0x4394d0`. Grammar
+  `{str8 prefix → +0x302, u8 digitOfs → +0x306, u32 hpThresh,
+  u32 extra → +0x30a}`; side effects `+0x149 |= 0x20` (enables the
+  element/homing scan) then fills all eight `int16` slots of
+  `+0x31e` AND `+0x30e` with `low16(hpThresh)` — a uniform
+  hp = threshold init.
+- `0xc7` → `0x45188f` is the actual `+0x104` variable write
+  (same operand grammar as `0x53`/`0x54`, inline-f32 mode). The
+  previous native mapping `0xc6 → +0x104` was a mislabel — fixed;
+  the decoder grammar/name tables follow the same correction.
+- The `+0x30e..+0x32d` region is a class-dependent union: `0xc6`
+  element pools vs connector ops `0x96`–`0x99` (anim pointers
+  `+0x306/+0x30a`, sound-name pointers `+0x316..+0x322`, radius
+  `+0x30e`). The two never coexist on one class (OBSERVED).
+- Census: 344 table-2 init scripts across LEVEL3–8 contain exactly
+  one `0xc6` — `LEVEL3 HMO_1$XH1_DOOR`:
+  `XH1_KEY / digitOfs 7 / hp 120 / extra 0` (the object also gets
+  the `0xfde8` invulnerable sentinel). Its model carries elements
+  `XH1_KEY1`/`XH1_KEY2`; the scan predicate `FUN_0045f634` accepts
+  `name == prefix` (NUL-terminated) with `name[digitOfs] ∈ 0..9`,
+  so `XH1_KEY1/2` hit and `XH1_DOOR1`/`XH1_KEYX`/`XH1_KEY` do not.
+- Consumers confirmed: element damage writes `+0x30e+2e` (int16
+  wrap quirk, Phase 10A); the `+0x31e <= 900` latch arms the
+  pseudo-object event timer; `+0x302/+0x306` drive both the
+  hit-element scan and the homing/meat targeting string compare
+  (`FUN_0042fa50` vs `MEAT_3/4/8`).
+
+## 144. Death-script handoff — `+0x108`/`+0x110`/`+0x230` (OBSERVED)
+
+- `+0x108` is the object script PC — the VM fetch cursor
+  (dispatch head `0x4389dd`, jump table `0x438a5c`); `+0x22c`
+  the wait timer, `+0x230` the resume PC after wait. VM entry
+  `FUN_004388d8` selects between them on resume.
+- `+0x110` is written by opcode `0x4c` (`image-ref`: stores
+  `cmiBase + off`) and populated at spawn by `FUN_00427218` from
+  the class template — same script-stream pointer domain as
+  `+0x108/+0x230`.
+- `FUN_00458140` handoff (already ported): `+0x110 != 0` →
+  `+0x108 = +0x230 = +0x110`, `+0x110 = 0`, `field11e = 0`,
+  `health = 0`, `+0x22c = 0`, `flags148 |= 0x20`. The `0x20` flag
+  excludes the corpse from every combat scan; the record stays
+  in its arena list — the deferred script drives the death
+  animation/removal itself. Where the handed-off script
+  terminates the object is the G5 boundary (UNKNOWN beyond this
+  point by scope).
+- Native: `kObjectDeathScript` event on the handoff branch,
+  `kObjectTeardown` on the `FUN_00457cf4` branch — both carry the
+  object pointer and position.
+
+## 145. Combat sound callsites — classification only (OBSERVED names)
+
+`FUN_0043394c` (level sound-table loader inside `FUN_00433d40`)
+registers 40 `FUN_00402fe8` name→handle lookups into
+`0x54c5d0..0x54c664`, plus two level-specific names from the
+`LEVEL-d .SNI` record into `0x54c628/0x54c62c`:
+
+```
+0x54c5d0 SNIPERSHOT   0x54c5d4 SNIPERON   0x54c5d8 SNIPEROFF
+0x54c5dc BREATH       0x54c5e0 MULTIFIRE  0x54c5e4 GATTFIRE
+0x54c5e8 RICO1        0x54c5ec RICO2      0x54c5f0 RICO3
+0x54c5f4 ALERT        0x54c5f8 ALDIE      0x54c5fc CHUTEOUT
+0x54c600 CHUTEIN      0x54c604 CHUTEON    0x54c608 LAND
+0x54c60c FOOT1        0x54c610 FOOT2      0x54c614 FOOT3
+0x54c618 FOOT4        0x54c61c EXPLODE    0x54c630 GRUNTFIRE
+0x54c634 APPLE        0x54c638 DUMMY      0x54c63c COW
+0x54c640 SNIPRELD     0x54c644 RUNNER     0x54c648 FAN
+0x54c64c TORNADO      0x54c650 RASPBER    0x54c654 ZOOMBEG
+0x54c658 ZOOM         0x54c65c WMIB       0x54c660 BONES
+0x54c664 COLLECT
+```
+
+Combat usage (OBSERVED callsites): fire per weapon handle via the
+`FUN_0045f138` table; fire-deny `RASPBER`; `FUN_00437444` wall
+impacts pick RICO1/2/3 (or the `+0x150` per-object override on
+object hits); detonation remnant plays `EXPLODE`; `ALDIE` sits on
+the teardown path. No audio playback is ported — the `CombatFxEvent`
+metadata preserves the handles' call context.
+
+## 146. Native implementation + validation (OBSERVED, ported)
+
+- `traversal_script.cpp`: `0xc6` = element-set declaration,
+  `0xc7` = `+0x104` write; init-decoder grammar/name tables
+  updated.
+- `dynamic_objects.h`: `field30a` added; `elemHp`/`elemThresh`/
+  `field104`/`field150`/`+0x108`/`+0x230` comments carry the
+  proven provenance/union notes.
+- `player_projectiles.h/.cpp`: `PlayerShotVisual`,
+  `kShotHudRect`, `playerShotRenderGate`, `playerShotVisuals`,
+  `CombatFxKind`/`CombatFxEvent`, event pushes at the
+  `FUN_00460164`/`FUN_0045ff9d`/`FUN_00460b7c`/`FUN_00458140`
+  seams; `player_fire.cpp` pushes the two punch events.
+- `TraversalRuntime::combatFx` — drainable presentation event
+  log alongside the existing `seams` counters.
+- `mdk_tests`: **3957 checks / 0 failures** — new coverage for
+  the `0xc6` declaration (incl. the real `XH1_DOOR` operand
+  triple), the `0xc7` write, an end-to-end `0xc6` → punch
+  element-damage case, the render gate + snapshot fields +
+  type-4 billboard math + HUD frame mapping, and one event
+  assertion per `CombatFxKind`.
+- Remaining seams for Phase 10C: the actual particle/sound/
+  software-render implementations, the `FUN_0045ee08` anim
+  driver, type-4 `FUN_00409760` widget, and the handed-off death
+  script's execution (G5).

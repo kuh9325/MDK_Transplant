@@ -83,6 +83,7 @@
 #include "core/gameplay_input.h"
 #include "core/player_camera.h"
 #include "core/player_fire.h"
+#include "core/player_projectiles.h"
 #include "core/player_look.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
@@ -463,6 +464,12 @@ struct TraversalRuntime {
   int fieldHealthGate = 0;        // 0x541510 — health/difficulty gate
   int difficulty = 1;             // 0x54147a — difficulty (0 easy/1/2 hard)
   int hudActive = 0;              // 0x5414d4 — HUD gate for d0c++/blit
+  // Phase 10B — combat presentation event log (player_projectiles.h).
+  // One CombatFxEvent per original FUN_00437444/FUN_004575fc/
+  // FUN_00458140 callsite, pushed alongside the seams.* counters.
+  // Presentation-only — the frontend drains it; nothing consumes it
+  // in-game. (std::move + clear to drain.)
+  std::vector<CombatFxEvent> combatFx;
   // Animation machine (FUN_00461954) + slide vector + scripted gates:
   int animPrev = -1;              // 0x540cb0 — previous anim state (the
                                   // first-frame detect latch)

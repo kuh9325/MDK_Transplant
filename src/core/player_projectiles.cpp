@@ -494,8 +494,16 @@ void wallImpactDispatch(TraversalRuntime& rt, TraversalArena& arena,
   const std::uint8_t res =
       shotSurfaceDispatch(arena.surface, secondary, 1, poly, s.type,
                           hitPt, s.pos, prevPos);
-  (void)res;   // the fx variant selects on result bit0 — counted only
+  // FUN_00437444(arena, &vec, 0, mode, variant) — handler-ran (res&1)
+  // -> {mode 1, variant 2}, else {mode 3, variant 1} (0x4601a8/0x4601c3,
+  // OBSERVED). The EBX aux is 0 on the wall path.
   ++rt.seams.shotImpactFxCalls;
+  CombatFxEvent ev;
+  ev.kind = CombatFxKind::kShotWallImpact;
+  ev.mode = (res & 1) ? 1 : 3;
+  ev.variant = (res & 1) ? 2 : 1;
+  ev.pos[0] = hitPt[0]; ev.pos[1] = hitPt[1]; ev.pos[2] = hitPt[2];
+  rt.combatFx.push_back(ev);
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +521,10 @@ void detonateShot(TraversalRuntime& rt, PlayerShot& s, int dmg,
   splashDamage(rt, s.pos, static_cast<float>(half), radius, 1, directObj,
                1, kDetonateExcl);
   ++rt.seams.remnantSpawnCalls;   // FUN_004575fc(arena, pos, 2.0f)
+  CombatFxEvent fx;
+  fx.kind = CombatFxKind::kDetonation;
+  fx.pos[0] = s.pos[0]; fx.pos[1] = s.pos[1]; fx.pos[2] = s.pos[2];
+  rt.combatFx.push_back(fx);
   s.state = 5;
   s.lifetime = kImpactLife;
   s.remnantIdx = 0;
@@ -562,6 +574,11 @@ void objectDeathBoundary(TraversalRuntime& rt, DynamicObject& obj,
                          const float hitPt[3], float facingDeg) {
   ++rt.seams.objectDeathCalls;
   if (obj.field110 != nullptr) {
+    CombatFxEvent fx;
+    fx.kind = CombatFxKind::kObjectDeathScript;
+    fx.obj = &obj;
+    fx.pos[0] = obj.pos[0]; fx.pos[1] = obj.pos[1]; fx.pos[2] = obj.pos[2];
+    rt.combatFx.push_back(fx);
     obj.field11e = 0;
     obj.health = 0;
     obj.field22c = 0.0f;
@@ -580,6 +597,14 @@ void objectDeathBoundary(TraversalRuntime& rt, DynamicObject& obj,
   //   == obj -> clear. The corpse-model/gib spawn, death sound and
   //   the fade accumulator are render/effect seams — counted.
   ++rt.seams.objectTeardownCalls;
+  {
+    CombatFxEvent fx;
+    fx.kind = CombatFxKind::kObjectTeardown;
+    fx.obj = &obj;
+    fx.pos[0] = obj.pos[0]; fx.pos[1] = obj.pos[1];
+    fx.pos[2] = obj.pos[2];
+    rt.combatFx.push_back(fx);
+  }
   if (obj.field11e == 0xf) rt.fieldD2c = 0xa;
   if (rt.fieldB85c == &obj) rt.fieldB85c = nullptr;
   if (rt.cs.excludeObj == &obj.col) {
@@ -1127,8 +1152,17 @@ void updateShot(TraversalRuntime& rt, PlayerShot& s, int frameStep,
     ++rt.shotHitCount;
     if (hitObj->health > 0) {
       // Survived — FUN_00437444(arena, &field210, field150, 3,
-      // flag21f) — counted.
+      // flag21f) at 0x460059 (OBSERVED).
       ++rt.seams.shotImpactFxCalls;
+      CombatFxEvent fx;
+      fx.kind = CombatFxKind::kShotObjectImpact;
+      fx.mode = 3;
+      fx.variant = hitObj->flag21f;
+      fx.aux = hitObj->field150;
+      fx.pos[0] = hitObj->field210[0]; fx.pos[1] = hitObj->field210[1];
+      fx.pos[2] = hitObj->field210[2];
+      fx.obj = hitObj;
+      rt.combatFx.push_back(fx);
       s.state = 3;
       s.lifetime = kImpactLife;
       s.dyingTimer = s.lifetime + 15;
@@ -1165,6 +1199,79 @@ void playerShotPoolTick(TraversalRuntime& rt, int frameStep, float dt,
   for (PlayerShot& s : rt.shots) {
     if (s.state != 0) updateShot(rt, s, frameStep, smoothed);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10B — the shot-render presentation contract.
+//
+// FUN_0045f030 (0x436dd3/0x436e33 callsites, OBSERVED): the frame
+// driver snapshots the camera block (0x540b28, 0xd4 bytes), sets the
+// render guard 0x540d44, calls FUN_0045ee7c once per slot in each of
+// two modes (0 = world, 1 = HUD indicator), then restores the block.
+//
+// FUN_0045ee7c per slot:
+//   state == 0                       -> HUD frame 0
+//   state != 0 && lifetime < 1       -> HUD frame 3 (state 4) /
+//                                       0x3c (state 3) / 0xf4 (else)
+//   state != 0 && lifetime >= 1      -> active: mode 0 submits the
+//                                       world billboard, mode 1 draws
+//                                       nothing (iVar7 == -1)
+// The world path runs FUN_0045e9a0 (billboard build), then optionally
+// FUN_0042b0c0 (flag541548 — no writer in BUILD_A) and FUN_0046ec60
+// (hudActive gate), then FUN_0045ee08. The HUD path additionally
+// requires hudActive (0x5414d4); type-4 slots use FUN_00409760 instead
+// of FUN_00416aa8 and run a +0xf4 counter (frameStep capped at 2,
+// clamp *_DAT_0054c66c*2-1).
+//
+// FUN_0045e9a0 builds a camera-facing billboard anchored at the tail
+// endpoint (+0xc0..0xc8): render yaw 0x540b50 = 90 - yawDeg (type 4:
+// 90 - atan2deg(pos-tail xy)); render pitch = pitchDeg (type 4:
+// -speedV*0.5 clamped to +-60); +0xcc is stored as the render scalar.
+// ---------------------------------------------------------------------------
+
+bool playerShotRenderGate(const TraversalRuntime& rt) {
+  return rt.flagC9c != 0 && rt.transitionPhase > 1;
+}
+
+std::array<PlayerShotVisual, 3>
+playerShotVisuals(const TraversalRuntime& rt) {
+  std::array<PlayerShotVisual, 3> out{};
+  for (int i = 0; i < 3; ++i) {
+    const PlayerShot& s = rt.shots[i];
+    PlayerShotVisual& v = out[i];
+    v.slot = i;
+    v.state = s.state;
+    v.type = s.type;
+    v.arena = s.arena;
+    v.pos[0] = s.pos[0]; v.pos[1] = s.pos[1]; v.pos[2] = s.pos[2];
+    v.tail[0] = s.tail[0]; v.tail[1] = s.tail[1]; v.tail[2] = s.tail[2];
+    v.tailLen = s.tailLen;
+    v.yawDeg = s.yawDeg;
+    v.pitchDeg = s.pitchDeg;
+    v.spinDeg = s.spinDeg;
+    v.fieldCc = s.fieldCc;
+    v.ribbonBound = (s.flags & 1u) != 0;
+    if (s.type == 4) {
+      // OBSERVED: atan2 over the horizontal pos-tail delta (the
+      // +0x20/+0x24 minus +0xc0/+0xc4 pair), pitch from speedV.
+      v.billboardYawDeg = 90.0f -
+          bearingDeg(s.pos[0] - s.tail[0], s.pos[1] - s.tail[1]);
+      float p = -s.speedV * 0.5f;                 // 0x4984a0
+      v.billboardPitchDeg = (p > 60.0f) ? 60.0f   // 0x4984a8
+                          : (p < -60.0f) ? -60.0f // 0x4984ac
+                          : p;
+    } else {
+      v.billboardYawDeg = 90.0f - s.yawDeg;       // 0x498498 = 90.0
+      v.billboardPitchDeg = s.pitchDeg;
+    }
+    // FUN_0045ee7c's frame/gate selection.
+    v.worldRenderable = (s.state != 0 && s.lifetime > 0);
+    v.hudFrame = (s.state == 0) ? 0
+               : (s.lifetime < 1)
+                   ? ((s.state == 4) ? 3 : (s.state == 3) ? 0x3c : 0xf4)
+               : -1;
+  }
+  return out;
 }
 
 } // namespace mdk

@@ -169,11 +169,13 @@
 #ifndef MDK_CORE_PLAYER_PROJECTILES_H
 #define MDK_CORE_PLAYER_PROJECTILES_H
 
+#include <array>
 #include <cstdint>
 
 namespace mdk {
 
 struct TraversalRuntime;
+struct TraversalArena;
 struct DynamicObject;
 
 // ---------------------------------------------------------------------------
@@ -219,6 +221,101 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
                   float dmgScale, float range, int tallyGate,
                   DynamicObject* directObj, std::uint32_t flags,
                   std::int8_t exclMask);
+
+// ---------------------------------------------------------------------------
+// Phase 10B — combat presentation contract (core-neutral).
+//
+// Everything below is derived from the original shot-render chain
+// FUN_0045f030 -> FUN_0045ee7c -> FUN_0045e9a0 and the FUN_00437444 /
+// FUN_004575fc / FUN_00458140 effect seams (all OBSERVED; see
+// GAMEPLAY_RECONSTRUCTION.md). No Godot types — the frontend consumes
+// these records verbatim.
+// ---------------------------------------------------------------------------
+
+// Per-slot shot presentation record — FUN_0045ee7c's two modes merged.
+struct PlayerShotVisual {
+  int slot = 0;              // pool index 0..2
+  int state = 0;             // +0x00 verbatim
+  int type = 0;              // +0xd0 weapon index
+  const TraversalArena* arena = nullptr; // +0x18
+  float pos[3] = {0, 0, 0};  // +0x20 — head position
+  float tail[3] = {0, 0, 0}; // +0xc0 — tail endpoint; FUN_0045e9a0
+                             // anchors the billboard here
+  float tailLen = 0.0f;      // +0xbc
+  float yawDeg = 0.0f;       // +0x04 stored yaw
+  float pitchDeg = 0.0f;     // +0x08 stored pitch
+  // FUN_0045e9a0's billboard basis inputs (0x540b50/local_20):
+  //   type != 4: billboardYaw = 90 - yawDeg,  billboardPitch = pitchDeg
+  //   type == 4: billboardYaw = 90 - atan2deg(dx, dy) over the
+  //              pos-tail xy delta, billboardPitch = -speedV*0.5
+  //              clamped to [-60, +60].
+  float billboardYawDeg = 0.0f;
+  float billboardPitchDeg = 0.0f;
+  float spinDeg = 0.0f;      // +0x0c streak spin
+  float fieldCc = 0.0f;      // +0xcc render scalar (0x540b58/0x540b64)
+  bool ribbonBound = false;  // +0xf8 bit0
+  // Mode-0 gate: the original submits geometry iff the record is
+  // active (state != 0 && lifetime > 0).
+  bool worldRenderable = false;
+  // Mode-1 HUD indicator frame select (FUN_0045ee7c iVar7): -1 for an
+  // active record (no indicator drawn), else 0 (free) / 3 (state 4
+  // expired) / 0x3c (state 3 expired) / 0xf4 (any other expired
+  // state). The indicator is gated on hudActive (0x5414d4).
+  int hudFrame = -1;
+};
+
+// The original's per-slot HUD indicator rects — pos at 0x49b900
+// {72,10} {228,0} {384,10} and size {140,70} at 0x49b8e8 (OBSERVED).
+struct PlayerShotHudRect { int x, y, w, h; };
+inline constexpr PlayerShotHudRect kShotHudRect[3] = {
+    {72, 10, 140, 70}, {228, 0, 140, 70}, {384, 10, 140, 70}};
+
+// FUN_0045f030's caller gate (0x436dd3, OBSERVED): the shot render
+// pass runs only when flagC9c != 0 && transitionPhase > 1 — the fully
+// scoped sniper state. There is no unscoped shot-render path.
+bool playerShotRenderGate(const TraversalRuntime& rt);
+
+// Per-frame snapshot of the 3-slot pool, mirroring FUN_0045f030's
+// per-slot dispatch. Pure read — the pool is untouched.
+std::array<PlayerShotVisual, 3>
+playerShotVisuals(const TraversalRuntime& rt);
+
+// ---------------------------------------------------------------------------
+// Presentation-facing combat events — one record per original
+// callsite, carrying the exact original effect args. Nothing here is
+// gameplay state; the frontend drains TraversalRuntime::combatFx.
+// ---------------------------------------------------------------------------
+
+enum class CombatFxKind : int {
+  kShotWallImpact = 0,   // FUN_00460164 tail -> FUN_00437444
+  kShotObjectImpact,     // FUN_0045ff9d survived path -> FUN_00437444
+  kPunchWallImpact,      // FUN_00432f84 miss stab -> FUN_00437444
+  kPunchObjectImpact,    // FUN_00432f84 survived -> FUN_00437444
+  kDetonation,           // FUN_00460b7c -> state 5 + FUN_004575fc
+                         // (remnant DynamicObject, scale 2.0f)
+  kObjectDeathScript,    // FUN_00458140 -> +0x110 script handoff
+  kObjectTeardown,       // FUN_00458140 -> FUN_00457cf4 teardown
+  // FUN_0045bec8's two water-splash FUN_00437444 callsites are NOT
+  // emitted here: they sit on the generic sweep helper chain
+  // (FUN_004572ac -> FUN_004533d4 -> FUN_0045b6f8), classified-only.
+};
+
+struct CombatFxEvent {
+  CombatFxKind kind = CombatFxKind::kShotWallImpact;
+  // FUN_00437444 ECX arg — particle palette/scale select: 0 -> {0xd|3,
+  // 3, 1.0}, 1 -> {0x25, 0xf0, 0.5}, else(3) -> {10, 3, 1.0}. 0 on
+  // non-00437444 events.
+  int mode = 0;
+  // FUN_00437444 stack arg — particle COUNT (the spawn loop runs
+  // count times). flag21f on object hits (0/1), handler-ran 2 else 1
+  // on wall hits.
+  int variant = 0;
+  // FUN_00437444 EBX arg — per-object impact-sound name override
+  // (obj +0x150). Null/empty selects a random RICO1/2/3 handle.
+  std::int32_t aux = 0;
+  float pos[3] = {0, 0, 0};  // the EDX vector (hit/contact point)
+  const DynamicObject* obj = nullptr;  // subject object, if any
+};
 
 } // namespace mdk
 

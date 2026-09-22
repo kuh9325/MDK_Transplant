@@ -640,6 +640,14 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
     }
     // FUN_00437444(obj.arena, &hitPt, obj.field150, 1, flag21f).
     ++rt.seams.punchEffectCalls;
+    CombatFxEvent fx;
+    fx.kind = CombatFxKind::kPunchObjectImpact;
+    fx.mode = 1;
+    fx.variant = obj.flag21f;
+    fx.aux = obj.field150;
+    fx.pos[0] = hitPt[0]; fx.pos[1] = hitPt[1]; fx.pos[2] = hitPt[2];
+    fx.obj = bestObj;
+    rt.combatFx.push_back(fx);
     return;
   }
 
@@ -678,8 +686,15 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
         punchState, aimPt, missPt, hitPt, fx, ctx->surface.scriptFn,
         ctx->surface.scriptUser);
     ++rt.seams.punchWallCalls;
-    (void)res;   // FUN_00437444: res&1 -> count 1 variant 2 else 1/1
+    // FUN_00437444(arena, &vec, 0, 1, variant) — handler-ran (res&1)
+    // -> variant 2, else variant 1 (0x43371f/0x43377e vs 0x43379b).
     ++rt.seams.punchEffectCalls;
+    CombatFxEvent ev;
+    ev.kind = CombatFxKind::kPunchWallImpact;
+    ev.mode = 1;
+    ev.variant = (res & 1) ? 2 : 1;
+    ev.pos[0] = hitPt[0]; ev.pos[1] = hitPt[1]; ev.pos[2] = hitPt[2];
+    rt.combatFx.push_back(ev);
     return;
   }
 }

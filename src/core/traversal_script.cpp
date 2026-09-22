@@ -678,8 +678,10 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
 //   fields:   0x08 +0x4c yaw(i16,neg+360)  0x0b +0x11a  0x49 +0x11b
 //             0x10 +0x8/+0x2a2/+0x21f health(u16)  0x6f +0x146(u16)
 //             0x32/0x33/0x34 +0x38/+0x3c/+0x40     0x53 +0x58 scale
-//             0x54 +0x5c zBias   0x5a +0xe8        0xc6 +0x104
+//             0x54 +0x5c zBias   0x5a +0xe8        0xc7 +0x104
 //             0x75 +0x118 anim-target(u16-1)     0x4c +0x110 imgref
+//             0xc6 elem-set decl -> +0x149|0x20, +0x302 prefix,
+//                +0x306 digitOfs, +0x30a extra, +0x30e/+0x31e pools
 //   flags:    0x23 +0x148|2   0x24 +0x148|1  0x29 +0x149|1/+0x14a|0x80
 //             0x3f +0x148^0x10(inv)  0x61 +0x148^0x80(inv,+0x54=0)
 //             0x74 +0x148 dword |=
@@ -812,7 +814,27 @@ TraversalScriptResult traversalObjectInitScript(
     }
     case 0x54: obj.zBias = resolveVar(r, oenv, st); break;    // +0x5c
     case 0x5a: obj.fieldE8 = resolveVar(r, oenv, st); break;  // +0xe8
-    case 0xc6: obj.field104 = resolveVar(r, oenv, st); break; // +0x104
+    case 0xc6: {                            // element-set declaration
+      // OBSERVED (handler 0x4394d0, dispatch-table slot 0xc6):
+      //   {str8 prefix, u8 digitOfs, u32 hpThresh, u32 extra}
+      // +0x149 |= 0x20; +0x302 = prefix chars (the original stores a
+      // char* into the bytecode stream — past the len byte, or at it
+      // for the empty string which reads as ""); +0x306 = digitOfs
+      // (dword-stored u8); +0x30a = extra; then all eight +0x31e[i]
+      // and +0x30e[i] = low16(hpThresh). The only real user in
+      // LEVEL3..8 is LEVEL3 HMO_1$XH1_DOOR {XH1_KEY, 7, 120, 0}.
+      obj.col.flags149 |= 0x20;
+      obj.homingPrefix = r.str();
+      obj.homingDigitOfs = r.u8();
+      const std::uint32_t hp = r.u32();
+      obj.field30a = r.u32();
+      if (!r.ok) { fail("init elemset"); return res; }
+      const std::int16_t v = static_cast<std::int16_t>(hp & 0xffffu);
+      obj.elemThresh.assign(8, v);
+      obj.elemHp.assign(8, v);
+      break;
+    }
+    case 0xc7: obj.field104 = resolveVar(r, oenv, st); break; // +0x104
     case 0x4c: {                              // +0x110 image ref (0->null)
       std::uint32_t off = r.u32();
       obj.field110 = (off == 0) ? nullptr : imageRef(off, 4);
@@ -1098,6 +1120,8 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xce: return "wfsw";
   case 0x8e: return "bsbbf";
   case 0x99: case 0x05: return "f";
+  case 0xc6: return "sbww";        // obj-init elem-set declaration
+  case 0xc7: return "v";           // obj-init +0x104 var write
   case 0xe0: return "b";           // + conditional ff when flag != 0
   case 0x0a: return "sbl";
   default: return nullptr;
@@ -1122,6 +1146,7 @@ const char* opcodeName(std::uint8_t op) {
   case 0x0d: return "linkGate"; case 0xe0: return "deflect";
   case 0x0a: return "brObj11a";  case 0x0b: return "setVar11a";
   case 0x41: return "setVar";
+  case 0xc6: return "elemset"; case 0xc7: return "setF104";
   default: return nullptr;
   }
 }
