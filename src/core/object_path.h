@@ -33,6 +33,10 @@ bool pathSample(const void* rec, float frame, float out[3]);
 float pathFirstFrame(const void* rec);
 float pathLastFrame(const void* rec);
 
+// entry[i].frame — OBSERVED: the cmd-0x80 release midpoint reads
+// entry[1]/entry[2] directly (record +0x2c/+0x54); 0 when out of range.
+float pathEntryFrame(const void* rec, int i);
+
 // FUN_00457264 — snap pos = pathSample(+0xec, +0xf0) + lateral +0xf4.
 // Runs once at op-0x02 bind time.
 void objectPathSnap(DynamicObject& o);

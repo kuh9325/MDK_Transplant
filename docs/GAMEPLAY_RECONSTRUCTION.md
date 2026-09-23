@@ -2882,8 +2882,9 @@ disassembly + decompile of `MDK95.EXE` unless tagged otherwise.
   probe) or `0x54163b != 0` (fire latch) → no-fire seam. Else
   `0x54163b = 1` when `0x541498 > 3`, `burstIndex -= 1`,
   `fireCadence += 1.0`, `0x541633 -= 1`, `fireCadence = 3.0` if
-  `burstIndex == 0`, then the weapon-5 spawn seam `FUN_0045a4dc`.
-  `0x540e80` (`shotSerial`) is **not** incremented on this path.
+  `burstIndex == 0`, then the weapon-5 spawn `FUN_0045a4dc`
+  (ported in Phase 12A — §162). `0x540e80` (`shotSerial`) is
+  **not** incremented on this path.
 - **Weapons 0..4**: scan the 3-slot pool for `state == 0`; return
   silently if all busy. `0x540d0c = 0`, fire-sound seam, slot memset,
   `state = 1`, `classIdx = -1`, `pos ← 0x540b28` (camera pos),
@@ -3040,9 +3041,10 @@ disassembly + decompile of `MDK95.EXE` unless tagged otherwise.
 - `FUN_0046a3d8` type-6 inventory reload — the inventory table is
   not modelled; only the unconditional `ammo[0] = 0` +
   `FUN_00469668(1)` notify are ported.
-- `FUN_0045f030` shot render, `FUN_0045a4dc` weapon-5 spawn,
-  `FUN_004022b8`/`FUN_00402388` fire/deny sounds, `FUN_00469668`
-  notify — counted seams, not ported.
+- `FUN_0045f030` shot render, `FUN_004022b8`/`FUN_00402388`
+  fire/deny sounds, `FUN_00469668` notify — counted seams, not
+  ported. `FUN_0045a4dc` weapon-5 spawn is ported (Phase 12A,
+  §162).
 - The fire transaction is a **state/mutation reconstruction**, not
   a rendered projectile sim — shots enter the pool with correct
   fields but nothing integrates their motion or impact yet.
@@ -4112,3 +4114,106 @@ BUILD_A.** Remaining seams by category:
 
 This closes native gameplay reconstruction for BUILD_A; it is
 not a claim of total MDK reconstruction.
+
+## 162. Phase 12A — weapon 5 (X_STRIKE) + enemy projectiles (OBSERVED, ported)
+
+### Weapon-5 charge probe — `FUN_0046145c` (`playerChargeProbe`)
+
+Called from `FUN_00437aa8` when `wpnSel == 5 && cadence == 0`; the
+result also gates the `0x540e94` scope decay. OBSERVED:
+
+- Suppressed entirely while a dropper is live (`0x540e54`).
+- Forward ray `pos + basis[2]·299` (z + 50) into the arena —
+  `FUN_0046153c` bounded world probe; sets `0x540e14 = 1` and writes
+  the aim point `0x540e18..20` on a clean hit, else `0x540e14 = 0`.
+- Partner-arena retry gated on `!0x540ca8` (carrier busy).
+
+### Weapon-5 thrown `X_STRIKE` — `FUN_0045a4dc` (`weapon5Spawn`)
+
+OBSERVED: `pos = playerPos − 50·(cos yaw, sin yaw)` (behind the
+player), `z = arena+0x45a + 30` (field unwritten in BUILD_A → 30.0),
+health 65000, `behaviorByte = 7`, cmd `0x80` bound (the path-dropper
+BOMB slot). Builds a shared 5-key path record `{origin, spawn,
+anchor, aim+32z, mid}` — key0's 9-dword pos/tangent block is copied
+from callee-residue stack (denormal ≈ origin, reproduced as zeros).
+Tangent pass `FUN_00409558`/`FUN_00409390` resolves to
+`tanIn = 0, tanOut = prev−cur` for the `{0.5,1.0,0.5}` weights.
+
+- Uncharged (`0x54163b == 0`): double march + z-blend; the `+0x120`
+  anchor stays at aim+32.
+- Charged: march loop steps the anchor toward the aim while
+  `A→anchor` stays blocked — `collisionSweep` with ext `{3,3,1.5}`
+  (OBSERVED `0x49b8c0`), flag 0.
+
+### cmd `0x80` path-dropper corrections (OBSERVED)
+
+- Release midpoint is `(f1 + f2) / 2` of the two path keys — was
+  `(f0 + f1) / 2`.
+- Drop gate is deterministic: `int((entry2.frame − f0)·10·(1/30) + 5)`
+  — replaces the earlier RNG approximation.
+- Dropped child model is `X_TOOTH`, named `BOMB_%d` by drop count.
+- The kamikaze die path now chains `objectTeardownNow` after the
+  `FUN_004581a4` die call, matching the original
+  die→teardown→record-wipe (`FUN_0045828c`) chain — a scriptless
+  `X_STRIKE` no longer re-detonates each frame.
+
+### Enemy projectile pipeline (OBSERVED census)
+
+Enemy shots are **not** spawned by command bodies — a full BUILD_A
+disasm census (L3/L6/L8, BFS over `rcall`/`rgoto` linkage) shows:
+
+- Spawn: object-script op `0x3d` (model spawn from named refpoint +
+  persistent script pc). Live call sites: `XG` fires `BOLT` from
+  `XG1_GUN`; `XT` fires `XT_MISS`×5 from `MISS1..5`; `BIGBOLT` from
+  refpoint 5. Op `0x68` aimed-spawn variant is **dead code** in
+  BUILD_A (zero validated call sites) — its real role is aim-with-
+  spread (below).
+- Projectile persistent script (`BOLT` @ L8 `0x1705b`):
+  `rate34 75; emit59; life302 5.33; setObj148; angleLink>45→skip;
+  aim68 75; goto tail{touchLink; pitchDrift 180; end}` — one-shot aim,
+  not homing. L8 `XGREN`/`XGATT`/`XHOME` projectile scripts are just
+  `yawAcc 200; end`.
+- The `SW_*` table-1 records (`SW_GATT`, `SW_HOME`, `SW_HGREN`,
+  `SW_LGREN`, `SW_SGREN`, `SW_TWIST`, `SW_THUMP`, `SW_HBOMB`,
+  `SW_NUKE`, `BULLET`, `BIGBOLT`, `BOLT`) are class/geometry records;
+  their flight semantics come from the persistent script + subtype-
+  `0x3d` object update (already ported: rate `+0x34` steer, `+0x14c&4`
+  player-touch latch consumed by op-`0x6c`).
+
+### New object-VM ops ported (OBSERVED, disasm)
+
+- `0x28` yawAcc `{varop}`: `+0x4c += v·(1/30)`, dead-wrap raw store
+  (0x441c6a).
+- `0x3e` angleLink `{u8 kind, f32 a, [f32 b], linkage}`: facing-angle
+  vs camera normalized to `[0,180]`, compared by `FUN_0045ad40`
+  (0x445d4d). x = angle: kinds `1:>=a 2:>a 3:−0.05>a 4:+0.05<a
+  5:|x−a|<.05 6:|x−a|>=.05 7:a<=x<=b 8:x<=a||x>=b`.
+- `0x68` aim68 `{f32 spread}`: `+0x4c = bearing(camXY−pos)`,
+  `+0x13c = bearing((camZ+3)−posZ, xyDist)`; spread ≠ 100 →
+  `yaw += (rand(0x14)−10)·(100−spread)/d3`, `bank += ·/(d3·4)`
+  (0x4422f9). Dead-wrap raw stores.
+- `0x6b` voiceBind `{lstr}`: `+0x15c` name + `FUN_004020b4`/
+  `FUN_00402160` voice release/respawn — presentation, counted in
+  `seams.fireSoundCalls` (0x43848).
+- `0x6d` camKick `{u8}`: `FUN_00467888` screen shake — presentation,
+  counted in `seams.screenShakeCalls` (0x443c73).
+- `0x86` pitchDrift corrected to the dead-wrap raw store
+  (`+0x54 += v·(1/30)` unwrapped, OBSERVED 0x441dcf..).
+
+### `FUN_0042f310` — X_STRIKB/X_STRIKD prop manager (seam, deferred)
+
+OBSERVED: a presentation-side prop manager — spawns/parks `X_STRIKB`
+(held-bomb visual) at `{5000,5000,2500}` and `X_STRIKD`, binds
+animations, conditionally tears down; called with param 1 from a
+cinematic path. Presentation-only (no gameplay state consumed by the
+native core) → deferred as a seam; revisit when the Godot bomb-visual
+binding lands.
+
+### Phase 12A validation
+
+`mdk_tests`: **4279 checks / 0 failures** — weapon-5 spawn/aim/path/
+probe, cmd0x80 midpoint/gate/model/drop-count/kamikaze-wipe, op-`0x28`
+raw yaw accumulate, op-`0x3e` facing-angle link (+wrap/180-fold),
+op-`0x68` aim+spread (spread-100 no-draw, spread-75 two-draw jitter),
+op-`0x6b`/`0x6d` seams, op-`0x86` dead-wrap, and a BOLT-shaped
+end-to-end script (rate→angleLink→aim68→pitchDrift).

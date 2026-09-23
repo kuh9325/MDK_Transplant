@@ -12201,6 +12201,175 @@ void test_traversal_object_script() {
         mdk::spawnArenaObjects(ar2, rec, testModelFor, &src, nullptr);
     CHECK(n2 == 1 && ar2.storage.front()->field108 == nullptr);
   }
+
+  // -- obj op 0x28: yaw accumulate, raw (dead-wrap) store -----------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x28, 0x03});               // mode3 inline f32
+    f.writeF(C + 2, 200.0f);                // XGREN-style turn rate
+    f.write(C + 6, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.yawDeg, 200.0 * (1.0 / 30.0), 1e-4));
+    // 350 + 6.667 = 356.667 stays raw — the original's wrap loops are
+    // unreachable (OBSERVED dead code at 0x441cca..).
+    o.yawDeg = 350.0f;
+    o.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(near(o.yawDeg, 356.6667, 1e-3));
+  }
+
+  // -- obj op 0x3e: facing-angle compare link ------------------------------
+  {
+    ScriptFixture f;
+    // {0x3e, kind, f32 a, linkage} — camera due +y -> bearing 90.
+    f.write(C, {0x3e, 0x02});               // kind 2 = angle > a
+    f.writeF(C + 2, 45.0f);
+    f.write(C + 6, {0x0c});                 // rgoto
+    f.writeW(C + 7, 0x300);
+    f.write(C + 11, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff}); // mark scriptFlagsLocal bit2
+    f.rt.camera.pose.pos[1] = 10.0f;
+    // Obj yaw 0 -> |90 - 0| = 90 > 45 -> goto fires.
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+    // Obj yaw 80 -> |90 - 80| = 10 <= 45 -> fallthrough to 0xff.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.yawDeg = 80.0f;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+    // Wrap normalize: yaw 350 -> 90-350=-260 -> +360 = 100 -> >45 fires.
+    mdk::DynamicObject& o3 = f.arena->dyn.allocFront();
+    o3.yawDeg = 350.0f;
+    o3.field108 = f.image.data() + 4 + C;
+    auto r3 = mdk::traversalObjectScriptTick(f.env, o3);
+    CHECK(r3.halted && !r3.error && (o3.scriptFlagsLocal & 8));
+    // >180 fold: camera due -y (bearing 270), yaw 0 -> |270|>180 ->
+    // 360-270 = 90 -> fires. (same normalization as FUN_0045ad40).
+    f.rt.camera.pose.pos[1] = -10.0f;
+    mdk::DynamicObject& o4 = f.arena->dyn.allocFront();
+    o4.field108 = f.image.data() + 4 + C;
+    auto r4 = mdk::traversalObjectScriptTick(f.env, o4);
+    CHECK(r4.halted && (o4.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0x68: aim at camera + spread --------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x68});
+    f.writeF(C + 1, 100.0f);                // spread 100 = no jitter
+    f.write(C + 5, {0xff});
+    f.rt.camera.pose.pos[0] = 100.0f;
+    f.rt.camera.pose.pos[1] = 0.0f;
+    f.rt.camera.pose.pos[2] = 53.0f;        // dz = 53+3 = 56
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    const std::uint32_t rng0 = f.rt.rngState;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.yawDeg, 0.0, 1e-4));       // due +x
+    CHECK(near(o.bankDeg, 29.2497, 1e-3));  // atan2(56, 100)
+    CHECK(f.rt.rngState == rng0);           // spread==100 draws no rand
+    // spread 75 -> two rand(0x14) draws, jitter scaled by 25/d3.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    f.writeF(C + 1, 75.0f);
+    f.rt.rngState = 1;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    // Expected jitter replays the port's own RNG draws on a side state.
+    const double d3 = std::sqrt(10000.0 + 3136.0) + 0.1;
+    std::uint32_t side = 1;
+    const int j1 = mdk::enemyRandBelow(side, 0x14);
+    const int j2 = mdk::enemyRandBelow(side, 0x14);
+    const double eyaw = 0.0 + (j1 - 10) * 25.0 / d3;
+    const double ebank = std::atan2(56.0, 100.0) * 180.0 / M_PI +
+                         (j2 - 10) * 25.0 / (d3 * 4.0);
+    CHECK(near(o2.yawDeg, eyaw, 1e-3));
+    CHECK(near(o2.bankDeg, ebank, 1e-3));
+    CHECK(f.rt.rngState != 1);              // two draws consumed
+  }
+
+  // -- obj op 0x6b: voice/sfx rebind seam ----------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x6b});
+    f.writeStr(C + 1, "SHOOT");             // 5+1+1=7 bytes
+    f.write(C + 8, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field15c == "SHOOT");
+    CHECK(f.rt.seams.fireSoundCalls == 1);  // FUN_00402160 respawn
+    // Bound handle -> release + respawn (2 seam calls), field158 null.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    mdk::DynamicObject& voice = f.arena->dyn.allocFront();
+    o2.field158 = &voice;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o2.field158 == nullptr && o2.field15c == "SHOOT");
+    CHECK(f.rt.seams.fireSoundCalls == 3);
+  }
+
+  // -- obj op 0x6d: camera kick seam ---------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x6d, 0x07, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && f.rt.seams.screenShakeCalls == 1);
+  }
+
+  // -- obj op 0x86: pitch drift, raw (dead-wrap) store ---------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x86, 0x03});
+    f.writeF(C + 2, 200.0f);
+    f.write(C + 6, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.pitchDeg = 350.0f;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.pitchDeg, 356.6667, 1e-3)); // unwrapped (OBSERVED)
+  }
+
+  // -- BOLT-shaped script: aim-if-facing<45 then touch/pitch ---------------
+  {
+    ScriptFixture f;
+    // {rate34; angleLink>45 -> skip aim; aim68; ckpt; pitchDrift; end}
+    // models the L8 GUNT_2$XGREN_0 pipeline end-to-end.
+    f.write(C, {0x35, 0x03});               // rate34 mode3
+    f.writeF(C + 2, 75.0f);
+    f.write(C + 6, {0x3e, 0x02});           // angle > 45 -> skip aim
+    f.writeF(C + 8, 45.0f);
+    f.write(C + 12, {0x0c});
+    f.writeW(C + 13, C + 22);               // goto ckpt
+    f.write(C + 17, {0x68});                // aim68 spread 75
+    f.writeF(C + 18, 75.0f);
+    f.write(C + 22, {0x01});                // ckpt
+    f.write(C + 23, {0x86, 0x03});          // pitchDrift 180
+    f.writeF(C + 25, 180.0f);
+    f.write(C + 29, {0xff});
+    f.rt.camera.pose.pos[0] = 50.0f;        // bearing 0, obj yaw 0
+    f.rt.camera.pose.pos[2] = -50.0f;       // dz = -47
+    f.rt.rngState = 7;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.field34, 75.0));
+    CHECK(near(o.pitchDeg, 180.0 * (1.0 / 30.0), 1e-4));
+    CHECK(f.rt.rngState != 7);              // angle<=45 -> aim ran
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -14401,9 +14570,16 @@ void test_player_fire() {
   // ---- FUN_00437aa8 charge-probe flag ------------------------------
   {
     mdk::TraversalRuntime rt;
-    rt.weapon5Probe = 1; rt.fieldE14 = 0;
+    rt.wpnSel0 = 5; rt.weapon5Probe = 1; rt.fieldE14 = 0;
     mdk::playerChargeProbe(rt);
     CHECK(rt.fieldE14 == 1 && rt.seams.chargeProbeCalls == 1);
+    // Gated off while wpnSel != 5 or the cadence hasn't elapsed.
+    rt.wpnSel0 = 0; rt.fieldE14 = 0;
+    mdk::playerChargeProbe(rt);
+    CHECK(rt.fieldE14 == 0);
+    rt.wpnSel0 = 5; rt.fireCadence = 1.0f;
+    mdk::playerChargeProbe(rt);
+    CHECK(rt.fieldE14 == 0);
   }
 
   // ---- FUN_0045f138 dispatch — weapons 0..4 shot spawn ------------
@@ -14482,6 +14658,289 @@ void test_player_fire() {
     mdk::playerFireDispatch(rt);
     CHECK(rt.seams.fireDenyCalls == 2 &&
           rt.seams.weapon5SpawnCalls == spawns);
+  }
+
+  // ---- FUN_0045a4dc weapon-5 spawn + shared path record -----------
+  {
+    auto pathF = [](const mdk::TraversalRuntime& rt, int k, int w) {
+      float v = 0.0f;
+      std::memcpy(&v, &rt.weapon5Path[1 + k * 10 + w], 4);
+      return v;
+    };
+    // Charged throw (charge >= 4 latches before the spawn).
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* cur = travArenaAdd(rt, "A");
+    rt.cur = cur;
+    CollisionFixture empty = makeEmptyArena();
+    rt.cs.arena = &empty.arena;
+    rt.level.enemies.entries = {{"X_STRIKE", 0, false}};
+    rt.level.models.resize(1);
+    rt.level.models[0] = makePlatformModel("X_STRIKE", "BOMB_0", 0.0f);
+    rt.cs.pos[0] = 100.0f; rt.cs.pos[1] = 200.0f; rt.cs.pos[2] = 50.0f;
+    rt.motion.yawDeg = 0.0f;
+    rt.weapon5Aim[0] = 500.0f; rt.weapon5Aim[1] = 200.0f;
+    rt.weapon5Aim[2] = 68.0f;
+    rt.wpnSel0 = 5; rt.ammo[5] = 9; rt.burstIndex = 2;
+    rt.fieldE14 = 1; rt.field541498 = 4;
+    mdk::playerFireDispatch(rt);
+    CHECK(rt.field54163b == 1 && rt.ammo[5] == 8);
+    CHECK(rt.seams.bombCinematicCalls == 1);   // FUN_0042f310(0)
+    CHECK(cur->dyn.storage.size() == 1);
+    const mdk::DynamicObject& o = *cur->dyn.storage.front();
+    CHECK(o.model.modelName() == "X_STRIKE");
+    // Spawn = player - 50*(cos,sin) on the yaw circle, z = 30.
+    CHECK(near(o.pos[0], 50.0, 1e-4) && near(o.pos[1], 200.0, 1e-4) &&
+          near(o.pos[2], 30.0, 1e-4));
+    CHECK(o.health == 0xfde8);
+    CHECK(o.col.flags148 == 0x5e20 && o.col.flags149 == 0x5e &&
+          o.col.flags14a == 0x08);
+    CHECK(o.field30a == 0x80 && o.fieldEC == rt.weapon5Path);
+    CHECK(o.fieldE6 == -1 && near(o.fieldF0, 1.0, 1e-6) &&
+          near(o.fieldE8, 1.0, 1e-6));
+    CHECK(o.spawnId == 1 && o.behaviorByte == 7 && o.enemyIndex == 0);
+    CHECK(near(o.yawDeg, 0.0, 1e-6));
+    // +0x120 anchor = the probe aim + 32 z.
+    CHECK(near(o.field120[0], 500.0, 1e-4) &&
+          near(o.field120[1], 200.0, 1e-4) &&
+          near(o.field120[2], 100.0, 1e-4));
+    // The five-key shared record — {0, S, anchor, A, M}; empty arena
+    // -> one march step -> anchor = S + (A-S)*0.09 = {90.5, 200, 30}.
+    CHECK(rt.weapon5Path[0] == 5);
+    CHECK(near(pathF(rt, 1, 1), 50.0, 1e-3) &&
+          near(pathF(rt, 1, 3), 30.0, 1e-3));      // key1 = S
+    CHECK(near(pathF(rt, 2, 1), 90.5, 1e-3) &&
+          near(pathF(rt, 2, 3), 30.0, 1e-3));      // key2 = anchor
+    CHECK(near(pathF(rt, 3, 1), 500.0, 1e-3) &&
+          near(pathF(rt, 3, 3), 100.0, 1e-3));     // key3 = A
+    CHECK(near(pathF(rt, 4, 1), 725.0, 1e-3) &&
+          near(pathF(rt, 4, 3), 135.0, 1e-3));     // key4 = mid(A,V)
+    // tanIn = 0; tanOut = next - cur (key4's "next" is V).
+    CHECK(near(pathF(rt, 1, 4), 0.0, 1e-6) &&
+          near(pathF(rt, 1, 7), 40.5, 1e-3) &&
+          near(pathF(rt, 1, 9), 0.0, 1e-6));
+    CHECK(near(pathF(rt, 3, 7), 225.0, 1e-3) &&
+          near(pathF(rt, 3, 9), 35.0, 1e-3));
+    CHECK(near(pathF(rt, 4, 7), 225.0, 1e-3) &&
+          near(pathF(rt, 4, 9), 35.0, 1e-3));
+    // Frames: cumulative round(dist * 30/150) along S->anchor->A->M->V.
+    const float d1 = 40.5f;
+    const float d2 = std::sqrt(409.5f * 409.5f + 70.0f * 70.0f);
+    const float d3 = std::sqrt(225.0f * 225.0f + 35.0f * 35.0f);
+    CHECK(mdk::pathEntryFrame(rt.weapon5Path, 0) == 0.0f);
+    CHECK(mdk::pathEntryFrame(rt.weapon5Path, 1) ==
+          std::lround(d1 * 0.2));
+    CHECK(mdk::pathEntryFrame(rt.weapon5Path, 2) ==
+          std::lround(d1 * 0.2) + std::lround(d2 * 0.2));
+    CHECK(mdk::pathEntryFrame(rt.weapon5Path, 4) ==
+          std::lround(d1 * 0.2) + std::lround(d2 * 0.2) +
+              2 * std::lround(d3 * 0.2));
+
+    // Uncharged throw — V stays on the spawn plane; M starts at V and
+    // marches back toward A at the 0.1 step (one step: {905,200,30}).
+    mdk::TraversalRuntime rt2;
+    mdk::TraversalArena* cur2 = travArenaAdd(rt2, "B");
+    rt2.cur = cur2;
+    rt2.cs.arena = &empty.arena;
+    rt2.level.enemies.entries = {{"X_STRIKE", 0, false}};
+    rt2.level.models.resize(1);
+    rt2.level.models[0] = makePlatformModel("X_STRIKE", "BOMB_0", 0.0f);
+    rt2.cs.pos[0] = 100.0f; rt2.cs.pos[1] = 200.0f;
+    rt2.motion.yawDeg = 0.0f;
+    rt2.weapon5Aim[0] = 500.0f; rt2.weapon5Aim[1] = 200.0f;
+    rt2.weapon5Aim[2] = 68.0f;
+    rt2.wpnSel0 = 5; rt2.ammo[5] = 9; rt2.burstIndex = 2;
+    rt2.fieldE14 = 1; rt2.field541498 = 0;    // charge < 4 -> no latch
+    mdk::playerFireDispatch(rt2);
+    CHECK(rt2.field54163b == 0);
+    CHECK(cur2->dyn.storage.size() == 1);
+    CHECK(near(pathF(rt2, 4, 1), 905.0, 1e-3) &&
+          near(pathF(rt2, 4, 3), 30.0, 1e-3));     // key4 = marched M
+    CHECK(near(pathF(rt2, 4, 7), 45.0, 1e-3) &&
+          near(pathF(rt2, 4, 9), 0.0, 1e-6));      // V - M = {45,0,0}
+
+    // Obstructed march — a wall at x=300 keeps A->anchor blocked until
+    // the anchor steps past it (7 steps: anchor.x = 50 + 7*40.5).
+    mdk::TraversalRuntime rt3;
+    mdk::TraversalArena* cur3 = travArenaAdd(rt3, "C");
+    rt3.cur = cur3;
+    CollisionFixture wall;
+    wall.verts = {300, 0, 200, 300, 400, 200, 300, 0, -100,
+                  300, 400, -100, 300, 0, -100, 300, 400, 200};
+    wall.polys = {makePoly(0, 1, 2), makePoly(3, 4, 5)};
+    wall.nodes = {makeNode(-1, 0, 0, 300, 0, polySet(2, 0), -1, -1)};
+    wall.finish();
+    rt3.cs.arena = &wall.arena;
+    rt3.level.enemies.entries = {{"X_STRIKE", 0, false}};
+    rt3.level.models.resize(1);
+    rt3.level.models[0] = makePlatformModel("X_STRIKE", "BOMB_0", 0.0f);
+    rt3.cs.pos[0] = 100.0f; rt3.cs.pos[1] = 100.0f;
+    rt3.motion.yawDeg = 0.0f;
+    rt3.weapon5Aim[0] = 500.0f; rt3.weapon5Aim[1] = 100.0f;
+    rt3.weapon5Aim[2] = 68.0f;
+    rt3.wpnSel0 = 5; rt3.ammo[5] = 9; rt3.burstIndex = 2;
+    rt3.fieldE14 = 1; rt3.field541498 = 4;
+    mdk::playerFireDispatch(rt3);
+    CHECK(cur3->dyn.storage.size() == 1);
+    CHECK(near(pathF(rt3, 2, 1), 333.5, 1e-3) &&
+          near(pathF(rt3, 2, 3), 30.0, 1e-3));     // anchor past wall
+    CHECK(near(pathF(rt3, 2, 2), 100.0, 1e-3));
+  }
+
+  // ---- cmd 0x80 — deterministic dropper gate + X_TOOTH drops -------
+  {
+    // A dropper model with two bomb slots at distinct local centers.
+    auto makeDropperModel = [] {
+      mdk::RuntimeModel m;
+      m.flag = 1;
+      mdk::RuntimeModel::NameRec nr;
+      std::snprintf(nr.name.data(), nr.name.size(), "X_STRIKE");
+      m.names.push_back(nr);
+      const float boxes[2][6] = {{-5, -5, -5, 5, 5, 5},
+                                 {95, -5, -5, 105, 5, 5}};
+      const char* names[2] = {"BOMB_0", "BOMB_1"};
+      m.elems.resize(2);
+      m.elemNames.resize(2);
+      m.elemField2.resize(2);
+      m.elemVerts.resize(2);
+      m.elemTris.resize(2);
+      for (int i = 0; i < 2; ++i) {
+        std::snprintf(m.elemNames[i].data(), m.elemNames[i].size(),
+                      "%s", names[i]);
+        m.elemVerts[i] = {95.f * i, -5, 0, 5.f + 95.f * i, -5, 0,
+                          5.f + 95.f * i, 5, 0};
+        m.elemTris[i].assign(0x24, 0);
+        auto* idx = reinterpret_cast<std::uint16_t*>(m.elemTris[i].data());
+        idx[0] = 0; idx[1] = 1; idx[2] = 2;
+        m.elems[i].triCount = 1;
+        std::memcpy(m.elems[i].localAabb, boxes[i], sizeof(boxes[i]));
+      }
+      m.rebind();
+      return m;
+    };
+    // Path record: {frame,pos,tanIn,tanOut} x5 — entry1 frame f1,
+    // entry2 frame f2 drive the gate n = round((f2-f0)/3 + 5).
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    home.col.objects = nullptr;
+    rt.level.enemies.entries = {{"X_TOOTH", 0, false}};
+    rt.level.models.resize(1);
+    rt.level.models[0] = makePlatformModel("X_TOOTH", "ELEM", 0.0f);
+    mdk::DynamicObject o;
+    o.col.named = true;
+    o.health = 10;
+    o.model = makeDropperModel();
+    o.setPosition(10.0f, 20.0f, 30.0f);
+    o.prevPos[0] = 10.0f; o.prevPos[1] = 20.0f; o.prevPos[2] = 30.0f;
+    mdk::initObjectCollision(o);
+    o.col.flags149 |= 0x40;                 // EXEC phase
+    o.field30a = 0x80;
+    std::int32_t rec[1 + 5 * 10] = {};
+    rec[0] = 5;
+    rec[1 + 1 * 10] = 100;                  // entry1 frame
+    rec[1 + 2 * 10] = 113;                  // entry2 frame
+    o.fieldEC = rec;
+    o.fieldF0 = 1.0f;
+    // n = round((113-1)/3 + 5) = round(42.33) = 42 -> not < 10: no drop.
+    mdk::enemyCommandDispatch(rt, o, home, 1.0f / 30.0f);
+    CHECK(home.storage.empty() && o.field306 == 0 && rt.cmdFlag54 == 1);
+    // f2 = 14 -> n = round(13/3 + 5) = 9: drops while +0x306 < 9.
+    rec[1 + 2 * 10] = 14;
+    mdk::enemyCommandDispatch(rt, o, home, 1.0f / 30.0f);
+    CHECK(o.field306 == 1 && home.storage.size() == 1);
+    const mdk::DynamicObject* c = home.storage.front().get();
+    CHECK(c->model.modelName() == "X_TOOTH");       // fixed child class
+    CHECK(c->field30e == 900 && c->field30a == 5 &&
+          near(c->field30, -5.0, 1e-6));
+    CHECK(c->field15c == "X_STRIKE");               // parent token
+    // BOMB_0's world center = dropper pos + local center {0,0,0}.
+    CHECK(near(c->pos[0], 10.0, 1e-4) && near(c->pos[1], 20.0, 1e-4) &&
+          near(c->pos[2], 30.0, 1e-4));
+    // Next drop -> BOMB_1 (digit = the drop count), center {100,0,0}.
+    mdk::enemyCommandDispatch(rt, o, home, 1.0f / 30.0f);
+    CHECK(o.field306 == 2 && home.storage.size() == 2);
+    const mdk::DynamicObject* c2 = home.storage.front().get();
+    CHECK(near(c2->pos[0], 110.0, 1e-4) && near(c2->pos[1], 20.0, 1e-4));
+    // field306=9 reaches the n<9 boundary -> the gate closes.
+    o.field306 = 9;
+    const std::size_t before = home.storage.size();
+    mdk::enemyCommandDispatch(rt, o, home, 1.0f / 30.0f);
+    CHECK(home.storage.size() == before && o.field306 == 9);
+
+    // Kamikaze release — midpoint = (f1+f2)/2 = 57; +0xf0 past it ->
+    // the path unbinds into velocity; contact -> splash + death.
+    mdk::TraversalRuntime rt4;
+    mdk::DynamicArena home4;
+    mdk::DynamicObject k;
+    k.col.named = true;
+    k.health = 10;
+    k.model = makeDropperModel();
+    k.setPosition(50.0f, 0.0f, 0.0f);
+    k.prevPos[0] = 47.0f; k.prevPos[1] = 0.0f; k.prevPos[2] = 0.0f;
+    mdk::initObjectCollision(k);
+    k.col.flags149 |= 0x40;
+    k.field30a = 0x80;
+    k.fieldEC = rec;                          // f1=100, f2=14 -> mid 57
+    rt4.field54163b = 1;                      // weapon-5 latch set
+    k.fieldF0 = 50.0f;                        // before the midpoint
+    mdk::enemyCommandDispatch(rt4, k, home4, 1.0f / 30.0f);
+    CHECK(k.fieldEC != nullptr && rt4.cmdFlag54 == 1);
+    k.fieldF0 = 60.0f;                        // past mid 57 -> release
+    mdk::enemyCommandDispatch(rt4, k, home4, 1.0f / 30.0f);
+    CHECK(k.fieldEC == nullptr && (k.col.flags148 & 6) != 0);
+    CHECK(near(k.field28, 90.0, 1e-4));       // (50-47) * 30
+    CHECK(k.health > 0);                      // no contact yet
+    // Wall contact — +0x14c bit 0 as objectCollide would re-arm it
+    // each frame. Die -> boundary (FUN_00457cf4 seam) -> record wipe.
+    k.col.flags14c |= 1;
+    mdk::enemyCommandDispatch(rt4, k, home4, 1.0f / 30.0f);
+    CHECK(rt4.seams.objectDeathCalls == 1 &&
+          rt4.seams.objectTeardownCalls == 2);   // boundary + wipe
+    CHECK(k.col.named == false && k.health == 0);
+    CHECK(rt4.combatFx.size() == 1 &&
+          rt4.combatFx.back().kind ==
+              mdk::CombatFxKind::kObjectTeardown &&
+          rt4.combatFx.back().obj == &k);
+  }
+
+  // ---- FUN_0046145c charge probe — real ray/stab path --------------
+  {
+    // Camera looks +x at a wall 300 away -> live probe, aim at the
+    // crossing + one basis step.
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* cur = travArenaAdd(rt, "A");
+    rt.cur = cur;
+    CollisionFixture wall;
+    wall.verts = {300, 0, 200, 300, 400, 200, 300, 0, -100,
+                  300, 400, -100, 300, 0, -100, 300, 400, 200};
+    wall.polys = {makePoly(0, 1, 2), makePoly(3, 4, 5)};
+    wall.nodes = {makeNode(-1, 0, 0, 300, polySet(2, 0), 0, -1, -1)};
+    wall.finish();
+    rt.cs.arena = &wall.arena;
+    rt.wpnSel0 = 5; rt.fireCadence = 0.0f;
+    rt.camera.pose.pos[0] = 0.0f; rt.camera.pose.pos[1] = 100.0f;
+    rt.camera.pose.pos[2] = 50.0f;
+    rt.camera.pose.basis[2][0] = -1.0f; rt.camera.pose.basis[2][1] = 0.0f;
+    rt.camera.pose.basis[2][2] = 0.0f;   // basis[2] = the backward axis
+    mdk::playerChargeProbe(rt);
+    CHECK(rt.fieldE14 == 1);
+    CHECK(near(rt.weapon5Aim[0], 299.0, 1e-3) &&
+          near(rt.weapon5Aim[1], 100.0, 1e-3) &&
+          near(rt.weapon5Aim[2], 50.0, 1e-3));
+    // A ceiling over the aim point -> the overhead stab kills it.
+    CollisionFixture ceil = makeCeilArena();
+    mdk::TraversalRuntime rt2;
+    rt2.cs.arena = &ceil.arena;
+    rt2.wpnSel0 = 5;
+    rt2.camera.pose.pos[0] = 0.0f; rt2.camera.pose.pos[1] = 0.0f;
+    rt2.camera.pose.pos[2] = 0.0f;
+    rt2.camera.pose.basis[2][0] = 0.0f; rt2.camera.pose.basis[2][1] = 0.0f;
+    rt2.camera.pose.basis[2][2] = -1.0f;   // ray goes +z, hits ceil@20
+    mdk::playerChargeProbe(rt2);
+    CHECK(rt2.fieldE14 == 0);
+    // cmdFlag54 (a live dropper) suppresses the probe entirely.
+    rt.cmdFlag54 = 1; rt.fieldE14 = 9;
+    mdk::playerChargeProbe(rt);
+    CHECK(rt.fieldE14 == 0);
   }
 
   // ---- FUN_0045f138 homing tail — HEAD + predicate elements -------

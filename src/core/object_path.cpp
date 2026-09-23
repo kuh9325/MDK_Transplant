@@ -135,6 +135,15 @@ float pathLastFrame(const void* rec) {
   return static_cast<float>(entryFrame(w, w[0] - 1));
 }
 
+// Entry[i].frame — the cmd-0x80 release midpoint reads entry[1]/entry[2]
+// directly (+0x2c/+0x54 for the fixed 0x28 stride). Out-of-range -> 0.
+float pathEntryFrame(const void* rec, int i) {
+  if (!rec) return 0.0f;
+  const std::int32_t* w = pathWords(rec);
+  if (i < 0 || i >= w[0]) return 0.0f;
+  return static_cast<float>(entryFrame(w, i));
+}
+
 // ---------------------------------------------------------------------------
 // FUN_00457264 — bind-time snap.
 // ---------------------------------------------------------------------------

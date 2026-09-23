@@ -214,6 +214,200 @@ DynamicObject* objectOf(const CollisionObject* o) {
       const_cast<CollisionObject*>(o));
 }
 
+// ---------------------------------------------------------------------------
+// FUN_0046153c — bounded ray-vs-world probe as invoked by the weapon-5
+// charge probe (flags=3: object scan + BSP stab, +0x148 mask 0x30).
+// `end` arrives as the ray target and is clipped to the nearest object
+// hit; a BSP hit overwrites it with the stab crossing (the original's
+// outPos writes through to the caller's vec). Returns true on any hit.
+// ---------------------------------------------------------------------------
+bool weapon5RayProbe(TraversalRuntime& rt, const float start[3],
+                     float end[3]) {
+  bool hit = false;
+  const DynamicArena* lists[2] = {
+      rt.cur ? &rt.cur->dyn : nullptr,
+      (rt.partnerActive && rt.partner) ? &rt.partner->dyn : nullptr};
+  for (const DynamicArena* la : lists) {
+    if (!la) continue;
+    for (const auto& up : la->storage) {
+      const DynamicObject& o = *up;
+      if (!o.col.named || o.col.model == nullptr) continue;  // +6/+8
+      if ((o.col.flags148 & 0x30) != 0) continue;            // mask arg
+      int elem = -1, tri = -1;
+      collisionObjectProbe(&o.col, start, end, &elem, &tri);
+      if (elem >= 0) hit = true;
+    }
+  }
+  float stabPt[3] = {0, 0, 0};
+  if (rt.cs.arena != nullptr &&
+      collisionStab(*rt.cs.arena, start, end, stabPt) != nullptr) {
+    for (int i = 0; i < 3; ++i) end[i] = stabPt[i];
+    return true;
+  }
+  if (rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0 &&
+      collisionStab(*rt.cs.carrier, start, end, stabPt) != nullptr) {
+    for (int i = 0; i < 3; ++i) end[i] = stabPt[i];
+    return true;
+  }
+  return hit;
+}
+
+// ---------------------------------------------------------------------------
+// FUN_0045a4dc — weapon-5 thrown X_STRIKE spawn + charged trajectory.
+// The object is an ordinary arena DynamicObject bound to cmd 0x80 and
+// the shared five-key path record at 0x54ca00.
+// ---------------------------------------------------------------------------
+constexpr float kW5Behind = 50.0f;   // 0x498160 — spawn dist behind player
+constexpr float kW5ZBase = 30.0f;    // 0x498168 — z base + frame scale/150
+constexpr float kW5ApexZ = 32.0f;    // 0x498170 — aim z raise
+constexpr float kW5Step1 = 0.09f;    // 0x498190 — charged/first march step
+constexpr float kW5Step2 = 0.1f;     // 0x4981a0 — uncharged second march
+constexpr float kW5ZBlend = 1.0f / 7.0f;  // 0x498198 — >7-step z blend
+constexpr float kW5Frame = 0.2f;     // 30 * (1/150) — dist -> frame scale
+const float kW5Ext[3] = {3.0f, 3.0f, 1.5f};  // 0x49b8c0 — sweep extents
+
+// FUN_00407fc0 march test — sweep A->pt on the current arena; a clear
+// result re-tests the partner arena when attached and !carrierBusy
+// (OBSERVED at 0x45a919). True while the segment stays obstructed.
+bool weapon5Blocked(TraversalRuntime& rt, const float A[3],
+                    const float pt[3]) {
+  float out[3] = {0, 0, 0};
+  if (rt.cs.arena != nullptr &&
+      collisionSweep(rt.cs, A, pt, 0, *rt.cs.arena, kW5Ext, 0.0f, out,
+                     nullptr))
+    return true;
+  if (rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0 &&
+      collisionSweep(rt.cs, A, pt, 0, *rt.cs.carrier, kW5Ext, 0.0f, out,
+                     nullptr))
+    return true;
+  return false;
+}
+
+void weapon5Spawn(TraversalRuntime& rt) {
+  ++rt.seams.weapon5SpawnCalls;
+  // FUN_0042f310(0) — the X_STRIKB/X_STRIKD held-bomb presentation
+  // routine. Presentation-only; counted, not ported.
+  ++rt.seams.bombCinematicCalls;
+  if (rt.cur == nullptr) return;    // port bound — original derefs 0x540c48
+  TraversalArena& home = *rt.cur;
+
+  // Spawn point — 50 units behind the player on the yaw circle;
+  // z = arena+0x45a (a zero-init field, no writer) + 30.
+  float sinY = 0.0f, cosY = 0.0f;
+  sincosDeg(rt.motion.yawDeg, &sinY, &cosY);
+  const float S[3] = {rt.cs.pos[0] - kW5Behind * cosY,
+                      rt.cs.pos[1] - kW5Behind * sinY, kW5ZBase};
+
+  ++rt.seams.classLookupCalls;      // FUN_00454794
+  const int idx = rt.level.enemies.indexOf("X_STRIKE");
+  if (idx < 0) return;
+  const RuntimeModel* src = traversalModelFor(idx, &rt.level);
+  if (src == nullptr) return;
+
+  // FUN_00454af8 — generic object spawn (model + pos + spawnId 1 +
+  // initDefaults + +0x11c=7), then FUN_0045a4dc's own field writes.
+  DynamicObject& o = home.dyn.allocFront();
+  o.scriptClass = "X_STRIKE";
+  o.scriptOff = 0;                  // +0x108 = arg 7 (0)
+  o.enemyIndex = static_cast<std::uint16_t>(idx);
+  o.arena = &home.dyn;
+  o.spawnId = 1;                    // +0x146 = the literal arg 1
+  o.setPosition(S[0], S[1], S[2]);
+  o.prevPos[0] = S[0]; o.prevPos[1] = S[1]; o.prevPos[2] = S[2];
+  o.yawDeg = rt.motion.yawDeg;
+  o.prevYawDeg = rt.motion.yawDeg;
+  o.behaviorByte = 7;               // +0x11c
+  o.model = deepCopyModel(*src);
+  initObjectCollision(o);
+  o.col.flags148 = 0x5e20;          // +0x148 dword = 0x85e20
+  o.col.flags149 = 0x5e;
+  o.col.flags14a = 0x08;
+  o.col.flags14b = 0x00;
+  o.health = 0xfde8;                // +0x08 = 65000
+
+  // +0x120 anchor = the charge-probe aim + 32 z.
+  float A[3] = {rt.weapon5Aim[0], rt.weapon5Aim[1],
+                rt.weapon5Aim[2] + kW5ApexZ};
+  o.field120[0] = A[0]; o.field120[1] = A[1]; o.field120[2] = A[2];
+
+  // Path keys. V = 2*A - S (far apex); M = mid(A,V) charged / V
+  // uncharged (whose z stays at the spawn plane). The key0 scratch
+  // record in the original is callee-residue stack below esp — the
+  // port bounds that as an all-zero first key (see doc note).
+  float V[3] = {A[0] * 2.0f - S[0], A[1] * 2.0f - S[1],
+                (rt.field54163b != 0) ? A[2] * 2.0f - S[2] : S[2]};
+  float M[3] = {(rt.field54163b != 0) ? (A[0] + V[0]) * 0.5f : V[0],
+                (rt.field54163b != 0) ? (A[1] + V[1]) * 0.5f : V[1],
+                (rt.field54163b != 0) ? (A[2] + V[2]) * 0.5f : V[2]};
+
+  // March 1 — anchor steps from S toward A (xy, 0.09 step) while the
+  // A->anchor segment stays obstructed; <= 10 iterations.
+  float anchor[3] = {S[0], S[1], S[2]};
+  const float st1[2] = {(A[0] - S[0]) * kW5Step1,
+                        (A[1] - S[1]) * kW5Step1};
+  int steps = 0;
+  while (steps < 10) {
+    anchor[0] += st1[0]; anchor[1] += st1[1];
+    if (!weapon5Blocked(rt, A, anchor)) break;
+    ++steps;
+  }
+
+  if (rt.field54163b == 0) {
+    // Uncharged only — a >7-step march 1 blends A.z back toward the
+    // spawn plane, then march 2 walks M (starts at V) toward A at the
+    // coarser 0.1 step with the same post-blend.
+    if (steps > 7)
+      A[2] += (S[2] - A[2]) * static_cast<float>(steps - 4) * kW5ZBlend;
+    const float st2[2] = {(A[0] - V[0]) * kW5Step2,
+                          (A[1] - V[1]) * kW5Step2};
+    int steps2 = 0;
+    while (steps2 < 10) {
+      M[0] += st2[0]; M[1] += st2[1];
+      if (!weapon5Blocked(rt, A, M)) break;
+      ++steps2;
+    }
+    if (steps2 > 7)
+      A[2] += (S[2] - A[2]) * static_cast<float>(steps2 - 4) * kW5ZBlend;
+  }
+
+  // Frames — cumulative round-half dist * (30/150) along the chain
+  // S -> anchor -> A -> M -> V (OBSERVED frndint at 0x45a600).
+  static const float kZero[3] = {0.0f, 0.0f, 0.0f};
+  const float* P[5] = {kZero, S, anchor, A, M};
+  const float* D[5] = {S, anchor, A, M, V};   // dist chain positions
+  std::int32_t frames[5] = {0, 0, 0, 0, 0};
+  for (int k = 1; k < 5; ++k)
+    frames[k] = frames[k - 1] + static_cast<std::int32_t>(std::lround(
+                                  dist3(D[k - 1], D[k]) * kW5Frame));
+
+  // Serialize the five keys — FUN_00409558's tangent pass resolves to
+  // tanIn = 0, tanOut = next - cur for the stored {0.5, 1.0, 0.5}
+  // weights (the key4 "next" is V, which has no key of its own).
+  std::int32_t* w = rt.weapon5Path;
+  w[0] = 5;
+  for (int k = 0; k < 5; ++k) {
+    std::int32_t* e = w + 1 + k * 10;
+    e[0] = frames[k];
+    for (int c = 0; c < 3; ++c) {
+      float v = P[k][c];
+      std::memcpy(e + 1 + c, &v, 4);
+      float ti = 0.0f;
+      std::memcpy(e + 4 + c, &ti, 4);
+      float to = (k > 0) ? (D[k][c] - P[k][c]) : 0.0f;
+      std::memcpy(e + 7 + c, &to, 4);
+    }
+  }
+
+  o.fieldEC = rt.weapon5Path;       // +0xec = 0x54ca00
+  o.fieldE6 = -1;
+  o.fieldF0 = 1.0f;
+  o.fieldE8 = 1.0f;
+  o.field30a = 0x80;                // +0x30a — path-dropper command
+  o.fieldF4[0] = 0.0f;              // +0xf4..+0xfc = 0 (zero block copy)
+  o.fieldF4[1] = 0.0f;
+  o.fieldF4[2] = 0.0f;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -234,7 +428,7 @@ void playerFireDispatch(TraversalRuntime& rt) {
     rt.fireCadence += 1.0f;
     rt.ammo[5] -= 1;               // 0x541633
     if (rt.burstIndex == 0) rt.fireCadence = 3.0f;
-    ++rt.seams.weapon5SpawnCalls; // FUN_0045a4dc
+    weapon5Spawn(rt);              // FUN_0045a4dc
     return;                        // 0x540e80 untouched on this path
   }
 
@@ -734,14 +928,49 @@ void playerFireLatch(TraversalRuntime& rt,
 }
 
 // ---------------------------------------------------------------------------
-// FUN_00437aa8 — the scoped charge-probe flag update. 0x540e14 =
-// (the FUN_0046145c charge probe is live). The probe spawn is a
-// deferred seam; `weapon5Probe` carries the live flag for tests.
+// FUN_00437aa8 — the scoped charge-probe flag update. The probe section
+// (0x437c9b) runs when !(0x4999d0 && 0x541548) && wpnSel==5 &&
+// 0x54161b==0 and stores FUN_0046145c's result in 0x540e14. The
+// 0x540e94/e98 overlay blends + palette cycling it feeds are
+// presentation and stay deferred; `weapon5Probe` forces the live flag
+// for tests instead of running the real probe.
 // ---------------------------------------------------------------------------
 
 void playerChargeProbe(TraversalRuntime& rt) {
   ++rt.seams.chargeProbeCalls;
-  rt.fieldE14 = rt.weapon5Probe;   // FUN_0046145c(0x540e18) live flag
+  if (rt.flag4999d0 && rt.flag541548) return;    // machine skipped
+  if (rt.wpnSel0 != 5 || rt.fireCadence != 0.0f) return;
+  if (rt.weapon5Probe != 0) {                    // PORT test hook
+    rt.fieldE14 = 1;
+    return;
+  }
+  rt.fieldE14 = 0;
+  if (rt.cmdFlag54 != 0) return;   // 0x540e54 — dead while a bomb lives
+
+  // FUN_0046145c — ray from the camera along -basis[2] for 5000,
+  // clipped by the object scan + BSP (FUN_0046153c flags=3, mask 0x30).
+  const float* cam = rt.camera.pose.pos;
+  const float* fwd = rt.camera.pose.basis[2];
+  float end[3] = {cam[0] - 5000.0f * fwd[0], cam[1] - 5000.0f * fwd[1],
+                  cam[2] - 5000.0f * fwd[2]};
+  if (!weapon5RayProbe(rt, cam, end)) return;
+
+  // Aim = hit + one basis step; then the overhead stab (aim+1000z ->
+  // aim) on cur, then the partner (attached && !carrierBusy) — any
+  // crossing kills the probe (OBSERVED 0x4614f4..0x461523).
+  float aim[3] = {end[0] + fwd[0], end[1] + fwd[1], end[2] + fwd[2]};
+  const float top[3] = {aim[0], aim[1], aim[2] + 1000.0f};
+  float pt[3] = {0, 0, 0};
+  if (rt.cs.arena != nullptr &&
+      collisionStab(*rt.cs.arena, top, aim, pt) != nullptr)
+    return;
+  if (rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0 &&
+      collisionStab(*rt.cs.carrier, top, aim, pt) != nullptr)
+    return;
+  rt.weapon5Aim[0] = aim[0];
+  rt.weapon5Aim[1] = aim[1];
+  rt.weapon5Aim[2] = aim[2];
+  rt.fieldE14 = 1;
 }
 
 } // namespace mdk

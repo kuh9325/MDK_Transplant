@@ -1491,6 +1491,50 @@ void objScriptInsn(ObjScriptPass& v) {
     }
     return;
   }
+  case 0x3e: {                            // facing-angle link (0x445d4d)
+    // {u8 kind, f32 a, [f32 b if kind==7|8], linkage}. OBSERVED:
+    // angle = bearing(camXY - pos) - +0x4c, normalized to [0,180]
+    // (+=360 while <0, -=360 while >360, 360-angle when >180); cond =
+    // FUN_0045ad40(kind, angle, a, b) — the angle is the comparator's
+    // first stack arg (x), so kind 1 = angle>=a, 2 = angle>a,
+    // 3 = angle-0.05>a, 4 = angle+0.05<a, 5 = |angle-a|<0.05,
+    // 6 = |angle-a|>=0.05, 7 = a<=angle<=b, 8 = angle<=a||angle>=b.
+    const std::uint8_t kind = r.u8();
+    const float va = r.f32();
+    float vb = 0.0f;
+    if (kind == 7 || kind == 8) vb = r.f32();
+    Linkage L;
+    if (!readLinkage(r, L)) { v.fail("anglelink"); return; }
+    bool cond = false;
+    if (env.rt != nullptr) {
+      const float* cam = env.rt->camera.pose.pos;  // 0x54c6c4..c8
+      float ang = bearingDeg(cam[1] - obj.pos[1],
+                             cam[0] - obj.pos[0]) - obj.yawDeg;
+      while (ang < 0.0f) ang += 360.0f;
+      while (ang > 360.0f) ang += -360.0f;
+      if (ang > 180.0f) ang = 360.0f - ang;
+      switch (kind) {                           // FUN_0045ad40
+      case 1: cond = ang >= va; break;
+      case 2: cond = ang > va; break;
+      case 3: cond = ang - 0.05f > va; break;   // C(0x4981cc) = -0.05
+      case 4: cond = ang + 0.05f < va; break;   // C(0x4981c4) = +0.05
+      case 5: cond = std::fabs(ang - va) < 0.05f; break;
+      case 6: cond = std::fabs(ang - va) >= 0.05f; break;
+      case 7: cond = ang >= va && ang <= vb; break;
+      case 8: cond = ang <= va || ang >= vb; break;
+      default: break;
+      }
+    }
+    switch (L.mode) {
+    case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+               break;
+    case 0xfc: if (cond) v.doCall(L.a); break;
+    case 0x0c: if (cond) v.doGoto(L.a); break;
+    case 0xfd: if (cond) v.doReturn(); break;
+    default: break;
+    }
+    return;
+  }
   case 0x3c: {                            // face camera (0x441e46)
     // No operands: +0x4c = bearing(0x54c6c4 - pos) wrapped [0,360).
     if (env.rt != nullptr) {
@@ -2194,6 +2238,17 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x28: {                            // yaw accumulate (0x441c6a)
+      // {varop}: +0x4c += operand*(1/30) — OBSERVED. Same dead-wrap
+      // quirk as op-0x68/0x86: the post-add FLDZ/FCOMPP split sends
+      // >0 to a `<0:+=360` loop and <=0 to a `>=360:-=360` loop — both
+      // unreachable, so +0x4c is stored raw (unbounded spin
+      // accumulator — the XGREN/XGATT/XHOME turn-rate op).
+      const float val = resolveVar(r, env, ctx);
+      if (!r.ok) { v.fail("yawacc"); return; }
+      obj.yawDeg += val * (1.0f / 30.0f);
+      return;
+    }
     case 0x59: {                            // sfx bind (0x43a112)
       // {u8 mode, [mode&0x10|0x40 -> 3f32 | mode&0x20 -> u8], lstr sfx}.
       // OBSERVED: the position locals (own +0x10 / literal / refpoint
@@ -2245,15 +2300,72 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x68: {                            // aim + spread (0x4422f9)
+      // {f32 spread}. OBSERVED: +0x4c = bearing(camXY - pos),
+      // +0x13c = bearing((camZ+3) - posZ, xyDist); when spread != 100,
+      // +0x4c += (rand(0x14)-10)*(100-spread)/d3 and +0x13c += the same
+      // draw scaled by (d3*4) — jitter shrinks with distance.
+      // FUN_004301bc = XY dist, FUN_00430160 + 0.1 = 3D dist. Both
+      // post-store wrap loops are dead (same quirk as op-0x65).
+      const float spread = r.f32();
+      if (!r.ok) { v.fail("aim68"); return; }
+      if (env.rt != nullptr) {
+        const float* cam = env.rt->camera.pose.pos;  // 0x54c6c4..cc
+        const float dx = cam[0] - obj.pos[0];
+        const float dy = cam[1] - obj.pos[1];
+        const float dz = cam[2] + 3.0f - obj.pos[2];
+        const float xyDist = std::sqrt(dx * dx + dy * dy);
+        const float d3 =
+            std::sqrt(dx * dx + dy * dy + dz * dz) + 0.1f;
+        float yaw = bearingDeg(dy, dx);
+        float bank = bearingDeg(dz, xyDist);
+        if (spread != 100.0f) {
+          const float s = 100.0f - spread;
+          yaw += static_cast<float>(
+                     enemyRandBelow(env.rt->rngState, 0x14) - 10) *
+                 s / d3;
+          bank += static_cast<float>(
+                      enemyRandBelow(env.rt->rngState, 0x14) - 10) *
+                  s / (d3 * 4.0f);
+        }
+        obj.yawDeg = yaw;                            // +0x4c, raw store
+        obj.bankDeg = bank;                          // +0x13c
+      }
+      return;
+    }
+    case 0x6b: {                            // voice rebind (0x43848)
+      // {lstr sfx}: +0x15c = name; +0x158 voice handle released via
+      // FUN_004020b4 when bound, then FUN_00402fe8 resolve +
+      // FUN_00402160 respawn when the name is nonempty. Voice/sfx are
+      // presentation — counted in seams.fireSoundCalls, not resolved.
+      const std::string sfx = r.str();
+      if (!r.ok) { v.fail("voicebind"); return; }
+      obj.field15c = sfx;                            // +0x15c
+      if (obj.field158 != nullptr) {
+        if (env.rt != nullptr) ++env.rt->seams.fireSoundCalls;
+        obj.field158 = nullptr;
+      }
+      if (!sfx.empty() && env.rt != nullptr)
+        ++env.rt->seams.fireSoundCalls;              // FUN_00402160
+      return;
+    }
+    case 0x6d: {                            // camera kick (0x443c73)
+      // {u8}: FUN_00467888(operand, +0x4c) — the impact screen-shake,
+      // gated on 0x541554/0x541510 render flags and camera mode.
+      // Presentation seam — counted, not applied.
+      (void)r.u8();
+      if (!r.ok) { v.fail("camkick"); return; }
+      if (env.rt != nullptr) ++env.rt->seams.screenShakeCalls;
+      return;
+    }
     case 0x86: {                            // pitch drift (0x441d58)
       // {varop}: +0x54 += operand * (1/30) — OBSERVED 0x49b6f4 is the
-      // frame-time constant. Same wrap quirk as op-0x65: the
-      // positive-side loop is dead, then +0x54 -= 360 while >= 360.
+      // frame-time constant. Dead-wrap quirk (OBSERVED 0x441dcf..):
+      // >0 routes to a `<0:+=360` loop and <=0 to a `>=360:-=360` loop
+      // — both unreachable, so +0x54 is stored raw.
       const float val = resolveVar(r, env, ctx);
       if (!r.ok) { v.fail("pitchdrift"); return; }
-      float pitch = obj.pitchDeg + val * (1.0f / 30.0f);
-      while (pitch >= 360.0f) pitch += -360.0f;
-      obj.pitchDeg = pitch;
+      obj.pitchDeg += val * (1.0f / 30.0f);
       return;
     }
     case 0x6a: {                            // f32 -> +0x302 (0x44382b)
@@ -2544,8 +2656,13 @@ namespace {
 // Operand grammars (identical to the executor's fetch order).
 const char* opcodeGrammar(std::uint8_t op) {
   switch (op) {
-  case 0x01: case 0x09: case 0xff: case 0xfd: return "";
-  case 0x40: return "v";
+  case 0x01: case 0x09: case 0xff: case 0xfd: case 0x65: case 0x6e:
+    return "";
+  case 0x28: case 0x35: case 0x40: case 0x86: return "v";
+  case 0x3e: case 0x7f: return "kl";
+  case 0x68: case 0x6a: return "f";
+  case 0x6b: return "s";
+  case 0x6d: return "b";
   case 0x44: case 0x45: case 0x61: case 0x0b: case 0xca:
     return (op == 0x44 || op == 0x45) ? "bb" : "b";
   case 0x46: case 0x47: case 0x48: case 0x7b: case 0x0d: return "bbl";
@@ -2574,6 +2691,12 @@ const char* opcodeName(std::uint8_t op) {
   switch (op) {
   case 0x01: return "ckpt";   case 0x09: return "stop";
   case 0xff: return "end";    case 0xfd: return "ret";
+  case 0x28: return "yawAcc"; case 0x35: return "rate34";
+  case 0x3e: return "angleLink"; case 0x65: return "faceCam";
+  case 0x68: return "aim68";  case 0x6a: return "life302";
+  case 0x6b: return "voiceBind"; case 0x6d: return "camKick";
+  case 0x6e: return "teardown"; case 0x7f: return "cmpLink";
+  case 0x86: return "pitchDrift";
   case 0x40: return "wait";   case 0x44: return "bitset";
   case 0x45: return "bitclr"; case 0x46: return "brSet2";
   case 0x47: return "brSet";  case 0x48: return "brClr";
@@ -2632,6 +2755,16 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
       std::uint8_t m = r.u8();
       if (m == 3) { std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg; }
       else { std::snprintf(arg, sizeof arg, " v%u:%u", m, r.u8()); text += arg; }
+      break;
+    }
+    case 'k': {                              // kind-cmp operands
+      std::uint8_t kind = r.u8();
+      std::uint32_t a = r.u32();
+      std::snprintf(arg, sizeof arg, " %u 0x%x", kind, a); text += arg;
+      if (kind == 7 || kind == 8) {
+        std::uint32_t b = r.u32();
+        std::snprintf(arg, sizeof arg, " 0x%x", b); text += arg;
+      }
       break;
     }
     case 'n': {

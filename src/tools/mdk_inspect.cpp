@@ -76,6 +76,10 @@ int usage() {
                "                            and <stem>S.MTI are decoded into\n"
                "                            the Phase 6A render-data view.\n"
                "                            Options: --arena NAME --start X Y Z)\n"
+               "       mdk-inspect --data-path DIR --script-disasm "
+               "<cmi-path> <name|*>\n"
+               "       mdk-inspect --data-path DIR --obj-script-disasm "
+               "<cmi-path>   (every table-0 object script)\n"
                "       mdk-inspect --data-path DIR --traversal-runtime "
                "<relative-path>\n"
                "                            (a .DTI path; loads the sibling\n"
@@ -1183,6 +1187,7 @@ int main(int argc, char** argv) {
   bool arenaRender = false;
   bool traversalRuntime = false;
   bool scriptDisasm = false;
+  bool objScriptDisasm = false;
   std::string scriptDisasmName;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
@@ -1304,6 +1309,11 @@ int main(int argc, char** argv) {
       const char* n = value(a);   // arena/script record name
       if (!n) return usage();
       scriptDisasmName = n;
+    } else if (!std::strcmp(a, "--obj-script-disasm")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;                 // .CMI path — dumps every table-0
+      objScriptDisasm = true;     // object script (Phase 12A census)
     } else if (!std::strcmp(a, "--arena")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -1456,7 +1466,7 @@ int main(int argc, char** argv) {
   if (!entriesMode && !visualInfoName && !fontInfoName &&
       !spriteInfoName && !collisionProbe && !arenaObjects &&
       !surfaceCensus && !arenaRender && !traversalRuntime &&
-      !scriptDisasm) {
+      !scriptDisasm && !objScriptDisasm) {
     return 0;
   }
 
@@ -2014,6 +2024,48 @@ int main(int argc, char** argv) {
     for (const auto& in : insns) {
       std::printf("  +%04x  %02x  %s\n",
                   in.off - code, in.opcode, in.text.c_str());
+    }
+    return 0;
+  }
+
+  if (objScriptDisasm) {
+    // Phase 12A — disassemble every CMI table-0 object script
+    // ("%s$%s_%u" records; code offset = value + 4, OBSERVED
+    // FUN_00456808) for the projectile-family census.
+    const auto cmiFile = root->readFile(*target, kEntriesMaxBytes, &err);
+    if (!cmiFile) {
+      std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
+      return 1;
+    }
+    std::span<const std::byte> img(
+        reinterpret_cast<const std::byte*>(cmiFile->data()),
+        cmiFile->size());
+    const auto cmi = mdk::inspectCmiDirectory(img);
+    if (cmi.status != mdk::CmiDirectoryStatus::kOk) {
+      std::fprintf(stderr, "cmi: parse FAILED (%s)\n",
+                   std::string(mdk::cmiDirectoryStatusName(cmi.status))
+                       .c_str());
+      return 1;
+    }
+    std::printf("cmi:   %s — %zu t0 records\n",
+                target->c_str(),
+                cmi.tables.empty() ? 0 : cmi.tables[0].records.size());
+    if (cmi.tables.empty()) return 0;
+    for (const auto& rec : cmi.tables[0].records) {
+      const std::uint64_t fo = 4 + static_cast<std::uint64_t>(rec.value);
+      if (fo >= img.size()) {
+        std::printf("=== %s  codeOff=0x%x  OUT OF BOUNDS\n",
+                    rec.name().c_str(), rec.value);
+        continue;
+      }
+      std::printf("=== %s  codeOff=0x%x\n", rec.name().c_str(),
+                  rec.value);
+      const auto insns =
+          mdk::traversalScriptDisasm(img, 4, rec.value, 256);
+      for (const auto& in : insns) {
+        std::printf("  +%04x  %02x  %s\n",
+                    in.off - rec.value, in.opcode, in.text.c_str());
+      }
     }
     return 0;
   }

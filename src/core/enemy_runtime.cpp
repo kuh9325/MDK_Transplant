@@ -1063,13 +1063,12 @@ void cmdBodyCarry(TraversalRuntime& rt, DynamicObject& o) {
 void cmdDropperSpawn(TraversalRuntime& rt, DynamicObject& o,
                      DynamicArena& home, DynamicModelSource modelFor,
                      void* modelCtx) {
-  // FUN_0045aaa4 — find a "BOMB_%d" element (random digit), mark the
-  // element mask and take its center as the spawn point.
+  // FUN_0045aaa4 — sprintf "BOMB_%d" with the DROP COUNT (+0x306), mark
+  // the element mask (+0x2c8) and take the element AABB center.
   float spawnPos[3] = {o.pos[0], o.pos[1], o.pos[2]};
   bool slot = false;
-  const int digit = enemyRandBelow(rt.rngState, 10);
   char name[16];
-  std::snprintf(name, sizeof(name), "BOMB_%d", digit);
+  std::snprintf(name, sizeof(name), "BOMB_%d", o.field306);
   for (std::size_t e = 0; e < o.model.elems.size(); ++e) {
     if (o.model.elemName(e) == name) {
       o.col.elemMaskB |= (1u << (e & 31));
@@ -1084,10 +1083,10 @@ void cmdDropperSpawn(TraversalRuntime& rt, DynamicObject& o,
     rt.seams.mountUnmountCalls++;              // FUN_00408eb0 fallback
     return;
   }
-  // FUN_00454794 — the spawn uses the object's own model name (the
-  // dropper re-spawns its class as a falling bomb).
+  // FUN_00454794 — OBSERVED: the drop is the fixed model "X_TOOTH"
+  // (0x498080), NOT the dropper's own class.
   rt.seams.classLookupCalls++;
-  const int idx = rt.level.enemies.indexOf(o.model.modelName());
+  const int idx = rt.level.enemies.indexOf("X_TOOTH");
   if (idx < 0) return;
   const RuntimeModel* src = modelFor ? modelFor(idx, modelCtx) : nullptr;
   if (src == nullptr) return;
@@ -1142,14 +1141,19 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
       case 9: cmdBody9(rt, o); return;
       case 0x80: {
         if (rt.field54163b == 0) {
-          // Idle dropper — random spawn gate ((edx<rnd<10) => the
-          // original's per-tick spawn chance window).
+          // Idle dropper — OBSERVED deterministic gate:
+          //   n = frndint((entry[2].frame - +0xf0) * 10 * (1/30) + 5)
+          // spawn when +0x306 < n < 10; +0x306 counts the drops and is
+          // also the BOMB_%d digit. No RNG in the original.
           if (o.fieldEC == nullptr) {
             objectTeardownNow(rt, o);
             return;
           }
-          const int r = enemyRandBelow(rt.rngState, 10);
-          if (r > 0 && r < 10) {
+          const int n = static_cast<int>(std::lround(
+              (pathEntryFrame(o.fieldEC, 2) - o.fieldF0) * 10.0f *
+                  (1.0f / 30.0f) +
+              5.0f));
+          if (static_cast<int>(o.field306) < n && n < 10) {
             cmdDropperSpawn(rt, o, home, traversalModelFor,
                             &rt.level);
             o.field306 += 1;                   // drop count
@@ -1157,12 +1161,15 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
           rt.cmdFlag54 = 1;
           return;
         }
-        // Weapon-5 latch — kamikaze run: past path mid -> release path
-        // to velocity, then die on wall/floor contact.
+        // Weapon-5 latch — kamikaze run: past the +0xec midpoint ->
+        // release path to velocity, then die on wall/floor contact.
         if (o.fieldEC != nullptr) {
+          // OBSERVED (0x458c02..0x458c21): the midpoint is
+          // (entry[1].frame + entry[2].frame) * 0.5 — the record's
+          // +0x2c/+0x54 dwords, NOT first/last.
           const double mid =
-              static_cast<double>(pathLastFrame(o.fieldEC) +
-                                  pathFirstFrame(o.fieldEC)) * 0.5;
+              static_cast<double>(pathEntryFrame(o.fieldEC, 1) +
+                                  pathEntryFrame(o.fieldEC, 2)) * 0.5;
           if (static_cast<double>(o.fieldF0) < mid ||
               static_cast<double>(o.fieldF0) == mid) {
             rt.cmdFlag54 = 1;
@@ -1180,6 +1187,10 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
           splashDamage(rt, o.pos, 450.0f, 80.0f, 1, nullptr, 6, -6);
           splashDamage(rt, o.pos, 67.0f, 80.0f, 1, nullptr, 1, -6);
           objectDieFacingPlayer(rt, o);
+          // FUN_004581a4's chain ends in the FUN_0045828c record wipe
+          // (inside FUN_00457cf4) — a scriptless object is dead and
+          // stops updating, not left live to re-detonate each frame.
+          objectTeardownNow(rt, o);
           return;
         }
         rt.cmdFlag54 = 1;

@@ -241,6 +241,10 @@ struct TraversalSeams {
   // --- Phase 5N — player weapon fire (see player_fire.h) ---
   int shotSpawnCalls = 0;         // FUN_0045f138 0..4 pool spawns
   int weapon5SpawnCalls = 0;      // FUN_0045a4dc thrown-object spawn
+  int bombCinematicCalls = 0;     // FUN_0042f310 — the X_STRIKB/X_STRIKD
+                                  // presentation prop manager invoked
+                                  // at the top of FUN_0045a4dc(0) and
+                                  // on the cinematic path (arg=1).
   int fireDenyCalls = 0;          // FUN_00402388(1,0x54c650) no-fire
   int fireNotifyCalls = 0;        // FUN_00469668 fire on/off seam
   int fireSoundCalls = 0;         // FUN_004022b8(0x54c5d0) fire sound
@@ -261,6 +265,7 @@ struct TraversalSeams {
   int objectDeathCalls = 0;       // FUN_00458140 deaths run
   int objectTeardownCalls = 0;    // FUN_00457cf4 teardown seam
   int mountDamageCalls = 0;       // FUN_0046771c mount-redirect hits
+  int screenShakeCalls = 0;       // FUN_00467888 camera kick (script op 0x6d)
 };
 
 struct TraversalFrameResult {
@@ -458,9 +463,18 @@ struct TraversalRuntime {
   std::array<int, 6> ammo = {};
   int field541498 = 0;            // 0x541498 — weapon-5 charge level
   int field54163b = 0;            // 0x54163b — weapon-5 fire latch
-  int weapon5Probe = 0;           // the FUN_0046145c charge-probe
-                                  // liveness the FUN_00437aa8 seam
-                                  // copies into 0x540e14 each frame
+  int weapon5Probe = 0;           // PORT test hook: when nonzero the
+                                  // charge probe is forced live
+                                  // (FUN_0046145c skipped). The real
+                                  // probe runs whenever this is 0.
+  float weapon5Aim[3] = {0, 0, 0};  // 0x540e18 — the FUN_0046145c
+                                  // probe hit point (+ camera basis
+                                  // bump); FUN_0045a4dc reads it as
+                                  // the trajectory apex.
+  std::int32_t weapon5Path[1 + 5 * 10] = {}; // 0x54ca00 — the SINGLE
+                                  // shared 5-key path record rebuilt
+                                  // on every weapon-5 throw (OBSERVED:
+                                  // one global, not per-bomb).
   int shotSerial = 0;             // 0x540e80 — per-spawn serial
   std::array<PlayerShot, 3> shots{};  // 0x540ed4 — the 3-slot pool
   int punchTime = 0;              // 0x540e78 — punch jitter accum
