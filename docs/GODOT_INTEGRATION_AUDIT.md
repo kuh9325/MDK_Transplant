@@ -353,11 +353,13 @@ custom `ResourceFormatLoader`.)
 - Audio: Godot `AudioStreamPlayer`/`AudioStreamPlayer3D` driven by
   presentation events from the core (`SoundAudioEvent` already exists
   on the menu side; traversal fire/notify seams are counted today —
-  including the object-VM voice rebind op `0x6b` and the `FUN_00467888`
-  camera-kick op `0x6d`, counted in `seams.fireSoundCalls` /
-  `seams.screenShakeCalls` respectively; the `FUN_0042f310` X_STRIKB/
+  including the object-VM voice rebind op `0x6b`, counted in
+  `seams.fireSoundCalls`; the `FUN_0042f310` X_STRIKB/
   X_STRIKD held-bomb prop manager is likewise a deferred presentation
   seam — the weapon-5 gameplay spawn `FUN_0045a4dc` itself is ported).
+  Object-VM op `0x6d` is **not** audio/presentation — it is
+  `FUN_00467888` player damage (`FUN_0046771c` body-identical),
+  fully ported in the native core.
   SNI payloads are OBSERVED mostly RIFF/WAVE — decode is ordinary
   coding, no RE risk. Positional audio must not acquire gameplay
   meaning (attenuation is presentation).

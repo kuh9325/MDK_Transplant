@@ -4157,6 +4157,26 @@ Tangent pass `FUN_00409558`/`FUN_00409390` resolves to
   die→teardown→record-wipe (`FUN_0045828c`) chain — a scriptless
   `X_STRIKE` no longer re-detonates each frame.
 
+### `BOMB_%d` child lifecycle (OBSERVED — fully owned by the port)
+
+The dropped `X_TOOTH` child is **ballistic**, not path-flown —
+closing the earlier "full flight profile" open question:
+
+- Spawn (`FUN_0045aaa4`/`FUN_00454794`): `+0x30a = 5` (detonate
+  cmd), `+0x30e = 900` fuse, `+0x30 = -5` initial downward
+  velocity, `+0x148 |= 0x18a6` (gravity + sweep), `+0x14a |= 8`.
+- Flight: the generic mover integrates `+0x30` under gravity
+  (`+0x48 = 32` default from `FUN_004566f0` init, terminal `-220`)
+  — a plain ballistic drop with no path record (`+0xec` unset).
+- Idle cmd-5 phase: object-touch scan with `excl = 0x810`,
+  `req = 0` masks (any contact counts), `cmdDetonate58` drop
+  counter gate, `+0x30e` fuse countdown.
+- Detonation transition (`+0x14c & 0x13` wall/floor/object touch,
+  or fuse expiry): `FUN_00460d44` splash `150/40` + `75/40`,
+  `FUN_004575fc` shockwave remnant (presentation),
+  `FUN_0045828c` record wipe. No post-detonation lifetime — the
+  record is dead the same tick.
+
 ### Enemy projectile pipeline (OBSERVED census)
 
 Enemy shots are **not** spawned by command bodies — a full BUILD_A
@@ -4195,10 +4215,38 @@ disasm census (L3/L6/L8, BFS over `rcall`/`rgoto` linkage) shows:
 - `0x6b` voiceBind `{lstr}`: `+0x15c` name + `FUN_004020b4`/
   `FUN_00402160` voice release/respawn — presentation, counted in
   `seams.fireSoundCalls` (0x43848).
-- `0x6d` camKick `{u8}`: `FUN_00467888` screen shake — presentation,
-  counted in `seams.screenShakeCalls` (0x443c73).
+- `0x6d` dmg `{u8 dmg}`: `FUN_00467888(dmg, +0x4c)` — **player
+  damage**, not presentation. `FUN_00467888` is body-identical to
+  `FUN_0046771c` (`playerDamageApply`): health/suppress gates,
+  `Skill` `0x54147a` scaling (`0→max(2d/3,1)`, `1→d`, `2→2d`),
+  `0x540dac += dmg·25` clamp `[75,180]`, mount redirect via
+  `0x540e6c`/`0x540e70&1`, `health -= dmg` floored at 0,
+  `landingAccum += dmg`. The pushed `+0x4c` arg is unread
+  (vestigial `RET 0x4` slot). (0x443c73)
 - `0x86` pitchDrift corrected to the dead-wrap raw store
   (`+0x54 += v·(1/30)` unwrapped, OBSERVED 0x441dcf..).
+
+### Enemy projectile hit → damage → cleanup (OBSERVED, L8)
+
+The `0x6c` touch link fires on `+0x14c&4` (subtype-`0x3d` player-box
+contact set by the subtype update). The real hit targets decode to:
+
+| family | touch target | hit ops | damage |
+|---|---|---|---|
+| BOLT | `0x1717c` | `6d 02; 4c 0; 6e` | 2 |
+| BOLT-alt | `0x17185` | `6d 05; 4c 0; 6e` | 5 |
+| BIGBOLT | `0x3af3`/`0xbc69` | `6d 05; 4c 0; 6e` | 5 |
+| XT_MISS | `0x42a9` et al. | `6d 14; 4c 0; 10 0000` | 20 |
+
+All three share one generic path: `0x6d` player damage → `0x4c 0`
+clears the death-ref → `0x6e` teardown (record wipe) — or, for
+XT_MISS, `0x10` health=0 which dies through the health boundary
+instead of the explicit wipe. The death-ref target is a bare
+`0x6e` (silent wall/expiry death). No repeat hit is possible: the
+object record is dead after the contact tick. Damage flows through
+the same `playerDamageApply` as weapons 0–4 — difficulty scaling,
+suppress gates, mount redirect, and the `0x540dac` accumulator all
+apply identically.
 
 ### `FUN_0042f310` — X_STRIKB/X_STRIKD prop manager (seam, deferred)
 
@@ -4211,9 +4259,22 @@ binding lands.
 
 ### Phase 12A validation
 
-`mdk_tests`: **4279 checks / 0 failures** — weapon-5 spawn/aim/path/
+`mdk_tests`: **4307 checks / 0 failures** — weapon-5 spawn/aim/path/
 probe, cmd0x80 midpoint/gate/model/drop-count/kamikaze-wipe, op-`0x28`
 raw yaw accumulate, op-`0x3e` facing-angle link (+wrap/180-fold),
 op-`0x68` aim+spread (spread-100 no-draw, spread-75 two-draw jitter),
-op-`0x6b`/`0x6d` seams, op-`0x86` dead-wrap, and a BOLT-shaped
-end-to-end script (rate→angleLink→aim68→pitchDrift).
+op-`0x6b` voice seam, op-`0x6d` player damage (Skill 0/1/2 scaling,
+suppress gate, accumulator floor), op-`0x86` dead-wrap, a BOLT-shaped
+end-to-end script (rate→angleLink→aim68→pitchDrift), and the golden
+enemy-attack chain: `0x3d` spawn → BOLT script → subtype-`0x3d` move
+→ player-box contact → `0x6d` health reduction → `0x6e` teardown →
+no repeat hit; plus the XT_MISS `0x10` health-boundary variant.
+
+**COMBAT NATIVE GAMEPLAY RECONSTRUCTION: CLOSED FOR BUILD_A** for
+the generic families — weapons 0–4 lifecycle, weapon-5 spawn/path/
+drop/kamikaze, `BOMB_%d` ballistic children, and the enemy
+projectile hit→damage→cleanup chain are all ported and tested.
+Open items are non-blocking: the 34-name tally table (statistics
+seam), FX/SFX record internals, `FUN_0042f310`/`0x6b` presentation
+seams, and boss-specific orchestration outside the generic
+`0x3d`-spawn path.

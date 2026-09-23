@@ -12318,14 +12318,38 @@ void test_traversal_object_script() {
     CHECK(f.rt.seams.fireSoundCalls == 3);
   }
 
-  // -- obj op 0x6d: camera kick seam ---------------------------------------
+  // -- obj op 0x6d: player damage (FUN_00467888) ----------------------------
   {
     ScriptFixture f;
-    f.write(C, {0x6d, 0x07, 0xff});
+    f.write(C, {0x6d, 0x02, 0xff});           // BOLT's hit: dmg 2
+    f.rt.fieldHealth = 100;                 // gates open
+    f.rt.difficulty = 1;
     mdk::DynamicObject& o = f.arena->dyn.allocFront();
     o.field108 = f.image.data() + 4 + C;
     auto r = mdk::traversalObjectScriptTick(f.env, o);
-    CHECK(r.halted && !r.error && f.rt.seams.screenShakeCalls == 1);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.fieldHealth == 98);          // health -= 2 (Skill 1)
+    CHECK(f.rt.fieldDac == 75);             // 2*25=50 floored at 75
+    CHECK(near(f.rt.vert.landingAccum, 2.0));
+    // Skill 0 -> 2d/3 floor 1; Skill 2 -> 2d.
+    f.rt.fieldHealth = 100; f.rt.fieldDac = 0; f.rt.vert.landingAccum = 0;
+    f.rt.difficulty = 0;
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(f.rt.fieldHealth == 99);          // max(2*2/3,1) = 1
+    f.rt.fieldHealth = 100; f.rt.difficulty = 2;
+    mdk::DynamicObject& o3 = f.arena->dyn.allocFront();
+    o3.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o3);
+    CHECK(f.rt.fieldHealth == 96);          // 2*2 = 4
+    // Suppressed (fieldE10 > 0) -> no damage, landingAccum cleared.
+    f.rt.fieldHealth = 100; f.rt.fieldE10 = 0.5f;
+    f.rt.vert.landingAccum = 9;
+    mdk::DynamicObject& o4 = f.arena->dyn.allocFront();
+    o4.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o4);
+    CHECK(f.rt.fieldHealth == 100 && f.rt.vert.landingAccum == 0);
   }
 
   // -- obj op 0x86: pitch drift, raw (dead-wrap) store ---------------------
@@ -12369,6 +12393,130 @@ void test_traversal_object_script() {
     CHECK(near(o.field34, 75.0));
     CHECK(near(o.pitchDeg, 180.0 * (1.0 / 30.0), 1e-4));
     CHECK(f.rt.rngState != 7);              // angle<=45 -> aim ran
+  }
+
+  // -- golden: enemy 0x3d spawn -> BOLT script -> move -> player ------
+  // contact -> op-0x6d damage -> teardown. Models the real L8
+  // GUNT_2$XG chain (spawn pc 0x1705b; hit pc 0x1717c:
+  // `6d 02; 4c 0; 6e` = dmg 2, clear death-ref, teardown — OBSERVED).
+  {
+    ScriptFixture f;
+    const std::uint32_t P = 0x300;          // BOLT persistent script
+    const std::uint32_t TAIL = 0x340;
+    const std::uint32_t HIT = 0x360;
+    const std::uint32_t DIE = 0x380;        // death-ref target
+    // Enemy script: 0x3d mode0 refIdx0 "BOLT" pc=P; end.
+    f.write(C, {0x3d, 0x00, 0x00});
+    f.writeStr(C + 3, "BOLT");
+    f.writeW(C + 9, P);
+    f.write(C + 13, {0xff});
+    // BOLT head (0x1705b): deathRef; rate34 75; life302 5; set148;
+    // aim68 spread 100 (no jitter); rgoto TAIL.
+    f.write(P, {0x4c}); f.writeW(P + 1, DIE);
+    f.write(P + 5, {0x35, 0x03}); f.writeF(P + 7, 75.0f);
+    f.write(P + 11, {0x6a}); f.writeF(P + 12, 5.0f);
+    f.write(P + 16, {0x61, 0x00});
+    f.write(P + 18, {0x68}); f.writeF(P + 19, 100.0f);
+    f.write(P + 23, {0x0c, 0x01}); f.writeW(P + 25, TAIL);
+    f.write(P + 29, {0xff});
+    // TAIL (0x17162): touchLink->HIT; pitchDrift; end (re-runs each
+    // frame while field108 sits at TAIL).
+    f.write(TAIL, {0x6c, 0x0c}); f.writeW(TAIL + 2, HIT);
+    f.write(TAIL + 6, {0x86, 0x03}); f.writeF(TAIL + 8, 180.0f);
+    f.write(TAIL + 12, {0xff});
+    // HIT (0x1717c): dmg 2; deathRef=0; teardown.
+    f.write(HIT, {0x6d, 0x02, 0x4c}); f.writeW(HIT + 3, 0);
+    f.write(HIT + 7, {0x6e, 0xff});
+    // DIE (0x1718e): silent teardown on wall/expiry.
+    f.write(DIE, {0x6e, 0xff});
+
+    // Enemy gun object with a muzzle refpoint at the origin.
+    mdk::DynamicObject& xg = f.arena->dyn.allocFront();
+    xg.col.named = true;
+    xg.pos[0] = 0.0f; xg.pos[1] = 0.0f; xg.pos[2] = 0.0f;
+    xg.worldRef[0][0] = 0.0f;               // muzzle = origin
+    xg.worldRef[0][1] = 0.0f;
+    xg.worldRef[0][2] = 0.0f;
+    xg.field108 = f.image.data() + 4 + C;
+
+    f.rt.level.enemies.entries.push_back({"BOLT", 0, false});
+    mdk::RuntimeModel bolt = makePlatformModel("BOLT", "BODY", 0.0f);
+    TestModelSrc src{{&bolt}};
+    f.env.modelFor = testModelFor;
+    f.env.modelCtx = &src;
+
+    // Player/camera at (100, 0, 53) — aim68 adds +3 to camera z.
+    f.rt.camera.pose.pos[0] = 100.0f;
+    f.rt.camera.pose.pos[1] = 0.0f;
+    f.rt.camera.pose.pos[2] = 53.0f;
+    f.rt.fieldHealth = 100;
+    f.rt.difficulty = 1;
+    const float pbox[6] = {20.0f, -5.0f, 0.0f, 60.0f, 5.0f, 40.0f};
+    std::copy(pbox, pbox + 6, f.rt.cs.playerBox);
+
+    // Tick 1: enemy script spawns the projectile.
+    auto r1 = mdk::traversalObjectScriptTick(f.env, xg);
+    CHECK(r1.halted && !r1.error);
+    mdk::DynamicObject& b = *f.arena->dyn.storage.front();
+    CHECK(b.col.named);
+    CHECK(b.field11e == 0x3d);
+    CHECK(b.field108 == f.image.data() + 4 + P);
+    CHECK(near(b.pos[0], 0.0f) && near(b.pos[2], 0.0f));
+
+    // Tick 2: BOLT head runs — aims at the camera, suspends at TAIL.
+    auto r2 = mdk::traversalObjectScriptTick(f.env, b);
+    CHECK(r2.halted && !r2.error);
+    CHECK(near(b.field34, 75.0));
+    CHECK(b.yawDeg == 0.0f);                // due +x toward camera
+    CHECK(b.field108 == f.image.data() + 4 + TAIL);
+
+    // Move: subtype-0x3d flies toward the player box and touches it.
+    const int teardowns0 = f.rt.seams.objectTeardownCalls;
+    mdk::objectSubtypeUpdate(f.rt, b, f.arena->dyn, 0.5f);
+    CHECK((b.col.flags14c & 4) != 0);       // player contact set
+    CHECK(b.pos[0] >= 19.0f);               // clamped at the box
+
+    // Tick 3: touchLink fires -> damage -> clear deathRef -> teardown.
+    auto r3 = mdk::traversalObjectScriptTick(f.env, b);
+    CHECK(r3.halted && !r3.error);
+    CHECK(f.rt.fieldHealth == 98);          // 2 base at Skill 1
+    CHECK(f.rt.fieldDac == 75);             // accumulator floor
+    CHECK(!b.col.named);                    // 0x6e teardown wiped it
+    CHECK(b.health == 0);
+    CHECK(f.rt.seams.objectTeardownCalls == teardowns0 + 1);
+
+    // No repeat hit — the wiped record is inert on the next tick.
+    auto r4 = mdk::traversalObjectScriptTick(f.env, b);
+    (void)r4;
+    CHECK(f.rt.fieldHealth == 98);
+  }
+
+  // -- XT_MISS hit variant: `6d 14; 4c 0; 10 0` (dmg 20 + health=0) --
+  // OBSERVED at 0x42a9: op-0x10 sets +0x10 health to zero instead of
+  // 0x6e — the object dies through the health boundary, not teardown.
+  {
+    ScriptFixture f;
+    const std::uint32_t HIT = 0x320;
+    // head: touchLink->HIT; pitchDrift; end.
+    f.write(C, {0x6c, 0x0c}); f.writeW(C + 2, HIT);
+    f.write(C + 6, {0x86, 0x03}); f.writeF(C + 8, 90.0f);
+    f.write(C + 12, {0xff});
+    // HIT: dmg 20; deathRef=0; setHealth 0.
+    f.write(HIT, {0x6d, 0x14, 0x4c}); f.writeW(HIT + 3, 0);
+    f.write(HIT + 7, {0x10, 0x00, 0x00, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.field11e = 0x3d;                      // spawned-projectile subtype
+    o.health = 5;
+    o.col.flags14c |= 4;                    // player contact already set
+    o.field108 = f.image.data() + 4 + C;
+    f.rt.fieldHealth = 100;
+    f.rt.difficulty = 1;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.fieldHealth == 80);          // 20 base at Skill 1
+    CHECK(o.health == 0);                   // 0x10 — dies via health
+    CHECK(o.col.named);                     // no 0x6e wipe this path
   }
 }
 

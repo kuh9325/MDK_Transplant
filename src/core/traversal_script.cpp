@@ -10,6 +10,7 @@
 
 #include "core/traversal_runtime.h"
 #include "core/player_surface.h"
+#include "core/player_projectiles.h"
 #include "core/dynamic_objects.h"
 #include "core/enemy_runtime.h"
 #include "core/dti_structure.h"
@@ -2349,13 +2350,19 @@ void objScriptInsn(ObjScriptPass& v) {
         ++env.rt->seams.fireSoundCalls;              // FUN_00402160
       return;
     }
-    case 0x6d: {                            // camera kick (0x443c73)
-      // {u8}: FUN_00467888(operand, +0x4c) — the impact screen-shake,
-      // gated on 0x541554/0x541510 render flags and camera mode.
-      // Presentation seam — counted, not applied.
-      (void)r.u8();
-      if (!r.ok) { v.fail("camkick"); return; }
-      if (env.rt != nullptr) ++env.rt->seams.screenShakeCalls;
+    case 0x6d: {                            // player damage (0x443c73)
+      // {u8 dmg}: FUN_00467888(dmg, +0x4c) — OBSERVED: FUN_00467888
+      // is the player-damage function (gates 0x541554/0x541510,
+      // 0x540e10 suppress + 0x540d5c clear, loco-state 0x326/0x385/
+      // 0x3ea, 0x540eb8; Skill scaling; 0x540dac += dmg·25 clamp
+      // [75,180]; mount redirect 0x540e6c + 0x540e70&1; health
+      // 0x541554 -= dmg floored 0; landingAccum += dmg). Identical
+      // body to FUN_0046771c = playerDamageApply; the pushed +0x4c
+      // arg is never read by the callee (vestigial RET 0x4 slot).
+      const std::uint8_t dmg = r.u8();
+      if (!r.ok) { v.fail("dmg"); return; }
+      if (env.rt != nullptr)
+        playerDamageApply(*env.rt, dmg, obj.pos);
       return;
     }
     case 0x86: {                            // pitch drift (0x441d58)
@@ -2694,7 +2701,7 @@ const char* opcodeName(std::uint8_t op) {
   case 0x28: return "yawAcc"; case 0x35: return "rate34";
   case 0x3e: return "angleLink"; case 0x65: return "faceCam";
   case 0x68: return "aim68";  case 0x6a: return "life302";
-  case 0x6b: return "voiceBind"; case 0x6d: return "camKick";
+  case 0x6b: return "voiceBind"; case 0x6d: return "dmg";
   case 0x6e: return "teardown"; case 0x7f: return "cmpLink";
   case 0x86: return "pitchDrift";
   case 0x40: return "wait";   case 0x44: return "bitset";

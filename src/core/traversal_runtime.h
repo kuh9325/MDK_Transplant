@@ -265,7 +265,6 @@ struct TraversalSeams {
   int objectDeathCalls = 0;       // FUN_00458140 deaths run
   int objectTeardownCalls = 0;    // FUN_00457cf4 teardown seam
   int mountDamageCalls = 0;       // FUN_0046771c mount-redirect hits
-  int screenShakeCalls = 0;       // FUN_00467888 camera kick (script op 0x6d)
 };
 
 struct TraversalFrameResult {
