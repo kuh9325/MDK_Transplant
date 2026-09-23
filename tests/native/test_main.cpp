@@ -14,6 +14,7 @@
 #include "core/display_menu.h"
 #include "core/dti_structure.h"
 #include "core/dynamic_objects.h"
+#include "core/enemy_runtime.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/frontend_flow.h"
@@ -29,6 +30,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/object_animation.h"
+#include "core/object_path.h"
 #include "core/options_menu.h"
 #include "core/player_camera.h"
 #include "core/player_fire.h"
@@ -12111,7 +12113,8 @@ void test_traversal_object_script() {
     auto r = mdk::traversalObjectScriptTick(f.env, o);
     CHECK(r.halted && !r.error);
     CHECK(o.field11e == 0x4e);
-    CHECK(o.field120[0] == 0x111 && o.field120[2] == 0x333);
+    CHECK(o.field120[0] == std::bit_cast<float>(0x111u) &&
+          o.field120[2] == std::bit_cast<float>(0x333u));
     CHECK(o.fieldEC == nullptr);
     CHECK(o.field2a0 == 0 && o.field2a1 == 0);
   }
@@ -12249,6 +12252,580 @@ mdk::DynamicObject& animObject(mdk::DynamicArena& da,
 }
 
 } // namespace
+
+void test_enemy_runtime() {
+  // -- FUN_0047d2b5 / FUN_00401ed4 — the MSVC CRT rand LCG -------------
+  {
+    std::uint32_t s = 1;
+    const std::uint32_t r0 = mdk::enemyRandNext(s);
+    CHECK(s == 0x41c67ea6u);               // 1*0x41c64e6d + 0x3039
+    CHECK(r0 == ((0x41c67ea6u >> 16) & 0x7fff));   // 16838
+    s = 1;
+    CHECK(mdk::enemyRandBelow(s, 10000) ==
+          static_cast<int>((16838u * 10000u) >> 15));   // 5137
+    s = 1;
+    for (int i = 0; i < 8; ++i)
+      CHECK(mdk::enemyRandBelow(s, 7) >= 0 &&
+            mdk::enemyRandBelow(s, 7) < 7);
+  }
+
+  // -- bearingDeg / sincosDeg (FUN_00437f30 / FUN_00437f98) ------------
+  {
+    CHECK(near(mdk::bearingDeg(1, 0), 90.0) &&
+          near(mdk::bearingDeg(0, 0), 0.0) &&
+          near(mdk::bearingDeg(-1, 0), 270.0) &&
+          near(mdk::bearingDeg(0, -1), 180.0));
+    float sn, cs;
+    mdk::sincosDeg(90.0f, &sn, &cs);
+    CHECK(near(sn, 1.0, 1e-5) && near(cs, 0.0, 1e-5));
+    mdk::sincosDeg(450.0f, &sn, &cs);      // no wrap inside the helper
+    CHECK(near(sn, 1.0, 1e-5) && near(cs, 0.0, 1e-5));  // sin(450)=1
+  }
+
+  // -- pathSample — the FUN_00456bc8 cubic Hermite --------------------
+  {
+    // {i32 count=3; entry x 0x28} — frames 0/10/20, x = frame, zero
+    // tangents (each entry: {frame,pos[3],tanIn[3],tanOut[3]}).
+    alignas(4) std::int32_t rec[1 + 3 * 10] = {};
+    rec[0] = 3;
+    auto setEntry = [&](int i, std::int32_t frame, float x) {
+      rec[1 + i * 10] = frame;
+      float fx = x;
+      std::memcpy(&rec[1 + i * 10 + 1], &fx, 4);   // pos.x (field 1)
+    };
+    setEntry(0, 0, 0.0f);
+    setEntry(1, 10, 10.0f);
+    setEntry(2, 20, 20.0f);
+    float pt[3];
+    CHECK(mdk::pathSample(rec, 5.0f, pt) && near(pt[0], 5.0) &&
+          near(pt[1], 0.0) && near(pt[2], 0.0));
+    CHECK(mdk::pathSample(rec, 15.0f, pt) && near(pt[0], 15.0));
+    CHECK(mdk::pathSample(rec, 10.0f, pt) && near(pt[0], 10.0)); // tie
+    // No clamping: t=1.5 extrapolates along the Hermite basis.
+    CHECK(mdk::pathSample(rec, 25.0f, pt) && near(pt[0], 10.0));
+    CHECK(near(mdk::pathFirstFrame(rec), 0.0) &&
+          near(mdk::pathLastFrame(rec), 20.0));
+    CHECK(!mdk::pathSample(nullptr, 0.0f, pt));
+  }
+
+  // -- objectPathSnap / objectPathFollow (FUN_00457264/FUN_00456d28) --
+  {
+    alignas(4) std::int32_t rec[1 + 3 * 10] = {};
+    rec[0] = 3;
+    auto setEntry = [&](int i, std::int32_t frame, float x) {
+      rec[1 + i * 10] = frame;
+      float fx = x;
+      std::memcpy(&rec[1 + i * 10 + 1], &fx, 4);
+    };
+    setEntry(0, 0, 0.0f);
+    setEntry(1, 10, 10.0f);
+    setEntry(2, 20, 20.0f);
+    const float player[3] = {0, 0, 0};
+
+    mdk::DynamicObject o;
+    o.fieldEC = rec;
+    o.fieldF0 = 5.0f;
+    o.fieldF4[0] = 1.0f; o.fieldF4[1] = 2.0f; o.fieldF4[2] = 3.0f;
+    mdk::objectPathSnap(o);
+    CHECK(near(o.pos[0], 6.0) && near(o.pos[1], 2.0) &&
+          near(o.pos[2], 3.0));
+
+    // Frame advance: step = fieldE8 * 1.0, sample at the new frame.
+    // Zero tangents -> smoothstep Hermite: h01(0.1) = 0.028 -> x 0.28.
+    o.fieldF0 = 0.0f; o.fieldE8 = 1.0f; o.fieldE6 = -1;
+    o.fieldF4[0] = o.fieldF4[1] = o.fieldF4[2] = 0.0f;
+    mdk::objectPathFollow(o, player, 0.0f);
+    CHECK(near(o.fieldF0, 1.0) && near(o.pos[0], 0.28, 1e-3));
+
+    // Cursor halt: fieldE6 == FRNDINT(+0xf0) freezes the follower.
+    o.fieldE6 = 2; o.fieldF0 = 1.0f;
+    mdk::objectPathFollow(o, player, 0.0f);          // lands on cursor
+    CHECK(near(o.fieldF0, 2.0));
+    o.pos[0] = 99.0f;
+    mdk::objectPathFollow(o, player, 0.0f);          // halted
+    CHECK(near(o.fieldF0, 2.0) && near(o.pos[0], 99.0));
+
+    // Release: +0x149&4 unbinds and clamps to last-1 (endFrame-2).
+    mdk::DynamicObject rel;
+    rel.fieldEC = rec; rel.fieldF0 = 19.0f; rel.fieldE8 = 1.0f;
+    rel.fieldE6 = -1; rel.col.flags149 = 0x4;
+    mdk::objectPathFollow(rel, player, 0.0f);
+    CHECK(rel.fieldEC == nullptr && near(rel.fieldF0, 18.0));
+
+    // Ghost: path displacement becomes +0x294 impulse, pos restored.
+    mdk::DynamicObject gh;
+    gh.fieldEC = rec; gh.fieldF0 = 0.0f; gh.fieldE8 = 1.0f;
+    gh.fieldE6 = -1; gh.col.flags14b = 0x8;
+    mdk::objectPathFollow(gh, player, 0.0f);
+    CHECK(near(gh.pos[0], 0.0) &&
+          near(gh.animImpulse[0], 0.28 * 30.0, 1e-3));
+  }
+
+  // -- seekOpcodeTail — the shared 0x4e/0x2b seek clear ---------------
+  {
+    mdk::DynamicObject o;
+    o.field2a0 = 9; o.field2a1 = 9; o.field2a4 = 1.0f;
+    o.field2a8 = 2.0f; o.field2ac = 3.0f;
+    o.col.flags14c |= 0x08;
+    mdk::seekOpcodeTail(o);
+    CHECK(o.field2a0 == 0 && o.field2a1 == 0 && o.field2a4 == 0.0f &&
+          o.field2a8 == 0.0f && o.field2ac == 0.0f &&
+          (o.col.flags14c & 0x08) == 0);
+  }
+
+  // -- objectOpSeekCamera — camera-relative seek target ----------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "SEEK");
+    rt.cur = a;
+    rt.camera.pose.pos[0] = 100.0f;
+    rt.camera.pose.pos[1] = 0.0f;
+    rt.camera.pose.pos[2] = 50.0f;
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.col.named = true;
+    // bearing 0 (camera due +x): point = pos + fwd*(d*0.01)*(cos,sin),
+    // z = cam.z.
+    mdk::objectOpSeekCamera(rt, o, a->dyn, 10.0f, 0.0f);
+    const float d = std::sqrt(100.0f * 100.0f + 50.0f * 50.0f);
+    CHECK(near(o.field120[0], 10.0 * d * 0.01, 1e-3) &&
+          near(o.field120[1], 0.0, 1e-3) &&
+          near(o.field120[2], 50.0));
+    CHECK(o.field11e == 0x2b && o.fieldEC == nullptr);
+  }
+
+  // -- objectOpSeekAway — flee + clamp + jitter (0x442de1) -------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "FLEE");
+    mdk::DynamicObject anchor;
+    anchor.pos[0] = 10.0f; anchor.pos[1] = 0.0f; anchor.pos[2] = 4.0f;
+    rt.cmdObj60 = &anchor;
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.col.named = true;
+    // dist clamps to 6; rng state 1 -> draw 16838 -> jit =
+    // (16838-0x4000) * 6.103515625e-5 * 6.
+    mdk::objectOpSeekAway(rt, o, 20.0f);
+    const float jit =
+        static_cast<float>(16838 - 0x4000) * 6.103515625e-5f * 6.0f;
+    CHECK(near(o.field120[0], -10.0, 1e-4) &&
+          near(o.field120[1], -jit, 1e-4) &&
+          near(o.field120[2], 4.0 + 2.5 + o.zBias, 1e-4));
+    CHECK(o.field11e == 0x4e && o.fieldEC == nullptr);
+    // No anchor -> no-op.
+    mdk::DynamicObject o2;
+    rt.cmdObj60 = nullptr;
+    mdk::objectOpSeekAway(rt, o2, 5.0f);
+    CHECK(o2.field11e == 0);
+  }
+
+  // -- objectOrbit — pendulum step (FUN_00457ab8) ----------------------
+  {
+    mdk::DynamicObject o;
+    o.bankDeg = 30.0f;
+    o.field1c[0] = 0.0f; o.field1c[1] = 0.0f; o.field1c[2] = 0.0f;
+    o.field302 = std::bit_cast<std::uint32_t>(0.0f);   // phase
+    o.field306 = std::bit_cast<std::uint32_t>(10.0f);  // radius
+    o.field30a = std::bit_cast<std::uint32_t>(1.0f);   // accel coeff
+    o.field30e = 0;                                  // target yaw
+    o.yawDeg = 0.0f;
+    const float player[3] = {0, 0, 0};
+    mdk::objectOrbit(o, player, 1.0f / 30.0f);
+    // phase = 0 - sin30*1*1 = -0.5; bank += phase*1 -> 29.5.
+    CHECK(near(std::bit_cast<float>(o.field302), -0.5) &&
+          near(o.bankDeg, 29.5, 1e-4));
+    // pos = center + yaw-rotated (sin30*10, -cos30*10): (5,0,-8.66).
+    CHECK(near(o.pos[0], 5.0, 1e-4) && near(o.pos[1], 0.0, 1e-4) &&
+          near(o.pos[2], -8.660254, 1e-4));
+    CHECK(o.field2d0 == 1 && o.field2d1 == 1);
+  }
+
+  // -- objectRollRide — rawMatrix premultiply (FUN_0045d578) -----------
+  {
+    mdk::DynamicObject o;
+    o.prevPos[0] = 0.0f; o.prevPos[1] = 0.0f;
+    o.pos[0] = 1.0f; o.pos[1] = 0.0f;
+    o.connMaskLock = std::bit_cast<std::uint32_t>(1.0f); // +0x326 cnt=1
+    o.rawMatrix[0] = o.rawMatrix[4] = o.rawMatrix[8] = 1.0f;
+    mdk::objectRollRide(o);
+    // dx=1 -> b'=90*(1/90)*rate with rate = 360/(2pi); R = Ry(b').
+    const float rate = 360.0f / 6.28318531f;
+    const float rad = rate * (3.14159265358979323846 / 180.0);
+    CHECK(near(o.rawMatrix[0], std::cos(rad), 1e-4) &&
+          near(o.rawMatrix[2], std::sin(rad), 1e-4) &&
+          near(o.rawMatrix[4], 1.0) &&
+          near(o.rawMatrix[6], -std::sin(rad), 1e-4) &&
+          near(o.rawMatrix[8], std::cos(rad), 1e-4));
+  }
+
+  // -- objectArenaTransfer — connector yaw flip (FUN_004574d0) ---------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "SRC");
+    mdk::TraversalArena* b = travArenaAdd(rt, "DST");
+    rt.cur = a;
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.col.named = true;
+    o.col.flags14a = 0x10;               // connector
+    o.yawDeg = 270.0f;
+    o.pendingArena = &b->dyn;
+    b->dyn.owner = a;                    // dst owned by current
+    CHECK(mdk::objectArenaTransfer(rt, o, a->dyn) == 1);
+    CHECK(o.arena == &b->dyn && near(o.yawDeg, 90.0));  // +180 wrap
+    // Same-arena pend: warn + clear, returns 0.
+    o.pendingArena = &b->dyn;
+    CHECK(mdk::objectArenaTransfer(rt, o, b->dyn) == 0 &&
+          o.pendingArena == nullptr);
+  }
+
+  const std::uint32_t C = 0x200;    // code image offset (script tests)
+
+  // -- obj op 0x3a: varop -> +0xe0 animRate ----------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x3a, 0x03});               // mode3 inline f32
+    f.writeF(C + 2, 5.5f);
+    f.write(C + 6, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && near(o.animRate, 5.5));
+  }
+  {
+    ScriptFixture f;                        // mode2 = ctx local slot
+    f.write(C, {0x41, 0x02, 0x01});         // locals[1] = f32
+    f.writeF(C + 3, 7.25f);
+    f.write(C + 7, {0x3a, 0x02, 0x01});     // +0xe0 = locals[1]
+    f.write(C + 10, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && near(o.animRate, 7.25));
+  }
+
+  // -- obj op 0xb0: +0x14a&4 conditional link ---------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0xb0, 0x0c});               // 0x0c goto target
+    f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xff});                 // fallthrough
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});  // set local bit3, end
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.flags14a = 0x04;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.col.flags14a = 0;                    // bit clear -> fallthrough
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0x12: timed link — mark >= wait*30 ------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x12});
+    f.writeF(C + 1, 1.0f);                  // wait 1.0s -> 30 marks
+    f.write(C + 5, {0x0c});
+    f.writeW(C + 6, 0x300);
+    f.write(C + 10, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.scriptMark[0] = 31;                   // >= 30 -> fires
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8) &&
+          o.scriptMark[0] == 0);            // fired mark resets
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.scriptMark[0] = 10;                  // < 30 -> fallthrough
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0x2f: probability link (rng state 1 -> draw 5137) --------
+  {
+    ScriptFixture f;
+    f.write(C, {0x2f});
+    f.writeF(C + 1, 60.0f);                 // 60% > 51.37% -> fires
+    f.write(C + 5, {0x0c});
+    f.writeW(C + 6, 0x300);
+    f.write(C + 10, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    f.rt.rngState = 1;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+    f.writeF(C + 1, 50.0f);                 // 50% < 51.37% -> not
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    f.rt.rngState = 1;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0x11: anim-done link --------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x11, 0x0c});
+    f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.animRec = nullptr;                    // done -> fires
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0x2c: no-subtype link --------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x2c, 0x0c});
+    f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field11e = 0;                         // no subtype -> fires
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field11e = 0x2b;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0xcf: yaw morph (FUN_0045dc18) -----------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0xcf});
+    f.writeF(C + 1, 300.0f);                // rate*dt = 10/tick
+    f.writeF(C + 5, 20.0f);                 // target 20
+    f.write(C + 9, {0x0c});
+    f.writeW(C + 10, 0x300);                // arrived link
+    f.write(C + 14, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.yawDeg = 10.0f;                       // 10 + 10 = 20 -> arrived
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && near(o.yawDeg, 20.0) &&
+          (o.scriptFlagsLocal & 8));
+    // Not arrived: no link, approach continues next tick.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.yawDeg = 5.0f;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && near(o2.yawDeg, 15.0) &&
+          !(o2.scriptFlagsLocal & 8));
+    // Wrap-aware: 350 -> target 10 crosses 0.
+    mdk::DynamicObject& o3 = f.arena->dyn.allocFront();
+    o3.yawDeg = 350.0f;
+    o3.field108 = f.image.data() + 4 + C;
+    auto r3 = mdk::traversalObjectScriptTick(f.env, o3);
+    CHECK(r3.halted && !r3.error && near(o3.yawDeg, 0.0, 1e-4));
+  }
+
+  // -- obj op 0x3c: face camera -----------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x3c, 0xff});
+    f.rt.camera.pose.pos[0] = 0.0f;
+    f.rt.camera.pose.pos[1] = 10.0f;        // camera due +y -> yaw 90
+    f.rt.camera.pose.pos[2] = 0.0f;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && near(o.yawDeg, 90.0, 1e-4));
+  }
+
+  // -- obj op 0x52: var -> +0x44 -----------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x52, 0x03});               // mode3 inline f32
+    f.writeF(C + 2, 64.0f);
+    f.write(C + 6, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && near(o.field44, 64.0));
+  }
+
+  // -- obj op 0x2a: bound-name match link --------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x2a});
+    f.writeStr(C + 1, "FOO");               // s1 non-empty (5 bytes)
+    f.write(C + 6, {0x0c});
+    f.writeW(C + 7, 0x300);
+    f.write(C + 11, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::RuntimeModel::NameRec nr;
+    std::snprintf(nr.name.data(), nr.name.size(), "%s", "FOO");
+    o.model.names.push_back(nr);
+    o.field21e = 1;                         // bound to names[0]
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8) &&
+          o.field21e == 0);                 // fired mark clears (s1)
+    // Wrong name -> fallthrough, mark kept.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.model.names.push_back(nr);
+    o2.field21e = 1;
+    o2.field108 = f.image.data() + 4 + C;
+    f.write(C + 1, {0x04, 'B', 'A', 'R', 0x00});   // s1 = "BAR"
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted);
+    CHECK(!r2.error);
+    CHECK(!(o2.scriptFlagsLocal & 8));
+    CHECK(o2.field21e == 0);   // kept through 0x2a, cleared by 0xff
+  }
+
+  // -- obj op 0x04: broadcast remote call (object ctx) -------------------
+  {
+    ScriptFixture f;
+    // {0x04, outer=7, linkage 0x0c target, inner=3(all)} — remote CALL
+    // dispatch to every home-arena object.
+    f.write(C, {0x04, 0x07, 0x0c});
+    f.writeW(C + 3, 0x300);
+    f.write(C + 7, {0x03, 0xff});
+    mdk::DynamicObject& src = f.arena->dyn.allocFront();
+    src.field108 = f.image.data() + 4 + C;
+    mdk::DynamicObject& tgt = f.arena->dyn.allocFront();
+    tgt.col.named = true;
+    tgt.health = 5;
+    tgt.field11b = 0;                       // rank gate passes
+    auto r = mdk::traversalObjectScriptTick(f.env, src);
+    CHECK(r.halted && !r.error);
+    CHECK(tgt.field108 == f.image.data() + 4 + 0x300 &&
+          tgt.field230 == tgt.field108 && tgt.field10c == tgt.field108 &&
+          tgt.field138 == &src && tgt.scriptCallDepth == 0);
+    // The ctx object itself is not a broadcast target.
+    CHECK(src.field10c == nullptr);
+  }
+
+  // -- arena op 0x77: model-count link -----------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x77});
+    f.writeStr(C + 1, "FOO");               // C+1..C+5 (incl NUL)
+    f.write(C + 6, {0x02});                 // kind 2 = '>'
+    f.writeF(C + 7, 1.0f);                  // count > 1 ?
+    f.write(C + 11, {0x0c});
+    f.writeW(C + 12, 0x300);
+    f.write(C + 16, {0xff});
+    f.write(0x300, {0x41, 0x02, 0x00});     // locals[0] = f32
+    f.writeF(0x303, 7.0f);
+    f.write(0x307, {0x09});
+    auto mk = [&](const char* nm) -> mdk::DynamicObject& {
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      mdk::RuntimeModel::NameRec nr;
+      std::snprintf(nr.name.data(), nr.name.size(), "%s", nm);
+      o.model.names.push_back(nr);
+      return o;
+    };
+    mk("FOO"); mk("FOO"); mk("BAR");        // count(FOO) = 2 > 1
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error &&
+          near(f.arena->script.locals[0], 7.0));
+  }
+
+  // -- arena op 0xaf: inventory count (unmodelled -> 0) -------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0xaf, 0x06, 0x01});         // id 6, kind 1 = '<'
+    f.writeF(C + 3, 1.0f);                  // 0 < 1 -> fires
+    f.write(C + 7, {0x0c});
+    f.writeW(C + 8, 0x300);
+    f.write(C + 12, {0xff});
+    f.write(0x300, {0x41, 0x02, 0x00});
+    f.writeF(0x303, 9.0f);
+    f.write(0x307, {0x09});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error &&
+          near(f.arena->script.locals[0], 9.0));
+  }
+
+  // -- arena op 0xd8: var += operand*(1/30) -------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0xd8, 0x02, 0x01});         // locals[1] += 30 * (1/30)
+    f.writeW(C + 3, 30);
+    f.write(C + 7, {0x09});
+    f.arena->script.pcImageOff = C;
+    f.arena->script.locals[1] = 2.0f;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error &&
+          near(f.arena->script.locals[1], 3.0, 1e-5));
+  }
+
+  // -- arena op 0x04: broadcast formation (outer 1) ----------------------
+  {
+    ScriptFixture f;
+    // {0x04, outer=1, inner=3}: formation slot command — side/fwd/vert
+    // offsets alternate per hit, subtype = 1, leader = ctx.
+    f.write(C, {0x04, 0x01, 0x03, 0xff});
+    f.arena->eventLatch.yawDeg = 0.0f;
+    mdk::DynamicObject& t1 = f.arena->dyn.allocFront();
+    mdk::DynamicObject& t2 = f.arena->dyn.allocFront();
+    t1.col.named = t2.col.named = true;
+    t1.health = t2.health = 5;
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(!r.error);
+    // yaw 0 -> sin 0 cos 1: pos.x = ctx.x - (-4)*0 + side*5*1*1 =
+    // side*5, pos.y = ctx.y - (-4)*1 - side*5*0 = 4, pos.z = ctx.z+8.
+    // allocFront pushes FRONT: t2 is iterated first (hitFlag 0 ->
+    // side -1), t1 second (hitFlag 1 -> side +1).
+    CHECK(near(t2.field12c[0], -5.0) && near(t2.field12c[1], -4.0) &&
+          near(t2.field12c[2], 8.0) && t2.field11e == 1 &&
+          t2.field138 == &f.arena->eventLatch);
+    CHECK(near(t2.field120[0], -5.0) && near(t2.field120[1], 4.0) &&
+          near(t2.field120[2], 8.0));
+    CHECK(near(t1.field12c[0], 5.0) && near(t1.field120[0], 5.0));
+  }
+
+  // -- XCORDOOR negative control — the enemy machinery must be inert ---
+  {
+    // A live connector door: +0x14a&0x10, connState 8 (closed), no
+    // +0xec path, no +0x149&0x10 dispatch, no +0x14b&0x40 runner, no
+    // subtype. Run the FUN_004572ac per-object steps with their loop
+    // gates — every gated piece must be skipped, the connector update
+    // alone owns the door (OBSERVED gates).
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    mdk::DynamicObject& door = home.allocFront();
+    door.col.named = true;
+    door.scriptClass = "XCORDOOR";
+    door.health = 10;
+    door.col.flags14a = 0x10;             // connector bit
+    door.connState = 8;                   // +0x312 closed
+    door.setPosition(-4.0f, 0.0f, 190.0f);
+    const float px = door.pos[0], py = door.pos[1], pz = door.pos[2];
+    // Gate checks in loop order — all must be clear for a connector.
+    CHECK(door.fieldEC == nullptr);        // +0xec path gate
+    CHECK((door.col.flags149 & 0x10) == 0);// dispatch gate
+    CHECK((door.col.flags14b & 0x40) == 0);// runner gate
+    CHECK((door.col.flags14a & 0x40) == 0);// orbit gate
+    CHECK(door.field11e == 0);             // subtype dispatch
+    CHECK(door.pendingArena == nullptr);   // transfer gate
+    // The ungated steps (subtype no-ops on +0x11e==0; gravity needs
+    // +0x148&2 which a door lacks; collide integrates zero velocity).
+    mdk::objectSubtypeUpdate(rt, door, home, 1.0f / 30.0f);
+    mdk::objectGravity(rt, door, home, 1.0f / 30.0f);
+    mdk::objectCollide(rt, door, home, nullptr, 1.0f / 30.0f);
+    CHECK(door.pos[0] == px && door.pos[1] == py && door.pos[2] == pz);
+    CHECK(door.health == 10 && door.col.named);
+    CHECK(door.connState == 8 && door.field11e == 0);
+    CHECK(door.fieldF0 == 0.0f && door.field18c[0] == 0.0f);
+  }
+}
 
 void test_object_animation() {
   // -- Record header / view accessors ---------------------------------
@@ -14971,6 +15548,7 @@ int main() {
   test_traversal_script();
   test_traversal_object_init();
   test_traversal_object_script();
+  test_enemy_runtime();
   test_object_animation();
   test_player_look();
   test_player_camera();

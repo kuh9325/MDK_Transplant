@@ -39,6 +39,8 @@ void boundsFromPoints(const float* pts, std::size_t count,
   }
 }
 
+} // namespace
+
 // Row-major 3x3 (scale baked) + translation — the matrix contract
 // shared with the collision query (world = M.local + origin).
 void transformPoint(const float m[9], const float org[3],
@@ -48,8 +50,6 @@ void transformPoint(const float m[9], const float org[3],
              in[2] * m[i * 3 + 2] + org[i];
   }
 }
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // RuntimeModel
@@ -384,6 +384,8 @@ void buildObjectMatrix(float pitchDeg, float bankDeg, float yawDeg,
 // FUN_0045612c — transform + world-AABB rebuild (collision core)
 // ---------------------------------------------------------------------------
 
+DynamicObject::~DynamicObject() { surfaceRecordsDestroy(surface); }
+
 void rebuildObjectTransform(DynamicObject& obj) {
   // OBSERVED seed quirk: min = {old minZ x3}, max = {old maxZ x3}.
   const float seedLo = obj.col.aabb[2];
@@ -436,6 +438,13 @@ void rebuildObjectTransform(DynamicObject& obj) {
         obj.col.aabb[3 + k] = el.aabb[3 + k];
     }
   }
+
+  // +0x1b0..+0x1cb — world-space refpoints (subtype 0x4a reads them;
+  // the anim driver keeps the LOCAL slots in model.refPoints, so the
+  // world copy is refreshed with the same matrix/origin).
+  for (std::uint32_t i = 0; i < obj.model.refPointCount && i < 8; ++i)
+    transformPoint(obj.col.xform, obj.col.origin, obj.model.refPoints[i],
+                   obj.worldRef[i]);
 }
 
 // ---------------------------------------------------------------------------

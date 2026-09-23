@@ -485,6 +485,21 @@ struct TraversalRuntime {
   // same token; contactObj on `vert` carries the u32 form).
   const CollisionPoly* lastContactPoly = nullptr;
 
+  // --- Phase 11B — enemy runtime globals (enemy_runtime.*) ---
+  std::uint32_t rngState = 1;       // CRT rand() __threadseed — the
+                                    // FUN_0047d2b5 LCG state (default
+                                    // 1 = the CRT unseeded start).
+  // FUN_0045897c command-registry globals:
+  int cmdFlag54 = 0;                // 0x540e54 — set by most command
+                                    // paths (idle/exec ran this tick)
+  int cmdDetonate58 = 0;            // 0x540e58 — cmd-5 arming counter
+                                    // (the first two armed detonators
+                                    // don't set e54)
+  DynamicObject* cmdObj5c = nullptr;// 0x540e5c — active cmd-1 lunge
+                                    // object registry
+  DynamicObject* cmdObj60 = nullptr;// 0x540e60 — active cmd-2 spin
+                                    // object registry
+
   // tr_alcmd script VM (Phase 5H) — bounded diagnostics + spawn
   // accounting collected across the frame's arena invocations.
   std::vector<std::string> scriptDiag;
@@ -566,6 +581,11 @@ TraversalArena* traversalPortalTest(TraversalRuntime& rt);
 // migration, proximity open/close, partner attach/detach, element
 // mask rebuild, +0x148 bit4 collision toggle.
 void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt);
+
+// FUN_004286c8 — the lazy runtime-model cache (deferred geometry
+// table). Resolves enemy-table index -> RuntimeModel, parsing on
+// first touch (ctx = &rt.level).
+const RuntimeModel* traversalModelFor(int idx, void* ctx);
 
 // FUN_004555bc — per-object animation advance (the generic driver —
 // any object may bind +0x114 via ops 0x03/0x3b). Advances +0xdc by

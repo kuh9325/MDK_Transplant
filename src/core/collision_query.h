@@ -125,6 +125,11 @@ struct CollisionObject {
                                      // bit1 = mount-scan gate
                                      // (FUN_00463608), bit2 = reticle
                                      // disabled (FUN_004691c4)
+  // +0x14c — per-frame contact byte (FUN_0045bac0 clears bits
+  // 0x13 at the head of each object update: bit0 = wall/XY sweep hit,
+  // bit1 = floor contact, bit4 = FUN_00459618 touch-scan hit). Bits
+  // 2/3/5..7 survive the clear (steering-side flags).
+  std::uint8_t flags14c = 0;
   float aabb[6];                     // +0x198
   float xform[9];                    // +0xac..0xd4 — row-major 3x3 (scale baked)
   float origin[3];                   // +0xb8, +0xc8, +0xd8

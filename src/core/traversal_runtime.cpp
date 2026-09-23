@@ -14,8 +14,10 @@
 #include <span>
 
 #include "core/data_root.h"
+#include "core/enemy_runtime.h"
 #include "core/frontend_machines.h"
 #include "core/object_animation.h"
+#include "core/object_path.h"
 #include "core/player_fire.h"
 #include "core/player_projectiles.h"
 #include "core/player_reticle.h"
@@ -51,36 +53,6 @@ bool segAxis(float lo, float hi, float prev, float cur) {
   if ((cur < lo) != (prev < lo)) return true;
   if ((cur < hi) != (prev < hi)) return true;
   return false;
-}
-
-// ---------------------------------------------------------------------------
-// Lazy model cache — FUN_004286c8's deferred geometry table.
-// ---------------------------------------------------------------------------
-
-const RuntimeModel* traversalModelFor(int idx, void* ctx) {
-  TraversalLevel& lv = *static_cast<TraversalLevel*>(ctx);
-  if (idx < 0 || static_cast<std::size_t>(idx) >= lv.models.size())
-    return nullptr;
-  if (lv.models[idx]) return &*lv.models[idx];
-  if (lv.modelTried[idx]) return nullptr;
-  lv.modelTried[idx] = true;
-  auto span = enemyModelData(
-      lv.enemies, idx, std::span<const std::byte>(lv.cmiBytes), lv.cmi,
-      &lv.mto, std::span<const std::byte>(lv.mtoBytes));
-  if (!span) {
-    ++lv.modelsFailed;
-    return nullptr;
-  }
-  auto model = parseGeometryRecord(
-      reinterpret_cast<const std::uint8_t*>(span->data()),
-      reinterpret_cast<const std::uint8_t*>(span->data() + span->size()));
-  if (!model) {
-    ++lv.modelsFailed;
-    return nullptr;
-  }
-  lv.models[idx] = std::move(model);
-  ++lv.modelsResolved;
-  return &*lv.models[idx];
 }
 
 // Locate the MTO directory entry + block for an arena name (the
@@ -126,6 +98,36 @@ const void* traversalObjectScriptFor(const char* arenaName,
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Lazy model cache — FUN_004286c8's deferred geometry table.
+// ---------------------------------------------------------------------------
+
+const RuntimeModel* traversalModelFor(int idx, void* ctx) {
+  TraversalLevel& lv = *static_cast<TraversalLevel*>(ctx);
+  if (idx < 0 || static_cast<std::size_t>(idx) >= lv.models.size())
+    return nullptr;
+  if (lv.models[idx]) return &*lv.models[idx];
+  if (lv.modelTried[idx]) return nullptr;
+  lv.modelTried[idx] = true;
+  auto span = enemyModelData(
+      lv.enemies, idx, std::span<const std::byte>(lv.cmiBytes), lv.cmi,
+      &lv.mto, std::span<const std::byte>(lv.mtoBytes));
+  if (!span) {
+    ++lv.modelsFailed;
+    return nullptr;
+  }
+  auto model = parseGeometryRecord(
+      reinterpret_cast<const std::uint8_t*>(span->data()),
+      reinterpret_cast<const std::uint8_t*>(span->data() + span->size()));
+  if (!model) {
+    ++lv.modelsFailed;
+    return nullptr;
+  }
+  lv.models[idx] = std::move(model);
+  ++lv.modelsResolved;
+  return &*lv.models[idx];
+}
 
 // ---------------------------------------------------------------------------
 // Arena / level teardown
@@ -1129,13 +1131,15 @@ TraversalFrameResult stepTraversalRuntime(
   playerPunch(rt, timing.frameStep);
   ++rt.seams.profilerHooks; // FUN_0042fecc rdtsc probe (0x43627f)
 
-  // Object updates — FUN_004572ac subset. Per-object order (OBSERVED):
-  // +0x07==1 view latch -> connector (0x14a&0x10) -> orbit (0x14a&0x40,
-  // seam) -> command runner (0x14b&0x40, seam) -> pendingArena transfer
-  // -> +0x108 object script VM -> path follower (+0xec, seam) ->
-  // FUN_004533d4 subtype (seam) -> gravity+collide (seam) ->
-  // FUN_0045897c enemy dispatch (0x149&0x10, seam) / mover (0x14a&0x20)
-  // -> FUN_004555bc anim -> ride/latch tail.
+  // Object updates — FUN_004572ac, per-object order (OBSERVED from raw
+  // disasm): +0x07==1 view latch -> connector (0x14a&0x10) -> orbit
+  // (0x14a&0x40) -> command runner (0x14b&0x40, +0x08 recheck) ->
+  // pendingArena transfer (+0x2bc, nonzero skips) -> +0x108 script VM
+  // -> +0x06 -> path follower (+0xec) -> FUN_004533d4 subtype -> +0x06
+  // -> gravity -> collision -> +0x06 -> FUN_0045897c enemy dispatch
+  // (0x149&0x10, replaces mover) / mover (0x14a&0x20) -> FUN_004555bc
+  // anim -> +0x06 -> +0x18c vel-cache -> roll ride (0x148&0x40) ->
+  // ridden-follow -> prev-state latch.
   if (rt.cs.arenaValid) {
     // Shared script env — built once per frame; the per-object tick
     // rebinds selfArena per object inside the call.
@@ -1162,56 +1166,71 @@ TraversalFrameResult stepTraversalRuntime(
     }
     for (int ai = 0; ai < updateCount; ++ai) {
       DynamicArena& da = updateArenas[ai]->dyn;
-      // FUN_00457738 connector pass runs first in the original
-      // dispatch (before the mover/ride tail). Collect the connectors
-      // first — the update can reattach the partner and flag a
-      // pendingArena migration, mutating arena lists mid-iteration.
-      std::vector<DynamicObject*> conns;
-      for (auto& up : da.storage)
-        if (up->col.flags14a & 0x10) conns.push_back(up.get());
-      for (DynamicObject* o : conns)
-        traversalConnectorUpdate(*o, rt);
-      for (auto& up : da.storage) {
-        DynamicObject& o = *up;
-        // 0x49b85c latch — inside FUN_004572ac's named gate, BEFORE the
-        // connector update (0x4572f4): the last named +0x07==1 object
-        // becomes the camera view-anchor source.
-        if (o.col.named && o.col.field07 == 1) rt.fieldB85c = &o;
-        // FUN_004388d8(obj) — the persistent per-object tr_alcmd VM
-        // (+0x108 gate). OBSERVED position: after the transfer gate,
-        // before the path follower / subtype / gravity / anim section.
-        if (o.col.named && o.field108 != nullptr) {
+      TraversalArena* otherArena =
+          (updateCount == 2) ? updateArenas[1 - ai] : nullptr;
+      // FUN_004572ac — the linked-list walk reads the next link BEFORE
+      // the body (0x4572c1), so a mid-frame transfer/teardown can't
+      // corrupt iteration; the +0x06 head-scan skips dead objects.
+      for (auto it = da.storage.begin(); it != da.storage.end();) {
+        auto nextIt = std::next(it);
+        DynamicObject& o = **it;
+        it = nextIt;
+        if (!o.col.named) continue;                  // +0x06 head-scan
+        // 0x4572f4 — +0x07==1 view latch -> connector (0x14a&0x10) ->
+        // orbit (0x14a&0x40).
+        if (o.col.field07 == 1) rt.fieldB85c = &o;
+        if (o.col.flags14a & 0x10)
+          traversalConnectorUpdate(o, rt);           // FUN_00457738
+        if (o.col.flags14a & 0x40)
+          objectOrbit(o, rt.cs.pos, dt);             // FUN_00457ab8
+        // 0x45747c — command runner branch (0x14b&0x40): runs, then
+        // the +0x08 health check; alive continues at the transfer.
+        if (o.col.flags14b & 0x40) {
+          objectCommandRunner(rt, o, da, dt);        // FUN_0045ab44
+          if (o.health == 0) continue;
+        }
+        // 0x457492 — pending-arena transfer (+0x2bc); nonzero return
+        // skips the rest of this object's update.
+        if (o.pendingArena != nullptr &&
+            objectArenaTransfer(rt, o, da)) {
+          ++rt.seams.objectMigrations;
+          continue;
+        }
+        // 0x45733a — object script VM (+0x108 gate).
+        if (o.field108 != nullptr) {
           TraversalScriptResult sr =
-              traversalObjectScriptTick(objEnv, o);
+              traversalObjectScriptTick(objEnv, o);  // FUN_004388d8
           rt.scriptInsnTotal += sr.instructions;
         }
-        // FUN_004555bc — per-object animation advance. OBSERVED
-        // ordering: the original re-checks +0x06 after the script VM
-        // and again after the anim driver (either can kill the
-        // object) before the velocity/ride tail.
-        if (o.col.named)
-          traversalObjectAnimUpdate(
-              o, reinterpret_cast<const std::uint8_t*>(
-                     rt.level.cmiBytes.data()) +
-                     rt.level.cmiBytes.size());
-        if (o.col.named) {
-          if (o.col.flags14a & 0x20) {
-            updateMoverCollision(o, rt.cs, &rt.motion.yawDeg);
-          } else {
-            applyRideDisplacement(o, rt.cs, &rt.motion.yawDeg);
-            latchObjectPrevState(o);
-          }
+        if (!o.col.named) continue;                  // 0x45734a
+        // Path follower (+0xec) -> subtype -> +0x06 -> gravity ->
+        // collision -> +0x06.
+        if (o.fieldEC != nullptr)
+          objectPathFollow(o, rt.cs.pos,
+                           rt.motion.yawDeg);        // FUN_00456d28
+        objectSubtypeUpdate(rt, o, da, dt);          // FUN_004533d4
+        if (!o.col.named) continue;                  // 0x45736b
+        objectGravity(rt, o, da, dt);                // FUN_0045b9fc
+        objectCollide(rt, o, da, otherArena, dt);    // FUN_0045bac0
+        if (!o.col.named) continue;                  // 0x457383
+        // 0x4574a6 — enemy dispatch (+0x149&0x10) REPLACES the mover
+        // branch and jumps straight to the anim step.
+        if (o.col.flags149 & 0x10) {
+          enemyCommandDispatch(rt, o, da, dt);       // FUN_0045897c
+          if (!o.col.named) continue;                // 0x4574ad
+        } else if (o.col.flags14a & 0x20) {
+          objectMover(rt, o, da, dt);                // FUN_004585c4
         }
-      }
-      // FUN_0045cf18 — pending-arena transfers (the splice mutates
-      // the list, so collect first).
-      std::vector<DynamicObject*> pending;
-      for (auto& up : da.storage)
-        if (up->pendingArena && up->pendingArena != &da)
-          pending.push_back(up.get());
-      for (DynamicObject* o : pending) {
-        da.transfer(*o, *o->pendingArena);
-        ++rt.seams.objectMigrations;
+        traversalObjectAnimUpdate(
+            o, reinterpret_cast<const std::uint8_t*>(
+                   rt.level.cmiBytes.data()) +
+                   rt.level.cmiBytes.size());        // FUN_004555bc
+        if (!o.col.named) continue;                  // 0x4573b1
+        // Tail: roll ride (0x148&0x40) -> ridden-follow -> +0x18c
+        // vel-cache + prev-state latch (inside latchObjectPrevState).
+        if (o.col.flags148 & 0x40) objectRollRide(o);  // FUN_0045d578
+        applyRideDisplacement(o, rt.cs, &rt.motion.yawDeg);
+        latchObjectPrevState(o);
       }
       // FUN_004572ac epilogue — the 3-slot shot pool ticks at the tail
       // of EACH arena update (0x4572cd), so partner-active frames tick

@@ -37,6 +37,7 @@ add_library(mdk_core STATIC
   src/core/display_menu.cpp
   src/core/dti_structure.cpp
   src/core/dynamic_objects.cpp
+  src/core/enemy_runtime.cpp
   src/core/file_family.cpp
   src/core/framebuffer.cpp
   src/core/frontend_flow.cpp
@@ -52,6 +53,7 @@ add_library(mdk_core STATIC
   src/core/mouse_menu.cpp
   src/core/mti_directory.cpp
   src/core/object_animation.cpp
+  src/core/object_path.cpp
   src/core/mto_directory.cpp
   src/core/options_menu.cpp
   src/core/player_camera.cpp

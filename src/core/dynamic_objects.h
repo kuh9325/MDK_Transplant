@@ -131,6 +131,7 @@
 #include "core/collision_query.h"
 #include "core/cmi_directory.h"
 #include "core/dti_structure.h"
+#include "core/player_surface.h"
 #include "core/mto_directory.h"
 
 namespace mdk {
@@ -245,6 +246,11 @@ struct DynamicObject {
                                       // xform/origin/scale, baseZ
   RuntimeModel model{};               // owned deep copy (+0x0c target)
   CollisionElementSet elemSet{};      // +0x0c record {count, elems}
+  // +0x6c..+0x45e — the object's surface-effect block: the FUN_0045d174
+  // sweep's surface dispatch (FUN_0040b5d0) writes handler state and
+  // surface records here (the same block tr_alcmd surface ops fill).
+  SurfaceObjectState surface;
+  ~DynamicObject();
 
   // +0x10/+0x14/+0x18 world position. pos[2] IS +0x18 == col.baseZ —
   // keep them equal (setPosition does; the original has one field).
@@ -255,11 +261,14 @@ struct DynamicObject {
   // prevPos latch. DAT_0049b6f0 = 1.0, so this is the raw frame
   // displacement. OBSERVED 0x45737b.
   float field18c[3] = {0, 0, 0};
-  // +0x28/+0x2c — display-position accumulators (the FUN_00432f84
-  // charged-kill displaces the corpse by {20*cos,20*sin}(yaw) here;
-  // the sim position +0x10 is untouched). Consumers are render-side.
-  float field28 = 0.0f;
-  float field2c = 0.0f;
+  // +0x28/+0x2c/+0x30 — object velocity. FUN_0045bac0 integrates
+  // (vel + +0x294 impulse) * dt and applies +0x44 drag each frame
+  // (OBSERVED, Phase 11B). The FUN_00432f84 charged-kill displaces
+  // the corpse by writing {20*cos,20*sin}(yaw) here — a velocity fling,
+  // not a display offset (the corpse then sweeps under physics).
+  float field28 = 0.0f;               // +0x28 — vel.x
+  float field2c = 0.0f;               // +0x2c — vel.y
+  float field30 = 0.0f;               // +0x30 — vel.z
   float yawDeg = 0.0f;                // +0x4c
   float prevYawDeg = 0.0f;            // +0x50
   float pitchDeg = 0.0f;              // +0x54 (matrix arg 1)
@@ -282,6 +291,9 @@ struct DynamicObject {
 
   DynamicArena* arena = nullptr;        // +0x60
   DynamicArena* pendingArena = nullptr; // +0x2bc
+  // +0x2b8 — bound object used as the controlalien broadcast mode-9
+  // target (FUN_00438094 dispatches to it directly).
+  DynamicObject* field2b8 = nullptr;
 
   // Arena-connector (door) state — FUN_00457738, gated by
   // col.flags14a & 0x10 (the tr_alcmd 0x95 spawn writes the dword
@@ -430,6 +442,9 @@ struct DynamicObject {
   // tr_alcmd VM tick (traversalObjectScriptTick — FUN_004388d8's
   // object-bound form).
   const void* field108 = nullptr;    // +0x108 — object script PC+gate
+  // +0x10c — last remotely-issued call PC (FUN_00438094's mode-7
+  // dedup reads it; FUN_004382e0's remote call/gosub writes it).
+  const void* field10c = nullptr;
   const void* field230 = nullptr;    // +0x230 — resume/wait PC
   float field22c = 0.0f;             // +0x22c — script wait seconds
                                      // (cleared on death)
@@ -451,7 +466,10 @@ struct DynamicObject {
                                      // "Gosub underflow/overflow")
   const void* scriptRetPc[4] = {};   // +0x24c — return PCs
   const void* scriptSavedPc[4] = {}; // +0x25c — saved +0x108 per level
-  std::uint16_t scriptMark[4] = {};  // +0x26c — per-level marks
+  std::uint16_t scriptMark[5] = {};  // +0x26c — per-level marks; the
+                                     // call tail clears
+                                     // mark[depth+1] (post-increment)
+                                     // so index 4 (+0x274) is reachable
   std::uint32_t scriptFlagsChild = 0;// +0x312 dword — flag group 5;
                                      // aliases connState's byte on
                                      // connectors (the ctx and
@@ -463,15 +481,99 @@ struct DynamicObject {
   const void* fieldEC = nullptr;     // +0xec — path record
   float fieldF0 = 0.0f;              // +0xf0 — path frame
   float fieldF4[3] = {0, 0, 0};      // +0xf4..0xfc — lateral offset
-  std::int16_t fieldE6 = -1;         // +0xe6 — path cursor (0xffff
-                                     // reset by op 0x02)
+  std::int16_t fieldE6 = -1;         // +0xe6 — path sync cursor
+                                     // (0xffff reset by op 0x02;
+                                     // >=0 = waypoint target the
+                                     // follower advances +0xf0 toward;
+                                     // halts when +0xe6 ==
+                                     // FRNDINT(+0xf0))
+  float field100 = 0.0f;             // +0x100 — face-travel yaw bias
+                                     // (FUN_00456d28: bearing + this,
+                                     // single ±360 wrap)
+  // +0x302/+0x306/+0x30a/+0x30e — generic scratch dword block aliased
+  // per owner: path speed lanes (+0x14b&0x10 — +0x302 approach
+  // setpoint, +0x306 far / +0x30a mid / +0x30e near speed), orbit
+  // (+0x14a&0x40 — +0x302 phase, +0x306 radius, +0x30a rate,
+  // +0x30e target yaw), command runner (+0x14b&0x40 — +0x302 target
+  // pos ptr, +0x306 fuse timer) and the FUN_0045897c command bodies
+  // (+0x30a command id, +0x30e tick countdown, +0x302/+0x306 i32
+  // counters). These alias the connector union (connDest/
+  // animRecNear/animRecFar/connRadius), homingPrefix/homingDigitOfs,
+  // elemHp — real objects never mix owners (OBSERVED). Stored as raw
+  // dword bits like the original; f32 views go through bit_cast.
+  std::uint32_t field302 = 0;        // +0x302 bits (f32 setpoint /
+                                     // orbit phase; i32 cmd counters)
+  std::uint32_t field306 = 0;        // +0x306 bits (f32 lane far /
+                                     // orbit radius / runner fuse;
+                                     // i32 dropper count)
+  const float* field302ptr = nullptr;// +0x302 — pointer view (command
+                                     // runner target; FUN_0046aa30
+                                     // writes the player pos here).
+                                     // The original aliases the same
+                                     // dword — a 64-bit pointer can't
+                                     // share u32 storage, so the port
+                                     // keeps a parallel field; owners
+                                     // always arm before reading.
+  std::int32_t field30e = 0;         // +0x30e (i32 view — command
+                                     // tick countdown; orbit/lane
+                                     // f32 uses bit_cast)
+  // +0x138 — subtype leader/attach object pointer AND the tick-hold
+  // gate: FUN_004533d4 only decrements +0x11c when +0x138 == 0, and
+  // subtypes 1/0x1e dereference it as the leader object (OBSERVED).
+  DynamicObject* field138 = nullptr;
+  // +0x1c..+0x24 — orbit/converge anchor: FUN_00457ab8's swing center
+  // and FUN_004599e8's lerp-away origin (op 0xe2 writes it).
+  float field1c[3] = {0, 0, 0};
+  // +0x34 — per-object speed (subtypes 0x3d timed-shot, 0x58 speed
+  // ramp, the 0x2b/0x4e/0xc5 steering tail).
+  float field34 = 0.0f;
+  // +0x11f — speed-ramp hold flag (subtype 0x58: nonzero pins the
+  // target to +0x38 instead of 0).
+  std::uint8_t field11f = 0;
+  // +0x12c/+0x130/+0x134 — follow/attach offsets (subtype 1 leader
+  // follow: side/forward/vertical; subtype 0x4e step target).
+  float field12c[3] = {0, 0, 0};
+  // (chain-member index is +0x146 = spawnId — the hi16 of the +0x144
+  // dword; subtype 0x1e scans same-arena objects by leader+index)
+  // +0x1b0..+0x1cb — world-space refpoints: the transform rebuild
+  // (FUN_0045612c) transforms the model's up-to-8 local refpoints
+  // here; subtype 0x4a (refpoint-attach) reads them.
+  float worldRef[8][3] = {};
+  // +0x276/+0x277 — refpoint indices bound by op 0x4a (self / target).
+  std::uint8_t field276 = 0;
+  std::uint8_t field277 = 0;
+  // +0x278 — the op-0x4a bound object (subtype 0x4a attach target).
+  DynamicObject* field278 = nullptr;
+  // +0x158 — spawned FX/child object written by the command bodies
+  // (FUN_00402160 seam child). +0x15c — its model-name token.
+  DynamicObject* field158 = nullptr;
+  std::string field15c;
+  // +0x2b0 — floor-contact handle from the vertical sweep
+  // (FUN_0045bac0 stores FUN_0045d174's hit poly; released via
+  // FUN_00412ef0 conveyor query next frame).
+  const CollisionPoly* field2b0 = nullptr;
+  // +0x2b4 — vertical sweep contact node (bounce reflects
+  // +0x28..+0x30 about its +0x00 plane normal when +0x14b&0x20).
+  const CollisionNode* field2b4 = nullptr;
+  // +0x27c..+0x290 — post-move clamp box (FUN_0045d174 clamps pos
+  // into it when valid: min <= max per axis).
+  float clampBox[6] = {0, 0, 0, 0, 0, 0};
+  // +0x2d0/+0x2d1 — orbit state flags (FUN_00457ab8 sets both to 1
+  // each frame). +0x2d2..+0x2e6 — orbit's saved {pos, center} copy.
+  std::uint8_t field2d0 = 0;
+  std::uint8_t field2d1 = 0;
+  float field2d2[6] = {0, 0, 0, 0, 0, 0};
 
   // --- op 0x4e (handler 0x448741): subtype set — three dwords to
   // +0x120..+0x128, +0x11e = 0x4e, path unbound (+0xec = 0), and the
   // +0x2a0/+0x2a1/+0x2a8/+0x2ac mover block cleared (OBSERVED). ---
-  std::uint32_t field120[3] = {0, 0, 0}; // +0x120..0x128
+  float field120[3] = {0, 0, 0};       // +0x120..0x128 — anchor
+                                       // position (op 0x4e writes the
+                                       // three target floats here too,
+                                       // OBSERVED 0x448741)
   std::uint8_t field2a0 = 0;           // +0x2a0
   std::uint8_t field2a1 = 0;           // +0x2a1
+  float field2a4 = 0.0f;               // +0x2a4
   float field2a8 = 0.0f;               // +0x2a8
   float field2ac = 0.0f;               // +0x2ac
 
@@ -503,6 +605,11 @@ struct DynamicArena {
   // `dst`'s (+0x60 updated; storage spliced).
   void transfer(DynamicObject& obj, DynamicArena& dst);
 };
+
+// Row-major 3x3 (scale baked) + translation — the matrix contract
+// shared with the collision query (world = M.local + origin).
+void transformPoint(const float m[9], const float org[3],
+                    const float in[3], float out[3]);
 
 // FUN_0046b2f8 — degrees -> scaled row-major 3x3 + origin (see the
 // header comment for the verified formula).

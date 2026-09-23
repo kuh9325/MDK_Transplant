@@ -3696,3 +3696,251 @@ through the same interpreter and `+0x108` is cleared afterward
   `FUN_0045ab44` command runner, `FUN_00457ab8` orbit, the
   `+0x14b` byte, the path sampler `FUN_00456bc8` in script
   context, RNG-real `FUN_00401ed4` picks.
+
+# Phase 11B — Native Enemy Motion, Command Dispatch, Attack Boundaries
+
+Phase 11A left the FUN_004572ac loop's native stages as seams.
+Phase 11B ports them all, in the observed order, and fills the
+object-script opcode census the live LEVEL3–8 scripts actually
+reach.
+
+## 152. Object paths — `FUN_00456bc8` / `FUN_00456d28` / `FUN_00457264` (OBSERVED, ported)
+
+Path record (OBSERVED): `{i32 count; entry[count]×0x28}` with each
+entry `{i32 frame; f32 pos[3]; f32 tanIn[3]; f32 tanOut[3]}`.
+
+- `FUN_00456bc8(path, frame, out)` — the cubic Hermite sampler.
+  Segment select walks `count−2` down to `0`, first entry with
+  `entry.frame <= frame`. No clamping: out-of-range frames
+  extrapolate through the first/last segment basis (OBSERVED
+  quirk — a frame 25 request on a 0–20 record yields the Hermite
+  tail value, not the endpoint).
+- `FUN_00456d28` — the per-frame follower. Advances `+0xf0` by
+  `dt·rate`, samples the record, applies the `+0xf4..0xfc`
+  lateral offset, integrates the position delta, and fires the
+  forward-release boundary at `endFrame − 2` (OBSERVED — the
+  +0xec binding drops two frames early, not at the terminator).
+- `FUN_00457264` — bind-time snap: positions the object at
+  `FUN_00456bc8(path, +0xf0)` + the lateral offset.
+
+Native: `src/core/object_path.{h,cpp}` — `pathSample`,
+`objectPathSnap`, `objectPathFollow`, `pathFirstFrame`/
+`pathLastFrame`. The path lane fields (`+0xf4..0xfc`) are raw
+dword storage with `std::bit_cast<float>` views — the original
+writes both floats and dword patterns into them.
+
+## 153. Enemy runtime core (OBSERVED, ported)
+
+- `FUN_0045b9fc` — gravity: gated on `+0x148 & 2`; `+0x30 −=
+  +0x48·dt`; medium damp (surface-volume query, mask 2) only
+  when `(+0x148 dword & 0x45000) == 0x1000` and command ∉
+  {0x80, 4} — then `+0x28/+0x2c ×= 0.1`; terminal `−220`.
+- `FUN_0045bac0` — collision/integration: clears `+0x14c` bits
+  0/1/4 at head; drag (3D for non-gravity objects, XY-only
+  under `+0x148 & 2`); `vel += +0x294 impulse·dt`; `pos +=
+  vel·dt` through axis-separated `FUN_0045d174` sweeps over
+  `FUN_00407fc0` with the `+0x27c` clamp box and partner-arena
+  retry; `+0x14c` contact bits (wall/floor/touch); floor-death
+  `FUN_00458354` below the arena kill plane.
+- `FUN_004533d4` — `+0x11e` subtype dispatcher: leader-follow,
+  fly-to-camera, heartbeat (30-frame period, current-arena
+  only), the spawnId-indexed chain drive (subtype 0x1e —
+  pitch+yaw+scale-only `FUN_0046b3e4` matrices, member index is
+  `+0x146` NOT a separate field), timed shot, attach,
+  speed-ramp, ground-timer, and the 0x2b/0x4e/0xc5 shared
+  steering tail (air `FUN_00452b80`, ground `FUN_004524e0`,
+  re-seek `FUN_00452140` — target-hold check, turn-diff speed
+  scaling, z-share damp, stuck accumulators, magnet pull).
+- `FUN_00457ab8` — pendulum orbit about `+0x1c..0x24`.
+- `FUN_0045ab44` — command runner (`+0x14b & 0x40` gate):
+  airborne seek of the `+0x302` XY target at 50 u/s with
+  per-axis clamp, `FUN_00454c6c` proximity arm (`+0x148 |=
+  0x20`), landed fuse countdown at `dt` → die facing player.
+- `turnToward`/`FUN_0045b56c` — quantized wrap steering:
+  `diff ∓ trunc((diff ± 180)/360)·360`, cap `dt·180`, yaw
+  wrap at exactly 360.0. FRNDINT under `FUN_0047d59a` is
+  truncation toward zero (RC=11), not round-half-even —
+  verified from the x87 control-word write.
+- RNG — MSVC CRT LCG `FUN_0047d2b5` (`state·0x41c64e6d +
+  0x3039`, `(>>16)&0x7fff`) + `FUN_00401ed4` pick
+  (`(rand·n)>>15`); deterministic per `TraversalRuntime::rngState`.
+
+Native: `src/core/enemy_runtime.{h,cpp}`.
+
+## 154. Enemy command dispatch + attack boundaries (OBSERVED, ported)
+
+`FUN_0045897c` (`+0x149 & 0x10` gate) dispatches on `+0x30a` with
+the `+0x30e` tick countdown. Command bodies decoded and ported:
+
+- cmd1 `FUN_00459330` (lunge), cmd2 `FUN_00459c5c` (spin
+  `dt·235`), cmd3 `FUN_00459968` (spin `dt·360`), cmd4
+  `FUN_00459160`, cmd5/0x81 detonate block (`SW_NUKE` morph —
+  `FUN_00454794` lookup by literal name, NOT `+0x15c`; child
+  init `+0x30e=900`, `+0x30=−5`, `+0x148 |= 0x818a6`,
+  `FUN_0045612c` rebuild on the CHILD, `+0x15c =
+  PTR_DAT_0049b854`), cmd7 `FUN_00459a9c` (morph burst —
+  connector unlock at dist²<2500 via `FUN_00430190`, `+0x312 =
+  (b & 0x1f)|0x80`, radial damage 200/60/−6-side −8),
+  cmd8 `FUN_00459450` (pitch drift `dt·30`, shrink `×0.9`,
+  die < 0.1), cmd9 `FUN_00459554` (timer freezes at 600 —
+  OBSERVED clamp), cmd0x80 path-dropper, `+0x14a&4` carry
+  `FUN_004599e8`.
+- Bank falloff `dt·45` (not the 270 first read); expiry and
+  contact-death share the contact tail; touch-scan masks are
+  per-command (cmd5 → excl `0x810`, cmd0x81 → excl `0x830`,
+  others → req `0x1000000`).
+- `FUN_00459618` — the AABB-delta touch scan (`+0x14c` bit4);
+  `FUN_00454c6c` — the melee proximity/damage scan (scale the
+  `+0x198` AABB about its center by `+0x2c0`, test the player
+  box `0x540c30` and arena objects).
+- `FUN_00458354` — floor/kill-plane death boundary.
+
+## 155. Update loop — full `FUN_004572ac` order (OBSERVED, ported)
+
+`traversal_runtime.cpp` now runs the complete per-object order
+verified against raw disasm (`0x4572c7–0x4574d0`):
+
+`+0x06` head-scan → `+0x07==1` view latch → connector
+(`+0x14a&0x10`) → orbit (`+0x14a&0x40`) → runner (`+0x14b&0x40`,
+then `+0x08` health check — dead skips the rest) → pending
+transfer (`+0x2bc`, nonzero skips) → script VM (`+0x108`) →
+`+0x06` → path (`+0xec`) → subtype → `+0x06` → gravity →
+collide → `+0x06` → enemy dispatch (`+0x149&0x10`, REPLACES the
+mover) / mover (`+0x14a&0x20`) → anim → `+0x06` → `+0x18c`
+vel-cache → roll ride (`+0x148&0x40`, `FUN_0045d578` —
+pre-multiplies the `+0x302` rawMatrix by the frame-delta roll)
+→ ridden-carrier displacement (`edx == 0x540dc0` check) →
+prev-state latch.
+
+Iteration reads the next link BEFORE the body (`0x4572c1`), so
+mid-frame transfers/teardowns cannot corrupt the walk — the
+port mirrors this with `std::next` capture. The `FUN_0045f9b8`
+3-slot shot pool ticks at the tail of EACH arena update
+(`0x4572cd`) — with a partner it ticks twice (OBSERVED quirk,
+preserved).
+
+`FUN_004574d0` transfer: `+0x302` dest arena, `+180°` yaw flip
+on migrate, `+0x148`/`+0x14b` activate/deactivate byte split.
+The mover's `+0x312`-as-child-pointer tail (`child+0x278 = ctx`,
+`child+0x11e = 0x4a`, `FUN_0045612c` rebuild) is documented;
+mover-child spawning stays a counted seam.
+
+## 156. Broadcast dispatch — `FUN_00438094` / `FUN_004382e0` (OBSERVED, ported)
+
+Object/arena op `0x04` is the shared broadcast:
+`FUN_00438094(ctx, outerMode, point, innerMode, name, arg)`
+filters arena objects then `FUN_004382e0` acts per object.
+
+- Outer modes: `7` remote script call, `0xfc` remote GOSUB
+  retag, `0x2b` camera-relative seek order, `1` formation-slot
+  command.
+- Inner filters: `3` all objects; `2`/`4`/`7` model-name match;
+  `5` spawnId; `6` range + line-of-sight; `0xa` position-Y
+  threshold; `7`/`8` subordinate filter; `9` bound object only
+  (`+0x2b8`); `4` first match only.
+- Rank gates `+0x11a`/`+0x11b`; remote-call dedup `+0x10c`;
+  leader/context `+0x138`; target/formation offsets
+  `+0x120`/`+0x12c`; seek orders run `FUN_00451ee8`
+  (`objectWaypointReseek`) + the seek tail. Formation mode 1
+  alternates ±side across matches in iteration order (the
+  arena storage front-inserts — newest first).
+
+Native: `broadcastDispatchOp` in `traversal_script.cpp`, shared
+by both VM forms (arena ctx = `eventLatch`, object ctx = the
+`DynamicObject`).
+
+## 157. Phase 11B object/arena opcode additions (OBSERVED, ported)
+
+The live LEVEL3–8 census drove implementation until zero
+unknown-opcode diagnostics remained. Operand grammars are the
+original's, including quirks:
+
+- Linkage family: `0x2a` (name-match vs `+0x21e` bound record
+  — the `-0x258` gate clears the mark only on fire, s1-empty
+  scripts still dispatch), `0xa6` (LOS to `0x540e60`, exits
+  entirely when the cmd object is null), `0xa7` (flee with
+  `±operand·(rand−0x4000)·2⁻¹⁴` perpendicular jitter, operand
+  clamped to 6.0), `0x2b` (camera-relative seek point —
+  `bearingDeg` + `FUN_0045acf0` convention verified),
+  `0x0e`/`0x39` (FUN_0045d880 cone+LOS — `0x39` inverts the
+  target polarity: operand 1 = else, operand 2 = true),
+  `0x36` (FUN_0045ad40 compare vs seek-target distance, 7
+  compare kinds, ±0.05 epsilon), `0x16` (`+0x21e != 0 &&
+  != −3`), `0x11` (anim-done), `0x12` (timed mark ≥
+  wait·30), `0x2c` (no subtype), `0x2f` (percent chance —
+  `rand(10000) < prob·100`), `0x48` (flag-bit-CLEAR, the
+  `0x47` inverse), `0x6c` (player-box overlap —
+  `FUN_0045c1b8` first-unmasked element vs `0x540c30`),
+  `0x2d` (camera distance compare), `0xb0` (`+0x14a & 4`),
+  `0xcf` (yaw morph via `FUN_0045dc18` wrap-aware approach —
+  `flag==0xff` escapes to a `while(yaw≥360)−=360` wrap; the
+  negative-side loop is dead code, OBSERVED).
+- Writes: `0x35` → `+0x34` steer/projectile rate; `0x3a` →
+  `+0xe0` animRate; `0x52` → `+0x44` drag; `0x6a` → `+0x302`
+  f32; `0x86` → `+0x54` pitch drift `dt·(1/30)`; `0xd8` → var
+  accumulate `*slot += operand·const`; `0x04` broadcast.
+- Actions: `0x3c` face camera (yaw only); `0x65` face camera +
+  pitch aim (`+0x4c` only when XY dist > 2.0, `+0x13c =
+  bearing(dz+3.0, xyDist)`, same dead wrap loop); `0x3d`
+  model spawn at refpoint/named-element centroid
+  (`FUN_0045db60` vertex centroid, `FUN_0045cffc` freelist
+  alloc with cross-arena XG reclaim edge case, `+0x11e=0x3d`,
+  `+0x148|=0x80820`, `+0x4c/+0x13c` inherit, `+0x108=pc`);
+  `0x59` sfx bind (`+0x15c` string when mode&4; the 0x4a1220
+  record resolve + state calls are a presentation seam — the
+  position locals are DEAD in the original); `0x6e` immediate
+  teardown (`FUN_0045828c`); `0xc8` move-toward-point +
+  arrive link (`+0x294` impulse triple); `0x17`/`0x52` flag
+  writes; `0x43` element spawn.
+- Arena-VM additions: `0x04` (shared broadcast), `0x77`
+  (model-name count → `FUN_0045ad40` compare), `0xaf`
+  (0x54155c inventory count — the table is unmodelled; scan
+  yields 0, same seam convention as the player reload path),
+  `0xd8` (var accumulate).
+
+doCall/doGoto mark convention (OBSERVED): the shared tails
+clear `mark[depth+1]` post-increment — `scriptMark` widened to
+5 slots (`+0x26c..+0x274`).
+
+## 158. Native implementation + validation (OBSERVED, ported)
+
+- `object_path.{h,cpp}`: §152 sampler/snap/follower.
+- `enemy_runtime.{h,cpp}`: §153–154 runtime, RNG, steering
+  family (`FUN_00452b80`/`FUN_004524e0`/`FUN_00452140`),
+  `objectWaypointReseek` (`FUN_00451ee8`), `objectRollRide`
+  (`FUN_0045d578`), `degAsin` (`FUN_00437ff4`), transfer
+  (`FUN_004574d0`), teardown (`FUN_0045828c`), touch/melee
+  scans, command bodies.
+- `traversal_runtime.cpp`: the loop now runs the full §155
+  order; `traversalModelFor` moved to mdk scope for the
+  spawn path.
+- `traversal_script.cpp`: §156 shared broadcast + §157 opcodes
+  on both VMs; `coneLosTest` extracted (`FUN_0045d880`).
+- `collision_query.h`: `+0x14c` per-frame contact byte.
+- `dynamic_objects.h`: `+0x11a/11b/11e/120/12c/138` subtype +
+  broadcast fields, `+0x22c/230` script state, `+0x2b8` bound
+  object, `+0x10c` dedup, `+0x108` script PC, `field2a4`,
+  orbit anchor `+0x1c`, `animRate +0xe0`, `field34` steer
+  rate, `scriptMark[5]`.
+- `mdk_tests`: **4152 checks / 0 failures** — path sampler
+  (Hermite incl. no-clamp extrapolation), snap/follow,
+  release boundary `endFrame−2`, ghost-path impulse, RNG LCG,
+  bearing/sincos, steering turn semantics, subtype behaviors,
+  orbit, runner fuse, dispatch bodies + detonate morph,
+  kill-plane, transfer yaw-flip, broadcast filters
+  (name/spawnId/range-LOS/bound/first), formation ±side
+  ordering, timed/probability/cone/no-subtype/anim-done/
+  flag-clear/box-overlap/camera-distance/`+0x14a&4`/yaw-morph
+  links, field-write ops, spawn, sfx, teardown, and the
+  XCORDOOR negative control (connector objects inert under
+  every gated Phase-11B piece).
+- LEVEL3–8 census at 3000 frames: `diag=0` on every level,
+  all runtime checks PASS, live migrations (LEVEL3 `624`,
+  LEVEL7 `2999`), no unknown-opcode diagnostics. Digests:
+  L3 `efde02a3b732fe6d`, L4 `bc18768bc028eab9`, L5
+  `45cd15c6721169cf`, L6 `24bd007d063dcac0`, L7
+  `bc02606139da10c6`, L8 `1079f68afa71a14d`.
+- Remaining seams (documented, counted): mover-child spawn
+  (`+0x312` pointer tail), FX/SFX record table (`0x4a1220`),
+  inventory table (`0x54155c`), the `FUN_004585c4` name
+  branches, and `FUN_00407fc0` clamp-box edge cases.
