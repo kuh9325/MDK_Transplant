@@ -1601,6 +1601,12 @@ int main(int argc, char** argv) {
                     (double)o->col.aabb[0], (double)o->col.aabb[3],
                     (double)o->col.aabb[1], (double)o->col.aabb[4],
                     (double)o->col.aabb[2], (double)o->col.aabb[5]);
+        // FUN_004585c4 census — every spawned mover target.
+        if (o->col.flags14a & 0x20)
+          std::printf("    mvr %s model=%s f148=%06x f14a=%02x\n",
+                      o->scriptClass.c_str(), o->model.modelName().c_str(),
+                      (unsigned)o->col.flags148,
+                      (unsigned)o->col.flags14a);
       }
     }
     std::printf("total:     spawned=%d  models resolved=%d failed=%d\n",
@@ -1790,6 +1796,29 @@ int main(int argc, char** argv) {
               (unsigned)(std::uint16_t)o.animLatch,
               (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
               (double)o.connRadius, o.animDone() ? 1 : 0);
+        }
+      // Mover census — FUN_004585c4 targets (+0x14a&0x20): model,
+      // child pointer, anim/impulse state per frame.
+      for (const auto& ap : rt.arenas)
+        for (const auto& up : ap->dyn.storage) {
+          const mdk::DynamicObject& o = *up;
+          if (!(o.col.flags14a & 0x20)) continue;
+          std::printf(
+              "      mvr %s model=%s home=%s child=%s anim=%c "
+              "fr=%.2f cur=%d lat=%04x f148=%04x f14a=%02x f14c=%02x "
+              "vel.z=%.2f yaw=%.2f scl=%.2f done=%d\n",
+              o.scriptClass.c_str(), o.model.modelName().c_str(),
+              o.arena && o.arena->owner ? o.arena->owner->name.c_str()
+                                        : "?",
+              o.moverChild ? o.moverChild->model.modelName().c_str()
+                           : "-",
+              o.animRec ? 'Y' : 'n',
+              (double)o.animAcc, (int)o.animFrame,
+              (unsigned)(std::uint16_t)o.animLatch,
+              (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
+              (unsigned)o.col.flags14c,
+              (double)o.field30, (double)o.yawDeg,
+              (double)o.col.scale, o.animDone() ? 1 : 0);
         }
       // The digest mixes only deterministic state — raw contact
       // tokens are process addresses and are mixed as booleans.

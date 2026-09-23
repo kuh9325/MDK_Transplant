@@ -903,13 +903,18 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       traversalScriptSpawn(env, x, y, z, 0.0f, 0, cls, "", scOff, 1);
       break;
     }
-    case 0xe6: {              // spawn3 {x,y,z,u32,u32,class,scOff}
+    case 0xe6: {              // spawn3 {x,y,z,yaw,spawnId,class,scOff}
+      // OBSERVED (0x44a0a9): operand 4 is an f32 copied raw to +0x4c
+      // (yaw); operand 5 is the spawn-id arg to FUN_00454af8 (>=0 kept,
+      // <0 -> FUN_00454810 name-instance counter+1). No +0x148 flag
+      // tail — spawn3 objects are not movers.
       float x = r.f32(), y = r.f32(), z = r.f32();
-      std::uint32_t a = r.u32(), b = r.u32();
+      float yaw = r.f32();
+      std::uint32_t spawnId = r.u32();
       std::string cls = r.str();
       std::uint32_t scOff = r.u32();
       if (!r.ok) { fail("spawn3"); return res; }
-      traversalScriptSpawn(env, x, y, z, 0.0f, a ^ b, cls, "", scOff,
+      traversalScriptSpawn(env, x, y, z, yaw, spawnId, cls, "", scOff,
                            3);
       break;
     }
@@ -2465,9 +2470,19 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
     o.col.flags148 = 0x8000;                 // +0x148=0x00 +0x149=0x80
     o.col.flags149 = 0x80;                   // +0x149
     o.col.flags14a = 0x10;                   // +0x14a (connector)
-  } else {
-    o.col.flags14a = flags & 0xffffu;        // spawn-flags byte (+0x14a)
+  } else if (variant == 2 || variant == 4) {
+    // OBSERVED: the op-0xa1 and op-0xce handlers share the tail
+    // `+0x148 dword = 0x2008a6` (0x4499d2 / 0x449b4b) — flags148=0x08a6
+    // (incl. the +0x148&2 gravity bit), flags14a=0x20. Every named
+    // pickup spawn through these ops is a FUN_004585c4 mover: SW_H150
+    // takes the flee branch, SW_SEAL/SW_SBONE are explicit no-ops, and
+    // all other SW_* models take the default yaw spin.
+    o.col.flags148 = 0x08a6;
+    o.col.flags149 = 0x08;
+    o.col.flags14a = 0x20;
   }
+  // Variants 1 (op-0x56) and 3 (op-0xe6) have no +0x148 flag tail in
+  // the original — flags14a keeps its alloc-zero value (no mover bit).
 
   // FUN_004566f0 — generic object init, common to every spawned object:
   // default block (health/scale/fields/identity) -> bind the model ->
@@ -2541,7 +2556,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x0c: case 0xfc: return "n";
   case 0x95: return "ffffwssw";
   case 0x56: case 0xa1: return "fffsw";
-  case 0xe6: return "fffwwsw";
+  case 0xe6: return "ffffwsw";
   case 0xce: return "wfsw";
   case 0x8e: return "bsbbf";
   case 0x99: case 0x05: return "f";

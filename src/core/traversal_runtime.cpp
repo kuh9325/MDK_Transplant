@@ -13,6 +13,7 @@
 #include <cstring>
 #include <span>
 
+#include "core/bni_directory.h"
 #include "core/data_root.h"
 #include "core/enemy_runtime.h"
 #include "core/frontend_machines.h"
@@ -724,6 +725,33 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
   rt.level.models.resize(rt.level.enemies.entries.size());
   rt.level.modelTried.assign(rt.level.enemies.entries.size(), false);
 
+  // TRAVSPRT.BNI — the traversal-context anim bank (DAT_004a1e38
+  // while traversing). The mover's SW_H150 records bind through
+  // FUN_004039ec (payload+4) at context init (0x434510/0x434524).
+  // Non-fatal: ports/tests without the bank keep null globals and
+  // the SW_H150 name branch degrades to its null-record state.
+  {
+    const std::string dir = dtiPath.substr(0, dtiPath.find_last_of('/'));
+    const std::string bniPath = dir.substr(
+        0, dir.find_last_of('/') + 1) + "TRAVSPRT.BNI";
+    auto bni = root.readFile(bniPath, kMaxDataFileBytes, detail);
+    if (bni) {
+      rt.level.travsprtBytes = std::move(*bni);
+      const BniDirectory bd = inspectBniDirectory(
+          std::span<const std::byte>(rt.level.travsprtBytes));
+      if (bd.status == BniDirectoryStatus::kOk) {
+        const auto payload4 = [&](const char* nm) -> const void* {
+          const BniRecord* r = findBniRecord(bd, nm);
+          if (!r) return nullptr;
+          // FUN_004039ec — record payload + 4 (skips the head u32).
+          return rt.level.travsprtBytes.data() + r->payloadFileOffset + 4;
+        };
+        rt.animH150I = payload4("H150_I");    // 0x54c6a4
+        rt.animH150R = payload4("H150_R");    // 0x54c6b0
+      }
+    }
+  }
+
   // The loader's arena work records: verbatim 36-byte sub-record
   // table + name fixups + connect pairing.
   rt.level.work = rt.level.dti.arenas;
@@ -1219,7 +1247,7 @@ TraversalFrameResult stepTraversalRuntime(
           enemyCommandDispatch(rt, o, da, dt);       // FUN_0045897c
           if (!o.col.named) continue;                // 0x4574ad
         } else if (o.col.flags14a & 0x20) {
-          objectMover(rt, o, da, dt);                // FUN_004585c4
+          objectMover(rt, o, da, dt, timing.frameStep); // FUN_004585c4
         }
         traversalObjectAnimUpdate(
             o, reinterpret_cast<const std::uint8_t*>(

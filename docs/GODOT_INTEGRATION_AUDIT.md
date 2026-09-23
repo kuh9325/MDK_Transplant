@@ -126,16 +126,16 @@ binary verification.
 | `.DTI` | ABSENT | PROVEN five-section structure + arena table + palette + grid | us | — |
 | Geometry (arena visual) | ABSENT | PROVEN — shared region-C poly records + BSP submission order (`src/core/arena_render.*`, Phase 6A) | us | — |
 | Textures/materials | PARTIAL — L8→RGBA via hand palette, unfiltered | PROVEN — MTI records → 0x34 material records, matlkup bank-A-then-B name resolution, NULL→0xff fallback, region-B palette | us | — |
-| Models | ABSENT | PARTIAL — `FUN_00428400` geometry record parsed; **animation UNKNOWN** | us | RE needed (G5) |
+| Models | ABSENT | PROVEN — `FUN_00428400` geometry + `FUN_004555bc`/`FUN_00455890` vertex-delta/ref-point/rigid animation driver (Phase 11A) | us | Godot presentation remains (G5) |
 | Sprites | PARTIAL — BNI sprites as flat textures | PROVEN BNI/FTI sprite decode into indexed fb | us | — |
-| Animations | ABSENT | PARTIAL — connector anim player `FUN_004555bc`; skeletal/anim format UNKNOWN | us | RE needed |
+| Animations | ABSENT | PROVEN — object anim driver + records (`FUN_004555bc`/`FUN_00455890`/`FUN_00455c48`, BNI record lookup, Phase 11A) | us | Godot presentation remains |
 | Collision | ABSENT — Godot physics on placeholder geometry | PROVEN — `FUN_004630d4` swept box-vs-BSP + object pass + floor probe | us | — |
 | Player | PARTIAL — KinematicBody approximation | PROVEN — motion/vertical/look/camera/sniper/fire dispatch | us | — |
 | Input | PARTIAL — InputMap + captured mouse | PROVEN — `FUN_00419370`/`FUN_00406f14` internal-domain merge | us | — |
 | Camera | PARTIAL — pivot + FOV toggle | PROVEN — pose/basis/M1/M2/obstruction/nudge | us | — |
 | Traversal | ABSENT | PROVEN — runtime, portal/trigger scans, arena streaming seams | us | — |
 | Scripts/events | ABSENT | PARTIAL — tr_alcmd VM core + ~25-opcode traversal subset | us | RE tail remains |
-| Enemies | ABSENT | PARTIAL — spawn/model placement proven; **AI UNKNOWN** | us | RE needed (G5) |
+| Enemies | ABSENT | PROVEN — spawn/placement + native gameplay runtime (gravity/collide/subtype/path/orbit/runner/command dispatch/mover incl. `FUN_004585c4` child lifecycle + `SW_H150`/`SW_SEAL`/`SW_SBONE` branches, Phase 11A–11C; G5 native CLOSED for BUILD_A) | us | Godot presentation remains (G5) |
 | Weapons | PARTIAL — hitscan raycast + particle puff | PARTIAL — fire dispatch + shot-pool creation proven; **flight/damage UNKNOWN** | us | RE needed (G4) |
 | UI/HUD | PARTIAL — menu skeleton + vitals textures | PARTIAL — full menu flow proven; HUD internals UNKNOWN | mixed | RE needed (G6) |
 | Audio | PARTIAL — WAV→AudioStreamSample + players | PARTIAL — semantic `SoundAudioEvent`s, no backend | godot-mdk (marginally) | Ordinary coding (G6) |
@@ -501,16 +501,17 @@ before/within them. Those are the ones that matter for the
 | **G2** — player presentation — **DONE** | Node3D player driven by traversal snapshots; move/jump/collision all core-side; debug wireframe of the proven collision world | G0 (+G1 for real geometry) | no (movement/collision already proven) | ordinary coding |
 | **G3** — dynamic objects / doors / portals — **DONE** | Object snapshot enumeration (opaque id, model, transform, AABB) + real RuntimeModel geometry; mover/door presentation; portal/arena display-set transitions | G1, G2 | no for known types (5E/5I proven); unknown record types 5/8 remain UNKNOWN | mostly coding, small RE tail |
 | **G4** — combat presentation | Shot-pool snapshot → projectile visuals; fire/impact sounds; hit feedback | G2 | **YES — projectile flight + damage/death internals** | RE + coding |
-| **G5** — enemies + AI | Enemy spawn→visual models, animation, AI behavior driven by core | G1, G3 | **YES — AI, animation format (large)** | RE + coding |
+| **G5** — enemies + AI | Enemy spawn→visual models, animation, AI behavior driven by core | G1, G3 | **NO for native runtime** — Phase 11A–11C reconstruct the full native enemy/mover gameplay core incl. `FUN_004585c4` (CLOSED FOR BUILD_A); remaining work is Godot presentation only | ordinary coding |
 | **G6** — audio / HUD / menus | SNI WAV playback via events; HUD from decoded FTI/BNI; menu screens re-skinned by Godot with logic still in core | G2 | partial — HUD layout details UNKNOWN | coding + bounded RE |
 | **G7** — progression / QA | Level transitions, save/load surface, full-game playthrough oracle-vs-native comparison | G1–G6 | partial — save semantics UNKNOWN | coding + bounded RE |
 | **G8** — macOS arm64 packaging | Export/packaging, icon/signing/notarization as applicable | G7 | no | ordinary coding |
 
-The RE-heavy items (G1 arena visuals, G4 combat tail, G5 AI/animation,
-plus the still-UNKNOWN freefall mode, bosses, save semantics, HUD
-layout, remaining tr_alcmd opcodes) are the work to schedule inside the
-current availability window; the presentation-only packages are
-deferrable ordinary coding.
+The RE-heavy items (G1 arena visuals, G4 combat tail, plus the
+still-UNKNOWN freefall mode, bosses, save semantics, HUD layout,
+remaining tr_alcmd opcodes) are the work to schedule inside the
+current availability window; G5 is now presentation-only after Phase
+11C, and the other presentation-only packages are deferrable ordinary
+coding.
 
 ## 20. Explicit non-goals
 

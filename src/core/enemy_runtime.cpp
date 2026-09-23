@@ -655,6 +655,7 @@ void objectTeardownNow(TraversalRuntime& rt, DynamicObject& o) {
   o.field138 = nullptr;
   o.field278 = nullptr;
   o.field158 = nullptr;
+  o.moverChild = nullptr;                  // +0x312 (mover union)
   o.field15c.clear();
   o.field11e = 0;
   o.field22c = 0.0f;
@@ -2160,25 +2161,203 @@ void subtypeSteeringTail(DynamicObject& o,
 // ---------------------------------------------------------------------------
 // FUN_004585c4 — the +0x14a&0x20 mover (enemy-dispatch else branch)
 // ---------------------------------------------------------------------------
+//
+// OBSERVED (MDK95.EXE 0x4585c4 — full instruction-level decode):
+//
+//   Entry gate (dword +0x148 & 0x20002) == 2 — gravity-active
+//   (+0x148 bit1) AND not yet hop-landed (+0x14a bit1):
+//     * airborne (+0x14c&2 == 0): when +0x30 falls below C(0x498070)
+//       = -15.0 the mover clamps +0x30 = -15.0 (0xc1700000) and —
+//       once, while +0x312 == 0 — spawns the "SW_CHUTE" child:
+//         FUN_00454794("SW_CHUTE") — name scan of the level model
+//         table (a miss is fatal in the original; a port without the
+//         model simply cannot spawn the child);
+//         FUN_00454af8(+0x60 arena, +0x10/+0x14/+0x18 pos, spawnId=1,
+//         modelIdx, scriptPC=0, connInit=0) -> +0x312;
+//         child +0x148 dword = 0x820, +0x276 = 0, +0x277 = 0,
+//         +0x278 = parent, +0x11e = 0x4a (the refpoint-attach
+//         subtype — the chute rides the parent's refpoint 0), then
+//         FUN_0045612c(child) rebuilds the transform.
+//     * floor contact (+0x14c&2): +0x5c = 1.5 (0x3fc00000),
+//       +0x14a |= 2 (the hop-landed latch — the 0x20000 gate bit),
+//       +0x18 += C(0x498078) = 1.5; return. The hop never re-arms —
+//       once landed, the name dispatch below runs instead.
+//
+//   Non-hop path (dword gate != 2):
+//     * child fade — while +0x312 != 0 and child +0x58 >
+//       C(0x498028) = 0.2: +0x58 -= dt; at <= 0.2 the child is torn
+//       down (FUN_0045828c) and +0x312 = 0. The chute shrinks out
+//       once the parent leaves the hop branch.
+//     * name dispatch on the model record name (+0x0c):
+//         SW_H150 — the fleeing health pickup (moverSwH150);
+//         SW_SEAL / SW_SBONE — explicit no-ops (return);
+//         default — +0x4c += dt * C(0x498030) = 180.0 (the pickup
+//         spin every BUILD_A HotPick takes: SW_HOME/SW_GREN/
+//         SW_GATT/SW_THUMP/SW_INTER/BONEHEAD/SW_DUMMY on LEVEL8
+//         GUNT_9, plus cmd-8/9-armed enemies elsewhere).
+
+namespace {
+
+// FUN_0045dc18 — approach `target` from `cur` by `step`, clamping at
+// the target and wrapping ±360 when the short way crosses 0/360.
+// OBSERVED constants: -180 (0x49839c), 180 (0x4983a0), 360
+// (0x4983a4), -360 (0x4983a8).
+float moverSteerTo(float target, float cur, float step) {
+  const float diff = target - cur;
+  const float up = cur + step;
+  if (diff < -180.0f) {
+    float out = up;
+    if (out >= 360.0f) {
+      out -= 360.0f;
+      if (out > target) out = target;
+    }
+    return out;
+  }
+  const float down = cur - step;
+  if (diff < 0.0f) return down < target ? target : down;
+  if (diff < 180.0f) return up <= target ? up : target;
+  float out = down;
+  if (out < 0.0f) {
+    out += 360.0f;
+    if (out < target) out = target;
+  }
+  return out;
+}
+
+// The hop branch's one-shot child — FUN_00454794 + FUN_00454af8 +
+// the post-spawn field block (0x45863c..0x4586af).
+void moverChuteSpawn(TraversalRuntime& rt, DynamicObject& o,
+                     DynamicArena& home) {
+  const int idx = rt.level.enemies.indexOf("SW_CHUTE");
+  if (idx <= 0) return;                     // original gates idx > 0
+  const RuntimeModel* src = traversalModelFor(idx, &rt.level);
+  if (src == nullptr) return;
+  DynamicArena& target = o.arena ? *o.arena : home;   // +0x60
+  DynamicObject& c = target.allocFront();             // freelist alloc
+  c.model = deepCopyModel(*src);                      // FUN_00403720
+  c.enemyIndex = static_cast<std::uint16_t>(idx);     // +0x04
+  c.spawnId = 1;                                      // +0x146 (arg 1)
+  c.field1c[0] = o.pos[0];                            // +0x1c anchor
+  c.field1c[1] = o.pos[1];
+  c.field1c[2] = o.pos[2];
+  c.setPosition(o.pos[0], o.pos[1], o.pos[2]);        // +0x10..0x18
+  c.prevPos[0] = o.pos[0];                            // +0x180..
+  c.prevPos[1] = o.pos[1];
+  c.prevPos[2] = o.pos[2];
+  initObjectCollision(c);                             // FUN_004566f0
+  c.behaviorByte = 7;                                 // +0x11c (FUN_00454af8 tail)
+  // +0x108 = 0 (scriptPC arg 0).
+  o.moverChild = &c;                                  // +0x312
+  // Post-spawn writes (OBSERVED 0x45866c..0x4586a2).
+  c.col.flags148 = 0x820;                             // dword +0x148
+  c.col.flags149 = 0x08;                              // byte1 mirror
+  c.col.flags14a = 0;
+  c.field276 = 0;                                     // refpoint idx
+  c.field277 = 0;
+  c.field278 = &o;                                    // +0x278 = parent
+  c.field11e = 0x4a;                                  // attach subtype
+  rebuildObjectTransform(c);                          // FUN_0045612c
+}
+
+// SW_H150 — the health pickup that runs away from the player.
+// OBSERVED (0x45871b..0x458930): idle (H150_I, one-shot) until the
+// player closes inside sqrt(C(0x498038)) = 20 u (3D dist²); then the
+// looping H150_R reaction + the 0x54c644 "RUNNER" SFX call
+// (FUN_00402388 — audio seam). While reacting it steers to the
+// compass bearing away from the player (+180) at dt*270 deg/s
+// (C(0x498060)) and accumulates a 40·(cos,sin)(yaw) impulse into
+// +0x294/+0x298 (C(0x498040)); once the player's XY distance²
+// exceeds C(0x498068) = 1000 it drops back to idle. The 0x45885b
+// lottery re-arms a completed idle anim with probability
+// frameStep*72 / 32768 per frame (DAT_0049b6e8 = 1 in the port,
+// matching the command-timer normalization).
+void moverSwH150(TraversalRuntime& rt, DynamicObject& o, float dt,
+                 int frameStep) {
+  o.zBias = 0.0f;                                     // +0x5c = 0
+  if (o.moverChild != nullptr) return;                // chute linked
+  // +0x114 == 0 or +0x118 == 0xff00 — the rebind lottery: with
+  // probability frameStep*72/32768 the idle record is (re)bound;
+  // otherwise control falls to the state dispatch at 0x458751.
+  if (o.animDone() &&
+      static_cast<int>(enemyRandNext(rt.rngState)) < frameStep * 72) {
+    o.animRate = 30.0f;                               // +0xe0
+    o.animLatch = -1;                                 // +0x118 = 0xffff
+    o.animAcc = 0.0f;                                 // +0xdc = 0
+    o.animFrame = -1;                                 // +0xe4 = 0xffff
+    o.animRec = rt.animH150I;                         // +0x114 = H150_I
+    o.col.flags148 &= ~0x8u;                          // one-shot
+    return;
+  }
+  // 0x458751 — state dispatch on the bound record.
+  if (o.animRec == rt.animH150R) {                    // reacting
+    float sn, cs;
+    sincosDeg(o.yawDeg, &sn, &cs);                    // FUN_00437f98
+    o.animImpulse[0] += cs * 40.0f;                   // +0x294
+    o.animImpulse[1] += sn * 40.0f;                   // +0x298
+    const float dx = rt.cs.pos[0] - o.pos[0];
+    const float dy = rt.cs.pos[1] - o.pos[1];
+    // FUN_00437f30(dx,dy) — the original's arg order yields
+    // atan2(dx,dy); +180 (0x498048) = away from the player.
+    float ang = bearingDeg(dx, dy) + 180.0f;
+    if (ang > 360.0f) ang -= 360.0f;                  // C(0x498050/58)
+    o.yawDeg = moverSteerTo(ang, o.yawDeg, dt * 270.0f);
+    o.col.flags148 |= 2;                              // gravity while
+                                                    // fleeing
+    if (dx * dx + dy * dy <= 1000.0f) return;         // C(0x498068)
+    // Player out of range — back to the idle record.
+    o.animAcc = 0.0f;
+    o.animFrame = -1;
+    o.animRec = rt.animH150I;
+    o.col.flags148 &= ~0x8u;
+    return;
+  }
+  // Idle (or any other record) — 3D proximity gate (FUN_00430190).
+  const float dx = rt.cs.pos[0] - o.pos[0];
+  const float dy = rt.cs.pos[1] - o.pos[1];
+  const float dz = rt.cs.pos[2] - o.pos[2];
+  if (dx * dx + dy * dy + dz * dz >= 400.0f) return;  // C(0x498038)
+  // Player close — the reaction starts looping + RUNNER call.
+  o.animRate = 30.0f;
+  o.animLatch = -1;
+  o.animAcc = 0.0f;
+  o.col.flags148 |= 8;                                // looping
+  o.animRec = rt.animH150R;
+  o.animFrame = -1;
+  ++rt.seams.moverSfxCalls;                           // FUN_00402388
+                                                    // (0x54c644, 0)
+}
+
+} // namespace
 
 void objectMover(TraversalRuntime& rt, DynamicObject& o,
-                 DynamicArena& home, float dt) {
-  // OBSERVED FUN_004585c4: the mover runs the hop/child-fade block and
-  // the SW_H150/SW_SEAL/SW_SBONE name branches, then its tail (0x458690)
-  // reads the +0x312 dword as a CHILD pointer: child+0x278 = ctx,
-  // child+0x11e = 0x4a, FUN_0045612c(child). The port does not yet
-  // spawn mover children (the +0x148&0x20002 hop block is a counted
-  // seam), so the tail is modelled as a documented seam; the shared
-  // ride-displacement + prev-state latch runs in the loop tail.
-  (void)home;
-  (void)dt;
-  if ((o.col.flags148 & 0x20002) == 2) {
-    // Hop child-spawn block — counted spawn seam.
-    rt.scriptSpawned++;
+                 DynamicArena& home, float dt, int frameStep) {
+  if ((flagsDword(o) & 0x20002) == 2) {               // hop branch
+    if ((o.col.flags14c & 2) == 0) {                  // airborne
+      if (o.field30 < -15.0f) {                       // C(0x498070)
+        o.field30 = -15.0f;                           // 0xc1700000
+        if (o.moverChild == nullptr)
+          moverChuteSpawn(rt, o, home);
+      }
+      return;
+    }
+    o.zBias = 1.5f;                                   // +0x5c = 0x3fc00000
+    o.col.flags14a |= 2;                              // hop-landed
+    o.pos[2] += 1.5f;                                 // C(0x498078)
+    return;
   }
-  // The name-specific mover branches drive scripted anim states — the
-  // port keeps the connector/mover flag behavior and counts the seam.
-  rt.seams.scriptedMoveCalls++;
+  // Child fade (0x4586bd..0x4586fc).
+  DynamicObject* c = o.moverChild;
+  if (c != nullptr && c->col.scale > 0.2f) {          // C(0x498028)
+    c->col.scale -= dt;                               // DAT_0049b6f4
+    if (c->col.scale <= 0.2f) {
+      objectTeardownNow(rt, *c);                      // FUN_0045828c
+      o.moverChild = nullptr;                         // +0x312 = 0
+    }
+  }
+  const std::string& nm = o.model.modelName();
+  if (nm == "SW_H150") { moverSwH150(rt, o, dt, frameStep); return; }
+  if (nm == "SW_SEAL" || nm == "SW_SBONE") return;    // no-op names
+  o.yawDeg += dt * 180.0f;                            // C(0x498030)
 }
 
 // ---------------------------------------------------------------------------

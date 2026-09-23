@@ -474,6 +474,14 @@ struct DynamicObject {
                                      // aliases connState's byte on
                                      // connectors (the ctx and
                                      // connector layouts overlap)
+  // +0x312 — FUN_004585c4 mover child pointer (the SW_CHUTE spawned
+  // by the hop branch). The original holds the child DynamicObject*
+  // in the same dword the script ctx reads as flag group 5 and the
+  // connector reads as its phase byte — three aliased views of one
+  // field. The port keeps them separate; a mover's scripts do not
+  // reach flag group 5 in BUILD_A, and connector/mover flag bits are
+  // disjoint (+0x14a 0x10 vs 0x20).
+  DynamicObject* moverChild = nullptr;
 
   // --- Phase 11A — path binding (op 0x02, handler 0x438e7c) ---
   // +0xec is the bound path record (image ptr); nonzero gates the

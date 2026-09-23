@@ -112,7 +112,7 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
 // (+0x148&0x20002)==2, the +0x312 child fade-out, the SW_H150 /
 // SW_SEAL / SW_SBONE name branches and the anim-state pushes.
 void objectMover(TraversalRuntime& rt, DynamicObject& o,
-                 DynamicArena& home, float dt);
+                 DynamicArena& home, float dt, int frameStep);
 
 // FUN_0045d578 — rolling-contact ride update (+0x148 & 0x40 gate in
 // the FUN_004572ac tail): the frame XY delta rolls the +0x302 raw

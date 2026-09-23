@@ -12827,6 +12827,239 @@ void test_enemy_runtime() {
   }
 }
 
+void test_mover_runtime() {
+  // ---- FUN_004585c4 — hop gate, chute lifecycle, name dispatch ------
+  const float dt = 1.0f / 30.0f;
+
+  // Helper: a mover object (flags14a&0x20) with the op-0xa1 spawn
+  // dword 0x2008a6 (gravity + mover) in `ar`.
+  auto mkMover = [](mdk::DynamicArena& ar,
+                    const char* modelName) -> mdk::DynamicObject& {
+    mdk::DynamicObject& o = ar.allocFront();
+    o.col.named = true;
+    o.health = 10;
+    o.model = makePlatformModel(modelName, "ELEM", 0.0f);
+    o.col.flags148 = 0x08a6;          // dword 0x2008a6 (0xa1/0xce tail)
+    o.col.flags149 = 0x08;
+    o.col.flags14a = 0x20;
+    return o;
+  };
+
+  // -- hop branch: airborne + vel < -15 -> clamp + chute spawn --------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    rt.level.enemies.entries = {{"DUMMY0", 0, false},
+                                {"SW_CHUTE", 0, false}};
+    rt.level.models.resize(2);
+    rt.level.models[1] = makePlatformModel("SW_CHUTE", "CHUTE", 0.0f);
+    mdk::DynamicObject& o = mkMover(home, "SW_HOME");
+    o.arena = &home;
+    o.field30 = -20.0f;                        // vel.z below the clamp
+    const std::size_t before = home.storage.size();
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(near(o.field30, -15.0, 1e-5));       // vel clamped (C 0x498070)
+    CHECK(o.moverChild != nullptr);            // +0x312 child
+    CHECK(home.storage.size() == before + 1);  // child on +0x68 list
+    mdk::DynamicObject* c = o.moverChild;
+    CHECK(c->col.named && c->arena == &home);
+    CHECK(c->model.modelName() == "SW_CHUTE");
+    CHECK(c->enemyIndex == 1 && c->spawnId == 1);
+    CHECK(c->col.flags148 == 0x820 && c->col.flags149 == 0x08);
+    CHECK(c->field278 == &o);                  // +0x278 reverse link
+    CHECK(c->field11e == 0x4a);                // refpoint attach
+    CHECK(c->field276 == 0 && c->field277 == 0);
+    CHECK(c->behaviorByte == 7);               // +0x11c
+    CHECK(near(c->col.scale, 1.0, 1e-6));
+    // No duplicate spawn on the next hop frame.
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(o.moverChild == c && home.storage.size() == before + 1);
+  }
+
+  // -- hop branch: floor contact -> zBias 1.5, latch, z bump ----------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    mdk::DynamicObject& o = mkMover(home, "SW_HOME");
+    o.arena = &home;
+    o.col.flags14c |= 2;                        // floor contact
+    o.field30 = -20.0f;
+    const float z0 = o.pos[2];
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(near(o.zBias, 1.5, 1e-6));            // +0x5c = 0x3fc00000
+    CHECK((o.col.flags14a & 2) != 0);           // hop-landed latch
+    CHECK(near(o.pos[2], z0 + 1.5, 1e-5));      // C(0x498078)
+    CHECK(o.moverChild == nullptr);             // no chute on contact
+  }
+
+  // -- child fade + teardown on the non-hop path ----------------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    mdk::DynamicObject& o = mkMover(home, "SW_HOME");
+    o.arena = &home;
+    o.col.flags14a |= 2;                        // landed -> non-hop
+    mdk::DynamicObject& c = home.allocFront();
+    c.col.named = true;
+    c.col.scale = 0.5f;
+    o.moverChild = &c;
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(near(c.col.scale, 0.5 - 1.0 / 30.0, 1e-5));   // -= dt
+    CHECK(o.moverChild == &c);                          // still linked
+    // Drive scale below 0.2 -> teardown + pointer clear.
+    int calls = 0;
+    while (o.moverChild != nullptr && calls < 30) {
+      mdk::objectMover(rt, o, home, dt, 1);
+      ++calls;
+    }
+    CHECK(o.moverChild == nullptr);
+    CHECK(!c.col.named);                        // FUN_0045828c wipe
+  }
+
+  // -- parent death: reverse link detaches via subtype 0x4a -----------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    rt.level.enemies.entries = {{"DUMMY0", 0, false},
+                                {"SW_CHUTE", 0, false}};
+    rt.level.models.resize(2);
+    rt.level.models[1] = makePlatformModel("SW_CHUTE", "CHUTE", 0.0f);
+    mdk::DynamicObject& o = mkMover(home, "SW_HOME");
+    o.field30 = -20.0f;
+    mdk::objectMover(rt, o, home, dt, 1);       // chute attached
+    mdk::DynamicObject* c = o.moverChild;
+    CHECK(c != nullptr && c->field11e == 0x4a);
+    // FUN_0045828c on the parent wipes it but the storage stays —
+    // the child's +0x278 then reads named==0 and self-detaches, the
+    // same as the original's memset'd pool slot.
+    mdk::objectTeardownNow(rt, o);
+    CHECK(o.moverChild == nullptr);
+    mdk::objectSubtypeUpdate(rt, *c, home, dt);
+    CHECK(c->field11e == 0);                    // detached
+    CHECK(c->col.named);                        // child survives
+  }
+
+  // -- child death: +0x312 stays set (OBSERVED quirk) -----------------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    rt.level.enemies.entries = {{"DUMMY0", 0, false},
+                                {"SW_CHUTE", 0, false}};
+    rt.level.models.resize(2);
+    rt.level.models[1] = makePlatformModel("SW_CHUTE", "CHUTE", 0.0f);
+    mdk::DynamicObject& o = mkMover(home, "SW_HOME");
+    o.field30 = -20.0f;
+    mdk::objectMover(rt, o, home, dt, 1);
+    mdk::DynamicObject* c = o.moverChild;
+    mdk::objectTeardownNow(rt, *c);             // child dies first
+    o.col.flags14a |= 2;                        // landed -> non-hop
+    mdk::objectMover(rt, o, home, dt, 1);
+    // The wiped child's +0x58 == 0 -> the fade gate skips it and
+    // +0x312 never clears (the original leaves the dead pointer too).
+    CHECK(o.moverChild == c);
+  }
+
+  // -- name dispatch: default spin / SW_SEAL / SW_SBONE no-ops --------
+  {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    mdk::DynamicObject& a = mkMover(home, "SW_HOME");
+    mdk::DynamicObject& b = mkMover(home, "SW_SEAL");
+    mdk::DynamicObject& c = mkMover(home, "SW_SBONE");
+    a.col.flags14a |= 2; b.col.flags14a |= 2; c.col.flags14a |= 2;
+    mdk::objectMover(rt, a, home, dt, 1);
+    mdk::objectMover(rt, b, home, dt, 1);
+    mdk::objectMover(rt, c, home, dt, 1);
+    CHECK(near(a.yawDeg, 180.0 / 30.0, 1e-4));  // dt * C(0x498030)
+    CHECK(b.yawDeg == 0.0f && c.yawDeg == 0.0f);// explicit no-ops
+  }
+
+  // -- SW_H150: idle -> react on approach, flee steering, drop-back ---
+  {
+    static const std::byte h150i[1] = {std::byte{0x11}};
+    static const std::byte h150r[1] = {std::byte{0x22}};
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    rt.animH150I = h150i;
+    rt.animH150R = h150r;
+    rt.rngState = 1;            // next rand = 16838 -> lottery skipped
+    mdk::DynamicObject& o = mkMover(home, "SW_H150");
+    o.arena = &home;
+    o.col.flags14a |= 2;                        // landed
+    o.animRec = rt.animH150I;
+    o.animLatch = 0;                            // idle record running
+    rt.cs.pos[0] = 5.0f; rt.cs.pos[1] = 0.0f; rt.cs.pos[2] = 0.0f;
+    mdk::objectMover(rt, o, home, dt, 1);       // dist2=25 < 400
+    CHECK(o.animRec == rt.animH150R);           // reaction bound
+    CHECK((o.col.flags148 & 8) != 0);           // looping
+    CHECK(rt.seams.moverSfxCalls == 1);         // RUNNER seam
+    CHECK(o.animFrame == -1 && o.animLatch == -1 && o.animAcc == 0.0f);
+    // Reacting: impulse + away-steer + gravity arm.
+    o.yawDeg = 0.0f;
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(near(o.animImpulse[0], 40.0, 1e-4));  // cos(0)*40 -> +0x294
+    CHECK(near(o.animImpulse[1], 0.0, 1e-4));   // sin(0)*40 -> +0x298
+    CHECK((o.col.flags148 & 2) != 0);
+    // bearing(5,0)=90 + 180 -> target 270; from 0 the short way is
+    // counterclockwise: one dt*270=9 step -> 351 (0x4587df..0x45880b).
+    CHECK(near(o.yawDeg, 351.0, 1e-3));
+    // Player retreats past XY dist2 1000 -> idle rebind.
+    rt.cs.pos[0] = 40.0f;                       // dist2=1600
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(o.animRec == rt.animH150I);
+    CHECK((o.col.flags148 & 8) == 0);           // one-shot again
+    // Far idle: dist2 >= 400 -> nothing changes.
+    o.animLatch = 0;
+    const float yaw0 = o.yawDeg;
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(o.yawDeg == yaw0 && rt.seams.moverSfxCalls == 1);
+    // Chute attached -> the whole H150 body is skipped.
+    mdk::DynamicObject& chute = home.allocFront();
+    chute.col.named = true;
+    o.moverChild = &chute;
+    o.animRec = rt.animH150I;
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(rt.seams.moverSfxCalls == 1);
+  }
+
+  // -- lottery: animDone + rand < frameStep*72 rebinds idle -----------
+  {
+    static const std::byte h150i[1] = {std::byte{0x33}};
+    static const std::byte h150r[1] = {std::byte{0x44}};
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    rt.animH150I = h150i;
+    rt.animH150R = h150r;
+    mdk::DynamicObject& o = mkMover(home, "SW_H150");
+    o.arena = &home;
+    o.col.flags14a |= 2;
+    o.animRec = nullptr;                        // animDone via +0x114==0
+    rt.cs.pos[0] = 500.0f;                      // far — react gate fails
+    rt.rngState = 0;                            // next rand = 0 < 72
+    mdk::objectMover(rt, o, home, dt, 1);
+    CHECK(o.animRec == rt.animH150I);           // lottery rebind
+    CHECK(o.animLatch == -1 && o.animFrame == -1);
+    CHECK(near(o.animRate, 30.0, 1e-5));
+    CHECK((o.col.flags148 & 8) == 0);           // one-shot cleared
+  }
+
+  // -- gates: mover/dispatch mutual exclusion + XCORDOOR --------------
+  {
+    mdk::DynamicObject o;
+    o.col.flags149 = 0x10;                      // enemy dispatch
+    o.col.flags14a = 0x20 | 0x10;               // mover + connector
+    // FUN_004572ac order: dispatch REPLACES the mover (else-if).
+    bool ranDispatch = false, ranMover = false;
+    if (o.col.flags149 & 0x10) ranDispatch = true;
+    else if (o.col.flags14a & 0x20) ranMover = true;
+    CHECK(ranDispatch && !ranMover);
+    // XCORDOOR connector: no mover bit -> loop never reaches the mover.
+    mdk::DynamicObject door;
+    door.col.flags14a = 0x10;
+    CHECK((door.col.flags14a & 0x20) == 0);
+  }
+}
+
 void test_object_animation() {
   // -- Record header / view accessors ---------------------------------
   // {rate=1, chanCount=1, frameCount=4, chanOff, rootKeys, refCount,
@@ -15549,6 +15782,7 @@ int main() {
   test_traversal_object_init();
   test_traversal_object_script();
   test_enemy_runtime();
+  test_mover_runtime();
   test_object_animation();
   test_player_look();
   test_player_camera();

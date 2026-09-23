@@ -145,6 +145,10 @@ struct TraversalLevel {
   std::vector<std::byte> dtiBytes;
   std::vector<std::byte> cmiBytes;
   std::vector<std::byte> mtoBytes;
+  // TRAVSPRT.BNI — the traversal-context anim bank (the original's
+  // DAT_004a1e38 image while traversing). Loaded when present; the
+  // mover's SW_H150 records resolve into it.
+  std::vector<std::byte> travsprtBytes;
   DtiStructure dti;
   CmiDirectory cmi;
   MtoDirectory mto;
@@ -243,6 +247,9 @@ struct TraversalSeams {
   int classLookupCalls = 0;       // FUN_00454794 class-name lookups
   int punchHitCalls = 0;          // punch target hit -> damage tail
   int punchWallCalls = 0;         // punch miss -> wall impact seam
+  int moverSfxCalls = 0;          // FUN_00402388(0x54c644 "RUNNER",0)
+                                  // — the SW_H150 reaction sound
+                                  // (FUN_004585c4; audio seam)
   int chargeProbeCalls = 0;       // FUN_00437aa8 -> FUN_0046145c
   int shotRenderCalls = 0;        // FUN_0045f030 shot-pool render pass
   int shotPoolTickCalls = 0;      // FUN_004572ac shot-pool update seam
@@ -401,6 +408,14 @@ struct TraversalRuntime {
                                   // the bankIdle test)
   bool bankIdle = false;          // 0x540bcc — bank+aux == 0
   int frameCounter = 0;           // 0x540ce0 — step counter
+
+  // --- Phase 11C — mover anim-record globals (FUN_004585c4) ---
+  // 0x54c6a4/0x54c6b0 — TRAVSPRT.BNI "H150_I"/"H150_R" record
+  // payload+4 pointers bound once at context init (0x434510..,
+  // FUN_004039ec). Null when the bank is absent; the mover compares
+  // +0x114 against them verbatim.
+  const void* animH150I = nullptr;    // 0x54c6a4
+  const void* animH150R = nullptr;    // 0x54c6b0
 
   // --- Phase 5L — sniper mode + mounted reticle (OBSERVED globals) ---
   // Shared counter + fire cadence (0x540d0c family): the sniper fire

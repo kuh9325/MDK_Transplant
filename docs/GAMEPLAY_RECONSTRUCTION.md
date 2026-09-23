@@ -3944,3 +3944,171 @@ clear `mark[depth+1]` post-increment — `scriptMark` widened to
   (`+0x312` pointer tail), FX/SFX record table (`0x4a1220`),
   inventory table (`0x54155c`), the `FUN_004585c4` name
   branches, and `FUN_00407fc0` clamp-box edge cases.
+
+## 159. The mover — `FUN_004585c4` (OBSERVED, ported)
+
+`FUN_004585c4` runs for every list object with `+0x14a & 0x20`,
+in the `FUN_004572ac` else-branch of the enemy-dispatch gate
+(§155). Instruction-level decode of `0x4585c4..0x458979`:
+
+**Entry gate** — `(+0x148 dword & 0x20002) == 2`, i.e. the
+`+0x148&2` gravity bit set AND the `+0x14a&2` hop-landed latch
+clear. While it holds, the mover is a falling object:
+
+- Airborne (`+0x14c&2 == 0`): if `+0x30` (vel.z) <
+  `C(0x498070)` = −15.0, clamp `+0x30 = 0xc1700000` (−15.0) and,
+  when `+0x312 == 0`, spawn the `SW_CHUTE` child (§160) — the
+  parachute only opens while the fall exceeds the terminal
+  clamp. Return.
+- Floor contact (`+0x14c&2 != 0`): `+0x5c = 0x3fc00000` (zBias
+  1.5), `+0x14a |= 2` (latch — permanently breaks the gate),
+  `+0x18 += C(0x498078)` = 1.5. Return. The hop never re-arms.
+
+**Non-hop path**:
+
+1. Child fade (`0x4586bd..0x4586fc`) — while `+0x312 != 0` and
+   child `+0x58 > C(0x498028)` = 0.2: `+0x58 -= DAT_0049b6f4`
+   (dt). At `<= 0.2` the child is torn down (`FUN_0045828c`)
+   and `+0x312 = 0`. The chute shrinks out over ~0.8 s once the
+   parent leaves the hop branch.
+2. Name dispatch on the model record name (`+0x0c`):
+
+   | name | branch | fields |
+   |---|---|---|
+   | `SW_H150` | flee logic (below) | +0x114/+0x118 anim, +0x294/+0x298 impulse, +0x4c steer, +0x148|2 gravity |
+   | `SW_SEAL` | explicit no-op (return) | — |
+   | `SW_SBONE` | explicit no-op (return) | — |
+   | default | `+0x4c += dt * C(0x498030)` = 180°/s | yaw only, no wrap |
+
+**`SW_H150`** (`0x45871b..0x458930`) — the fleeing health
+pickup: `+0x5c = 0`; returns early while `+0x312 != 0` (chute
+still linked). Lottery at `0x45885b`: when `+0x114 == 0` or
+`+0x118` word == `0xff00`, `FUN_0047d2b5` rand <
+`DAT_0049b6e8 * 72` rebinds `+0x114 = H150_I`, `+0xe0 = 30`,
+`+0x118 = 0xffff`, `+0xdc = 0`, `+0xe4 = 0xffff`, `+0x148 &= ~8`
+(one-shot). Otherwise state dispatch on `+0x114`:
+
+- `H150_R` (reacting): `+0x294 += cos(yaw)*40`,
+  `+0x298 += sin(yaw)*40` (`C(0x498040)`); bearing =
+  `FUN_00437f30(dx,dy)` = `atan2(dx,dy)` compass + `C(0x498048)`
+  = 180 (away from player), wrapped `> C(0x498050)` = 360 →
+  `+C(0x498058)` = −360; `+0x4c = FUN_0045dc18(target, yaw,
+  dt * C(0x498060)` = 270) steer-with-wrap; `+0x148 |= 2`
+  (gravity while fleeing). XY dist² `> C(0x498068)` = 1000 →
+  rebind `H150_I` (`+0xdc=0`, `+0xe4=0xffff`, `+0x148&=0xf7` —
+  no `+0xe0`/`+0x118` write).
+- else (idle/other): 3D dist² `FUN_00430190` `< C(0x498038)` =
+  400 → bind `H150_R` (`+0xe0=30`, `+0x118=0xffff`, `+0xdc=0`,
+  `+0x148 |= 8` looping, `+0xe4=0xffff`) + `FUN_00402388(
+  0x54c644, 0)` — the `RUNNER` SFX call (audio seam, §145).
+
+`H150_I`/`H150_R` are bound once at init from `TRAVSPRT.BNI`
+(records `0x54c6a4`/`0x54c6b0`, via `FUN_004039c8` name lookup;
+the port resolves them at level load — missing bank is
+non-fatal and leaves the branch inert, matching a missing-BNI
+abort in the original).
+
+## 160. `+0x312` union + the mover-child lifecycle (OBSERVED)
+
+`+0x312` is a contextual union — three views proven:
+
+- **connector** (`+0x14a & 0x10`): byte door-state
+  (`connState`, §107) — integer, never pointer-relocated.
+- **mover** (`+0x14a & 0x20`): `DynamicObject*` child pointer.
+  Save/load treats it as a pointer: `0x42710c` gates `+0x14a&0x20`
+  → `FUN_004282dc` rebase at `0x427115`.
+- **AABB extent** (`+0x30e/312/316` f32 block): `FUN_0045612c`
+  reads `+0x312` as the half-extent y (`fld * scale → +0xc0`);
+  `0x4495b5` snapshots `+0xbc/c0/c4` → `+0x30e/312/316`.
+
+Mover-child creation (hop branch, `0x45863c..0x4586af`):
+`FUN_00454794("SW_CHUTE")` gates `idx > 0`; then
+`FUN_00454af8(arena +0x60, pos, 1, idx, 0, 0)` — parent-arena
+freelist alloc, `+0x146 = 1`, `+0x11c = 7`, `+0x108 = 0` (no
+script), position = parent pos. Post-spawn writes: parent
+`+0x312 = child`; child `+0x148 dword = 0x820`,
+`+0x276 = +0x277 = 0`, `+0x278 = parent`, `+0x11e = 0x4a`;
+`FUN_0045612c` rebuild. The child is a normal `+0x68` list
+member — it runs gravity/collide/subtype/anim like any object;
+subtype `0x4a` glues it to the parent's world refpoint-0 delta
+each frame (it visually rides the parent) and self-detaches
+(`+0x11e = 0`) if `+0x278` ever reads a wiped slot.
+
+Lifecycle: the pointer is only cleared by the fade teardown
+(`+0x312 = 0` after `FUN_0045828c`) or by the parent's own
+teardown memset. OBSERVED quirks preserved: a child that dies
+independently leaves `+0x312` non-null forever (wiped
+`+0x58 == 0` fails the `> 0.2` gate), which permanently
+suppresses the `SW_H150` body; a dead parent leaves the child
+attached-but-detached (subtype `0x4a` clears itself next tick).
+Duplicate spawn is impossible — the `+0x312 == 0` check gates
+the spawn.
+
+Mover arming paths (all `+0x148 dword` writers):
+
+| writer | dword | objects |
+|---|---|---|
+| `FUN_00456808` (type-4 HotPick record activation) | `0x2008a0` | `flags148=0x8a0` — no gravity bit; immediate name dispatch |
+| op-`0xa1` `spawnNamed` tail (`0x4499d2`) | `0x2008a6` | `flags148=0x8a6` — gravity bit set → hop branch until landed |
+| op-`0xce` `imgobj` tail (`0x449b4b`) | `0x2008a6` | same |
+| cmd8/cmd9 arm (`+0x14a |= 0x20`) | `0x20000` added | enemy models → default spin (no gravity bit unless already set) |
+
+ops `0x56`/`0xe6` (`spawn2`/`spawn3`) have **no** `+0x148` tail —
+their spawns are never movers. (op-`0xe6` operand correction:
+`{x,y,z, yaw:f32, spawnId:u32, name, scOff}` — the fourth field
+is an f32 copied to `+0x4c`, the fifth the `FUN_00454af8`
+spawn-id arg; negative → `FUN_00454810` name-instance counter.)
+
+## 161. BUILD_A mover census + Phase 11C validation (OBSERVED)
+
+Static census of every mover arming path in LEVEL3–8:
+
+- **Type-4 HotPick records**: only `GUNT_9` (LEVEL8) — 9
+  pickups (`SW_HOME`, `SW_GREN`×3, `SW_GATT`, `SW_THUMP`,
+  `SW_INTER`, `BONEHEAD`, `SW_DUMMY`), all `flags148=0x8a0`
+  `flags14a=0x20` → default spin.
+- **op-`0xa1` script operands** (all `0x2008a6` → hop→spin):
+  `SW_H150` — L3×1, L4×1, L6×2, L7×2 (the flee branch is real
+  BUILD_A content); `SW_SEAL` — L5×1; `SW_SBONE` — L5×1 (both
+  explicit no-ops); ~200 other `SW_*` pickups (`SW_H25`,
+  `SW_H01`, `SW_HBOMB`, `SW_GATT`, `SW_LGREN`, `SW_SGREN`,
+  `SW_BONES`, `SW_HOME`, `SW_TWIST`, `SW_DUMMY`, `SW_HGREN`,
+  `SW_H50`, `SW_H100`, `SW_KEY`, `SW_THUMP`, `SW_INTER`,
+  `BONEFLC`, `SW_EWJ`, `C_HEAD`, `_FOTL`) → default spin.
+- **cmd8/cmd9-armed enemies**: e.g. `XS_ALL` on LEVEL3 — live
+  at runtime (default spin observed at 180°/s).
+
+No other `FUN_004585c4` name branches exist — the dispatch has
+exactly three name tests (`SW_H150`, `SW_SEAL`, `SW_SBONE`) +
+default; all four are real BUILD_A content.
+
+Live runtime proof (LEVEL3, 3000 frames): `SW_BONES`
+(`BONEHEAD` model) spawns via op-`0xa1` with `f148=08a6`,
+falls (`vel.z` −1→−14.9), `SW_CHUTE` attaches at `vel.z ≤ −15`,
+lands (`+0x14c&2` → `f14a=22` latch + z bump), chute fades, and
+the pickup spins at +6°/frame (180°/s).
+
+`mdk_tests`: **4198 checks / 0 failures** — hop gate + vel
+clamp, chute spawn/init/linkage, landing latch, child
+fade/teardown, no-duplicate-spawn, default spin, `SW_SEAL`/
+`SW_SBONE` no-ops, `SW_H150` idle→react→flee→idle transitions
+(dist² 400 / 1000 gates), impulse + steer + gravity arm,
+lottery rebind, chute-suppression of the H150 body,
+parent-death detach, dead-child `+0x312` quirk, and the
+dispatch/mover mutual exclusion + XCORDOOR negative control.
+
+**G5 native gameplay/animation reconstruction: CLOSED FOR
+BUILD_A.** Remaining seams by category:
+
+- A. native enemy/mover runtime — none; `FUN_004585c4` is
+  fully classified and all BUILD_A branches are ported.
+- B. frontend presentation — Godot enemy/mover rendering
+  (consumes native state; not started).
+- C. audio/FX — `0x4a1220` SFX record table (`RUNNER` etc.
+  counted at `seams.moverSfxCalls`), `FUN_00402388` seam.
+- D. unrelated systems — inventory `0x54155c`.
+- E. unreachable/dead — op `0x60` (never reached by real
+  streams), DOS parity.
+
+This closes native gameplay reconstruction for BUILD_A; it is
+not a claim of total MDK reconstruction.
