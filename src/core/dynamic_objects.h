@@ -66,6 +66,13 @@
 //   Arena +0x68 list (FUN_0045cffc / FUN_0045cf90 / FUN_004574d0):
 //     singly-linked through object +0x00; push-front on spawn and on
 //     portal transfer; +0x60 = current arena, +0x2bc = pending arena.
+//     Allocation is pool-based: FUN_0045cffc pops the global freelist
+//     (0x540ed0) before falling back to the inactive-arena scavenge,
+//     and FUN_0045cf90 memsets the record and pushes it back. The
+//     per-arena corpse sweep (FUN_0045cf18, called after each arena's
+//     FUN_004572ac pass in the frame loop) unlinks+frees every
+//     +0x06==0 record — teardown (FUN_0045828c) only marks a corpse;
+//     this sweep is what removes it from the list.
 //
 //   Init (FUN_004566f0): health +0x08 = 10, scale +0x58 = 1.0,
 //     identity matrix, then FUN_0045612c transform/AABB rebuild.
@@ -602,12 +609,27 @@ struct DynamicArena {
   std::list<std::unique_ptr<DynamicObject>> storage;
 
   // FUN_0045cffc — allocate + push-front onto +0x68 (col.objects),
-  // named=1, +0x60 = this. Storage is owned by the arena; the
-  // returned reference stays valid until detach.
+  // named=1, +0x60 = this. The original pops the global freelist
+  // (0x540ed0) first; the port mirrors that — a recycled record is
+  // already memset-clean (the free path wipes it), so it is
+  // indistinguishable from a fresh allocation. Storage is owned by
+  // the arena; the returned reference stays valid until detach.
   DynamicObject& allocFront();
 
-  // FUN_0045cf90 — unlink from +0x68 and release storage.
+  // FUN_0045cf90 — unlink from +0x68, wipe the record (the
+  // original's memset), and push it onto the global freelist. The
+  // memory stays allocated: stale DynamicObject* held by other
+  // objects stay dereferenceable exactly like the original's pool.
   void detach(DynamicObject& obj);
+
+  // FUN_0045cf18's +0x68 sweep — unlink and free every unnamed
+  // record (a corpse left by FUN_0045828c teardown). Runs after each
+  // arena's FUN_004572ac object pass in the frame loop, before the
+  // script pass, so script-side dedup sees live objects only and a
+  // same-frame respawn can reuse the freed record. The original's
+  // cur-only deferred-free countdown drain (0x540ea8) has no port
+  // equivalent — nothing produces deferred-free records yet.
+  void reapUnnamed();
 
   // FUN_004574d0 — unlink from this arena's list and push-front onto
   // `dst`'s (+0x60 updated; storage spliced).

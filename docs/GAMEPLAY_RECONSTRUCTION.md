@@ -1223,7 +1223,14 @@ update (`FUN_004572ac` + `FUN_0045cf18` per arena) → scripts
   pendingArena`). `pos[2]` mirrors `col.baseZ` (+0x18).
 - `DynamicArena` — owns `CollisionArena` + object storage
   (`std::list`, stable addresses); `allocFront`/`detach`/`transfer`
-  = `FUN_0045cffc`/`FUN_0045cf90`/`FUN_004574d0`.
+  = `FUN_0045cffc`/`FUN_0045cf90`/`FUN_004574d0`, and `reapUnnamed`
+  = the `FUN_0045cf18` `+0x06==0` sweep (runs after each arena's
+  `FUN_004572ac` pass in `stepTraversalRuntime`, before the script
+  pass). The port's freelist keeps freed records allocated rather
+  than pooling 399 statics — `detach` wipes the record in place and
+  pushes it; `allocFront` pops before a fresh allocation, so a
+  same-frame respawn reuses the corpse's record exactly like the
+  original.
 - `buildObjectMatrix` — `FUN_0046b2f8`.
 - `rebuildObjectTransform` — `FUN_0045612c` collision core (matrix
   select + element world AABBs + degenerate-seeded union).

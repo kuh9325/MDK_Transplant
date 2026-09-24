@@ -2,10 +2,24 @@
 
 #include <cmath>
 #include <cstring>
+#include <new>
 
 namespace mdk {
 
 namespace {
+
+// 0x540ed0 — the global dynamic-object freelist. FUN_0045cf90 pushes
+// memset records here (LIFO) and FUN_0045cffc pops before falling
+// back to the inactive-arena scavenge. The port keeps freed records
+// alive in this list instead of returning them to the heap: stale
+// DynamicObject* held by other objects then stay dereferenceable —
+// the same guarantee the original's fixed record pool provides. The
+// original's 399-slot cap is a memory-budget mechanism; the port's
+// list is bounded by the peak live-object count and needs none.
+std::list<std::unique_ptr<DynamicObject>>& objectFreelist() {
+  static std::list<std::unique_ptr<DynamicObject>> l;
+  return l;
+}
 
 std::uint32_t rdU32(const std::uint8_t* p) {
   std::uint32_t v;
@@ -286,7 +300,17 @@ void DynamicObject::syncCollisionView() {
 }
 
 DynamicObject& DynamicArena::allocFront() {
-  storage.push_front(std::make_unique<DynamicObject>());
+  // FUN_0045cffc — the freelist pop comes first (a recycled record is
+  // memset-clean from the free path); the original's fallback was a
+  // scavenged inactive-arena record, the port's is a fresh heap
+  // record — same observable state.
+  auto& fl = objectFreelist();
+  if (!fl.empty()) {
+    storage.push_front(std::move(fl.front()));
+    fl.pop_front();
+  } else {
+    storage.push_front(std::make_unique<DynamicObject>());
+  }
   DynamicObject& o = *storage.front();
   o.col.next = col.objects;
   col.objects = &o.col;
@@ -310,11 +334,29 @@ void DynamicArena::detach(DynamicObject& obj) {
   }
   for (auto it = storage.begin(); it != storage.end(); ++it) {
     if (it->get() == &obj) {
+      // FUN_0045cf90 — the record is memset before the freelist push;
+      // destroying + reconstructing in place is the port equivalent
+      // (members with owned storage are released by the destructor).
+      std::unique_ptr<DynamicObject> up = std::move(*it);
       storage.erase(it);
-      break;
+      obj.~DynamicObject();
+      new (&obj) DynamicObject();
+      objectFreelist().push_front(std::move(up));
+      return;
     }
   }
   obj.arena = nullptr;
+}
+
+void DynamicArena::reapUnnamed() {
+  // FUN_0045cf18 — walk +0x68 and free every corpse. The storage
+  // walk pre-reads the next node (same pattern as the original's
+  // next-link read and the update loop) so detach can't corrupt it.
+  for (auto it = storage.begin(); it != storage.end();) {
+    auto nextIt = std::next(it);
+    if (!(*it)->col.named) detach(**it);
+    it = nextIt;
+  }
 }
 
 void DynamicArena::transfer(DynamicObject& obj, DynamicArena& dst) {

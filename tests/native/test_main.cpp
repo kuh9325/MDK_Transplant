@@ -11226,6 +11226,43 @@ void test_dynamic_objects() {
     a.detach(o3);
     CHECK(a.col.objects == &o1.col);
     CHECK(a.storage.size() == 1);
+    // FUN_0045cf90 — detach wipes the record in place (the original's
+    // memset) and pushes it onto the global freelist; FUN_0045cffc
+    // pops it back, so a same-arena re-alloc reuses the same record.
+    DynamicObject& o4 = a.allocFront();
+    CHECK(&o4 == &o3);                       // freelist pop (LIFO)
+    CHECK(o4.col.named && o4.arena == &a);
+    CHECK(o4.health == 0 && o4.enemyIndex == 0 && o4.field108 == nullptr);
+    CHECK(a.col.objects == &o4.col && a.col.objects->next == &o1.col);
+  }
+
+  // ---- reapUnnamed: FUN_0045cf18 corpse sweep ----------------------
+  {
+    DynamicArena a;
+    a.name = "R";
+    DynamicObject& keep = a.allocFront();
+    DynamicObject& dead1 = a.allocFront();
+    DynamicObject& dead2 = a.allocFront();
+    keep.scriptClass = "KEEP";
+    dead1.col.named = false;                 // teardown'd corpse
+    dead2.col.named = false;
+    a.reapUnnamed();
+    CHECK(a.storage.size() == 1);
+    CHECK(a.col.objects == &keep.col);
+    CHECK(keep.col.named && keep.scriptClass == "KEEP");
+    // Both corpses are memset-wiped before the freelist push. The
+    // sweep walks the list front-to-back and each free push-fronts,
+    // so the FIRST-reaped record sits on top: dead2 is list head
+    // (allocFront push-front), reaped first, dead1 pushed over it.
+    DynamicObject& r1 = a.allocFront();
+    CHECK(&r1 == &dead1);
+    CHECK(r1.scriptClass.empty() && r1.health == 0);
+    DynamicObject& r2 = a.allocFront();
+    CHECK(&r2 == &dead2);
+    CHECK(a.storage.size() == 3);
+    CHECK(a.col.objects == &r2.col);
+    CHECK(a.col.objects->next == &r1.col);
+    CHECK(a.col.objects->next->next == &keep.col);
   }
 
   // ---- floor probe consumes a spawned object's rebuilt transform --

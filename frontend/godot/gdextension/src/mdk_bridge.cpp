@@ -914,14 +914,19 @@ Array MdkBridge::get_object_snapshots() {
   if (!rt_) return out;
   // Live-set pass over EVERY arena's storage — the ID map must see
   // despawned objects even when their arena leaves the view set.
+  // +0x06==0 records are corpses pending the post-pass FUN_0045cf18
+  // sweep: the original unlinks+frees them, so they neither mark a
+  // live id nor enumerate (a script-pass kill can leave one in
+  // storage until the next frame's sweep).
   objIds_.beginPass();
   for (auto& a : rt_->arenas) {
     for (auto& up : a->dyn.storage) {
-      objIds_.markLive(up.get());
+      if (up->col.named) objIds_.markLive(up.get());
     }
   }
   for (mdk::TraversalArena* a : viewArenas_()) {
     for (auto& up : a->dyn.storage) {
+      if (!up->col.named) continue;
       out.push_back(objectSnapshot_(*a, *up));
     }
   }

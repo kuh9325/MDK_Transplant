@@ -949,10 +949,16 @@ func _run_smoke(data_root: String) -> void:
 	# ---- G3: dynamic objects — the HMO_9 XGS (real spawn record,
 	# real RuntimeModel geometry). Diagnostic re-anchor mirrors
 	# mdk-inspect's --arena/--start selftest path.
+	# OBSERVED: the XGS spawn sits at z=-293, below the arena
+	# deepFloorZ-200 kill plane (+0x44e is provably zero, so the plane
+	# is -200), and FUN_0045bac0's floor-death takes it on the first
+	# object pass — the corpse is then unlinked+freed by the post-pass
+	# FUN_0045cf18 sweep. The snapshot checks therefore run before the
+	# first stepped frame; the stepped check afterwards asserts the
+	# reap itself.
 	var ds9: Dictionary = bridge.diagnostic_start(8,
 		Vector3(-174.0, 2635.0, -293.0), 0.0)
 	_check(ds9.get("ok", false), "diagnostic_start into HMO_9")
-	_step_n({}, 3)
 	var dsp9: Dictionary = bridge.get_display_snapshot()
 	_check(int(dsp9["cur_arena"]) == 8, "display cur == HMO_9")
 	var objs: Array = bridge.get_object_snapshots()
@@ -983,13 +989,6 @@ func _run_smoke(data_root: String) -> void:
 			abs(ga.position.y - ab[2]) < 1e-3 and
 			abs(ga.position.z + ab[3]) < 1e-3,
 			"object AABB MDK->Godot")
-		# id + transform stability over idle frames.
-		_step_n({}, 5)
-		var o2: Dictionary = bridge.get_object_snapshots()[0]
-		_check(int(o2["id"]) == oid,
-			"object id stable across frames")
-		_check(Transform3D(o2["transform"]).is_equal_approx(t0),
-			"static object transform stable")
 		# Real RuntimeModel geometry — one surface per element.
 		var g: Dictionary = bridge.get_object_geometry(oid)
 		_check(not g.is_empty(), "object geometry resolved")
@@ -1036,38 +1035,70 @@ func _run_smoke(data_root: String) -> void:
 		for c in onode.get_children():
 			_check(c.visible,
 				"elem_mask=0 -> all elements visible")
+	# OBSERVED lifecycle: the XGS dies at the -200 kill plane on the
+	# first object pass and the post-pass FUN_0045cf18 sweep unlinks
+	# it — the enumeration drops to zero (no corpse is ever exposed).
+	_step_n({}, 3)
+	_check(bridge.get_object_snapshots().is_empty(),
+		"below-plane object dies and is reaped (FUN_0045cf18)")
 
 	# ---- G3: corridor door + portal crossing + arena transfer ----
 	# CHMO_2 has no MTO render block — the partner's geometry carries
 	# the view while its script-spawned XCORDOOR door presents from
 	# the corridor's own object list. Walking +y crosses the proven
-	# y=1237 portal into HMO_3 (arena 11 -> 2). OBSERVED on this
-	# route: the door stays homed on CHMO_2 — the +0x2bc
-	# self-migration needs its home arena in the update set, which
-	# the partner slot no longer provides after the crossing — so
-	# the corridor's objects simply leave the presentation view.
+	# y=1237 portal into HMO_3 (arena 11 -> 2).
+	# OBSERVED lifecycle on this route (FUN_004572ac pass order +
+	# FUN_0045bac0 kill plane + FUN_0045cf18 reap): the corridor door
+	# spawns at z=-935 — below the -200 plane — so each connector is
+	# a ~2-frame transient: the CHMO_2 door opens (attaching HMO_3)
+	# and dies; HMO_3's script then respawns a fresh connector (the
+	# dedup scan sees only named records, so the corpse cannot
+	# suppress it); that door self-migrates toward cur and dies too.
+	# The authentic enumeration contract is therefore sequential
+	# transient doors — at most one live connector per snapshot, and
+	# an id that leaves the enumeration never returns — not a single
+	# stable id.
 	var ds11: Dictionary = bridge.diagnostic_start(11,
 		Vector3(3.0, 1230.0, -929.0), 90.0)
 	_check(ds11.get("ok", false), "diagnostic_start into CHMO_2")
 	var door_id := int(-1)
 	var door_arena0 := -1
 	var door_states := {}
-	var door_id_stable := true
+	var door_ids_seen := {}
+	var door_gone := {}           # ids that have left the enumeration
+	var door_multi := false       # >1 live connector in one snapshot
+	var door_revived := false     # a vanished connector id returned
+	var live_door := -1           # connector id enumerated last frame
 	var corridor_checked := false
 	var crossed := false
 	var dspc: Dictionary = bridge.get_display_snapshot()
 	for i in 90:
 		_step_n({"actions": ACT_FORWARD}, 1)
 		dspc = bridge.get_display_snapshot()
+		var conn_id := -1
+		var conn_count := 0
 		for od in bridge.get_object_snapshots():
 			if bool(od["connector"]):
+				conn_count += 1
+				conn_id = int(od["id"])
 				if door_id < 0:
-					door_id = int(od["id"])
-				elif int(od["id"]) != door_id:
-					door_id_stable = false
+					door_id = conn_id
 				if door_arena0 < 0:
 					door_arena0 = int(od["arena"])
 				door_states[int(od["conn_state"])] = true
+				door_ids_seen[conn_id] = true
+		if conn_count > 1:
+			door_multi = true
+		if conn_count == 1:
+			if conn_id != live_door:
+				if live_door >= 0:
+					door_gone[live_door] = true
+				if door_gone.has(conn_id):
+					door_revived = true
+				live_door = conn_id
+		elif live_door >= 0:
+			door_gone[live_door] = true
+			live_door = -1
 		if int(dspc["cur_arena"]) == 11 and not corridor_checked:
 			corridor_checked = true
 			_check(int(dspc["primary"]) != 11,
@@ -1077,19 +1108,22 @@ func _run_smoke(data_root: String) -> void:
 			break
 	_check(door_id >= 0, "connector door enumerated (XCORDOOR)")
 	_check(door_arena0 == 11, "door starts on corridor list")
-	_check(door_id_stable, "door id stable while enumerated")
+	_check(not door_multi, "at most one live connector per snapshot")
+	_check(not door_revived, "dead connector id never re-enumerates")
 	_check(door_states.size() >= 2, "door conn_state transitions")
 	if crossed:
 		_check(int(dspc["portals_crossed"]) >= 1,
 			"portal crossing counted")
 		# Post-crossing view: cur==HMO_3 and CHMO_2 is no longer the
 		# active partner, so the corridor's object list leaves the
-		# presentation set — the door must not alias onto a new id.
+		# presentation set — no seen door id may alias onto another
+		# arena's object.
 		for od in bridge.get_object_snapshots():
-			_check(int(od["id"]) != door_id or int(od["arena"]) == 11,
+			_check(not door_ids_seen.has(int(od["id"])) or
+				int(od["arena"]) == 11,
 				"door id never aliases another arena")
-		print("  note: object_migrations=%d (door stays homed on CHMO_2)" %
-			int(dspc["object_migrations"]))
+		print("  note: object_migrations=%d door_ids=%d (sequential transients)" %
+			[int(dspc["object_migrations"]), door_ids_seen.size()])
 	else:
 		_check(false, "player crossed CHMO_2 -> HMO_3 portal")
 	# Object presentation survives the arena hops without dupes.

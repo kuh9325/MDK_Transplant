@@ -344,7 +344,11 @@ view set** — the same `{cur} + active partner` arenas that drive the
 display set, so a geometry-less corridor's objects (e.g. the
 CHMO_2 connector door) still enumerate while its partner's geometry
 shows. Objects are NOT enumerated level-wide; resident but
-out-of-view arenas contribute nothing.
+out-of-view arenas contribute nothing. Only named (`+0x06 != 0`)
+records enumerate: a teardown corpse pending the arena's post-pass
+`FUN_0045cf18` sweep (`DynamicArena::reapUnnamed`) is already inert
+and never reaches the snapshot, matching the original where the
+sweep unlinks+frees it to the `0x540ed0` freelist the same frame.
 
 ### Opaque object IDs (`mdk_objid.h`)
 
@@ -560,7 +564,8 @@ drawn.
 
 ## Deterministic smoke
 
-`--smoke` asserts (61 checks). G1: extension load, LEVEL3 load,
+`--smoke` asserts (119 checks as of the lifecycle fix; the count
+grows with per-element visibility checks). G1: extension load, LEVEL3 load,
 arena count, HMO_1 counts (verts 234 / polys 399 / names 20 /
 resolved 20 / textured 193 / pen 203 / unresolved 3 / submitted 296
 / textures 11), array alignment, atlas sizing, palette size,
@@ -601,17 +606,22 @@ G3 additions: display snapshot (cur/partner names + indices,
 partner active, portal fields), multi-arena `ArenaRoot` nodes and
 digest-driven rebuild, the real HMO_9 `XGS` object (enemy index 30,
 spawn id 9, `model`=`XG_BOD` vs `enemy_name`=`XGS`), object
-transform/AABB conversion goldens, opaque-id stability across idle
-frames, real geometry resolution (`elem_count` 25, per-element
-meshes), `geom_key` consistency, `Object_<id>` node creation and
-per-element child count, stale/unknown id → empty geometry, F2
-debug wire/tag creation and cleanup, element-mask visibility, the
-CHMO_2→HMO_3 corridor run (connector door enumerated on the
+transform/AABB conversion goldens, real geometry resolution
+(`elem_count` 25, per-element meshes), `geom_key` consistency,
+`Object_<id>` node creation and per-element child count,
+stale/unknown id → empty geometry, F2 debug wire/tag creation and
+cleanup, element-mask visibility, the below-plane reap (the XGS
+sits under the -200 kill plane and drops out of the enumeration on
+the first stepped frame — OBSERVED `FUN_0045bac0`/`FUN_0045cf18`),
+the CHMO_2→HMO_3 corridor run (connector door enumerated on the
 geometry-less corridor, door `conn_state` transition, portal
-crossing counted, door id stable, no duplicate ids, door leaves
-the view set when its home arena does — reported, not forced), and
-`object_migrations` reported as a counter (0 on that route — the
-door stays homed on CHMO_2 in core).
+crossing counted, at most one live connector per snapshot, a dead
+connector's id never re-enumerates, no duplicate ids), and
+`object_migrations` reported as a counter. OBSERVED on that route:
+each connector is a ~2-frame kill-plane transient — the CHMO_2
+door attaches HMO_3 and dies, HMO_3's script respawns a second
+door that self-migrates into CHMO_2 and dies too — so the id set
+is sequential (`door_ids=2`), not a single stable id.
 
 Cross-level: `--smoke` on LEVEL6/LEVEL8 runs the generic path —
 object enumeration census, per-object geometry resolution, node

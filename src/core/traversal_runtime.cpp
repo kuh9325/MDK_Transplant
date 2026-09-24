@@ -246,11 +246,15 @@ void traversalAttachSideEffects(TraversalRuntime& rt,
   rt.cs.carrierValid = 1;
 }
 
-// FUN_00432980 tail — object migration from stale peer arenas:
-// for each type-6 peer of `a`, objects listed there whose +0x60
-// home is `a` are transferred (pendingArena path). Dormant in the
-// bounded runtime — no script moves objects across lists — but
-// the mechanism is the original's.
+// FUN_00432980 tail — connector pull-in from type-6 peer arenas
+// (OBSERVED 0x432b01..0x432b79): for each type-6 record of `a`, the
+// peer arena's +0x68 chain is scanned for a named connector
+// (+0x06!=0, +0x14a&0x10) whose home +0x60 OR destination +0x302 is
+// `a`; a match takes +0x2bc <- `a` and transfers via FUN_004574d0.
+// Peers equal to c48 are skipped; a peer equal to ca4 is skipped
+// only when ca8 is set (the port's call sites always run this with
+// `a` freshly bound as partner, so peer==partner is covered by the
+// peer==`a` skip).
 void traversalMigrateInto(TraversalRuntime& rt, TraversalArena& a) {
   if (!a.rec) return;
   for (const DtiSubRecord& r : a.rec->subRecords) {
@@ -266,7 +270,7 @@ void traversalMigrateInto(TraversalRuntime& rt, TraversalArena& a) {
       DynamicObject& o = **it;
       auto next = std::next(it);
       if (o.col.named && (o.col.flags14a & 0x10) &&
-          o.arena == &a.dyn) {
+          (o.arena == &a.dyn || o.connDest == &a)) {
         o.pendingArena = &a.dyn;
         peer.dyn.transfer(o, a.dyn);
         ++rt.seams.objectMigrations;
@@ -1186,16 +1190,18 @@ TraversalFrameResult stepTraversalRuntime(
     objEnv.hasContactNormal = (rt.lastContactPoly != nullptr);
     objEnv.diagLog = &rt.scriptDiag;
 
-    TraversalArena* updateArenas[2] = {cur, nullptr};
-    int updateCount = 1;
-    if (rt.partnerActive && rt.partner) {
-      updateArenas[1] = rt.partner;
-      updateCount = 2;
-    }
-    for (int ai = 0; ai < updateCount; ++ai) {
-      DynamicArena& da = updateArenas[ai]->dyn;
-      TraversalArena* otherArena =
-          (updateCount == 2) ? updateArenas[1 - ai] : nullptr;
+    // FUN_00436100 (OBSERVED 0x4362a8..0x4362e6): the object pass and
+    // the FUN_0045cf18 corpse sweep run per arena, cur first, then the
+    // partner — with the ca8/ca4 gate evaluated AT the partner call
+    // site, so a partner attached during cur's pass takes its first
+    // object pass this same frame.
+    for (int ai = 0; ai < 2; ++ai) {
+      TraversalArena* ua = cur;
+      if (ai == 1) {
+        if (!rt.partnerActive || rt.partner == nullptr) break;
+        ua = rt.partner;
+      }
+      DynamicArena& da = ua->dyn;
       // FUN_004572ac — the linked-list walk reads the next link BEFORE
       // the body (0x4572c1), so a mid-frame transfer/teardown can't
       // corrupt iteration; the +0x06 head-scan skips dead objects.
@@ -1239,6 +1245,14 @@ TraversalFrameResult stepTraversalRuntime(
         objectSubtypeUpdate(rt, o, da, dt);          // FUN_004533d4
         if (!o.col.named) continue;                  // 0x45736b
         objectGravity(rt, o, da, dt);                // FUN_0045b9fc
+        // The +0x14a&8 retry target is the live partner global in the
+        // original (FUN_0045bac0 reads 0x540ca4 per object) — a
+        // partner attached earlier in this same pass is visible here.
+        TraversalArena* otherArena =
+            (ai == 0)
+                ? ((rt.partnerActive && rt.partner) ? rt.partner
+                                                    : nullptr)
+                : cur;
         objectCollide(rt, o, da, otherArena, dt);    // FUN_0045bac0
         if (!o.col.named) continue;                  // 0x457383
         // 0x4574a6 — enemy dispatch (+0x149&0x10) REPLACES the mover
@@ -1264,6 +1278,13 @@ TraversalFrameResult stepTraversalRuntime(
       // of EACH arena update (0x4572cd), so partner-active frames tick
       // it twice. OBSERVED quirk, preserved.
       playerShotPoolTick(rt, timing.frameStep, dt, timing.smoothed);
+      // FUN_0045cf18 — the per-arena corpse sweep runs after the
+      // object pass (OBSERVED 0x4362b2 cur / 0x4362e6 partner) and
+      // before the script pass: teardown'd records leave the +0x68
+      // list and their storage here, so the script-side spawn dedup
+      // sees live objects only and a same-frame respawn reuses the
+      // freed record (freelist pop in FUN_0045cffc/allocFront).
+      da.reapUnnamed();
     }
   }
 

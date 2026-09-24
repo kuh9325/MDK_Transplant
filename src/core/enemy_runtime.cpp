@@ -6,6 +6,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <new>
 
 #include "core/collision_query.h"
 #include "core/dynamic_objects.h"
@@ -632,39 +633,25 @@ int objectTouchScan(TraversalRuntime& rt, DynamicObject& o,
 // ---------------------------------------------------------------------------
 
 void objectTeardownNow(TraversalRuntime& rt, DynamicObject& o) {
-  // OBSERVED: memset except +0x00 (list link) and +0x60 (arena) —
-  // +0x06 named clears, so every live gate (named/model/health) drops.
-  // The port preserves the collision-node identity + arena membership
-  // and wipes the gameplay record.
+  // OBSERVED: memset(obj, 0, 0x32e) except +0x00 (list link) and
+  // +0x60 (arena), which are saved/restored around the wipe — the
+  // record goes fully inert in place: +0x06 named clears (every live
+  // gate drops) and the connector/mover/script state vanishes too.
+  // The port's equivalent is an in-place reconstruct keeping exactly
+  // the collision-list link and the arena membership; the corpse is
+  // unlinked+freed by the arena's post-pass FUN_0045cf18 sweep
+  // (DynamicArena::reapUnnamed).
   rt.seams.objectTeardownCalls++;
   if (rt.fieldB85c == &o) rt.fieldB85c = nullptr;   // view-anchor clear
   if (rt.eventTimerObj == &o) rt.eventTimerObj = nullptr;
   if (rt.cmdObj5c == &o) rt.cmdObj5c = nullptr;
   if (rt.cmdObj60 == &o) rt.cmdObj60 = nullptr;
-  surfaceRecordsDestroy(o.surface);
-  o.surface = SurfaceObjectState{};
-  const bool keepNamedList = true;
-  (void)keepNamedList;
-  o.col.named = false;
-  o.col.model = nullptr;
-  o.health = 0;
-  o.field108 = nullptr;
-  o.field230 = nullptr;
-  o.field110 = nullptr;
-  o.fieldEC = nullptr;
-  o.field138 = nullptr;
-  o.field278 = nullptr;
-  o.field158 = nullptr;
-  o.moverChild = nullptr;                  // +0x312 (mover union)
-  o.field15c.clear();
-  o.field11e = 0;
-  o.field22c = 0.0f;
-  o.pendingArena = nullptr;
-  o.field2b0 = nullptr;
-  o.field2b4 = nullptr;
-  o.animRec = nullptr;
-  o.animRecNear = nullptr;
-  o.animRecFar = nullptr;
+  const CollisionObject* next = o.col.next;
+  DynamicArena* arena = o.arena;
+  o.~DynamicObject();
+  new (&o) DynamicObject();
+  o.col.next = next;
+  o.arena = arena;
 }
 
 // ---------------------------------------------------------------------------
