@@ -17391,6 +17391,321 @@ void test_progression_campaign() {
   fs::remove_all(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 14B — .SAV envelope/packet reader + header-only writer
+// ---------------------------------------------------------------------------
+
+void test_save_game() {
+  namespace fs = std::filesystem;
+  using mdk::SaveError;
+  using mdk::SaveGame;
+  using mdk::SaveWriteInput;
+
+  // --- registry census (OBSERVED 0x49b2ac) ---
+  {
+    int n = 0;
+    const auto* t = mdk::savePacketTable(n);
+    CHECK(n == 16);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('S', 'A', 'V', 'E'))->size == 2);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('S', 'E', 'N', 'D'))->size == 0);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('G', 'A', 'M', 'E'))->size == 24);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('T', 'H', 'M', 'B'))->size ==
+          3648);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('P', 'L', 'A', 'Y'))->size ==
+          239);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('D', 'A', 'M', 'P'))->size ==
+          724);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('A', 'R', 'E', 'N'))->size ==
+          1126);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('A', 'L', 'I', 'E'))->size ==
+          814);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('B', 'U', 'L', 'L'))->size ==
+          252);
+    CHECK(mdk::savePacketSpec(mdk::saveTag('X', 'X', 'X', 'X')) ==
+          nullptr);
+    (void)t;
+  }
+
+  // --- header-only write -> parse round trip ---
+  {
+    SaveWriteInput in;
+    in.modeField = 3;
+    in.levelId = 2;
+    in.health = 0;      // floors to 100 in the writer
+    in.deathCount = 7;
+    in.field54163b = 5;
+    in.seed = 0x1234;
+    const auto bytes = mdk::saveGameWriteHeaderOnly(in);
+    CHECK(!bytes.empty());
+
+    SaveGame sg;
+    CHECK(mdk::saveGameParse(bytes.data(), bytes.size(), sg) ==
+          SaveError::kOk);
+    CHECK(sg.fileSize == bytes.size());
+    CHECK(sg.seed == 0x1234);
+    CHECK(sg.headerOnly);
+    CHECK(sg.packets.size() == 4);  // SAVE THMB GAME SEND
+    CHECK(sg.packets[0].tag == mdk::saveTag('S', 'A', 'V', 'E'));
+    CHECK(sg.packets[1].tag == mdk::saveTag('T', 'H', 'M', 'B'));
+    CHECK(sg.packets[1].payload.size() == 3648);
+    CHECK(sg.packets[2].tag == mdk::saveTag('G', 'A', 'M', 'E'));
+    CHECK(sg.packets[3].tag == mdk::saveTag('S', 'E', 'N', 'D'));
+    CHECK(sg.game.modeField == 3 && sg.game.mode() == 3);
+    CHECK(sg.game.levelId == 2);
+    CHECK(sg.game.health == 100);   // 0 < 0x65 -> floored
+    CHECK(sg.game.deathCount == 7);
+    CHECK(sg.game.field54163b == 5);
+    CHECK(sg.game.field8 == 0);
+
+    // health >= 101 is stored verbatim (writer floor is one-sided).
+    in.health = 150;
+    in.modeField = 6;
+    const auto b2 = mdk::saveGameWriteHeaderOnly(in);
+    SaveGame sg2;
+    CHECK(mdk::saveGameParse(b2.data(), b2.size(), sg2) ==
+          SaveError::kOk);
+    CHECK(sg2.game.health == 150 && sg2.game.modeField == 6 &&
+          sg2.game.mode() == 6);
+
+    // mode field decode: full-save marker 1003 -> mode 3, full shape.
+    CHECK((mdk::SaveGamePacket{1003, 0, 0, 100, 0, 0}.mode() == 3));
+    CHECK((mdk::SaveGamePacket{1003, 0, 0, 100, 0, 0}.full()));
+    CHECK((mdk::SaveGamePacket{6, 0, 0, 100, 0, 0}.mode() == 6));
+  }
+
+  // --- corruption ladder ---
+  {
+    SaveWriteInput in;
+    in.levelId = 1;
+    in.seed = 0xBEEF;
+    auto bytes = mdk::saveGameWriteHeaderOnly(in);
+    SaveGame sg;
+
+    // bad size field
+    auto bad = bytes;
+    bad[0] = std::byte(0xff);
+    CHECK(mdk::saveGameParse(bad.data(), bad.size(), sg) ==
+          SaveError::kBadSizeField);
+    // checksum mismatch (flip a stream byte)
+    bad = bytes;
+    bad[20] ^= std::byte(0xff);
+    CHECK(mdk::saveGameParse(bad.data(), bad.size(), sg) ==
+          SaveError::kChecksumMismatch);
+    // bad SAVE tag (must keep checksum valid to reach the tag check)
+    bad = bytes;
+    bad[8] ^= std::byte(1);
+    // recompute checksum over the corrupted stream
+    std::uint32_t sum = 0;
+    for (std::size_t i = 8; i < bad.size(); ++i)
+      sum += std::uint8_t(bad[i]);
+    bad[4] = std::byte(sum);
+    bad[5] = std::byte(sum >> 8);
+    bad[6] = std::byte(sum >> 16);
+    bad[7] = std::byte(sum >> 24);
+    CHECK(mdk::saveGameParse(bad.data(), bad.size(), sg) ==
+          SaveError::kMissingSaveTag);
+    // truncated file
+    CHECK(mdk::saveGameParse(bytes.data(), bytes.size() - 4, sg) ==
+          SaveError::kBadSizeField);
+    std::vector<std::byte> tiny(10);
+    CHECK(mdk::saveGameParse(tiny.data(), tiny.size(), sg) ==
+          SaveError::kReadFail);
+    // invalid level id / health — written then rejected by the
+    // FUN_004278c0 validation.
+    in.levelId = 6;
+    const auto badId = mdk::saveGameWriteHeaderOnly(in);
+    CHECK(mdk::saveGameParse(badId.data(), badId.size(), sg) ==
+          SaveError::kBadLevelId);
+    in.levelId = 1;
+    in.health = 200;
+    auto h200 = mdk::saveGameWriteHeaderOnly(in);
+    CHECK(mdk::saveGameParse(h200.data(), h200.size(), sg) ==
+          SaveError::kBadHealth);
+  }
+
+  // --- SaveStore: LASTGAME lifecycle ---
+  {
+    const fs::path tmp = fs::temp_directory_path() / "mdk_test_saves";
+    fs::remove_all(tmp);
+    mdk::SaveStore store(tmp);
+    CHECK(!store.exists("LASTGAME"));
+    SaveWriteInput in;
+    in.modeField = 3;
+    in.levelId = 4;
+    in.health = 0;
+    in.deathCount = 2;
+    in.seed = 0x0042;
+    CHECK(store.writeLastgame(in));
+    CHECK(store.exists("LASTGAME"));
+    SaveGame sg;
+    CHECK(store.loadLastgame(sg) == SaveError::kOk);
+    CHECK(sg.game.levelId == 4 && sg.game.health == 100 &&
+          sg.game.deathCount == 2);
+    CHECK(store.deleteLastgame());
+    CHECK(!store.exists("LASTGAME"));
+    fs::remove_all(tmp);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14B — traversal death -> LASTGAME -> continue golden
+// ---------------------------------------------------------------------------
+
+void test_progression_death_restore() {
+  namespace fs = std::filesystem;
+  using mdk::ProgressionError;
+  using mdk::ProgressionSession;
+  using mdk::SaveError;
+  using mdk::TraversalRuntime;
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_death";
+  fs::remove_all(tmp);
+  for (int dir : {7, 6, 3, 4, 8, 5})
+    makeSyntheticLevel(tmp, dir, 1.0f, 2.0f, 3.0f, 0.0f);
+  const fs::path saveDir = tmp / "SAVES";
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+  mdk::SaveStore store(saveDir);
+
+  // --- death loop: die in level 2 traversal -> LASTGAME -> continue ---
+  {
+    ProgressionSession s;
+    s.mode = 3;
+    s.levelId = 2;
+    s.health = 40;
+    s.ammo = {10, 20, 30, 40, 50, 60};
+
+    // alive -> no death route
+    CHECK(mdk::progressionStepDeath(s, 0.033f) ==
+          ProgressionError::kNoDeath);
+    // god flag suppresses death entirely (0x541510).
+    s.health = 0;
+    s.godMode = true;
+    CHECK(mdk::progressionStepDeath(s, 0.033f) ==
+          ProgressionError::kNoDeath);
+    s.godMode = false;
+
+    // first dead frame: the 0x3ea state posts.
+    CHECK(mdk::progressionStepDeath(s, 0.033f) ==
+          ProgressionError::kStageRunning);
+    CHECK(s.deathPhase == 1 && s.deathFade == 0.0f && s.mode == 3);
+
+    // ~1.0s of fade (rint(0.033*100)=3 per frame -> >255 at ~86 frames).
+    int frames = 0;
+    while (mdk::progressionStepDeath(s, 0.033f) ==
+           ProgressionError::kStageRunning)
+      ++frames;
+    CHECK(frames > 80 && frames < 95);  // the >255 accumulator bound
+    CHECK(s.mode == 0);                 // FUN_0041d85c frontend
+    CHECK(s.levelId == 2);              // death never advances levelId
+    CHECK(s.deathCount == 1);           // ++0x541637
+    CHECK(s.lastgameArmed);
+    CHECK(s.lastgame.modeField == 3 && s.lastgame.levelId == 2 &&
+          s.lastgame.health == 100 && s.lastgame.deathCount == 1);
+
+    // the checkpoint file: header-only LASTGAME.SAV semantics.
+    mdk::SaveWriteInput wr;
+    wr.modeField = s.lastgame.modeField;
+    wr.levelId = s.lastgame.levelId;
+    wr.health = s.health;   // live health — the writer floors <0x65
+    wr.deathCount = s.lastgame.deathCount;
+    wr.field54163b = s.lastgame.field54163b;
+    wr.seed = 0xABCD;
+    CHECK(store.writeLastgame(wr));
+    mdk::SaveGame onDisk;
+    CHECK(store.loadLastgame(onDisk) == SaveError::kOk);
+    CHECK(onDisk.game.modeField == 3 && onDisk.game.levelId == 2 &&
+          onDisk.game.health == 100);
+    // dead session keeps health 0 (the teardown samples it, not the
+    // restored file — the file's 100 lands only on continue).
+    CHECK(s.health == 0);
+
+    // continue: FUN_00427f94 route — mode 3 restore, health 100,
+    // same levelId, ammo carried (not in the header-only save).
+    CHECK(mdk::progressionContinue(s) == ProgressionError::kOk);
+    CHECK(s.mode == 3 && s.levelId == 2 && s.health == 100);
+    CHECK(s.deathCount == 1);
+    CHECK(s.ammo[0] == 10 && s.ammo[5] == 60);  // session state carries
+
+    // second continue without a checkpoint is rejected.
+    CHECK(mdk::progressionContinue(s) == ProgressionError::kNoCheckpoint);
+
+    // restored traversal loads the same level fresh (s0 spawn) and
+    // the first frame does not reset the restored globals.
+    TraversalRuntime trav;
+    CHECK(mdk::progressionLoadTraversalForCurrentLevel(*root, s, trav,
+                                                     &err) ==
+          ProgressionError::kOk);
+    CHECK(trav.cur != nullptr && trav.cur->name == "A3_0");
+    CHECK(trav.fieldHealth == 100);
+    CHECK(trav.ammo[0] == 10);
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const auto fr = mdk::stepTraversalRuntime(trav,
+                                              mdk::RawGameplayInput{},
+                                              bindings, timing);
+    CHECK(fr.frame == 0);
+    CHECK(trav.fieldHealth == 100 && trav.cur != nullptr);
+  }
+
+  // --- mode-6 checkpoint: briefing save restores to briefing ---
+  {
+    ProgressionSession s;
+    s.mode = 0;
+    s.lastgame = mdk::SaveGamePacket{};
+    s.lastgame.modeField = 6;
+    s.lastgame.levelId = 1;
+    s.lastgame.health = 150;
+    s.lastgameArmed = true;
+    CHECK(mdk::progressionContinue(s) == ProgressionError::kOk);
+    CHECK(s.mode == 6 && s.loaderSub == 3 && s.levelId == 1 &&
+          s.health == 150);
+  }
+
+  // --- quit path: LASTGAME deleted on clean exit ---
+  {
+    ProgressionSession s;
+    s.lastgameArmed = true;
+    mdk::progressionDeleteCheckpoint(s);
+    CHECK(!s.lastgameArmed);
+    CHECK(mdk::progressionContinue(s) == ProgressionError::kNoCheckpoint);
+  }
+
+  // --- manual load of a different level: apply packet directly ---
+  {
+    ProgressionSession s;
+    s.mode = 3;
+    s.levelId = 0;
+    s.health = 50;
+    mdk::SaveGamePacket pkt{};
+    pkt.modeField = 3;
+    pkt.levelId = 4;      // a LEVEL8 save mid-campaign
+    pkt.health = 120;
+    pkt.deathCount = 3;
+    pkt.field54163b = 9;
+    CHECK(mdk::progressionApplyGamePacket(s, pkt) == ProgressionError::kOk);
+    CHECK(s.mode == 3 && s.levelId == 4 && s.health == 120 &&
+          s.deathCount == 3 && s.field54163b == 9);
+    TraversalRuntime trav;
+    CHECK(mdk::progressionLoadTraversalForCurrentLevel(*root, s, trav,
+                                                     &err) ==
+          ProgressionError::kOk);
+    CHECK(trav.cur != nullptr && trav.cur->name == "A8_0");
+  }
+
+  // --- death in a non-traversal mode is rejected ---
+  {
+    ProgressionSession s;
+    s.mode = 5;
+    s.health = 0;
+    CHECK(mdk::progressionStepDeath(s, 0.033f) ==
+          ProgressionError::kBadMode);
+  }
+
+  fs::remove_all(tmp);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -17465,6 +17780,8 @@ int main() {
   test_freefall_freelist();
   test_progression_handoff();
   test_progression_campaign();
+  test_save_game();
+  test_progression_death_restore();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

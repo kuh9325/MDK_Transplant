@@ -4724,3 +4724,87 @@ Remaining seams (explicit, bounded): save-packet semantics
 inventory block, score-entry overlay internals (`FUN_00422bc0`
 arm is modelled as a presentation seam), mode-5 statistics content,
 and boss logic (stops at the script completion opcodes).
+
+# Phase 14B — Save / Death-Restore
+
+§175+. `.SAV` format, death checkpoint, continue — full reconstruction
+in `docs/reverse-engineering/SAVE_FORMAT.md`; this section carries only
+the session-flow summary and the native mapping.
+
+## 175. Save stream model (OBSERVED — all 5 local real saves validate)
+
+`{u32 fileSize, u32 checksum=Σraw[8..)}` envelope; `{tag,u32 size,payload}`
+packets; clear `SAVE` packet carries the u16 cipher seed (file offset
+0x10), rolling XOR `b^=key; key+=delta` armed over everything after it.
+Registry `0x49b2ac` — 16 tags. Header-only shape `SAVE THMB GAME SEND`
+(3714 bytes); full shape appends `MORE PLAY DAMP CAME (AREN ALIE* FAND*)*
+BULL×3`. GAME 24B = `{modeField, levelId, uninit, health, deathCount,
+field54163b}`; `modeField>=1000` marks full saves (recover `mode =
+(field+0x18)&0xff`); writer floors header-only health `<0x65`→100.
+Skill `0x54147a` and CRT RNG state are NOT persisted.
+
+## 176. Traversal death route (OBSERVED — FUN_00463608 @0x464070)
+
+`541554==0 && 541510==0` (god-mode flag suppresses) → `0x3ea` death
+state → per-frame `0x540dac += rint(0x49b6f4·100.0)` → `>255`:
+`++0x541637`, thumbnail → `0x49f010`, `SAVES\LASTGAME.SAV` written
+header-only via `FUN_00427ed4(…, EBX=1)`, traversal teardown
+(`FUN_0046ca84`/`FUN_004371bc`), `FUN_0041d85c` → mode-0 frontend.
+Level id never advances. Clean quit deletes the checkpoint
+(`0x401174`→`DeleteFileA`); Continue (`FUN_0041dc90`→`FUN_00427f94`,
+exists-gated `FUN_00428290`) restores `mode=3`, the saved levelId, and
+health 100, loading the level fresh at its s0 record.
+
+The `0x5414d0`/`FUN_004090fc` demo-set restore latch is **dormant in
+BUILD_A** — `0x5414c0`/`0x5414c4`/`0x49b284`/`0x49b288` have no writers;
+the latch's only writers are the `KEYS`-stream exhaustion edge and the
+death-during-demo edge, both unreachable without a demo stream.
+
+## 177. Manual save family (OBSERVED)
+
+`FUN_00422bc0(EAX)` arms the save dialog; `EAX=0` = traversal quick-save
+(`0x54bdb4=0` → `FUN_00427ed4` full) — name entry sub-mode 8,
+`FUN_00422dec` state machine, `FUN_00422d84` writes `SAVES\<name>.SAV`;
+`EAX=1` = briefing prompt (header-only, default name `%d`=levelId+1 —
+matches the real `2.SAV`/`3.SAV` header-only files). Load path:
+`FUN_004202cc` slot list → `FUN_004206d0` dialog (thumb preview
+`FUN_00428144`) → `FUN_0042056c` teardown → `FUN_00427f94`.
+
+## 178. Native implementation
+
+`src/core/save_game.{h,cpp}` — `saveParse` (envelope validate, cipher,
+registry-checked packet walk, GAME decode + `FUN_004278c0` levelId/health
+gates, typed MORE/PLAY/DAMP/CAME/AREN views), `saveWriteHeader`
+(SAVE+THMB+GAME+SEND with the same envelope/cipher — LASTGAME/briefing
+shape), `SaveStore` (SAVES dir, `LASTGAME.SAV` exists/load/delete).
+`ProgressionSession` gains `deathCount`/`field54163b`/`godMode`/
+`deathPhase`/`deathFade`/`lastgameArmed`/`lastgame` and
+`progressionStepDeath` (the `0x464070` edge: posts `0x3ea`, advances
+the fade at `rint(dt·100)`, on `>255` arms the LASTGAME payload +
+increments `deathCount` + drops to frontend), `progressionContinue`
+(the `FUN_0041dc90` route: apply GAME, return traversal at the same
+level, health 100), `progressionApplyGamePacket`, and
+`progressionDeleteCheckpoint` (quit edge).
+
+`mdk-inspect --save-info <file>` prints envelope/seed/shape/packet
+census + GAME/PLAY/DAMP/CAME/AREN field digests; `--save-roundtrip`
+re-emits any real save through the header-only writer and reports the
+byte/packet delta (all five local saves: `OK`, 3714-byte output).
+
+## 179. Phase 14B validation
+
+`mdk_tests::test_save_game` (registry census, envelope round-trip,
+corruption ladder — bad size/checksum/tag/levelId/health, SaveStore
+lifecycle, LASTGAME write/load/delete) +
+`test_progression_death_restore` (alive guard, god-mode suppression,
+`0x3ea` entry, ~86-frame fade at `dt=0.033`, frontend mode, level-id
+preservation, `deathCount` increment, header-only lastgame fields,
+continue restore → traversal mode 3 health 100 same level).
+4825 checks, 0 failures total.
+
+**Status: DEATH→LASTGAME→CONTINUE + SAVE ENVELOPE — CLOSED FOR
+BUILD_A.** Bounded open seam: full-save writing (AREN/ALIE raw-record
+emission) and full-save world application through `FUN_00427218`
+(mid-arena position/object/script-PC restore) — the reader accepts and
+exposes all full packets, but the traversal runtime does not yet
+consume DAMP/CAME/AREN/ALIE/FAND/BULL on load.

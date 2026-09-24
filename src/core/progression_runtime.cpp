@@ -6,6 +6,7 @@
 
 #include "core/data_root.h"
 
+#include <cmath>
 #include <cstdio>
 
 namespace mdk {
@@ -42,6 +43,8 @@ const char* progressionErrorName(ProgressionError e) {
     case ProgressionError::kAlreadyEnded: return "already-ended";
     case ProgressionError::kStageRunning: return "stage-running";
     case ProgressionError::kTerminalConsumed: return "terminal-consumed";
+    case ProgressionError::kNoCheckpoint: return "no-checkpoint";
+    case ProgressionError::kNoDeath: return "no-death";
   }
   return "?";
 }
@@ -363,6 +366,94 @@ ProgressionError progressionLoadTraversalForCurrentLevel(
   trav.rngState = sess.rng;
   trav.ammo = sess.ammo;
   return ProgressionError::kOk;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14B — traversal death → LASTGAME → continue
+// ---------------------------------------------------------------------------
+
+ProgressionError progressionStepDeath(ProgressionSession& sess,
+                                      float frameSeconds) {
+  if (sess.mode != 3) return ProgressionError::kBadMode;
+  // FUN_00463608 death gate: 0x541510 != 0 suppresses the route
+  // entirely; 0x541554 == 0 is the trigger.
+  if (sess.godMode || sess.health > 0) return ProgressionError::kNoDeath;
+
+  if (sess.deathPhase == 0) {
+    // The dispatcher's event tail latches 0x540cac = 0x3ea — the
+    // death-fade state — on the first dead frame.
+    sess.deathPhase = 1;
+    sess.deathFade = 0.0f;
+    return ProgressionError::kStageRunning;
+  }
+
+  // 0x46388a: 0x540dac = trunc-FFRd(0x540dac + 0x49b6f4 * 100.0f) —
+  // the 0x4986ec constant; FISTP rounds to nearest under the loop's
+  // control word (0x40104a..).
+  sess.deathFade += std::lrintf(frameSeconds * 100.0f);
+  if (sess.deathFade <= 255.0f) return ProgressionError::kStageRunning;
+
+  // 0x464070 block: fade complete — reset the accumulator, ++0x541637,
+  // thumbnail capture (seam), FUN_00427ed4 writes the header-only
+  // LASTGAME.SAV (GAME mode field = 3 since 541492 is 3 here), then
+  // FUN_0046ca84 + FUN_004371bc teardown + FUN_0041d85c frontend.
+  sess.deathFade = 0.0f;
+  ++sess.deathCount;
+  sess.lastgame = SaveGamePacket{};
+  sess.lastgame.modeField = 3;
+  sess.lastgame.levelId = sess.levelId;
+  // The GAME writer's floor: (541554 < 0x65) → 100 (the stored value,
+  // not the live global — health stays 0 through the teardown).
+  sess.lastgame.health = sess.health < 101 ? 100 : sess.health;
+  sess.lastgame.deathCount = sess.deathCount;
+  sess.lastgame.field54163b = sess.field54163b;
+  sess.lastgameArmed = true;
+  sess.deathPhase = 0;
+  sess.mode = 0;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionApplyGamePacket(ProgressionSession& sess,
+                                            const SaveGamePacket& pkt) {
+  // FUN_004278c0's five writes — the packet was already validated
+  // (levelId [0,6), health (0,150]) by saveGameParse, matching the
+  // original's own acceptance ladder.
+  sess.levelId = pkt.levelId;
+  sess.health = pkt.health;
+  sess.deathCount = pkt.deathCount;
+  sess.field54163b = pkt.field54163b;
+  const int mode = pkt.mode();
+  if (mode == 3) {
+    // Header-only traversal restore — the caller runs
+    // progressionLoadTraversalForCurrentLevel for the saved levelId
+    // (FUN_0041b7b4 + FUN_004346e8 — fresh s0 spawn).
+    sess.mode = 3;
+  } else if (mode == 6) {
+    // FUN_00429200 — briefing re-entry for the saved level. The
+    // first state-3 frame's FUN_00429cb4 init floors health to 100
+    // (the same rule progressionStartCampaign applies — see its
+    // "any direct sub-3 entry" note).
+    sess.mode = 6;
+    sess.loaderSub = 3;
+    if (sess.health < 100) sess.health = 100;
+  } else {
+    // 0x428088 else-branch — FUN_0041d85c frontend.
+    sess.mode = 0;
+  }
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionContinue(ProgressionSession& sess) {
+  // FUN_0041dc90 gates on FUN_00428290's file-exists check; the
+  // session equivalent is the armed record.
+  if (!sess.lastgameArmed) return ProgressionError::kNoCheckpoint;
+  sess.lastgameArmed = false;  // consumed — the file stays on disk
+  return progressionApplyGamePacket(sess, sess.lastgame);
+}
+
+void progressionDeleteCheckpoint(ProgressionSession& sess) {
+  // 0x401174: SAVES\LASTGAME.SAV → DeleteFileA on the quit edge.
+  sess.lastgameArmed = false;
 }
 
 const CampaignLevelInfo* progressionCampaignTable(int& count) {

@@ -102,6 +102,7 @@
 #define MDK_CORE_PROGRESSION_RUNTIME_H
 
 #include "core/freefall_runtime.h"
+#include "core/save_game.h"
 #include "core/traversal_runtime.h"
 
 #include <array>
@@ -141,6 +142,24 @@ struct ProgressionSession {
   int loaderSub = 0;       // 0x54bef8 — mode-6 sub-state (0 when not in 6)
   bool terminalDone = false; // mode-8 finish consumed → frontend reached
   int transitionCount = 0;   // diagnostic: level advances applied
+
+  // Phase 14B — traversal death / checkpoint restore. The original
+  // death route (FUN_00463608): while 0x540cac == 0x3ea the
+  // 0x540dac accumulator adds rint(frameSeconds*100) per frame; at
+  // >255 the engine increments 0x541637, writes SAVES\LASTGAME.SAV
+  // (header-only — GAME mode field 3), tears down traversal and
+  // drops to the frontend (FUN_0041d85c). The demo/dispatch latch
+  // 0x5414d0 route is dormant in BUILD_A (its 0x5414c0/0x5414c4
+  // file context has no writers).
+  int deathCount = 0;        // 0x541637 — persisted in GAME
+  int field54163b = 0;       // 0x54163b — persisted in GAME
+  bool godMode = false;      // 0x541510 — suppresses the death route
+  int deathPhase = 0;        // 0 none · 1 = 0x3ea posted (fading)
+  float deathFade = 0.0f;    // 0x540dac — fade accumulator
+  bool lastgameArmed = false;      // SAVES\LASTGAME.SAV present
+                                   // (the FUN_00428290 exists-check)
+  SaveGamePacket lastgame{};       // the checkpoint as the loader
+                                   // would decode it
 };
 
 enum class ProgressionRoute : int {
@@ -159,6 +178,8 @@ enum class ProgressionError : int {
   kAlreadyEnded,       // duplicate end-level request on this level
   kStageRunning,       // the current mode-5/6 stage has not finished
   kTerminalConsumed,   // the mode-8 finish already ran
+  kNoCheckpoint,       // continue requested with no LASTGAME armed
+  kNoDeath,            // death step requested with health > 0 / god flag
 };
 
 const char* progressionErrorName(ProgressionError e);
@@ -293,6 +314,56 @@ ProgressionError progressionStepCinematic(ProgressionSession& sess,
 ProgressionError progressionLoadTraversalForCurrentLevel(
     const DataRoot& root, ProgressionSession& sess,
     TraversalRuntime& trav, std::string* detail);
+
+// ---------------------------------------------------------------------------
+// Phase 14B — traversal death → LASTGAME → continue
+// ---------------------------------------------------------------------------
+
+// One frame of the FUN_00463608 death route. Call only while the
+// traversal runtime reports health <= 0 — callers sync
+// sess.health = trav.fieldHealth at frame top (the dispatcher's
+// CMP [0x541554] read). Requires mode 3; the 0x541510 god flag and
+// health > 0 both return kNoDeath with no side effects.
+//
+//   frame 1:  the 0x3ea death state posts (deathPhase = 1)
+//   frames n: deathFade += rint(frameSeconds * 100.0f)  (0x49b6f4
+//             times the 100.0 constant at 0x4986ec — FISTP
+//             round-to-nearest under the loop's FPU control word)
+//   fade >255: ++deathCount; lastgame record armed (the
+//             FUN_00427ed4("SAVES\LASTGAME.SAV", thumb, 1) write —
+//             header-only, GAME mode field 3, health floored to 100
+//             when < 0x65); traversal teardown; mode 0 frontend.
+//
+// Returns kStageRunning while the fade accumulates and kOk at the
+// frontend edge. The caller is responsible for the actual file write
+// through SaveStore::writeLastgame when `lastgameArmed` flips —
+// keeping the session model free of I/O, same as the original's
+// split between state and the disk write.
+ProgressionError progressionStepDeath(ProgressionSession& sess,
+                                      float frameSeconds);
+
+// FUN_0041dc90 → FUN_00427f94 — the frontend Continue edge for
+// SAVES\LASTGAME.SAV. `pkt` is the loaded GAME packet (the caller
+// parses through SaveStore::loadLastgame; for the in-memory model the
+// armed `sess.lastgame` record is equivalent). Restores mode, levelId,
+// health, deathCount, field54163b verbatim — then routes:
+//   mode 3 → mode stays 3 for progressionLoadTraversalForCurrentLevel
+//            (header-only restore = fresh level load at s0);
+//   mode 6 → mode 6 with loaderSub = 3 (FUN_00429200 briefing);
+//   else  → the FUN_0041d85c frontend fallback (mode 0).
+// Returns kNoCheckpoint when nothing is armed.
+ProgressionError progressionContinue(ProgressionSession& sess);
+
+// The general FUN_004278c0 application edge for a parsed GAME packet
+// (manual header saves take the same route). Restores the five
+// globals; the caller still needs the mode route afterwards — same
+// returns/semantics as progressionContinue for the armed record.
+ProgressionError progressionApplyGamePacket(ProgressionSession& sess,
+                                            const SaveGamePacket& pkt);
+
+// The quit path (0x401174 → DeleteFileA): the death checkpoint is
+// deleted on a clean exit — lastgameArmed drops to false.
+void progressionDeleteCheckpoint(ProgressionSession& sess);
 
 // Static campaign table — the full internal sequence the BUILD_A
 // data supports. For each entry: internal id, the 0x4999e8 directory

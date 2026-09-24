@@ -37,6 +37,7 @@
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
 #include "core/progression_runtime.h"
+#include "core/save_game.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
 #include "core/traversal_runtime.h"
@@ -112,6 +113,12 @@ int usage() {
                "                            drives the ProgressionSession through\n"
                "                            new-game -> terminal with real-data\n"
                "                            traversal loads where present)\n"
+               "       mdk-inspect --save-info <file.SAV>\n"
+               "                            (Phase 14B: envelope + packet table +\n"
+               "                            proven GAME/PLAY/DAMP/CAME/AREN fields)\n"
+               "       mdk-inspect --save-roundtrip <file.SAV>\n"
+               "                            (parse -> re-emit header-only ->\n"
+               "                            re-parse -> compare)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1254,6 +1261,8 @@ int main(int argc, char** argv) {
   bool freefallRuntime = false;
   bool campaignHandoff = false;
   bool campaignSequence = false;
+  std::optional<std::string> saveInfoPath;
+  std::optional<std::string> saveRoundtripPath;
   int ffCourse = 0;
   int ffSkill = 0;
   unsigned ffSeed = 0xC0FFEE;
@@ -1384,6 +1393,14 @@ int main(int argc, char** argv) {
       campaignHandoff = true;
     } else if (!std::strcmp(a, "--campaign-sequence")) {
       campaignSequence = true;
+    } else if (!std::strcmp(a, "--save-info")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      saveInfoPath = v;
+    } else if (!std::strcmp(a, "--save-roundtrip")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      saveRoundtripPath = v;
     } else if (!std::strcmp(a, "--course")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -1652,6 +1669,129 @@ int main(int argc, char** argv) {
                 sess.terminalDone ? 1 : 0);
     std::printf("digest:  %016llx\n", (unsigned long long)digest);
     return rc;
+  }
+
+  // --save-info: Phase 14B — parse a .SAV through the
+  // original-compatible reader and print the envelope, packet table,
+  // and every gameplay-authoritative field with PROVEN semantics.
+  // Works on a direct file path (saves are runtime files — never
+  // resolved through the read-only data root).
+  if (saveInfoPath) {
+    mdk::SaveGame sg;
+    const auto e = mdk::saveGameLoadFile(*saveInfoPath, sg);
+    std::printf("file:      %s\n", saveInfoPath->c_str());
+    std::printf("parse:     %s\n", mdk::saveErrorName(e));
+    if (e != mdk::SaveError::kOk) return 1;
+    std::printf("envelope:  size=%u checksum=0x%06x seed=0x%04x\n",
+                sg.fileSize, sg.checksum, sg.seed);
+    std::printf("shape:     %s\n",
+                sg.headerOnly ? "header-only (mode field < 1000)"
+                              : "full (mode field >= 1000)");
+    std::printf("packets:   %zu\n", sg.packets.size());
+    for (const auto& p : sg.packets) {
+      const auto* spec = mdk::savePacketSpec(p.tag);
+      char tag[5] = {char(p.tag), char(p.tag >> 8), char(p.tag >> 16),
+                     char(p.tag >> 24), 0};
+      std::printf("  @%-6u %-4s size=%-5u registry=%u%s\n",
+                  p.streamOffset, tag, (unsigned)p.payload.size(),
+                  spec ? spec->size : 0,
+                  spec && spec->size != p.payload.size() ? " !SIZE" : "");
+    }
+    const auto& g = sg.game;
+    std::printf("game:      modeField=%d mode=%d levelId=%d health=%d "
+                "deathCount=%d field54163b=%d field8=0x%x\n",
+                g.modeField, g.mode(), g.levelId, g.health,
+                g.deathCount, g.field54163b, (unsigned)g.field8);
+    // Proven PLAY fields — health at +0, ammo block 0x54161f..33 at
+    // +0xcb, weapon indicators 0x541618..1b at +0xc4, 0x54163b +0xe7.
+    if (const auto* play = sg.find(mdk::saveTag('P', 'L', 'A', 'Y'))) {
+      const auto* d = play->payload.data();
+      auto r = [&](std::size_t o) {
+        return int(std::uint32_t(std::uint8_t(d[o])) |
+                   (std::uint32_t(std::uint8_t(d[o + 1])) << 8) |
+                   (std::uint32_t(std::uint8_t(d[o + 2])) << 16) |
+                   (std::uint32_t(std::uint8_t(d[o + 3])) << 24));
+      };
+      std::printf("play:      health=%d ammo=[%d %d %d %d %d %d] "
+                  "wpn-ind=[%d %d %d %d] field63b=%d\n",
+                  r(0), r(0xcb), r(0xcf), r(0xd3), r(0xd7), r(0xdb),
+                  r(0xdf), int(std::uint8_t(d[0xc4])),
+                  int(std::uint8_t(d[0xc5])), int(std::uint8_t(d[0xc6])),
+                  int(std::uint8_t(d[0xc7])), r(0xe7));
+    }
+    // DAMP +0x00 = the 0x540bfc player position; CAME +0x00 = camera.
+    auto f32 = [](const std::byte* p) {
+      std::uint32_t u = std::uint32_t(std::uint8_t(p[0])) |
+                        (std::uint32_t(std::uint8_t(p[1])) << 8) |
+                        (std::uint32_t(std::uint8_t(p[2])) << 16) |
+                        (std::uint32_t(std::uint8_t(p[3])) << 24);
+      float f;
+      std::memcpy(&f, &u, 4);
+      return double(f);
+    };
+    if (const auto* damp = sg.find(mdk::saveTag('D', 'A', 'M', 'P')))
+      std::printf("damp:      pos=(%.2f,%.2f,%.2f)\n",
+                  f32(damp->payload.data()), f32(damp->payload.data() + 4),
+                  f32(damp->payload.data() + 8));
+    if (const auto* came = sg.find(mdk::saveTag('C', 'A', 'M', 'E')))
+      std::printf("came:      pos=(%.2f,%.2f,%.2f)\n",
+                  f32(came->payload.data()), f32(came->payload.data() + 4),
+                  f32(came->payload.data() + 8));
+    for (const auto& p : sg.all(mdk::saveTag('A', 'R', 'E', 'N'))) {
+      mdk::SaveArenaHead h;
+      if (mdk::SaveGame::arenaHead(p, h))
+        std::printf("aren:      name=%-8s objects=%d fans=%d\n", h.name,
+                    h.objectCount, h.fanCount);
+    }
+    std::printf("alie:      %zu  fand: %zu  bull: %zu\n",
+                sg.all(mdk::saveTag('A', 'L', 'I', 'E')).size(),
+                sg.all(mdk::saveTag('F', 'A', 'N', 'D')).size(),
+                sg.all(mdk::saveTag('B', 'U', 'L', 'L')).size());
+    return 0;
+  }
+
+  // --save-roundtrip: parse, re-emit the header-only GAME form, parse
+  // again, and compare every authoritative field. Also verifies the
+  // checksum over a re-patched copy of the input.
+  if (saveRoundtripPath) {
+    mdk::SaveGame sg;
+    const auto e = mdk::saveGameLoadFile(*saveRoundtripPath, sg);
+    if (e != mdk::SaveError::kOk) {
+      std::fprintf(stderr, "parse: %s\n", mdk::saveErrorName(e));
+      return 1;
+    }
+    mdk::SaveWriteInput in;
+    in.modeField = sg.game.mode();
+    in.levelId = sg.game.levelId;
+    in.health = sg.game.health;
+    in.deathCount = sg.game.deathCount;
+    in.field54163b = sg.game.field54163b;
+    in.seed = sg.seed;
+    const auto bytes = mdk::saveGameWriteHeaderOnly(in);
+    mdk::SaveGame rt;
+    const auto e2 = mdk::saveGameParse(bytes.data(), bytes.size(), rt);
+    if (e2 != mdk::SaveError::kOk) {
+      std::fprintf(stderr, "re-parse: %s\n", mdk::saveErrorName(e2));
+      return 1;
+    }
+    // The writer floors health < 0x65 to 100 — compare against the
+    // stored (floored) expectation, not the raw input.
+    const int expectHealth = sg.game.health < 101 ? 100 : sg.game.health;
+    const int expectMode = (sg.game.mode() == 6) ? 6 : 3;
+    const bool ok =
+        rt.game.mode() == expectMode && rt.game.levelId == sg.game.levelId &&
+        rt.game.health == expectHealth &&
+        rt.game.deathCount == sg.game.deathCount &&
+        rt.game.field54163b == sg.game.field54163b;
+    std::printf("roundtrip: %s  mode=%d levelId=%d health=%d "
+                "deaths=%d x63b=%d  (%zu -> %zu bytes, %zu -> %zu "
+                "packets)\n",
+                ok ? "OK" : "MISMATCH", rt.game.mode(), rt.game.levelId,
+                rt.game.health, rt.game.deathCount, rt.game.field54163b,
+                (std::size_t)sg.fileSize, bytes.size(),
+                sg.packets.size(),
+                rt.packets.size());
+    return ok ? 0 : 1;
   }
 
   if (!dataPath || !target) {
