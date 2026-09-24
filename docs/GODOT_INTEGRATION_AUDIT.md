@@ -139,7 +139,7 @@ binary verification.
 | Weapons | PARTIAL — hitscan raycast + particle puff | PARTIAL — fire dispatch + shot-pool creation proven; **flight/damage UNKNOWN** | us | RE needed (G4) |
 | UI/HUD | PARTIAL — menu skeleton + vitals textures | PARTIAL — full menu flow proven; HUD internals UNKNOWN | mixed | RE needed (G6) |
 | Audio | PARTIAL — WAV→AudioStreamSample + players | PARTIAL — semantic `SoundAudioEvent`s, no backend | godot-mdk (marginally) | Ordinary coding (G6) |
-| Level transitions | ABSENT | PARTIAL — freefall→traversal handoff native-closed (Phase 13B: `ProgressionSession`/`progressionFreefallHandoff`); mode-5/6/7 seams + save remain | us | — |
+| Level transitions | ABSENT | PROVEN — full campaign loop native-closed (Phase 14A: traversal→mode-5 intermission→mode-6 loader advance→mode-7 traversal-only→mode-8 terminal; `ProgressionSession` + step APIs); save + presentation remain | us | — |
 | Save/load | ABSENT | PARTIAL — `.SAV` packet structure observed, semantics UNKNOWN | us | RE needed |
 
 ### Overlapping findings (the only real overlap is formats)
@@ -208,10 +208,17 @@ pure-GDScript bridge.**
   `freefall_runtime.h`).
 - `FrontendTimingState` — the reconstructed `FUN_0042fcd0` clock.
 - `GameplayInputState` + bindings — the `0x4ce6e0` control-block path.
-- `ProgressionSession` + `ProgressionHandoff` (Phase 13B) — the
-  orchestrator-owned cross-mode state (mode/course id/health/skill/
-  ammo/rand) and the `progressionFreefallHandoff` transition record.
-  Godot consumes the record; it never decides the route.
+- `ProgressionSession` + `ProgressionHandoff` (Phase 13B, extended
+  Phase 14A) — the orchestrator-owned cross-mode state
+  (mode/course id/health/skill/ammo/rand + `victoryPhase`/
+  `loaderSub`/`terminalDone`/`transitionCount`) and the transition
+  APIs (`progressionFreefallHandoff`, `progressionTraversalComplete`,
+  `progressionStepIntermission`/`Loader`/`Mode7`,
+  `progressionEnterCinematic`/`StepCinematic`). Mode-5 tally, mode-6
+  briefing pages and the mode-8 cinematic are semantic-completion
+  inputs (`tallyDone`/`stageDone`/`cinematicDone`) — Godot drives the
+  presentation clocks, the core owns every mode/level-id decision.
+  Godot consumes the records; it never decides the route.
 
 **Bridge owns (the seam):**
 
@@ -523,7 +530,7 @@ before/within them. Those are the ones that matter for the
 | **G4** — combat presentation | Shot-pool snapshot → projectile visuals; fire/impact sounds; hit feedback | G2 | **YES — projectile flight + damage/death internals** | RE + coding |
 | **G5** — enemies + AI | Enemy spawn→visual models, animation, AI behavior driven by core | G1, G3 | **NO for native runtime** — Phase 11A–11C reconstruct the full native enemy/mover gameplay core incl. `FUN_004585c4` (CLOSED FOR BUILD_A); remaining work is Godot presentation only | ordinary coding |
 | **G6** — audio / HUD / menus | SNI WAV playback via events; HUD from decoded FTI/BNI; menu screens re-skinned by Godot with logic still in core | G2 | partial — HUD layout details UNKNOWN | coding + bounded RE |
-| **G7** — progression / QA | Level transitions, save/load surface, full-game playthrough oracle-vs-native comparison | G1–G6 | partial — freefall→traversal handoff CLOSED natively (Phase 13B); save semantics + traversal→next seams UNKNOWN | coding + bounded RE |
+| **G7** — progression / QA | Level transitions, save/load surface, full-game playthrough oracle-vs-native comparison | G1–G6 | partial — full campaign loop CLOSED natively (Phase 14A: mode-5 intermission, mode-6 advance, mode-7, mode-8 terminal); save semantics + mode-5 statistics + presentation seams remain | coding + bounded RE |
 | **G8** — macOS arm64 packaging | Export/packaging, icon/signing/notarization as applicable | G7 | no | ordinary coding |
 | **G9** — freefall presentation | FALL3D course visuals driven by `FreefallRuntime` snapshots: object models (Kurt/missile/radar/pickup+chute/bones/EXPLODE), `cameraPos`+zoom state → camera node, `FreefallEvent` sound/grant tags → audio+HUD seams, FALLPU grant events → inventory surface | G0 (+G1 for model plumbing) | **NO for native runtime** — Phase 13A reconstructs the full mode-2 core incl. difficulty scaling and death/completion; remaining work is Godot presentation only | ordinary coding |
 

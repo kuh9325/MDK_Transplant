@@ -17147,6 +17147,250 @@ void test_progression_handoff() {
   fs::remove_all(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 14A — campaign loop: traversal → mode 5 → mode 6/7 → terminal.
+// ---------------------------------------------------------------------------
+
+void test_progression_campaign() {
+  namespace fs = std::filesystem;
+  using mdk::FreefallRuntime;
+  using mdk::ProgressionError;
+  using mdk::ProgressionHandoff;
+  using mdk::ProgressionRoute;
+  using mdk::ProgressionSession;
+  using mdk::TraversalRuntime;
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_campaign";
+  fs::remove_all(tmp);
+  // All six BUILD_A traversal dirs (ids 0..5); LEVEL2/LEVEL1 absent.
+  for (int dir : {7, 6, 3, 4, 8, 5})
+    makeSyntheticLevel(tmp, dir, 1.0f, 2.0f, 3.0f, 0.0f);
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+
+  const int idToDir[8] = {7, 6, 3, 4, 8, 5, 2, 1};
+
+  auto ffDone = [](FreefallRuntime& ff, int course, int health) {
+    mdk::freefallInit(ff, ffCourse(course, 1), 0xC0FFEE);
+    ff.finished = true;
+    ff.phase = FreefallRuntime::Phase::kDone;
+    ff.health = health;
+  };
+
+  // --- full campaign end-to-end: new game -> terminal mode 8 -> frontend ---
+  {
+    ProgressionSession s;
+    mdk::progressionStartCampaign(s, 1);
+    CHECK(s.mode == 6 && s.loaderSub == 3 && s.levelId == 0);
+    CHECK(s.transitionCount == 0 && s.health == 100);
+
+    // New-game mode-6 entry: EAX=1 -> sub 3 (briefing only, no ++).
+    CHECK(mdk::progressionStepLoader(s, false) ==
+          ProgressionError::kStageRunning);
+    CHECK(s.mode == 6 && s.levelId == 0);
+    CHECK(mdk::progressionStepLoader(s, true) == ProgressionError::kOk);
+    CHECK(s.mode == 2 && s.levelId == 0 && s.loaderSub == 0);
+
+    TraversalRuntime trav;
+    ProgressionHandoff ho;
+
+    // ids 0..3: freefall -> traversal -> intermission -> loader advance.
+    for (int id = 0; id < 4; ++id) {
+      CHECK(s.mode == 2 && s.levelId == id);
+      FreefallRuntime ff;
+      ffDone(ff, id, 40 + id);
+      CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, ho,
+                                            &err) == ProgressionError::kOk);
+      CHECK(s.mode == 3 && ho.route == ProgressionRoute::kTraversal);
+      CHECK(ho.traversalDir == idToDir[id]);
+      CHECK(trav.cur != nullptr);
+
+      // Victory edge — staged latches, one at a time.
+      s.ammo[1] = 5;  // ammo must carry through the whole transition
+      s.rng = 0xABCD + static_cast<std::uint32_t>(id);
+      CHECK(mdk::progressionRequestTraversalEnd(s) ==
+            ProgressionError::kOk);
+      CHECK(s.victoryPhase == 1);
+      CHECK(s.health == 40 + id);  // > 1 — FUN_0040dde0 floor no-op
+      // Completion edge cannot repeat while the sequence runs.
+      CHECK(mdk::progressionRequestTraversalEnd(s) ==
+            ProgressionError::kAlreadyEnded);
+      // Teardown gated on the dispatcher-visible latch (49a030).
+      CHECK(mdk::progressionTraversalTeardown(s) ==
+            ProgressionError::kNoTraversalExit);
+      CHECK(mdk::progressionAdvanceVictory(s) == ProgressionError::kOk);
+      CHECK(s.victoryPhase == 2);
+      CHECK(mdk::progressionTraversalTeardown(s) ==
+            ProgressionError::kNoTraversalExit);
+      CHECK(mdk::progressionAdvanceVictory(s) == ProgressionError::kOk);
+      CHECK(s.victoryPhase == 3);
+      CHECK(mdk::progressionTraversalTeardown(s) ==
+            ProgressionError::kOk);
+      CHECK(s.mode == 5 && s.victoryPhase == 0);
+
+      // Mode 5 holds while the tally runs; then the id<4 branch.
+      CHECK(mdk::progressionStepIntermission(s, false) ==
+            ProgressionError::kStageRunning);
+      CHECK(s.mode == 5);
+      CHECK(mdk::progressionStepIntermission(s, true) ==
+            ProgressionError::kOk);
+      CHECK(s.mode == 6 && s.loaderSub == 2);
+
+      // Mode 6: 2 -> 4 -> 1 -> (541498++) -> 3 -> exit to freefall.
+      CHECK(mdk::progressionStepLoader(s, true) ==
+            ProgressionError::kStageRunning);
+      CHECK(s.loaderSub == 4 && s.levelId == id);
+      CHECK(mdk::progressionStepLoader(s, true) ==
+            ProgressionError::kStageRunning);
+      CHECK(s.loaderSub == 1 && s.levelId == id);
+      CHECK(mdk::progressionStepLoader(s, true) ==
+            ProgressionError::kStageRunning);
+      CHECK(s.levelId == id + 1 && s.loaderSub == 3);
+      CHECK(s.health == 100);  // FUN_00429cb4 briefing floor
+      CHECK(s.transitionCount == id + 1);
+      CHECK(mdk::progressionStepLoader(s, true) ==
+            ProgressionError::kOk);
+      CHECK(s.mode == 2 && s.loaderSub == 0);
+      CHECK(s.ammo[1] == 5);   // carried through mode 5 + mode 6
+      CHECK(s.rng == 0xABCD + static_cast<std::uint32_t>(id));
+    }
+
+    // id 4: freefall -> LEVEL8 -> mode 5 -> literal 541498=5 -> mode 7.
+    CHECK(s.mode == 2 && s.levelId == 4 && s.transitionCount == 4);
+    {
+      FreefallRuntime ff;
+      ffDone(ff, 4, 60);
+      CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, ho,
+                                            &err) == ProgressionError::kOk);
+      CHECK(s.mode == 3 && ho.traversalDir == 8);
+    }
+    CHECK(mdk::progressionTraversalComplete(s) == ProgressionError::kOk);
+    CHECK(s.mode == 5);
+    CHECK(mdk::progressionStepIntermission(s, true) ==
+          ProgressionError::kOk);
+    // 0x4015ef literal store — id 4 -> 5, traversal-only route.
+    CHECK(s.levelId == 5 && s.mode == 7 && s.transitionCount == 5);
+
+    // Mode 7: one-shot traversal entry — no advance, no freefall.
+    CHECK(mdk::progressionStepMode7(s) == ProgressionError::kOk);
+    CHECK(s.mode == 3 && s.levelId == 5);
+    CHECK(mdk::progressionStepMode7(s) == ProgressionError::kBadMode);
+    CHECK(mdk::progressionLoadTraversalForCurrentLevel(*root, s, trav,
+                                                       &err) ==
+          ProgressionError::kOk);
+    CHECK(trav.cur != nullptr && trav.cur->name == "A5_0");
+    CHECK(trav.fieldHealth == 60);  // carried, no floor on mode 7
+
+    // Terminal: opcode 0x51 -> mode 8 -> teardown + cinematic -> mode 0.
+    CHECK(mdk::progressionEnterCinematic(s) == ProgressionError::kOk);
+    CHECK(s.mode == 8);
+    CHECK(mdk::progressionStepCinematic(s, false) ==
+          ProgressionError::kStageRunning);
+    CHECK(s.mode == 8 && !s.terminalDone);
+    CHECK(mdk::progressionStepCinematic(s, true) == ProgressionError::kOk);
+    CHECK(s.mode == 0 && s.terminalDone);
+    CHECK(mdk::progressionStepCinematic(s, true) ==
+          ProgressionError::kTerminalConsumed);
+    CHECK(s.transitionCount == 5);
+  }
+
+  // --- no double advance: every edge consumed exactly once ---
+  {
+    ProgressionSession s;
+    mdk::progressionNewGame(s, 0);
+    s.mode = 3;
+    s.levelId = 0;
+    CHECK(mdk::progressionTraversalComplete(s) == ProgressionError::kOk);
+    CHECK(s.mode == 5 && s.levelId == 0);
+    // A second completion edge in mode 5 is a bad-mode reject.
+    CHECK(mdk::progressionTraversalComplete(s) ==
+          ProgressionError::kBadMode);
+    CHECK(mdk::progressionRequestTraversalEnd(s) ==
+          ProgressionError::kBadMode);
+    CHECK(s.levelId == 0);
+    // Intermission completion consumed once: second call hits mode 6.
+    CHECK(mdk::progressionStepIntermission(s, true) ==
+          ProgressionError::kOk);
+    CHECK(mdk::progressionStepIntermission(s, true) ==
+          ProgressionError::kBadMode);
+    // Loader advances the id exactly once across its sub-states.
+    while (mdk::progressionStepLoader(s, true) ==
+           ProgressionError::kStageRunning)
+      ;
+    CHECK(s.levelId == 1 && s.mode == 2 && s.transitionCount == 1);
+    // Further loader edges are rejected — no second ++.
+    CHECK(mdk::progressionStepLoader(s, true) ==
+          ProgressionError::kBadMode);
+    CHECK(s.levelId == 1);
+  }
+
+  // --- victory health floor: completion at <=0 health still proceeds ---
+  {
+    ProgressionSession s;
+    s.mode = 3;
+    s.levelId = 1;
+    s.health = 0;
+    CHECK(mdk::progressionRequestTraversalEnd(s) ==
+          ProgressionError::kOk);
+    CHECK(s.health == 1);  // FUN_0040dde0: max(1, health)
+    CHECK(mdk::progressionAdvanceVictory(s) == ProgressionError::kOk);
+    CHECK(mdk::progressionAdvanceVictory(s) == ProgressionError::kOk);
+    CHECK(mdk::progressionTraversalTeardown(s) ==
+          ProgressionError::kOk);
+    CHECK(mdk::progressionStepIntermission(s, true) ==
+          ProgressionError::kOk);
+    CHECK(s.mode == 6);  // health 1 > 0 — no frontend route
+  }
+
+  // --- non-success at mode-5 exit: health <= 0 -> frontend, no advance ---
+  {
+    ProgressionSession s;
+    s.mode = 5;
+    s.levelId = 2;
+    s.health = 0;
+    CHECK(mdk::progressionStepIntermission(s, true) ==
+          ProgressionError::kOk);
+    CHECK(s.mode == 0 && s.levelId == 2);  // FUN_0041d85c, id untouched
+    CHECK(s.transitionCount == 0);
+  }
+
+  // --- levelId == 6 arm: the ++ lands on 6 -> immediate exit, no briefing ---
+  {
+    ProgressionSession s;
+    s.mode = 6;
+    s.loaderSub = 1;
+    s.levelId = 5;
+    CHECK(mdk::progressionStepLoader(s, true) == ProgressionError::kOk);
+    CHECK(s.levelId == 6 && s.mode == 3 && s.loaderSub == 0);
+    // LEVEL2 is absent: the mode-3 entry load fails rather than
+    // fabricating a level.
+    TraversalRuntime trav;
+    CHECK(mdk::progressionLoadTraversalForCurrentLevel(*root, s, trav,
+                                                       &err) ==
+          ProgressionError::kTraversalLoad);
+    CHECK(mdk::progressionLevelDir(6) == 2);  // table maps id 6 -> dir 2
+  }
+
+  // --- ids 6/7 map to LEVEL2/LEVEL1 — absent in BUILD_A (classified) ---
+  {
+    CHECK(mdk::progressionLevelDir(6) == 2);
+    CHECK(mdk::progressionLevelDir(7) == 1);
+    int n = 0;
+    const auto* tab = mdk::progressionCampaignTable(n);
+    CHECK(n == 8);
+    for (int i = 0; i < 8; ++i) {
+      CHECK(tab[i].levelId == i);
+      CHECK(tab[i].dir == idToDir[i]);
+      CHECK(tab[i].freefallFirst == (i < 5));
+      CHECK(tab[i].viaMode7 == (i >= 5));
+      CHECK(tab[i].terminal == (i == 5));
+    }
+  }
+
+  fs::remove_all(tmp);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -17220,6 +17464,7 @@ int main() {
   test_freefall_determinism();
   test_freefall_freelist();
   test_progression_handoff();
+  test_progression_campaign();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

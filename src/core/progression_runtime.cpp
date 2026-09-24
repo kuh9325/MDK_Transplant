@@ -37,6 +37,11 @@ const char* progressionErrorName(ProgressionError e) {
     case ProgressionError::kAlreadyHandedOff: return "already-handed-off";
     case ProgressionError::kBadLevelId: return "bad-level-id";
     case ProgressionError::kTraversalLoad: return "traversal-load";
+    case ProgressionError::kBadMode: return "bad-mode";
+    case ProgressionError::kNoTraversalExit: return "no-traversal-exit";
+    case ProgressionError::kAlreadyEnded: return "already-ended";
+    case ProgressionError::kStageRunning: return "stage-running";
+    case ProgressionError::kTerminalConsumed: return "terminal-consumed";
   }
   return "?";
 }
@@ -50,6 +55,10 @@ void progressionNewGame(ProgressionSession& sess, int skill) {
   sess.skill = skill;
   sess.ammo.fill(0);
   sess.freefallHandedOff = false;
+  sess.victoryPhase = 0;
+  sess.loaderSub = 0;
+  sess.terminalDone = false;
+  sess.transitionCount = 0;
   // mode is left for the entry path (frontend/menu at boot).
 }
 
@@ -166,6 +175,211 @@ ProgressionError progressionFreefallHandoff(
   for (int i = 0; i < 3; ++i) out.spawnPos[i] = trav->cs.pos[i];
   out.spawnYawDeg = trav->motion.yawDeg;
   return ProgressionError::kOk;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14A — traversal → intermission → next level / terminal loop
+// ---------------------------------------------------------------------------
+
+void progressionStartCampaign(ProgressionSession& sess, int skill) {
+  progressionNewGame(sess, skill);
+  // FUN_0041b630: reset → FUN_0041b7b4 preload → FUN_00429200(EAX=1).
+  // EAX != 0 selects sub-state 3 — the briefing stage alone; the
+  // levelId is already 0 so no advance runs.
+  sess.mode = 6;       // FUN_00429200's 541492 = 6 write
+  sess.loaderSub = 3;  // 0x54bef8 = 3 (EAX != 0 branch, 0x4295ae)
+  // The first state-3 frame runs FUN_00429cb4's init arm — health
+  // floor to 100. No-op here (new game already set 100), but the
+  // rule applies to any direct sub-3 entry (save restore).
+  if (sess.health < 100) sess.health = 100;
+}
+
+ProgressionError progressionRequestTraversalEnd(ProgressionSession& sess) {
+  if (sess.mode != 3) return ProgressionError::kBadMode;
+  // 540ebc == -1 consumed by the FUN_00436100 tail → FUN_0040dde0.
+  if (sess.victoryPhase != 0) return ProgressionError::kAlreadyEnded;
+  // FUN_0040dde0: 541554 = max(1, 541554) — victory floors health so
+  // the mode-5 exit's <= 0 check cannot fire on a completed level.
+  if (sess.health < 1) sess.health = 1;
+  sess.victoryPhase = 1;  // 540d9c = 1 — END_LEVEL sequence running
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionAdvanceVictory(ProgressionSession& sess) {
+  if (sess.mode != 3) return ProgressionError::kBadMode;
+  if (sess.victoryPhase == 0 || sess.victoryPhase == 3)
+    return ProgressionError::kBadMode;
+  // 1 → 2: the END_LEVEL object's countdown completes
+  //     (FUN_00461954 / FUN_00463608 write 540da0 = 1).
+  // 2 → 3: FUN_0040e958's white-out counter passes 300 → 49a030 = 1.
+  ++sess.victoryPhase;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionTraversalTeardown(ProgressionSession& sess) {
+  if (sess.mode != 3) return ProgressionError::kBadMode;
+  // Dispatcher 0x401497: CMP [0x49a030],0 — the only mode-3 exit.
+  if (sess.victoryPhase != 3) return ProgressionError::kNoTraversalExit;
+  // 49a030 cleared (0x4014fb), fades = 1000.0f, FUN_004371bc
+  // teardown — object/arena/script destruction only; health, ammo,
+  // inventory, RNG and levelId all carry (no writer in its call
+  // graph). FUN_0042b270 then writes 541492 = 5.
+  sess.victoryPhase = 0;
+  sess.mode = 5;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionTraversalComplete(ProgressionSession& sess) {
+  auto e = progressionRequestTraversalEnd(sess);
+  if (e != ProgressionError::kOk) return e;
+  progressionAdvanceVictory(sess);
+  progressionAdvanceVictory(sess);
+  return progressionTraversalTeardown(sess);
+}
+
+ProgressionError progressionStepIntermission(ProgressionSession& sess,
+                                             bool tallyDone) {
+  if (sess.mode != 5) return ProgressionError::kBadMode;
+  // FUN_0042c8b0 returns 0 while the tally/fade runs — the session
+  // holds in mode 5 until the caller reports the presentation done.
+  if (!tallyDone) return ProgressionError::kStageRunning;
+  // Dispatcher exit (0x4015c3): FUN_0046ca84 + FUN_0042c824 teardown.
+  if (sess.health <= 0) {
+    sess.mode = 0;  // FUN_0041d85c — frontend
+    return ProgressionError::kOk;
+  }
+  if (sess.levelId < 4) {
+    // FUN_00429200(EAX=0) → mode 6, sub-state 2 (full advance).
+    sess.mode = 6;
+    sess.loaderSub = 2;
+    return ProgressionError::kOk;
+  }
+  // 0x4015ef: MOV [541498],5 — the literal store; FUN_00422bc0 arms
+  // the score-entry overlay (a presentation seam), then mode 7.
+  sess.levelId = 5;
+  ++sess.transitionCount;
+  sess.mode = 7;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionStepLoader(ProgressionSession& sess,
+                                       bool stageDone) {
+  if (sess.mode != 6) return ProgressionError::kBadMode;
+  if (!stageDone) return ProgressionError::kStageRunning;
+  switch (sess.loaderSub) {
+    case 2:  // FUN_00429f40 — level-intro card → sub 4
+      sess.loaderSub = 4;
+      return ProgressionError::kStageRunning;
+    case 4:  // FUN_00429984 — debrief pages → sub 1
+      sess.loaderSub = 1;
+      return ProgressionError::kStageRunning;
+    case 1: {
+      // FUN_00429fe4 load-bar done → 0x4297d9: levelId++ — the only
+      // normal-campaign advance write.
+      ++sess.levelId;
+      ++sess.transitionCount;
+      if (sess.levelId == 6) break;  // ==6 → early exit, no briefing
+      // FUN_00422bc0(1,3) arms the score overlay (seam); the store
+      // of ECX=3 selects the briefing stage.
+      sess.loaderSub = 3;
+      // FUN_00429cb4 init effects (first state-3 frame): health
+      // floored to 100; the 541618..1b weapon indicators reset.
+      if (sess.health < 100) sess.health = 100;
+      return ProgressionError::kStageRunning;
+    }
+    case 3:
+      break;  // FUN_00429cb4 briefing done → mode-6 exit
+    default:
+      return ProgressionError::kBadMode;
+  }
+  // Dispatcher exit (0x40155d): teardown, fades = 1000.0f,
+  // FUN_0041b7b4(levelId) preload — FALL3D_<id> assets are queued
+  // only for id < 5 — then the next-mode select.
+  sess.loaderSub = 0;
+  if (sess.levelId < 5) {
+    sess.mode = 2;  // FUN_0040ef28 — freefall init re-arms the latch
+    sess.freefallHandedOff = false;
+  } else {
+    sess.mode = 3;  // FUN_004346e8 — traversal-only entry
+  }
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionStepMode7(ProgressionSession& sess) {
+  if (sess.mode != 7) return ProgressionError::kBadMode;
+  // 0x40160c: FUN_0046ca84 + FUN_00413b20 cleanup, FUN_0041b7b4
+  // (levelId unchanged — no FALL3D assets queued since 5 >= 5),
+  // FUN_004346e8 → mode 3.
+  sess.mode = 3;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionEnterCinematic(ProgressionSession& sess) {
+  if (sess.mode != 3) return ProgressionError::kBadMode;
+  // FUN_0047b038: 541492 = 8, 49bd40 = 1 — the next mode-8 frame runs
+  // FUN_004371bc teardown before the cinematic. A pending victory
+  // latch is consumed by the teardown path either way.
+  sess.victoryPhase = 0;
+  sess.mode = 8;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionStepCinematic(ProgressionSession& sess,
+                                        bool cinematicDone) {
+  if (sess.terminalDone) return ProgressionError::kTerminalConsumed;
+  if (sess.mode != 8) return ProgressionError::kBadMode;
+  if (!cinematicDone) return ProgressionError::kStageRunning;
+  // FUN_0047b3f4 finished → FUN_0047b674 + FUN_0041d85c: mode 0.
+  sess.mode = 0;
+  sess.terminalDone = true;
+  return ProgressionError::kOk;
+}
+
+ProgressionError progressionLoadTraversalForCurrentLevel(
+    const DataRoot& root, ProgressionSession& sess,
+    TraversalRuntime& trav, std::string* detail) {
+  auto fail = [&](ProgressionError e, const char* msg) {
+    if (detail) *detail = msg;
+    return e;
+  };
+  if (sess.mode != 3) return fail(ProgressionError::kBadMode,
+                                  "traversal load requires mode 3");
+  const int dir = progressionLevelDir(sess.levelId);
+  if (dir < 0)
+    return fail(ProgressionError::kBadLevelId,
+                "level id outside the 0x4999e8 table");
+  char base[64];
+  std::snprintf(base, sizeof base, "TRAVERSE/LEVEL%d/LEVEL%d", dir, dir);
+  const auto le = traversalRuntimeLoad(root, std::string(base) + ".DTI",
+                                       std::string(base) + ".CMI",
+                                       std::string(base) + "O.MTO",
+                                       trav, detail);
+  if (le != TraversalLoadError::kOk)
+    return fail(ProgressionError::kTraversalLoad,
+                detail ? detail->c_str() : "traversal load failed");
+  // Same carry rule as the freefall handoff — the globals outlive
+  // FUN_0041b7b4 / FUN_004346e8 / FUN_00433d40.
+  trav.fieldHealth = sess.health;
+  trav.rngState = sess.rng;
+  trav.ammo = sess.ammo;
+  return ProgressionError::kOk;
+}
+
+const CampaignLevelInfo* progressionCampaignTable(int& count) {
+  // id, dir(0x4999e8), freefallFirst(id<5), viaMode7(id>=4 write),
+  // terminal. Ids 6/7 have no BUILD_A data — see the header notes.
+  static const CampaignLevelInfo kTable[8] = {
+      {0, 7, true,  false, false},
+      {1, 6, true,  false, false},
+      {2, 3, true,  false, false},
+      {3, 4, true,  false, false},
+      {4, 8, true,  false, false},  // mode-5 exit writes id = 5
+      {5, 5, false, true,  true},   // mode 7 → traversal; ends via mode 8
+      {6, 2, false, true,  false},  // unreachable — LEVEL2 absent
+      {7, 1, false, true,  false},  // unreachable — LEVEL1 absent
+  };
+  count = 8;
+  return kTable;
 }
 
 } // namespace mdk

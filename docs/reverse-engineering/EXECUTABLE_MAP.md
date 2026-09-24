@@ -106,16 +106,40 @@ surfaces).
     `0x5414a0/a4/a8 = 1000.0f` + `FUN_004346e8(0)` (mode 3);
     `≤0` → `FUN_0041d85c` (mode 0),
   - `3` traversal — frame `FUN_00436100`; `0x49a030` flag →
-    `FUN_004371bc` teardown + `FUN_0042b270` → mode 5,
-  - `5` post-traversal intermission — frame `FUN_0042c8b0`; done →
-    `541498 < 4` ? `FUN_00429200` (mode 6) : `541498 = 5` + mode 7,
-  - `6` level-load/briefing — entry `FUN_00429200` (arg → sub-state
-    `0x54bef8`); frame `FUN_00422bc0`: `FUN_00429fe4` multi-stage
-    loader (`541498++` once on completion — the campaign advance),
-    `FUN_00429cb4` briefing (`541554` floor 100 @`0x429d6a`,
-    indicator reset `541618/19/1a/1b = 0/0/3/0` @`0x429d4b`),
-  - `7` traversal-only load — `FUN_0041b7b4(541498)` + `FUN_004346e8`,
-  - `8` cinematic `FUN_0047b038`.
+    `FUN_004371bc` teardown + `FUN_0042b270` → mode 5. Completion
+    chain (Phase 14A): script VM arm @`0x43d411` (opcodes `<=0x32`)
+    writes `0x540ebc=-1` → frame tail → `FUN_0040dde0` (health floor
+    ≥1, `0x540d9c=1`, END_LEVEL effect) → `0x540da0=1`
+    (`FUN_00461954`/`FUN_00463608`) → `FUN_0040e958` white-out →
+    `0x49a030=1` → dispatcher exit. Death instead: `541554==0` →
+    `0x5414d0=1` → `FUN_004090fc` demo/save-restore loop — no id
+    advance,
+  - `5` post-traversal intermission — entry `FUN_0042b270`
+    (`541492=5`, `0x4edad0=id>3`, tally init); frame `FUN_0042c8b0`
+    (fade `0x4eda9c`, returns done); exit `FUN_0042c824` teardown →
+    `541554<=0` → `FUN_0041d85c` (mode 0); `541498<4` →
+    `FUN_00429200(0)` (mode 6); `541498>=4` → `MOV [541498],5`
+    @`0x4015ef` (literal store, not ++) + `FUN_00422bc0` overlay →
+    mode 7,
+  - `6` level-load/briefing — entry `FUN_00429200` (`EAX==0`→sub 2,
+    `EAX!=0`→sub 3 briefing-only); frame `FUN_00422bc0` dispatch on
+    `0x54bef8` (jump table `0x4296e0`): 2=`FUN_00429f40` intro →4,
+    4=`FUN_00429984` debrief →1, 1=`FUN_00429fe4` load-bar →
+    `541498++` @`0x4297d9` (the campaign advance; `==6`→early exit)
+    + `FUN_00422bc0` overlay →3, 3=`FUN_00429cb4` briefing
+    (`541554` floor 100 @`0x429d6a`, indicator reset
+    `541618/19/1a/1b = 0/0/3/0` @`0x429d4b`) → exit; exit
+    `FUN_0041b7b4(541498)` (queues `FALL3D_%d` only `id<5`) →
+    `id<5` ? `FUN_0040ef28` (mode 2) : `FUN_004346e8` (mode 3),
+  - `7` traversal-only load — `FUN_0041b7b4(541498)` + `FUN_004346e8`
+    → mode 3; no `541498` write — one-shot for the post-mode-5
+    id-5 leg,
+  - `8` cinematic/ending — `FUN_0047b038` (`541492=8`,
+    `0x49bd40=1`); triggered by script opcode `0x51` via the `>0x32`
+    script arm `FUN_0047baf4`; body `FUN_0047b06c` = one-shot
+    `FUN_004371bc` teardown + `FUN_0047b3f4` finish cinematic +
+    `FUN_0041d85c` → mode 0. Terminal route for the final level
+    (id 5 / `LEVEL5`).
 - Level-directory table `0x4999e8` (dword[8] = `{7,6,3,4,8,5,2,1}`) —
   indexed by `DAT_00541498` in `FUN_00433d40` (`0x433d7d`) and
   `FUN_0041b7b4` (`0x41b7d1`) to build `TRAVERSE\LEVEL%d\LEVEL%d.*`

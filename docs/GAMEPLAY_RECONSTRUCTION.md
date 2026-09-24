@@ -4529,3 +4529,198 @@ surfaces on the frontend frame, not as a third handoff branch.
 **Status: FREEFALL → TRAVERSAL MODE HANDOFF — CLOSED FOR BUILD_A**;
 with Phase 13A closed this makes **FREEFALL GAMEPLAY + PROGRESSION
 ENTRY — CLOSED FOR BUILD_A**.
+
+# Phase 14A — Campaign Loop: Traversal → Intermission → Next Level
+
+## 166. Traversal completion signal (OBSERVED, instruction-level)
+
+Mode 3 exits through exactly one edge in the master dispatcher
+(`FUN_0040103c`): at `0x401497` the mode-3 tail does
+`CMP dword ptr [0x49a030],0` and, when set, clears it (`0x4014fb`),
+arms the three `1000.0f` transition-fade floats, calls `FUN_004371bc`
+(traversal teardown), then `FUN_0042b270` → mode 5. `0x49a030`'s sole
+writer is `FUN_0040e958` — the victory white-out sequence, which sets
+the flag after its `>300` counter completes.
+
+The signal chain feeding `0x49a030`:
+
+| step | global | writer | trigger |
+|---|---|---|---|
+| end-level request | `0x540ebc = -1` | script VM arm `0x43d411` (script opcodes `<= 0x32` write `0xffffffff`); also the cheat-table "win" path in `FUN_00423ca0` | level script / object script — the boss-side completion seam |
+| victory latch | `0x540d9c = 1` | `FUN_0040dde0`, called from the `FUN_00436100` frame tail when `0x540ebc == -1` | floors `0x541554` to ≥ 1 (`0x40de0b` `MOV [541554],1` arm), spawns the `END_LEVEL` effect |
+| victory-state flag | `0x540da0 = 1` | `FUN_00461954` (`0x461bfc`) and `FUN_00463608` (`0x464259`), both with `0x540cac = 0x3e9` | END_LEVEL countdown expiry / player-state dispatcher |
+| dispatcher-visible exit | `0x49a030 = 1` | `FUN_0040e958`, reached from `FUN_00463608` when `0x540da0 != 0` | white-out `>300` counter |
+
+So the authoritative completion edge is *script → `0x540ebc=-1` →
+`FUN_0040dde0` → `540d9c` → `540da0` → `FUN_0040e958` → `49a030` →
+mode-3 tail*. Boss defeat only matters to progression where it makes
+a script issue the end-level opcode — boss AI itself stays out of
+scope.
+
+Death is a different edge and never reaches `0x49a030`:
+`0x541554 == 0` inside `FUN_00463608` sets the death/demo latch
+`0x5414d0 = 1`, and the dispatcher runs the `FUN_004090fc` restore
+loop (`main\demo.c` assert path — save/demo replay via
+`FUN_00427d48`/`FUN_004278c0`). **No level-id advance on death.**
+
+## 167. `FUN_004371bc` — traversal teardown (OBSERVED)
+
+Broad traversal cleanup: destroys the traversal object/arena/script
+state and runs shared cleanup (`FUN_0046ca84`-family). It contains
+**no writes** to `0x541554` health, `0x54161f..33` ammo, `0x541498`
+level id, or the RNG stream — all campaign state carries across the
+seam verbatim. It runs identically on the mode-3→5 exit and on the
+mode-8 entry (`0x49bd40` latch in `FUN_0047b06c`).
+
+## 168. Mode 5 — post-traversal intermission (OBSERVED)
+
+- `FUN_0042b270`: entry — writes `0x541492 = 5`, records
+  `0x4edad0 = (541498 > 3)`, initialises the tally/statistics state.
+- `FUN_0042c8b0`: per-frame tally/fade — returns 0 while running, 1
+  when done (`0x4eda9c` fade in/out arms).
+- Dispatcher exit (`0x4015c3`): `FUN_0046ca84` + `FUN_0042c824`
+  teardown, then the next-mode decision:
+  - `0x541554 <= 0` → `FUN_0041d85c` → mode 0 (frontend). Reachable
+    in principle — the normal victory path floors health to ≥ 1, so
+    this arm covers non-completion exits.
+  - `0x541498 < 4` → `FUN_00429200(EAX=0)` → mode 6, sub-state 2.
+  - `0x541498 >= 4` → **`MOV dword ptr [0x541498],5` @`0x4015ef`** —
+    a literal store (the level id *jumps* to 5, it does not
+    increment) — then `FUN_00422bc0` arms the score-entry overlay and
+    the dispatcher writes mode 7.
+
+## 169. Mode 6 — loader/briefing (OBSERVED)
+
+`FUN_00429200` writes `0x541492 = 6` and selects the `0x54bef8`
+sub-state: `EAX==0` → 2 (full advance chain), `EAX!=0` → 3 (briefing
+only — new game and save restore enter this way so `541498` is not
+re-incremented).
+
+Sub-state machine (jump table `0x4296e0`):
+
+| sub-state | body | on completion |
+|---|---|---|
+| 2 | `FUN_00429f40` — level-intro card | → 4 |
+| 4 | `FUN_00429984` — debrief/tally pages | → 1 |
+| 1 | `FUN_00429fe4` — staged load bar | `541498++` @`0x4297d9`; `==6` → exit immediately; else `FUN_00422bc0` overlay arm + → 3 |
+| 3 | `FUN_00429cb4` — briefing/map (`pBBRIEF_<id>` / `_<id>_MAP`) | → mode-6 exit |
+
+`0x541498++` timing is **before** the briefing that shows the new
+level — sub-state 1 completes, increments, arms the overlay, then
+sub-state 3 runs `FUN_00429cb4` for the already-incremented id.
+`FUN_00429cb4`'s init arm floors `0x541554` to **100** (`0x429d6a`)
+and resets `0x541618/19/1a/1b` to `0/0/3/0` — the per-level health
+refill.
+
+Mode-6 exit (`0x40155d`): teardown + fades, `FUN_0041b7b4(541498)`
+preload — which queues `FALL3D_<id>`/`FALLPU_<id>` freefall assets
+**only while `541498 < 5`** — then the next-mode select:
+`541498 < 5` → `FUN_0040ef28` (mode 2 freefall); `>= 5` →
+`FUN_004346e8` (mode 3 traversal, no freefall).
+
+## 170. Mode 7 — traversal-only entry (OBSERVED)
+
+Dispatcher body `0x40160c`: shared cleanup, `FUN_0041b7b4(541498)`
+(`FALL3D` not queued — id is already 5), `FUN_004346e8` → mode 3.
+It does **not** advance `541498`. One-shot by construction: used only
+by the mode-5 exit's `>= 4` branch. Its traversal then completes via
+the script `0x51` opcode → mode 8 (§171) rather than the
+`0x540ebc=-1` victory chain.
+
+## 171. Terminal route — mode 8 ending (OBSERVED)
+
+Script opcodes `> 0x32` dispatch to `FUN_0047baf4`; opcode `0x51`
+calls `FUN_0047b038` which writes `0x541492 = 8` and sets the
+cinematic latch `0x49bd40 = 1`. The mode-8 body `FUN_0047b06c`
+one-shots `FUN_004371bc` teardown, runs the finish/ending sequence
+`FUN_0047b3f4` (`main\finish.c` assert path), then `FUN_0047b674` +
+`FUN_0041d85c` → mode 0 frontend. The final campaign level is
+id 5 (`LEVEL5`); its script issues `0x51` to end the game — it does
+not go through mode 5.
+
+## 172. Full BUILD_A campaign sequence (OBSERVED)
+
+```
+new game (FUN_0041b630): 541498=0, 541554=100
+ → FUN_00429200(EAX=1): mode 6 sub-3 briefing only (no ++)
+ → mode 2 FALL3D_1 → mode 3 LEVEL7 (id 0)
+ → 540ebc=-1 victory chain → mode 5 → mode 6 (sub 2→4→1: ++→1 →3)
+ → mode 2 FALL3D_2 → mode 3 LEVEL6 (id 1)     → … id 2 → LEVEL3
+ → … id 3 → LEVEL4                            → … id 4 → LEVEL8
+ → mode 5 exit: 541498>=4 → MOV [541498],5 → mode 7
+ → mode 3 LEVEL5 (traversal-only, no freefall)
+ → script opcode 0x51 → mode 8 ending cinematic → mode 0 frontend
+```
+
+BUILD_A ships `TRAVERSE/LEVEL{3,4,5,6,7,8}` only — `LEVEL1`/`LEVEL2`
+(table ids 7/6) are **absent** and unreachable in normal play: the
+mode-6 `++` arm exits early at `== 6`, and the mode-5 literal store
+pins the last level to 5.
+
+Writers of `0x541498` (complete census): new-game `=0`
+(`FUN_0041b724`), `FUN_0041b7b4` arg echo, mode-6 `++`
+(`0x4297d9`, the only normal advance), mode-5 exit `=5`
+(`0x4015ef`), save-load restore (`FUN_004278c0`).
+
+## 173. Cross-level state (OBSERVED)
+
+| global | across traversal→intermission→briefing→next level |
+|---|---|
+| `0x541554` health | floored ≥1 at victory (`FUN_0040dde0`), floored **up** to 100 in briefing init (`FUN_00429cb4`); carried verbatim elsewhere |
+| `0x54161f..33` ammo | no writer anywhere on the transition path — carries verbatim |
+| `0x541618/19/1a/1b` indicators | reset `0/0/3/0` by `FUN_00429cb4` and `FUN_00433c4c` |
+| RNG (`FUN_0047d2b5` stream) | shared CRT stream — never reseeded on transitions |
+| non-ammo inventory (`FUN_0046a500`/`FUN_0046aa30`) | carried opaquely — bounded seam |
+| `0x541498` | §172 census — single normal-advance write |
+
+## 174. Native port — `ProgressionSession` extension (ported)
+
+`src/core/progression_runtime.*` now models the full loop on the same
+session object (no second coordinator):
+
+- `victoryPhase` 0–3 models `540d9c → 540da0 → 49a030`;
+  `loaderSub` is `0x54bef8`; `terminalDone` is the consumed mode-8
+  finish; `transitionCount` counts level-id advances (diagnostic).
+- `progressionStartCampaign` — `FUN_0041b630` new-game (mode 6,
+  sub 3, no `++`).
+- `progressionRequestTraversalEnd` / `progressionAdvanceVictory` /
+  `progressionTraversalTeardown` — the staged victory edge;
+  `progressionTraversalComplete` is the single-shot convenience edge.
+- `progressionStepIntermission(tallyDone)` — mode 5; `health<=0` →
+  mode 0, `id<4` → mode 6 sub 2, `id>=4` → `id=5` + mode 7.
+- `progressionStepLoader(stageDone)` — mode 6 sub-states `2→4→1→
+  (++→id==6?exit)→3→exit`; briefing arm floors health to 100; exit
+  selects mode 2 (`id<5`) or mode 3.
+- `progressionStepMode7` — mode 7 → mode 3 (no advance).
+- `progressionEnterCinematic` / `progressionStepCinematic(done)` —
+  opcode-`0x51` edge → mode 8 → mode 0 + `terminalDone`.
+- `progressionLoadTraversalForCurrentLevel` — the `FUN_00433d40`
+  path for mode-3 entries outside the freefall handoff (mode 7).
+- `progressionCampaignTable` — the static 8-entry diagnostic table.
+
+Presentation stages (tally pages, briefing art, cinematic playback)
+are explicit semantic-completion inputs — deterministic headless
+edges, not emulated timers.
+
+### Phase 14A validation
+
+`mdk_tests::test_progression_campaign` (227 checks) drives a full
+synthetic six-level campaign through the real APIs with synthetic
+`LEVEL{7,6,3,4,8,5}` fixtures — every mode/sub-state/id assertion,
+the literal `4→5` store, the mode-7 one-shot, the mode-8 terminal
+edge, no-double-advance rejection at every edge, the `health<=0`
+frontend arm, and the unreachable `id==6` arm (load fails on absent
+`LEVEL2` rather than fabricating).
+
+`mdk-inspect --campaign-sequence --data-path <root>` prints the
+0x4999e8 table with per-dir presence and runs the deterministic
+simulation with real-data loads at every traversal leg: all six
+BUILD_A levels load (LEVEL7 `DANT_1` … LEVEL5 spawn verified),
+`LEVEL2`/`LEVEL1` report `ABSENT`, digest `23c84c9f241af58b`.
+
+**Status: CAMPAIGN MODE/LEVEL PROGRESSION — CLOSED FOR BUILD_A.**
+Remaining seams (explicit, bounded): save-packet semantics
+(`FUN_004278c0`/`FUN_004206d0` callsites only), the non-ammo
+inventory block, score-entry overlay internals (`FUN_00422bc0`
+arm is modelled as a presentation seam), mode-5 statistics content,
+and boss logic (stops at the script completion opcodes).

@@ -106,6 +106,12 @@ int usage() {
                "                            frame on the success route.\n"
                "                            Options: --course 0..4 --skill 0..2\n"
                "                            --seed N --frames N)\n"
+               "       mdk-inspect --data-path DIR --campaign-sequence\n"
+               "                            (Phase 14A: prints the 0x4999e8 level\n"
+               "                            table with per-dir data presence, then\n"
+               "                            drives the ProgressionSession through\n"
+               "                            new-game -> terminal with real-data\n"
+               "                            traversal loads where present)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1247,6 +1253,7 @@ int main(int argc, char** argv) {
   bool traversalRuntime = false;
   bool freefallRuntime = false;
   bool campaignHandoff = false;
+  bool campaignSequence = false;
   int ffCourse = 0;
   int ffSkill = 0;
   unsigned ffSeed = 0xC0FFEE;
@@ -1375,6 +1382,8 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;                 // FALL3D.BNI path
       campaignHandoff = true;
+    } else if (!std::strcmp(a, "--campaign-sequence")) {
+      campaignSequence = true;
     } else if (!std::strcmp(a, "--course")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -1470,6 +1479,179 @@ int main(int argc, char** argv) {
     } else {
       target = a;
     }
+  }
+
+  // --campaign-sequence: Phase 14A diagnostic. No <relative-path>
+  // target — it iterates the whole 0x4999e8 table. Prints the static
+  // campaign table (id → dir, freefall/mode-7/terminal flags, data
+  // presence) then drives one ProgressionSession deterministically
+  // through new-game → freefall legs → traversal completions → mode 5
+  // → mode 6 advances → the id-4→5 literal store → mode 7 → mode 8
+  // terminal → frontend, loading real traversal data where present.
+  if (campaignSequence) {
+    if (!dataPath) return usage();
+    std::string err;
+    const auto root = mdk::DataRoot::open(*dataPath, &err);
+    if (!root) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 2;
+    }
+
+    int tableCount = 0;
+    const auto* table = mdk::progressionCampaignTable(tableCount);
+    std::printf("campaign: 0x4999e8 id->dir table, %d entries\n",
+                tableCount);
+    std::printf("%3s %3s  %-30s %-8s %-5s %-8s %s\n", "id", "dir",
+                "traversal-path", "freefall", "mode7", "terminal",
+                "data");
+
+    std::uint64_t digest = 1469598103934665603ull;
+    auto mix = [&](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        digest ^= (v >> (i * 8)) & 0xff;
+        digest *= 1099511628211ull;
+      }
+    };
+
+    bool present[8] = {};
+    for (int i = 0; i < tableCount; ++i) {
+      const auto& e = table[i];
+      char base[64];
+      std::snprintf(base, sizeof base, "TRAVERSE/LEVEL%d/LEVEL%d",
+                    e.dir, e.dir);
+      const std::string dtiPath = std::string(base) + ".DTI";
+      // Presence probe: the DTI must resolve AND parse-load cleanly
+      // to count as usable data.
+      const auto sz = root->fileSize(dtiPath, &err);
+      present[i] = sz.has_value();
+      std::printf("%3d %3d  %-30s %-8s %-5s %-8s %s\n", e.levelId,
+                  e.dir, dtiPath.c_str(), e.freefallFirst ? "yes" : "no",
+                  e.viaMode7 ? "yes" : "no", e.terminal ? "yes" : "no",
+                  present[i] ? "present" : "ABSENT");
+      mix(static_cast<std::uint64_t>(e.dir));
+      mix(present[i] ? 1 : 0);
+    }
+
+    // Deterministic transition simulation. Freefall legs use a
+    // completed-course runtime (the proven 13B boundary) so the real
+    // traversal load runs per level where data exists.
+    std::printf("\nsequence:\n");
+    mdk::ProgressionSession sess;
+    mdk::progressionStartCampaign(sess, /*skill=*/1);
+    std::printf("  new-game: mode=%d sub=%d id=%d health=%d\n",
+                sess.mode, sess.loaderSub, sess.levelId, sess.health);
+    mix(static_cast<std::uint64_t>(sess.mode));
+
+    auto reportLoad = [&]() {
+      mdk::TraversalRuntime trav;
+      const auto le = mdk::progressionLoadTraversalForCurrentLevel(
+          *root, sess, trav, &err);
+      std::printf("    load: err=%s", mdk::progressionErrorName(le));
+      if (le == mdk::ProgressionError::kOk)
+        std::printf(" arenas=%zu spawn=%d pos=(%.1f,%.1f,%.1f) "
+                    "yaw=%.1f\n",
+                    trav.arenas.size(),
+                    trav.cur ? trav.cur->index : -1,
+                    (double)trav.cs.pos[0], (double)trav.cs.pos[1],
+                    (double)trav.cs.pos[2], (double)trav.motion.yawDeg);
+      else
+        std::printf(" (%s)\n", err.c_str());
+      mix(static_cast<std::uint64_t>(le));
+    };
+
+    int guard = 64;
+    int rc = 0;
+    while (guard-- > 0) {
+      if (sess.terminalDone) break;
+      switch (sess.mode) {
+        case 6: {
+          const auto e = mdk::progressionStepLoader(sess, true);
+          std::printf("  mode6:  sub-done -> mode=%d id=%d sub=%d "
+                      "health=%d (%s)\n",
+                      sess.mode, sess.levelId, sess.loaderSub,
+                      sess.health, mdk::progressionErrorName(e));
+          mix(static_cast<std::uint64_t>(sess.levelId));
+          if (e == mdk::ProgressionError::kBadMode) rc = 1;
+          break;
+        }
+        case 2: {
+          mdk::FreefallRuntime ff;
+          mdk::FreefallCourseData fc;
+          fc.course = sess.levelId;
+          fc.skill = sess.skill;
+          mdk::freefallInit(ff, fc, ffSeed);
+          ff.finished = true;
+          ff.phase = mdk::FreefallRuntime::Phase::kDone;
+          ff.health = 80;
+          mdk::TraversalRuntime trav;
+          mdk::ProgressionHandoff ho;
+          const auto e = mdk::progressionFreefallHandoff(
+              *root, sess, ff, &trav, ho, &err);
+          std::printf("  fall%d:  -> mode=%d route=%d dir=%d "
+                      "load=%s arenas=%zu\n",
+                      sess.levelId, sess.mode,
+                      static_cast<int>(ho.route), ho.traversalDir,
+                      mdk::traversalLoadErrorName(ho.loadError),
+                      trav.arenas.size());
+          mix(static_cast<std::uint64_t>(ho.traversalDir < 0
+                                             ? 0xffff
+                                             : ho.traversalDir));
+          if (e != mdk::ProgressionError::kOk ||
+              ho.route != mdk::ProgressionRoute::kTraversal)
+            rc = 1;
+          break;
+        }
+        case 3: {
+          // Traversal leg: if this is the terminal id the script's
+          // 0x51 arm routes to mode 8; otherwise the victory edge.
+          if (sess.levelId == 5) {
+            const auto e = mdk::progressionEnterCinematic(sess);
+            std::printf("  trav5:  opcode 0x51 -> mode=%d (%s)\n",
+                        sess.mode, mdk::progressionErrorName(e));
+          } else {
+            const auto e = mdk::progressionTraversalComplete(sess);
+            std::printf("  trav%d:  victory -> mode=%d (%s)\n",
+                        sess.levelId, sess.mode,
+                        mdk::progressionErrorName(e));
+          }
+          mix(static_cast<std::uint64_t>(sess.mode));
+          break;
+        }
+        case 5: {
+          const auto e = mdk::progressionStepIntermission(sess, true);
+          std::printf("  mode5:  tally-done -> mode=%d id=%d (%s)\n",
+                      sess.mode, sess.levelId,
+                      mdk::progressionErrorName(e));
+          mix(static_cast<std::uint64_t>(sess.levelId));
+          break;
+        }
+        case 7: {
+          const auto e = mdk::progressionStepMode7(sess);
+          std::printf("  mode7:  -> mode=%d id=%d (%s)\n", sess.mode,
+                      sess.levelId, mdk::progressionErrorName(e));
+          reportLoad();
+          break;
+        }
+        case 8: {
+          const auto e = mdk::progressionStepCinematic(sess, true);
+          std::printf("  mode8:  cinematic-done -> mode=%d "
+                      "terminal=%d (%s)\n",
+                      sess.mode, sess.terminalDone ? 1 : 0,
+                      mdk::progressionErrorName(e));
+          break;
+        }
+        default:
+          std::printf("  stop:   unexpected mode=%d\n", sess.mode);
+          rc = 1;
+          guard = 0;
+          break;
+      }
+    }
+    std::printf("final:   mode=%d id=%d transitions=%d terminal=%d\n",
+                sess.mode, sess.levelId, sess.transitionCount,
+                sess.terminalDone ? 1 : 0);
+    std::printf("digest:  %016llx\n", (unsigned long long)digest);
+    return rc;
   }
 
   if (!dataPath || !target) {
