@@ -194,6 +194,13 @@ void playerFireLatch(TraversalRuntime& rt, const GameplayInputFrame& ctrl);
 // spawn is deferred; `weapon5Probe` carries the live flag for tests.
 void playerChargeProbe(TraversalRuntime& rt);
 
+// FUN_0045c230 — segment-vs-AABB Liang-Barsky ENTRY clipper, shared
+// with the freefall missile/pickup collision path. Returns 2 when the
+// start is inside (out=start), 1 when the segment enters the box
+// (out=entry point), 0 on a miss / entry past the end.
+int segClipAabb(const float* start, const float* end, const float* aabb,
+                float* out);
+
 } // namespace mdk
 
 #endif // MDK_CORE_PLAYER_FIRE_H

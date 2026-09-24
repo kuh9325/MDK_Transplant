@@ -4285,3 +4285,81 @@ Open items are non-blocking: the 34-name tally table (statistics
 seam), FX/SFX record internals, `FUN_0042f310`/`0x6b` presentation
 seams, and boss-specific orchestration outside the generic
 `0x3d`-spawn path.
+
+# Phase 13A — Freefall (FALL3D) Native Runtime
+
+## 163. Mode-2 freefall core (OBSERVED, ported)
+
+`src/core/freefall_runtime.{h,cpp}` hosts the original FALL3D
+course — mode `0x541492 = 2`, entered from the orchestrator
+`FUN_0041dc90` (mode 6 loads the level bundle then `541498 < 5` →
+`FUN_0040ef28`) and exited to traversal (`FUN_004346e8`) when the
+tick returns 1 with `541554 > 0`, else the front end
+(`FUN_0041d85c`). Headless: no renderer/audio — presentation
+side-effects are emitted as typed `FreefallEvent`s.
+
+**Function ownership (BUILD_A, all OBSERVED via disasm):**
+
+| Original | Role |
+|---|---|
+| `FUN_0040ef28` | course init: pool wipe + LIFO freelist chain (399×`0x32e`), FALL3D bundle resolve, difficulty block `0x4edc10..24` from `0x541498`/`0x54147a`, `0x4edcb8=150` intro countdown, `0x4edaf4=(course>=4)`, `0x4edbfc=-66.6667`, viewport 600×360 zoom 2.4 |
+| `FUN_004103d8` | mode-2 frame: zoom-sprite pitch → intro tick (`0x4edcb8>0`) → audio seam → palette cycle → fade machine → three frame-step timers (`0x4edcac` radar, `0x4edca8` FALLPU backward-pop, `0x4edcb4` missile) → `0x4edc00 += dt` → object walk `FUN_00410e38` → camera `0x4ce69c/a0 = {px,py}·0.85` + `0x4ce6a4` → render seams → return 1 on `edc00>33` or death-fade end |
+| `FUN_0040ff78` | scripted intro: countdown 150→0 by frameStep; fade ramp `1-(t-90)/60` / hold / `1-(60-t)/60`; zoom index `0xc00` then `((120-t)·12/60)<<8` for t∈61..119; player spawns first frame t<90 on eased arc `s=1-(1-t)²`, `{30s-30, 10s-10, -10s}`; at 0: seed timers, `player.z=5206`, Bones spawn (`0x4edaf4`, z=5290) |
+| `FUN_00410e38` | object walk over `0x4edaec` list — type dispatch table `0x410e20` (0 player, 1 missile, 2 explosion, 3 radar, 4 pickup, 5 bones) |
+| `FUN_0040f96c`/`FUN_0040f9d0` | alloc/free: LIFO freelist pop + insert-after-head; unlink + LIFO push. Stale-field inheritance preserved (spawners only write the fields the original writes) |
+| `FUN_0041210c` | player: `z -= 66.6667·dt`; control window `edc00 ≤ 30` — shared `FUN_00465b54` accel channel (input fold `FUN_00407e50`: digital `±11.7647`/`±117.647`, analog X direct / Y negated); after 30s spring-damp `(v-2p)·0.5` + `K_FINISH` edge on `0x4ce6a8`; clamps x ±58.8235, y ±35.2941; AABB `{4,5,5}`; hit-anim restore when `+0x118 == -256` |
+| `FUN_0041151c` | missile spawn: type 1, dir `rand·360/32768`°, `vel={sin·250,cos·250,+250}`, timer 60, x/y leads `(rand-0x4000)·edc14·2^-14`, M_LNCH |
+| `FUN_00410e9c` | missile: integrate + z-throttle (`z < pz·0.75` → `+3·vz·dt`); collision window `edc00 < 30` via `FUN_0045c230` seg-vs-AABB → KURT_HIT latch, damage `4 / 4+rand8 / twice` by skill, `edc04=3`, type-2 conversion; launch 60→0 (`+0x108`→8); homing `vel = v·0.8 + dir·0.2` toward lead point (`dz/225` capped `<10` else `-666.667`); pass `dz ≤ -5` → M_PASS + timer `-1` → sink 60 frames → free |
+| `FUN_00411660` | explosion: z pinned to player, `animAcc += f0`, `frame=rint(acc)`, `scale=frame/2`, free at model-anim frame count (`explodeAnimFrames` seam — the `model->anims[0]+0xc>>16` chain is data-derived, not hardcoded) |
+| `FUN_00412060`/`FUN_00411aac`/`FUN_004119ec` | radar: spawn type 3 → marker `+0x128` rises `3000·dt` to `player.z-3`, then `vel = v·0.75 + dir·0.25` toward wander targets (FUN_004119ec picks from live type-0/4 positions + ≤3 random points); retarget within 2.9412 or timer>30 (R_MOVE); player proximity `<15²` → lock: `edcb0 += waveSize+(rand&1)`, `edcb4=1`, K_SEEN, `edc0c-0.5` clamp 0.75, `edc08=3`, timer `-1` → sink `1500·dt` → below z 0 re-arms `edcac = edc20+(rand&0x3f)` and frees |
+| `FUN_004118b0`/`FUN_00411710` | pickup: popped BACKWARD from `FALLPU_%d` (12-byte `{name[8],u32}` records, NUL-name terminator); type 4, `vel={0,0,-133.333}`, pos random in ±56.38/±33.53 at `player.z+15`, timer `(rand&0x3f)+30`, P_FALL; timer → CHUTE attach + sound, glide brake toward `-50` at `66.6667·dt`, yaw spin `30·dt`; `z > camZ` cull; post-deploy `FUN_0045c230` hit → P_COLL + K_COLL + `FUN_0046a9c8` grant + free |
+| `FUN_0041236c` | bones: flyby `z -= 74.074·dt`, one-shot pass sound on overtaking the player |
+| `FUN_004123f4` | camera projection writer — `0x540b28/2c/30` camera world pos (pickup cull plane = camZ) |
+| `FUN_0046a9c8` | pickup grant — two name tables (health/ammo vs key/seal); health rows apply +10/+50/=100/+1 cap 100, others emit semantic grant events |
+| `FUN_00407e50` | input fold — four digital channels `±11.7647/±117.647` (`left=-X right=+X up=+Y down=-Y`), analog `axis·11.7647/·117.647` with Y negated; digital wins per axis |
+| `FUN_004555bc` | shared anim sequencer — modeled subset: clip accumulator advances in frame units; KURT_HIT expires into the `-256` sentinel after 18 frames (BNI census) |
+
+**Difficulty block** (OBSERVED; c=`0x541498` 0..4, s=`0x54147a` 0..2,
+integer division): `wave = c/{5,3,2}+2`, `radarSpeed = 117.647·(1+c·{0.1,0.2,1/3})`, `wander = {7.5,6.5,5.5}-c`, `missileDelay = 32-{1,7,5}c`, `radarDelay = 63-{3,7,9}c`.
+
+**Frame model:** `frameStep` (`0x49b6e8`) decrements int timers,
+`frameUnits` (`0x49b6f0`) advances accumulators, `dtSec` (`0x49b6f4`)
+integrates positions. `edc00` runs in seconds: control 0–30,
+`K_FINISH` at 30, exit fade `1-(prevT-31)·0.5` from 31, completion
+`>33`. RNG is the shared MSVC LCG (`enemyRandNext`/`enemyRandBelow`)
+— the whole course is deterministic per seed.
+
+**Fade state machine** (OBSERVED): `edc04` current, `edc0c` target,
+`edc08` rate — fade-in `<1s` (`target=1`, `rate=100000`), damage
+flash `edc04=3` on hit, missile-spawn bump `target-0.2` clamp `0.5`,
+radar-lock `target-0.5` clamp `0.75` + `rate=3`, ambient dip
+`rand&0x1f==0` → `target=0.9`/`rate=0.5`, death fade `-= dt` →
+return 1 at `≤0` (gated on `prevT ≥ 1`).
+
+### Phase 13A validation
+
+`mdk_tests`: **4413 checks / 0 failures** — difficulty formulas for
+all 9 course/skill pairs (spot-checked 0/0, 4/2, 3/1), intro arc +
+150-frame countdown + Bones gating, input fold (digital wins, analog
+Y negated), motion clamps + spring-damp cutoff + AABB tracking,
+missile launch/homing/lead/pass/collision-window-30 + type-2
+conversion + damage-by-skill, pickup backward-pop + chute deploy +
+glide brake + cull + collect-grant (SW_H25 +10 cap 100), radar
+rise/steer/lock/wave/re-arm, completion `>33` + death-fade return,
+LIFO freelist reuse with stale-field inheritance, and a
+same-seed/different-seed determinism digest over 1200 frames.
+
+`mdk-inspect --freefall-runtime FALL3D/FALL3D.BNI --course N
+--skill N --seed N --frames N` drives the core on the real
+FALL3D.BNI — reads `FALLPU_<course+1>` (OBSERVED `{name[8],u32}`
+records, NUL terminator), prints per-frame authoritative state and
+a state digest. Real-data smoke (course 0, skill 0): radar spawn at
+0.6 s → lock ~2.6 s → missile wave (M_LNCH) → 3 hits ×4 dmg →
+pickup pops (P_FALL/CHUTE) → exit fade → completion at `t>33`.
+
+**Deferred seams (never emulated):** all sounds (event tags only),
+palette/fade uploads, zoom-sprite frames (index state kept), the
+`+0x60` trail FX ring, model basis matrices, the `0x541554`→traversal
+handoff (mode 6), `FUN_00418688` keymap config, save games, and
+Godot presentation. Explosion lifetime stays a bounded data seam
+(`FreefallCourseData::explodeAnimFrames`).

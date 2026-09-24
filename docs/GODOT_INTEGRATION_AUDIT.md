@@ -199,6 +199,13 @@ pure-GDScript bridge.**
   (`CollisionPoly*`, `DynamicObject*`, `DtiArenaRecord*`, `unique_ptr`
   arena addresses used as tokens) are semantically meaningful inside
   the core and **must never cross the FFI**.
+- `FreefallRuntime` (Phase 13A) — the FALL3D mode-2 course state:
+  399-record object pool + LIFO freelist, timers, difficulty block,
+  camera/zoom state, deterministic LCG. Presentation surface = the
+  object snapshot (type/model/pos/anim fields) + `FreefallEvent`
+  sound/grant tags; input surface = `FreefallInput` (four digital
+  channels + two analog axes — semantics documented OBSERVED in
+  `freefall_runtime.h`).
 - `FrontendTimingState` — the reconstructed `FUN_0042fcd0` clock.
 - `GameplayInputState` + bindings — the `0x4ce6e0` control-block path.
 
@@ -392,7 +399,9 @@ Unchanged and mandatory:
   touch them.
 - `python3 -m pytest tests/` — inventory/manifest tests.
 - `mdk-inspect` selftests + the traversal FNV-1a digest (folds frame
-  outputs incl. camera pose f32 bit patterns).
+  outputs incl. camera pose f32 bit patterns) + the freefall
+  `--freefall-runtime` digest (Phase 13A — folds rng/timeline/health
+  + per-object type/timer/pos bits).
 - The SDL3 app + all `--selftest-*` diagnostics — the SDL/Metal/native
   path remains a first-class headless host. It is not deprecated,
   subordinated, or "legacy."
@@ -512,13 +521,14 @@ before/within them. Those are the ones that matter for the
 | **G6** — audio / HUD / menus | SNI WAV playback via events; HUD from decoded FTI/BNI; menu screens re-skinned by Godot with logic still in core | G2 | partial — HUD layout details UNKNOWN | coding + bounded RE |
 | **G7** — progression / QA | Level transitions, save/load surface, full-game playthrough oracle-vs-native comparison | G1–G6 | partial — save semantics UNKNOWN | coding + bounded RE |
 | **G8** — macOS arm64 packaging | Export/packaging, icon/signing/notarization as applicable | G7 | no | ordinary coding |
+| **G9** — freefall presentation | FALL3D course visuals driven by `FreefallRuntime` snapshots: object models (Kurt/missile/radar/pickup+chute/bones/EXPLODE), `cameraPos`+zoom state → camera node, `FreefallEvent` sound/grant tags → audio+HUD seams, FALLPU grant events → inventory surface | G0 (+G1 for model plumbing) | **NO for native runtime** — Phase 13A reconstructs the full mode-2 core incl. difficulty scaling and death/completion; remaining work is Godot presentation only | ordinary coding |
 
-The RE-heavy items (G1 arena visuals, G4 combat tail, plus the
-still-UNKNOWN freefall mode, bosses, save semantics, HUD layout,
-remaining tr_alcmd opcodes) are the work to schedule inside the
-current availability window; G5 is now presentation-only after Phase
-11C, and the other presentation-only packages are deferrable ordinary
-coding.
+The RE-heavy items (G1 arena visuals, G4 combat tail, plus bosses,
+save semantics, HUD layout, remaining tr_alcmd opcodes) are the work
+to schedule inside the current availability window; G5 is
+presentation-only after Phase 11C, the freefall core is reconstructed
+after Phase 13A (G9 is presentation-only), and the other
+presentation-only packages are deferrable ordinary coding.
 
 ## 20. Explicit non-goals
 

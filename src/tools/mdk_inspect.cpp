@@ -25,6 +25,7 @@
 #include "core/dti_structure.h"
 #include "core/dynamic_objects.h"
 #include "core/file_family.h"
+#include "core/freefall_runtime.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
@@ -87,6 +88,13 @@ int usage() {
                "                            Phase 5G runtime and steps frames.\n"
                "                            Options: --arena NAME --start X Y Z\n"
                "                            --yaw DEG --frames N)\n"
+               "       mdk-inspect --data-path DIR --freefall-runtime "
+               "<relative-path>\n"
+               "                            (a FALL3D.BNI path; reads the\n"
+               "                            FALLPU_<course+1> pickup list and\n"
+               "                            steps the Phase 13A freefall core.\n"
+               "                            Options: --course 0..4 --skill 0..2\n"
+               "                            --seed N --frames N)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1186,6 +1194,10 @@ int main(int argc, char** argv) {
   bool surfaceCensus = false;
   bool arenaRender = false;
   bool traversalRuntime = false;
+  bool freefallRuntime = false;
+  int ffCourse = 0;
+  int ffSkill = 0;
+  unsigned ffSeed = 0xC0FFEE;
   bool scriptDisasm = false;
   bool objScriptDisasm = false;
   std::string scriptDisasmName;
@@ -1301,6 +1313,41 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       traversalRuntime = true;
+    } else if (!std::strcmp(a, "--freefall-runtime")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;                 // FALL3D.BNI path
+      freefallRuntime = true;
+    } else if (!std::strcmp(a, "--course")) {
+      const char* c = value(a);
+      if (!c) return usage();
+      char* endp = nullptr;
+      const long v = std::strtol(c, &endp, 10);
+      if (!endp || *endp != '\0' || v < 0 || v > 4) {
+        std::fprintf(stderr, "invalid --course (0..4): %s\n", c);
+        return usage();
+      }
+      ffCourse = static_cast<int>(v);
+    } else if (!std::strcmp(a, "--skill")) {
+      const char* c = value(a);
+      if (!c) return usage();
+      char* endp = nullptr;
+      const long v = std::strtol(c, &endp, 10);
+      if (!endp || *endp != '\0' || v < 0 || v > 2) {
+        std::fprintf(stderr, "invalid --skill (0..2): %s\n", c);
+        return usage();
+      }
+      ffSkill = static_cast<int>(v);
+    } else if (!std::strcmp(a, "--seed")) {
+      const char* c = value(a);
+      if (!c) return usage();
+      char* endp = nullptr;
+      const unsigned long v = std::strtoul(c, &endp, 0);
+      if (!endp || *endp != '\0' || v > 0xfffffffful) {
+        std::fprintf(stderr, "invalid --seed: %s\n", c);
+        return usage();
+      }
+      ffSeed = static_cast<unsigned>(v);
     } else if (!std::strcmp(a, "--script-disasm")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -1466,7 +1513,7 @@ int main(int argc, char** argv) {
   if (!entriesMode && !visualInfoName && !fontInfoName &&
       !spriteInfoName && !collisionProbe && !arenaObjects &&
       !surfaceCensus && !arenaRender && !traversalRuntime &&
-      !scriptDisasm && !objScriptDisasm) {
+      !freefallRuntime && !scriptDisasm && !objScriptDisasm) {
     return 0;
   }
 
@@ -1972,6 +2019,117 @@ int main(int argc, char** argv) {
                 rt.cs.carrierBusy ? 1 : 0, carrierGeom ? 1 : 0,
                 ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+  }
+
+  // --freefall-runtime: Phase 13A FALL3D diagnostic. Reads the
+  // FALLPU_<course+1> pickup record from the target FALL3D.BNI,
+  // initializes the freefall core with --course/--skill/--seed and
+  // steps --frames frames at the standard 30 fps frame model,
+  // printing authoritative state and a determinism digest. FALLPU
+  // entries are 12-byte {name[8], u32} records terminated by a NUL
+  // first name byte (OBSERVED: FUN_0040ef28 count loop + the BNI
+  // census in docs/reverse-engineering/EXECUTABLE_MAP.md).
+  if (freefallRuntime) {
+    const auto bniFile = root->readFile(*target, kEntriesMaxBytes, &err);
+    if (!bniFile) {
+      std::fprintf(stderr, "read-file: FAILED (%s)\n", err.c_str());
+      return 1;
+    }
+    mdk::FreefallCourseData course;
+    course.course = ffCourse;
+    course.skill = ffSkill;
+    const auto dir = mdk::inspectBniDirectory(
+        std::span<const std::byte>(bniFile->data(), bniFile->size()));
+    if (dir.status == mdk::BniDirectoryStatus::kOk) {
+      char recName[16];
+      std::snprintf(recName, sizeof recName, "FALLPU_%d", ffCourse + 1);
+      if (const mdk::BniRecord* rec = mdk::findBniRecord(dir, recName)) {
+        const std::byte* p = bniFile->data() + rec->payloadFileOffset;
+        const std::byte* end = bniFile->data() + rec->payloadEnd;
+        for (; p + 12 <= end; p += 12) {
+          if (p[0] == std::byte{0}) break;  // terminator entry
+          mdk::FreefallPickupRec r{};
+          for (int k = 0; k < 8; ++k)
+            r.name[k] = static_cast<char>(p[k]);
+          r.name[8] = '\0';
+          course.pickups.push_back(r);
+        }
+      } else {
+        std::printf("fallpu:    %s — NOT FOUND (no pickups)\n",
+                    recName);
+      }
+    } else {
+      std::printf("bni:       %s — %s (no pickups)\n",
+                  std::string(mdk::bniDirectoryStatusName(dir.status))
+                      .c_str(),
+                  dir.detail.c_str());
+    }
+
+    mdk::FreefallRuntime rt;
+    mdk::freefallInit(rt, course, ffSeed);
+    std::printf("freefall:  course=%d skill=%d seed=%08x pickups=%zu "
+                "bones=%d\n",
+                ffCourse, ffSkill, ffSeed, course.pickups.size(),
+                rt.bonesCourse ? 1 : 0);
+    std::printf("difficulty: wave=%d speed=%.4f wander=%.4f delay=%d "
+                "radar-delay=%d\n",
+                rt.waveSize, (double)rt.radarSpeed, (double)rt.wanderScale,
+                rt.missileDelay, rt.radarDelay);
+
+    std::uint64_t digest = 1469598103934665603ull;
+    auto mix = [&](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        digest ^= (v >> (i * 8)) & 0xff;
+        digest *= 1099511628211ull;
+      }
+    };
+    int framesRun = 0;
+    bool done = false;
+    for (int f = 0; f < travFrames && !done; ++f) {
+      mdk::FreefallInput in{};  // idle — scripted-input seam TODO
+      done = mdk::freefallStep(rt, in, 1, 1.0f, 1.0f / 30.0f);
+      ++framesRun;
+      const mdk::FreefallObject* pl =
+          rt.listHead >= 0 ? &rt.pool[rt.listHead] : nullptr;
+      int counts[6] = {};
+      for (int i = rt.listHead; i >= 0; i = rt.pool[i].next)
+        if (rt.pool[i].type >= 0 && rt.pool[i].type < 6)
+          ++counts[rt.pool[i].type];
+      std::printf(
+          "f=%03d ph=%d t=%6.2f hp=%3d fade=%5.2f pl=(%7.2f,%7.2f,%8.2f) "
+          "cam=(%7.2f,%7.2f,%8.2f) obj 0-5=%d/%d/%d/%d/%d/%d ev=%zu\n",
+          f, static_cast<int>(rt.phase), (double)rt.timeline, rt.health,
+          (double)rt.fade,
+          pl ? (double)pl->px : 0.0, pl ? (double)pl->py : 0.0,
+          pl ? (double)pl->pz : 0.0,
+          (double)rt.cameraPos[0], (double)rt.cameraPos[1],
+          (double)rt.cameraPos[2],
+          counts[0], counts[1], counts[2], counts[3], counts[4],
+          counts[5], rt.events.size());
+      for (const auto& e : rt.events)
+        std::printf("      ev kind=%d a=%d b=%d\n", e.kind, e.a, e.b);
+      mix(static_cast<std::uint64_t>(rt.rng));
+      std::uint32_t tb;
+      std::memcpy(&tb, &rt.timeline, 4);
+      mix(tb);
+      mix(static_cast<std::uint64_t>(rt.health));
+      for (int i = rt.listHead; i >= 0; i = rt.pool[i].next) {
+        const mdk::FreefallObject& o = rt.pool[i];
+        mix(static_cast<std::uint64_t>(o.type) << 16 |
+            static_cast<std::uint64_t>(static_cast<std::uint16_t>(o.timer)));
+        std::uint32_t bits;
+        std::memcpy(&bits, &o.px, 4);
+        mix(bits);
+        std::memcpy(&bits, &o.py, 4);
+        mix(bits);
+        std::memcpy(&bits, &o.pz, 4);
+        mix(bits);
+      }
+    }
+    std::printf("frames:    %d  finished=%d died=%d digest=%016llx\n",
+                framesRun, rt.finished ? 1 : 0, rt.died ? 1 : 0,
+                (unsigned long long)digest);
+    return 0;
   }
 
   // --surface-census: Phase 5F BUILD_A smoke. Reads the .DTI target

@@ -77,6 +77,8 @@ bool elemNamePredicate(const char* name, const char* prefix, int digitOfs) {
   }
 }
 
+} // namespace
+
 // FUN_0045c230 — segment-vs-AABB Liang-Barsky ENTRY clipper.
 // start=in_EAX, end=param_2, out=param_1, aabb=unaff_EBX. Returns 2 if
 // the start is inside (out=start), 1 if the segment enters the box
@@ -170,6 +172,8 @@ int segClipAabb(const float* start, const float* end, const float* aabb,
   out[0] = start[0]; out[1] = start[1]; out[2] = start[2];
   return 2;
 }
+
+namespace {
 
 // FUN_004337ac — the punch cone test. aabb is EAX, center EDX,
 // bestScore [0x8], stabOut [0xc], aimPt [0x10], outBearing [0x14].

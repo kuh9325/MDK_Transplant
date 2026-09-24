@@ -17,6 +17,7 @@
 #include "core/enemy_runtime.h"
 #include "core/file_family.h"
 #include "core/framebuffer.h"
+#include "core/freefall_runtime.h"
 #include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
@@ -16375,6 +16376,471 @@ void test_arena_mesh() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 13A — freefall runtime (FALL3D / mode 2). Constants asserted below
+// are OBSERVED decodes from MDK95.EXE (see freefall_runtime.h ownership map).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using mdk::FreefallCourseData;
+using mdk::FreefallInput;
+using mdk::FreefallObject;
+using mdk::FreefallRuntime;
+
+FreefallCourseData ffCourse(int course = 0, int skill = 0,
+                            std::initializer_list<const char*> names = {}) {
+  FreefallCourseData d;
+  d.course = course;
+  d.skill = skill;
+  d.explodeAnimFrames = 30.0f;
+  for (const char* n : names) {
+    mdk::FreefallPickupRec r{};
+    std::strncpy(r.name, n, 8);
+    d.pickups.push_back(r);
+  }
+  return d;
+}
+
+// Standard frame: 1 int step, 1 frame unit, 1/30 s.
+void ffStep(FreefallRuntime& rt, const FreefallInput& in) {
+  mdk::freefallStep(rt, in, 1, 1.0f, 1.0f / 30.0f);
+}
+void ffStepN(FreefallRuntime& rt, int n, const FreefallInput& in = {}) {
+  for (int i = 0; i < n; ++i) ffStep(rt, in);
+}
+void ffRunIntro(FreefallRuntime& rt) {
+  while (rt.introCountdown > 0) ffStep(rt, {});
+}
+FreefallObject* ffPlayer(FreefallRuntime& rt) {
+  return rt.listHead >= 0 ? &rt.pool[rt.listHead] : nullptr;
+}
+FreefallObject* ffFirstOfType(FreefallRuntime& rt, int type) {
+  for (int i = rt.listHead; i >= 0; i = rt.pool[i].next)
+    if (rt.pool[i].type == type) return &rt.pool[i];
+  return nullptr;
+}
+int ffCountType(FreefallRuntime& rt, int type) {
+  int n = 0;
+  for (int i = rt.listHead; i >= 0; i = rt.pool[i].next)
+    if (rt.pool[i].type == type) ++n;
+  return n;
+}
+bool ffSawEvent(const FreefallRuntime& rt, int kind, int a) {
+  for (const auto& e : rt.events)
+    if (e.kind == kind && e.a == a) return true;
+  return false;
+}
+
+} // namespace
+
+void test_freefall_init() {
+  // Difficulty block (OBSERVED formulas, c=course s=skill).
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 1);
+    CHECK(rt.health == 100 && rt.introCountdown == 150);
+    CHECK(rt.waveSize == 2 && rt.missileDelay == 32 && rt.radarDelay == 63);
+    CHECK(near(rt.wanderScale, 7.5) && near(rt.radarSpeed, 117.6470588, 1e-4));
+    CHECK(!rt.bonesCourse && rt.pickupsRemaining == 0);
+    CHECK(rt.freeHead == 0 && rt.listHead == -1);
+    CHECK(rt.pool[0].next == 1 && rt.pool[397].next == 398 &&
+          rt.pool[398].next == -1);
+  }
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(4, 2, {"SW_H25"}), 7);
+    CHECK(rt.waveSize == 4 && rt.missileDelay == 12 && rt.radarDelay == 27);
+    CHECK(near(rt.wanderScale, 1.5) &&
+          near(rt.radarSpeed, 117.6470588 * (1.0 + 4.0 / 3.0), 1e-3));
+    CHECK(rt.bonesCourse && rt.pickupsRemaining == 1);
+  }
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(3, 1), 9);
+    CHECK(rt.waveSize == 3 && rt.missileDelay == 11 && rt.radarDelay == 42);
+    CHECK(near(rt.wanderScale, 3.5) &&
+          near(rt.radarSpeed, 117.6470588 * 1.6, 1e-3));
+  }
+}
+
+void test_freefall_intro() {
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, ffCourse(4, 0), 12345);
+  // 150 countdown frames at frameStep 1; player spawns once t < 90.
+  for (int i = 0; i < 60; ++i) ffStep(rt, {});
+  CHECK(rt.introCountdown == 90 && ffPlayer(rt) == nullptr);
+  ffStep(rt, {});
+  FreefallObject* pl = ffPlayer(rt);
+  CHECK(pl != nullptr && pl->type == 0 && pl->model == mdk::kFfModelKurt);
+  // Eased arc s = 1-(1-t)^2, t = (90-tc)/60.
+  const float t = 1.0f / 60.0f;
+  const float s = 1.0f - (1.0f - t) * (1.0f - t);
+  CHECK(near(pl->px, s * 30.0f - 30.0f, 1e-4));
+  CHECK(near(pl->py, s * 10.0f - 10.0f, 1e-4));
+  CHECK(near(pl->pz, s * -10.0f, 1e-4));
+  ffRunIntro(rt);
+  CHECK(rt.introCountdown == 0);
+  pl = ffPlayer(rt);
+  CHECK(pl && near(pl->pz, 5206.0));
+  // Bones on course >= 4 (0x4edaf4).
+  FreefallObject* bo = rt.bonesIdx >= 0 ? &rt.pool[rt.bonesIdx] : nullptr;
+  CHECK(bo && bo->type == 5 && near(bo->pz, 5290.0));
+  // radarTimer seeded (rand&0xf)+7 — exact value depends on LCG seed.
+  CHECK(rt.radarTimer >= 7 && rt.radarTimer <= 22);
+
+  // No bones on lower courses.
+  FreefallRuntime rt2;
+  mdk::freefallInit(rt2, ffCourse(3, 0), 12345);
+  ffRunIntro(rt2);
+  CHECK(rt2.bonesIdx == -1 && ffCountType(rt2, 5) == 0);
+}
+
+void test_freefall_input_fold() {
+  float out[4];
+  mdk::freefallInputFold({}, out);
+  CHECK(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0);
+  mdk::freefallInputFold({.left = true}, out);
+  CHECK(near(out[0], -11.7647059) && near(out[1], -117.647059, 1e-4));
+  mdk::freefallInputFold({.down = true}, out);
+  CHECK(near(out[2], -11.7647059) && near(out[3], -117.647059, 1e-4));
+  // Analog: X direct, Y negated; digital wins.
+  mdk::freefallInputFold({.axisX = 0.5f, .axisY = 0.5f}, out);
+  CHECK(near(out[0], 0.5 * 11.7647059) && near(out[2], -0.5 * 11.7647059));
+  mdk::freefallInputFold({.left = true, .axisX = 0.9f}, out);
+  CHECK(near(out[0], -11.7647059));
+}
+
+void test_freefall_motion() {
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, ffCourse(0, 0), 99);
+  ffRunIntro(rt);
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  FreefallObject* pl = ffPlayer(rt);
+  CHECK(pl);
+  const float z0 = pl->pz;
+  // Neutral input: position holds (velocity decays), z falls at 66.67/s.
+  ffStepN(rt, 30);
+  CHECK(near(pl->px, 0.0, 1e-4) && near(pl->py, 0.0, 1e-4));
+  CHECK(near(pl->pz, z0 - 66.6666667 * 1.0, 1e-2));
+  // Hold right: accelerates toward cap, clamps at +58.8235. Keep the
+  // total under the 30s control cutoff.
+  FreefallInput in{};
+  in.right = true;
+  ffStepN(rt, 300, in);
+  CHECK(pl->px <= 58.8235294f + 1e-4f);
+  CHECK(near(pl->px, 58.8235294, 1e-3) && pl->vx == 0.0f);
+  in = {};
+  in.up = true;
+  ffStepN(rt, 300, in);
+  CHECK(pl->py <= 35.2941176f + 1e-4f);
+  CHECK(near(pl->py, 35.2941176, 1e-3) && pl->vy == 0.0f);
+  // Control cutoff at timeline > 30: spring-damp pulls to center.
+  rt.timeline = 30.01f;
+  pl->vx = 50.0f;
+  const float pxPre = pl->px;
+  ffStep(rt, in);
+  CHECK(near(pl->vx, (50.0f - pxPre * 2.0f) * 0.5f, 1e-3));
+  // AABB tracks position with {4,5,5} extents.
+  CHECK(near(pl->aabb[0], pl->px - 4.0) && near(pl->aabb[3], pl->px + 4.0));
+  CHECK(near(pl->aabb[1], pl->py - 5.0) && near(pl->aabb[5], pl->pz + 5.0));
+}
+
+void test_freefall_missile() {
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, ffCourse(0, 0), 4242);
+  ffRunIntro(rt);
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  FreefallObject* pl = ffPlayer(rt);
+  CHECK(pl);
+  // Force a missile wave: budget 1, timer 1 -> spawns next tick.
+  rt.missileBudget = 1;
+  rt.missileTimer = 1;
+  ffStep(rt, {});
+  FreefallObject* m = ffFirstOfType(rt, 1);
+  // Spawned with timer 60, ticked once in the same frame -> 59.
+  CHECK(m != nullptr && m->timer == 59);
+  const float spd = std::sqrt(m->vx * m->vx + m->vy * m->vy);
+  CHECK(near(spd, 250.0, 1e-3) && near(m->vz, 250.0));
+  CHECK(ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndMLnch));
+  // Launch: timer 60 -> 0 over 60 frames, position integrates.
+  const float mz0 = m->pz;
+  ffStepN(rt, 60);
+  CHECK(m->timer == 0);
+  CHECK(m->pz > mz0);  // launched upward (+vz) at the falling player
+  // Homing: velocity blends toward the lead point.
+  ffStepN(rt, 30);
+  const float vmag =
+      std::sqrt(m->vx * m->vx + m->vy * m->vy + m->vz * m->vz);
+  CHECK(vmag > 200.0f && vmag < 300.0f);
+  // Place it on a collision course: right at the player moving in.
+  m->px = pl->px;
+  m->py = pl->py;
+  m->pz = pl->pz - 3.0f;
+  m->vx = 0;
+  m->vy = 0;
+  m->vz = 60.0f;
+  const int hp0 = rt.health;
+  ffStep(rt, {});
+  // Converted to a type-2 explosion at the player position.
+  FreefallObject* ex = ffFirstOfType(rt, 2);
+  CHECK(ex != nullptr && ex == m);
+  CHECK(ex->model == mdk::kFfModelBang && ex->explodeFlag == 1);
+  CHECK(rt.health == hp0 - 4);  // skill 0: fixed 4 damage
+  CHECK(pl->animHandle == mdk::kFfAnimKurtHit);
+  CHECK(ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndExplode));
+  // Explosion lifetime = explodeAnimFrames units, then freed.
+  rt.explodeAnimFrames = 3.0f;
+  ffStepN(rt, 4);
+  CHECK(ffFirstOfType(rt, 2) == nullptr);
+  // Pass behavior: once dz <= -5 the missile sinks 60 frames then frees.
+  FreefallRuntime rt2;
+  mdk::freefallInit(rt2, ffCourse(0, 0), 4242);
+  ffRunIntro(rt2);
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  FreefallObject* pl2 = ffPlayer(rt2);
+  rt2.missileBudget = 1;
+  rt2.missileTimer = 1;
+  ffStep(rt2, {});
+  FreefallObject* m2 = ffFirstOfType(rt2, 1);
+  CHECK(m2);
+  // Skip launch; park it above the player so homing registers a pass
+  // (dz = player.z - missile.z <= -5 means the missile overtook upward).
+  m2->timer = 0;
+  m2->pz = pl2->pz + 10.0f;
+  ffStep(rt2, {});
+  CHECK(m2->timer < 0);  // post-pass linger
+  CHECK(ffSawEvent(rt2, mdk::kFfEvSound, mdk::kFfSndMPass));
+  ffStepN(rt2, 65);
+  CHECK(ffFirstOfType(rt2, 1) == nullptr);
+  // Collision window closes at timeline 30.
+  FreefallRuntime rt3;
+  mdk::freefallInit(rt3, ffCourse(0, 0), 4242);
+  ffRunIntro(rt3);
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  rt3.timeline = 30.5f;
+  rt3.missileBudget = 1;
+  rt3.missileTimer = 1;
+  ffStep(rt3, {});
+  FreefallObject* m3 = ffFirstOfType(rt3, 1);
+  FreefallObject* pl3 = ffPlayer(rt3);
+  m3->px = pl3->px;
+  m3->py = pl3->py;
+  m3->pz = pl3->pz - 3.0f;
+  m3->vz = 60.0f;
+  const int hp3 = rt3.health;
+  ffStep(rt3, {});
+  CHECK(rt3.health == hp3 && ffFirstOfType(rt3, 2) == nullptr);
+}
+
+void test_freefall_pickup() {
+  FreefallRuntime rt;
+  // FALLPU pops backward — the last record ("SW_H25") spawns first.
+  mdk::freefallInit(rt, ffCourse(0, 0, {"SW_DUMMY", "SW_KEY", "SW_H25"}),
+                    777);
+  ffRunIntro(rt);
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  CHECK(rt.pickupsRemaining == 3);
+  FreefallObject* pl = ffPlayer(rt);
+  // Force the pop timer -> pops the LAST record first (backward walk).
+  const float plz0 = pl->pz;
+  rt.pickupTimer = 1;
+  ffStep(rt, {});
+  FreefallObject* p = ffFirstOfType(rt, 4);
+  CHECK(p != nullptr && p->pickupRec == 2);
+  CHECK(near(p->vz, -133.333333, 1e-3));
+  // Spawned at player.z+15 then integrated once this frame (-133.33*dt).
+  CHECK(near(p->pz, plz0 + 15.0f - 133.333333f / 30.0f, 1e-3));
+  CHECK(p->timer >= 29 && p->timer <= 92);  // (rand&0x3f)+30, -1 this tick
+  CHECK(ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndPFall));
+  // Timer expiry deploys the chute + brakes toward -50.
+  p->timer = 1;
+  ffStep(rt, {});
+  CHECK(p->chute == mdk::kFfModelChute);
+  CHECK(ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndChute));
+  ffStepN(rt, 60);
+  CHECK(near(p->vz, -50.0, 1e-4));
+  // No-hit: the pickup is NOT freed (regression — earlier bug freed it).
+  p->px = pl->px + 50.0f;
+  p->py = pl->py + 40.0f;
+  ffStep(rt, {});
+  CHECK(ffFirstOfType(rt, 4) == p);
+  // Collect: align on the player, let the segment clip.
+  p->px = pl->px;
+  p->py = pl->py;
+  p->pz = pl->pz + 2.0f;
+  rt.health = 50;
+  ffStep(rt, {});
+  CHECK(ffFirstOfType(rt, 4) == nullptr);
+  CHECK(rt.health == 60);  // SW_H25 = +10 cap 100 (OBSERVED grant)
+  CHECK(ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndPColl));
+  CHECK(ffSawEvent(rt, mdk::kFfEvGrantHealth, 5));
+  // Cull: deployed pickup above the camera plane despawns.
+  FreefallRuntime rt2;
+  mdk::freefallInit(rt2, ffCourse(0, 0, {"SW_H50"}), 777);
+  ffRunIntro(rt2);
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  rt2.pickupTimer = 1;
+  ffStep(rt2, {});
+  FreefallObject* q = ffFirstOfType(rt2, 4);
+  q->timer = 0;
+  q->chute = mdk::kFfModelChute;
+  ffStep(rt2, {});
+  q->pz = rt2.cameraPos[2] + 5.0f;
+  ffStep(rt2, {});
+  CHECK(ffFirstOfType(rt2, 4) == nullptr);
+}
+
+void test_freefall_radar() {
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, ffCourse(0, 0), 5150);
+  ffRunIntro(rt);
+  FreefallObject* pl = ffPlayer(rt);
+  rt.radarTimer = 1;
+  ffStep(rt, {});
+  FreefallObject* r = ffFirstOfType(rt, 3);
+  CHECK(r != nullptr && ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndRStart));
+  // Rises at 3000/s toward player.z - 3 (the plane sinks as Kurt falls;
+  // a 100-unit rise overshoots it and snaps to the plane).
+  r->tz = pl->pz - 103.0f;
+  ffStep(rt, {});
+  CHECK(near(r->tz, pl->pz - 3.0, 1e-3));
+  // In-plane steer; force a lock by placing the marker at the player.
+  r->tx = pl->px;
+  r->ty = pl->py;
+  const int budget0 = rt.missileBudget;
+  ffStep(rt, {});
+  CHECK(r->timer == -1);
+  CHECK(rt.missileTimer == 1);
+  CHECK(rt.missileBudget >= budget0 + rt.waveSize &&
+        rt.missileBudget <= budget0 + rt.waveSize + 1);
+  CHECK(ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndKSeen));
+  // Sink: tz drops at 1500/s, frees below 0 and re-arms the timer.
+  rt.radarDelay = 63;
+  r->tz = 1.0f;
+  ffStep(rt, {});
+  CHECK(ffFirstOfType(rt, 3) == nullptr);
+  CHECK(rt.radarTimer >= 63 && rt.radarTimer <= 126);
+}
+
+void test_freefall_completion_death() {
+  // Completion: timeline > 33 returns true, finished.
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 11);
+    ffRunIntro(rt);
+    rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+    // Completion is post-increment: 32.9 + 1/30 stays under 33.
+    rt.timeline = 32.9f;
+    CHECK(!mdk::freefallStep(rt, {}, 1, 1.0f, 1.0f / 30.0f));
+    rt.timeline = 33.0f;
+    CHECK(mdk::freefallStep(rt, {}, 1, 1.0f, 1.0f / 30.0f));
+    CHECK(rt.finished && !rt.died &&
+          rt.phase == FreefallRuntime::Phase::kDone);
+  }
+  // Death: health <= 0 -> fade to black (~1s at fade 1.0), then true.
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 11);
+    ffRunIntro(rt);
+    rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+    rt.timeline = 5.0f;
+    rt.health = 0;
+    rt.fade = 0.05f;
+    CHECK(!mdk::freefallStep(rt, {}, 1, 1.0f, 1.0f / 30.0f));
+    CHECK(mdk::freefallStep(rt, {}, 1, 1.0f, 1.0f / 30.0f));
+    CHECK(rt.died && !rt.finished &&
+          rt.phase == FreefallRuntime::Phase::kDone);
+  }
+  // K_FINISH edge fires once when control ends.
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 11);
+    ffRunIntro(rt);
+    rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+    rt.timeline = 29.99f;
+    rt.camPrevTimeline = 29.9f;
+    ffStep(rt, {});
+    bool seen = ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndKFinish);
+    ffStep(rt, {});
+    seen = seen || ffSawEvent(rt, mdk::kFfEvSound, mdk::kFfSndKFinish);
+    CHECK(seen);
+    int count = 0;
+    for (int i = 0; i < 5; ++i) {
+      ffStep(rt, {});
+      for (const auto& e : rt.events)
+        if (e.kind == mdk::kFfEvSound && e.a == mdk::kFfSndKFinish) ++count;
+    }
+    CHECK(count == 0);
+  }
+}
+
+void test_freefall_determinism() {
+  // Two identical runs produce identical state digests.
+  auto digest = [](FreefallRuntime& rt, int frames) {
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](std::uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    FreefallInput in{};
+    for (int f = 0; f < frames; ++f) {
+      in.right = (f % 40) < 20;
+      in.up = (f % 60) < 30;
+      mdk::freefallStep(rt, in, 1, 1.0f, 1.0f / 30.0f);
+      mix(std::bit_cast<std::uint32_t>(rt.timeline));
+      mix(static_cast<std::uint32_t>(rt.rng));
+      mix(static_cast<std::uint32_t>(rt.health));
+      for (int i = rt.listHead; i >= 0; i = rt.pool[i].next) {
+        const FreefallObject& o = rt.pool[i];
+        mix(std::bit_cast<std::uint32_t>(o.px));
+        mix(std::bit_cast<std::uint32_t>(o.py));
+        mix(std::bit_cast<std::uint32_t>(o.pz));
+        mix(static_cast<std::uint32_t>(o.type) << 16 |
+            static_cast<std::uint32_t>(o.timer));
+      }
+    }
+    return h;
+  };
+  FreefallRuntime a, b;
+  auto course = ffCourse(2, 1, {"SW_H25", "SW_SGREN", "SW_KEY"});
+  mdk::freefallInit(a, course, 0xC0FFEE);
+  mdk::freefallInit(b, course, 0xC0FFEE);
+  const std::uint64_t h = digest(a, 1200);
+  CHECK(h == digest(b, 1200));
+  // Different seed -> different digest (RNG actually feeds gameplay).
+  FreefallRuntime c;
+  mdk::freefallInit(c, course, 0xDEAD);
+  CHECK(digest(c, 1200) != h);
+}
+
+void test_freefall_freelist() {
+  // LIFO freelist: alloc order pool[0], [1], ...; free pushes back on top.
+  // Active-list insertion is AFTER the head, so the newest spawn walks
+  // first (list order 0 -> newest -> older).
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, ffCourse(0, 0), 3);
+  ffRunIntro(rt);  // player = pool[0]
+  rt.radarTimer = 0;  // disarm ambient spawns (seeded (rand&0xf)+7 by the intro)
+  CHECK(rt.listHead == 0);
+  rt.missileBudget = 2;
+  rt.missileTimer = 1;
+  ffStep(rt, {});   // missile A = pool[1]
+  rt.missileTimer = 1;
+  ffStep(rt, {});   // missile B = pool[2], walks before A
+  FreefallObject* b = ffFirstOfType(rt, 1);
+  CHECK(b == &rt.pool[2]);
+  // Free pool[2] via the post-pass linger path -> LIFO push.
+  b->timer = -58;
+  ffStepN(rt, 4);   // -59,-60,-61 < -60 -> freed
+  CHECK(ffFirstOfType(rt, 1) == &rt.pool[1]);
+  rt.missileBudget = 1;
+  rt.missileTimer = 1;
+  ffStep(rt, {});
+  FreefallObject* m = ffFirstOfType(rt, 1);
+  CHECK(m == &rt.pool[2]);  // LIFO reuse — stale fields inherit
+  // Stale-field inheritance: the reused record kept its old position
+  // (the missile spawner never writes position — OBSERVED).
+  CHECK(m->pz != 0.0f);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -16437,6 +16903,16 @@ int main() {
   test_player_projectiles();
   test_arena_render();
   test_arena_mesh();
+  test_freefall_init();
+  test_freefall_intro();
+  test_freefall_input_fold();
+  test_freefall_motion();
+  test_freefall_missile();
+  test_freefall_pickup();
+  test_freefall_radar();
+  test_freefall_completion_death();
+  test_freefall_determinism();
+  test_freefall_freelist();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
