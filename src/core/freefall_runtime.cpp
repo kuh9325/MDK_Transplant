@@ -619,14 +619,22 @@ void bonesTick(FreefallRuntime& rt, FreefallObject& o, float frameUnits,
 
 // FUN_0046a9c8 — pickup name -> grant. Table 1 (0x49bad4) is the
 // health/ammo/inventory list, table 2 (0x49bba0) the key/seal list.
-// Headless port emits the grant events; the observed health cases
-// (rows 5..9) also apply to the runtime health.
+// OBSERVED (FUN_0046a790): rows 0..4 write ammo[1+row] += 0x49bb04[row]
+// (halved on skill 2 when > 1) and pending-weapon 0x541619 = row+1;
+// rows 5..9 are health (+10/+50 cap 100, floor 100, floor 150, +1 cap
+// 100 — all no-ops when health already exceeds the floor); row 10 runs
+// FUN_0046aa30 and row 11 does nothing extra. The headless port applies
+// the health rows to rt.health and reports rows 0..4 amounts in the
+// grant event's b so the coordinator can land them on the shared ammo
+// block (0x54161f..33).
 void applyPickup(FreefallRuntime& rt, int recIdx) {
   static const char* const kGrantTable[] = {
       "SW_HOME",  "SW_SGREN", "SW_HGREN", "SW_LGREN", "SW_BONES",
       "SW_H25",   "SW_H50",   "SW_H100",  "SW_H150",  "SW_H01",
       "SW_EWJ",   "BONEFLC",
   };
+  // OBSERVED 0x49bb04 — grant amounts for rows 0..4.
+  static const int kGrantAmount[] = {8, 3, 3, 8, 1};
   static const char* const kKeyTable[] = {
       "SW_DUMMY", "SW_INTER", "SW_TWIST", "SW_THUMP", "SW_HBOMB",
       "SW_GATT",  "SW_KEY",   "SW_SEAL",  "SW_SBONE",
@@ -648,10 +656,14 @@ void applyPickup(FreefallRuntime& rt, int recIdx) {
           emit(rt, kFfEvGrantHealth, i, 50);
           return;
         }
-        case 7:
-        case 8: {  // SW_H100 / SW_H150 — set 100
-          rt.health = 100;
+        case 7: {  // SW_H100 — health floor 100
+          if (rt.health < 100) rt.health = 100;
           emit(rt, kFfEvGrantHealth, i, 100);
+          return;
+        }
+        case 8: {  // SW_H150 — health floor 150
+          if (rt.health < 150) rt.health = 150;
+          emit(rt, kFfEvGrantHealth, i, 150);
           return;
         }
         case 9: {  // SW_H01 +1 cap 100
@@ -661,9 +673,16 @@ void applyPickup(FreefallRuntime& rt, int recIdx) {
           return;
         }
         default: {
-          // ammo/inventory rows — the grant amounts live in the shared
-          // ammo table; emit the semantic event only.
-          emit(rt, kFfEvGrantAmmo, i, 0);
+          // rows 0..4 — ammo grants (0x49bb04 amounts, halved on
+          // skill 2 when the amount exceeds 1); rows 10/11 are the
+          // SW_EWJ (FUN_0046aa30) / BONEFLC paths — the event still
+          // reports the row with amount 0 as the seam marker.
+          int amount = 0;
+          if (i < 5) {
+            amount = kGrantAmount[i];
+            if (rt.skill == 2 && amount > 1) amount /= 2;
+          }
+          emit(rt, kFfEvGrantAmmo, i, amount);
           return;
         }
       }

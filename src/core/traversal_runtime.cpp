@@ -817,6 +817,15 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
   rt.cs.contactHook = surfaceContactHook;
   rt.cs.surfaceContextMask = 8; // the player sweep channel
 
+  // FUN_00433c4c's weapon/fire indicator reset (0x433d22..0x433d30 —
+  // also written by the mode-6 briefing at 0x429d4b): 541618 = 0,
+  // 541619 = 0, 54161a = 3, 54161b = 0. The ammo block 0x54161f..33
+  // is NOT reset — grants/inventory persist across the transition.
+  rt.wpnSel0 = 0;
+  rt.wpnSel1 = 0;
+  rt.burstIndex = 3;
+  rt.fireCadence = 0.0f;
+
   rt.cur = rt.arenas[spawnArena].get();
   rt.cs.arena = &rt.cur->dyn.col;
   rt.cs.surface = &rt.cur->surface;

@@ -39,6 +39,7 @@
 #include "core/player_projectiles.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
+#include "core/progression_runtime.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
@@ -16387,6 +16388,7 @@ using mdk::FreefallCourseData;
 using mdk::FreefallInput;
 using mdk::FreefallObject;
 using mdk::FreefallRuntime;
+using mdk::TraversalRuntime;
 
 FreefallCourseData ffCourse(int course = 0, int skill = 0,
                             std::initializer_list<const char*> names = {}) {
@@ -16880,6 +16882,271 @@ void test_freefall_freelist() {
   CHECK(m->pz != 0.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 13B — freefall→traversal handoff coordinator.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Minimal loadable level triple for level-dir <n> under a tmp root:
+// DTI with one arena "A<n>_0" (s0 spawn: arena 0, pos, yaw), CMI with
+// four empty tables, MTO with a matching region-C block (one degenerate
+// node/poly/vert — collisionBlobParse requires nonzero counts).
+std::filesystem::path makeSyntheticLevel(const std::filesystem::path& tmp,
+                                         int dirNum, float px, float py,
+                                         float pz, float yaw) {
+  namespace fs = std::filesystem;
+  const fs::path dir =
+      tmp / "TRAVERSE" / ("LEVEL" + std::to_string(dirNum));
+  fs::create_directories(dir);
+  const std::string stem = "LEVEL" + std::to_string(dirNum);
+  const std::string arenaName = "A" + std::to_string(dirNum) + "_0";
+
+  auto dti = SyntheticDti::build(
+      (stem + ".DTI").c_str(), {},
+      {{arenaName.c_str(), 1.0f, {}}},
+      0x70, 8, 4, 0xffffffff, false);
+  // s0 spawn record: params[0] arena idx, [1..3] pos, [4] yaw deg.
+  dti.put32(static_cast<std::size_t>(dti.s0File), 0);
+  dti.put32(static_cast<std::size_t>(dti.s0File + 4),
+            SyntheticDti::f32bits(px));
+  dti.put32(static_cast<std::size_t>(dti.s0File + 8),
+            SyntheticDti::f32bits(py));
+  dti.put32(static_cast<std::size_t>(dti.s0File + 12),
+            SyntheticDti::f32bits(pz));
+  dti.put32(static_cast<std::size_t>(dti.s0File + 16),
+            SyntheticDti::f32bits(yaw));
+  std::ofstream(dir / (stem + ".DTI"), std::ios::binary)
+      .write(reinterpret_cast<const char*>(dti.buf.data()),
+             static_cast<std::streamsize>(dti.buf.size()));
+
+  auto cmi = SyntheticCmi::build((stem + ".CMI").c_str(),
+                                 {{}, {}, {}, {}}, 8);
+  std::ofstream(dir / (stem + ".CMI"), std::ios::binary)
+      .write(reinterpret_cast<const char*>(cmi.buf.data()),
+             static_cast<std::streamsize>(cmi.buf.size()));
+
+  SyntheticMto::BlockSpec spec;
+  spec.entryName = arenaName.c_str();
+  spec.innerName = "MAT";
+  spec.c2 = 1;  // one BSP node
+  spec.c3 = 1;  // one poly
+  spec.c4 = 1;  // one vert
+  auto mto = SyntheticMto::build((stem + "O.MTO").c_str(), {spec});
+  // Patch the region-C node: unit +z normal, leaf children (-1,-1),
+  // empty poly sets — poly/vert zeroes are already valid.
+  {
+    const std::size_t off = mto.blockOffs[0];
+    auto rd32 = [&](std::size_t o) {
+      return static_cast<std::uint32_t>(mto.buf[o]) |
+             (static_cast<std::uint32_t>(mto.buf[o + 1]) << 8) |
+             (static_cast<std::uint32_t>(mto.buf[o + 2]) << 16) |
+             (static_cast<std::uint32_t>(mto.buf[o + 3]) << 24);
+    };
+    const std::size_t tC = off + 4 + rd32(off + 0x0c);
+    const std::size_t node = tC + 8;  // after c1,c2 counts
+    mto.put32(node + 8, SyntheticDti::f32bits(1.0f));  // nz = 1
+    mto.put32(node + 16, 0xffffffff);                // children -1,-1
+  }
+  std::ofstream(dir / (stem + "O.MTO"), std::ios::binary)
+      .write(reinterpret_cast<const char*>(mto.buf.data()),
+             static_cast<std::streamsize>(mto.buf.size()));
+  return dir;
+}
+
+} // namespace
+
+void test_progression_handoff() {
+  namespace fs = std::filesystem;
+  using mdk::ProgressionError;
+  using mdk::ProgressionHandoff;
+  using mdk::ProgressionRoute;
+  using mdk::ProgressionSession;
+
+  // OBSERVED 0x4999e8 — internal level id → TRAVERSE\LEVEL<n> dir.
+  {
+    const int expect[8] = {7, 6, 3, 4, 8, 5, 2, 1};
+    for (int i = 0; i < 8; ++i)
+      CHECK(mdk::progressionLevelDir(i) == expect[i]);
+    CHECK(mdk::progressionLevelDir(-1) == -1);
+    CHECK(mdk::progressionLevelDir(8) == -1);
+  }
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_handoff";
+  fs::remove_all(tmp);
+  makeSyntheticLevel(tmp, 7, 10.0f, 20.0f, 30.0f, 90.0f);
+  makeSyntheticLevel(tmp, 6, 1.0f, 2.0f, 3.0f, 45.0f);
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+
+  // --- not-finished guard ---
+  {
+    ProgressionSession s;
+    s.levelId = 0;
+    FreefallRuntime ff;  // still running
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) ==
+          ProgressionError::kNotFinished);
+    CHECK(s.mode == 0 && !s.freefallHandedOff);
+    CHECK(trav.arenas.empty());  // nothing loaded
+  }
+
+  // --- success route: course 0 -> LEVEL7, health/rng/ammo carry ---
+  {
+    ProgressionSession s;
+    mdk::progressionNewGame(s, 1);
+    mdk::progressionEnterFreefall(s);
+    FreefallRuntime ff;
+    mdk::freefallInit(ff, ffCourse(0, 1), 0xBEEF);
+    ff.finished = true;
+    ff.phase = FreefallRuntime::Phase::kDone;
+    ff.health = 42;                  // damaged but alive at 33s
+    ff.rng = 0x12345678;
+    ff.listHead = 0;                 // live objects present
+    ff.bonesIdx = 5;
+    // grant events the original wrote into the ammo block mid-flight
+    ff.events.push_back({mdk::kFfEvGrantAmmo, 0, 8});   // ammo[1] += 8
+    ff.events.push_back({mdk::kFfEvGrantAmmo, 2, 3});   // ammo[3] += 3
+    ff.events.push_back({mdk::kFfEvGrantAmmo, 10, 0});  // SW_EWJ — seam, skip
+    ff.events.push_back({mdk::kFfEvGrantHealth, 5, 10});
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) == ProgressionError::kOk);
+    CHECK(out.route == ProgressionRoute::kTraversal);
+    CHECK(s.mode == 3);                          // FUN_004346e8 write
+    CHECK(out.levelId == 0);
+    CHECK(out.traversalDir == 7);
+    CHECK(out.dtiPath == "TRAVERSE/LEVEL7/LEVEL7.DTI");
+    CHECK(out.healthBefore == 42 && out.healthAfter == 42);
+    CHECK(s.health == 42);
+    CHECK(trav.fieldHealth == 42);               // carried verbatim
+    CHECK(trav.rngState == 0x12345678);          // shared rand stream
+    CHECK(trav.ammo[1] == 8 && trav.ammo[3] == 3 && trav.ammo[0] == 0);
+    CHECK(out.ammoGranted == 2);
+    CHECK(out.loadError == mdk::TraversalLoadError::kOk);
+    // s0 spawn: arena 0 ("A7_0"), pos (10,20,30), yaw 90.
+    CHECK(out.spawnArena == 0);
+    CHECK(trav.cur != nullptr && trav.cur->name == "A7_0");
+    CHECK(trav.cs.pos[0] == 10.0f && trav.cs.pos[1] == 20.0f &&
+          trav.cs.pos[2] == 30.0f);
+    CHECK(trav.motion.yawDeg == 90.0f);
+    // FUN_00433c4c indicator block reset (ammo block untouched).
+    CHECK(trav.wpnSel0 == 0 && trav.wpnSel1 == 0 &&
+          trav.burstIndex == 3 && trav.fireCadence == 0.0f);
+    // teardown: the freefall object lists are drained.
+    CHECK(ff.listHead == -1 && ff.bonesIdx == -1);
+    // first traversal frame runs (gates valid).
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const auto fr = mdk::stepTraversalRuntime(trav, mdk::RawGameplayInput{},
+                                              bindings, timing);
+    CHECK(fr.frame == 0);
+    CHECK(trav.cs.arenaValid == 1 && trav.cs.queryEnabled == 1);
+    // double transition rejected — no reload, mode unchanged.
+    ProgressionHandoff out2;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out2,
+                                          &err) ==
+          ProgressionError::kAlreadyHandedOff);
+    CHECK(s.mode == 3);
+  }
+
+  // --- failure route: died -> frontend, no traversal load ---
+  {
+    ProgressionSession s;
+    mdk::progressionNewGame(s, 2);
+    mdk::progressionEnterFreefall(s);
+    s.levelId = 4;  // course 4 (Bones)
+    FreefallRuntime ff;
+    mdk::freefallInit(ff, ffCourse(4, 2), 9);
+    ff.died = true;
+    ff.phase = FreefallRuntime::Phase::kDone;
+    ff.health = 0;
+    ff.listHead = 3;
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) == ProgressionError::kOk);
+    CHECK(out.route == ProgressionRoute::kFrontend);
+    CHECK(s.mode == 0);                          // FUN_0041d85c write
+    CHECK(s.health == 0);                        // no reset at route
+    CHECK(trav.arenas.empty());                  // traversal untouched
+    CHECK(trav.fieldHealth == 0);
+    CHECK(out.traversalDir == -1 && out.dtiPath.empty());
+    CHECK(ff.listHead == -1);                    // teardown still ran
+  }
+
+  // --- health is the sole predicate: finished + health<=0 -> frontend ---
+  {
+    ProgressionSession s;
+    mdk::progressionNewGame(s, 0);
+    mdk::progressionEnterFreefall(s);
+    FreefallRuntime ff;
+    mdk::freefallInit(ff, ffCourse(2, 0), 1);
+    ff.finished = true;   // timeline completed but health drained
+    ff.health = -4;
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) == ProgressionError::kOk);
+    CHECK(out.route == ProgressionRoute::kFrontend);
+    CHECK(s.mode == 0 && trav.arenas.empty());
+  }
+
+  // --- bad level id / load failure ---
+  {
+    ProgressionSession s;
+    s.levelId = 9;  // outside the 0x4999e8 table
+    mdk::progressionEnterFreefall(s);
+    FreefallRuntime ff;
+    ff.finished = true; ff.health = 50;
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) ==
+          ProgressionError::kBadLevelId);
+    CHECK(s.mode == 3);  // FUN_004346e8's mode write precedes the load
+  }
+  {
+    ProgressionSession s;
+    s.levelId = 1;  // course 1 -> LEVEL6 exists; course->LEVEL4 (id 3)
+    mdk::progressionEnterFreefall(s);
+    s.levelId = 3;  // LEVEL4 was never written into tmp -> load fail
+    FreefallRuntime ff;
+    ff.finished = true; ff.health = 77;
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) ==
+          ProgressionError::kTraversalLoad);
+    CHECK(out.traversalDir == 4);
+    CHECK(out.loadError == mdk::TraversalLoadError::kDtiRead);
+  }
+
+  // --- course 1 -> LEVEL6 end-to-end (second mapped dir) ---
+  {
+    ProgressionSession s;
+    mdk::progressionNewGame(s, 0);
+    mdk::progressionEnterFreefall(s);
+    s.levelId = 1;
+    FreefallRuntime ff;
+    ff.finished = true; ff.health = 100; ff.rng = 7;
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) == ProgressionError::kOk);
+    CHECK(out.traversalDir == 6);
+    CHECK(trav.cur != nullptr && trav.cur->name == "A6_0");
+    CHECK(trav.cs.pos[0] == 1.0f && trav.motion.yawDeg == 45.0f);
+    CHECK(trav.fieldHealth == 100 && trav.rngState == 7);
+  }
+
+  fs::remove_all(tmp);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -16952,6 +17219,7 @@ int main() {
   test_freefall_completion_death();
   test_freefall_determinism();
   test_freefall_freelist();
+  test_progression_handoff();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

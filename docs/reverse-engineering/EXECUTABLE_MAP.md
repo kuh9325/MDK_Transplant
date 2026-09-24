@@ -96,28 +96,52 @@ surfaces).
   dialogs (save dialog, options menu, abort console, …).
 - Sub-mode `switch (DAT_00541493)` cases 1–11 → per-dialog functions, each
   followed by `FUN_004026f8` (post-dialog frame op — exact role TENTATIVE).
-- Primary mode `DAT_00541492` dispatch:
-  - `0` frontend (`FUN_0041dc90` orchestrator),
-  - `2` transition → `FUN_004103d8`/`FUN_0040fa68` then intro
-    `FUN_0041d85c` or `FUN_004346e8` (writes three `0x447a0000`=1000.0f
-    state floats — fall/reset init),
-  - `3` traversal frame `FUN_00436100`, else `FUN_004371bc`+`FUN_0042b270`
-    (stream),
-  - `5` `FUN_0042c824/0x42c8b0` (stats/high-score),
-  - `6` level-load `FUN_004296f0`→`FUN_004295c4`,
-  - `7` traverse-load continuation,
-  - `8` cinematic `FUN_0047b06c`.
+- Primary mode `DAT_00541492` dispatch (Phase 13B, instruction-level):
+  - `0`/`1`/`4` frontend family — frame `FUN_0041dc90` (menu dispatch;
+    `0x54b584` New Game edge → `FUN_0041b630(0)` at `0x41dfba`:
+    `FUN_0041b724` resets `541498=0`/`541554=100`, `FUN_0041b7b4(0)`
+    preload, `FUN_00429200(1)` briefing-only → mode 6 → `FUN_0040ef28`),
+  - `2` freefall — frame `FUN_004103d8`; return 1 → `FUN_0040fa68`
+    teardown then `CMP [0x541554],0` @`0x4014bc`: `>0` →
+    `0x5414a0/a4/a8 = 1000.0f` + `FUN_004346e8(0)` (mode 3);
+    `≤0` → `FUN_0041d85c` (mode 0),
+  - `3` traversal — frame `FUN_00436100`; `0x49a030` flag →
+    `FUN_004371bc` teardown + `FUN_0042b270` → mode 5,
+  - `5` post-traversal intermission — frame `FUN_0042c8b0`; done →
+    `541498 < 4` ? `FUN_00429200` (mode 6) : `541498 = 5` + mode 7,
+  - `6` level-load/briefing — entry `FUN_00429200` (arg → sub-state
+    `0x54bef8`); frame `FUN_00422bc0`: `FUN_00429fe4` multi-stage
+    loader (`541498++` once on completion — the campaign advance),
+    `FUN_00429cb4` briefing (`541554` floor 100 @`0x429d6a`,
+    indicator reset `541618/19/1a/1b = 0/0/3/0` @`0x429d4b`),
+  - `7` traversal-only load — `FUN_0041b7b4(541498)` + `FUN_004346e8`,
+  - `8` cinematic `FUN_0047b038`.
+- Level-directory table `0x4999e8` (dword[8] = `{7,6,3,4,8,5,2,1}`) —
+  indexed by `DAT_00541498` in `FUN_00433d40` (`0x433d7d`) and
+  `FUN_0041b7b4` (`0x41b7d1`) to build `TRAVERSE\LEVEL%d\LEVEL%d.*`
+  paths (`%s` = `0x541524` = `"TRAVERSE"`); `FUN_0040ef28` uses the
+  same id `+1` for `FALL3D_%d`/`FALLPU_%d`, so freefall course N and
+  traversal `LEVEL{table[N]}` share the id. `DAT_00541498` writers:
+  `FUN_0041b724` (=0 new game), `FUN_0041b7b4` (=arg),
+  `FUN_00429fe4` (`++` @`0x4297d9`), dispatcher (=5 @`0x4015ef`),
+  `FUN_004278c0` (save load).
 - Loop tail: `FUN_0041ab50` (shutdown-time file op on a path buffer —
   exact role TENTATIVE), then `thunk_FUN_0047f47f` exits.
 
-## Mode orchestrator — `FUN_0041dc90` (OBSERVED)
+## Frontend/menu frame — `FUN_0041dc90` (OBSERVED)
 
-Called only from the main loop; branches to: `FUN_0041d85c` intro/frontend,
-`FUN_0041b630` menu, `FUN_004202cc` save-game list, `FUN_0040ef28` FALL3D
-init, `FUN_0042b270` stream, `FUN_00429200` stats, `FUN_0041b7b4` level
-bundle loader, `FUN_00433d40` traversal loader, `FUN_004346e8` transition,
-`FUN_0047b06c` finish/video, `FUN_0041ef74` GIF slideshow,
-`FUN_004206d0` save writer.
+The mode-0 (and 1/4) frame body, called only from the main loop's
+primary dispatch; it is the frontend half of the orchestrator — the
+gameplay-mode routing lives in `FUN_0040103c` itself (see the mode
+table above). Branches to: `FUN_0041d85c` intro/frontend,
+`FUN_0041b630` menu/new-game chain, `FUN_004202cc` save-game list,
+`FUN_0040ef28` FALL3D init, `FUN_0042b270` stream, `FUN_00429200`
+stats/briefing, `FUN_0041b7b4` level bundle loader, `FUN_00433d40`
+traversal loader, `FUN_004346e8` transition, `FUN_0047b06c`
+finish/video, `FUN_0041ef74` GIF slideshow, `FUN_004206d0` save
+writer. `0x54148e` (the main-loop quit flag) is written here — an
+in-course quit surfaces through the frontend frame, not as a third
+freefall-exit branch.
 
 ## Subsystem map (BUILD_A)
 

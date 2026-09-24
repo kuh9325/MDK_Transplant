@@ -26,6 +26,7 @@
 #include "core/dynamic_objects.h"
 #include "core/file_family.h"
 #include "core/freefall_runtime.h"
+#include "core/frontend_machines.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
@@ -35,6 +36,7 @@
 #include "core/player_motion.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
+#include "core/progression_runtime.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
 #include "core/traversal_runtime.h"
@@ -95,6 +97,15 @@ int usage() {
                "                            steps the Phase 13A freefall core.\n"
                "                            Options: --course 0..4 --skill 0..2\n"
                "                            --seed N --frames N)\n"
+               "       mdk-inspect --data-path DIR --campaign-handoff "
+               "<relative-path>\n"
+               "                            (a FALL3D.BNI path; fast-forwards\n"
+               "                            the freefall course to completion,\n"
+               "                            runs the Phase 13B handoff and prints\n"
+               "                            the transition record + one traversal\n"
+               "                            frame on the success route.\n"
+               "                            Options: --course 0..4 --skill 0..2\n"
+               "                            --seed N --frames N)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -111,6 +122,46 @@ std::string stemOf(const std::string& relPath) {
   }
   const auto begin = slash == std::string::npos ? 0 : slash + 1;
   return relPath.substr(begin, dot - begin);
+}
+
+// Shared FALLPU_<course+1> pickup-table read for --freefall-runtime
+// and --campaign-handoff. FALLPU entries are 12-byte {name[8], u32}
+// records terminated by a NUL first name byte (OBSERVED: FUN_0040ef28
+// count loop + the BNI census in docs/reverse-engineering/
+// EXECUTABLE_MAP.md). Appends to `data.pickups`; returns false when
+// the BNI or the record cannot be read/parsed (detail says which).
+bool inspectReadFallpu(const mdk::DataRoot& root,
+                       const std::string& bniPath,
+                       mdk::FreefallCourseData& data,
+                       std::string* detail) {
+  const auto bniFile = root.readFile(bniPath, kEntriesMaxBytes, detail);
+  if (!bniFile) return false;
+  const auto dir = mdk::inspectBniDirectory(
+      std::span<const std::byte>(bniFile->data(), bniFile->size()));
+  if (dir.status != mdk::BniDirectoryStatus::kOk) {
+    if (detail)
+      *detail = "bni parse: " +
+                std::string(mdk::bniDirectoryStatusName(dir.status));
+    return false;
+  }
+  char recName[16];
+  std::snprintf(recName, sizeof recName, "FALLPU_%d", data.course + 1);
+  const mdk::BniRecord* rec = mdk::findBniRecord(dir, recName);
+  if (!rec) {
+    if (detail) *detail = std::string(recName) + " not found";
+    return false;
+  }
+  const std::byte* p = bniFile->data() + rec->payloadFileOffset;
+  const std::byte* end = bniFile->data() + rec->payloadEnd;
+  for (; p + 12 <= end; p += 12) {
+    if (p[0] == std::byte{0}) break;  // terminator entry
+    mdk::FreefallPickupRec r{};
+    for (int k = 0; k < 8; ++k)
+      r.name[k] = static_cast<char>(p[k]);
+    r.name[8] = '\0';
+    data.pickups.push_back(r);
+  }
+  return true;
 }
 
 int selftest() {
@@ -1195,6 +1246,7 @@ int main(int argc, char** argv) {
   bool arenaRender = false;
   bool traversalRuntime = false;
   bool freefallRuntime = false;
+  bool campaignHandoff = false;
   int ffCourse = 0;
   int ffSkill = 0;
   unsigned ffSeed = 0xC0FFEE;
@@ -1318,6 +1370,11 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;                 // FALL3D.BNI path
       freefallRuntime = true;
+    } else if (!std::strcmp(a, "--campaign-handoff")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;                 // FALL3D.BNI path
+      campaignHandoff = true;
     } else if (!std::strcmp(a, "--course")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -1513,7 +1570,8 @@ int main(int argc, char** argv) {
   if (!entriesMode && !visualInfoName && !fontInfoName &&
       !spriteInfoName && !collisionProbe && !arenaObjects &&
       !surfaceCensus && !arenaRender && !traversalRuntime &&
-      !freefallRuntime && !scriptDisasm && !objScriptDisasm) {
+      !freefallRuntime && !campaignHandoff && !scriptDisasm &&
+      !objScriptDisasm) {
     return 0;
   }
 
@@ -2130,6 +2188,119 @@ int main(int argc, char** argv) {
                 framesRun, rt.finished ? 1 : 0, rt.died ? 1 : 0,
                 (unsigned long long)digest);
     return 0;
+  }
+
+  // --campaign-handoff: Phase 13B diagnostic. Fast-forwards the
+  // freefall course to completion (same 30 fps step model as
+  // --freefall-runtime, silent), then drives the native
+  // freefall→traversal handoff: FUN_0040fa68 teardown, the health
+  // branch, and FUN_004346e8/FUN_00433d40 for the mapped level —
+  // or the frontend route when health <= 0. On the success route
+  // one traversal frame runs so its deterministic state joins the
+  // digest.
+  if (campaignHandoff) {
+    mdk::FreefallCourseData course;
+    course.course = ffCourse;
+    course.skill = ffSkill;
+    const bool fallpu =
+        inspectReadFallpu(*root, *target, course, &err);
+    mdk::FreefallRuntime ff;
+    mdk::freefallInit(ff, course, ffSeed);
+    std::printf("freefall:  course=%d skill=%d seed=%08x "
+                "pickups=%zu fallpu=%s\n",
+                ffCourse, ffSkill, ffSeed, course.pickups.size(),
+                fallpu ? "ok" : err.c_str());
+    int framesRun = 0;
+    bool done = false;
+    for (int f = 0; f < travFrames && !done; ++f) {
+      done = mdk::freefallStep(ff, mdk::FreefallInput{}, 1, 1.0f,
+                               1.0f / 30.0f);
+      ++framesRun;
+    }
+    std::printf("           frames=%d finished=%d died=%d health=%d "
+                "events=%zu\n",
+                framesRun, ff.finished ? 1 : 0, ff.died ? 1 : 0,
+                ff.health, ff.events.size());
+
+    mdk::ProgressionSession sess;
+    mdk::progressionNewGame(sess, ffSkill);
+    mdk::progressionEnterFreefall(sess);
+    // The orchestrator owns 541498 (new game = 0); the diag selects
+    // the course directly for mid-campaign starts.
+    sess.levelId = ffCourse;
+    mdk::TraversalRuntime trav;
+    mdk::ProgressionHandoff ho;
+    const auto pe = mdk::progressionFreefallHandoff(
+        *root, sess, ff, &trav, ho, &err);
+    std::printf("handoff:   err=%s route=%s mode=%d level=%d dir=%d\n",
+                mdk::progressionErrorName(pe),
+                ho.route == mdk::ProgressionRoute::kTraversal
+                    ? "traversal" : "frontend",
+                sess.mode, ho.levelId, ho.traversalDir);
+    std::printf("           health=%d->%d skill=%d rng=%08x "
+                "ammo-grants=%d teardown-list=%d bones=%d\n",
+                ho.healthBefore, ho.healthAfter, ho.skill, ho.rng,
+                ho.ammoGranted, ff.listHead, ff.bonesIdx);
+
+    std::uint64_t digest = 1469598103934665603ull;
+    auto mix = [&](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        digest ^= (v >> (i * 8)) & 0xff;
+        digest *= 1099511628211ull;
+      }
+    };
+    mix(static_cast<std::uint64_t>(sess.mode));
+    mix(static_cast<std::uint64_t>(ho.levelId));
+    mix(static_cast<std::uint64_t>(ho.traversalDir < 0
+                                       ? 0xffff : ho.traversalDir));
+    mix(static_cast<std::uint64_t>(ho.healthBefore));
+    mix(static_cast<std::uint64_t>(ho.healthAfter));
+    mix(static_cast<std::uint64_t>(ho.rng));
+
+    if (pe == mdk::ProgressionError::kOk &&
+        ho.route == mdk::ProgressionRoute::kTraversal) {
+      std::printf("traversal: dti=%s load=%s\n", ho.dtiPath.c_str(),
+                  mdk::traversalLoadErrorName(ho.loadError));
+      if (ho.loadError == mdk::TraversalLoadError::kOk) {
+        std::printf(
+            "           arenas=%zu spawn=%d cur=%s "
+            "pos=(%.2f,%.2f,%.2f) yaw=%.2f\n",
+            trav.arenas.size(), ho.spawnArena,
+            trav.cur ? trav.cur->name.c_str() : "?",
+            (double)ho.spawnPos[0], (double)ho.spawnPos[1],
+            (double)ho.spawnPos[2], (double)ho.spawnYawDeg);
+        std::printf(
+            "           carried health=%d ammo=[%d %d %d %d %d %d] "
+            "wpn=(%d %d %d %.1f)\n",
+            trav.fieldHealth, trav.ammo[0], trav.ammo[1],
+            trav.ammo[2], trav.ammo[3], trav.ammo[4], trav.ammo[5],
+            trav.wpnSel0, trav.wpnSel1, trav.burstIndex,
+            (double)trav.fireCadence);
+        const mdk::GameplayInputBindings bindings;
+        const mdk::FrontendTimingState timing;
+        const auto fr = mdk::stepTraversalRuntime(
+            trav, mdk::RawGameplayInput{}, bindings, timing);
+        std::printf(
+            "trav-f0:   arena=%d pos=(%.2f,%.2f,%.2f) yaw=%.2f "
+            "grounded=%d loco=%02x\n",
+            fr.curArenaIndex, (double)fr.pos[0], (double)fr.pos[1],
+            (double)fr.pos[2], (double)fr.yawDeg,
+            fr.grounded ? 1 : 0, fr.locoState);
+        mix(static_cast<std::uint64_t>(fr.curArenaIndex));
+        for (int i = 0; i < 3; ++i) {
+          std::uint32_t bits;
+          std::memcpy(&bits, &fr.pos[i], 4);
+          mix(bits);
+        }
+        std::uint32_t bits;
+        std::memcpy(&bits, &fr.yawDeg, 4);
+        mix(bits);
+        mix(fr.grounded ? 1 : 0);
+        mix(static_cast<std::uint64_t>(fr.locoState));
+      }
+    }
+    std::printf("digest:    %016llx\n", (unsigned long long)digest);
+    return pe == mdk::ProgressionError::kOk ? 0 : 1;
   }
 
   // --surface-census: Phase 5F BUILD_A smoke. Reads the .DTI target

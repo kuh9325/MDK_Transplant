@@ -4291,12 +4291,13 @@ seams, and boss-specific orchestration outside the generic
 ## 163. Mode-2 freefall core (OBSERVED, ported)
 
 `src/core/freefall_runtime.{h,cpp}` hosts the original FALL3D
-course — mode `0x541492 = 2`, entered from the orchestrator
-`FUN_0041dc90` (mode 6 loads the level bundle then `541498 < 5` →
-`FUN_0040ef28`) and exited to traversal (`FUN_004346e8`) when the
-tick returns 1 with `541554 > 0`, else the front end
-(`FUN_0041d85c`). Headless: no renderer/audio — presentation
-side-effects are emitted as typed `FreefallEvent`s.
+course — mode `0x541492 = 2`, entered via `FUN_0040ef28` (the mode-6
+briefing chain ends by calling it while `541498 < 5`; New Game's own
+path is `FUN_0041b630` → `FUN_00429200(1)` → briefing →
+`FUN_0040ef28`) and exited by the master loop `FUN_0040103c` to
+traversal (`FUN_004346e8`) when the tick returns 1 with `541554 > 0`,
+else the front end (`FUN_0041d85c`). Headless: no renderer/audio —
+presentation side-effects are emitted as typed `FreefallEvent`s.
 
 **Function ownership (BUILD_A, all OBSERVED via disasm):**
 
@@ -4315,7 +4316,7 @@ side-effects are emitted as typed `FreefallEvent`s.
 | `FUN_004118b0`/`FUN_00411710` | pickup: popped BACKWARD from `FALLPU_%d` (12-byte `{name[8],u32}` records, NUL-name terminator); type 4, `vel={0,0,-133.333}`, pos random in ±56.38/±33.53 at `player.z+15`, timer `(rand&0x3f)+30`, P_FALL; timer → CHUTE attach + sound, glide brake toward `-50` at `66.6667·dt`, yaw spin `30·dt`; `z > camZ` cull; post-deploy `FUN_0045c230` hit → P_COLL + K_COLL + `FUN_0046a9c8` grant + free |
 | `FUN_0041236c` | bones: flyby `z -= 74.074·dt`, one-shot pass sound on overtaking the player |
 | `FUN_004123f4` | camera projection writer — `0x540b28/2c/30` camera world pos (pickup cull plane = camZ) |
-| `FUN_0046a9c8` | pickup grant — two name tables (health/ammo vs key/seal); health rows apply +10/+50/=100/+1 cap 100, others emit semantic grant events |
+| `FUN_0046a9c8` | pickup grant dispatcher — `SW_HOME_*`/`SW_DUMMY_*` name split; `SW_*` rows → `FUN_0046a790`: rows 0–4 ammo `0x541623[row] += {8,3,3,8,1}` (`0x49bb04`, halved on skill 2 when >1) + pending-select `0x541619 = row+1`; rows 5–9 health `+10`/`+50`/floor-100/floor-150/`+1` cap 100; row 10 → `FUN_0046aa30`; row 11 no-op. `SW_DUMMY_*` rows → `FUN_0046a500` (key/seal inventory — separate seam) |
 | `FUN_00407e50` | input fold — four digital channels `±11.7647/±117.647` (`left=-X right=+X up=+Y down=-Y`), analog `axis·11.7647/·117.647` with Y negated; digital wins per axis |
 | `FUN_004555bc` | shared anim sequencer — modeled subset: clip accumulator advances in frame units; KURT_HIT expires into the `-256` sentinel after 18 frames (BNI census) |
 
@@ -4361,7 +4362,170 @@ pickup pops (P_FALL/CHUTE) → exit fade → completion at `t>33`.
 
 **Deferred seams (never emulated):** all sounds (event tags only),
 palette/fade uploads, zoom-sprite frames (index state kept), the
-`+0x60` trail FX ring, model basis matrices, the `0x541554`→traversal
-handoff (mode 6), `FUN_00418688` keymap config, save games, and
-Godot presentation. Explosion lifetime stays a bounded data seam
-(`FreefallCourseData::explodeAnimFrames`).
+`+0x60` trail FX ring, model basis matrices, `FUN_00418688` keymap
+config, save games, and Godot presentation. Explosion lifetime stays
+a bounded data seam (`FreefallCourseData::explodeAnimFrames`). The
+`0x541554`→traversal handoff itself is Phase 13B (§164).
+
+# Phase 13B — Freefall→Traversal Handoff
+
+## 164. Mode dispatch + the handoff seam (OBSERVED, instruction-level)
+
+The master loop `FUN_0040103c` (called once from WinMain) dispatches
+on the primary-mode byte `0x541492` each outer iteration; the
+sub-mode byte `0x541493` selects frontend/pause overlays and is 0
+while a gameplay mode runs. The loop exits on `0x54148e`. Verified
+mode table (dispatch + writers):
+
+| `0x541492` | role | entry write | frame body | exit edge |
+|---|---|---|---|---|
+| 0 | frontend/menu | `FUN_0041d85c` | `FUN_0041dc90` (menu dispatch — `0x54b584` New Game edge → `FUN_0041b630`) | menu selections arm the next mode |
+| 2 | freefall | `FUN_0040ef28` (`MOV BH,0x2` @`0x40f4f9`) | `FUN_004103d8` | returns 1 → `FUN_0040fa68` + health branch (below) |
+| 3 | traversal | `FUN_004346e8` | `FUN_00436100` | `0x49a030` flag → `FUN_004371bc` teardown + `FUN_0042b270` → mode 5 |
+| 5 | post-traversal intermission | `FUN_0042b270` | `FUN_0042c8b0` | done → `541498 < 4` ? `FUN_00429200` (mode 6) : `541498 = 5` + mode 7 |
+| 6 | level-load/briefing | `FUN_00429200` (arg picks `0x54bef8` = 2 full / 3 briefing-only) | `FUN_00422bc0` sub-state machine on `0x54bef8` | done → `FUN_0040ef28` (mode 2) while `541498 < 5` |
+| 7 | traversal-only load | dispatcher body | `FUN_0041b7b4(541498)` preload → `FUN_004346e8` | mode 3 |
+| 8 | cinematic | — | `FUN_0047b038` | — |
+| 1/4 | frontend family | — | `FUN_0041dc90` (same branch as 0) | — |
+
+Mode-6 sub-states (`0x54bef8`): `FUN_00429fe4` is the multi-stage
+loader — it increments `0x541498` **once** on completion (this is the
+only campaign-advance `++`); `FUN_00429cb4` is the mission
+briefing/map — on entry it floors `0x541554` to 100 (`0x429d6a`) and
+resets the weapon-indicator block `0x541618=0`/`541619=0`/`54161a=3`/
+`54161b=0` (`0x429d4b`), i.e. the health refill happens **before**
+each freefall, not between freefall and traversal.
+
+### The freefall exit branch (dispatcher mode-2 tail)
+
+`FUN_004103d8` returning nonzero is the sole trigger — one outer
+frame later, same iteration:
+
+```
+0x4014aa  CALL FUN_004103d8     ; freefall frame
+0x4014af  TEST EAX,EAX
+0x4014b1  JZ   loop             ; still falling
+0x4014b7  CALL FUN_0040fa68     ; teardown (below)
+0x4014bc  CMP  [0x541554],0     ; health — the SOLE predicate
+0x4014c3  JLE  0x4014e8
+ ; success: 0x5414a0/a4/a8 = 1000.0f (transition-fade timers)
+0x4014de  CALL FUN_004346e8     ; EAX=0 → entry arg bit1 clear
+0x4014ea  CALL FUN_0041d85c     ; failure: mode 0, frontend rebuild
+```
+
+`0x541498` is **not** written on this path — the course id in effect
+at completion is the one `FUN_0040ef28` consumed at entry. The branch
+is single-shot by construction (the dispatcher owns the decision;
+mode 2 is overwritten by the callee on either route).
+
+### Teardown — `FUN_0040fa68`
+
+Releases the 80×`0x88` model-slot table (`0x4edcc0`), drains the
+freefall object lists `0x4edaf0`/`0x4edaec` via `FUN_0040f9d0`, and
+runs shared cleanup `FUN_0046ca84`/`FUN_00413b20`/`FUN_0041c86c`.
+It writes **no** gameplay globals: `0x541554` health, `0x541498`
+level id, `0x541492` mode, and the `0x54161f..33` ammo block all
+survive untouched.
+
+### Course → traversal level mapping — `0x4999e8` (OBSERVED)
+
+`FUN_00433d40` and the bundle preloader `FUN_0041b7b4` both read the
+dword table at `0x4999e8` indexed by `0x541498` to form
+`TRAVERSE\LEVEL<n>\LEVEL<n>{.DTI,.CMI,O.MTO,S.MTI}` paths (with
+`TLEVEL.*` fallbacks; `%s` root = `0x541524` = `"TRAVERSE"`):
+
+| `0x541498` | FALL3D_%d | traversal dir | spawn arena (s0) |
+|---|---|---|---|
+| 0 | `FALL3D_1` | `LEVEL7` | `DANT_1` (0,4,9) yaw 90 |
+| 1 | `FALL3D_2` | `LEVEL6` | `OLYM_1` (−1167,−1173,−27) yaw 268 |
+| 2 | `FALL3D_3` | `LEVEL3` | `HMO_1` (−4,0,190) yaw 96 |
+| 3 | `FALL3D_4` | `LEVEL4` | `MEAT_1` (0,−73,374) yaw 90 |
+| 4 | `FALL3D_5` | `LEVEL8` | `GUNT_1` (94,−41,1) yaw 90 |
+| 5..7 | — (no freefall) | `LEVEL5`/`LEVEL2`/`LEVEL1` | mode-7 entries |
+
+`FUN_0040ef28` uses `541498 + 1` for `FALL3D_%d`/`FALLPU_%d`, so
+freefall course N and traversal `LEVEL{table[N]}` share the id.
+New Game is proven to start at id 0: the menu edge calls
+`FUN_0041b630(0)` (`XOR EAX,EAX` @`0x41dfba`) → `FUN_0041b724`
+(`541498=0`, `541554=100`, zoom 2.4) → `FUN_0041b7b4(0)` →
+`FUN_00429200(1)` (briefing-only, **no** `541498++`) → `FUN_0040ef28`
+→ `FALL3D_1` → `LEVEL7`.
+
+### Traversal entry — `FUN_004346e8` + `FUN_00433d40`
+
+`FUN_004346e8` writes `541492 = 3`, runs `FUN_00433c4c` (query gates
+`0x540c68/6c/70 = 1` + the same `541618/19/1a/1b` indicator reset the
+briefing used — ammo block untouched), then `FUN_00433d40` (level
+load), and with entry arg bit 1 clear (the dispatcher passes `EAX=0`)
+runs `FUN_00432d9c` — the spawn-once object pass. Spawn selection is
+**not** passed across the seam: the loader reads the level's own s0
+record — word 0 = arena index (min-clamped), words 1–3 = position,
+word 4 = yaw degrees.
+
+### State carried across the handoff (no writer on the path)
+
+| global | fate | port field |
+|---|---|---|
+| `0x541554` health | verbatim — `died` picks die at ≤0, survivors keep the damaged value | `FreefallRuntime.health` → `TraversalRuntime.fieldHealth` |
+| `0x54147a` skill | verbatim (read by `FUN_00433d40` @`0x433d4e` for the skill-0 fade globals) | `FreefallRuntime.skill` → session |
+| `0x54161f..33` ammo block | verbatim — freefall grants already wrote it via `FUN_0046a790` | `FreefallEvent kFfEvGrantAmmo` → `TraversalRuntime.ammo` |
+| CRT rand stream `FUN_0047d2b5` | shared process state — no reseed on either side | `FreefallRuntime.rng` → `TraversalRuntime.rngState` |
+| `0x541618/19/1a/1b` indicators | reset `0/0/3/0` inside `FUN_00433c4c` (traversal init) | `TraversalRuntime.wpnSel0/1/burstIndex/fireCadence` (in `traversalRuntimeLoad`) |
+| `0x541498` level id | unchanged — consumed by the mapping table | `ProgressionSession.levelId` |
+| player pose/camera | not carried — traversal respawns from s0 | — |
+
+## 165. Native coordinator — `progression_runtime.{h,cpp}` (ported)
+
+`src/core/progression_runtime.*` models the orchestrator-owned seam:
+
+- `ProgressionSession` — the cross-mode globals: `mode` (0x541492),
+  `levelId` (0x541498), `health` (0x541554), `skill` (0x54147a), the
+  shared rand stream, the ammo block, and the one-shot handoff latch.
+- `progressionLevelDir(id)` — the `0x4999e8` table lookup.
+- `progressionNewGame` — the `FUN_0041b724` reset subset
+  (`levelId=0`, `health=100`, ammo clear).
+- `progressionEnterFreefall` — the `FUN_0040ef28` mode-2 write; arms
+  the latch.
+- `progressionFreefallHandoff` — the mode-2 exit: requires
+  `finished || died` (else `kNotFinished`), drains the freefall lists
+  (`FUN_0040fa68` gameplay subset), syncs the shared globals, then
+  `health ≤ 0` → mode 0 frontend (no traversal load) or `health > 0`
+  → mode 3 + `traversalRuntimeLoad` on `TRAVERSE/LEVEL<table[id]>`.
+  A second call returns `kAlreadyHandedOff` with no side effects
+  (the dispatcher's single-shot edge). `ProgressionHandoff` records
+  route/paths/spawn/carried state for diagnostics and tests.
+
+### Phase 13B validation
+
+`mdk_tests` covers the full table (8 ids + out-of-range), the
+not-finished/already-handed-off guards, success route end-to-end on a
+synthetic `LEVEL7`/`LEVEL6` fixture (spawn arena/pos/yaw from s0,
+health/rng/ammo carry, indicator reset, first `stepTraversalRuntime`
+frame), the died route (mode 0, no load, teardown still runs),
+finished-with-`health≤0` → frontend, and load-failure propagation.
+
+`mdk-inspect --campaign-handoff FALL3D/FALL3D.BNI --course N --skill
+N --seed N --frames N` runs the real-data integration: silent
+fast-forward to freefall completion, the native handoff, and one
+traversal frame with a digest. All five BUILD_A courses verified —
+c0→`LEVEL7` `DANT_1`, c1→`LEVEL6` `OLYM_1`, c2→`LEVEL3` `HMO_1`,
+c3→`LEVEL4` `MEAT_1`, c4→`LEVEL8` `GUNT_1`; the c4/skill-2 death run
+(840 frames, `died=1`) routes to frontend mode 0 with no traversal
+load.
+
+**Grant-semantics corrections folded in (OBSERVED `FUN_0046a790`):**
+ammo rows carry `{8,3,3,8,1}` with skill-2 halving when >1 and set
+pending weapon select `row+1`; `SW_H100`/`SW_H150` are health
+*floors* (100/150), not assignments.
+
+**Remaining seams (not in this seam's scope):** save packets
+(`FUN_004278c0` writes `541498` on load — G7), the non-ammo
+`FUN_0046a500` key/seal inventory block, `FUN_0046aa30` (grant row
+10), mode-5/6 presentation (briefing/intermission), the three
+`1000.0f` transition-fade floats `0x5414a0/a4/a8`, and quit/abort —
+`0x54148e` is written inside `FUN_0041dc90`, so an in-course quit
+surfaces on the frontend frame, not as a third handoff branch.
+
+**Status: FREEFALL → TRAVERSAL MODE HANDOFF — CLOSED FOR BUILD_A**;
+with Phase 13A closed this makes **FREEFALL GAMEPLAY + PROGRESSION
+ENTRY — CLOSED FOR BUILD_A**.
