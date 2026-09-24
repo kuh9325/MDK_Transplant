@@ -4338,8 +4338,10 @@ return 1 at `≤0` (gated on `prevT ≥ 1`).
 
 ### Phase 13A validation
 
-`mdk_tests`: **4413 checks / 0 failures** — difficulty formulas for
-all 9 course/skill pairs (spot-checked 0/0, 4/2, 3/1), intro arc +
+`mdk_tests`: **4458 checks / 0 failures** — difficulty formulas for
+the exhaustive 5×3 course/skill grid (hand-computed expected values
+per pair, plus Bones gating `course ≥ 4` across all five courses),
+intro arc +
 150-frame countdown + Bones gating, input fold (digital wins, analog
 Y negated), motion clamps + spring-damp cutoff + AABB tracking,
 missile launch/homing/lead/pass/collision-window-30 + type-2

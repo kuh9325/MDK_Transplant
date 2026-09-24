@@ -16462,6 +16462,45 @@ void test_freefall_init() {
     CHECK(near(rt.wanderScale, 3.5) &&
           near(rt.radarSpeed, 117.6470588 * 1.6, 1e-3));
   }
+  // Exhaustive 5x3 course/skill grid — expected values hand-computed
+  // from the OBSERVED 0x4edc10..0x4edc20 formulas (waveSize uses the
+  // original integer division; radarSpeed uses float c/3 for skill 2).
+  {
+    const float kSp = 117.6470588f;
+    struct Row {
+      int wave, mDelay, rDelay;
+      float speed, wander;
+    };
+    const Row exp[5][3] = {
+        // skill 0              skill 1                skill 2
+        {{2, 32, 63, kSp * 1.0f, 7.5f},
+         {2, 32, 63, kSp * 1.0f, 6.5f},
+         {2, 32, 63, kSp * 1.0f, 5.5f}},
+        {{2, 31, 60, kSp * 1.1f, 6.5f},
+         {2, 25, 56, kSp * 1.2f, 5.5f},
+         {2, 27, 54, kSp * 4.0f / 3.0f, 4.5f}},
+        {{2, 30, 57, kSp * 1.2f, 5.5f},
+         {2, 18, 49, kSp * 1.4f, 4.5f},
+         {3, 22, 45, kSp * 5.0f / 3.0f, 3.5f}},
+        {{2, 29, 54, kSp * 1.3f, 4.5f},
+         {3, 11, 42, kSp * 1.6f, 3.5f},
+         {3, 17, 36, kSp * 2.0f, 2.5f}},
+        {{2, 28, 51, kSp * 1.4f, 3.5f},
+         {3, 4, 35, kSp * 1.8f, 2.5f},
+         {4, 12, 27, kSp * 7.0f / 3.0f, 1.5f}},
+    };
+    for (int c = 0; c < 5; ++c)
+      for (int s = 0; s < 3; ++s) {
+        FreefallRuntime rt;
+        mdk::freefallInit(rt, ffCourse(c, s), 1);
+        const Row& e = exp[c][s];
+        CHECK(rt.waveSize == e.wave && rt.missileDelay == e.mDelay &&
+              rt.radarDelay == e.rDelay);
+        CHECK(near(rt.radarSpeed, e.speed, 1e-3) &&
+              near(rt.wanderScale, e.wander, 1e-4));
+        CHECK(rt.bonesCourse == (c >= 4));
+      }
+  }
 }
 
 void test_freefall_intro() {
