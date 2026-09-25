@@ -17998,7 +17998,7 @@ SyntheticFullSave buildSyntheticFullSave(std::int32_t cmiImageSize) {
     auto& aren0 = sb.add('A', 'R', 'E', 'N', 1126);
     std::memcpy(aren0.data(), "A7_0", 4);
     S::wi(aren0, 0x0c, 1);                 // one ALIE follows
-    S::wi(aren0, 0x10, 0);                 // no FAND
+    S::wi(aren0, 0x10, 1);                 // one FAND follows
     embedded(aren0, 1);
 
     auto& obj0 = sb.add('A', 'L', 'I', 'E', 814);
@@ -18026,6 +18026,22 @@ SyntheticFullSave buildSyntheticFullSave(std::int32_t cmiImageSize) {
     S::wi(obj0, 0x15c, -1);
     S::wi(obj0, 0x230, -1);
     S::wi(obj0, 0x2bc, -1);                // pendingArena
+
+    // One FAND on arena 0 (FAND* sits after the arena's ALIE*).
+    auto& fand = sb.add('F', 'A', 'N', 'D', 72);
+    S::wi(fand, 0x04, 0);                  // owner = arena 0 token
+    S::wi(fand, 0x08, kScrB);              // name = in-image CMI off
+    S::w8(fand, 0x0c, 0x42);               // surfType
+    S::wi(fand, 0x10, 7);                  // f10
+    S::wi(fand, 0x14, 3);                  // kind
+    S::wf(fand, 0x18, 0.5f);               // rate
+    S::wi(fand, 0x1c, 0x101);              // queryMask
+    for (int i = 0; i < 6; ++i)
+      S::wf(fand, 0x20 + 4 * i, static_cast<float>(i) + 0.25f);
+    S::wf(fand, 0x38, 0.25f);              // uvAcc
+    S::wf(fand, 0x3c, 0.75f);
+    S::wf(fand, 0x40, 2.0f);               // target
+    S::wf(fand, 0x44, 3.0f);               // ramp
 
     auto& aren1 = sb.add('A', 'R', 'E', 'N', 1126);
     std::memcpy(aren1.data(), "A7_1", 4);
@@ -18317,6 +18333,7 @@ void test_save_full_write() {
       mdk::saveGameWriteFull(rt1, sess1, in, &wrep, &detail);
   CHECK(!bytes.empty());
   CHECK(wrep.arenasWritten == 2 && wrep.objectsWritten == 2);
+  CHECK(wrep.fansWritten == 1);
   CHECK(wrep.saveIds == 4);   // 2 embedded + 2 objects, sequential
   for (const auto& w : wrep.warnings)
     std::fprintf(stderr, "write-warn: %s\n", w.c_str());
@@ -18338,16 +18355,17 @@ void test_save_full_write() {
       mdk::saveTag('G', 'A', 'M', 'E'), mdk::saveTag('M', 'O', 'R', 'E'),
       mdk::saveTag('P', 'L', 'A', 'Y'), mdk::saveTag('D', 'A', 'M', 'P'),
       mdk::saveTag('C', 'A', 'M', 'E'), mdk::saveTag('A', 'R', 'E', 'N'),
-      mdk::saveTag('A', 'L', 'I', 'E'), mdk::saveTag('A', 'R', 'E', 'N'),
-      mdk::saveTag('A', 'L', 'I', 'E'), mdk::saveTag('B', 'U', 'L', 'L'),
+      mdk::saveTag('A', 'L', 'I', 'E'), mdk::saveTag('F', 'A', 'N', 'D'),
+      mdk::saveTag('A', 'R', 'E', 'N'), mdk::saveTag('A', 'L', 'I', 'E'),
       mdk::saveTag('B', 'U', 'L', 'L'), mdk::saveTag('B', 'U', 'L', 'L'),
-      mdk::saveTag('S', 'E', 'N', 'D')};
-  CHECK(sg2.packets.size() == 15);
-  if (sg2.packets.size() == 15) {
-    for (int i = 0; i < 15; ++i) CHECK(sg2.packets[i].tag == want[i]);
+      mdk::saveTag('B', 'U', 'L', 'L'), mdk::saveTag('S', 'E', 'N', 'D')};
+  CHECK(sg2.packets.size() == 16);
+  if (sg2.packets.size() == 16) {
+    for (int i = 0; i < 16; ++i) CHECK(sg2.packets[i].tag == want[i]);
     CHECK(sg2.packets[7].payload.size() == 1126);  // AREN
     CHECK(sg2.packets[8].payload.size() == 814);   // ALIE
-    CHECK(sg2.packets[11].payload.size() == 252);  // BULL
+    CHECK(sg2.packets[9].payload.size() == 72);    // FAND
+    CHECK(sg2.packets[12].payload.size() == 252);  // BULL
   }
 
   // ---- re-restore + authoritative equivalence ----
@@ -18381,6 +18399,20 @@ void test_save_full_write() {
   // Object state + list order: the stream order IS the list order.
   CHECK(rt2.arenas[0]->dyn.storage.size() == 1);
   CHECK(rt2.arenas[1]->dyn.storage.size() == 1);
+  // FAND: one surface record on arena 0, fields verbatim, owner ->
+  // the arena's DTI index, name kept as the raw CMI offset.
+  const mdk::SurfaceRecord* fa = rt1.arenas[0]->surface.records;
+  const mdk::SurfaceRecord* fb = rt2.arenas[0]->surface.records;
+  CHECK(fa && fb && fa->next == nullptr && fb->next == nullptr);
+  if (fa && fb) {
+    CHECK(fb->owner == fa->owner && fb->name == fa->name);
+    CHECK(fb->surfType == fa->surfType && fb->kind == fa->kind);
+    CHECK(fb->rate == fa->rate && fb->queryMask == fa->queryMask);
+    CHECK(fb->target == fa->target && fb->ramp == fa->ramp);
+    for (int i = 0; i < 6; ++i) CHECK(fb->v[i] == fa->v[i]);
+    CHECK(fb->uvAcc[0] == fa->uvAcc[0] && fb->uvAcc[1] == fa->uvAcc[1]);
+  }
+  CHECK(rt2.arenas[1]->surface.records == nullptr);
   const mdk::DynamicObject* a0 = rt1.arenas[0]->dyn.storage.front().get();
   const mdk::DynamicObject* b0 = rt2.arenas[0]->dyn.storage.front().get();
   const mdk::DynamicObject* a1 = rt1.arenas[1]->dyn.storage.front().get();
@@ -18436,6 +18468,65 @@ void test_save_full_write() {
     std::string d0;
     CHECK(mdk::saveGameWriteFull(bare, sess1, in, &r0, &d0).empty());
     CHECK(!d0.empty());
+  }
+
+  // Gameplay-authoritative references that cannot be tokenized must
+  // FAIL the write — silently emitting a null token would corrupt the
+  // restored world (object id 0, arena -1, or a wild CMI offset).
+  auto freshRt = [&]() -> TraversalRuntime {
+    TraversalRuntime r;
+    ProgressionSession s;
+    mdk::FullRestoreReport rr;
+    CHECK(mdk::applyFullSaveToTraversal(sb.sg, *root, s, r, &rr,
+                                        &detail) == SaveError::kOk);
+    return r;
+  };
+  // 1) object ref -> a record outside the serialized set.
+  {
+    TraversalRuntime rt = freshRt();
+    ProgressionSession sx;
+    mdk::DynamicObject foreign;
+    rt.arenas[0]->dyn.storage.front()->field138 = &foreign;
+    mdk::FullWriteReport rr;
+    std::string dd;
+    CHECK(mdk::saveGameWriteFull(rt, sx, in, &rr, &dd).empty());
+    CHECK(dd.find("object") != std::string::npos);
+  }
+  // 2) arena ref -> a TraversalArena outside rt.arenas.
+  {
+    TraversalRuntime rt = freshRt();
+    ProgressionSession sx;
+    mdk::TraversalArena foreign;
+    rt.partner = &foreign;
+    mdk::FullWriteReport rr;
+    std::string dd;
+    CHECK(mdk::saveGameWriteFull(rt, sx, in, &rr, &dd).empty());
+    CHECK(dd.find("arena") != std::string::npos);
+  }
+  // 3) CMI ref -> a pointer outside the loaded image.
+  {
+    TraversalRuntime rt = freshRt();
+    ProgressionSession sx;
+    const std::byte outside{0};
+    rt.arenas[0]->dyn.storage.front()->field108 = &outside;
+    mdk::FullWriteReport rr;
+    std::string dd;
+    CHECK(mdk::saveGameWriteFull(rt, sx, in, &rr, &dd).empty());
+    CHECK(dd.find("cmi") != std::string::npos);
+  }
+  // The string fields are the documented exception: a non-CMI string
+  // was never representable (the original saved a wild self-referential
+  // offset), so those degrade to -1 + warning instead of failing.
+  {
+    TraversalRuntime rt = freshRt();
+    ProgressionSession sx;
+    rt.arenas[0]->dyn.storage.front()->animSoundName =
+        "NOT_IN_THE_CMI_IMAGE";
+    mdk::FullWriteReport rr;
+    std::string dd;
+    const auto nb = mdk::saveGameWriteFull(rt, sx, in, &rr, &dd);
+    CHECK(!nb.empty());
+    CHECK(!rr.warnings.empty());
   }
 
   fs::remove_all(tmp);

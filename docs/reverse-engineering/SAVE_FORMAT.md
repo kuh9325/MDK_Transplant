@@ -313,6 +313,16 @@ The native reader maps these onto `SaveError` codes one-for-one.
   (operand `{len}{chars}{NUL}` first, bare NUL-terminated fallback;
   non-CMI strings → `-1` + warning — the original saved a wild
   `ptr−base` that only resolved inside its own address space).
+- **Unrepresentable references are fatal**: a live arena pointer not
+  in `rt.arenas`, a live object pointer outside the serialized set
+  (embedded + list records), or a gameplay CMI pointer outside the
+  loaded image cannot be encoded — silently emitting a null/sentinel
+  token would corrupt the restored world (wrong-object id, arena -1,
+  wild CMI offset). The writer collects every such failure and returns
+  an empty buffer with `detail` set rather than producing a parseable
+  but semantically broken save. The only non-fatal degradation left is
+  the non-CMI *string* class above (the original itself could not
+  represent those).
 - **FUN_00426738 record fixup, mirrored**: `+0x0c`/`+0x158` zeroed;
   `+0x60`/`+0x2bc`/conn `+0x302` arena tokens; `+0xec`, `+0x108`,
   `+0x10c`, `+0x110`, `+0x114`, `+0x230`, retPc `+0x24c..`, savedPc
@@ -335,17 +345,27 @@ The native reader maps these onto `SaveError` codes one-for-one.
   post-load `+0x68` walk order matches the original (a per-record
   `allocFront` had reversed it). `objFlag148` restores the embedded
   record's `+0x30` low byte; `ribbonT` mirrors `+0xe4` on load.
-- **Golden (local real save)**: `MDK.SAV` → restore → 1 frame →
-  write → reparse → restore → equivalence OK. Byte-level packet diff
-  vs the original: identical in every gameplay-authoritative field;
-  remaining deltas are the cipher seed, the THMB capture (no renderer
-  seam — zeros), `GAME+0x08` uninit dword, `MORE+0x0c` (the live
-  `0x5414a8` had decayed past the saved `+0x08` value; loader ignores
-  it), loader-skipped scratch/pointer fields (DAMP `+0x18..+0x2b`,
-  `+0x50..+0x57`, stat counters, AREN `+0x14..+0x43`/`+0x5c..+0x6a`/
-  `+0x446..+0x461`, ALIE `+0x00`/`+0x64..+0xab`), pointer sentinels
-  (DAMP `+0x250`/`+0x254`, ALIE `+0x2b0`/`+0x2b4`), and one frame of
-  authored drift (positions, anim accumulators, `frameCounter`).
+- **Golden (local real saves)**: `MDK.SAV` and
+  `original/installed/SAVES/1.SAV` → restore → step → write →
+  reparse → restore → equivalence OK, at identical file size
+  (37973B / 57701B) with zero unresolved re-restore references.
+  Byte-level packet diffs vs the originals: identical in every
+  gameplay-authoritative field; remaining deltas are the cipher seed,
+  the THMB capture (no renderer seam — zeros), `GAME+0x08` uninit
+  dword, `MORE+0x0c` (the live `0x5414a8` had decayed past the saved
+  `+0x08` value; loader ignores it), `PLAY +0xc4..+0xca` (the
+  wpnSel/burst/cadence bytes the loader's post-apply reset discards),
+  loader-skipped scratch/pointer fields (DAMP `+0x18..+0x2b`,
+  `+0x50..+0x57`, `+0x1d0`, `+0x290`, stat counters, AREN
+  `+0x14..+0x43`/`+0x5c..+0x6a`/`+0x446..+0x461`, ALIE
+  `+0x00`/`+0x64..+0xab`), pointer sentinels (DAMP `+0x250`/`+0x254`,
+  ALIE `+0x2b0`/`+0x2b4`), empty-string `-1`s (conn-sound slots
+  pointing at NUL in the CMI image), and authored drift from the
+  stepped frames (positions, `frameCounter`, script PCs/ctx/locals,
+  anim latch state).
+- **FAND emit note**: `+0x04` (owner) is emitted as the token of the
+  arena whose `+0x45e` list the record hangs on — not the stored
+  `owner` index, which goes stale on runtime-created records.
 
 ### Phase 14C.1 load-closure audit (OBSERVED)
 

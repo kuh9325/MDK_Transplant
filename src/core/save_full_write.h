@@ -46,7 +46,11 @@ struct FullWriteReport {
   int fansWritten = 0;      // FAND packets emitted
   int shotSlots = 3;        // BULL packets (always 3 — fixed pool)
   int saveIds = 0;          // highest stamped +0x7c id
-  std::vector<std::string> warnings;  // unrepresentable refs -> sentinels
+  // Non-fatal degradations only (e.g. a non-CMI string -> -1 — the
+  // original saved a wild offset there too). Gameplay-authoritative
+  // reference misses (arena/object/CMI pointer) are fatal: they are
+  // reported through `detail` and the write returns empty.
+  std::vector<std::string> warnings;
 };
 
 // Writer inputs beside the runtime/session: the cipher seed (pin it
@@ -62,9 +66,12 @@ struct SaveWriteFullInput {
 // stream (SAVE THMB GAME MORE PLAY DAMP CAME (AREN ALIE* FAND*)*
 // BULLx3 SEND), ciphered and enveloped — parseable by saveGameParse
 // and restorable by applyFullSaveToTraversal. Returns an empty vector
-// with `detail` set when the state is structurally unrepresentable
-// (no arenas, no CMI image, invalid level id); reference-resolution
-// misses degrade to the null token + a warning instead.
+// with `detail` set when the state is unrepresentable: structural
+// (no arenas, no CMI image, invalid level id) or a gameplay-
+// authoritative reference that cannot be tokenized (arena pointer
+// outside rt.arenas, object pointer outside the serialized set, or a
+// script/CMI pointer outside the loaded CMI image). Only proven
+// load-neutral fields degrade to a sentinel + warning.
 std::vector<std::byte> saveGameWriteFull(const TraversalRuntime& rt,
                                        const ProgressionSession& sess,
                                        const SaveWriteFullInput& in,

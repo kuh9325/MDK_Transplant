@@ -79,11 +79,22 @@ struct Toks {
   // pointers hash to the same slot because col is the first member.
   std::unordered_map<const void*, std::int32_t> ids;
 
+  // Non-fatal degradation (documented -1 sentinel cases).
   void warn(const char* what, const void* p) {
     if (!rep) return;
     char buf[96];
     std::snprintf(buf, sizeof buf, "%s: unrepresentable ref %p", what, p);
     rep->warnings.emplace_back(buf);
+  }
+
+  // Gameplay-authoritative ref that cannot be represented — the
+  // write must fail rather than silently serialize a null token.
+  // Emission continues so one call reports every bad ref.
+  std::vector<std::string> errs;
+  void failRef(const char* what, const void* p) {
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%s: unrepresentable ref %p", what, p);
+    errs.emplace_back(buf);
   }
 
   // Arena record ptr -> position*0x466 (-1 = NULL). The loader
@@ -95,11 +106,12 @@ struct Toks {
       if (rt.arenas[i].get() == a)
         return static_cast<std::int32_t>(i) *
                static_cast<std::int32_t>(kArenaStride);
-    warn("arena", a);
+    failRef("arena", a);
     return -1;
   }
   std::int32_t arenaTok(const DynamicArena* d) {
     if (d == nullptr) return -1;
+    if (d->owner == nullptr) { failRef("arena", d); return -1; }
     return arenaTok(d->owner);
   }
 
@@ -108,7 +120,7 @@ struct Toks {
     if (p == nullptr) return -1;
     const auto* q = static_cast<const std::byte*>(p);
     if (q < cmiImg || static_cast<std::size_t>(q - cmiImg) >= cmiImgSize) {
-      warn("cmi", p);
+      failRef("cmi", p);
       return -1;
     }
     return static_cast<std::int32_t>(q - cmiImg);
@@ -147,12 +159,13 @@ struct Toks {
     return -1;
   }
 
-  // Object ptr -> its stamped +0x7c id (0 = NULL/unserialized).
+  // Object ptr -> its stamped +0x7c id (0 = NULL; a non-null pointer
+  // to a record outside the serialized set fails the write).
   std::int32_t objTok(const DynamicObject* o) {
     if (o == nullptr) return 0;
     auto it = ids.find(o);
     if (it == ids.end()) {
-      warn("object", o);
+      failRef("object", o);
       return 0;
     }
     return it->second;
@@ -688,12 +701,14 @@ void emitAren(Img& img, const TraversalRuntime& rt, const TraversalArena& a,
 // token, +0x08 the raw CMI name offset (both stored verbatim by the
 // port post-load).
 // ---------------------------------------------------------------------------
-void emitFand(Img& img, const SurfaceRecord& f, Toks& tk) {
+void emitFand(Img& img, const SurfaceRecord& f,
+              const TraversalArena* owner, Toks& tk) {
   // +0x00 — the list link (runtime-owned).
-  img.i32(0x04, f.owner < tk.rt.arenas.size()
-                    ? static_cast<std::int32_t>(f.owner) *
-                          static_cast<std::int32_t>(kArenaStride)
-                    : -1);
+  // +0x04 — the owner arena's token. The record hangs on `owner`'s
+  // list, so its position is authoritative (the stored `f.owner`
+  // index is the restored mirror and goes stale on runtime-created
+  // records).
+  img.i32(0x04, tk.arenaTok(owner));
   img.u32(0x08, f.name);   // raw CMI offset (kept verbatim by design)
   img.u8(0x0c, f.surfType);
   img.u32(0x10, f.f10);
@@ -770,7 +785,7 @@ std::vector<std::byte> saveGameWriteFull(const TraversalRuntime& rt,
   if (rt.cur == nullptr) return fail("no current arena");
 
   Toks tk{rt, rep, rt.level.cmiBytes.data() + 4,
-          rt.level.cmiBytes.size() - 4, {}};
+          rt.level.cmiBytes.size() - 4, {}, {}};
 
   // --- Pass 1: stamp the sequential +0x7c ids (FUN_00426a0c order:
   // per arena the embedded +0x118 record first, then the +0x68 list
@@ -850,7 +865,7 @@ std::vector<std::byte> saveGameWriteFull(const TraversalRuntime& rt,
     }
     for (const SurfaceRecord* f = a->surface.records; f; f = f->next) {
       Img fand(72);
-      emitFand(fand, *f, tk);
+      emitFand(fand, *f, a.get(), tk);
       emit(saveTag('F','A','N','D'), fand);
       ++rep->fansWritten;
     }
@@ -863,6 +878,20 @@ std::vector<std::byte> saveGameWriteFull(const TraversalRuntime& rt,
   }
 
   putPacket(saveTag('S','E','N','D'), nullptr, 0);
+
+  // A gameplay-authoritative ref that survived to a sentinel would
+  // silently corrupt the restored world — refuse the whole write
+  // (emission already collected every miss for the report).
+  if (!tk.errs.empty()) {
+    if (detail) {
+      *detail = "unrepresentable state:";
+      for (const auto& e : tk.errs) {
+        *detail += ' ';
+        *detail += e;
+      }
+    }
+    return {};
+  }
   return saveGameEnvelope(std::move(stream), seed);
 }
 
