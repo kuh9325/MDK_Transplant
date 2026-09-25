@@ -440,6 +440,10 @@ struct DynamicObject {
   // null/empty name falls back to the random RICO1/2/3 pick. Stored
   // as an int32 marker — the name data itself is not ported.
   std::int32_t field150 = 0;
+  // +0x154 — second name/table pointer in the same CMI-offset family
+  // (the save fixups resolve +0x150/+0x154/+0x15c identically);
+  // consumer UNKNOWN. Stored as an int32 marker like +0x150.
+  std::int32_t field154 = 0;
 
   // Death-boundary script handoff (FUN_00458140): when +0x110 is set
   // the object keeps a deferred script — field11e cleared, health

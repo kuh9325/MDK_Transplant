@@ -37,6 +37,7 @@
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
 #include "core/progression_runtime.h"
+#include "core/save_full_restore.h"
 #include "core/save_game.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
@@ -119,6 +120,11 @@ int usage() {
                "       mdk-inspect --save-roundtrip <file.SAV>\n"
                "                            (parse -> re-emit header-only ->\n"
                "                            re-parse -> compare)\n"
+               "       mdk-inspect --data-path DIR --save-restore <file.SAV>\n"
+               "                            (Phase 14C: full-save restore —\n"
+               "                            MORE/PLAY/DAMP/CAME/AREN/ALIE/FAND/BULL\n"
+               "                            into a live TraversalRuntime, then\n"
+               "                            steps --frames frames)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1263,6 +1269,7 @@ int main(int argc, char** argv) {
   bool campaignSequence = false;
   std::optional<std::string> saveInfoPath;
   std::optional<std::string> saveRoundtripPath;
+  std::optional<std::string> saveRestorePath;
   int ffCourse = 0;
   int ffSkill = 0;
   unsigned ffSeed = 0xC0FFEE;
@@ -1401,6 +1408,10 @@ int main(int argc, char** argv) {
       const char* v = value(a);
       if (!v) return usage();
       saveRoundtripPath = v;
+    } else if (!std::strcmp(a, "--save-restore")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      saveRestorePath = v;
     } else if (!std::strcmp(a, "--course")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -1792,6 +1803,116 @@ int main(int argc, char** argv) {
                 sg.packets.size(),
                 rt.packets.size());
     return ok ? 0 : 1;
+  }
+
+  // --save-restore: the Phase 14C full-save path (FUN_00427218) —
+  // parses, rebuilds the level through the suppressed-spawn load,
+  // applies every packet family, resolves the reference tables, and
+  // steps the restored runtime for --frames frames.
+  if (saveRestorePath) {
+    mdk::SaveGame sg;
+    const auto e = mdk::saveGameLoadFile(*saveRestorePath, sg);
+    if (e != mdk::SaveError::kOk) {
+      std::fprintf(stderr, "parse: %s\n", mdk::saveErrorName(e));
+      return 1;
+    }
+    if (!dataPath) {
+      std::fprintf(stderr, "--save-restore needs --data-path\n");
+      return usage();
+    }
+    std::string err;
+    const auto root = mdk::DataRoot::open(*dataPath, &err);
+    if (!root) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 2;
+    }
+    mdk::ProgressionSession sess;
+    mdk::TraversalRuntime rt;
+    mdk::FullRestoreReport rep;
+    const auto re = mdk::applyFullSaveToTraversal(sg, *root, sess, rt,
+                                                  &rep, &err);
+    std::printf("file:      %s\n", saveRestorePath->c_str());
+    std::printf("restore:   %s\n", mdk::saveErrorName(re));
+    if (re != mdk::SaveError::kOk) {
+      std::fprintf(stderr, "detail:  %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("game:      modeField=%d mode=%d levelId=%d identity=%s\n",
+                rep.modeField, rep.mode, rep.levelId,
+                rep.identityOk ? "ok" : "MISMATCH");
+    std::printf("packets:   aren=%d/%d applied, alie=%d (%d scripted), "
+                "fand=%d, bull=%d (%d active)\n",
+                rep.arenPackets, rep.arenApplied, rep.objectsAllocated,
+                rep.scriptedObjects, rep.fansAllocated, rep.shotSlots,
+                rep.shotsActive);
+    std::printf("refs:      arena=%d/%d obj=%d/%d cmi=%d/%d "
+                "(resolved/failed)\n",
+                rep.arenaRefsResolved, rep.arenaRefsFailed,
+                rep.objectRefsResolved, rep.objectRefsFailed,
+                rep.cmiRefsResolved, rep.cmiRefsFailed);
+    std::printf("arenas:    cur=%d partner=%d load=%d\n",
+                rep.curArenaIndex, rep.partnerArenaIndex,
+                rep.loadArenaIndex);
+    std::printf("player:    pos=(%.2f,%.2f,%.2f) yaw=%.1f health=%d\n",
+                (double)rep.playerPos[0], (double)rep.playerPos[1],
+                (double)rep.playerPos[2], (double)rep.playerYawDeg,
+                rep.health);
+    for (const auto& u : rep.unmapped)
+      std::printf("unmapped:  %s +0x%02x..+0x%02x (%uB)\n", u.packet,
+                  u.offset, u.offset + u.size, u.size);
+    for (const auto& w : rep.warnings)
+      std::printf("warning:   %s\n", w.c_str());
+    for (const auto& a : rt.arenas) {
+      std::size_t bound = 0;
+      for (const auto& o : a->dyn.storage)
+        if (o->col.elements != nullptr) ++bound;
+      std::printf("  arena[%2d] %-9s objs=%2zu elems=%2zu flags44=%02x "
+                  "spawned=%d latch=%d\n",
+                  a->index, a->name.c_str(), a->dyn.storage.size(), bound,
+                  a->flags44, a->objectsSpawned ? 1 : 0,
+                  a->eventLatch.col.elements != nullptr ? 1 : 0);
+    }
+
+    // Step the restored world — the same scripted input as
+    // --traversal-runtime (idle -> KeyUp -> idle -> KeyJump).
+    const mdk::GameplayInputBindings bindings;
+    auto rawFor = [](int phase) {
+      mdk::RawGameplayInput r;
+      if (phase == 1) r.keyLevel[103 >> 5] |= 1u << (103 & 31);
+      if (phase == 3) r.keyLevel[56 >> 5] |= 1u << (56 & 31);
+      return r;
+    };
+    mdk::FrontendTimingState timing;
+    std::uint64_t digest = 1469598103934665603ull;
+    auto mix = [&](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        digest ^= (v >> (i * 8)) & 0xff;
+        digest *= 1099511628211ull;
+      }
+    };
+    for (int f = 0; f < travFrames; ++f) {
+      const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
+      const auto out =
+          mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
+      std::printf("f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "
+                  "vv=%6.2f gnd=%d ctc=%08x\n",
+                  out.frame, out.curArenaIndex, out.partnerArenaIndex,
+                  (double)out.pos[0], (double)out.pos[1],
+                  (double)out.pos[2], (double)out.yawDeg,
+                  (double)out.vertVel, out.grounded ? 1 : 0,
+                  out.contactObj);
+      for (int i = 0; i < 3; ++i) {
+        std::uint32_t u;
+        std::memcpy(&u, &out.pos[i], 4);
+        mix(u);
+      }
+      mix(static_cast<std::uint32_t>(out.curArenaIndex));
+      mix(static_cast<std::uint32_t>(out.grounded ? 1 : 0));
+      mix(static_cast<std::uint32_t>(rt.scriptInsnTotal));
+    }
+    std::printf("digest:    %016llx  (%d frames)\n",
+                (unsigned long long)digest, travFrames);
+    return 0;
   }
 
   if (!dataPath || !target) {

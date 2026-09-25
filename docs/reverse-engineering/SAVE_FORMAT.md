@@ -239,15 +239,35 @@ The native reader maps these onto `SaveError` codes one-for-one.
   edge), `progressionContinue` (the FUN_0041dc90 → FUN_00427f94 route),
   `progressionApplyGamePacket`, `progressionDeleteCheckpoint` (the
   quit-delete edge).
-- `mdk-inspect --save-info` / `--save-roundtrip` — census + round-trip
-  diagnostics; all five local real saves parse and round-trip cleanly.
+- `src/core/save_full_restore.*` — Phase 14C: the FUN_00427218 world
+  apply — MORE/PLAY/DAMP/CAME globals, AREN 0x466-record image apply,
+  ALIE object records + FUN_00426f34-equivalent fixups (0x466-strided
+  arena offsets, CMI image offsets with `imageBase=4`, sequential
+  object ids), FAND owner/name tokens, BULL slots (state-dormant in
+  observed saves), then the attach tail `FUN_00432c34 → FUN_00432d9c
+  (cur) → FUN_00432d9c (partner)`.
+- The `+0x0c` lifecycle (OBSERVED — see GAMEPLAY_RECONSTRUCTION §181):
+  the fixup clears it; `FUN_004321dc` (end of `FUN_00432980` pull-in)
+  rebinds every named object in cur+partner via `FUN_0045a3b0`;
+  `FUN_0045a2d0` releases it on migration out. Port:
+  `objectArenaActivate` (gate `col.elements == nullptr`) +
+  `traversalMigrateInto` tail loop; the embedded pseudo-object binds
+  model 0's element view (`arena+0x124 = 0x4edcc0` equivalent).
+- `mdk-inspect --save-info` / `--save-roundtrip` / `--save-restore` —
+  census + round-trip + full-restore diagnostics; all five local real
+  saves parse, and both full saves restore and step deterministically
+  (`1.SAV` digest `06307535cd8e10ca`, `MDK.SAV` `4243287bfc9fb26a`,
+  90 frames each).
 
 ### Remaining seam (BOUNDED, not closed)
 
 Full-save **writing** requires reproducing the AREN/ALIE/FAND raw
 memory records (the port deliberately uses different object storage —
-no raw pointers are ever serialized). Full-save **application** beyond
-GAME — restoring mid-arena position/objects/script PCs — needs the
-`FUN_00427218` field map completed against `TraversalRuntime`, which
-is the recommended next RE-heavy phase. Reader, death checkpoint, and
-header-only save/continue semantics are closed.
+no raw pointers are ever serialized). On the load side: unmapped
+packet regions remain (the `--save-restore` report lists them —
+e.g. most of the DAMP middle block and the BULL +0x2c..0xbc region),
+and six `+0x114` anim pointers in `1.SAV` are runtime heap addresses
+(runtime-allocated anims, shared in triplets — no image backing) that
+resolve to null with a diagnostic. Reader, death checkpoint,
+header-only save/continue, and full-save loading semantics are
+closed for BUILD_A on the local corpus.

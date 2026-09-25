@@ -151,6 +151,14 @@ void objectOpSeekAway(TraversalRuntime& rt, DynamicObject& o,
 int objectArenaTransfer(TraversalRuntime& rt, DynamicObject& o,
                         DynamicArena& home);
 
+// FUN_0045a3b0 — the lazy element-set rebind: when +0x0c (the port's
+// col.elements) is null it is rebuilt from the +0x04 enemy index
+// (shared record 0 for index 0, FUN_00403538 named lookup for
+// 0xffff, FUN_00403720 deep copy otherwise) with the +0x114-armed
+// anim re-sync, then the +0x158/+0x15c voice restart. Runs for every
+// named object in the active arenas at attach time (FUN_004321dc).
+void objectArenaActivate(TraversalRuntime& rt, DynamicObject& o);
+
 // FUN_00458354 — kill-plane / floor death: +0x110!=0 -> deferred
 // script + arena-deep floor snap; else immediate teardown.
 void objectFloorDeath(TraversalRuntime& rt, DynamicObject& o);

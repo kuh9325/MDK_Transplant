@@ -11550,6 +11550,45 @@ void test_traversal_deep_floor() {
   CHECK(arena.deepFloorZ == 0.0f);
 }
 
+void test_traversal_element_bind() {
+  // FUN_004321dc tail / FUN_0045a3b0 (Phase 14C, OBSERVED): at the end
+  // of the pull-in the original walks the current + partner object
+  // lists and lazily rebinds +0x0c (the collision element set) on
+  // every named object. Full-save restore and FUN_0045a2d0 migration
+  // leave +0x0c null and the frame's floor probe derefs it unguarded.
+  mdk::TraversalRuntime rt;
+  mdk::TraversalArena* cur = travArenaAdd(rt, "CUR");
+  mdk::TraversalArena* partner = travArenaAdd(rt, "PRT");
+  mdk::TraversalArena* other = travArenaAdd(rt, "OTH");
+  rt.cur = cur;
+  rt.partner = partner;
+  // Pre-populated lazy-model slot — traversalModelFor short-circuits
+  // on a resident record, so no CMI is needed.
+  rt.level.models.resize(2);
+  rt.level.modelTried.resize(2, false);
+  rt.level.models[1] = mdk::RuntimeModel{};
+  rt.level.models[1]->elems.resize(1);
+
+  auto makeObj = [](mdk::TraversalArena* a, bool named, int idx) {
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.col.named = named;
+    o.enemyIndex = static_cast<std::uint16_t>(idx);
+    return &o;
+  };
+  mdk::DynamicObject* o1 = makeObj(cur, true, 1);
+  mdk::DynamicObject* o2 = makeObj(partner, true, 1);
+  mdk::DynamicObject* o3 = makeObj(other, true, 1);
+  mdk::DynamicObject* dead = makeObj(cur, false, 1);
+  for (mdk::DynamicObject* o : {o1, o2, o3, dead})
+    CHECK(o->col.elements == nullptr);
+
+  mdk::traversalMigrateInto(rt, *cur);
+  CHECK(o1->col.elements != nullptr && o1->col.elements->count == 1);
+  CHECK(o2->col.elements != nullptr);
+  CHECK(o3->col.elements == nullptr);   // non-active arenas untouched
+  CHECK(dead->col.elements == nullptr); // +0x06 == 0 skipped
+}
+
 // ---------------------------------------------------------------------------
 // Phase 5H — tr_alcmd arena script VM
 // ---------------------------------------------------------------------------
@@ -17753,6 +17792,7 @@ int main() {
   test_traversal_portal_test();
   test_traversal_trigger_scan();
   test_traversal_deep_floor();
+  test_traversal_element_bind();
   test_traversal_script();
   test_traversal_object_init();
   test_traversal_object_script();

@@ -4804,7 +4804,80 @@ continue restore → traversal mode 3 health 100 same level).
 
 **Status: DEATH→LASTGAME→CONTINUE + SAVE ENVELOPE — CLOSED FOR
 BUILD_A.** Bounded open seam: full-save writing (AREN/ALIE raw-record
-emission) and full-save world application through `FUN_00427218`
-(mid-arena position/object/script-PC restore) — the reader accepts and
-exposes all full packets, but the traversal runtime does not yet
-consume DAMP/CAME/AREN/ALIE/FAND/BULL on load.
+emission) — see Phase 14C for full-save loading.
+
+# Phase 14C — Full Manual Save / Load Restore
+
+## 180. Full-save loader route (OBSERVED — FUN_00427218)
+
+`FUN_00427f94` (envelope+seed) → `FUN_004278c0` (GAME handler): for
+`modeField >= 1000` it stores the GAME fields, validates
+`levelId ∈ [0,6)` and `health ∈ (0,150]`, calls `FUN_00427218`, and
+clears `0x54be2c` so the load entry returns early. The loader applies
+MORE/PLAY/DAMP/CAME field-for-field, then walks
+`(AREN ALIE* FAND*)* BULL×3`: each AREN is the full 0x466-byte arena
+record image with pointer regions skipped then resolved; each ALIE is
+an 814-byte object record; the embedded pseudo-object lives at
+arena `+0x118`. Per-object fixup `FUN_00426f34` resolves saved tokens
+(0x466-strided arena offsets, CMI image offsets, sequential object
+ids) to runtime pointers and clears object `+0x0c`. Stale heap
+pointers no table resolves stay dead.
+
+## 181. The +0x0c lazy rebind (OBSERVED — FUN_004321dc → FUN_0045a3b0)
+
+Restored objects reach the first frame with `+0x0c == 0` even when
+`+0x149 & 1` passes the floor-probe gate — and `FUN_004138d8`
+dereferences the element set unconditionally, so the bind must happen
+inside the restore tail. It does, via the arena-attach path:
+`FUN_00432c34` → `FUN_00432d9c` → `FUN_00432980` (connector pull-in)
+→ `FUN_004321dc` (geometry build), which ends by walking the current
+then partner `+0x68` list calling `FUN_0045a3b0` on every named
+(`+0x06 != 0`) object:
+
+* `+0x0c != 0` → skip.
+* `+0x04 == 0` → `+0x0c = 0x4edcc0` (shared class-table record 0,
+  no copy).
+* `+0x04 == 0xffff` → `FUN_00403538(+0x316,+0x31a,+0x31e,&+0x322)`
+  procedural/named lookup.
+* else → `+0x0c = FUN_00403720(table[+0x04])` deep copy; when `+0x114`
+  is armed: `+0xe4 = −1`, `+0x148 |= 0x80000000` temporarily,
+  `FUN_00455890(obj, FRNDINT(+0xdc + 1.0))`, `+0xdc = −1.0`, `+0x148`
+  restored (0x45a44c..0x45a492).
+* outside the gate, every call: `+0x158 == 0` with nonempty `+0x15c`
+  restarts the object voice.
+
+Mirror deactivate `FUN_0045a2d0` (migration OUT): voice stop; then
+`+0x0c` null/sentinel (`0x4edcc0`/`0x4edd48`) early-out; owned records
+release via `FUN_00403880`, `+0x0c = 0`, `+0xe4 = −1`, and
+`+0x118 = −1` iff the done latch (0xff00) was armed — objects lose
+the element set on exit and rebind on return. The embedded arena
+pseudo-object is bound eagerly at load: `arena+0x124 = 0x4edcc0`.
+
+Port: `objectArenaActivate` gates on `col.elements == nullptr` (the
+`+0x0c` equivalent — the earlier `col.model` gate missed the
+restored-object case where `+0x08` survives but `+0x0c` is cleared);
+`traversalMigrateInto` runs the cur+partner named-object loop; the
+embedded pseudo-object binds model 0's element view. Bounded
+differences: index-0 objects bind via the same deep-copy path (no
+shared-record alias exists in the port), and `+0x114` values that are
+stale runtime heap pointers (six records in `1.SAV`, shared in
+triplets — runtime-allocated anims with no image backing) resolve to
+null with a diagnostic, matching the remap-failure path.
+
+## 182. Phase 14C validation
+
+`mdk-inspect --data-path DIR --save-restore <file.SAV>` parses a real
+full save, applies all packets into a live `TraversalRuntime`, and
+steps frames. `1.SAV` (levelId 0, cur DANT_3): 19/19 arenas, 37
+objects, all 26 current-arena objects element-bound, 90 frames,
+digest `06307535cd8e10ca` — the player grounds on a restored object
+element set (`floorObj`). `MDK.SAV` (levelId 2, cur HMO_1): 13
+objects, 90 frames, digest `4243287bfc9fb26a`.
+`test_traversal_element_bind` covers the bind-pass scope (cur+partner
+named objects only, the `+0x06` gate).
+
+**Status: full-save LOAD restores and steps deterministically for
+BUILD_A on both local full saves.** Not overall `SAVE / LOAD GAMEPLAY
+STATE` closure: unmapped packet regions remain (the report lists
+them), six `+0x114` runtime-heap anim records are unresolvable, and
+full-save WRITING stays open.

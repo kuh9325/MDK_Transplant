@@ -221,8 +221,8 @@ TraversalLoadError traversalArenaLoadGeometry(TraversalRuntime& rt,
 // Attach/detach — FUN_00432d9c / FUN_00432980 / FUN_00432bf8
 // ---------------------------------------------------------------------------
 
-static void traversalEnsureLoaded(TraversalRuntime& rt,
-                                  TraversalArena& arena) {
+void traversalEnsureLoaded(TraversalRuntime& rt,
+                           TraversalArena& arena) {
   if (!arena.geometryLoaded) {
     std::string detail;
     traversalArenaLoadGeometry(rt, arena, &detail);
@@ -278,6 +278,19 @@ void traversalMigrateInto(TraversalRuntime& rt, TraversalArena& a) {
       it = next;
     }
   }
+  // FUN_004321dc tail (OBSERVED — called at the end of FUN_00432980,
+  // the pull-in this function mirrors): walk the current arena's
+  // +0x68 list then the partner's and run FUN_0045a3b0 on every named
+  // object — the lazy +0x0c element-set rebind. Save-load restore and
+  // FUN_0045a2d0 migration-outs leave +0x0c null; the frame's
+  // collision probes (FUN_004138d8) deref it unguarded, so the bind
+  // must complete before the next frame step.
+  if (rt.cur)
+    for (auto& o : rt.cur->dyn.storage)
+      if (o->col.named) objectArenaActivate(rt, *o);
+  if (rt.partner && rt.partner != rt.cur)
+    for (auto& o : rt.partner->dyn.storage)
+      if (o->col.named) objectArenaActivate(rt, *o);
 }
 
 void traversalAttachPartner(TraversalRuntime& rt, TraversalArena& a) {
@@ -696,7 +709,8 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
                                         const std::string& cmiPath,
                                         const std::string& mtoPath,
                                         TraversalRuntime& rt,
-                                        std::string* detail) {
+                                        std::string* detail,
+                                        std::uint32_t flags) {
   auto fail = [&](TraversalLoadError e, const std::string& msg) {
     if (detail) *detail = msg;
     return e;
@@ -847,7 +861,11 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
   rt.cs.playerBox[5] = pos[2] + 4.25f;
 
   // Initial-arena stream + spawn-once (the loader's warm attach).
-  traversalEnsureLoaded(rt, *rt.cur);
+  // kTraversalLoadSuppressSpawn mirrors FUN_004346e8(param=2): the
+  // save-load path leaves every arena's object list empty for the
+  // ALIE records (unactivated arenas keep lazy spawn via +0x44 bit2).
+  if ((flags & kTraversalLoadSuppressSpawn) == 0)
+    traversalEnsureLoaded(rt, *rt.cur);
   return TraversalLoadError::kOk;
 }
 
@@ -1198,6 +1216,11 @@ TraversalFrameResult stepTraversalRuntime(
     objEnv.slideMode = (rt.slideChannel != 0);
     objEnv.hasContactNormal = (rt.lastContactPoly != nullptr);
     objEnv.diagLog = &rt.scriptDiag;
+    // Persistent script globals (0x541534 / 0x540d88 / 0x540d98) —
+    // seeded from the runtime so writes survive past this frame.
+    objEnv.g541534 = rt.g541534;
+    objEnv.gFlags = rt.scriptGFlags;
+    for (int i = 0; i < 8; ++i) objEnv.gVars[i] = rt.scriptGVars[i];
 
     // FUN_00436100 (OBSERVED 0x4362a8..0x4362e6): the object pass and
     // the FUN_0045cf18 corpse sweep run per arena, cur first, then the
@@ -1295,6 +1318,11 @@ TraversalFrameResult stepTraversalRuntime(
       // freed record (freelist pop in FUN_0045cffc/allocFront).
       da.reapUnnamed();
     }
+    // Write the persistent script globals back (the original's
+    // globals outlive the frame — the env is per-frame scratch).
+    rt.g541534 = objEnv.g541534;
+    rt.scriptGFlags = objEnv.gFlags;
+    for (int i = 0; i < 8; ++i) rt.scriptGVars[i] = objEnv.gVars[i];
   }
 
   // FUN_004388d8 script-object calls — Phase 5H tr_alcmd VM.
@@ -1317,6 +1345,9 @@ TraversalFrameResult stepTraversalRuntime(
     env.slideMode = (rt.slideChannel != 0);
     env.hasContactNormal = (rt.lastContactPoly != nullptr);
     env.diagLog = &rt.scriptDiag;
+    env.g541534 = rt.g541534;
+    env.gFlags = rt.scriptGFlags;
+    for (int i = 0; i < 8; ++i) env.gVars[i] = rt.scriptGVars[i];
 
     TraversalArena* run[2] = {cur, nullptr};
     int nrun = 1;
@@ -1333,6 +1364,9 @@ TraversalFrameResult stepTraversalRuntime(
                             env.slideClear = false; }
       rt.slideChannel = env.slideChannel;
     }
+    rt.g541534 = env.g541534;
+    rt.scriptGFlags = env.gFlags;
+    for (int i = 0; i < 8; ++i) rt.scriptGVars[i] = env.gVars[i];
     rt.scriptSpawned += env.seamsSpawned;
   }
   ++rt.seams.profilerHooks; // FUN_0042fecc rdtsc probe (0x43632d)

@@ -126,6 +126,12 @@ struct TraversalArena {
   // / +0x2a2 threshold here when no real object is available, so the
   // 0x540eb4 timer validation reads them through the object layout.
   DynamicObject eventLatch;
+  std::uint32_t flags44 = 0;           // +0x44 — arena flag dword;
+                                       // bit2 mirrors objectsSpawned
+                                       // (the FUN_00432d9c spawn gate),
+                                       // bit0 gates FUN_00432c34's
+                                       // activation calls. Persisted
+                                       // verbatim by full saves.
   std::uint32_t flags58 = 0;           // +0x58 — bound-object flag
                                        // dword (script flag group 1)
   std::uint8_t objFlag148 = 0;         // +0x148 — script byte (0x61)
@@ -535,6 +541,28 @@ struct TraversalRuntime {
   int scriptInsnTotal = 0;           // instructions executed (total)
   int scriptRuns = 0;                // FUN_004388d8 invocations
 
+  // --- Phase 14C — persisted globals restored by full saves ---
+  // These are original globals the full-save MORE/PLAY/DAMP packets
+  // carry; the port parks them here so a restore is byte-faithful and
+  // the script VM sees its persistent operands.
+  float fadeTimer5414a0 = 0.0f;      // 0x5414a0 — transition fade
+  float fadeTimer5414a4 = 0.0f;      // 0x5414a4   (MORE+0x04..+0x0c;
+  float fadeTimer5414a8 = 0.0f;      // 0x5414a8   both a4/a8 take +0x08)
+  int field5414d8 = 0;               // 0x5414d8 — MORE+0x14 counter
+  int field541518 = 0;               // 0x541518 — MORE+0x18; the
+                                     // frontend tick mirror (the live
+                                     // counter is frontend-owned)
+  std::int8_t g541534 = 0;           // 0x541534 — script byte (op 0xca)
+  float scriptGVars[8] = {};         // 0x540d88 — script operand
+                                     // group 0 (slots 4..7 alias
+                                     // scriptGFlags/masterMoveGate/
+                                     // fieldDa0/fieldDa4)
+  std::uint32_t scriptGFlags = 0;    // 0x540d98 — script flag group 0
+  // The verbatim 0x541554 image (PLAY, 239B). Typed fields above
+  // mirror the proven slots; +0x04..+0xc3 is the stats/inventory
+  // region with no typed consumer yet — kept raw, not guessed.
+  std::array<std::byte, 239> savePlayBlock = {};
+
   TraversalSeams seams;
 };
 
@@ -550,12 +578,19 @@ struct TraversalRuntime {
 // the initial arena (geometry + spawn-once), and initializes the
 // player/collision state. `detail` receives a human-readable
 // diagnostic string on failure.
+//
+// `flags` — bit0 suppresses the tail's initial-arena ensure/spawn,
+// mirroring FUN_004346e8(param=2): the save-load path needs the fresh
+// level data + s0 binds WITHOUT the eager spawn (restored objects
+// arrive through ALIE records; unactivated arenas keep lazy spawn).
+inline constexpr std::uint32_t kTraversalLoadSuppressSpawn = 1;
 TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
                                         const std::string& dtiPath,
                                         const std::string& cmiPath,
                                         const std::string& mtoPath,
                                         TraversalRuntime& rt,
-                                        std::string* detail);
+                                        std::string* detail,
+                                        std::uint32_t flags = 0);
 
 // NATIVE DIAGNOSTIC OVERRIDE — not original behavior. Re-anchors the
 // player at `pos`/yaw and re-attaches `arenaIndex` as current
@@ -590,6 +625,14 @@ void traversalPrefetchPartner(TraversalRuntime& rt, TraversalArena& a);
 
 // FUN_00432bf8 — detach partner (type-1 fields[0]==-1).
 void traversalDetachPartner(TraversalRuntime& rt);
+
+// Geometry ensure + the +0x44 bit-2 spawn-once gate (FUN_00432d9c's
+// tail). Exposed for the save restore, which drives the same
+// attach sequence on restored arenas.
+void traversalEnsureLoaded(TraversalRuntime& rt, TraversalArena& arena);
+
+// FUN_00432980 tail — connector pull-in from type-6 peer arenas.
+void traversalMigrateInto(TraversalRuntime& rt, TraversalArena& a);
 
 // FUN_00435178 — scan an arena's type-6 records for a portal
 // crossing of the from->to segment; returns the destination arena

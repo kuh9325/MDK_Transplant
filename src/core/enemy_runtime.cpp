@@ -10,6 +10,7 @@
 
 #include "core/collision_query.h"
 #include "core/dynamic_objects.h"
+#include "core/object_animation.h"
 #include "core/object_path.h"
 #include "core/player_camera.h"
 #include "core/player_projectiles.h"
@@ -718,20 +719,51 @@ void objectArenaDeactivate(TraversalRuntime& rt, DynamicObject& o) {
     rt.seams.fireSoundCalls++;
     o.field158 = nullptr;
   }
+  // OBSERVED 0x45a353..0x45a3a4 — the element-set release: +0x0c==0
+  // or a shared-record sentinel (0x4edcc0/0x4edd48 — the port binds
+  // only owned copies, so "shared" is the structural test
+  // `elements != &o.elemSet`) exits before the anim reset; an owned
+  // record is released (FUN_00403880) and +0x0c clears, then
+  // +0xe4 = -1 and +0x118 = -1 when the done latch (0xff00) is armed.
+  if (o.col.elements == nullptr || o.col.elements != &o.elemSet)
+    return;
+  o.col.elements = nullptr;
+  o.elemSet = CollisionElementSet{};
+  o.model = RuntimeModel{};
+  o.animFrame = -1;
+  if (o.animRec != nullptr &&
+      static_cast<std::uint16_t>(o.animLatch) == 0xff00u)
+    o.animLatch = -1;
 }
 
+} // namespace
+
 // FUN_0045a3b0 — activate on migration INTO an active arena
-// (OBSERVED): when the model record (+0xc) is unbound, reload it via
-// the +0x04 enemy index (FUN_00403720) or the +0x316 named lookup
-// (FUN_00403538 when the index is 0xffff); an armed anim (+0x114)
-// re-syncs (+0xe4 = 0xffff) and the +0x148 flag dword becomes
-// FRNDINT(+0xdc + 1.0) | 0x80000000 — the anim frame marker replaces
-// the flag word (OBSERVED quirk, written verbatim).
+// (OBSERVED, full decode): the +0x0c element-set record is the gate —
+// when null it is rebound from the +0x04 enemy index:
+//   * +0x04 == 0:      +0x0c = the shared class-table record 0
+//                      (0x4edcc0 — no copy). Bounded: the port binds
+//                      record 0's element view via the same deep-copy
+//                      path (no shared-record alias exists).
+//   * +0x04 == 0xffff: FUN_00403538(+0x316, +0x31a, +0x31e, &+0x322)
+//                      procedural/named lookup — a counted seam.
+//   * else:            +0x0c = FUN_00403720(table[+0x04]) — a fresh
+//                      deep copy; when +0x114 (animRec) is armed the
+//                      anim state re-syncs (OBSERVED 0x45a44c..92):
+//                      +0xe4 = -1, +0x148 |= 0x80000000 temporarily,
+//                      FUN_00455890(obj, FRNDINT(+0xdc + 1.0)) applies
+//                      the pending frames, +0xdc = -1.0, +0x148
+//                      restored.
+// After the gate (every call, OBSERVED 0x45a3e1..): +0x158 == 0 with
+// a nonempty +0x15c name restarts the object voice — a counted seam.
 void objectArenaActivate(TraversalRuntime& rt, DynamicObject& o) {
-  if (o.col.model == nullptr) {
-    if (o.enemyIndex == 0xffff) {
-      // FUN_00403538(+0x316, &+0x322, +0x31a, +0x31e) — named model
-      // lookup, a counted seam (the port binds via enemyIndex).
+  if (o.col.elements == nullptr) {
+    if (o.enemyIndex == 0) {
+      if (const RuntimeModel* src = traversalModelFor(0, &rt.level)) {
+        o.model = deepCopyModel(*src);
+        o.syncCollisionView();
+      }
+    } else if (o.enemyIndex == 0xffff) {
       rt.seams.classLookupCalls++;
     } else {
       const RuntimeModel* src =
@@ -740,15 +772,26 @@ void objectArenaActivate(TraversalRuntime& rt, DynamicObject& o) {
         o.model = deepCopyModel(*src);
         o.syncCollisionView();
       }
-    }
-    if (o.animRec != nullptr) {
-      o.animFrame = -1;
-      setFlagDword148(
-          o.col,
-          static_cast<std::uint32_t>(
-              static_cast<std::int32_t>(
-                  static_cast<float>(o.animAcc + 1.0f))) |
-              0x80000000u);
+      if (o.animRec != nullptr) {
+        const std::uint32_t saved =
+            (static_cast<std::uint32_t>(o.col.flags148) & 0xffu) |
+            (static_cast<std::uint32_t>(o.col.flags149) << 8) |
+            (static_cast<std::uint32_t>(o.col.flags14a) << 16) |
+            (static_cast<std::uint32_t>(o.col.flags14b) << 24);
+        o.animFrame = -1;
+        setFlagDword148(o.col, saved | 0x80000000u);
+        const int frame = static_cast<int>(
+            std::lrint(static_cast<double>(o.animAcc) + 1.0));
+        o.animAcc = -1.0f;
+        const std::uint8_t* end =
+            reinterpret_cast<const std::uint8_t*>(
+                rt.level.cmiBytes.data()) +
+            rt.level.cmiBytes.size();
+        ObjectAnimView view{
+            static_cast<const std::uint8_t*>(o.animRec), end, true};
+        objectAnimApply(o, view, frame);
+        setFlagDword148(o.col, saved);
+      }
     }
   }
   // Voice restart: +0x158 == 0 with a nonempty +0x15c name restarts
@@ -756,8 +799,6 @@ void objectArenaActivate(TraversalRuntime& rt, DynamicObject& o) {
   if (o.field158 == nullptr && !o.field15c.empty())
     rt.seams.fireSoundCalls++;
 }
-
-} // namespace
 
 // Returns 1 when the object was transferred (skip the rest of its
 // update this frame), 0 to continue — the FUN_004574d0 contract.
