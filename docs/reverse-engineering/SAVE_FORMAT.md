@@ -274,16 +274,78 @@ The native reader maps these onto `SaveError` codes one-for-one.
   model 0's element view (`arena+0x124 = 0x4edcc0` equivalent).
 - `mdk-inspect --save-info` / `--save-roundtrip` / `--save-restore`
   (`--save-activate N` exercises the dormant-arena activation route on
-  a restored save) — census + round-trip + full-restore diagnostics;
-  all five local real saves parse, and both full saves restore and
-  step deterministically. Phase 14C.1 digests (post-restore /
-  1 frame / 90 frames): `1.SAV` `1375600551be9d99` /
-  `fa92f4a340280874` / `06307535cd8e10ca`; `MDK.SAV`
-  `034f2771a215c7a8` / `85ac853650977ca6` / `fbf41127b6aba8f6`
-  (the `MDK.SAV` 90-frame digest changed from `4243287bfc9fb26a`
-  because the corrected DAMP field mapping now restores nonzero
-  state — `frameCounter=157`, `animPhase=15.03`, `fieldD0c=999`,
-  `turboLatch=1`, `lruB=-1` — that the buggy offsets had dropped).
+  a restored save; `--save-write-full out.SAV` emits the Phase 14D
+  full-save stream after the frame steps — deterministic under
+  `--seed`, refuses to overwrite its input — re-parses, re-restores,
+  and reports key-state equivalence) — census + round-trip +
+  full-restore + full-write diagnostics; all five local real saves
+  parse, and both full saves restore and step deterministically.
+  Phase 14C.1 digests (post-restore / 1 frame / 90 frames): `1.SAV`
+  `1375600551be9d99` / `fa92f4a340280874` / `06307535cd8e10ca`;
+  `MDK.SAV` `034f2771a215c7a8` / `85ac853650977ca6` /
+  `fbf41127b6aba8f6` (the `MDK.SAV` 90-frame digest changed from
+  `4243287bfc9fb26a` because the corrected DAMP field mapping now
+  restores nonzero state — `frameCounter=157`, `animPhase=15.03`,
+  `fieldD0c=999`, `turboLatch=1`, `lruB=-1` — that the buggy offsets
+  had dropped).
+
+### Phase 14D writer (OBSERVED — FUN_00427ed4 → FUN_00426e98 →
+### FUN_00426a0c → FUN_00427970)
+
+- `src/core/save_full_write.*` — `saveGameWriteFull(rt, sess, in)`
+  builds the whole packet stream `SAVE THMB GAME MORE PLAY DAMP CAME
+  (AREN ALIE* FAND*)* BULL×3 SEND` in memory and hands it to the
+  shared `saveGameEnvelope` (cipher armed after the 2B seed, size +
+  checksum patch) — the same envelope helper the header-only writer
+  uses. `SaveWriteFullInput.seed` forces the cipher seed (tests /
+  diagnostics only); `thumbnail` accepts a caller blob, else zeros.
+- **GAME**: full writes stamp `modeField = 0x3eb` (mode+1000) and
+  health verbatim — the <0x65→100 floor is header-only-branch only.
+  `+0x08` emits 0 (the original carried an uninit stack dword).
+- **Ids**: sequential `+0x7c` stamping, 1-based, no gaps — per arena
+  the embedded `+0x118` record first, then the live list in order
+  (OBSERVED in the FUN_00426a0c staging loop).
+- **Token encoders** (the FUN_004262b0 family, inverse of the loader's
+  FUN_004262c8): arena refs → `position × 0x466`, `-1` = null; object
+  refs → stamped `+0x7c` id, `0` = null (the fixup never writes -1
+  into object slots); CMI pointers → `ptr − imageBase`, `-1` = null;
+  CMI strings → the char-position offset located by image search
+  (operand `{len}{chars}{NUL}` first, bare NUL-terminated fallback;
+  non-CMI strings → `-1` + warning — the original saved a wild
+  `ptr−base` that only resolved inside its own address space).
+- **FUN_00426738 record fixup, mirrored**: `+0x0c`/`+0x158` zeroed;
+  `+0x60`/`+0x2bc`/conn `+0x302` arena tokens; `+0xec`, `+0x108`,
+  `+0x10c`, `+0x110`, `+0x114`, `+0x230`, retPc `+0x24c..`, savedPc
+  `+0x25c..`, conn `+0x306`/`+0x30a`/`+0x316..+0x322`, homing `+0x302`,
+  `+0x140`/`+0x15c` strings → CMI tokens; `+0x138`/`+0x278`/`+0x2b8`/
+  mover `+0x312` → object ids. The `+0x302..+0x32d` union emits the
+  verbatim lane views first, then overlays flag-owned views in the
+  original's fixup order (mover → connector → homing prefix).
+- **DAMP**: `+0x1d4..+0x20f` emitted zero (the original writer scrubs
+  the weapon-5 block too); `+0x134`/`+0x170` emit the current arena's
+  token — the loader clears both post-attach but the original's live
+  globals still held the load target (OBSERVED `0` in real saves);
+  `+0x250` emits nonzero→sentinel like the object `+0x2b0`/`+0x2b4`.
+- **BULL**: `+0x18` arena token, `+0xd4` the FUN_00461724 fly-callback
+  enum inverse, `+0xd8` home object id, `+0xdc` nonzero→the element
+  rebind gate, `+0xe0` verbatim (ribbon-path alias is a dead slot),
+  `+0xe4` the `flags&1`-selected `ribbonT`/`speedH` view.
+- **Restore-order fix**: the loader materializes ALIE records in
+  stream order — `DynamicArena::allocBack()` now appends so the
+  post-load `+0x68` walk order matches the original (a per-record
+  `allocFront` had reversed it). `objFlag148` restores the embedded
+  record's `+0x30` low byte; `ribbonT` mirrors `+0xe4` on load.
+- **Golden (local real save)**: `MDK.SAV` → restore → 1 frame →
+  write → reparse → restore → equivalence OK. Byte-level packet diff
+  vs the original: identical in every gameplay-authoritative field;
+  remaining deltas are the cipher seed, the THMB capture (no renderer
+  seam — zeros), `GAME+0x08` uninit dword, `MORE+0x0c` (the live
+  `0x5414a8` had decayed past the saved `+0x08` value; loader ignores
+  it), loader-skipped scratch/pointer fields (DAMP `+0x18..+0x2b`,
+  `+0x50..+0x57`, stat counters, AREN `+0x14..+0x43`/`+0x5c..+0x6a`/
+  `+0x446..+0x461`, ALIE `+0x00`/`+0x64..+0xab`), pointer sentinels
+  (DAMP `+0x250`/`+0x254`, ALIE `+0x2b0`/`+0x2b4`), and one frame of
+  authored drift (positions, anim accumulators, `frameCounter`).
 
 ### Phase 14C.1 load-closure audit (OBSERVED)
 
@@ -313,14 +375,15 @@ Every `PLAY`/`DAMP`/`BULL` packet byte is now classified:
   anim-record resolution, active-shot advance, deterministic
   re-apply, and MORE-identity rejection.
 
-### Remaining seam (BOUNDED, not closed)
+### Remaining seam
 
-Full-save **writing** requires reproducing the AREN/ALIE/FAND raw
-memory records (the port deliberately uses different object storage —
-no raw pointers are ever serialized). On the load side the remaining
-unmapped spans are all proven derived render scratch, per-frame
-rewritten registers, diagnostic counters, no-xref padding, or stale
-heap tokens — the `--save-restore` report lists each with its class.
 Reader, death checkpoint, header-only save/continue, and manual
-full-save **loading** are closed for BUILD_A on the local corpus;
-full-save writing stays open.
+full-save **loading and writing** are closed for BUILD_A on the local
+corpus — the emitted stream re-parses and re-restores with zero
+reference failures and identical authoritative state, and the
+packet-image diff against a real save contains no gameplay-
+authoritative difference. Known intentional deviations (all
+load-neutral): `THMB` is a zero fill unless the caller supplies a
+blob; non-CMI-resident strings save as `-1`; the `MORE+0x0c` live
+value cannot be reconstructed from the loaded state; pointer identity
+sentinels and loader-ignored scratch emit `0`/`1`.

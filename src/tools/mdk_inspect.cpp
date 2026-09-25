@@ -39,6 +39,7 @@
 #include "core/player_vertical.h"
 #include "core/progression_runtime.h"
 #include "core/save_full_restore.h"
+#include "core/save_full_write.h"
 #include "core/save_game.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
@@ -128,7 +129,12 @@ int usage() {
                "                            steps --frames frames;\n"
                "                            --save-activate N also runs the\n"
                "                            dormant-arena activation route on\n"
-               "                            restored arena N)\n"
+               "                            restored arena N;\n"
+               "                            --save-write-full <out.SAV> emits the\n"
+               "                            Phase 14D full-save stream after the\n"
+               "                            frame steps (deterministic under\n"
+               "                            --seed), re-parses and re-restores it,\n"
+               "                            and reports equivalence)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1274,6 +1280,7 @@ int main(int argc, char** argv) {
   std::optional<std::string> saveInfoPath;
   std::optional<std::string> saveRoundtripPath;
   std::optional<std::string> saveRestorePath;
+  std::optional<std::string> saveWriteFullPath;
   int saveActivateIdx = -1;
   int ffCourse = 0;
   int ffSkill = 0;
@@ -1427,6 +1434,10 @@ int main(int argc, char** argv) {
         return usage();
       }
       saveActivateIdx = static_cast<int>(n);
+    } else if (!std::strcmp(a, "--save-write-full")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      saveWriteFullPath = v;
     } else if (!std::strcmp(a, "--course")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -1988,6 +1999,77 @@ int main(int argc, char** argv) {
     std::printf("digest:    %016llx  (%d frames)  insn=%d gfl=%08x\n",
                 (unsigned long long)digest, travFrames,
                 rt.scriptInsnTotal, rt.scriptGFlags);
+
+    // --save-write-full: Phase 14D — re-emit the (possibly stepped)
+    // runtime as a full-save stream, then verify it end-to-end
+    // through the native parser + full-restore path. Never writes
+    // over the input file.
+    if (saveWriteFullPath) {
+      if (*saveWriteFullPath == *saveRestorePath) {
+        std::fprintf(stderr, "--save-write-full refuses to overwrite "
+                             "the input save\n");
+        return 1;
+      }
+      mdk::SaveWriteFullInput win;
+      win.seed = static_cast<std::uint16_t>(ffSeed & 0xffff);
+      mdk::FullWriteReport wrep;
+      std::string werr;
+      const auto bytes =
+          mdk::saveGameWriteFull(rt, sess, win, &wrep, &werr);
+      if (bytes.empty()) {
+        std::fprintf(stderr, "write-full: %s\n", werr.c_str());
+        return 1;
+      }
+      {
+        FILE* f = std::fopen(saveWriteFullPath->c_str(), "wb");
+        if (!f) {
+          std::fprintf(stderr, "write-full: cannot open %s\n",
+                       saveWriteFullPath->c_str());
+          return 1;
+        }
+        std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+      }
+      std::printf("write-full: %zuB -> %s (aren=%d obj=%d fand=%d "
+                  "ids=%d seed=%04x)\n", bytes.size(),
+                  saveWriteFullPath->c_str(), wrep.arenasWritten,
+                  wrep.objectsWritten, wrep.fansWritten, wrep.saveIds,
+                  (unsigned)win.seed);
+      for (const auto& w : wrep.warnings)
+        std::printf("write-warn: %s\n", w.c_str());
+      // Verify: parse -> restore -> key-state equivalence.
+      mdk::SaveGame sg2;
+      const auto pe = mdk::saveGameParse(bytes.data(), bytes.size(),
+                                         sg2);
+      std::printf("reparse:   %s\n", mdk::saveErrorName(pe));
+      if (pe != mdk::SaveError::kOk) return 1;
+      mdk::ProgressionSession sess2;
+      mdk::TraversalRuntime rt2;
+      mdk::FullRestoreReport rep2;
+      const auto re2 = mdk::applyFullSaveToTraversal(sg2, *root, sess2,
+                                                     rt2, &rep2, &err);
+      std::printf("rerestore: %s  (arena-refs %d/%d obj %d/%d "
+                  "cmi %d/%d)\n", mdk::saveErrorName(re2),
+                  rep2.arenaRefsResolved, rep2.arenaRefsFailed,
+                  rep2.objectRefsResolved, rep2.objectRefsFailed,
+                  rep2.cmiRefsResolved, rep2.cmiRefsFailed);
+      for (const auto& w : rep2.warnings)
+        std::printf("warn2:     %s\n", w.c_str());
+      if (re2 != mdk::SaveError::kOk) return 1;
+      const bool eq =
+          rt2.cs.pos[0] == rt.cs.pos[0] &&
+          rt2.cs.pos[1] == rt.cs.pos[1] &&
+          rt2.cs.pos[2] == rt.cs.pos[2] &&
+          rt2.motion.yawDeg == rt.motion.yawDeg &&
+          rt2.fieldHealth == rt.fieldHealth &&
+          rt2.scriptGFlags == rt.scriptGFlags &&
+          rt2.cur == rt2.arenas[rep.curArenaIndex].get() &&
+          rt2.shots[0].state == rt.shots[0].state &&
+          sess2.deathCount == sess.deathCount;
+      std::printf("equiv:     %s (pos/yaw/health/gflags/arena/shots/"
+                  "deaths)\n", eq ? "OK" : "MISMATCH");
+      return eq ? 0 : 1;
+    }
     return 0;
   }
 

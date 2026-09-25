@@ -620,6 +620,14 @@ struct DynamicArena {
   // the arena; the returned reference stays valid until detach.
   DynamicObject& allocFront();
 
+  // List-tail variant — same freelist/alloc semantics as allocFront
+  // but appends to +0x68. The full-save loader uses it: the original
+  // fills the list head->tail in ALIE stream order (FUN_00427218's
+  // bulk allocation), so a per-record allocFront would reverse the
+  // list relative to the original and change the +0x68 walk order
+  // the frame pass depends on.
+  DynamicObject& allocBack();
+
   // FUN_0045cf90 — unlink from +0x68, wipe the record (the
   // original's memset), and push it onto the global freelist. The
   // memory stays allocated: stale DynamicObject* held by other

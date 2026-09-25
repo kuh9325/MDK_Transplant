@@ -70,11 +70,10 @@
 // NATIVE PORT DECISIONS:
 //   - The reader parses the whole stream and exposes typed views for
 //     the proven packets only; unknown payloads stay raw byte views.
-//   - The writer emits the header-only form (the LASTGAME/checkpoint
-//     and briefing-save shape). Full-save writing is the documented
-//     remaining seam — the AREN/ALIE/FAND records are raw original
-//     memory images that this port deliberately does not reproduce
-//     field-for-field.
+//   - saveGameWriteHeaderOnly emits the header-only form (the
+//     LASTGAME/checkpoint and briefing-save shape). The full manual-
+//     save writer lives in save_full_write.* (Phase 14D) and produces
+//     the (AREN ALIE* FAND*)* BULLx3 stream this reader consumes.
 //   - GAME+0x08 is written as 0 (the original stores uninit stack
 //     garbage there; any value is load-neutral).
 //   - No original bytes are embedded; all sizes/tags come from the
@@ -211,6 +210,14 @@ struct SaveWriteInput {
 // original writer's (mode==6)?6:3 clamp is reproduced by clamping any
 // other value to 3, matching "else 3").
 std::vector<std::byte> saveGameWriteHeaderOnly(const SaveWriteInput& in);
+
+// Shared stream tail (FUN_00426380 cipher arm + FUN_00426440 close):
+// `stream` must begin with the clear SAVE packet (tag, size=2, seed
+// payload); every byte after the seed is ciphered and the result is
+// wrapped in the {size, checksum} envelope. Both the header-only and
+// full writers funnel through it.
+std::vector<std::byte> saveGameEnvelope(std::vector<std::byte> stream,
+                                        std::uint16_t seed);
 
 // FUN_00426440's close-out: patch size+checksum over a finished stream
 // (exposed for tests).

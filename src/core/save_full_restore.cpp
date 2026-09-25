@@ -807,6 +807,9 @@ void applyEmbeddedRecord(std::span<const std::byte> rec,
     s.savedPc[i] = static_cast<std::uint32_t>(sp);
     s.marker[i] = rd16(rec, 0x26c + 2 * i);
   }
+  // The op-0x61 script byte lives at AREN+0x148 == the embedded
+  // record's +0x30 low byte (aliased with eventLatch.field30).
+  a.objFlag148 = rd8(rec, 0x30);
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +869,8 @@ void applyBull(std::span<const std::byte> p, PlayerShot& s, BullRefs& r,
   r.hadHomeElem = rdi32(p, 0xdc) != 0;
   r.homeElemIdx = rdi32(p, 0xe0);
   s.speedH = rdf32(p, 0xe4);
+  s.ribbonT = s.speedH;   // the +0xe4 alias view — dead unless
+                          // +0xf8&1, kept in sync for the writer
   s.yawAccum = rdf32(p, 0xe8);
   // +0xec — flight scratch (unmapped).
   s.speedV = rdf32(p, 0xf0);
@@ -1006,7 +1011,11 @@ SaveError applyFullSaveToTraversal(const SaveGame& save,
         rep.warnings.emplace_back("ALIE without a preceding AREN");
         continue;
       }
-      DynamicObject& o = curArena->dyn.allocFront();
+      // The original allocates the arena's object block once and
+      // fills the +0x68 list head->tail in ALIE stream order, so the
+      // post-load list order IS the stream order — append (allocFront
+      // would reverse it, changing the per-frame object walk).
+      DynamicObject& o = curArena->dyn.allocBack();
       ObjRefs r;
       applyObjectRecord(pkt.payload, o, r);
       if (r.saveId > 0) refs.byId[r.saveId] = &o;

@@ -41,6 +41,7 @@
 #include "core/player_vertical.h"
 #include "core/progression_runtime.h"
 #include "core/save_full_restore.h"
+#include "core/save_full_write.h"
 #include "core/save_game.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
@@ -17829,35 +17830,28 @@ struct SyntheticFullSave {
   }
 };
 
-} // namespace
+// The CMI data-region layout shared by the full-restore + full-write
+// tests (image offsets — file = image + 4):
+//   0x20  scriptA  {0x44,0x00,0x03,0xff}  — set gflag0 bit3; end
+//   0x30  scriptB  {0x44,0x00,0x04,0xff}  — set gflag0 bit4; end
+//   0x40  animRec  {rate 30, 0 channels, 4 frames, rootKeys, 0 refs}
+//   0x80  pathRec  {count 2, e0{f0,{0,0,0}}, e1{f100,{100,0,0}}}
+constexpr std::uint32_t kScrA = 0x20, kScrB = 0x30, kAnim = 0x40,
+                        kPath = 0x80;
 
-void test_save_full_restore() {
-  namespace fs = std::filesystem;
-  using mdk::ProgressionSession;
-  using mdk::SaveError;
-  using mdk::TraversalRuntime;
-  using S = SyntheticFullSave;
-
-  const fs::path tmp = fs::temp_directory_path() / "mdk_test_fullsave";
-  fs::remove_all(tmp);
-
-  // CMI data-region layout (image offsets — file = image + 4):
-  //   0x20  scriptA  {0x44,0x00,0x03,0xff}  — set gflag0 bit3; end
-  //   0x30  scriptB  {0x44,0x00,0x04,0xff}  — set gflag0 bit4; end
-  //   0x40  animRec  {rate 30, 0 channels, 4 frames, rootKeys, 0 refs}
-  //   0x80  pathRec  {count 2, e0{f0,{0,0,0}}, e1{f100,{100,0,0}}}
-  const std::uint32_t kScrA = 0x20, kScrB = 0x30, kAnim = 0x40,
-                      kPath = 0x80;
+void makeSaveTestLevel(const std::filesystem::path& tmp) {
   makeSyntheticLevel(tmp, 7, 0.0f, 0.0f, 0.0f, 0.0f,
-                     {"A7_0", "A7_1"}, 0x100, [&](SyntheticCmi& cmi) {
+                     {"A7_0", "A7_1"}, 0x100, [](SyntheticCmi& cmi) {
     const std::size_t d = static_cast<std::size_t>(cmi.dataStart);
     auto b8 = [&](std::size_t o, int v) {
       cmi.buf[o] = static_cast<std::byte>(v & 0xff);
     };
     auto b32 = [&](std::size_t o, std::int32_t v) {
-      S::wi(cmi.buf, o, v);
+      SyntheticFullSave::wi(cmi.buf, o, v);
     };
-    auto bf = [&](std::size_t o, float v) { S::wf(cmi.buf, o, v); };
+    auto bf = [&](std::size_t o, float v) {
+      SyntheticFullSave::wf(cmi.buf, o, v);
+    };
     // scriptA at image 0x20 -> file d+0x00.
     b8(d + 0x00, 0x44); b8(d + 0x01, 0x00); b8(d + 0x02, 0x03);
     b8(d + 0x03, 0xff);
@@ -17875,20 +17869,10 @@ void test_save_full_restore() {
     b32(d + 0x8c, 100);           // e1.frame = 100
     bf(d + 0x90, 100.0f);         // e1.pos.x = 100
   });
+}
 
-  // The MORE identity: loaded .CMI byte length - 4 (the image view
-  // excludes the length prefix — OBSERVED).
-  const fs::path cmiPath =
-      tmp / "TRAVERSE" / "LEVEL7" / "LEVEL7.CMI";
-  const auto cmiImageSize = static_cast<std::int32_t>(
-      fs::file_size(cmiPath) - 4);
-
-  std::string err;
-  auto root = mdk::DataRoot::open(tmp, &err);
-  CHECK(root.has_value());
-
-  // ---- build the packet stream ----
-  auto buildSave = [&]() {
+SyntheticFullSave buildSyntheticFullSave(std::int32_t cmiImageSize) {
+  using S = SyntheticFullSave;
     SyntheticFullSave sb;
     // GAME is a struct field, not a packet in `packets`.
     sb.sg.game.modeField = 1003;
@@ -18103,7 +18087,30 @@ void test_save_full_restore() {
     sb.add('S', 'E', 'N', 'D', 0);
     sb.finish();
     return sb;
-  };
+}
+
+} // namespace
+
+void test_save_full_restore() {
+  namespace fs = std::filesystem;
+  using mdk::ProgressionSession;
+  using mdk::SaveError;
+  using mdk::TraversalRuntime;
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_fullsave";
+  fs::remove_all(tmp);
+  makeSaveTestLevel(tmp);
+
+  // The MORE identity: loaded .CMI byte length - 4 (the image view
+  // excludes the length prefix — OBSERVED).
+  const auto cmiImageSize = static_cast<std::int32_t>(
+      fs::file_size(tmp / "TRAVERSE" / "LEVEL7" / "LEVEL7.CMI") - 4);
+
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+
+  auto buildSave = [&]() { return buildSyntheticFullSave(cmiImageSize); };
 
   // ---- full apply: every packet class + typed state ----
   {
@@ -18271,6 +18278,169 @@ void test_save_full_restore() {
   fs::remove_all(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 14D — the FUN_00426a0c writer path: restore the synthetic full
+// save, re-emit it through saveGameWriteFull, parse the stream, and
+// re-restore — comparing every gameplay-authoritative field.
+// ---------------------------------------------------------------------------
+void test_save_full_write() {
+  namespace fs = std::filesystem;
+  using mdk::ProgressionSession;
+  using mdk::SaveError;
+  using mdk::TraversalRuntime;
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_fullwrite";
+  fs::remove_all(tmp);
+  makeSaveTestLevel(tmp);
+
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+  if (!root) return;
+
+  auto sb = buildSyntheticFullSave(
+      static_cast<std::int32_t>(
+          fs::file_size(tmp / "TRAVERSE" / "LEVEL7" / "LEVEL7.CMI") - 4));
+
+  ProgressionSession sess1;
+  TraversalRuntime rt1;
+  mdk::FullRestoreReport rep1;
+  std::string detail;
+  CHECK(mdk::applyFullSaveToTraversal(sb.sg, *root, sess1, rt1, &rep1,
+                                      &detail) == SaveError::kOk);
+
+  // ---- write ----
+  mdk::SaveWriteFullInput in;
+  in.seed = 0x5eed;
+  mdk::FullWriteReport wrep;
+  const auto bytes =
+      mdk::saveGameWriteFull(rt1, sess1, in, &wrep, &detail);
+  CHECK(!bytes.empty());
+  CHECK(wrep.arenasWritten == 2 && wrep.objectsWritten == 2);
+  CHECK(wrep.saveIds == 4);   // 2 embedded + 2 objects, sequential
+  for (const auto& w : wrep.warnings)
+    std::fprintf(stderr, "write-warn: %s\n", w.c_str());
+  CHECK(wrep.warnings.empty());
+
+  // ---- parse: the emitted stream must round-trip the envelope ----
+  mdk::SaveGame sg2;
+  CHECK(mdk::saveGameParse(bytes.data(), bytes.size(), sg2) ==
+        SaveError::kOk);
+  CHECK(sg2.game.full() && sg2.game.modeField == 1003);
+  CHECK(sg2.game.mode() == 3);
+  CHECK(sg2.game.levelId == 0 && sg2.game.health == 150);
+  CHECK(sg2.game.deathCount == 2 && sg2.game.field54163b == 7);
+
+  // Packet order: SAVE THMB GAME MORE PLAY DAMP CAME (AREN ALIE*)*
+  // BULLx3 SEND.
+  const std::uint32_t want[] = {
+      mdk::saveTag('S', 'A', 'V', 'E'), mdk::saveTag('T', 'H', 'M', 'B'),
+      mdk::saveTag('G', 'A', 'M', 'E'), mdk::saveTag('M', 'O', 'R', 'E'),
+      mdk::saveTag('P', 'L', 'A', 'Y'), mdk::saveTag('D', 'A', 'M', 'P'),
+      mdk::saveTag('C', 'A', 'M', 'E'), mdk::saveTag('A', 'R', 'E', 'N'),
+      mdk::saveTag('A', 'L', 'I', 'E'), mdk::saveTag('A', 'R', 'E', 'N'),
+      mdk::saveTag('A', 'L', 'I', 'E'), mdk::saveTag('B', 'U', 'L', 'L'),
+      mdk::saveTag('B', 'U', 'L', 'L'), mdk::saveTag('B', 'U', 'L', 'L'),
+      mdk::saveTag('S', 'E', 'N', 'D')};
+  CHECK(sg2.packets.size() == 15);
+  if (sg2.packets.size() == 15) {
+    for (int i = 0; i < 15; ++i) CHECK(sg2.packets[i].tag == want[i]);
+    CHECK(sg2.packets[7].payload.size() == 1126);  // AREN
+    CHECK(sg2.packets[8].payload.size() == 814);   // ALIE
+    CHECK(sg2.packets[11].payload.size() == 252);  // BULL
+  }
+
+  // ---- re-restore + authoritative equivalence ----
+  ProgressionSession sess2;
+  TraversalRuntime rt2;
+  mdk::FullRestoreReport rep2;
+  CHECK(mdk::applyFullSaveToTraversal(sg2, *root, sess2, rt2, &rep2,
+                                      &detail) == SaveError::kOk);
+  CHECK(rep2.identityOk && rep2.warnings.empty());
+  CHECK(rep2.arenaRefsFailed == 0 && rep2.objectRefsFailed == 0 &&
+        rep2.cmiRefsFailed == 0);
+  CHECK(rt2.cs.pos[0] == rt1.cs.pos[0] &&
+        rt2.cs.pos[1] == rt1.cs.pos[1] &&
+        rt2.cs.pos[2] == rt1.cs.pos[2]);
+  CHECK(rt2.motion.yawDeg == rt1.motion.yawDeg);
+  CHECK(rt2.fieldHealth == rt1.fieldHealth);
+  CHECK(sess2.health == sess1.health &&
+        sess2.deathCount == sess1.deathCount);
+  CHECK(rt2.inventoryCount == rt1.inventoryCount &&
+        rt2.inventorySel == rt1.inventorySel);
+  CHECK(rt2.inventory[0].id == rt1.inventory[0].id &&
+        rt2.inventory[0].charges == rt1.inventory[0].charges);
+  CHECK(rt2.ammo[0] == rt1.ammo[0] && rt2.ammo[5] == rt1.ammo[5]);
+  CHECK(rt2.focusDist == rt1.focusDist &&
+        rt2.frameCounter == rt1.frameCounter);
+  CHECK(rt2.fieldE88 == rt1.fieldE88 && rt2.fieldE9c == rt1.fieldE9c);
+  CHECK(rt2.cur == rt2.arenas[0].get() &&
+        rt2.partner == rt2.arenas[1].get());
+  CHECK(rt2.lruA == rt2.arenas[0].get() && rt2.lruB == nullptr);
+
+  // Object state + list order: the stream order IS the list order.
+  CHECK(rt2.arenas[0]->dyn.storage.size() == 1);
+  CHECK(rt2.arenas[1]->dyn.storage.size() == 1);
+  const mdk::DynamicObject* a0 = rt1.arenas[0]->dyn.storage.front().get();
+  const mdk::DynamicObject* b0 = rt2.arenas[0]->dyn.storage.front().get();
+  const mdk::DynamicObject* a1 = rt1.arenas[1]->dyn.storage.front().get();
+  const mdk::DynamicObject* b1 = rt2.arenas[1]->dyn.storage.front().get();
+  CHECK(a0 && b0 && a1 && b1);
+  if (a0 && b0 && a1 && b1) {
+    const auto* cm1 = rt1.level.cmiBytes.data();
+    const auto* cm2 = rt2.level.cmiBytes.data();
+    const auto offOf = [](const void* p, const std::byte* base) {
+      return p == nullptr
+                 ? std::ptrdiff_t(-1)
+                 : static_cast<const std::byte*>(p) - base;
+    };
+    CHECK(b0->health == a0->health && b0->pos[0] == a0->pos[0]);
+    CHECK(offOf(b0->field108, cm2) == offOf(a0->field108, cm1));
+    CHECK(offOf(b0->animRec, cm2) == offOf(a0->animRec, cm1));
+    CHECK(b0->animAcc == a0->animAcc);
+    CHECK(offOf(b1->fieldEC, cm2) == offOf(a1->fieldEC, cm1));
+    CHECK(b1->fieldF0 == a1->fieldF0);
+    CHECK(offOf(b1->field230, cm2) == offOf(a1->field230, cm1));
+    CHECK(b1->field22c == a1->field22c);    // saved wait
+    CHECK(b1->arena == &rt2.arenas[1]->dyn);
+  }
+
+  // Shots — the active slot + free slots round-trip.
+  CHECK(rt2.shots[0].state == rt1.shots[0].state &&
+        rt2.shots[0].speedH == rt1.shots[0].speedH);
+  CHECK(rt2.shots[0].flyKind == rt1.shots[0].flyKind);
+  CHECK(rt2.shots[1].state == 0 && rt2.shots[2].state == 0);
+
+  // ---- deterministic first-frame equivalence: step both worlds ----
+  const mdk::GameplayInputBindings bindings;
+  const mdk::FrontendTimingState timing;
+  mdk::stepTraversalRuntime(rt1, mdk::RawGameplayInput{}, bindings,
+                            timing);
+  mdk::stepTraversalRuntime(rt2, mdk::RawGameplayInput{}, bindings,
+                            timing);
+  CHECK(rt2.cs.pos[0] == rt1.cs.pos[0] &&
+        rt2.cs.pos[1] == rt1.cs.pos[1] &&
+        rt2.cs.pos[2] == rt1.cs.pos[2]);
+  CHECK(rt2.scriptGFlags == rt1.scriptGFlags);
+  CHECK(rt2.shots[0].pos[0] == rt1.shots[0].pos[0]);
+  const mdk::DynamicObject* s1 =
+      rt1.arenas[1]->dyn.storage.front().get();
+  const mdk::DynamicObject* s2 =
+      rt2.arenas[1]->dyn.storage.front().get();
+  CHECK(s1 && s2 && s1->fieldF0 == s2->fieldF0);
+
+  // ---- rejections: unrepresentable inputs fail explicitly ----
+  {
+    mdk::FullWriteReport r0;
+    TraversalRuntime bare;
+    std::string d0;
+    CHECK(mdk::saveGameWriteFull(bare, sess1, in, &r0, &d0).empty());
+    CHECK(!d0.empty());
+  }
+
+  fs::remove_all(tmp);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -18349,6 +18519,7 @@ int main() {
   test_save_game();
   test_progression_death_restore();
   test_save_full_restore();
+  test_save_full_write();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

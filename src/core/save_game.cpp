@@ -38,7 +38,6 @@ constexpr std::uint32_t kTagSave = saveTag('S', 'A', 'V', 'E');
 constexpr std::uint32_t kTagSend = saveTag('S', 'E', 'N', 'D');
 constexpr std::uint32_t kTagGame = saveTag('G', 'A', 'M', 'E');
 constexpr std::uint32_t kTagThmb = saveTag('T', 'H', 'M', 'B');
-constexpr std::uint32_t kTagMore = saveTag('M', 'O', 'R', 'E');
 
 std::uint32_t rd32(const std::byte* p) {
   return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
@@ -229,7 +228,6 @@ std::vector<std::byte> saveGameWriteHeaderOnly(const SaveWriteInput& in) {
   // SAVE — written before the cipher arms (FUN_00427ed4 order).
   const std::uint16_t seed = in.seed;
   putPacket(kTagSave, &seed, 2);
-  const std::size_t cipherStart = stream.size();  // stream offset 10
 
   // THMB — 3648 bytes; zero-filled when the caller has no capture.
   std::vector<std::byte> thmb(3648, std::byte(0));
@@ -253,8 +251,14 @@ std::vector<std::byte> saveGameWriteHeaderOnly(const SaveWriteInput& in) {
   putPacket(kTagSend, nullptr, 0);
 
   // Cipher arm + envelope patch.
-  cipherRun(stream.data() + cipherStart, stream.size() - cipherStart,
-            seed);
+  return saveGameEnvelope(std::move(stream), seed);
+}
+
+std::vector<std::byte> saveGameEnvelope(std::vector<std::byte> stream,
+                                        std::uint16_t seed) {
+  // The leading SAVE packet (8-byte header + 2-byte seed) stays clear;
+  // everything after it runs through the rolling cipher.
+  cipherRun(stream.data() + 10, stream.size() - 10, seed);
   std::vector<std::byte> file(8 + stream.size());
   wr32(file.data(), std::uint32_t(file.size()));
   std::memcpy(file.data() + 8, stream.data(), stream.size());

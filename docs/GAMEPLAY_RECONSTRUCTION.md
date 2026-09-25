@@ -4946,5 +4946,88 @@ writer/loader disassembly and classified every unmapped span:
 packet field is mapped or proven derived/dormant/scratch; script,
 animation, path, and projectile continuation are proven where
 represented; both real saves restore deterministically. Full-save
-**writing** remains OPEN (it requires serializing the port's own
-object graph — a separate task).
+writing was closed in Phase 14D below.
+
+# Phase 14D — Full-Save Writer
+
+## 185. The writer route (OBSERVED — FUN_00427ed4)
+
+Manual F2 save (name-entry `FUN_00422bc0(0)` → `FUN_00422dec` →
+`FUN_00422d84`) calls `FUN_00427ed4(path, thumbCtx, headerOnly=0)`:
+envelope open → `FUN_00427e8c` THMB capture → `FUN_00426e98` GAME
+(`modeField = 0x3eb` hard-coded on the full branch — mode+1000;
+health is written verbatim — the <0x65→100 floor applies only to the
+header-only path) → `FUN_00426a0c` stages MORE/PLAY/DAMP/CAME, then
+per arena AREN (0x466 record image) + ALIE per object (0x32e record)
++ FAND per surface record, then BULL×3, then `SEND`, then
+`FUN_00426440` checksum/file close. Each packet goes through
+`FUN_00427970` `{tag,u32 size,payload}`. Before emission each staged
+record passes `FUN_00426738` — the write-side token remap (the
+FUN_004262b0 family: `ptr−base`, `-1` null, object slots resolve to
+the stamped `+0x7c` id with `0` for null):
+
+* `+0x0c` and `+0x158` are zeroed outright (the model deep-copy and
+  the stale-bsp slot are never serialized);
+* `+0x60` (home arena), `+0x2bc` (pending arena), connector `+0x302`
+  (destination) → `arenaBase` offsets (`index×0x466`);
+* `+0xec` (path), `+0x108`/`+0x10c`/`+0x110` (script PCs), `+0x114`
+  (anim record), `+0x230` (wait resume), the call-stack PCs
+  `+0x24c..+0x25b`/`+0x25c..+0x26b`, connector `+0x306`/`+0x30a` anim
+  records + `+0x316..+0x322` sound strings, homing `+0x302` name
+  prefix, `+0x140`/`+0x15c` string slots, `+0x150`/`+0x154` markers →
+  CMI-image offsets;
+* `+0x138`/`+0x278`/`+0x2b8` and the mover-child `+0x312` → stamped
+  object ids.
+
+DAMP staging additionally zeroes `+0x114..+0x124` and the weapon-5
+scratch `+0x1d4..+0x20f` before the conversions. The `+0x302..+0x32d`
+union is memcpy'd live then fixed per flag in order mover (`14a&0x20`)
+→ connector (`14a&0x10`) → homing (`149&0x20`).
+
+## 186. Native implementation (`src/core/save_full_write.*`)
+
+`saveGameWriteFull(rt, sess, in)` emits the stream through the shared
+`saveGameEnvelope` (cipher + checksum) used by the header-only writer.
+Save ids stamp 1-based, embedded `+0x118` first then the `+0x68` list
+in order. The union emits verbatim lane views first (the port keeps
+each alias in its own field) then overlays the flag-owned views in the
+original's fixup order. String fields re-locate their char-position in
+the CMI image (operand-form `{len}{chars}{NUL}` first); non-image
+strings emit `-1` + a report warning — the original saved a wild
+`ptr−base` that was only meaningful in its own address space.
+
+Restore-side fixes that make the round trip exact:
+
+* `DynamicArena::allocBack()` — the loader fills the `+0x68` list
+  head→tail in stream order, so appending preserves the original
+  post-load object order (a per-record `allocFront` had reversed it —
+  the front→back update walk order is gameplay-observable).
+* `TraversalArena::objFlag148` restores the embedded record's `+0x30`
+  low byte (the op-`0x61` script byte).
+* `PlayerShot::ribbonT` mirrors `+0xe4` on load so the writer's
+  `flags&1` view select re-emits the saved bits.
+
+## 187. Validation
+
+* `test_save_full_write` — restore the synthetic two-arena save →
+  `saveGameWriteFull` → reparse → re-restore: exact packet order and
+  sizes (`SAVE THMB GAME MORE PLAY DAMP CAME (AREN ALIE)* BULL×3
+  SEND`), `modeField==1003`, 4 sequential ids (2 embedded + 2
+  objects), zero reference failures, identical pos/yaw/health/
+  inventory/ammo/arena refs/object fields (CMI offsets compare
+  image-relative), script PCs and wait/path state preserved, and a
+  deterministic first frame on both runtimes.
+* `MDK.SAV` golden (local corpus): restore → step 1 and 30 frames →
+  write → reparse → re-restore → `equiv: OK` (`write-full: 37973B`,
+  identical size; `arena-refs 36/0 obj 4/0 cmi 38/0`). A byte-level
+  packet diff against the original shows **no gameplay-authoritative
+  difference** — remaining deltas are the cipher seed, the THMB
+  capture (zero-filled; screenshot capture is a host seam), the
+  uninit `GAME+0x08` dword, the dead-on-load `MORE+0x0c` live value,
+  loader-skipped scratch/pointer fields, pointer-identity sentinels,
+  and the authored per-frame drift from stepping.
+
+**Status: `MANUAL FULL-SAVE WRITE: CLOSED FOR BUILD_A`** — and with
+death LASTGAME + header-only save/continue already closed,
+`SAVE / LOAD GAMEPLAY STATE: CLOSED FOR BUILD_A`. Remaining seams are
+frontend save-slot UI and THMB screenshot capture only.

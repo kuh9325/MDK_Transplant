@@ -319,6 +319,28 @@ DynamicObject& DynamicArena::allocFront() {
   return o;
 }
 
+DynamicObject& DynamicArena::allocBack() {
+  auto& fl = objectFreelist();
+  if (!fl.empty()) {
+    storage.push_back(std::move(fl.front()));
+    fl.pop_front();
+  } else {
+    storage.push_back(std::make_unique<DynamicObject>());
+  }
+  DynamicObject& o = *storage.back();
+  o.col.next = nullptr;
+  if (col.objects == nullptr) {
+    col.objects = &o.col;
+  } else {
+    const CollisionObject* tail = col.objects;
+    while (tail->next) tail = tail->next;
+    const_cast<CollisionObject*>(tail)->next = &o.col;  // owned by storage
+  }
+  o.col.named = true;
+  o.arena = this;
+  return o;
+}
+
 void DynamicArena::detach(DynamicObject& obj) {
   CollisionObject* prev = nullptr;   // owned non-const below
   for (const CollisionObject* c = col.objects; c; c = c->next) {
