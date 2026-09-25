@@ -99,14 +99,33 @@ Health `>= 101` stores verbatim.
 ## 4. Field-level map of the other packets
 
 - `PLAY` (239B) — byte copy of `0x541554..0x541642`:
-  `+0x00` health (u32), `+0xc4..0xc7` the weapon-indicator bytes
-  `0x541618..0x54161b`, `+0xcb..0xe3` the six-dword ammo block
-  `0x54161f..0x541633`, `+0xe7` `0x54163b`. Other stat fields inside
-  the block remain UNKNOWN.
+  `+0x00` health (u32), `+0x04` HUD/item timer `0x541558`,
+  `+0x08..+0xbb` the five 0x24-byte inventory slot records
+  `0x54155c..0x541610` (`{i32 id, i32 charges, f32 anim[4],
+  i32 slotX, i32 slotY, i32 aux}` — HUD item rows; both real saves
+  carry populated records), `+0xbc` inventory count `0x541610`,
+  `+0xc0` inventory selection `0x541614`, `+0xc2..+0xc5` the packed
+  weapon-select/cadence dword `0x541616` — its low u16 (`+0xc2`) is
+  restored as the selection aux, while the high u16 (`+0xc4/+0xc5` =
+  `0x541618/19` = wpnSel0/wpnSel1) is reset by the loader post-copy
+  along with `0x54161a/1b` (`+0xc6/+0xc7`), `+0xcb..+0xe2` the
+  six-dword ammo block `0x54161f..0x541633`, `+0xe3` death counter
+  `0x541637`, `+0xe7` `0x54163b`.
+  The script VM's `0xaf` opcode scans the restored table and the
+  punch drain consumes id-6 records (FUN_0046a3d8 semantics).
 - `DAMP` (724B) — the `0x540bfc` motion block: `+0x00` player position
   xyz (f32), `+0x0c` previous position. Real saves confirm mid-arena
   coordinates (`403.0,770.28,-66.0` etc.) — full saves restore the
-  player pose, they do not respawn at s0.
+  player pose, they do not respawn at s0. The whole packet is field-
+  classified in `save_full_restore.cpp::applyDamp`: every gameplay
+  field is mapped (transform, collision, arena refs at `+0x4c/+0xa8/
+  +0x134/+0x164/+0x168`, motion channels `+0x14c..+0x160`, script
+  globals `+0x18c..+0x19c`, slide/anim state, counters, pending view),
+  loader-cleared dwords are documented (`+0x114..+0x124`,
+  `+0x140/+0x144`, `+0x16c`, `+0x1d4..+0x210`, `+0x2ac`), ambient-
+  sound fades/channel records are carried dormant (audio seam), and
+  the only unmapped spans are proven derived scratch, diagnostic
+  counters, no-xref padding, and stale heap tokens.
 - `CAME` (200B) — the `0x540b28` camera block: `+0x00` camera position,
   then the basis/orientation tail.
 - `MORE` (52B, 13 dwords) — session/timer globals (`0x5414a0/a4/a8`
@@ -253,21 +272,55 @@ The native reader maps these onto `SaveError` codes one-for-one.
   `objectArenaActivate` (gate `col.elements == nullptr`) +
   `traversalMigrateInto` tail loop; the embedded pseudo-object binds
   model 0's element view (`arena+0x124 = 0x4edcc0` equivalent).
-- `mdk-inspect --save-info` / `--save-roundtrip` / `--save-restore` —
-  census + round-trip + full-restore diagnostics; all five local real
-  saves parse, and both full saves restore and step deterministically
-  (`1.SAV` digest `06307535cd8e10ca`, `MDK.SAV` `4243287bfc9fb26a`,
-  90 frames each).
+- `mdk-inspect --save-info` / `--save-roundtrip` / `--save-restore`
+  (`--save-activate N` exercises the dormant-arena activation route on
+  a restored save) — census + round-trip + full-restore diagnostics;
+  all five local real saves parse, and both full saves restore and
+  step deterministically. Phase 14C.1 digests (post-restore /
+  1 frame / 90 frames): `1.SAV` `1375600551be9d99` /
+  `fa92f4a340280874` / `06307535cd8e10ca`; `MDK.SAV`
+  `034f2771a215c7a8` / `85ac853650977ca6` / `fbf41127b6aba8f6`
+  (the `MDK.SAV` 90-frame digest changed from `4243287bfc9fb26a`
+  because the corrected DAMP field mapping now restores nonzero
+  state — `frameCounter=157`, `animPhase=15.03`, `fieldD0c=999`,
+  `turboLatch=1`, `lruB=-1` — that the buggy offsets had dropped).
+
+### Phase 14C.1 load-closure audit (OBSERVED)
+
+Every `PLAY`/`DAMP`/`BULL` packet byte is now classified:
+
+- `PLAY +0x04..+0xbb` was the unknown span: it is the five-record
+  inventory table `0x54155c` + count + selection, restored verbatim
+  (the original loader resets only `0x541618..0x54161b`).
+- `DAMP` mid-region: a systematic +4 offset defect (`+0xe4..+0x170`
+  had been mapped as if `+0x100 ≡ 0x540d00`) was corrected against
+  the writer/loader disassembly; all fields now map to their true
+  `0x540bfc`-anchored addresses.
+- `BULL +0x2c..+0xbc` (144B/slot): `FUN_0045f670` rewrites the whole
+  span every frame for `state==1` shots — screen AABB `+0x2c..+0x43`,
+  render transform `+0x44..+0xa3`, vertex block `+0xa4..+0xbb` —
+  pure derived render scratch, never read by tick/fly/collision.
+- Six `+0x114` values in `1.SAV` are stale runtime heap pointers
+  (`0x3b4f0c`/`0x3db980` triplets in dormant arenas DANT_1/DANT_2).
+  The original's `FUN_004262b0` remap returns **−1** for them
+  (value < image base), so the original object stores the 0xffXX-
+  family sentinel — semantically the same "anim done/no record"
+  state as the port's `animRec == nullptr` (`animDone()` gate).
+- Synthetic packet-application coverage (`test_save_full_restore`)
+  exercises MORE/PLAY/DAMP/CAME + 2 AREN + 2 ALIE + FAND + 3 BULL on
+  a generated level: cross-arena refs, inventory/ammo, script
+  resume (global-flag observable), wait resume, path continuation,
+  anim-record resolution, active-shot advance, deterministic
+  re-apply, and MORE-identity rejection.
 
 ### Remaining seam (BOUNDED, not closed)
 
 Full-save **writing** requires reproducing the AREN/ALIE/FAND raw
 memory records (the port deliberately uses different object storage —
-no raw pointers are ever serialized). On the load side: unmapped
-packet regions remain (the `--save-restore` report lists them —
-e.g. most of the DAMP middle block and the BULL +0x2c..0xbc region),
-and six `+0x114` anim pointers in `1.SAV` are runtime heap addresses
-(runtime-allocated anims, shared in triplets — no image backing) that
-resolve to null with a diagnostic. Reader, death checkpoint,
-header-only save/continue, and full-save loading semantics are
-closed for BUILD_A on the local corpus.
+no raw pointers are ever serialized). On the load side the remaining
+unmapped spans are all proven derived render scratch, per-frame
+rewritten registers, diagnostic counters, no-xref padding, or stale
+heap tokens — the `--save-restore` report lists each with its class.
+Reader, death checkpoint, header-only save/continue, and manual
+full-save **loading** are closed for BUILD_A on the local corpus;
+full-save writing stays open.

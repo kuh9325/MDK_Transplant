@@ -24,6 +24,7 @@
 #include "core/data_root.h"
 #include "core/dti_structure.h"
 #include "core/dynamic_objects.h"
+#include "core/enemy_runtime.h"
 #include "core/file_family.h"
 #include "core/freefall_runtime.h"
 #include "core/frontend_machines.h"
@@ -124,7 +125,10 @@ int usage() {
                "                            (Phase 14C: full-save restore —\n"
                "                            MORE/PLAY/DAMP/CAME/AREN/ALIE/FAND/BULL\n"
                "                            into a live TraversalRuntime, then\n"
-               "                            steps --frames frames)\n"
+               "                            steps --frames frames;\n"
+               "                            --save-activate N also runs the\n"
+               "                            dormant-arena activation route on\n"
+               "                            restored arena N)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1270,6 +1274,7 @@ int main(int argc, char** argv) {
   std::optional<std::string> saveInfoPath;
   std::optional<std::string> saveRoundtripPath;
   std::optional<std::string> saveRestorePath;
+  int saveActivateIdx = -1;
   int ffCourse = 0;
   int ffSkill = 0;
   unsigned ffSeed = 0xC0FFEE;
@@ -1412,6 +1417,16 @@ int main(int argc, char** argv) {
       const char* v = value(a);
       if (!v) return usage();
       saveRestorePath = v;
+    } else if (!std::strcmp(a, "--save-activate")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      char* endp = nullptr;
+      const long n = std::strtol(v, &endp, 10);
+      if (!endp || *endp != '\0' || n < 0) {
+        std::fprintf(stderr, "invalid --save-activate: %s\n", v);
+        return usage();
+      }
+      saveActivateIdx = static_cast<int>(n);
     } else if (!std::strcmp(a, "--course")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -1873,6 +1888,40 @@ int main(int argc, char** argv) {
                   a->eventLatch.col.elements != nullptr ? 1 : 0);
     }
 
+    // --save-activate N: run the dormant-arena activation path on
+    // restored arena N — the FUN_00432c34 route the loader's attach
+    // tail takes for a stream-loaded arena (geometry ensure + the
+    // FUN_004321dc/FUN_0045a3b0 element-set rebind on named objects),
+    // then FUN_00432d9c partner attach so the frame pass iterates its
+    // objects (script/path/anim ticks). Exercises restored arenas the
+    // save never had active (e.g. the six +0x114 objects' arenas).
+    if (saveActivateIdx >= 0) {
+      if (static_cast<std::size_t>(saveActivateIdx) >=
+          rt.arenas.size()) {
+        std::fprintf(stderr, "--save-activate %d: only %zu arenas\n",
+                     saveActivateIdx, rt.arenas.size());
+        return 1;
+      }
+      mdk::TraversalArena& a = *rt.arenas[saveActivateIdx];
+      mdk::traversalEnsureLoaded(rt, a);
+      for (auto& o : a.dyn.storage)
+        if (o->col.named) mdk::objectArenaActivate(rt, *o);
+      mdk::traversalAttachPartner(rt, a);
+      std::printf("activate:  arena[%d] %-9s partner=%d\n", a.index,
+                  a.name.c_str(),
+                  rt.partner == &a ? 1 : 0);
+      for (auto& o : a.dyn.storage) {
+        std::printf("  obj hp=%d named=%d elem=%d anim=%d pc=%d "
+                    "wait=%.3f pos=(%.1f,%.1f,%.1f)\n",
+                    o->health, o->col.named ? 1 : 0,
+                    o->col.elements != nullptr ? 1 : 0,
+                    o->animRec != nullptr ? 1 : 0,
+                    o->field108 != nullptr ? 1 : 0,
+                    (double)o->field22c, (double)o->pos[0],
+                    (double)o->pos[1], (double)o->pos[2]);
+      }
+    }
+
     // Step the restored world — the same scripted input as
     // --traversal-runtime (idle -> KeyUp -> idle -> KeyJump).
     const mdk::GameplayInputBindings bindings;
@@ -1890,6 +1939,29 @@ int main(int argc, char** argv) {
         digest *= 1099511628211ull;
       }
     };
+    // Post-restore state digest (before frame 0) — kept on a separate
+    // accumulator so the frame digest's golden values are unchanged.
+    {
+      std::uint64_t sd = 1469598103934665603ull;
+      auto mixS = [&](std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+          sd ^= (v >> (i * 8)) & 0xff;
+          sd *= 1099511628211ull;
+        }
+      };
+      for (int i = 0; i < 3; ++i) {
+        std::uint32_t u;
+        std::memcpy(&u, &rt.cs.pos[i], 4);
+        mixS(u);
+      }
+      mixS(static_cast<std::uint32_t>(rep.curArenaIndex));
+      mixS(static_cast<std::uint32_t>(rep.partnerArenaIndex));
+      mixS(static_cast<std::uint32_t>(rt.fieldHealth));
+      mixS(static_cast<std::uint32_t>(rt.scriptGFlags));
+      mixS(static_cast<std::uint32_t>(rt.inventoryCount));
+      std::printf("digest0:   %016llx  (post-restore)\n",
+                  (unsigned long long)sd);
+    }
     for (int f = 0; f < travFrames; ++f) {
       const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
       const auto out =
@@ -1909,9 +1981,13 @@ int main(int argc, char** argv) {
       mix(static_cast<std::uint32_t>(out.curArenaIndex));
       mix(static_cast<std::uint32_t>(out.grounded ? 1 : 0));
       mix(static_cast<std::uint32_t>(rt.scriptInsnTotal));
+      if (f == 0)
+        std::printf("digest1:   %016llx  (1 frame)\n",
+                    (unsigned long long)digest);
     }
-    std::printf("digest:    %016llx  (%d frames)\n",
-                (unsigned long long)digest, travFrames);
+    std::printf("digest:    %016llx  (%d frames)  insn=%d gfl=%08x\n",
+                (unsigned long long)digest, travFrames,
+                rt.scriptInsnTotal, rt.scriptGFlags);
     return 0;
   }
 

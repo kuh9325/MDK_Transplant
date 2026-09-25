@@ -173,6 +173,29 @@ void applyPlay(std::span<const std::byte> p, TraversalRuntime& rt,
               rt.savePlayBlock.size());
   rt.fieldHealth = rdi32(p, 0x00);
   sess.health = rt.fieldHealth;
+  rt.invHudTimer = rdi32(p, 0x04);           // 0x541558
+  // 0x54155c..0x541614 — the inventory table. NOT touched by the
+  // FUN_00433c4c reset: the saved records/count/selection persist
+  // (OBSERVED xref-clean; only 0x541618/19/1a/1b are rewritten).
+  for (int i = 0; i < 5; ++i) {
+    const int b = 0x08 + i * 0x24;
+    InventoryRecord& rec = rt.inventory[i];
+    rec.id = rdi32(p, b + 0x00);
+    rec.charges = rdi32(p, b + 0x04);
+    rec.animX = rdf32(p, b + 0x08);
+    rec.animY = rdf32(p, b + 0x0c);
+    rec.animVel = rdf32(p, b + 0x10);
+    rec.animAux = rdf32(p, b + 0x14);
+    rec.slotX = rdi32(p, b + 0x18);
+    rec.slotY = rdi32(p, b + 0x1c);
+    rec.aux = rdi32(p, b + 0x20);
+  }
+  rt.inventoryCount = rdi32(p, 0xbc);        // 0x541610
+  rt.inventorySel = rdi32(p, 0xc0);          // 0x541614
+  rt.invSelAux = rdi16(p, 0xc2);             // 0x541616 — packed sel
+                                           // dword low u16; the +0xc4/
+                                           // +0xc5 bytes are wpnSel0/1
+                                           // (reset post-apply)
   for (int i = 0; i < 6; ++i) {
     rt.ammo[i] = rdi32(p, 0xcb + 4 * i);
     sess.ammo[i] = rt.ammo[i];
@@ -252,12 +275,17 @@ void applyDamp(std::span<const std::byte> p, TraversalRuntime& rt,
   rt.vert.posY = rt.cs.pos[1];             // one original vec, two
   rt.vert.posZ = rt.cs.pos[2];             // native views kept in sync
   // +0x18..+0x2f — no proven consumer (unmapped).
-  rep.unmapped.push_back({"DAMP", 0x18, 0x18});
+  rep.unmapped.push_back({"DAMP", 0x18, 0x18}); // 0x540c14..0x540c2b —
+                                           // FUN_00431300/FUN_0047c9e0
+                                           // stab-query segment block;
+                                           // per-query scratch (D)
   rt.motion.yawDeg = rdf32(p, 0x30);
   for (int i = 0; i < 6; ++i)
     rt.cs.playerBox[i] = rdf32(p, 0x34 + 4 * i);
   r.cur = rdi32(p, 0x4c);                    // 0x540c48
-  rep.unmapped.push_back({"DAMP", 0x50, 8}); // +0x50..+0x57
+  rep.unmapped.push_back({"DAMP", 0x50, 8}); // 0x540c4c/50 — render
+                                           // projection ints, rebuilt
+                                           // per frame (B)
   rt.cs.contactFlags = rd8(p, 0x58);
   rt.vert.contactFlags = rt.cs.contactFlags;
   rt.cs.floorZ = rdf32(p, 0x5c);
@@ -289,48 +317,73 @@ void applyDamp(std::span<const std::byte> p, TraversalRuntime& rt,
   rt.locoState = rdi32(p, 0xb0);
   rt.animPrev = rdi32(p, 0xb4);
   rt.animFrame = rdi32(p, 0xb8);
-  rep.unmapped.push_back({"DAMP", 0xbc, 4}); // 0x540cb8
+  rt.animPhase = rdf32(p, 0xbc);             // 0x540cb8 — FUN_00464308
+                                           // move-anim phase accum
   rt.eventPriority = rdi32(p, 0xc0);
   rt.vert.eventIdle = rt.eventPriority;
   rt.motion.moveDirLatch = rdi32(p, 0xc4);
-  rep.unmapped.push_back({"DAMP", 0xc8, 4}); // 0x540cc4
+  rep.unmapped.push_back({"DAMP", 0xc8, 4}); // 0x540cc4 — move-consumed
+                                           // flag; written by dispatch
+                                           // before FUN_00466740 reads
+                                           // it each frame (D)
   rt.fieldCc8 = rdi32(p, 0xcc);
   rt.scopeChanC = rdf32(p, 0xd0);
   rt.scopeChanD0 = rdf32(p, 0xd4);
   rt.scopeChanD4 = rdf32(p, 0xd8);
   r.focusObj = rdi32(p, 0xdc);               // 0x540cd8
-  rt.teleportFlag = rdi32(p, 0xe0);          // 0x540cdc / focusDist
+  // 0x540cdc is float-only in the original (FSTP/FDIV/FST inside
+  // FUN_00464b50 — the focus-distance integrator). The earlier
+  // "teleport block" int view was a doc over-claim; teleportFlag has
+  // no DAMP home and stays 0.
   rt.focusDist = rdf32(p, 0xe0);
-  for (int i = 0; i < 6; ++i)
-    rt.teleportVec[i] = rdf32(p, 0xe4 + 4 * i);
-  rt.camera.shakeX = rdf32(p, 0xf8);
-  rt.camera.shakeY = rdf32(p, 0xfc);
-  rep.unmapped.push_back({"DAMP", 0x100, 8}); // 0x540d00/0x540d04
-  rt.reticleAux = rdi32(p, 0x108);
-  rt.fieldD0c = rdi32(p, 0x10c);
-  // +0x110/+0x114/+0x11c/+0x120 (0x540d10/14/1c/20) are zeroed by the
-  // loader — not restored. +0x118/+0x124/+0x128 have no proven
-  // consumer.
-  rep.unmapped.push_back({"DAMP", 0x118, 4});
-  rep.unmapped.push_back({"DAMP", 0x124, 8});
-  rt.fieldD2c = rdi32(p, 0x12c);
-  r.loadArena = rdi32(p, 0x130);             // 0x540d30
-  rt.scopeHudOffset = rdi32(p, 0x134);
-  rep.unmapped.push_back({"DAMP", 0x138, 4}); // 0x540d38
-  // +0x13c/+0x140 (0x540d3c/0x540d40 pending lists) cleared post-fixup.
-  rep.unmapped.push_back({"DAMP", 0x144, 4}); // 0x540d44
-  rt.motion.moveVel = rdf32(p, 0x148);
-  rt.motion.strafeVel = rdf32(p, 0x14c);
-  rt.motion.turnVel = rdf32(p, 0x150);
-  rt.motion.zoomChannel = rdf32(p, 0x154);
-  rt.look.lookPitchOffset = rdf32(p, 0x158);
-  rt.vert.landingAccum = rdf32(p, 0x15c);
-  r.lruA = rdi32(p, 0x160);                  // 0x540d60
-  r.lruB = rdi32(p, 0x164);                  // 0x540d64
-  // +0x168 (0x540d68 pending list) cleared post-fixup.
-  r.d6c = rdi32(p, 0x16c);                   // 0x540d6c — resolved then
+  rt.frameCounter = rdi32(p, 0xe4);          // 0x540ce0 — step counter
+  rt.camera.shakeMag = rdf32(p, 0xe8);       // 0x540ce4 — shake enable
+  rep.unmapped.push_back({"DAMP", 0xec, 0x10}); // 0x540ce8..0x540cf4 —
+                                           // frame-stat trackers (E)
+  rt.camera.shakeX = rdf32(p, 0xfc);         // 0x540cf8
+  rt.camera.shakeY = rdf32(p, 0x100);        // 0x540cfc
+  rt.fieldD00 = rdf32(p, 0x104);             // 0x540d00 — FUN_00463608
+                                           // exclude latch (mounted-
+                                           // idle event-100 variant)
+  rep.unmapped.push_back({"DAMP", 0x108, 4}); // 0x540d04 — no xrefs (G)
+  rt.reticleAux = rdi32(p, 0x10c);           // 0x540d08
+  rt.fieldD0c = rdi32(p, 0x110);             // 0x540d0c — fire cadence
+  // +0x114/+0x118/+0x120/+0x124 (0x540d10/14/1c/20) — zeroed by the
+  // original loader (FUN_00427218 EBX stores at 0x4275f3..0x42760a).
+  rt.ambientFades[0] = rdf32(p, 0x11c);      // 0x540d18 — live ambient
+                                           // fade accumulator; carried
+                                           // dormant (audio seam)
+  rt.ambientFades[1] = rdf32(p, 0x128);      // 0x540d24
+  rt.ambientFades[2] = rdf32(p, 0x12c);      // 0x540d28
+  rt.fieldD2c = rdi32(p, 0x130);             // 0x540d2c
+  r.loadArena = rdi32(p, 0x134);             // 0x540d30
+  rt.scopeHudOffset = rdi32(p, 0x138);       // 0x540d34
+  rt.inputState.setTurboLatch = rd32(p, 0x13c); // 0x540d38 — STURB
+                                           // edge latch (gameplay)
+  rt.cs.carrierBusy = 0;                     // 0x540d3c — loader-
+                                           // cleared (0x427830); the
+                                           // saved +0x140 value is
+                                           // discarded by the original
+  // +0x144 (0x540d40 pending gate) — loader-cleared (0x42782a).
+  rep.unmapped.push_back({"DAMP", 0x148, 4}); // 0x540d44 — scoped-
+                                           // render guard, rewritten
+                                           // per render call (D)
+  rt.motion.moveVel = rdf32(p, 0x14c);       // 0x540d48
+  rt.motion.strafeVel = rdf32(p, 0x150);     // 0x540d4c
+  rt.motion.turnVel = rdf32(p, 0x154);       // 0x540d50
+  rt.motion.zoomChannel = rdf32(p, 0x158);   // 0x540d54
+  rt.look.lookPitchOffset = rdf32(p, 0x15c); // 0x540d58
+  rt.vert.landingAccum = rdf32(p, 0x160);    // 0x540d5c
+  r.lruA = rdi32(p, 0x164);                  // 0x540d60
+  r.lruB = rdi32(p, 0x168);                  // 0x540d64
+  // +0x16c (0x540d68 pending gate) — loader-cleared (0x427824).
+  r.d6c = rdi32(p, 0x170);                   // 0x540d6c — resolved then
                                            // cleared by the loader
-  rep.unmapped.push_back({"DAMP", 0x170, 0x1c}); // 0x540d70..0x540d8b
+  for (int i = 0; i < 6; ++i)
+    rt.ambientChan[i] = rdi32(p, 0x174 + 4 * i); // 0x540d70..0x540d87 —
+                                           // two 12-byte ambient-sound
+                                           // channel records; carried
+                                           // dormant (audio seam)
   for (int i = 0; i < 8; ++i)
     rt.scriptGVars[i] = rdf32(p, 0x18c + 4 * i); // 0x540d88 (script
                                                  // operand group 0)
@@ -339,9 +392,11 @@ void applyDamp(std::span<const std::byte> p, TraversalRuntime& rt,
   rt.masterMoveGate = rdi32(p, 0x1a0) != 0;
   rt.fieldDa0 = rdi32(p, 0x1a4);
   rt.fieldDa4 = rdi32(p, 0x1a8);
-  rep.unmapped.push_back({"DAMP", 0x1ac, 4}); // 0x540da8
+  rep.unmapped.push_back({"DAMP", 0x1ac, 4}); // 0x540da8 — frame-stat
+                                           // tracker (E)
   rt.fieldDac = rdi32(p, 0x1b0);
-  rep.unmapped.push_back({"DAMP", 0x1b4, 4}); // 0x540db0
+  rep.unmapped.push_back({"DAMP", 0x1b4, 4}); // 0x540db0 — frame-stat
+                                           // tracker (E)
   rt.camera.pullback = rdf32(p, 0x1b8);
   rt.camera.eyeHeight = rdf32(p, 0x1bc);
   rt.scopeScale = rdi32(p, 0x1c0);
@@ -350,7 +405,11 @@ void applyDamp(std::span<const std::byte> p, TraversalRuntime& rt,
   rt.vert.moveBlocker1 = rt.cs.rideElemMask;
   rt.cs.rideActive = rdi32(p, 0x1cc);
   rt.vert.moveBlockerFlag = rt.cs.rideActive;
-  rep.unmapped.push_back({"DAMP", 0x1d0, 4}); // 0x540dcc
+  rep.unmapped.push_back({"DAMP", 0x1d0, 4}); // 0x540dcc — cached
+                                           // arena/stream ptr read by
+                                           // FUN_004321dc/FUN_00432980;
+                                           // rebuilt by the attach
+                                           // tail (C)
   // +0x1d4..+0x210 (0x540dd0..0x540e0c) — 16 dwords the loader zeroes
   // (weapon-5 charge/work globals — the saved values are discarded).
   rt.fieldE10 = rdf32(p, 0x214);
@@ -359,7 +418,12 @@ void applyDamp(std::span<const std::byte> p, TraversalRuntime& rt,
     rt.weapon5Aim[i] = rdf32(p, 0x21c + 4 * i);
   rt.slideChannel = rdi32(p, 0x228);
   rt.vert.bounceFlag = rdi32(p, 0x22c);
-  rep.unmapped.push_back({"DAMP", 0x230, 0x18}); // 0x540e2c..0x540e43
+  for (int i = 0; i < 6; ++i)
+    rt.slideState[i] = rdf32(p, 0x230 + 4 * i); // 0x540e2c..0x540e43 —
+                                           // FUN_0046603c slide-mode
+                                           // internals; restored, port
+                                           // consumer deferred with
+                                           // the slide port (seam)
   rt.animE44 = rdf32(p, 0x248);
   rt.animE48 = rdf32(p, 0x24c);
   // +0x250/+0x254 (0x540e4c/0x540e50) — pointer tokens: nonzero is
@@ -385,15 +449,18 @@ void applyDamp(std::span<const std::byte> p, TraversalRuntime& rt,
   rt.punchHitTime = rdi32(p, 0x280);         // 0x540e7c
   rt.shotSerial = rdi32(p, 0x284);           // 0x540e80
   rt.shotHitCount = rdi32(p, 0x288);         // 0x540e84
-  rep.unmapped.push_back({"DAMP", 0x28c, 8}); // 0x540e88/0x540e8c
+  rt.fieldE88 = rdi32(p, 0x28c);             // 0x540e88 — script-inc
+                                           // mode-dispatch counter
+  rep.unmapped.push_back({"DAMP", 0x290, 4}); // 0x540e8c — no xrefs (G)
   rt.killTally = rdi32(p, 0x294);            // 0x540e90
   rt.scopeBlend94 = rdf32(p, 0x298);         // 0x540e94
   rt.scopeBlend98 = rdf32(p, 0x29c);         // 0x540e98
-  rep.unmapped.push_back({"DAMP", 0x2a0, 4}); // 0x540e9c
+  rt.fieldE9c = rdi32(p, 0x2a0);             // 0x540e9c — frame-head
+                                           // gate (init 0x47)
   rt.bombs = rdi32(p, 0x2a4);                // 0x540ea0
   rt.bombRecharge = rdf32(p, 0x2a8);         // 0x540ea4
   // +0x2ac (0x540ea8 deferred-free countdown) cleared by the loader.
-  rep.unmapped.push_back({"DAMP", 0x2b0, 4}); // 0x540eac
+  rt.flagEac = rd32(p, 0x2b0);               // 0x540eac — cheat bits
   rt.eventTimer = rdf32(p, 0x2b4);           // 0x540eb0
   r.eventTimerObj = rdi32(p, 0x2b8);         // 0x540eb4
   rt.fieldEb8 = rdi32(p, 0x2bc);             // 0x540eb8
@@ -962,6 +1029,20 @@ SaveError applyFullSaveToTraversal(const SaveGame& save,
       fanFixups.emplace_back(rec, curArena);
       ++rep.fansAllocated;
     }
+  }
+
+  // Object-record unmapped spans (emitted once — the 0x32e layout is
+  // shared by ALIE records and every AREN's embedded +0x118 record):
+  // +0x00 list link is runtime-owned; +0x0c/+0x158/+0x160..+0x17f are
+  // loader-cleared pointer regions; +0x64..+0xab screen bounds +
+  // parent 3x4 + surface block are render-rebuilt scratch; +0x11d /
+  // +0x14d..+0x14f are unnamed pad bytes; the two below are the only
+  // fields with no proven classification.
+  if (rep.objectsAllocated > 0 || rep.arenApplied > 0) {
+    rep.unmapped.push_back({"ALIE", 0x2cc, 4});   // dword — no proven
+                                                 // consumer (G)
+    rep.unmapped.push_back({"ALIE", 0x2ea, 0x18}); // 24B — no proven
+                                                 // consumer (G)
   }
 
   // --- BULL x3 -> the 0x540ed4 pool.

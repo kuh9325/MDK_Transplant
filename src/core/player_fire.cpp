@@ -655,11 +655,17 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
     charged = 1;
     rt.ammo[0] -= frameStep;
     if (rt.ammo[0] <= 0) {
-      // Reload — the original scans the 0x54155c inventory table for a
-      // type-6 entry and calls FUN_0046a3d8 on it; the inventory isn't
-      // modelled, so the scan finds nothing and that call never fires.
-      // ammo[0] = 0 and the FUN_00469668(1) notify are unconditional;
-      // the charged punch still runs this frame (OBSERVED).
+      // Reload — OBSERVED (0x4330a5): the original scans the 0x54155c
+      // inventory table (0x24-stride, count 0x541610) for a type-6
+      // record and calls FUN_0046a3d8 on the first match. ammo[0] = 0
+      // and the FUN_00469668(1) notify are unconditional; the charged
+      // punch still runs this frame (OBSERVED).
+      for (int i = 0; i < rt.inventoryCount; ++i) {
+        if (rt.inventory[i].id == 6) {
+          inventoryRemove(rt, i);
+          break;
+        }
+      }
       rt.ammo[0] = 0;
       ++rt.seams.fireNotifyCalls;
     }

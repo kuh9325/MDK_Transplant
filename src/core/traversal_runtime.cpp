@@ -239,6 +239,32 @@ void traversalEnsureLoaded(TraversalRuntime& rt,
   }
 }
 
+// FUN_0046a3d8 — inventory record delete. OBSERVED (0x46a3d8): each
+// record above idx drops its HUD slot target by 0x30 (48px) and
+// recomputes the slide-in velocity (slotX - animX) * 2.0f before the
+// shift; then count-- and the selection fixup incl. the type-6 GATT
+// skip.
+void inventoryRemove(TraversalRuntime& rt, int idx) {
+  for (int i = idx + 1; i < rt.inventoryCount; ++i) {
+    InventoryRecord& s = rt.inventory[i];
+    s.slotX -= 0x30;
+    s.animVel = (s.slotX - s.animX) * 2.0f;
+    rt.inventory[i - 1] = s;
+  }
+  if (rt.inventoryCount > 0) --rt.inventoryCount;
+  if (rt.inventorySel == rt.inventoryCount && rt.inventoryCount != 0)
+    --rt.inventorySel;
+  if (rt.inventoryCount > 1 && rt.inventorySel >= 0 &&
+      rt.inventorySel < 5 &&
+      rt.inventory[rt.inventorySel].id == 6) {
+    if (rt.inventorySel == 0) {
+      rt.inventorySel = 1;
+    } else {
+      --rt.inventorySel;
+    }
+  }
+}
+
 void traversalAttachSideEffects(TraversalRuntime& rt,
                               TraversalArena& arena) {
   traversalEnsureLoaded(rt, arena);

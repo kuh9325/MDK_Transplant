@@ -608,17 +608,22 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       // OBSERVED (0x44112f): sums rec+0x04 over the 0x54155c
       // inventory records (0x24-stride, count 0x541610) whose
       // rec+0x00 == id, then FUN_0045ad40. The inventory table is
-      // unmodelled (same seam as the player_fire reload scan) — the
-      // sum is 0.
+      // restored from PLAY (Phase 14C.1).
       const std::uint8_t id = r.u8();
-      (void)id;
       const std::uint8_t kind = r.u8();
       const float va = r.f32();
       float vb = 0.0f;
       if (kind == 7 || kind == 8) vb = r.f32();
       Linkage L;
       if (!readLinkage(r, L)) { fail("invlink"); return res; }
-      applyLink(L, cmpOp5ad40(kind, 0.0f, va, vb));
+      float invSum = 0.0f;
+      if (env.rt != nullptr) {
+        for (int i = 0; i < env.rt->inventoryCount; ++i) {
+          const InventoryRecord& rec = env.rt->inventory[i];
+          if (rec.id == id) invSum += rec.charges;
+        }
+      }
+      applyLink(L, cmpOp5ad40(kind, invSum, va, vb));
       break;
     }
 
@@ -2448,6 +2453,11 @@ TraversalScriptResult traversalObjectScriptTick(
   if (obj.field108 == nullptr) return res;
   TraversalScriptEnv oenv = env;
   if (obj.arena && obj.arena->owner) oenv.selfArena = obj.arena->owner;
+  // oenv is a copy made for the selfArena override — but group-0 flag
+  // ops (0x44..0x48) write 0x540d98, a GLOBAL in the original. The
+  // flag dword must reach the caller's env on every exit, else
+  // restored object scripts silently drop global flag writes.
+  auto sync = [&] { env.gFlags = oenv.gFlags; };
 
   const std::byte* base = oenv.image.data() + oenv.imageBase;
   auto offIn = [&](const void* p) -> std::uint32_t {
@@ -2461,7 +2471,11 @@ TraversalScriptResult traversalObjectScriptTick(
   std::uint32_t entryOff;
   if (obj.field22c > 0.0f) {
     obj.field22c -= 1.0f / 30.0f;       // 0x49b6f4 (OBSERVED)
-    if (obj.field22c > 0.0f) { res.waited = true; return res; }
+    if (obj.field22c > 0.0f) {
+      res.waited = true;
+      sync();
+      return res;
+    }
     obj.field22c = 0.0f;
     entryOff = offIn(obj.field230);
   } else {
@@ -2472,6 +2486,7 @@ TraversalScriptResult traversalObjectScriptTick(
     res.diag = "object script PC out of bounds";  // port kills it
     if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
     obj.field108 = nullptr;
+    sync();
     return res;
   }
 
@@ -2492,6 +2507,7 @@ TraversalScriptResult traversalObjectScriptTick(
     res.error = true;
     obj.field108 = nullptr;
   }
+  sync();
   return res;
 }
 

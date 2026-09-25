@@ -40,6 +40,8 @@
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
 #include "core/progression_runtime.h"
+#include "core/save_full_restore.h"
+#include "core/save_game.h"
 #include "core/sni_directory.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
@@ -54,8 +56,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <sstream>
 #include <tuple>
@@ -699,7 +703,7 @@ struct SyntheticMto {
   static std::uint64_t align4(std::uint64_t v) { return (v + 3) & ~3ull; }
 
   static SyntheticMto build(const char* logicalName,
-                            std::initializer_list<BlockSpec> specs) {
+                            const std::vector<BlockSpec>& specs) {
     SyntheticMto s;
     const std::uint32_t count = static_cast<std::uint32_t>(specs.size());
     const std::uint64_t dirEnd = 0x18 + std::uint64_t(count) * 12;
@@ -16931,19 +16935,28 @@ namespace {
 // DTI with one arena "A<n>_0" (s0 spawn: arena 0, pos, yaw), CMI with
 // four empty tables, MTO with a matching region-C block (one degenerate
 // node/poly/vert — collisionBlobParse requires nonzero counts).
-std::filesystem::path makeSyntheticLevel(const std::filesystem::path& tmp,
-                                         int dirNum, float px, float py,
-                                         float pz, float yaw) {
+std::filesystem::path makeSyntheticLevel(
+    const std::filesystem::path& tmp, int dirNum, float px, float py,
+    float pz, float yaw,
+    const std::vector<std::string>& arenaNames = {},
+    std::uint32_t cmiDataBytes = 8,
+    const std::function<void(SyntheticCmi&)>& cmiPatch = {}) {
   namespace fs = std::filesystem;
   const fs::path dir =
       tmp / "TRAVERSE" / ("LEVEL" + std::to_string(dirNum));
   fs::create_directories(dir);
   const std::string stem = "LEVEL" + std::to_string(dirNum);
-  const std::string arenaName = "A" + std::to_string(dirNum) + "_0";
+  const std::vector<std::string> names =
+      arenaNames.empty()
+          ? std::vector<std::string>{"A" + std::to_string(dirNum) + "_0"}
+          : arenaNames;
 
+  std::vector<SyntheticDti::Arena> dtiArenas;
+  for (const std::string& n : names)
+    dtiArenas.push_back({n.c_str(), 1.0f, {}});
   auto dti = SyntheticDti::build(
       (stem + ".DTI").c_str(), {},
-      {{arenaName.c_str(), 1.0f, {}}},
+      dtiArenas,
       0x70, 8, 4, 0xffffffff, false);
   // s0 spawn record: params[0] arena idx, [1..3] pos, [4] yaw deg.
   dti.put32(static_cast<std::size_t>(dti.s0File), 0);
@@ -16960,22 +16973,27 @@ std::filesystem::path makeSyntheticLevel(const std::filesystem::path& tmp,
              static_cast<std::streamsize>(dti.buf.size()));
 
   auto cmi = SyntheticCmi::build((stem + ".CMI").c_str(),
-                                 {{}, {}, {}, {}}, 8);
+                                 {{}, {}, {}, {}}, cmiDataBytes);
+  if (cmiPatch) cmiPatch(cmi);
   std::ofstream(dir / (stem + ".CMI"), std::ios::binary)
       .write(reinterpret_cast<const char*>(cmi.buf.data()),
              static_cast<std::streamsize>(cmi.buf.size()));
 
-  SyntheticMto::BlockSpec spec;
-  spec.entryName = arenaName.c_str();
-  spec.innerName = "MAT";
-  spec.c2 = 1;  // one BSP node
-  spec.c3 = 1;  // one poly
-  spec.c4 = 1;  // one vert
-  auto mto = SyntheticMto::build((stem + "O.MTO").c_str(), {spec});
-  // Patch the region-C node: unit +z normal, leaf children (-1,-1),
+  std::vector<SyntheticMto::BlockSpec> specs;
+  for (const std::string& n : names) {
+    SyntheticMto::BlockSpec spec;
+    spec.entryName = n.c_str();
+    spec.innerName = "MAT";
+    spec.c2 = 1;  // one BSP node
+    spec.c3 = 1;  // one poly
+    spec.c4 = 1;  // one vert
+    specs.push_back(spec);
+  }
+  auto mto = SyntheticMto::build((stem + "O.MTO").c_str(), specs);
+  // Patch each region-C node: unit +z normal, leaf children (-1,-1),
   // empty poly sets — poly/vert zeroes are already valid.
-  {
-    const std::size_t off = mto.blockOffs[0];
+  for (const std::uint64_t boff : mto.blockOffs) {
+    const std::size_t off = static_cast<std::size_t>(boff);
     auto rd32 = [&](std::size_t o) {
       return static_cast<std::uint32_t>(mto.buf[o]) |
              (static_cast<std::uint32_t>(mto.buf[o + 1]) << 8) |
@@ -17745,6 +17763,514 @@ void test_progression_death_restore() {
   fs::remove_all(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 14C.1 — synthetic full-save packet application. Packet views
+// are populated directly in SaveGame::plain (the post-cipher form
+// saveGameParse produces); no real .SAV bytes enter the tree. The
+// level is generated: LEVEL7 with two arenas (A7_0 current / A7_1
+// partner) and a CMI data region carrying the script, animation, and
+// path blobs the ALIE records reference by image offset.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Decoded-stream SaveGame builder — staged payloads are laid into
+// `plain` once so every registered view aliases stable storage.
+struct SyntheticFullSave {
+  mdk::SaveGame sg;
+  // deque — emplace_back keeps earlier payload references stable.
+  std::deque<std::pair<std::uint32_t, std::vector<std::byte>>> staged;
+
+  std::vector<std::byte>& add(char a, char b, char c, char d,
+                            std::size_t size) {
+    staged.emplace_back(mdk::saveTag(a, b, c, d),
+                        std::vector<std::byte>(size, std::byte{0}));
+    return staged.back().second;
+  }
+  void finish() {
+    // Size `plain` once — views registered below must not see the
+    // buffer reallocate out from under them.
+    std::size_t total = 0;
+    for (auto& [tag, data] : staged) total += 8 + data.size();
+    sg.plain.resize(total);
+    std::size_t off = 0;
+    for (auto& [tag, data] : staged) {
+      wi(sg.plain, off, static_cast<std::int32_t>(tag));
+      wi(sg.plain, off + 4, static_cast<std::int32_t>(data.size()));
+      std::memcpy(sg.plain.data() + off + 8, data.data(), data.size());
+      mdk::SavePacketView v;
+      v.tag = tag;
+      v.payload = std::span<const std::byte>(sg.plain.data() + off + 8,
+                                             data.size());
+      v.streamOffset = static_cast<std::uint32_t>(off + 8);
+      sg.packets.push_back(v);
+      off += 8 + data.size();
+    }
+  }
+
+  static void wi(std::vector<std::byte>& b, std::size_t o,
+                 std::int32_t v) {
+    for (int k = 0; k < 4; ++k)
+      b[o + k] = static_cast<std::byte>(
+          (static_cast<std::uint32_t>(v) >> (8 * k)) & 0xff);
+  }
+  static void w16(std::vector<std::byte>& b, std::size_t o,
+                  std::uint32_t v) {
+    b[o] = static_cast<std::byte>(v & 0xff);
+    b[o + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+  }
+  static void w8(std::vector<std::byte>& b, std::size_t o,
+                 std::uint32_t v) {
+    b[o] = static_cast<std::byte>(v & 0xff);
+  }
+  static void wf(std::vector<std::byte>& b, std::size_t o, float f) {
+    std::int32_t v;
+    std::memcpy(&v, &f, 4);
+    wi(b, o, v);
+  }
+};
+
+} // namespace
+
+void test_save_full_restore() {
+  namespace fs = std::filesystem;
+  using mdk::ProgressionSession;
+  using mdk::SaveError;
+  using mdk::TraversalRuntime;
+  using S = SyntheticFullSave;
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_fullsave";
+  fs::remove_all(tmp);
+
+  // CMI data-region layout (image offsets — file = image + 4):
+  //   0x20  scriptA  {0x44,0x00,0x03,0xff}  — set gflag0 bit3; end
+  //   0x30  scriptB  {0x44,0x00,0x04,0xff}  — set gflag0 bit4; end
+  //   0x40  animRec  {rate 30, 0 channels, 4 frames, rootKeys, 0 refs}
+  //   0x80  pathRec  {count 2, e0{f0,{0,0,0}}, e1{f100,{100,0,0}}}
+  const std::uint32_t kScrA = 0x20, kScrB = 0x30, kAnim = 0x40,
+                      kPath = 0x80;
+  makeSyntheticLevel(tmp, 7, 0.0f, 0.0f, 0.0f, 0.0f,
+                     {"A7_0", "A7_1"}, 0x100, [&](SyntheticCmi& cmi) {
+    const std::size_t d = static_cast<std::size_t>(cmi.dataStart);
+    auto b8 = [&](std::size_t o, int v) {
+      cmi.buf[o] = static_cast<std::byte>(v & 0xff);
+    };
+    auto b32 = [&](std::size_t o, std::int32_t v) {
+      S::wi(cmi.buf, o, v);
+    };
+    auto bf = [&](std::size_t o, float v) { S::wf(cmi.buf, o, v); };
+    // scriptA at image 0x20 -> file d+0x00.
+    b8(d + 0x00, 0x44); b8(d + 0x01, 0x00); b8(d + 0x02, 0x03);
+    b8(d + 0x03, 0xff);
+    // scriptB at image 0x30 -> file d+0x10.
+    b8(d + 0x10, 0x44); b8(d + 0x11, 0x00); b8(d + 0x12, 0x04);
+    b8(d + 0x13, 0xff);
+    // anim record at image 0x40 -> file d+0x20 (64B).
+    bf(d + 0x20, 30.0f);          // +0x00 rate
+    b32(d + 0x24, 0);             // +0x04 channelCount
+    b32(d + 0x28, 4);             // +0x08 frameCount
+    b32(d + 0x5c, 0);             // rootKeys end: +0x0c..0x5b, refs
+    // path record at image 0x80 -> file d+0x60.
+    b32(d + 0x60, 2);             // count
+    b32(d + 0x64, 0);             // e0.frame = 0 (pos/tans zero)
+    b32(d + 0x8c, 100);           // e1.frame = 100
+    bf(d + 0x90, 100.0f);         // e1.pos.x = 100
+  });
+
+  // The MORE identity: loaded .CMI byte length - 4 (the image view
+  // excludes the length prefix — OBSERVED).
+  const fs::path cmiPath =
+      tmp / "TRAVERSE" / "LEVEL7" / "LEVEL7.CMI";
+  const auto cmiImageSize = static_cast<std::int32_t>(
+      fs::file_size(cmiPath) - 4);
+
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+
+  // ---- build the packet stream ----
+  auto buildSave = [&]() {
+    SyntheticFullSave sb;
+    // GAME is a struct field, not a packet in `packets`.
+    sb.sg.game.modeField = 1003;
+    sb.sg.game.levelId = 0;
+    sb.sg.game.health = 150;
+    sb.sg.game.deathCount = 2;
+    sb.sg.game.field54163b = 7;
+
+    auto& more = sb.add('M', 'O', 'R', 'E', 52);
+    S::wi(more, 0x00, cmiImageSize);
+    S::wi(more, 0x20, -1);                 // anchorId -> null
+
+    auto& play = sb.add('P', 'L', 'A', 'Y', 239);
+    S::wi(play, 0x00, 150);                // health
+    S::wi(play, 0x04, 77);                 // invHudTimer 0x541558
+    S::wi(play, 0x08, 6);                  // inv[0] id + charges
+    S::wi(play, 0x0c, 200);
+    S::wf(play, 0x10, 10.0f);              // animX/Y/vel/aux
+    S::wf(play, 0x14, 20.0f);
+    S::wf(play, 0x18, 2.0f);
+    S::wf(play, 0x1c, 1.0f);
+    S::wi(play, 0x20, 100);                // slotX/Y
+    S::wi(play, 0x24, 50);
+    S::wi(play, 0x28, 1);                  // aux
+    S::wi(play, 0x2c, 5);                  // inv[1] id + charges
+    S::wi(play, 0x30, 3);
+    S::wi(play, 0x44, 148);
+    S::wi(play, 0x48, 50);
+    S::wi(play, 0xbc, 2);                  // inventoryCount
+    S::wi(play, 0xc0, 1);                  // inventorySel dword
+    S::wi(play, 0xc4, 0x00010505);         // 0x541618 packed wpnSel
+                                           // (loader-reset post-apply)
+    for (int i = 0; i < 6; ++i)
+      S::wi(play, 0xcb + 4 * i, 400 - 50 * i);  // ammo[0..5]
+    S::wi(play, 0xe3, 2);                  // deathCount
+    S::wi(play, 0xe7, 7);                  // field54163b
+
+    auto& damp = sb.add('D', 'A', 'M', 'P', 724);
+    S::wf(damp, 0x00, 50.0f);              // pos {50,90,10}
+    S::wf(damp, 0x04, 90.0f);
+    S::wf(damp, 0x08, 10.0f);
+    S::wf(damp, 0x0c, 51.0f);              // entryPos
+    S::wf(damp, 0x10, 91.0f);
+    S::wf(damp, 0x14, 11.0f);
+    S::wf(damp, 0x30, 45.0f);              // yawDeg
+    S::w8(damp, 0x58, 1);                  // contactFlags
+    S::wf(damp, 0x5c, 10.0f);              // floorZ
+    S::wi(damp, 0x64, -1);                 // floorObj
+    S::wi(damp, 0x6c, 1);                  // arenaValid
+    S::wi(damp, 0x70, 1);                  // vertEnable
+    S::wi(damp, 0x74, 1);                  // queryEnabled
+    S::wi(damp, 0x4c, 0);                  // cur = arena 0
+    S::wi(damp, 0xa8, 0x466);              // partner = arena 1
+    S::wi(damp, 0xac, 1);                  // partnerActive
+    S::wf(damp, 0xbc, 1.5f);               // animPhase 0x540cb8
+    S::wf(damp, 0xe0, 0.5f);               // focusDist 0x540cdc
+    S::wi(damp, 0xe4, 42);                 // frameCounter 0x540ce0
+    S::wf(damp, 0xe8, 2.0f);               // shakeMag 0x540ce4
+    S::wf(damp, 0xfc, 0.1f);               // shakeX 0x540cf8
+    S::wf(damp, 0x100, -0.1f);             // shakeY 0x540cfc
+    S::wf(damp, 0x104, 0.25f);             // fieldD00 0x540d00
+    S::wi(damp, 0x10c, 9);                 // reticleAux 0x540d08
+    S::wi(damp, 0x110, 3);                 // fieldD0c 0x540d0c
+    S::wi(damp, 0x130, 5);                 // fieldD2c 0x540d2c
+    S::wi(damp, 0x134, 0);                 // loadArena = arena 0
+    S::wi(damp, 0x138, -115);              // scopeHudOffset
+    S::wi(damp, 0x13c, 1);                 // turboLatch 0x540d38
+    S::wf(damp, 0x14c, 2.0f);              // moveVel 0x540d48
+    S::wf(damp, 0x150, 1.0f);              // strafeVel
+    S::wf(damp, 0x154, 0.5f);              // turnVel
+    S::wf(damp, 0x158, 0.25f);             // zoomChannel
+    S::wf(damp, 0x15c, 0.75f);             // lookPitchOffset
+    S::wi(damp, 0x164, 0);                 // lruA = arena 0
+    S::wi(damp, 0x168, -1);                // lruB = null
+    S::wf(damp, 0x1b8, 3.0f);              // pullback
+    S::wf(damp, 0x1bc, 1.6f);              // eyeHeight
+    S::wi(damp, 0x1c0, 1);                 // scopeScale
+    S::wi(damp, 0x1c4, -1);                // rideObj
+    for (int i = 0; i < 6; ++i)
+      S::wf(damp, 0x230 + 4 * i, static_cast<float>(i + 1));  // slide
+    S::wi(damp, 0x28c, 11);                // fieldE88 0x540e88
+    S::wi(damp, 0x2a0, 0x47);              // fieldE9c 0x540e9c
+    S::wi(damp, 0x2a4, 2);                 // bombs
+    S::wf(damp, 0x2a8, 30.0f);             // bombRecharge
+    S::wi(damp, 0x2b0, 0x20);              // flagEac cheat bit
+    S::wf(damp, 0x2b4, 9.5f);              // eventTimer
+    S::wi(damp, 0x2b8, -1);                // eventTimerObj
+    S::wi(damp, 0x2c0, -1);                // pendingViewSnap
+
+    auto& came = sb.add('C', 'A', 'M', 'E', 200);
+    S::wf(came, 0x00, 50.0f);              // cam pos
+    S::wf(came, 0x04, 90.0f);
+    S::wf(came, 0x08, 5.0f);
+    S::wf(came, 0x0c, 1.0f);               // back = +x
+    S::wf(came, 0x18 + 8, 1.0f);           // up = +z
+    S::wf(came, 0x30, 1.0f);               // zoom
+    for (int r = 0; r < 3; ++r) {
+      S::wf(came, 0x58 + r * 16 + r * 4, 1.0f);   // M1 identity
+      S::wf(came, 0x88 + r * 16 + r * 4, 1.0f);   // M2 identity
+    }
+    S::wf(came, 0xc0, 1.0f);               // cosPitch
+
+    // Embedded +0x118 record defaults: all refs null/-1, saveId set.
+    auto embedded = [](std::vector<std::byte>& aren, std::int32_t id) {
+      const std::size_t e = 0x118;
+      S::w8(aren, e + 0x06, 1);            // named
+      S::wi(aren, e + 0x08, 1);            // health -> col.model set
+      S::wi(aren, e + 0x60, 0);            // arena ref (self)
+      S::wi(aren, e + 0x7c, id);           // saveId
+      S::wi(aren, e + 0xec, -1);           // path
+      S::wi(aren, e + 0x108, -1);          // scriptPc
+      S::wi(aren, e + 0x10c, -1);
+      S::wi(aren, e + 0x110, -1);
+      S::wi(aren, e + 0x114, -1);          // animRec
+      S::wi(aren, e + 0x150, -1);
+      S::wi(aren, e + 0x154, -1);
+      S::wi(aren, e + 0x15c, -1);
+      S::wi(aren, e + 0x230, -1);
+      S::wi(aren, e + 0x2b8, -1);          // obj refs (0 -> null anyway)
+      S::wi(aren, e + 0x2bc, -1);          // pendingArena
+    };
+
+    auto& aren0 = sb.add('A', 'R', 'E', 'N', 1126);
+    std::memcpy(aren0.data(), "A7_0", 4);
+    S::wi(aren0, 0x0c, 1);                 // one ALIE follows
+    S::wi(aren0, 0x10, 0);                 // no FAND
+    embedded(aren0, 1);
+
+    auto& obj0 = sb.add('A', 'L', 'I', 'E', 814);
+    S::w16(obj0, 0x04, 1);                 // enemyIndex 1 (no class —
+                                           // anim apply still runs)
+    S::w8(obj0, 0x06, 1);                  // named
+    S::wi(obj0, 0x08, 500);                // health
+    S::wf(obj0, 0x10, 60.0f);              // pos
+    S::wf(obj0, 0x14, 92.0f);
+    S::wf(obj0, 0x18, 12.0f);
+    S::wi(obj0, 0x60, 0);                  // arena 0
+    S::wi(obj0, 0x7c, 2);                  // saveId 2
+    S::wf(obj0, 0xdc, 2.5f);               // animAcc mid-anim
+    S::wf(obj0, 0xe0, 30.0f);              // animRate
+    S::w16(obj0, 0xe4, 0xffff);            // animFrame -1
+    S::w16(obj0, 0xe6, 0xffff);            // fieldE6 -1
+    S::wi(obj0, 0xec, -1);                 // path
+    S::wi(obj0, 0x108, kScrA);             // scriptPc -> scriptA
+    S::wi(obj0, 0x10c, -1);
+    S::wi(obj0, 0x110, -1);
+    S::wi(obj0, 0x114, kAnim);             // animRec
+    S::w16(obj0, 0x118, 0xffff);           // animLatch -1
+    S::wi(obj0, 0x150, -1);
+    S::wi(obj0, 0x154, -1);
+    S::wi(obj0, 0x15c, -1);
+    S::wi(obj0, 0x230, -1);
+    S::wi(obj0, 0x2bc, -1);                // pendingArena
+
+    auto& aren1 = sb.add('A', 'R', 'E', 'N', 1126);
+    std::memcpy(aren1.data(), "A7_1", 4);
+    S::wi(aren1, 0x0c, 1);
+    S::wi(aren1, 0x10, 0);
+    embedded(aren1, 3);
+    S::wi(aren1, 0x118 + 0x60, 0x466);     // embedded rec -> arena 1
+
+    auto& obj1 = sb.add('A', 'L', 'I', 'E', 814);
+    S::w16(obj1, 0x04, 0xffff);            // no class
+    S::w8(obj1, 0x06, 1);                  // named
+    S::wi(obj1, 0x08, 500);
+    S::wf(obj1, 0x10, 10.0f);              // pos (path start)
+    S::wf(obj1, 0x14, 0.0f);
+    S::wf(obj1, 0x18, 0.0f);
+    S::wi(obj1, 0x60, 0x466);              // arena 1 — cross-arena ref
+    S::wi(obj1, 0x7c, 4);                  // saveId 4
+    S::wf(obj1, 0xe8, 10.0f);              // fieldE8 path speed
+    S::w16(obj1, 0xe6, 0xffff);            // fieldE6 -1 (unlatched)
+    S::wi(obj1, 0xec, kPath);              // path record
+    S::wf(obj1, 0xf0, 5.0f);               // fieldF0 path cursor
+    S::wi(obj1, 0x108, kScrB);             // scriptPc -> scriptB
+    S::wi(obj1, 0x10c, -1);
+    S::wi(obj1, 0x110, -1);
+    S::wi(obj1, 0x114, -1);
+    S::wi(obj1, 0x150, -1);
+    S::wi(obj1, 0x154, -1);
+    S::wi(obj1, 0x15c, -1);
+    // saved wait: 0.04s left, resume PC = scriptB (field230).
+    S::wf(obj1, 0x22c, 0.04f);
+    S::wi(obj1, 0x230, kScrB);
+    S::wi(obj1, 0x2bc, -1);
+
+    for (int i = 0; i < 3; ++i) {
+      auto& bull = sb.add('B', 'U', 'L', 'L', 252);
+      if (i == 0) {
+        S::wi(bull, 0x00, 1);              // state = flight
+        S::wf(bull, 0x04, 0.0f);           // yaw 0 (+x heading)
+        S::wf(bull, 0x08, 0.0f);           // pitch 0
+        S::wi(bull, 0x10, 30);             // lifetime
+        S::wi(bull, 0x18, 0);              // arena 0
+        S::wf(bull, 0x20, 50.0f);          // pos
+        S::wf(bull, 0x24, 90.0f);
+        S::wf(bull, 0x28, 20.0f);
+        S::wf(bull, 0xbc, 5.0f);           // tailLen
+        S::wf(bull, 0xcc, 1.5f);           // fieldCc
+        S::wi(bull, 0xd0, 0);              // type 0 (tracer)
+        S::wi(bull, 0xd4, 0);              // flyEnum 0 = tracer
+        S::wi(bull, 0xd8, -1);             // homeObj
+        S::wi(bull, 0xdc, 0);              // no home element
+        S::wi(bull, 0xe0, -1);             // homeElemIdx
+        S::wf(bull, 0xe4, 30.0f);          // speedH
+        S::wf(bull, 0xf0, 0.0f);           // speedV
+      } else {
+        S::wi(bull, 0x00, 0);              // free slot
+        S::wi(bull, 0xd8, -1);
+      }
+    }
+    sb.add('S', 'E', 'N', 'D', 0);
+    sb.finish();
+    return sb;
+  };
+
+  // ---- full apply: every packet class + typed state ----
+  {
+    auto sb = buildSave();
+    ProgressionSession sess;
+    TraversalRuntime rt;
+    mdk::FullRestoreReport rep;
+    std::string detail;
+    CHECK(mdk::applyFullSaveToTraversal(sb.sg, *root, sess, rt, &rep,
+                                        &detail) == SaveError::kOk);
+    // `detail` may carry a resource-seam note (the synthetic level has
+    // no TRAVSPRT.BNI); it is not an apply error.
+    CHECK(rep.identityOk);
+    CHECK(rep.arenPackets == 2 && rep.arenApplied == 2);
+    CHECK(rep.arenNameMismatch == 0);
+    CHECK(rep.objectsAllocated == 2 && rep.scriptedObjects == 2);
+    CHECK(rep.shotSlots == 3 && rep.shotsActive == 1);
+    CHECK(rep.curArenaIndex == 0 && rep.partnerArenaIndex == 1);
+    CHECK(rep.loadArenaIndex == 0);
+    CHECK(rep.arenaRefsFailed == 0 && rep.cmiRefsFailed == 0 &&
+          rep.objectRefsFailed == 0);
+    CHECK(rep.warnings.empty());
+
+    // Typed state — DAMP/PLAY/CAME fields land.
+    CHECK(rt.cs.pos[0] == 50.0f && rt.cs.pos[1] == 90.0f &&
+          rt.cs.pos[2] == 10.0f);
+    CHECK(rt.motion.yawDeg == 45.0f);
+    CHECK(rt.fieldHealth == 150 && sess.health == 150);
+    CHECK(rt.inventoryCount == 2 && rt.inventorySel == 1);
+    CHECK(rt.inventory[0].id == 6 && rt.inventory[0].charges == 200);
+    CHECK(rt.inventory[1].id == 5 && rt.inventory[1].charges == 3);
+    // invSelAux is the +0xc2 u16 — the high half of the sel dword
+    // (the 0x541616 dword view the cadence machine reads); 0 here.
+    CHECK(rt.invSelAux == 0 && rt.invHudTimer == 77);
+    CHECK(rt.ammo[0] == 400 && rt.ammo[5] == 150);
+    CHECK(sess.deathCount == 2 && sess.field54163b == 7);
+    CHECK(rt.focusDist == 0.5f && rt.frameCounter == 42);
+    CHECK(rt.camera.shakeMag == 2.0f && rt.camera.shakeX == 0.1f);
+    CHECK(rt.fieldD00 == 0.25f && rt.animPhase == 1.5f);
+    CHECK(rt.motion.moveVel == 2.0f && rt.look.lookPitchOffset == 0.75f);
+    CHECK(rt.inputState.setTurboLatch == 1);
+    CHECK(rt.slideState[0] == 1.0f && rt.slideState[5] == 6.0f);
+    CHECK(rt.fieldE88 == 11 && rt.fieldE9c == 0x47);
+    CHECK(rt.flagEac == 0x20 && rt.bombs == 2);
+
+    // Arena wiring — cur/partner/load resolved to runtime arenas.
+    CHECK(rt.cur == rt.arenas[0].get() && rt.cur->name == "A7_0");
+    CHECK(rt.partner == rt.arenas[1].get() &&
+          rt.partner->name == "A7_1");
+    CHECK(rt.partnerActive);
+    CHECK(rt.lruA == rt.arenas[0].get() && rt.lruB == nullptr);
+
+    // Restored objects — one ALIE per arena, refs resolved.
+    CHECK(rt.arenas[0]->dyn.storage.size() == 1);
+    CHECK(rt.arenas[1]->dyn.storage.size() == 1);
+    mdk::DynamicObject* o0 = rt.arenas[0]->dyn.storage.front().get();
+    mdk::DynamicObject* o1 = rt.arenas[1]->dyn.storage.front().get();
+    CHECK(o0 != nullptr && o1 != nullptr);
+    if (o0 && o1) {
+      CHECK(o0->health == 500 && o0->pos[0] == 60.0f);
+      CHECK(o0->field108 != nullptr);      // scriptPc resolved
+      CHECK(o0->animRec != nullptr);       // CMI offset -> image ptr
+      CHECK(o0->animAcc == -1.0f);         // consumed by the activate
+                                           // seek int(2.5+1)=3
+      CHECK(o1->health == 500 && o1->field108 != nullptr);
+      CHECK(o1->fieldEC != nullptr);       // path record resolved
+      CHECK(o1->fieldF0 == 5.0f);          // saved path cursor kept
+      CHECK(o1->field22c > 0.0f);          // saved wait persists
+      CHECK(o1->field230 != nullptr);      // resume PC resolved
+      CHECK(o1->arena == &rt.arenas[1]->dyn);  // cross-arena home
+    }
+
+    // BULL — active shot restored; free slots stay free.
+    CHECK(rt.shots[0].state == 1 && rt.shots[0].speedH == 30.0f);
+    CHECK(rt.shots[0].flyKind == mdk::kShotFlyTracer);
+    CHECK(rt.shots[0].pos[0] == 50.0f && rt.shots[0].pos[2] == 20.0f);
+    CHECK(rt.shots[1].state == 0 && rt.shots[2].state == 0);
+
+    // ---- resumed frames: script/wait/anim/path/shot continuation ----
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const float shotX0 = rt.shots[0].pos[0];
+    const float pathF0 = o1 ? o1->fieldF0 : 0.0f;
+    mdk::stepTraversalRuntime(rt, mdk::RawGameplayInput{}, bindings,
+                              timing);
+    // Script-resume: object script ran from the SAVED pc (bit3), not
+    // a spawn/init re-entry — the flag lands on rt.scriptGFlags.
+    CHECK((rt.scriptGFlags & 0x8) != 0);
+    // Wait-resume: 0.04s - 1/30 ≈ 0.0067s left — still waiting.
+    CHECK((rt.scriptGFlags & 0x10) == 0);
+    // Active shot: tracer flew +x at speedH 30 for one 1/30 tick.
+    CHECK(rt.shots[0].pos[0] > shotX0);
+    mdk::stepTraversalRuntime(rt, mdk::RawGameplayInput{}, bindings,
+                              timing);
+    // Wait elapsed -> resume PC ran scriptB (bit4).
+    CHECK((rt.scriptGFlags & 0x10) != 0);
+    // Path resume: cursor advanced past the saved 5.0.
+    CHECK(o1 == nullptr || o1->fieldF0 > pathF0);
+    CHECK(o1 == nullptr || o1->pos[0] > 10.0f);  // sampled along path
+  }
+
+  // ---- malformed: short MORE is rejected, not applied ----
+  {
+    auto sb = buildSave();
+    // Truncate the MORE payload view (4B instead of 52).
+    for (auto& v : sb.sg.packets) {
+      if (v.tag == mdk::saveTag('M', 'O', 'R', 'E'))
+        v.payload = v.payload.subspan(0, 4);
+    }
+    ProgressionSession sess;
+    TraversalRuntime rt;
+    mdk::FullRestoreReport rep;
+    std::string detail;
+    CHECK(mdk::applyFullSaveToTraversal(sb.sg, *root, sess, rt, &rep,
+                                        &detail) ==
+          SaveError::kTruncatedPacket);
+    CHECK(!detail.empty());
+  }
+
+  // ---- identity mismatch: wrong CMI length fails the MORE check ----
+  {
+    auto sb = buildSave();
+    ProgressionSession sess;
+    TraversalRuntime rt;
+    mdk::FullRestoreReport rep;
+    std::string detail;
+    // Corrupt MORE+0x00 in the decoded stream (first packet payload).
+    const mdk::SavePacketView* more =
+        sb.sg.find(mdk::saveTag('M', 'O', 'R', 'E'));
+    CHECK(more != nullptr);
+    if (more)
+      sb.sg.plain[more->streamOffset] = std::byte{0xee};
+    CHECK(mdk::applyFullSaveToTraversal(sb.sg, *root, sess, rt, &rep,
+                                        &detail) == SaveError::kPacketSize);
+    CHECK(!rep.identityOk);
+  }
+
+  // ---- repeated load: second apply clears the first's state ----
+  {
+    auto sb = buildSave();
+    ProgressionSession sess;
+    TraversalRuntime rt;
+    mdk::FullRestoreReport rep;
+    CHECK(mdk::applyFullSaveToTraversal(sb.sg, *root, sess, rt, &rep,
+                                        nullptr) == SaveError::kOk);
+    // Mutate: kill the restored object, drain the shot slot.
+    if (!rt.arenas[0]->dyn.storage.empty()) {
+      for (auto& up : rt.arenas[0]->dyn.storage) up->health = 1;
+    }
+    rt.shots[0].state = 0;
+    // Rebuild + re-apply — a fresh runtime load replaces state.
+    auto sb2 = buildSave();
+    TraversalRuntime rt2;
+    mdk::FullRestoreReport rep2;
+    CHECK(mdk::applyFullSaveToTraversal(sb2.sg, *root, sess, rt2, &rep2,
+                                        nullptr) == SaveError::kOk);
+    CHECK(rep2.objectsAllocated == 2 && rep2.shotsActive == 1);
+    CHECK(rt2.shots[0].state == 1);        // not the drained slot
+    bool healthy = false;
+    for (auto& up : rt2.arenas[0]->dyn.storage)
+      if (up->col.named && up->health == 500) healthy = true;
+    CHECK(healthy);
+  }
+
+  fs::remove_all(tmp);
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -17822,6 +18348,7 @@ int main() {
   test_progression_campaign();
   test_save_game();
   test_progression_death_restore();
+  test_save_full_restore();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

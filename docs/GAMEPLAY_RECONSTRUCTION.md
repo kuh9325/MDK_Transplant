@@ -4872,12 +4872,79 @@ steps frames. `1.SAV` (levelId 0, cur DANT_3): 19/19 arenas, 37
 objects, all 26 current-arena objects element-bound, 90 frames,
 digest `06307535cd8e10ca` — the player grounds on a restored object
 element set (`floorObj`). `MDK.SAV` (levelId 2, cur HMO_1): 13
-objects, 90 frames, digest `4243287bfc9fb26a`.
+objects, 90 frames, digest `fbf41127b6aba8f6` (14C.1-corrected
+mapping; was `4243287bfc9fb26a`).
 `test_traversal_element_bind` covers the bind-pass scope (cur+partner
 named objects only, the `+0x06` gate).
 
-**Status: full-save LOAD restores and steps deterministically for
-BUILD_A on both local full saves.** Not overall `SAVE / LOAD GAMEPLAY
-STATE` closure: unmapped packet regions remain (the report lists
-them), six `+0x114` runtime-heap anim records are unresolvable, and
-full-save WRITING stays open.
+# Phase 14C.1 — Full-Save Load Closure Audit
+
+## 183. Audit findings and corrections (OBSERVED)
+
+The closure audit re-derived every packet offset against the
+writer/loader disassembly and classified every unmapped span:
+
+* **DAMP +4 shift defect**: `+0xe4..+0x170` had been mapped one dword
+  late (as if `+0x100 ≡ 0x540d00` — the packet is `0x540bfc`-
+  anchored). Real save data confirms: `+0xe4` is `0x540ce0` the frame
+  counter (not a teleport vector), `+0x134` is `0x540d30` the load
+  arena (1.SAV stores 2252 = 2×0x466 → DANT_3), `+0x14c` is `0x540d48`
+  moveVel, `+0x15c` lookPitch, `+0x164/0x168` the LRU refs. `1.SAV`
+  carried zero-equivalent values so its digest held; `MDK.SAV`'s
+  live values (`frameCounter=157`, `animPhase=15.03`,
+  `fieldD0c=999`, `turboLatch=1`, `lruB=-1`) now restore — digest
+  `fbf41127b6aba8f6`.
+* **`0x540cdc` teleport-flag alias was a doc over-claim** — the dword
+  is float-only (`focusDist` integrator inside `FUN_00464b50`);
+  `teleportVec`/`teleportFlag` have no DAMP home.
+* **Loader-cleared fields** (documented, discarded on purpose):
+  `0x540d10/14/1c/20`, `0x540d3c/40`, `0x540d68`, `0x540dd0..0x540e0c`,
+  `0x540ea8`.
+* **PLAY inventory**: `+0x08..+0xbb` is the five-record `0x54155c`
+  table (`{id, charges, f32 anim[4], slotX, slotY, aux}`), count at
+  `+0xbc`, selection `+0xc0`, packed-sel low u16 `+0xc2`; the loader
+  resets only `0x541618..0x54161b`. Both real saves carry populated
+  records (`{6,400}`+`{1,0}` and `{6,200}`+`{5,3}`). Script `0xaf`
+  scans it; the punch drain consumes id-6 (FUN_0046a3d8).
+* **BULL `+0x2c..+0xbc`**: `FUN_0045f670` rewrites the span every
+  frame for `state==1` shots (screen AABB, render transform, vertex
+  block) — derived render scratch, never read by tick/fly/collision.
+* **Six `+0x114` stale heap pointers** (`1.SAV` DANT_1/2 triplets):
+  `FUN_004262b0` returns **−1** for them (below the image base), so
+  the original stores the 0xffXX sentinel — the same `animDone()`
+  predicate state as the port's `animRec == nullptr`. OBSERVED via
+  `FUN_00426738` storing the remap result verbatim.
+* **`traversalObjectScriptTick` env-copy defect**: object scripts ran
+  on a copied `TraversalScriptEnv`, so `0x44` global-flag writes died
+  with the copy. Fixed by syncing `gFlags` back on every exit path;
+  the synthetic resume test now observes script continuation as
+  `rt.scriptGFlags` bits 3 and 4.
+
+## 184. Closure evidence
+
+* `test_save_full_restore` — a decoded-stream `SaveGame` builder
+  stages MORE/PLAY/DAMP/CAME + 2 AREN + 2 ALIE + FAND + 3 BULL on a
+  generated two-arena level and proves: cross-arena cur/partner/load
+  resolution, object/CMI ref fixups, inventory+ammo, script PC
+  continuation (`0x44` → gflag bit 3), wait-resume (`0x40` → bit 4
+  next frame), path-cursor advance, anim-record continuation,
+  active-shot advance, deterministic re-application, and MORE
+  identity rejection.
+* Real saves: both restore with `refs … /0` failed, all unmapped
+  spans classified derived/scratch/dormant. `--save-activate 0|1`
+  exercises the dormant-arena route: DANT_1 (6 objs) and DANT_2
+  (5 objs) attach as partner, all named objects element-bind, the
+  stale-anim objects carry `animRec == null` without incident.
+* Determinism ×3 (post-restore / 1 frame / 90 frames):
+  `1.SAV` `1375600551be9d99` / `fa92f4a340280874` /
+  `06307535cd8e10ca`; `MDK.SAV` `034f2771a215c7a8` /
+  `85ac853650977ca6` / `fbf41127b6aba8f6`.
+* `traversalObjectScriptTick` now persists object-script `0x44`
+  writes — required for resumed scripts to keep their flag state.
+
+**Status: `MANUAL FULL-SAVE LOAD: CLOSED FOR BUILD_A`.** Every
+packet field is mapped or proven derived/dormant/scratch; script,
+animation, path, and projectile continuation are proven where
+represented; both real saves restore deterministically. Full-save
+**writing** remains OPEN (it requires serializing the port's own
+object graph — a separate task).

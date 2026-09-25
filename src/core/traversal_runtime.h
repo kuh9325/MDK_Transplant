@@ -324,6 +324,23 @@ struct TraversalFrameResult {
 // Runtime host
 // ---------------------------------------------------------------------------
 
+// The 0x54155c inventory table record (0x24-stride, 5 slots). OBSERVED
+// (FUN_0046a3d8 delete, opcode-0xaf scan, FUN_00432f84 type-6 consume):
+// id + charges are gameplay-authoritative; the anim/slot fields are the
+// HUD slide-row state (48px slots — rec+0x18 drops 0x30 on delete,
+// rec+0x10 recomputes as (slotX - animX) * 2.0).
+struct InventoryRecord {
+  std::int32_t id = 0;          // +0x00 item type (5,6 OBSERVED)
+  std::int32_t charges = 0;     // +0x04 amount — opcode 0xaf sums this
+  float animX = 0.0f;           // +0x08 HUD slide x (float)
+  float animY = 0.0f;           // +0x0c bar row y (float)
+  float animVel = 0.0f;         // +0x10 slide-in velocity
+  float animAux = 0.0f;         // +0x14
+  std::int32_t slotX = 0;       // +0x18 HUD target x
+  std::int32_t slotY = 0;       // +0x1c bar row y (int mirror)
+  std::int32_t aux = 0;         // +0x20
+};
+
 struct TraversalRuntime {
   TraversalLevel level;
   // Stable arena storage — NATIVE PORT infrastructure. Pointers are
@@ -411,8 +428,13 @@ struct TraversalRuntime {
                                   // sniper abort/entry gates and fed
                                   // to vert env.
   int fieldC74 = 0;               // 0x540c74 — FUN_00432f84 gate
-  int teleportFlag = 0;           // 0x540cdc — teleport block gate
-  float teleportVec[6] = {0, 0, 0, 0, 0, 0}; // 0x540ce0..0x540cf4
+  int teleportFlag = 0;           // script-side teleport seam gate;
+                                  // 0x540cdc is float-only (focusDist)
+                                  // — no int DAMP home (Phase 14C.1)
+  float fieldD00 = 0.0f;          // 0x540d00 — FUN_00463608 exclude
+                                  // latch (mounted-idle event-100
+                                  // variant); restored, consumer
+                                  // deferred with that variant
   float bankAux = 0.0f;           // 0x540b60 — aux bank term (the
                                   // writer is UNKNOWN; folded into
                                   // the bankIdle test)
@@ -466,6 +488,16 @@ struct TraversalRuntime {
   // 0x54161f..0x541633 — the six-dword ammo block: ammo[0] doubles
   // as the punch-charge resource; ammo[1..5] gate the weapons.
   std::array<int, 6> ammo = {};
+  // The 0x54155c inventory table — NOT reset by the save loader
+  // (FUN_00427218 xref-clean; the FUN_00433c4c reset only rewrites
+  // 0x541618/19/1a/1b). Persisted authoritative state.
+  InventoryRecord inventory[5]; // 0x54155c..0x54160f
+  int inventoryCount = 0;       // 0x541610 — live record count
+  int inventorySel = 0;         // 0x541614 — HUD selection
+  int invSelAux = 0;            // 0x541616 — low u16 of the packed
+                              // select dword (survives the reset)
+  int invHudTimer = 0;          // 0x541558 — FUN_00469f7c HUD anim
+                              // countdown (60-tick writes)
   int field541498 = 0;            // 0x541498 — weapon-5 charge level
   int field54163b = 0;            // 0x54163b — weapon-5 fire latch
   int weapon5Probe = 0;           // PORT test hook: when nonzero the
@@ -481,6 +513,15 @@ struct TraversalRuntime {
                                   // on every weapon-5 throw (OBSERVED:
                                   // one global, not per-bomb).
   int shotSerial = 0;             // 0x540e80 — per-spawn serial
+  int fieldE88 = 0;               // 0x540e88 — script-incremented
+                                  // counter; FUN_00429200 mode
+                                  // dispatch reads it (<5/<0x11
+                                  // tiering) — OBSERVED
+  int fieldE9c = 0;               // 0x540e9c — FUN_00436100 head /
+                                  // FUN_00422bc0 gate; FUN_0047b7e0
+                                  // init-writes 0x47
+  std::uint32_t flagEac = 0;      // 0x540eac — FUN_00423ca0 cheat
+                                  // flag bits (persisted cheat state)
   std::array<PlayerShot, 3> shots{};  // 0x540ed4 — the 3-slot pool
   int punchTime = 0;              // 0x540e78 — punch jitter accum
   int punchHitTime = 0;           // 0x540e7c — hit-time accumulator
@@ -508,8 +549,23 @@ struct TraversalRuntime {
   int animPrev = -1;              // 0x540cb0 — previous anim state (the
                                   // first-frame detect latch)
   int animFrame = 0;              // 0x540cb4 — anim frame counter
+  float animPhase = 0.0f;         // 0x540cb8 — FUN_00464308 move-anim
+                                  // phase accumulator (integrates
+                                  // moveVel; restored, port consumer
+                                  // deferred with the anim machine)
+  float slideState[6] = {};       // 0x540e2c..0x540e43 — FUN_0046603c
+                                  // slide-mode internals; restored,
+                                  // consumer deferred with the
+                                  // slide port (seam)
   float animE44 = 0.0f;           // 0x540e44 — slide vector X
   float animE48 = 0.0f;           // 0x540e48 — slide vector Y
+  float ambientFades[3] = {};     // 0x540d18/0x540d24/0x540d28 — live
+                                  // ambient-sound fade accumulators;
+                                  // restored, no port consumer yet
+                                  // (audio seam)
+  std::int32_t ambientChan[6] = {}; // 0x540d70..0x540d87 — two 12-byte
+                                  // ambient-sound channel records;
+                                  // restored raw (audio seam)
   int fieldDa0 = 0;               // 0x540da0 — scripted transition gate
   int fieldDa4 = 0;               // 0x540da4 — post-tick decay target
   int fieldEb8 = 0;               // 0x540eb8 — death-fade mode byte
@@ -609,6 +665,14 @@ TraversalLoadError traversalRuntimeDiagnosticStart(
 TraversalLoadError traversalArenaLoadGeometry(TraversalRuntime& rt,
                                               TraversalArena& arena,
                                               std::string* detail);
+
+// FUN_0046a3d8 — inventory record delete: shifts records above `idx`
+// left one slot (recomputing each shifted record's HUD slide fields:
+// slotX -= 0x30, animVel = (slotX - animX) * 2.0), decrements the
+// count, then applies the selection fixup — `sel--` when it pointed
+// past the new tail, plus the OBSERVED type-6 GATT quirk (a selected
+// id-6 record nudges sel to 1 when sel==0, else sel--).
+void inventoryRemove(TraversalRuntime& rt, int idx);
 
 // FUN_00432d9c tail — attach side-effects on an already-slotted
 // arena: geometry ensure + stream drain (eager no-op) + spawn-once.
