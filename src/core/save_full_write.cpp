@@ -311,7 +311,7 @@ void emitObjectRecord(Img& img, const DynamicObject& o, Toks& tk,
   img.f32(0x2c0, o.field2c0);
   img.f32(0x2c4, o.field2c4);
   img.u32(0x2c8, o.col.elemMaskB);
-  // +0x2cc — unmapped dword.
+  img.u32(0x2cc, o.col.elemMaskLatch);   // OBSERVED (op 0x20): unmask latch
   img.u8(0x2d0, o.field2d0);
   img.u8(0x2d1, o.field2d1);
   for (int i = 0; i < 6; ++i) img.f32(0x2d2 + 4 * i, o.field2d2[i]);

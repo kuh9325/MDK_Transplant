@@ -579,9 +579,13 @@ struct DynamicObject {
   float clampBox[6] = {0, 0, 0, 0, 0, 0};
   // +0x2d0/+0x2d1 — orbit state flags (FUN_00457ab8 sets both to 1
   // each frame). +0x2d2..+0x2e6 — orbit's saved {pos, center} copy.
+  // Op 0xf2 (0x451987) extends the block: flag!=0 writes 12 f32
+  // through +0x2d2..+0x301 (field2d2 + field2ea) and sets
+  // +0x2d0=1/+0x2d1=0xff; flag==0 clears only +0x2d1.
   std::uint8_t field2d0 = 0;
   std::uint8_t field2d1 = 0;
   float field2d2[6] = {0, 0, 0, 0, 0, 0};
+  float field2ea[6] = {0, 0, 0, 0, 0, 0};  // +0x2ea..+0x301 (op 0xf2 tail)
 
   // --- op 0x4e (handler 0x448741): subtype set — three dwords to
   // +0x120..+0x128, +0x11e = 0x4e, path unbound (+0xec = 0), and the

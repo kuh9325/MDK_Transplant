@@ -654,7 +654,7 @@ void applyObjectRecord(std::span<const std::byte> r, DynamicObject& o,
   o.field2c0 = rdf32(r, 0x2c0);
   o.field2c4 = rdf32(r, 0x2c4);
   o.col.elemMaskB = rd32(r, 0x2c8);
-  // +0x2cc — unmapped dword.
+  o.col.elemMaskLatch = rd32(r, 0x2cc);   // OBSERVED (op 0x20): unmask latch
   o.field2d0 = rd8(r, 0x2d0);
   o.field2d1 = rd8(r, 0x2d1);
   for (int i = 0; i < 6; ++i)
@@ -1048,8 +1048,6 @@ SaveError applyFullSaveToTraversal(const SaveGame& save,
   // +0x14d..+0x14f are unnamed pad bytes; the two below are the only
   // fields with no proven classification.
   if (rep.objectsAllocated > 0 || rep.arenApplied > 0) {
-    rep.unmapped.push_back({"ALIE", 0x2cc, 4});   // dword — no proven
-                                                 // consumer (G)
     rep.unmapped.push_back({"ALIE", 0x2ea, 0x18}); // 24B — no proven
                                                  // consumer (G)
   }

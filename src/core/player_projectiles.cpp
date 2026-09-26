@@ -20,6 +20,11 @@
 #include "core/traversal_runtime.h"
 
 namespace mdk {
+
+// enemy_runtime.cpp — FUN_0045828c in-place record wipe. Forward
+// declared: including enemy_runtime.h here would collide bearingDeg.
+void objectTeardownNow(TraversalRuntime& rt, DynamicObject& o);
+
 namespace {
 
 constexpr double kDegToRad = 0.017453292519943276;  // 0x497924
@@ -590,13 +595,14 @@ void objectDeathBoundary(TraversalRuntime& rt, DynamicObject& obj,
   }
   // FUN_00457cf4 — the teardown. The observable runtime writes:
   //   +0x11e == 0xf  -> 0x540d2c = 10
-  //   the FUN_0045828c record wipe: 0x49b85c global latch clear,
-  //   the resource/model release (seam), the memset keeping
-  //   +0x00/+0x60, and FUN_00458204's global-ref clears:
-  //   excludeObj == obj -> clear + playerDamage(50); lastObjContact
-  //   == obj -> clear. The corpse-model/gib spawn, death sound and
-  //   the fade accumulator are render/effect seams — counted.
-  ++rt.seams.objectTeardownCalls;
+  //   FUN_00458204's global-ref clears (excludeObj == obj -> clear +
+  //   playerDamage(50); lastObjContact == obj -> clear), then the
+  //   FUN_0045828c record wipe (memset keeping +0x00/+0x60 — run
+  //   through objectTeardownNow's in-place reconstruct so the storage
+  //   node stays valid for mid-iteration callers) and the die-facing
+  //   corpse spawn (0x45cffc+0x4566f0 — presentation, carried by the
+  //   kObjectTeardown event). The death sound and the 0x540da4 fade
+  //   accumulator are render/effect seams — counted.
   {
     CombatFxEvent fx;
     fx.kind = CombatFxKind::kObjectTeardown;
@@ -606,13 +612,13 @@ void objectDeathBoundary(TraversalRuntime& rt, DynamicObject& obj,
     rt.combatFx.push_back(fx);
   }
   if (obj.field11e == 0xf) rt.fieldD2c = 0xa;
-  if (rt.fieldB85c == &obj) rt.fieldB85c = nullptr;
   if (rt.cs.excludeObj == &obj.col) {
     rt.cs.excludeObj = nullptr;
     // A dying mount deals 50 to the player (FUN_00458204, OBSERVED).
     playerDamageApply(rt, 50, obj.pos);
   }
   if (rt.cs.lastObjContact == &obj.col) rt.cs.lastObjContact = nullptr;
+  objectTeardownNow(rt, obj);             // FUN_0045828c (counts the seam)
   (void)hitPt;
   (void)facingDeg;
 }
@@ -988,8 +994,21 @@ void updateShot(TraversalRuntime& rt, PlayerShot& s, int frameStep,
                                     kZeroExt) == 0) {
           continue;
         }
+        float segEnd[3] = {s.pos[0], s.pos[1], s.pos[2]};
         int elem = -1, tri = -1;
-        collisionObjectProbe(o, prevPos, s.pos, &elem, &tri);
+        collisionObjectProbe(o, prevPos, segEnd, &elem, &tri);
+        static const bool traceScan =
+            std::getenv("MDK_TRACE_SCAN") != nullptr;
+        if (traceScan)
+          std::fprintf(stderr,
+              "  [scan] obj=%p named=%d model=%p es=%p "
+              "seg=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f) elem=%d tri=%d\n",
+              (const void*)o, o->named ? 1 : 0, o->model,
+              (const void*)o->elements, prevPos[0], prevPos[1],
+              prevPos[2], segEnd[0], segEnd[1], segEnd[2], elem, tri);
+        if (elem >= 0) {
+          s.pos[0] = segEnd[0]; s.pos[1] = segEnd[1]; s.pos[2] = segEnd[2];
+        }
         if (elem >= 0) {
           hitObj = objectOf(o);
           hitElem = elem;

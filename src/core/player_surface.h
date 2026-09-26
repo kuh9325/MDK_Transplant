@@ -32,6 +32,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include "core/collision_query.h"
 #include "core/dti_structure.h"
@@ -126,7 +127,13 @@ struct SurfaceObjectState {
 struct SurfaceRecord {
   SurfaceRecord* next = nullptr;   // +0x00
   std::uint32_t owner = 0;         // +0x04
-  std::uint32_t name = 0;          // +0x08 — script-facing key
+  std::uint32_t name = 0;          // +0x08 — script-facing key (the
+                                   // original stores the lstr name
+                                   // pointer here; SAV serializes a u32
+                                   // key — `nameText` carries the text)
+  std::string nameText;            // +0x08 as the original's char*
+                                   // (0xbe's stricmp target, OBSERVED
+                                   // FUN_00413354/FUN_00412c80)
   std::uint8_t surfType = 0;       // +0x0c — surface id (surface kind)
   std::uint32_t f10 = 0;           // +0x10 — volume: no-falloff flag
   std::int32_t kind = -1;          // +0x14 — -1 surface; 1..6 volume

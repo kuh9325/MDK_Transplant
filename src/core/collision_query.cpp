@@ -5,6 +5,8 @@
 #include "core/collision_query.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace mdk {
@@ -454,6 +456,7 @@ struct StabState {
   float hitPt[3];                // 0x54b6e0 — crossing point
   const CollisionPoly* hitPoly;  // 0x54b6d4
   const CollisionNode* hitNode;  // 0x54b6f4
+  int dbgVisits = 0;             // MDK_TRACE_STAB diagnostic only
 };
 
 // FUN_004189c8 — interpolate the cand1->cand2 segment to the node
@@ -490,12 +493,61 @@ int stabPolyScan(StabState& s, const CollisionNode* node,
   return 0;
 }
 
+// FUN_00418a50 mode-1 form (FUN_00418ce8's variant, OBSERVED
+// 0x418b0d..0x418c35): crossings on planes with |nz| < 0.5
+// (C(0x495288)) are skipped outright, and the containment scan runs
+// on ONE set — polysPos when nz >= +0.5, polysNeg when nz <= -0.5 —
+// instead of both. The only mode-1 caller family is the yaw-offset
+// floor probe (FUN_0045d71c via object op 0xec).
+const CollisionNode* stabWalkMode1(StabState& s,
+                                   const CollisionNode* node) {
+  while (node) {
+    const float dStart = s.cand1[1] * node->ny + s.cand1[0] * node->nx +
+                         s.cand1[2] * node->nz + node->d;
+    const float dEnd = s.cand2[1] * node->ny + s.cand2[0] * node->nx +
+                       s.cand2[2] * node->nz + node->d;
+    const CollisionNode* r = nullptr;
+    if (dStart < 0.0f) {
+      if (node->childFar >= 0)
+        r = stabWalkMode1(s, s.nodes + node->childFar);
+    } else {
+      if (node->childNear >= 0)
+        r = stabWalkMode1(s, s.nodes + node->childNear);
+    }
+    if (r) return r;
+    if (dStart * dEnd >= 0.0f) return nullptr;
+    if (std::fabs(node->nz) >= 0.5f) {
+      stabPlanePoint(s, dStart, node);
+      if (stabPolyScan(s, node,
+                       node->nz >= 0.0f ? node->polysPos
+                                        : node->polysNeg)) {
+        return node;
+      }
+    }
+    node = (dStart >= 0.0f)
+               ? (node->childFar >= 0 ? s.nodes + node->childFar : nullptr)
+               : (node->childNear >= 0 ? s.nodes + node->childNear : nullptr);
+  }
+  return nullptr;
+}
+
 // FUN_00418a50 — recursive BSP stab traversal. Descends the side
 // containing cand1 first; on a strict plane crossing (dStart*dEnd < 0)
 // interpolates the crossing point and scans polysPos then polysNeg;
 // then iterates the opposite side. Returns the containing node.
 const CollisionNode* stabWalk(StabState& s, const CollisionNode* node) {
+  static const bool traceStab = std::getenv("MDK_TRACE_STAB") != nullptr;
   while (node) {
+    if (traceStab && ++s.dbgVisits > 40) {
+      std::fprintf(stderr,
+          "  [stab] visits=%d node=%ld far=%d near=%d "
+          "seg=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)\n",
+          s.dbgVisits, (long)(node - s.nodes),
+          (int)node->childFar, (int)node->childNear,
+          s.cand1[0], s.cand1[1], s.cand1[2],
+          s.cand2[0], s.cand2[1], s.cand2[2]);
+      if (s.dbgVisits > 2000) return nullptr;
+    }
     // Original accumulation order: (ny*p.y + nx*p.x) + nz*p.z + d.
     const float dStart = s.cand1[1] * node->ny + s.cand1[0] * node->nx +
                          s.cand1[2] * node->nz + node->d;
@@ -566,6 +618,22 @@ const CollisionNode* collisionStabFull(const CollisionArena& arena,
     if (outPoly) *outPoly = s.hitPoly;
   }
   return r;
+}
+
+// FUN_00418ce8 export — the mode-1 stab (0x54b6f8=1): same walk as
+// collisionStabFull but the nz>=0.5 floor gate and single-set scan
+// of stabWalkMode1. Used by the script yaw-offset floor probe.
+const CollisionNode* collisionStabMode1(const CollisionArena& arena,
+                                        const float* from,
+                                        const float* to) {
+  if (!arena.verts || !arena.nodes) return nullptr;
+  StabState s;
+  s.verts = arena.verts;
+  s.polys = arena.polys;
+  s.nodes = arena.nodes;
+  s.cand1 = from;
+  s.cand2 = to;
+  return stabWalkMode1(s, arena.nodes);
 }
 
 // FUN_004138d8 export — same body as the file-local floor-probe
@@ -1065,6 +1133,21 @@ bool collisionBlobParse(const std::uint8_t* blob, std::size_t size,
   arena->verts = reinterpret_cast<const float*>(vertBase);
   arena->polys = reinterpret_cast<const CollisionPoly*>(polyBase);
   arena->nodes = reinterpret_cast<const CollisionNode*>(nodeBase);
+  // OBSERVED (FUN_004320d0, called at 0x4323dd and 0x42911c right
+  // after the FUN_00419ee0 install): the record's +0x446..+0x45a
+  // AABB is folded from the installed vertex array. +0x44e — the
+  // unaligned minZ — is the abyss reference read by the object kill
+  // plane (pos.z < +0x44e - 200 at 0x45bdd6), the death snap
+  // (+0x44e - 150 at 0x4583ab/0x4583ce), 0x45fd55, and the player
+  // failsafe (0x4673f3). The write goes through
+  // `lea ecx,[eax+0x446]` + [ecx+8]/[ecx+0x14] stores. Arenas whose
+  // +0x24 vert pointer is NULL keep the memset-zero reference.
+  float minZ = blobF32(vertBase + 8);
+  for (std::uint32_t i = 1; i < cD; ++i) {
+    const float z = blobF32(vertBase + i * 12 + 8);
+    if (z < minZ) minZ = z;
+  }
+  arena->deepFloorZ = minZ;
   if (outCounts) {
     outCounts[0] = cA;
     outCounts[1] = cB;

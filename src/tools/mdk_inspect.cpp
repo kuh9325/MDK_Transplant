@@ -46,11 +46,13 @@
 #include "core/traversal_runtime.h"
 
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -1288,6 +1290,14 @@ int main(int argc, char** argv) {
   bool scriptDisasm = false;
   bool objScriptDisasm = false;
   std::string scriptDisasmName;
+  std::optional<std::uint32_t> scriptDisasmOff;
+  struct HitSpec {
+    std::string objName, elemName;
+    int type = 0;
+    int count = 1;
+  };
+  std::vector<HitSpec> hitSpecs;
+  std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
   bool travStartGiven = false;
@@ -1400,6 +1410,41 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;
       traversalRuntime = true;
+    } else if (!std::strcmp(a, "--hit")) {
+      // Phase 15A combat harness: "NAME[@ELEM][:TYPE][xN]". Each
+      // remaining count injects ONE shot per frame into a free pool
+      // slot, aimed through the named object/element — the pool's
+      // own collision + damage tail resolves it (FUN_00460d44 /
+      // the w0 hit path). TYPE: weapon 0..4 (default 0); N default 1.
+      const char* v = value(a);
+      if (!v) return usage();
+      HitSpec h;
+      std::string spec = v;
+      const auto x = spec.rfind('x');
+      if (x != std::string::npos && x + 1 < spec.size() &&
+          std::isdigit(static_cast<unsigned char>(spec[x + 1]))) {
+        h.count = std::atoi(spec.c_str() + x + 1);
+        spec.erase(x);
+      }
+      const auto colon = spec.rfind(':');
+      if (colon != std::string::npos &&
+          colon + 1 < spec.size() &&
+          std::isdigit(static_cast<unsigned char>(spec[colon + 1]))) {
+        h.type = std::atoi(spec.c_str() + colon + 1);
+        spec.erase(colon);
+      }
+      const auto at = spec.find('@');
+      if (at != std::string::npos) {
+        h.objName = spec.substr(0, at);
+        h.elemName = spec.substr(at + 1);
+      } else {
+        h.objName = spec;
+      }
+      hitSpecs.push_back(h);
+    } else if (!std::strcmp(a, "--boss")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      bossNames.push_back(v);
     } else if (!std::strcmp(a, "--freefall-runtime")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -1476,6 +1521,10 @@ int main(int argc, char** argv) {
       const char* n = value(a);   // arena/script record name
       if (!n) return usage();
       scriptDisasmName = n;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {  // optional raw off
+        scriptDisasmOff = static_cast<std::uint32_t>(
+            std::strtoul(argv[++i], nullptr, 0));
+      }
     } else if (!std::strcmp(a, "--obj-script-disasm")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -2472,11 +2521,362 @@ int main(int argc, char** argv) {
     bool airborneSeen = false;
     bool contactSeen = false;
     bool partnerSeen = false;
+    // Phase 15A — boss/combat harness state. `--hit` shots are
+    // injected below; `--boss` objects are change-detected each
+    // frame; completion latches accumulate.
+    bool sawEndLevel = false;
+    bool sawEnding = false;
+    struct BossSnap {
+      std::int32_t health = -1;
+      std::uint8_t mark = 0, sub = 0;
+      const void* pc = nullptr;
+      const void* f230 = nullptr;
+      std::uint32_t f148 = 0;
+      bool dead = false;
+      const void* animRec = nullptr;
+      std::int16_t animFrame = 0, animLatch = 0;
+      std::array<std::int16_t, 12> eh{};
+      bool operator==(const BossSnap&) const = default;
+    };
+    std::unordered_map<const mdk::DynamicObject*, BossSnap> lastSnap;
+    auto bossMatches = [](const mdk::DynamicObject& o, const char* nm) {
+      if (nm[0] == '*') return true;
+      // Live-only: the shot scan skips +0x08<=0 objects, and dead
+      // objects linger in the collision list until teardown/reap —
+      // without the filter a killed match keeps soaking up shots.
+      return o.health > 0 && o.col.named != 0 &&
+             (o.scriptClass == nm || o.model.modelName() == nm);
+    };
     for (int f = 0; f < travFrames; ++f) {
       const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
+      // Phase 15A — combat harness: each pending --hit injects ONE
+      // shot into a free pool slot, aimed through the named
+      // object/element. The pool's own collision + damage tail
+      // (w0/w1 hit path, FUN_00460d44 for 2/3/4) resolves it — no
+      // health/phase fields are written by the harness.
+      // Element shots are serialized one per frame: a shot's hit
+      // writes the element mark into +0x21e/+0x21c, which the next
+      // frame's script pass consumes. Two element hits landing in
+      // the same pool tick overwrite the mark before consumption —
+      // the same reason the original can't register simultaneous
+      // element kills — so at most one @ELEM spec fires per frame.
+      bool elemShotFired = false;
+      for (auto& h : hitSpecs) {
+        if (h.count <= 0) continue;
+        if (!h.elemName.empty() && elemShotFired) continue;
+        const mdk::CollisionArena* ar =
+            (rt.cs.arena != nullptr)
+                ? rt.cs.arena
+                : (rt.cs.carrierBusy == 0 ? rt.cs.carrier : nullptr);
+        if (ar == nullptr) { h.count = 0; continue; }
+        mdk::DynamicObject* boss = nullptr;
+        for (const mdk::CollisionObject* o = ar->objects; o;
+             o = o->next) {
+          auto* cand = reinterpret_cast<mdk::DynamicObject*>(
+              const_cast<mdk::CollisionObject*>(o));
+          if (bossMatches(*cand, h.objName.c_str())) {
+            boss = cand;
+            break;
+          }
+        }
+        if (boss == nullptr) continue;   // spawn may land later —
+                                         // retry next frame
+        // Aim through the object position — NOT the +0x198 AABB
+        // centre: movers' boxes stay frozen at the pose where
+        // +0x14a&0x20 latched, so the box can sit far from the live
+        // model. pad covers the element cluster around pos; speed
+        // crosses it fully in one tick.
+        float tp[3] = {boss->pos[0], boss->pos[1], boss->pos[2]};
+        float pad = 24.0f;
+        float elemHalf[3] = {0.0f, 0.0f, 0.0f};
+        int elemIdx = -1;
+        const mdk::CollisionElementSet* es = boss->col.elements;
+        if (es != nullptr) {
+          float reach = 0.0f;
+          // Union of the live elements — pos can be a detached
+          // waypoint/anchor for driven objects (the XG walker's
+          // body elements sit far from +0x10); zero-volume elems
+          // union the world origin in and explode the box.
+          float umin[3] = {0, 0, 0}, umax[3] = {0, 0, 0};
+          int liveElems = 0;
+          for (int e = 0; e < es->count; ++e) {
+            const float* bb = es->elems[e].aabb;
+            if (bb[0] == bb[3] && bb[1] == bb[4] && bb[2] == bb[5])
+              continue;   // zero-volume elem (folded/unposed wing)
+            for (int k = 0; k < 3; ++k) {
+              if (liveElems == 0 || bb[k] < umin[k]) umin[k] = bb[k];
+              if (liveElems == 0 || bb[3 + k] > umax[k])
+                umax[k] = bb[3 + k];
+            }
+            ++liveElems;
+          }
+          if (liveElems != 0) {
+            float ctr[3] = {(umin[0] + umax[0]) * 0.5f,
+                            (umin[1] + umax[1]) * 0.5f,
+                            (umin[2] + umax[2]) * 0.5f};
+            for (int k = 0; k < 3; ++k) tp[k] = ctr[k];
+          }
+          for (int e = 0; e < es->count; ++e) {
+            const float* bb = es->elems[e].aabb;
+            if (bb[0] == bb[3] && bb[1] == bb[4] && bb[2] == bb[5])
+              continue;
+            const float cx = (bb[0] + bb[3]) * 0.5f - tp[0];
+            const float cy = (bb[1] + bb[4]) * 0.5f - tp[1];
+            const float cz = (bb[2] + bb[5]) * 0.5f - tp[2];
+            const float rx = (bb[3] - bb[0]) * 0.5f;
+            const float ry = (bb[4] - bb[1]) * 0.5f;
+            const float rz = (bb[5] - bb[2]) * 0.5f;
+            const float r = std::sqrt(cx * cx + cy * cy + cz * cz) +
+                            std::sqrt(rx * rx + ry * ry + rz * rz);
+            if (r > reach) reach = r;
+          }
+          if (reach > 0.0f) pad = reach + 6.0f;
+          if (!h.elemName.empty()) {
+            for (int e = 0; e < es->count; ++e) {
+              if (boss->model.elemName(static_cast<std::size_t>(e)) !=
+                  h.elemName)
+                continue;
+              const float* bb = es->elems[e].aabb;
+              tp[0] = (bb[0] + bb[3]) * 0.5f;
+              tp[1] = (bb[1] + bb[4]) * 0.5f;
+              tp[2] = (bb[2] + bb[5]) * 0.5f;
+              const float rx = (bb[3] - bb[0]) * 0.5f;
+              const float ry = (bb[4] - bb[1]) * 0.5f;
+              const float rz = (bb[5] - bb[2]) * 0.5f;
+              pad = std::sqrt(rx * rx + ry * ry + rz * rz) + 6.0f;
+              elemHalf[0] = rx; elemHalf[1] = ry; elemHalf[2] = rz;
+              elemIdx = e;
+              break;
+            }
+          }
+        }
+        int slot = -1;
+        for (int i = 0; i < 3; ++i)
+          if (rt.shots[i].state == 0) { slot = i; break; }
+        if (slot < 0) continue;    // pool busy — retry next frame
+        float dir[3] = {tp[0] - rt.cs.pos[0], tp[1] - rt.cs.pos[1],
+                        tp[2] - rt.cs.pos[2]};
+        const float dl =
+            std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        if (dl > 1e-6f) { dir[0] /= dl; dir[1] /= dl; dir[2] /= dl; }
+        mdk::PlayerShot& s = rt.shots[slot];
+        s = mdk::PlayerShot{};
+        s.state = 1;
+        s.classIdx = -1;
+        if (elemIdx >= 0) {
+          // Element shots probe the six axis approaches off the
+          // element's own AABB through the real collisionObjectProbe
+          // and keep the first whose segment resolves the target
+          // element — modelling the player standing where the
+          // turret's face is actually exposed. A blind camera/radial
+          // aim sends the segment through hull elements whose tris
+          // occlude embedded turret boxes (XBS_BOT/XBS_RIGH vs
+          // T1..T7), resolving a hull hit instead. The shot itself
+          // still flies through the pool and resolves identically —
+          // probing picks the direction, the engine does the rest.
+          const float diag = std::sqrt(elemHalf[0] * elemHalf[0] +
+                                       elemHalf[1] * elemHalf[1] +
+                                       elemHalf[2] * elemHalf[2]);
+          bool aimed = false;
+          for (int ax = 0; ax < 3 && !aimed; ++ax) {
+            for (int sgn = -1; sgn <= 1 && !aimed; sgn += 2) {
+              float d[3] = {0.0f, 0.0f, 0.0f};
+              d[ax] = static_cast<float>(sgn);
+              float start[3] = {tp[0] + d[0] * (elemHalf[0] + 2.0f),
+                                tp[1] + d[1] * (elemHalf[1] + 2.0f),
+                                tp[2] + d[2] * (elemHalf[2] + 2.0f)};
+              float end[3] = {tp[0] - d[0] * (diag + 16.0f),
+                              tp[1] - d[1] * (diag + 16.0f),
+                              tp[2] - d[2] * (diag + 16.0f)};
+              int pe = -1, pt = -1;
+              mdk::collisionObjectProbe(&boss->col, start, end,
+                                        &pe, &pt);
+              static const bool traceAim =
+                  std::getenv("MDK_TRACE_AIM") != nullptr;
+              if (traceAim)
+                std::fprintf(stderr,
+                    "    [aim] %s ax=%d sgn=%d start=(%.1f,%.1f,%.1f) "
+                    "end=(%.1f,%.1f,%.1f) pe=%d (want %d)\n",
+                    h.elemName.c_str(), ax, sgn,
+                    start[0], start[1], start[2],
+                    end[0], end[1], end[2], pe, elemIdx);
+              if (pe != elemIdx) continue;
+              dir[0] = -d[0]; dir[1] = -d[1]; dir[2] = -d[2];
+              s.pos[0] = start[0]; s.pos[1] = start[1];
+              s.pos[2] = start[2];
+              aimed = true;
+              elemShotFired = true;
+            }
+          }
+          if (!aimed) {
+            s.pos[0] = tp[0] - dir[0] * pad;
+            s.pos[1] = tp[1] - dir[1] * pad;
+            s.pos[2] = tp[2] - dir[2] * pad;
+            elemShotFired = true;
+          }
+        } else {
+          s.pos[0] = tp[0] - dir[0] * pad;
+          s.pos[1] = tp[1] - dir[1] * pad;
+          s.pos[2] = tp[2] - dir[2] * pad;
+        }
+        // flyTracer convention: pos += speedH*dt*(cosY*cosP,
+        // sinY*cosP, -sinP) — yaw = atan2(dy,dx); positive pitch
+        // travels -z.
+        s.yawDeg = std::atan2(dir[1], dir[0]) * (180.0f / 3.14159265f);
+        s.pitchDeg = -std::asin(dir[2]) * (180.0f / 3.14159265f);
+        s.arena = rt.cur;
+        s.fieldCc = 2.0f;
+        s.type = static_cast<std::int16_t>(h.type);
+        s.flyKind = (h.type == 0 || h.type == 2)
+                        ? mdk::kShotFlyTracer
+                        : mdk::kShotFlyGrenade;
+        s.lifetime = 0x4b;
+        // Cover the full cluster in one tick: spawn is tp-pad, so
+        // 2*pad+16 reaches past the far element faces.
+        s.speedH = (2.0f * pad + 16.0f) * 30.0f;
+        ++rt.shotSerial;
+        --h.count;
+        static const bool traceHit =
+            std::getenv("MDK_TRACE_HIT") != nullptr;
+        if (traceHit)
+          std::fprintf(stderr,
+            "  [hit] %s tp=(%.1f,%.1f,%.1f) spawn=(%.1f,%.1f,%.1f) "
+            "aabb=(%.0f..%.0f, %.0f..%.0f, %.0f..%.0f) pad=%.1f "
+            "es=%p n=%d tris0=%d\n",
+            h.objName.c_str(), tp[0], tp[1], tp[2],
+            s.pos[0], s.pos[1], s.pos[2],
+            boss->col.aabb[0], boss->col.aabb[3],
+            boss->col.aabb[1], boss->col.aabb[4],
+            boss->col.aabb[2], boss->col.aabb[5], pad,
+            (const void*)es,
+            es ? es->count : -1,
+            (es && es->count > 0) ? es->elems[0].triCount : -1);
+        if (traceHit && es != nullptr) {
+          std::fprintf(stderr,
+              "    pos=(%.1f,%.1f,%.1f) org=(%.1f,%.1f,%.1f) xf0=%.2f "
+              "maskB=%08x\n",
+              boss->pos[0], boss->pos[1], boss->pos[2],
+              boss->col.origin[0], boss->col.origin[1],
+              boss->col.origin[2], boss->col.xform[0],
+              boss->col.elemMaskB);
+          for (int e = 0; e < es->count; ++e) {
+            const float* bb = es->elems[e].aabb;
+            const float* lb = es->elems[e].localAabb;
+            std::fprintf(stderr,
+                "    elem %s aabb=(%.0f..%.0f, %.0f..%.0f, %.0f..%.0f) "
+                "lbb=(%.0f..%.0f, %.0f..%.0f, %.0f..%.0f) tris=%d "
+                "v=%d t=%d\n",
+                boss->model.elemName(static_cast<std::size_t>(e)).c_str(),
+                bb[0], bb[3], bb[1], bb[4], bb[2], bb[5],
+                lb[0], lb[3], lb[1], lb[4], lb[2], lb[5],
+                es->elems[e].triCount,
+                es->elems[e].verts != nullptr,
+                es->elems[e].tris != nullptr);
+            if (es->elems[e].verts != nullptr) {
+              float vmn[3] = {1e30f, 1e30f, 1e30f},
+                    vmx[3] = {-1e30f, -1e30f, -1e30f};
+              const std::size_t nv =
+                  boss->model.elemVerts[e].size() / 3;
+              for (std::size_t vi = 0; vi < nv; ++vi) {
+                for (int k = 0; k < 3; ++k) {
+                  const float c = es->elems[e].verts[vi * 3 + k];
+                  if (c < vmn[k]) vmn[k] = c;
+                  if (c > vmx[k]) vmx[k] = c;
+                }
+              }
+              std::fprintf(stderr,
+                  "      verts(%zu)=(%.1f..%.1f, %.1f..%.1f, "
+                  "%.1f..%.1f) v0=(%.1f,%.1f,%.1f)\n",
+                  nv, vmn[0], vmx[0], vmn[1], vmx[1],
+                  vmn[2], vmx[2],
+                  es->elems[e].verts[0], es->elems[e].verts[1],
+                  es->elems[e].verts[2]);
+            }
+          }
+        }
+      }
       const auto out =
           mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
       ++framesRun;
+      sawEndLevel = sawEndLevel || out.endLevelRequested;
+      sawEnding = sawEnding || out.endingRequested;
+      // Phase 15A — storage census per frame (object-lifetime debug).
+      if (!bossNames.empty() && bossNames[0][0] == '*') {
+        std::size_t tot = 0;
+        std::string det;
+        for (const auto& ap : rt.arenas) {
+          tot += ap->dyn.storage.size();
+          for (const auto& up : ap->dyn.storage)
+            det += " " + up->scriptClass;
+        }
+        std::printf("      [f%03d objs=%zu:%s ]\n", f, tot,
+                    det.c_str());
+      }
+      // Phase 15A — boss change-detection: print when a watched
+      // object's health / mark / subtype / pc / flags / elemHp or
+      // dead state changes.
+      if (!bossNames.empty()) {
+        for (const auto& ap : rt.arenas) {
+          for (const auto& up : ap->dyn.storage) {
+            const mdk::DynamicObject& o = *up;
+            bool want = false;
+            for (const auto& nm : bossNames)
+              want = want || bossMatches(o, nm.c_str());
+            if (!want) continue;
+            BossSnap sn;
+            sn.health = o.health;
+            sn.mark = o.field21e;
+            sn.sub = o.field11e;
+            sn.pc = o.field108;
+            sn.f230 = o.field230;
+            sn.f148 = o.col.flags148;
+            sn.dead = (o.col.flags148 & 0x20) != 0;
+            sn.animRec = o.animRec;
+            sn.animFrame = o.animFrame;
+            sn.animLatch = o.animLatch;
+            const std::size_t neh = o.elemHp.size() < 12
+                                        ? o.elemHp.size() : 12;
+            for (std::size_t i = 0; i < neh; ++i) sn.eh[i] = o.elemHp[i];
+            auto it = lastSnap.find(&o);
+            if (it == lastSnap.end()) {
+              lastSnap[&o] = sn;
+              continue;
+            }
+            if (!(it->second == sn)) {
+              const auto* pcb =
+                  static_cast<const std::byte*>(o.field108);
+              const auto* img = rt.level.cmiBytes.data();
+              const std::ptrdiff_t pco =
+                  (pcb >= img && pcb < img + rt.level.cmiBytes.size())
+                      ? pcb - img
+                      : -1;
+              std::printf(
+                  "      boss %s hp=%d mark=%02x sub=%02x "
+                  "pc=+%lx f230=%p f148=%04x f149=%02x dead=%d "
+                  "f0=%.1f e8=%.2f e6=%d ec=%p "
+                  "anim=%p f=%d l=%04x acc=%.2f "
+                  "f11a=%d f11b=%d f138=%s eh=[%d,%d,%d,%d]\n",
+                  o.scriptClass.c_str(), (int)o.health,
+                  (unsigned)o.field21e, (unsigned)o.field11e,
+                  static_cast<unsigned long>(pco), o.field230,
+                  (unsigned)o.col.flags148, (unsigned)o.col.flags149,
+                  sn.dead ? 1 : 0,
+                  (double)o.fieldF0, (double)o.fieldE8,
+                  (int)o.fieldE6, o.fieldEC,
+                  o.animRec, (int)o.animFrame,
+                  (unsigned)(std::uint16_t)o.animLatch,
+                  (double)o.animAcc,
+                  (int)o.field11a, (int)o.field11b,
+                  o.field138 ? o.field138->scriptClass.c_str() : "-",
+                  o.elemHp.size() > 0 ? (int)o.elemHp[0] : -1,
+                  o.elemHp.size() > 1 ? (int)o.elemHp[1] : -1,
+                  o.elemHp.size() > 2 ? (int)o.elemHp[2] : -1,
+                  o.elemHp.size() > 3 ? (int)o.elemHp[3] : -1);
+              it->second = sn;
+            }
+          }
+        }
+      }
       floorObjSeen |= (rt.cs.contactFlags & 2) != 0;
       groundedSeen |= out.grounded;
       airborneSeen |= !out.grounded;
@@ -2496,6 +2896,25 @@ int main(int argc, char** argv) {
           (double)out.camera.pos[2],
           out.overheadViewActive ? " OVH" : "",
           out.viewOnPartner ? " VP" : "");
+      for (const auto& ap : rt.arenas) {
+        static std::uint32_t lastF58[64] = {};
+        static std::uint32_t lastPc[64] = {};
+        static std::uint32_t lastWait[64] = {};
+        if (ap->index < 64 &&
+            (ap->flags58 != lastF58[ap->index] ||
+             ap->script.pcImageOff != lastPc[ap->index] ||
+             (ap->script.waitSeconds > 0.0f) != (lastWait[ap->index] != 0))) {
+          std::printf("      f58[%s] %08x -> %08x pc=+%x wait=%.2f depth=%d\n",
+                      ap->name.c_str(), lastF58[ap->index],
+                      (unsigned)ap->flags58,
+                      (unsigned)ap->script.pcImageOff,
+                      (double)ap->script.waitSeconds,
+                      (int)ap->script.callDepth);
+          lastF58[ap->index] = ap->flags58;
+          lastPc[ap->index] = ap->script.pcImageOff;
+          lastWait[ap->index] = (ap->script.waitSeconds > 0.0f) ? 1u : 0u;
+        }
+      }
       // Connector (door) state dump — connState/anim/flags per frame.
       for (const auto& ap : rt.arenas)
         for (const auto& up : ap->dyn.storage) {
@@ -2638,6 +3057,67 @@ int main(int argc, char** argv) {
                 static_cast<int>(rt.scriptDiag.size()));
     for (const std::string& m : rt.scriptDiag)
       std::printf("           ! %s\n", m.c_str());
+    // Phase 15A — boss-runtime summary: end-state of each watched
+    // object plus the completion-latch edges observed this run.
+    if (!bossNames.empty() || !hitSpecs.empty() || sawEndLevel ||
+        sawEnding) {
+      std::printf("boss-runtime:\n");
+      for (const auto& ap : rt.arenas) {
+        if (!ap->dyn.storage.empty())
+          std::printf("  [arena %s storage=%zu]\n", ap->name.c_str(),
+                      ap->dyn.storage.size());
+        for (const auto& up : ap->dyn.storage) {
+          const mdk::DynamicObject& o = *up;
+          bool want = bossNames.empty() && !hitSpecs.empty()
+                          ? (o.col.named != 0)
+                          : false;
+          for (const auto& nm : bossNames)
+            want = want || bossMatches(o, nm.c_str());
+          for (const auto& h : hitSpecs)
+            want = want || bossMatches(o, h.objName.c_str());
+          if (!want) continue;
+          std::printf(
+              "  %s model=%s arena=%s hp=%d sub=%02x mark=%02x "
+              "pos=(%.1f,%.1f,%.1f) elemHp=[", o.scriptClass.c_str(),
+              o.model.modelName().c_str(),
+              o.arena && o.arena->owner ? o.arena->owner->name.c_str()
+                                        : "?",
+              (int)o.health, (unsigned)o.field11e,
+              (unsigned)o.field21e,
+              o.pos[0], o.pos[1], o.pos[2]);
+          for (std::size_t i = 0; i < o.elemHp.size(); ++i)
+            std::printf("%s%d", i ? "," : "", (int)o.elemHp[i]);
+          auto pcOff = [&](const void* p) -> std::ptrdiff_t {
+            const auto* b =
+                static_cast<const std::byte*>(p);
+            const auto* base = rt.level.cmiBytes.data();
+            const auto* end = base + rt.level.cmiBytes.size();
+            return (b >= base && b < end) ? b - base : -1;
+          };
+          std::printf("] pc=%p(+%lx) f230=%p f110=%p f148=%04x dead=%d "
+                      "child=%s\n",
+                      o.field108,
+                      static_cast<unsigned long>(
+                          pcOff(o.field108)),
+                      o.field230, o.field110,
+                      (unsigned)o.col.flags148,
+                      (o.col.flags148 & 0x20) ? 1 : 0,
+                      o.field158 ? o.field158->scriptClass.c_str()
+                                 : "-");
+        }
+      }
+      for (const auto& r : mdk::traversalSpawnLog())
+        std::printf("  spawn %s name=%s arena=%s v%d\n",
+                    r.cls.c_str(), r.name.c_str(), r.arena.c_str(),
+                    r.variant);
+      std::printf(
+          "  completion: endLevel=%d ending=%d vsnapPending=%d "
+          "vsnaps=%d objDeathCalls=%d shotHits=%d\n",
+          sawEndLevel ? 1 : 0, sawEnding ? 1 : 0,
+          rt.pendingViewSnap == -1 ? 1 : 0,
+          rt.seams.pendingViewSnaps, rt.seams.objectDeathCalls,
+          rt.shotHitCount);
+    }
     // Bounded checks: gates + at least one grounded frame. Arenas
     // with their own MTO collision blob must also show a collision
     // contact. 'C*' corridor arenas carry no blob (OBSERVED: the MTO
@@ -2928,8 +3408,13 @@ int main(int argc, char** argv) {
                        .c_str());
       return 1;
     }
-    const std::uint32_t code =
+    std::uint32_t code =
         mdk::cmiScriptCodeOffset(cmi, img, scriptDisasmName);
+    const char* codeKind = "t3";
+    if (scriptDisasmOff) {
+      code = *scriptDisasmOff;
+      codeKind = "raw";
+    }
     std::printf("cmi:   %s — %zu tables, %zu t3 records\n",
                 target->c_str(), cmi.tables.size(),
                 cmi.tables.size() > 3 ? cmi.tables[3].records.size()
@@ -2942,8 +3427,23 @@ int main(int argc, char** argv) {
                       mdk::cmiScriptCodeOffset(cmi, img, r.name()));
       return 0;
     }
-    std::printf("script: %s  codeOff=0x%x\n", scriptDisasmName.c_str(),
-                code);
+    if (code == 0 && scriptDisasmName.find('$') != std::string::npos) {
+      // "ARENA$OBJ" — table-2 object-init record (value is the code
+      // offset directly; OBSERVED FUN_004566f0) then table-0.
+      code = mdk::cmiObjectScriptOffset(cmi, scriptDisasmName);
+      codeKind = "t2";
+      if (code == 0 && !cmi.tables.empty()) {
+        for (const auto& r : cmi.tables[0].records) {
+          if (r.name() == scriptDisasmName) {
+            code = r.value;
+            codeKind = "t0";
+            break;
+          }
+        }
+      }
+    }
+    std::printf("script: %s  codeOff=0x%x  (%s)\n",
+                scriptDisasmName.c_str(), code, codeKind);
     if (code == 0) {
       std::printf("  (no script record / zero code offset — the "
                   "+0x220 gate stays cleared)\n");

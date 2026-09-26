@@ -1,5 +1,6 @@
 #include "core/dynamic_objects.h"
 
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -376,7 +377,9 @@ void DynamicArena::reapUnnamed() {
   // next-link read and the update loop) so detach can't corrupt it.
   for (auto it = storage.begin(); it != storage.end();) {
     auto nextIt = std::next(it);
-    if (!(*it)->col.named) detach(**it);
+    if (!(*it)->col.named) {
+      detach(**it);
+    }
     it = nextIt;
   }
 }
@@ -451,9 +454,13 @@ void buildObjectMatrix(float pitchDeg, float bankDeg, float yawDeg,
 DynamicObject::~DynamicObject() { surfaceRecordsDestroy(surface); }
 
 void rebuildObjectTransform(DynamicObject& obj) {
-  // OBSERVED seed quirk: min = {old minZ x3}, max = {old maxZ x3}.
-  const float seedLo = obj.col.aabb[2];
-  const float seedHi = obj.col.aabb[5];
+  // OBSERVED (FUN_0045612c head, byte-exact): +0x1a0 = 0x6fa18f08
+  // (+1.0e29) and +0x1ac = 0xefa18f08 (-1.0e29) are written first,
+  // then spread — +0x1a0→+0x19c→+0x198, +0x1ac→+0x1a8→+0x1a4. Every
+  // rebuild is a clean union recompute, NOT a grow-only merge; a
+  // stale or zeroed aabb never survives into the new box.
+  constexpr float seedLo = std::bit_cast<float>(0x6fa18f08u);
+  constexpr float seedHi = std::bit_cast<float>(0xefa18f08u);
   obj.col.aabb[0] = obj.col.aabb[1] = obj.col.aabb[2] = seedLo;
   obj.col.aabb[3] = obj.col.aabb[4] = obj.col.aabb[5] = seedHi;
 

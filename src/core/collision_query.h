@@ -135,6 +135,7 @@ struct CollisionObject {
   float origin[3];                   // +0xb8, +0xc8, +0xd8
   float scale;                       // +0x58 — uniform scale
   std::uint32_t elemMaskB;           // +0x2c8 — excluded-element bitmask
+  std::uint32_t elemMaskLatch;       // +0x2cc — unmask latch (op 0x20 skips set bits)
   std::uint32_t elemMaskA;           // +0x326 — extra mask (flags14a bit4 gate)
 };
 
@@ -144,10 +145,13 @@ struct CollisionArena {
   const CollisionPoly* polys = nullptr;    // +0x28 — 0x24 records
   const CollisionNode* nodes = nullptr;    // +0x2c — 0x2c records
   const CollisionObject* objects = nullptr;// +0x68 — linked list
-  // +0x44e — arena "abyss" reference for the failsafe family
-  // (player -50 at 0x4673f3; object respawn -200/-150 at
-  // 0x4583ab/0x45bdd6/0x45fd55). Zero-init proven: the record array
-  // is memset at creation and +0x44e has no writer anywhere.
+  // +0x44e — arena geometry AABB minZ, the "abyss" reference for
+  // the failsafe family (player -50 at 0x4673f3; object kill plane
+  // -200 at 0x45bdd6; death snap -150 at 0x4583ab/0x4583ce; 0x45fd55).
+  // OBSERVED (FUN_004320d0): folded from the installed verts via
+  // lea ecx,[eax+0x446] + register-indirect stores — which is why a
+  // disp32 pattern sweep finds no +0x44e writer. Zero when the
+  // record has no verts (FUN_004320d0 early-returns on +0x24 == 0).
   float deepFloorZ = 0.0f;
 };
 
@@ -301,6 +305,16 @@ const CollisionNode* collisionStabFull(const CollisionArena& arena,
                                        const float* from, const float* to,
                                        float* outPos,
                                        const CollisionPoly** outPoly);
+
+// FUN_00418ce8 — the mode-1 BSP stab (0x54b6f8=1, OBSERVED
+// 0x418b0d..0x418c35): crossings on planes with |nz| < 0.5 are
+// skipped outright, and containment scans a single poly set chosen
+// by the nz sign (polysPos for nz>=+0.5, polysNeg for nz<=-0.5). The
+// script yaw-offset floor probe (object op 0xec -> FUN_0045d71c) is
+// the sole caller family — a vertical "is there floor here" query.
+const CollisionNode* collisionStabMode1(const CollisionArena& arena,
+                                        const float* from,
+                                        const float* to);
 
 // FUN_004138d8 — object-local segment probe. Transforms the
 // world-space `start`->`end` segment into the object's local frame,

@@ -196,18 +196,18 @@ TraversalLoadError traversalArenaLoadGeometry(TraversalRuntime& rt,
     if (detail) *detail = "collision blob parse failed for " + arena.name;
     return TraversalLoadError::kCollisionBlobParse;
   }
-  // deepFloorZ (+0x44e) is provably zero for every arena: the
-  // 0x466-stride record array is memset(0) at creation inside
-  // FUN_00433d40 (0x434147 call 0x47d20a, edx=0), the per-record
-  // init loop only writes +0x00 name/+0x34/+0x38/+0x3c/+0x40/
-  // +0x44/+0x5c..+0x64/+0x462, and a full code-section sweep finds
-  // no store to +0x44e (the only overlapping +0x44c/+0x450 dword
-  // writes are FUN_00413c20/FUN_00413dd8 on a different record
-  // type — name at +4, dispatch block at +0x444). All five +0x44e
-  // readers take it as the arena's abyss reference: the player
-  // failsafe (0x4673f3, -50) and object respawn checks through
-  // obj+0x60 (0x4583ab/0x45bdd6/0x45fd55, -200/-150). Leaving the
-  // CollisionArena default reproduces the observed flat -50 catch.
+  // deepFloorZ (+0x44e) — populated by collisionBlobParse from the
+  // installed verts (see collision_query.cpp). OBSERVED: the original
+  // runs FUN_004320d0 right after FUN_00419ee0 (call pairs at
+  // 0x4323dd and 0x42911c), folding the record's +0x446..+0x45a AABB
+  // from +0x24/+0x0c. +0x44e is the unaligned minZ; +0x128..+0x130
+  // gets the AABB center (not yet mirrored). The earlier "provably
+  // zero" conclusion was wrong — the stores go through
+  // lea ecx,[eax+0x446] + [ecx+8]/[ecx+0x14], invisible to a
+  // [reg+disp32] sweep. Consequence: deep arenas (GUNT_10 verts span
+  // z -427..-321) get a real abyss reference instead of 0, so
+  // script-spawned objects below the -200 plane survive as they do
+  // in the original.
 
   // The arena's surface state aliases the live poly table (the
   // original's +0x28/+0x10 fields on the surface block).
@@ -643,7 +643,8 @@ void traversalTriggerScan(TraversalRuntime& rt) {
 // kind/rate/mask — dormant otherwise (no load-time instantiation).
 // ---------------------------------------------------------------------------
 
-bool traversalVolumeActivate(TraversalArena& arena, int id, int kind,
+bool traversalVolumeActivate(TraversalArena& arena, int id,
+                             const std::string& name, int kind,
                              float rate, std::uint32_t mask,
                              bool noFalloff) {
   if (!arena.rec) return false;
@@ -655,6 +656,7 @@ bool traversalVolumeActivate(TraversalArena& arena, int id, int kind,
         surfaceVolumeCreate(arena.surface, kind, box, rate, mask);
     if (!rec) return false;
     rec->name = static_cast<std::uint32_t>(id);
+    rec->nameText = name;      // +0x8 in the original — the lstr ptr
     rec->f10 = noFalloff ? 1u : 0u;
     return true;
   }
@@ -1371,6 +1373,7 @@ TraversalFrameResult stepTraversalRuntime(
     env.slideMode = (rt.slideChannel != 0);
     env.hasContactNormal = (rt.lastContactPoly != nullptr);
     env.diagLog = &rt.scriptDiag;
+    env.frameStep = timing.frameStep;
     env.g541534 = rt.g541534;
     env.gFlags = rt.scriptGFlags;
     for (int i = 0; i < 8; ++i) env.gVars[i] = rt.scriptGVars[i];
@@ -1401,6 +1404,8 @@ TraversalFrameResult stepTraversalRuntime(
   // apply (FUN_0043490c: pos/prevPos <- pendingView[0..2],
   // 0x540c2c <- pendingView[3], c48 <- snap arena). The writer is
   // script-side; nothing in the bounded runtime sets it — counted.
+  // The -1 mailbox value is NOT consumed here — it is the end-level
+  // request checked at the FUN_00436100 tail (see below).
   if (rt.pendingViewSnap != 0 && rt.pendingViewSnap != -1) {
     ++rt.seams.pendingViewSnaps;
     rt.pendingViewSnap = 0;
@@ -1652,6 +1657,48 @@ TraversalFrameResult stepTraversalRuntime(
   // stream/list bookkeeping, all deferred seams.
   rt.seams.postTailCalls += 7;
 
+  // 0x540ebc == -1 — the FUN_00436100 end-level arm (0x436b0b ->
+  // 0x436d30, OBSERVED): the mailbox is cleared, the 0x540c68
+  // (arenaValid) and 0x540c74 (FUN_00432f84) gates drop, FUN_00469668
+  // notifies, then FUN_0040dde0(pos) starts the victory sequence.
+  // The bounded runtime surfaces that call as the endLevelRequest
+  // edge — the session driver maps it to
+  // progressionRequestTraversalEnd.
+  if (rt.pendingViewSnap == -1) {
+    rt.pendingViewSnap = 0;
+    rt.cs.arenaValid = 0;
+    rt.fieldC74 = 0;
+    ++rt.seams.animEventCalls;    // FUN_00469668 notify
+    rt.endLevelRequest = 1;
+    ++rt.seams.endLevelRequests;
+  }
+
+  // FUN_0047c9e0 per-object transform refresh — OBSERVED (0x47cd01 /
+  // 0x47cede): the render-collection pass calls FUN_0045612c once per
+  // frame for every live object whose +0x148 dword lacks 0x201000 —
+  // i.e. +0x14a&0x20 movers (which rebuild inside FUN_004585c4) and
+  // +0x148&0x1000. Path/mover/steer movement during the tick therefore
+  // reaches the collision xform + element world-AABBs only here, at
+  // frame end — same-frame probes see last frame's refresh.
+  {
+    TraversalArena* colRun[2] = {cur, nullptr};
+    int ncolRun = 1;
+    if (rt.partnerActive && rt.partner) {
+      colRun[1] = rt.partner;
+      ncolRun = 2;
+    }
+    for (int ai = 0; ai < ncolRun; ++ai) {
+      for (auto& up : colRun[ai]->dyn.storage) {
+        DynamicObject& o = *up;
+        if (!o.col.named) continue;                  // dead/teardown
+        if ((o.col.flags148 & 0x1000) != 0 ||
+            (o.col.flags14a & 0x20) != 0)            // +0x148 dword
+          continue;                                 //  & 0x201000 skip
+        rebuildObjectTransform(o);                  // FUN_0045612c
+      }
+    }
+  }
+
   ++rt.frameCounter;
 
   // ------------------------- result ------------------------------
@@ -1684,6 +1731,8 @@ TraversalFrameResult stepTraversalRuntime(
   out.partnerActive = rt.partnerActive;
   out.currentArenaSwapped = swapped;
   out.portalCandidate = portalCand;
+  out.endLevelRequested = rt.endLevelRequest != 0;
+  out.endingRequested = rt.endingRequest != 0;
   out.eventTimer = rt.eventTimer;
   out.viewScalar = rt.viewScalar;
   out.lookOffsetDeg = rt.look.lookPitchOffset;

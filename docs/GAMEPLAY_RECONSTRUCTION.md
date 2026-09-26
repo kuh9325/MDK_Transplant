@@ -1596,17 +1596,24 @@ unresolved spawn/script/portal behavior stays an explicit seam.
 
 - `0x4673ee` computes `c48->+0x44e + (-50.0) >= posZ` → forced
   grounded + vertVel=0 (`kDeepFloorDelta` = `0x498a98` = -50.0).
-- Zero-init is proven, not inferred: the 0x466-stride arena array is
-  allocated (`0x434130` call `0x41c884`) then memset to 0
-  (`0x434147` call `0x47d20a`, fill byte edx=0, size `count*0x466`),
-  and the per-record init loop (`0x434191..0x434229`) writes only
-  `+0x00` name, `+0x34`, `+0x38`/`+0x3c`, `+0x40`, `+0x44` flag-or
-  (`c`/`C` corridor gate), `+0x5c..+0x64` (embedded self-ref), and
-  `+0x462` (DTI scalar). A full code-section sweep for displacements
-  `0x448..0x453` finds no store to `+0x44e`; the only overlapping
-  `+0x44c`/`+0x450` dword writes are in `FUN_00413c20`/`FUN_00413dd8`
-  on a *different* record type (name at `+4`, 5-pointer dispatch
-  block at `+0x444` copied from table `0x49a750`).
+- `+0x44e` is the arena collision geometry's AABB **minZ**, folded
+  from the installed vertex array by `FUN_004320d0` — called right
+  after the `FUN_00419ee0` region-C install (call pairs at `0x4323dd`
+  and `0x42911c`). The function forms `ecx = rec+0x446` via `lea`,
+  seeds min=`-1e6` (`0x497423f0`)/max=`+1e6` (`0xc97423f0`), folds
+  `rec+0x0c` verts at `rec+0x24` (stride 12), then writes the AABB
+  centre into `rec+0x128..+0x130`. Layout: `+0x446/44a/44e` = min,
+  `+0x452/456/45a` = max. A lazy guard (`fld [ecx]; fcomp [ecx+0xc]`;
+  equal → compute) makes the first call populate the box and later
+  calls skip it. Records with `+0x24 == NULL` (no geometry — `C*`
+  corridors, unloaded arenas) early-return and keep the memset-zero
+  reference.
+- Why the earlier "provably zero" conclusion was wrong: the stores
+  are `mov [ecx+8]`/`[ecx+0x14]` through the `lea`-formed base —
+  invisible to a `[reg+disp32]` pattern sweep. The `+0x44c/+0x450`
+  dword writes in `FUN_00413c20`/`FUN_00413dd8` are a red herring on
+  a *different* record type (dispatch block at `+0x444` copied from
+  table `0x49a750`); the real writer is `FUN_004320d0`.
 - All five `+0x44e` readers consume it as the arena's abyss
   reference: the player failsafe (`0x4673f3`, base `c48`, `-50`),
   and object checks through `obj+0x60` (the object's arena pointer):
@@ -1614,22 +1621,26 @@ unresolved spawn/script/portal behavior stays an explicit seam.
   `+0x44e + (-200)` by writing `obj+0x18 = +0x44e + (-150)`;
   `0x45bdd6` compares `+0x44e + (-200)` vs `obj+0x18` to skip a kill
   path; `0x45fd55` compares through `rec+0x18`.
-- Net effect: a flat `posZ <= -50` catch for the player and `-200`
-  (respawn to `-150`) for objects, worldwide — not per-arena
-  geometry. LEVEL5 (MUSE) spawns at z=-293, so the failsafe fires
-  every frame there; it only re-asserts grounded/vertVel=0 atop real
-  contact — OBSERVED, harmless.
-- Native note: an earlier implementation derived it from the arena's
-  own vertex min — corrected to the observed flat -50.
+- Net effect: the kill plane is per-arena — `minZ - 200` for objects
+  (respawn to `minZ - 150`), `minZ - 50` for the player. Arenas with
+  no installed geometry keep the flat `-50`/`-200` behaviour.
+  GUNT_10 is the proof case: its collision verts span z `-427..-321`
+  (MTO region C, 401 verts), so `+0x44e = -427` and the five
+  script-spawned objects parked at z `-345..-427` survive — with the
+  old flat-zero reference the port tore them all down on frame 1
+  (observed discrepancy, now resolved).
 
 ## 64. Phase 5G validation + boundary
 
 - `mdk-inspect --traversal-runtime` on all six BUILD_A levels: every
   spawn arena (HMO_1, MEAT_1, MUSE_1, OLYM_1, DANT_1, GUNT_1) passes
-  with real contact+grounded — LEVEL3 digest `f568d6aa986f4b70`
-  (60 frames); MUSE_1 spawns below the -50 abyss line so the
-  failsafe fires all frames alongside real contact (OBSERVED
-  no-op); GUNT_1 spawns 2 objects + 2 models cleanly.
+  with real contact+grounded — LEVEL3 digest `cd543f7532fc5094`
+  (60 frames, post-`FUN_004320d0` `+0x44e` semantics; the earlier
+  `f568d6aa986f4b70` was captured under the retracted flat-zero
+  reference); GUNT_1 spawns 2 objects + 2 models cleanly. MUSE_1
+  spawns at z=-293 — exactly its geometry minZ — so the player
+  failsafe (now correctly `minZ-50 = -343`) does NOT fire; the old
+  "fires every frame" note was an artifact of the flat -50 model.
 - Corridor attach fired on every level: CHMO_1, CMEAT_3, CMUSE_1,
   COLYM_1, CDANT_3, CGUNT_1 all show `partner=1 car-vld=1
   car-geom=1` (partner = adjacent main arena, blob loaded).
@@ -1652,7 +1663,7 @@ unresolved spawn/script/portal behavior stays an explicit seam.
   counted but not executed; corridor crossing mechanics (script-
   driven doors/forced movement/teleports) are UNKNOWN until the VM
   is mapped; type-5/type-8 records remain UNKNOWN; `+0x44e`'s
-  zero-init is proven via the creation memset for MDK95 — DOS build
+  population is the `FUN_004320d0` AABB fold for MDK95 — DOS build
   parity unchecked.
 
 # Phase 5H — the tr_alcmd arena script VM
@@ -5031,3 +5042,316 @@ Restore-side fixes that make the round trip exact:
 death LASTGAME + header-only save/continue already closed,
 `SAVE / LOAD GAMEPLAY STATE: CLOSED FOR BUILD_A`. Remaining seams are
 frontend save-slot UI and THMB screenshot capture only.
+
+## 188. Phase 15A — the `0x83` script opcode (OBSERVED)
+
+Opcode byte `0x83` (dispatch table entry `0x83` → handler `0x43d3e2`)
+reads one `u8` subop and branches:
+
+```
+subop <= 0x32 : MOV dword ptr [0x540ebc],0xffffffff   (0x43d411)
+subop >  0x32 : FUN_0047baf4(ctx, subop)              (0x43d40a)
+```
+
+So `0x83 XX` is the **traversal completion opcode family**: subop
+`<= 0x32` latches the end-level request `0x540ebc = -1` consumed by the
+`FUN_00436100` frame loop (§166), while `> 0x32` enters the shared
+cinematic-command dispatcher.
+
+The complete `FUN_0047baf4` arm map (OBSERVED — full CMP/JZ chain):
+
+| subop | arm |
+|---|---|
+| `0x33` | `FUN_0047b7e0` — cinematic setup A |
+| `0x34` | `FUN_0047b8c4` — cinematic setup B |
+| `0x35` | `FUN_0047b8c4` → `0x540e9c = ESI` — cinematic mode write |
+| `0x36` | (arm at `0x47bb2a`) |
+| `0x37` | `0x54f3b8 = 2` — camera-rig mode |
+| `0x3d` | `FUN_0047b944` → `0x540e9c` — cinematic mode write |
+| `0x51` | `FUN_0047b038` — **mode-8 ending latch** (`0x541492 = 8`) |
+| `0x5b` | `FUN_0047ba84` — cinematic |
+| `0x5c` | `0x540e9c = EDX` — cinematic mode write |
+| `0x5d` | `FUN_0047ba34` — cinematic |
+| other `> 0x32` | RET — benign no-op |
+
+Subops `0x5c`/`0x5d`/`0x5b` seen in L7 `DANT_10` just before the
+end-level op drive the boss-death cinematic beats, then `0x83 0x00`
+arms `0x540ebc`. Unlisted subops (e.g. `0xa2`, `0xf3`, `0x76`, `0x43`)
+are script-level no-ops — they decode at real boundaries but the
+dispatcher ignores them.
+
+## 189. Phase 15A — per-level completion sites (OBSERVED/CORROBORATED)
+
+Each traversal level's end op was located by CFG-following the
+table-0/table-2/table-3 script space with operand grammars derived
+from the 253-entry handler dump, then confirming the `83 XX 09 ff`
+idiom (`0x83` → `0x09` script-suspend → `0xff` script-end). Image
+offsets (`fileOff − 4`):
+
+| level | image offset | bytes | owning script | verdict |
+|---|---|---|---|---|
+| L3 | `0x1fe35` | `83 00 09 ff` | t3 `HMO_10` (final arena) | CORROBORATED |
+| L4 | `0x1a856` | `83 00 09 ff` | t3 `MEAT_10` (final arena) | CORROBORATED |
+| L5 | `0xb6e9` | `83 51 09 ff` | tail of `MUSE_5$XBN`/MUSE block | CORROBORATED |
+| L6 | `0x15acd` | `83 00 09 ff` | `OLYM_10$XB2_0` object script | CORROBORATED |
+| L6 | `0x8336` | `83 00` | `XG1_HEAD`-watch handler block | CORROBORATED |
+| L7 | `0x20f35` | `83 00 09 ff` | t3 `DANT_10` — **decoded at a CFG boundary** | OBSERVED |
+| L8 | `0x21ff7` | `83 00 09 ff` | `GUNT_10` XGUNTAM/XBO script block | CORROBORATED |
+
+L5's `0x83 0x51` matches §170–172: level id 5 is the terminal level,
+and `0x51` enters the mode-8 ending FMV rather than `0x540ebc=-1`.
+
+No site carries an external `u32` link reference — each is reached by
+sequential fall-through inside its owning script after the
+broadcast/name-watch blocks (`0x04` linkmode dispatch, `0x2a` `NAMED`
+element handlers, `0x12` wait loops). This matches the DANT_10 decode:
+a run of `0x04 07 fc <tgt>` waits on boss-element deaths, then
+`83 5d`/`83 5c` cinematic beats, then `83 00` ends the level.
+
+## 190. Phase 15A — boss/special-class census (OBSERVED data layout)
+
+Class lists come from the CMI table-1 records; spawn paths from the
+decoded spawn ops (`0x56`/`0x95`/`0xa1`/`0xce`/`0xe6`); health from
+`t2`/`t0` init ops `0x10` (HEALTH u16).
+
+Legend: **[gen]** generic enemy family, **[mov]** mover/door/connector,
+**[boss]** boss/miniboss, **[comp]** completion-critical special,
+**[cine]** cinematic-only, **[unk]** unclassified.
+
+### LEVEL3 — HMO_* (18 arenas)
+
+- `XM3` — boss enemy (HMO boss) — **[boss]**, spawn via `86`-op in
+  `HMO_2`/`HMO_10`, object scripts `HMO_1$XM3_0`/`HMO_2$XM3_0`, death
+  watch `NAMED 'XM3'` links in `HMO_10`.
+- `XG`/`XGD`/`XGS`, `XD`/`XDD`, `XF`/`XFD`, `XS`/`XSD`, `XC`/`XCD`,
+  `XT`/`XTD`/`XT_MISS`, `XGEND`/`XGEN`, `XTUR`, `XTGUN`/`XTGUND`,
+  `XE`/`XED`, `XU`/`XU_MISS` — **[gen]**.
+- `X4DOOR`-family, `XCORDOOR`, `XH1_DOOR`, `XWINCH`, `XMT`, `XBRD`,
+  `XH1_DOOR`, `XPGUN`, `XBOX`, `XTRE*`/`XBUSH`/`XROCK`, `XBT`,
+  `XG_BOMB1`, `XW3`/`XW3D`, `XB3`, `XGCHAIR`, `XGSPLAT`, `XCOW`,
+  `X_STRIKE`/`X_TOOTH`/`X_STRIKB` — movers/pickups — **[mov]**.
+- `SW_*` pickups (all `SW_H*`, `SW_GATT`, `SW_KEY`, weapons,
+  `SW_DUMMY`, `SW_NUKE`, `SW_SEAL`/`SW_SBONE` no-ops) — **[mov]**.
+- `EXPLODE`/`BULLET`/`BIGBOLT`/`BOLT` — projectile classes — **[gen]**.
+- Completion: t3 `HMO_10` `83 00` at `0x1fe35` — **[comp]**.
+
+### LEVEL4 — MEAT_* (18 arenas)
+
+- `XCBOSS`, `XCBOMB` — boss + bomb classes (name-only blobs,
+  `val=0`) — **[boss]**. `XTANK`/`XTANKD`/`XTANKT`/`XTANKTD` — the
+  L4 tank boss/its turret — **[boss]**.
+- `X4DOOR`, `X6LIFT`, `XBAR`, `XMT`, `XC`/`XCD` — **[mov]**.
+- `XSNOWB`, `XGSNOW`, `XGCHAIR`, `XBONEFLC`-family spawns — **[gen]**.
+- Completion: t3 `MEAT_10` `83 00` at `0x1a856` — **[comp]**.
+
+### LEVEL5 — MUSE_* (11 arenas, terminal level, id 5)
+
+- `XGUNTAM` (`0x343c1` blob) — Gunter-class boss reused from L8
+  family — **[boss]**. `XCARCAS` — boss corpse/debris — **[boss]**.
+- `XBN`, `XM5_FLAP`, `X4_TOWER`, `X_STRIKD`, `SW_SEAL`, `SW_SBONE`
+  — specials/pickups — **[mov]**.
+- Completion: `83 51` at `0xb6e9` → `FUN_0047b038` → mode-8 ending
+  — **[comp]** (terminal-level path, §170–172).
+
+### LEVEL6 — OLYM_* (19 arenas)
+
+- `XB2`, `XBD`, `XBSHARK`, `XBO` — OLYM boss family (arena `OLYM_10`
+  spawns `XBD`+`XBSHARK`) — **[boss]**.
+- `XBGUN`, `XBG_B1..B3`, `XG_MISS`, `XGSMOKE` — boss gun/missile
+  children — **[boss]** (projectile children).
+- `TARGET1..9`, `XGHTARG`-style watched elements — completion-watch
+  targets — **[comp]**.
+- `X3_BALC`, `X3_LDOOR`, `XSWINGB`, `XGDR`, `X_GLASS`, `XTR`,
+  `6_DOOR`, `XGEN`/`XGEND` — movers — **[mov]**.
+- `NAMED 'XG1_HEAD'` handlers + `0x83 00` at `0x8336` — a Gunter
+  head-element death-watch (shared XG1_* element family) — **[comp]**.
+- Completion: `83 00` at `0x15acd` (OLYM_10 object tail) and
+  `0x8336` — **[comp]**.
+
+### LEVEL7 — DANT_* (19 arenas)
+
+- `XB1`, `XBANG`, `X7_BEAM`/`BEAMS`, `XD6GUN`, `XGHTARG`/`XGTARG`,
+  `XTURBINE`, `XTANK`/`D`/`T`/`TD`, `X7DOOR`, `XD9_DOOR`, `XD2` —
+  the DANT boss family — **[boss]**.
+- `XU`/`XU_MISS` spawns — **[gen]**.
+- Completion: t3 `DANT_10` `83 00` at `0x20f35` — OBSERVED at a CFG
+  boundary (`83 5d`,`83 5c` cinematic beats precede it) — **[comp]**.
+
+### LEVEL8 — GUNT_* (18 arenas; campaign id 4, mid-campaign)
+
+- `XGUNTAM` — the Gunter boss object, `GUNT_10$XGUNTAM` init sets
+  `HEALTH 65000`; spawn `0x56` scOff `0x21ef5` — **[boss]**.
+- `XBSHIP` — the ship object (`GUNT_1$XBSHIP_0`, `GUNT_10$XBSHIP`
+  `HEALTH 65000`) — **[boss]**.
+- `XBN`/`XBO` (`HEALTH 200`)/`X10_DOOR`/`X10_CAP`/`X10_PLAT`,
+  `XMART`/`XMARTD`, `XFORK`, `XI3ARM`/`XI5_DOOR`, `XCARGO`/`XCARGOD`,
+  `XWALL`, `XEARTH`, `XHATCH`, `XPER`/`XPERD`, `XMINCAR`, `XM_BOLT`,
+  `XP_BOLT`, `XPELLET`, `X_HINGE`/`XHINGED`, `XCORRDOR` —
+  boss-machinery/door/mover classes — **[boss]**/**[mov]**.
+- `XG1_HEAD`/`XG1_*` element names appear in `NAMED` links — the
+  Gunter element-death watch (same family as L6's `0x8336` site).
+- Completion: `83 00` at `0x21ff7` adjacent to `GUNT_10$XGUNTAM` —
+  **[comp]**.
+
+### Common completion idiom
+
+All six traversal levels complete via a single `0x83` op:
+
+- ids 0–4 (`LEVEL7`,`6`,`3`,`4`,`8`) → `83 00` → `0x540ebc=-1` →
+  victory chain §166–169 → mode 5.
+- id 5 (`LEVEL5`) → `83 51` → mode-8 ending → frontend.
+
+Cheat path aside (`FUN_00423ca0` → `FUN_0040dde0`), `0x83 ≤0x32` is
+the **only** producer of `0x540ebc=-1` in BUILD_A (writer xref at
+`0x43d411` is unique; no register-indirect `-1` stores found).
+
+## 191. Phase 15A — open items
+
+- Exact boss-phase/damage semantics per class remain UNKNOWN — the
+  `0x83` sites prove *where* completion latches, but the preceding
+  `0x04`-broadcast/`NAMED`-watch gates need per-class analysis.
+- The `0x83 0x76`/`0xa2`/`0xf3` decoded sites (L3/L5) are dispatcher
+  no-ops — real-but-inert reserved cinematic ids.
+- `0x5e` (jump-by-CALL `pc=eax`) and `0x81` (element blow-off
+  `{u8 form,u8 n,n×lstr}`) are script features the port does not yet
+  implement — flagged for the boss-phase work.
+- Live harness (`--traversal-runtime LEVEL8 --arena GUNT_10`) shows
+  the spawned boss objects ticking and stopping on three unimplemented
+  object-VM ops: `0x60` at `+21f0c` (inside `XGUNTAM`@`0x21ef5`),
+  `0xf2` at `+21e65`, `0x55` at `+2201d` — the current gates between
+  the GUNT_10 spawn path and the `83 00` tail at `0x21ff7`.
+
+## 192. Phase 15A — `0x83` native bridge (implemented)
+
+`src/core/traversal_script.cpp` `completionOp83` now runs op `0x83` in
+both script switches (arena `traversalScriptRun` and object
+`objScriptInsn` — the original uses one dispatch table for both):
+
+- `subop <= 0x32` → `rt.pendingViewSnap = -1` (the `0x540ebc` mailbox
+  write, OBSERVED `0x43d411`). `stepTraversalRuntime`'s tail consumes
+  `-1` as the FUN_00436100 arm did (`0x436b0b`→`0x436d30`): clears the
+  mailbox, drops `cs.arenaValid` (`0x540c68`) and `fieldC74`
+  (`0x540c74`), counts the `FUN_00469668` notify, and latches
+  `rt.endLevelRequest` — the `FUN_0040dde0` edge the session driver
+  maps to `progressionRequestTraversalEnd`.
+- `subop == 0x51` → `rt.fieldE9c = 0x51` (`0x540e9c = EDX`, OBSERVED
+  `0x47bb60`) + `rt.endingRequest = 1` — the `FUN_0047b038`
+  (`0x541492 = 8`) edge; the driver maps it to
+  `progressionEnterCinematic`.
+- `subop == 0x35`/`0x5c` → `fieldE9c = 0` (OBSERVED `0x47bb3e`/
+  `0x47bb85`). Arms `0x33`/`0x34`/`0x37`/`0x3d`/`0x5b`/`0x5d` call the
+  cinematic rig (`0x54f3b8`/`0x54f3c4` have no port home) and unlisted
+  subops RET — all counted via `seams.cineDispatchCalls`.
+- `endLevelRequest`/`endingRequest` are transient frame edges, not
+  original state — not serialized; `pendingViewSnap` stays the saved
+  mailbox (the save format's `+0x2c0` token only encodes
+  armed/idle anyway, and the mailbox is consumed same-frame).
+- `TraversalFrameResult.endLevelRequested`/`endingRequested` mirror
+  the latches for the driver.
+
+
+## 193. Phase 15A — boss-path VM coverage (implemented)
+
+Iterating the real boss/encounter arenas under `--traversal-runtime`
+closed the object/arena VM gaps in waves. All Level3–8 boss arenas
+now run `diag=0` at 300 frames (the `contact=0` check failure is the
+harness's floor-contact assert — an idle-harness artifact, no player
+mover collides without gameplay input):
+
+- HMO_10 (L3): `0x30` period link `{f32,link}` —
+  `rng(10000) < 10000/(30·p)` per tick.
+- MEAT_10 (L4): `0xbe` recEnable `{u8,lstr}` — stricmp the arena's
+  +0x45e record list, set/clear bit0 of `queryMask` (+0x1c); needed
+  `nameText` retention on `0x8e` volume records. Then `0x77`/`0xd3`/
+  `0xa1`/`0x71`/`0x25`/`0xb1`/`0xbb` object-side.
+- MUSE_4 (L5): arena `0xae` ammoLink `{u8,u8,f32,[f32],link}` —
+  FUN_0045ad40 on the `0x54161f` ammo block; `0x43` varcmpLink and
+  obj `0x4f` setPos.
+- OLYM_4 (L6): `0x7c` faceBias `{f32}` → +0x100, `0xdc` spawnX
+  `{f32×3}` — random x in [lo,hi) + same-height dedupe (|dx|<11.5 →
+  x−12, HYPOTHESIS bound=100 for the stale-EDX arm), `0x72` ride link
+  (cond `cs.rideObj == &col`).
+- GUNT_10 (L8): `0x60`/`0xf2`/`0x55` (box2d link, orbit-block write,
+  transform snapshot), `0x9a` animation-progress wait
+  (`{i16}` checkpoint-suspend preserving +0x21e).
+- GUNT_5/GUNT_8 (L8): `0x42` varAdd `{b,b,f32}` (unscaled `*var +=`),
+  `0x7d` event-stack clear, `0xbe` object-side, `0xf9` seam-child link
+  `{u8 mode,[lstr],link}` (+0x158/+0x15c), `0xb7` computed call
+  `{b,b,n,u32[n]}` — `trunc(*var)` indexes a target table dispatched
+  as a forced `0xfc` call (out-of-range consumes the table, no
+  dispatch), `0x4b`/`0x0f` subtype writes (+0x11e).
+- Broadcast `0x04` operand fix: inner==5 is `{lstr name, u32 arg}`
+  (OBSERVED `0x439a0e` — lstr first, u32 second). Previously parsed
+  as a bare u32, which desynced the stream (the GUNT_5 `XG`-name
+  broadcast records) and surfaced as `op 0x00` stalls.
+
+Remaining unimplemented ops are all in *non-boss* mid-level arenas
+(HMO_2..9, MEAT_2..9, MUSE_2/5, OLYM_2..7, DANT_2..9, GUNT_2..9) —
+the tail: `0x84, 0x63, 0x69, 0x87, 0xeb, 0x67, 0x37, 0x7f, 0x8d,
+0x5b, 0x62, 0x64, 0xfb, 0x0d, 0x9e, 0x12, 0xf7, 0x5e, 0xe2, 0x50,
+0x1d, 0xbf, 0xf5, 0x1b, 0x4d, 0x14, 0x20, 0x9c` + arena-side
+`0x30/0x87/0x8d/0x64/0x84/0x12/0xf7/0x5e/0xb7`. DANT_6 spins at the
+1000-insn/frame cap (a spawn-loop whose gate never satisfies in the
+idle harness — not a decode bug).
+
+## 194. Phase 15A — GUNT_10 combat chain (implemented)
+
+Combat-capable harness validation of the full GUNT_10 completion
+chain (XBSHIP T1–T7 element kills → `+21d6a` six-`XG` spawn →
+`cntLink "XG" 6` → `XGUNTAM` → `0x83`). Findings:
+
+- `rebuildObjectTransform` AABB seed corrected (OBSERVED byte-exact,
+  `FUN_0045612c` head): the original writes `+0x1a0=0x6fa18f08`
+  (+1.0e29) / `+0x1ac=0xefa18f08` (-1.0e29) then spreads, so every
+  rebuild is a clean union recompute. The earlier port seeded from
+  the old aabb z-slots (grow-only) — a zeroed box unioned the world
+  origin into every object AABB, exploding shot broad-phase bounds.
+- Mover/`f14a&0x20` bounds are genuinely spawn-frozen in the
+  original (OBSERVED: `FUN_0045612c` callers are spawn paths + the
+  render-collection rebuild which skips the `0x201000` flag mask;
+  no per-frame writer of `+0x198` exists). The shot-scan
+  broad-phase tests the stale world box — authentic.
+- `deepFloorZ` is geometry-derived (GUNT_10 spans `z -427..-321`),
+  so the object kill plane sits ~200 below the real floor —
+  deep-level objects survive (earlier flat-zero default removed
+  the whole arena).
+- `0x77` cntLink gates (OBSERVED `0x44d04a`): object `+0x06` named
+  flag set, health > 0, and the name compared via `FUN_0042fa50`
+  against the object `+0x0c` class/enemy-table name (not the
+  geometry model name) — `objectEnemyName` added.
+- Object-VM ops added for the GUNT_10 chain: `0x7b` ifPartner
+  (object side: `obj.arena != currentArena->dyn`), `0xde`
+  insn-count link (`FUN_0045ad40` on the per-invocation insn
+  count — a script watchdog), `0xf0` damage-channel arm (when the
+  global channel `0x540e10 <= 0` → `0x540d5c = u8`, with the
+  observed `1 → 5.0` bias quirk), `0x58` speed-ramp arm
+  (`{u8 mode}`: mode!=2 → `+0x11e=0x58, +0x11f=mode`; mode==2 →
+  disarm + `+0x34=0`; both unbind `+0xec`), `0xec` yaw-offset floor
+  probe (below).
+- `0xec` floorL `{f32 x,y,z, linkage}` (OBSERVED `0x44e657` →
+  `FUN_0045d71c` → `FUN_00418ce8`): builds `pt = pos - R(yaw)·(x,y)`
+  (byte-faithful FPU order: `pt.x = pos.x - x·cos - y·sin`,
+  `pt.y = pos.y - x·sin - y·cos`) and stabs the bound arena's
+  collision vertically from `z0 = pos.z + 3.0` (C(0x49835c)) to
+  `z0 - 6.0` (C(0x498364)) when z==0, else `z0 + z - 3.0`
+  (C(0x498360)). Mode-1 stab (below) runs on `ctx->+0x60` (the
+  object's bound arena, matching `0x7b`). INVERTED polarity
+  (OBSERVED `0x44e754`/`0x44e810`/`0x44e8bd`): the linkage fires on
+  NO floor — fe/fc → call t1, 0x0c → goto t1, fd → return, other
+  modes → `+0x108 = t1` (0 → halt); on a hit only `0xfe` fires
+  (call t2), others fall through.
+- Mode-1 BSP stab (OBSERVED `0x418b0d..0x418c35`): same walk as
+  `collisionStab` but crossings on planes with `|nz| < 0.5`
+  (C(0x495288) = double 0.5) are skipped entirely, and containment
+  scans a single set picked by the nz SIGN (nz>=+0.5 → polysPos,
+  nz<=-0.5 → polysNeg) — a floor-only accept. Ported as
+  `collisionStabMode1`/`stabWalkMode1`; the GUNT_10 `XG` gait
+  scripts (`ec (-20,0,0)`, `ec (-6,0,0)`) are ledge probes ahead of
+  the walker.
+- Data-section constants now decode via the PE section map (image
+  base `0x400000`, DGROUP va `0x94000` → file `0x92400`): the
+  earlier `0x497e**` reads hit Watcom error strings, not data.
+- Harness: `bossMatches` now skips dead objects (`health<=0`) —
+  dead XGs soaked the "XG" shot specs. Aiming reads `boss->pos`
+  plus the live element-aabb union rather than the frozen
+  collision box.

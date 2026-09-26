@@ -213,6 +213,10 @@ struct TraversalSeams {
   int postTailCalls = 0;        // FUN_0042ff9c + FUN_0042fef4 walk
   int teleportCalls = 0;        // 0x540cdc teleport block
   int pendingViewSnaps = 0;     // 0x540ebc snap consumed
+  int endLevelRequests = 0;     // 0x540ebc == -1 consumed — the
+                                // FUN_00436100 -1 arm (0x436d30)
+                                // that calls FUN_0040dde0
+  int cineDispatchCalls = 0;    // op 0x83 >0x32 → FUN_0047baf4
   int arenaReleases = 0;        // 0x540d60/64 LRU drops
   int type1Triggers = 0;        // FUN_00434b44 attach/detach fires
   int type3Prefetches = 0;      // FUN_00434b44 prefetch fires
@@ -271,6 +275,25 @@ struct TraversalSeams {
   int objectDeathCalls = 0;       // FUN_00458140 deaths run
   int objectTeardownCalls = 0;    // FUN_00457cf4 teardown seam
   int mountDamageCalls = 0;       // FUN_0046771c mount-redirect hits
+  int sfxPeeCalls = 0;            // op-0x84 FX spawn (FUN_00405270 /
+                                  // 0x403f6c+0x404108) — the probability
+                                  // gate passed; spawn stays inert
+  int impactDecalCalls = 0;       // op-0x82 (0x43d420) — FUN_00454e4c
+                                  // decal emit; +0x21c gate passed,
+                                  // decal itself stays presentation-only
+  int namedAnimAngleCalls = 0;    // op-0x5a (0x44a861) — named model
+                                  // anim-record angle set; operands
+                                  // consumed, the model anim-record
+                                  // array is not modelled yet
+  std::string namedAnimAngleName; // last name the op searched for
+  int surfFlagElemTags = 0;       // op-0x62 (0x44ba80) — the
+                                  // FUN_0040a704 element +0x20 flag
+                                  // arm is unmodelled; the +0x10c/
+                                  // +0x110 mask writes do land
+  int elemShardCalls = 0;         // op-0x81 (0x43d363) — element-kill
+                                  // debris shard emit (FUN_0041c420
+                                  // alloc path); mask+latch lands,
+                                  // shard geometry is cosmetic
 };
 
 struct TraversalFrameResult {
@@ -306,6 +329,10 @@ struct TraversalFrameResult {
   bool partnerActive = false;        // 0x540ca8
   bool currentArenaSwapped = false;  // portal swap ran this frame
   int portalCandidate = -1;          // dest arena idx (fields[0])
+  bool endLevelRequested = false;    // rt.endLevelRequest (FUN_0040dde0
+                                     // edge — 0x540ebc == -1 consumed)
+  bool endingRequested = false;      // rt.endingRequest (op 0x83 0x51
+                                     // — FUN_0047b038 mode-8 edge)
   float eventTimer = 0.0f;           // 0x540eb0
   float viewScalar = 0.0f;           // 0x540b54
   float lookOffsetDeg = 0.0f;        // 0x540d58 — look offset
@@ -401,6 +428,15 @@ struct TraversalRuntime {
   int flagBec = 0;                // 0x540bec — blend gate
   int pendingViewSnap = 0;        // 0x540ebc
   float pendingView[4] = {0, 0, 0, 0}; // 0x540ec0..0x540ecc
+  int endLevelRequest = 0;        // FUN_00436100's 0x540ebc == -1 arm
+                                  // (0x436b0b -> 0x436d30): the
+                                  // FUN_0040dde0 end-level edge,
+                                  // surfaced for the session driver
+                                  // (progressionRequestTraversalEnd)
+  int endingRequest = 0;          // script op 0x83 0x51 -> FUN_0047b038
+                                  // (0x541492 = 8): the ending-
+                                  // cinematic edge (driver maps it to
+                                  // progressionEnterCinematic)
   float eventTimer = 0.0f;        // 0x540eb0
   const DynamicObject* eventTimerObj = nullptr; // 0x540eb4
   int fieldD2c = 0;               // 0x540d2c — frameStep-decayed
@@ -740,7 +776,8 @@ void traversalTriggerScan(TraversalRuntime& rt);
 // record with script-supplied kind/rate/queryMask (+0x10 no-falloff
 // flag). Returns false when no such record exists (original prints
 // a "cannot find fan hotspot" error and continues).
-bool traversalVolumeActivate(TraversalArena& arena, int id, int kind,
+bool traversalVolumeActivate(TraversalArena& arena, int id,
+                             const std::string& name, int kind,
                              float rate, std::uint32_t mask,
                              bool noFalloff);
 

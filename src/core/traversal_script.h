@@ -167,6 +167,13 @@ struct TraversalScriptEnv {
   // (event -> handlerOff script) builds a fresh state per invoke.
   TraversalScriptState* stateOverride = nullptr;
 
+  // The interpreter's executing ctx (FUN_004388d8's record arg):
+  // the arena VM uses &selfArena->eventLatch, the object VM the
+  // object itself. Spawn ops write child+0x138 (leader) from it —
+  // OBSERVED 0x43fc16 — so arena-spawned objects are born led by the
+  // latch and object-spawned children by their spawner.
+  DynamicObject* ctxObject = nullptr;
+
   // Mirrored globals the subset touches (0x541534, 0x540b58,
   // 0x540d98, 0x540d88[8], 0x54b5e0/0x5414e8 read-only, 0x540e24/cbc).
   std::int8_t g541534 = 0;
@@ -184,6 +191,8 @@ struct TraversalScriptEnv {
   bool slideMode = false;
   bool hasContactNormal = false;
   float dt = 0.0f;
+  int frameStep = 1;                // DAT_0049b6e8 — the per-eval mark
+                                    // quantum used by op 0x12's timer
   int slideChannel = 0;               // 0x540e24 (out)
   float slideImpulseX = 0.0f;
   float slideImpulseZ = 0.0f;
@@ -280,6 +289,18 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
 std::vector<TraversalScriptInsn> traversalScriptDisasm(
     std::span<const std::byte> image, std::uint32_t imageBase,
     std::uint32_t codeOff, int maxInsn = 256);
+
+// Phase 15A — bounded spawn census for the combat harness. Appended
+// by traversalScriptSpawn (in addition to the object landing in the
+// arena's storage) so --traversal-runtime can list encounter
+// participants. Process-local; not serialized.
+struct TraversalSpawnRecord {
+  std::string cls;
+  std::string name;
+  std::string arena;      // owning arena at spawn time
+  int variant = 0;
+};
+std::vector<TraversalSpawnRecord>& traversalSpawnLog();
 
 } // namespace mdk
 

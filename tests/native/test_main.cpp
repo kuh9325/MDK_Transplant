@@ -10415,6 +10415,9 @@ void test_player_collision() {
     CHECK(a.nodes != nullptr && a.polys != nullptr &&
           a.verts != nullptr);
     CHECK(near(a.nodes[0].nz, 1.0) && a.polys[0].v[2] == 2);
+    // +0x44e (deepFloorZ) = the AABB minZ folded from the installed
+    // verts — OBSERVED FUN_004320d0, run right after FUN_00419ee0.
+    CHECK(near(a.deepFloorZ, 10.0));
     // A parsed arena answers a real query.
     mdk::CollisionState cs = makeCollisionState(&a);
     cs.pos[2] = 12.0f;
@@ -11079,7 +11082,7 @@ void test_dynamic_objects() {
           near(m[8], 2.f, 1e-5));
   }
 
-  // ---- FUN_0045612c rebuild: Euler path + AABB seed quirk ----------
+  // ---- FUN_0045612c rebuild: Euler path + sentinel seed ----------
   {
     DynamicArena ar;
     DynamicObject& o = ar.allocFront();
@@ -11087,27 +11090,28 @@ void test_dynamic_objects() {
     o.setPosition(10, 20, 30);
     o.prevYawDeg = o.yawDeg = 0;
     mdk::initObjectCollision(o);
-    // first build: seed {0,0,0}/{0,0,0} then union elem world
-    // {-5,-5,0,5,5,0}+pos = {5,15,30,15,25,30} -> min clamps to 0.
-    CHECK(near(o.col.aabb[0], 0.f, 1e-5) &&
+    // OBSERVED (FUN_0045612c head, byte-exact): +0x1a0/+0x1ac are
+    // seeded with 0x6fa18f08/0xefa18f08 (+/-1.0e29) then spread to all
+    // axes — a clean union recompute, not a grow-only merge of the
+    // previous box. elem world {-5,-5,0,5,5,0}+pos = {5,15,30,15,25,30}.
+    CHECK(near(o.col.aabb[0], 5.f, 1e-5) &&
           near(o.col.aabb[3], 15.f, 1e-5) &&
           near(o.col.aabb[4], 25.f, 1e-5) &&
           near(o.col.aabb[5], 30.f, 1e-5));
     CHECK(near(o.model.elems[0].aabb[0], 5.f, 1e-5) &&
           near(o.model.elems[0].aabb[3], 15.f, 1e-5) &&
           near(o.model.elems[0].aabb[5], 30.f, 1e-5));
-    // second build at same pos: seed = {minZ x3}/{maxZ x3} of the
-    // PREVIOUS aabb {0,0,0,15,25,30} -> {0,0,0}/{30,30,30}, then the
-    // element union -> {0,0,0,30,30,30} (z-seed quirk reproduced).
+    // second build at same pos: identical clean recompute — no stale
+    // or zeroed extents survive into the new box.
     mdk::rebuildObjectTransform(o);
-    CHECK(near(o.col.aabb[2], 0.f, 1e-5) &&
-          near(o.col.aabb[5], 30.f, 1e-5) &&
-          near(o.col.aabb[3], 30.f, 1e-5));
-    // elemMaskB excludes the element: AABB stays the degenerate seed.
+    CHECK(near(o.col.aabb[0], 5.f, 1e-5) &&
+          near(o.col.aabb[2], 30.f, 1e-5) &&
+          near(o.col.aabb[5], 30.f, 1e-5));
+    // elemMaskB excludes the element: the AABB stays the inverted
+    // sentinel seed (+1e29 min / -1e29 max — a degenerate empty box).
     o.col.elemMaskB = 1;
     mdk::rebuildObjectTransform(o);
-    CHECK(near(o.col.aabb[0], 0.f, 1e-5) &&
-          near(o.col.aabb[3], 30.f, 1e-5));
+    CHECK(o.col.aabb[0] > 1e28f && o.col.aabb[3] < -1e28f);
     o.col.elemMaskB = 0;
   }
 
@@ -11549,10 +11553,35 @@ void test_traversal_trigger_scan() {
 }
 
 void test_traversal_deep_floor() {
-  // +0x44e has no writer in MDK95 — a fresh CollisionArena carries the
-  // observed zero-init: the 0x4673ee failsafe is a flat posZ<=-50.
+  // +0x44e = the arena geometry AABB minZ (OBSERVED FUN_004320d0 —
+  // folded from +0x24/+0x0c via lea ecx,[eax+0x446] + register-
+  // indirect stores, run right after FUN_00419ee0). A record with
+  // no verts keeps the memset-zero reference (early return on
+  // +0x24 == 0): the 0x4673ee failsafe is a flat posZ<=-50 there.
   mdk::CollisionArena arena;
   CHECK(arena.deepFloorZ == 0.0f);
+
+  // GUNT_10 lifecycle (Phase 15A): the arena's collision verts span
+  // z -427..-321, so the kill plane is -627 — script-spawned boss
+  // objects at -345..-427 survive where a flat -200 reference would
+  // tear them down on frame 1 (OBSERVED in MDK95: the objects
+  // persist). Below -627 the same object still dies.
+  {
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "GUNT_10");
+    a->dyn.col.deepFloorZ = -427.0f;
+    mdk::DynamicObject& o = a->dyn.allocFront();
+    o.col.named = true;
+    o.health = 10;
+    o.arena = &a->dyn;
+    o.setPosition(-42.0f, 3458.0f, -373.0f);   // XGUNTAM's spawn
+    mdk::objectCollide(rt, o, a->dyn, nullptr, 1.0f / 30.0f);
+    CHECK(o.col.named);                      // -373 > -427 - 200
+
+    o.setPosition(-42.0f, 3458.0f, -630.0f); // past the abyss plane
+    mdk::objectCollide(rt, o, a->dyn, nullptr, 1.0f / 30.0f);
+    CHECK(!o.col.named);                     // torn down below -627
+  }
 }
 
 void test_traversal_element_bind() {
@@ -11791,6 +11820,196 @@ void test_traversal_script() {
     CHECK(r.error);
     CHECK(r.diag.find("Unrecognised") != std::string::npos);
   }
+
+  // --- 0x83 end-level: subop <= 0x32 latches 0x540ebc = -1 ---------------
+  // OBSERVED (0x43d3e2 + 0x43d411): the traversal-completion opcode.
+  {
+    ScriptFixture f;
+    f.write(C, {0x83, 0x00, 0x09, 0xff});        // endlvl; stop; end
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error);
+    CHECK(f.rt.pendingViewSnap == -1);
+    CHECK(f.rt.seams.cineDispatchCalls == 0);
+  }
+
+  // --- 0x83 boundary: subop 0x32 is still the end-level arm --------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x83, 0x32, 0x09, 0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error);
+    CHECK(f.rt.pendingViewSnap == -1);
+  }
+
+  // --- 0x83 0x51: mode-8 ending edge (FUN_0047b038) -----------------------
+  // OBSERVED (0x47bb5b): 0x540e9c = EDX(=0x51) then the ending latch.
+  {
+    ScriptFixture f;
+    f.write(C, {0x83, 0x51, 0x09, 0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error);
+    CHECK(f.rt.fieldE9c == 0x51);
+    CHECK(f.rt.endingRequest == 1);
+    CHECK(f.rt.pendingViewSnap == 0);            // no end-level latch
+    CHECK(f.rt.seams.cineDispatchCalls == 1);
+  }
+
+  // --- 0x83 cine subops: 0x5c clears 0x540e9c; unlisted subops nop --------
+  {
+    ScriptFixture f;
+    f.rt.fieldE9c = 0x47;
+    f.write(C, {0x83, 0x5c, 0x83, 0xa2, 0x09, 0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.stopped && !r.error);
+    CHECK(f.rt.fieldE9c == 0);                   // 0x5c -> 0x540e9c = 0
+    CHECK(f.rt.pendingViewSnap == 0);
+    CHECK(f.rt.endingRequest == 0);
+    CHECK(f.rt.seams.cineDispatchCalls == 2);
+  }
+
+  // --- 0x540ebc == -1 consume: the FUN_00436100 tail arm ------------------
+  // OBSERVED (0x436b0b -> 0x436d30): mailbox cleared, 0x540c68/0x540c74
+  // dropped, FUN_00469668 notify, FUN_0040dde0 — surfaced here as the
+  // endLevelRequest edge.
+  {
+    CollisionFixture cf = makeFloorArena();
+    mdk::TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "TEST");
+    a->dyn.col.verts = cf.verts.data();
+    a->dyn.col.polys = cf.polys.data();
+    a->dyn.col.nodes = cf.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    rt.cur = a;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1;
+    rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 12.0f;
+    rt.fieldC74 = 1;
+    rt.pendingViewSnap = -1;
+    const mdk::GameplayInputBindings bindings;
+    const mdk::FrontendTimingState timing;
+    const mdk::RawGameplayInput idle{};
+    const auto out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.pendingViewSnap == 0);
+    CHECK(rt.endLevelRequest == 1);
+    CHECK(rt.cs.arenaValid == 0);
+    CHECK(rt.fieldC74 == 0);
+    CHECK(rt.seams.endLevelRequests == 1);
+    CHECK(out.endLevelRequested);
+    CHECK(!out.endingRequested);
+  }
+
+  // --- 0x8e name propagation + 0xbe named record enable ----------------
+  // OBSERVED (0x44ace6 + FUN_00413354/FUN_0047e02c): 0x8e stores the
+  // script name at record +0x8 (nameText); 0xbe stricmp-matches it and
+  // sets/clears bit0 of +0x1c (queryMask). No match -> silent no-op.
+  {
+    ScriptFixture f;
+    mdk::DtiArenaRecord drec = {};
+    mdk::DtiSubRecord vol = {};
+    vol.type = 7;
+    vol.fields[0] = 7;                          // record id
+    for (int i = 0; i < 6; ++i) {               // volume box floats
+      float v = static_cast<float>(i);
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      vol.fields[2 + i] = u;
+    }
+    drec.subRecords.push_back(vol);
+    f.arena->rec = &drec;
+    // volact {id=7, "BIGBERTA", mask=3, kind=5, rate=2.0}
+    f.write(C, {0x8e, 0x07});
+    f.writeStr(C + 2, "BIGBERTA");              // len+9B -> C+2..C+11
+    f.write(C + 12, {0x03, 0x05});
+    f.writeF(C + 14, 2.0f);
+    f.write(C + 18, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    mdk::SurfaceRecord* rec = f.arena->surface.records;
+    CHECK(rec != nullptr);
+    if (rec == nullptr) return;
+    CHECK(rec->name == 7 && rec->nameText == "BIGBERTA" &&
+          rec->kind == 5 && rec->queryMask == 3);
+
+    // 0xbe flag=1 with a lowercase operand: stricmp match -> bit0 set.
+    rec->queryMask = 0;
+    f.write(C, {0xbe, 0x01});
+    f.writeStr(C + 2, "bigberta");
+    f.write(C + 12, {0xff});
+    f.arena->script.pcImageOff = C;
+    r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error && (rec->queryMask & 1u));
+
+    // flag=0 clears the bit; the rest of the mask is preserved.
+    rec->queryMask = 0x5;
+    f.write(C, {0xbe, 0x00});
+    f.writeStr(C + 2, "BIGBERTA");
+    f.write(C + 12, {0xff});
+    f.arena->script.pcImageOff = C;
+    r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error && rec->queryMask == 0x4);
+
+    // Missing name: silent no-op.
+    f.write(C, {0xbe, 0x01});
+    f.writeStr(C + 2, "NOSUCH");                // len+7B -> C+2..C+9
+    f.write(C + 10, {0xff});
+    f.arena->script.pcImageOff = C;
+    r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error && rec->queryMask == 0x4);
+    mdk::surfaceRecordsDestroy(f.arena->surface);
+  }
+
+  // -- 0xae ammoLink: {idx, kind, f32 a, [b], linkage} ------------------
+  {
+    ScriptFixture f;
+    f.rt.ammo[2] = 5;
+    // kind 5 = approx-eq (per FUN_0045ad40 table): ammo[2]==5 -> call.
+    f.write(C, {0xae, 0x02, 0x05}); f.writeF(C + 3, 5.0f);
+    f.write(C + 7, {0xfc}); f.writeW(C + 8, 0x300);
+    f.write(C + 12, {0xff});
+    f.write(0x300, {0x44, 0x00, 0x02, 0xfd});   // set global flag bit2
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.env.gFlags & (1u << 2));
+    // ammo[2]==5 vs compare 9 -> no fire.
+    f.env.gFlags = 0;
+    f.write(C + 7, {0xfc});                     // same layout
+    f.writeF(C + 3, 9.0f);
+    f.arena->script.pcImageOff = C;
+    r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK((f.env.gFlags & (1u << 2)) == 0);
+  }
+
+  // -- 0x43 varcmpLink: {mode, idx, kind, a, [b], linkage} -------------
+  {
+    ScriptFixture f;
+    f.arena->objVars48[1] = 7.0f;               // mode-1 slot
+    // kind 2 = ">": 7 > 3 -> call.
+    f.write(C, {0x43, 0x01, 0x01, 0x02}); f.writeF(C + 4, 3.0f);
+    f.write(C + 8, {0xfc}); f.writeW(C + 9, 0x300);
+    f.write(C + 13, {0xff});
+    f.write(0x300, {0x44, 0x00, 0x04, 0xfd});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.env.gFlags & (1u << 4));
+    // 7 > 9 -> no fire.
+    f.env.gFlags = 0;
+    f.writeF(C + 4, 9.0f);
+    f.arena->script.pcImageOff = C;
+    r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK((f.env.gFlags & (1u << 4)) == 0);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -11878,27 +12097,31 @@ void test_traversal_object_init() {
     CHECK(o.connSound316.empty() && o.connSound31e.empty());
   }
 
-  // Field-set family beyond the door's: 0x5a->+0xe8, 0xc7->+0x104
-  // (same {mode,[f32|idx]} grammar as 0x53/0x54), 0x76->+0x118
-  // (u32 slot, low16-1), and 0x75->+0x148 &= ~u32. Confirmed from
-  // MDK95.EXE handler disasm — the +0x104 writer is dispatch-table
-  // slot 0xc7 (handler 0x45188f), not 0xc6; the +0x118 writer is
-  // 0x76 (handler 0x43976b) and 0x75 is the AND-clear at 0x44d025.
+  // Field-set family beyond the door's: 0x5a is the named-anim angle
+  // store (handler 0x44a861 — scans the model's anim-record array for
+  // a name match, then FUN_00425190; a presentation seam here), plus
+  // the field writers 0xc7->+0x104, 0x76->+0x118 (u32 slot, low16-1),
+  // and 0x75->+0x148 &= ~u32. Confirmed from MDK95.EXE handler
+  // disasm — the +0x104 writer is dispatch-table slot 0xc7 (handler
+  // 0x45188f), not 0xc6; the +0x118 writer is 0x76 (handler 0x43976b)
+  // and 0x75 is the AND-clear at 0x44d025.
   {
     ScriptFixture f;
     const std::uint32_t C = 0x200;
-    f.write(C,      {0x5a, 0x03});  f.writeF(C + 2, 4.5f);   // +0xe8
-    f.write(C + 6,  {0xc7, 0x03});  f.writeF(C + 8, 7.25f);  // +0x104
-    f.write(C + 12, {0x76});        f.writeW(C + 13, 9);     // +0x118=8
-    f.write(C + 17, {0x75});        f.writeW(C + 18, 0x10);  // clr bit4
-    f.write(C + 22, {0xff});
+    f.write(C,      {0x5a});      f.writeStr(C + 1, "ROT");  // named anim
+    f.writeF(C + 6, 4.5f);                                 // angle
+    f.write(C + 10, {0xc7, 0x03});  f.writeF(C + 12, 7.25f); // +0x104
+    f.write(C + 16, {0x76});        f.writeW(C + 17, 9);     // +0x118=8
+    f.write(C + 21, {0x75});        f.writeW(C + 22, 0x10);  // clr bit4
+    f.write(C + 26, {0xff});
     mdk::DynamicObject& o = f.arena->dyn.allocFront();
     mdk::initObjectDefaults(o);
     o.col.flags148 |= 0x14;                  // set bits 2+4
     o.col.flags149 = static_cast<std::uint8_t>(o.col.flags148 >> 8);
     auto r = mdk::traversalObjectInitScript(f.env, o, C);
     CHECK(r.halted && !r.error);
-    CHECK(near(o.fieldE8, 4.5, 1e-5));
+    CHECK(f.rt.seams.namedAnimAngleCalls == 1 &&
+          f.rt.seams.namedAnimAngleName == "ROT");
     CHECK(near(o.field104, 7.25, 1e-5));
     CHECK(o.animLatch == 8);                 // 9 - 1
     CHECK((o.col.flags148 & 0x14) == 0x4);   // 0x75 cleared bit4
@@ -12575,8 +12798,9 @@ void test_traversal_object_script() {
   }
 
   // -- XT_MISS hit variant: `6d 14; 4c 0; 10 0` (dmg 20 + health=0) --
-  // OBSERVED at 0x42a9: op-0x10 sets +0x10 health to zero instead of
-  // 0x6e — the object dies through the health boundary, not teardown.
+  // OBSERVED at 0x42a9: op-0x10 sets +0x8 health to zero instead of
+  // 0x6e — the object dies through the health boundary's own teardown
+  // (FUN_00457cf4), not the explicit teardown op.
   {
     ScriptFixture f;
     const std::uint32_t HIT = 0x320;
@@ -12596,10 +12820,306 @@ void test_traversal_object_script() {
     f.rt.fieldHealth = 100;
     f.rt.difficulty = 1;
     auto r = mdk::traversalObjectScriptTick(f.env, o);
-    CHECK(r.halted && !r.error);
+    // OBSERVED (0x439fbc): the health-zero arm ends the pass at the
+    // death boundary — no 0xff halt, and FUN_00457cf4's record wipe
+    // (objectTeardownNow) leaves the corpse inert in place.
+    CHECK(!r.error);
     CHECK(f.rt.fieldHealth == 80);          // 20 base at Skill 1
     CHECK(o.health == 0);                   // 0x10 — dies via health
-    CHECK(o.col.named);                     // no 0x6e wipe this path
+    CHECK(!o.col.named);                    // wiped by the teardown
+  }
+
+  // -- 0x83 end-level: object scripts share the completion op -----------
+  // OBSERVED (0x43d3e2): subop <= 0x32 writes 0x540ebc = -1; 0x51 takes
+  // the FUN_0047b038 mode-8 ending edge. Boss death-watch object
+  // scripts (e.g. L6 OLYM_10$XB2_0) carry the completion tail.
+  {
+    ScriptFixture f;
+    f.write(C, {0x83, 0x00, 0x09, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.stopped && !r.error);
+    CHECK(f.rt.pendingViewSnap == -1);
+    CHECK(f.rt.endingRequest == 0);
+  }
+  {
+    ScriptFixture f;
+    f.write(C, {0x83, 0x51, 0x09, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.stopped && !r.error);
+    CHECK(f.rt.pendingViewSnap == 0);
+    CHECK(f.rt.fieldE9c == 0x51);
+    CHECK(f.rt.endingRequest == 1);
+  }
+
+  // -- Phase 15A filler ops (OBSERVED field writes) --------------------
+  // 0x7c faceBias: {f32} -> +0x100.
+  {
+    ScriptFixture f;
+    f.write(C, {0x7c}); f.writeF(C + 1, 12.5f);
+    f.write(C + 5, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.field100, 12.5, 1e-5));
+  }
+  // 0x4f setPos: {f32 x,y,z} -> +0x10/+0x14/+0x18 raw stores.
+  {
+    ScriptFixture f;
+    f.write(C, {0x4f});
+    f.writeF(C + 1, 3.0f); f.writeF(C + 5, 4.0f); f.writeF(C + 9, -2.0f);
+    f.write(C + 13, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.pos[0], 3.0, 1e-5) && near(o.pos[1], 4.0, 1e-5) &&
+          near(o.pos[2], -2.0, 1e-5));
+  }
+  // 0xd3 velZero: clears +0x28/+0x2c/+0x30.
+  {
+    ScriptFixture f;
+    f.write(C, {0xd3, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field28 = 1.5f; o.field2c = -2.0f; o.field30 = 9.0f;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field28 == 0.0f && o.field2c == 0.0f && o.field30 == 0.0f);
+  }
+  // 0x4b/0x0f: subtype writes (+0x11e).
+  {
+    ScriptFixture f;
+    f.write(C, {0x4b, 0x0f, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field11e = 0x3d;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field11e == 0x0f);            // 0x0f overwrote 0x4b's clear
+  }
+  // 0x7d: clears the +0x248 event-call depth.
+  {
+    ScriptFixture f;
+    f.write(C, {0x7d, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.scriptCallDepth = 3;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 0);
+  }
+  // 0x42 varAdd: {mode,idx,f32} — object locals slot.
+  {
+    ScriptFixture f;
+    f.write(C, {0x42, 0x02, 0x01}); f.writeF(C + 3, 2.25f);
+    f.write(C + 7, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.scriptLocals[1] = 1.0f;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.scriptLocals[1], 3.25, 1e-5));
+  }
+  // 0xb1 auxDist: {varop} -> +0x2c4.
+  {
+    ScriptFixture f;
+    f.write(C, {0xb1, 0x03}); f.writeF(C + 2, 42.0f);
+    f.write(C + 6, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(near(o.field2c4, 42.0, 1e-5));
+  }
+  // 0x25 flag14c&2 link: conditional 0xfc.
+  {
+    ScriptFixture f;
+    f.write(C, {0x25, 0xfc}); f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x05, 0xfd});   // set local bit5; ret
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.flags14c = 0;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK((o.scriptFlagsLocal & (1u << 5)) == 0);   // no link fire
+    o.field108 = f.image.data() + 4 + C;
+    o.col.flags14c = 2;
+    o.scriptCallDepth = 0;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o.scriptFlagsLocal & (1u << 5));           // link fired
+  }
+  // 0x72 ride link: cond = cs.rideObj == &obj.col.
+  {
+    ScriptFixture f;
+    f.write(C, {0x72, 0xfc}); f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x06, 0xfd});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    f.rt.cs.rideObj = nullptr;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK((o.scriptFlagsLocal & (1u << 6)) == 0);
+    o.field108 = f.image.data() + 4 + C;
+    o.scriptCallDepth = 0;
+    f.rt.cs.rideObj = &o.col;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o.scriptFlagsLocal & (1u << 6));
+  }
+  // 0xf9 child link: mode 0 has-child / mode 2 no-child.
+  {
+    ScriptFixture f;
+    f.write(C, {0xf9, 0x02, 0xfc}); f.writeW(C + 3, 0x300);
+    f.write(C + 7, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x07, 0xfd});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptFlagsLocal & (1u << 7));       // no child -> fires
+    o.field108 = f.image.data() + 4 + C;
+    o.scriptCallDepth = 0;
+    mdk::DynamicObject& c = f.arena->dyn.allocFront();
+    o.field158 = &c;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o.scriptCallDepth == 0);               // child -> no fire
+  }
+  // 0xb7 computed call: var slot picks the table index.
+  {
+    ScriptFixture f;
+    f.write(C, {0xb7, 0x02, 0x00, 0x02});       // var m2 i0, n=2
+    f.writeW(C + 4, 0x300);
+    f.writeW(C + 8, 0x310);
+    f.write(C + 12, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x00, 0xfd});   // bit0
+    f.write(0x310, {0x44, 0x02, 0x01, 0xfd});   // bit1
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.scriptLocals[0] = 1.0f;                    // trunc -> index 1
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK((o.scriptFlagsLocal & 0x3) == 2);      // only idx-1 callee ran
+    // Out-of-range index consumes the table but dispatches nothing.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.scriptLocals[0] = 9.0f;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o2.scriptFlagsLocal == 0);
+  }
+  // 0xdc spawnX: writes pos.x inside [lo,hi).
+  {
+    ScriptFixture f;
+    f.write(C, {0xdc});
+    f.writeF(C + 1, 10.0f); f.writeF(C + 5, 30.0f); f.writeF(C + 9, 5.0f);
+    f.write(C + 13, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.pos[1] = -999.0f;                          // no co-height peers
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.pos[0] >= 10.0f && o.pos[0] < 30.0f);
+  }
+  // 0xbb randImpulse: velocity lands in all three axes.
+  {
+    ScriptFixture f;
+    f.write(C, {0xbb}); f.writeF(C + 1, 2.0f); f.writeF(C + 5, 3.0f);
+    f.write(C + 9, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    f.rt.rngState = 7;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field30 > 0.0f);                     // vert = +mag*scale
+    CHECK(o.field28 != 0.0f || o.field2c != 0.0f);
+    const double hs =
+        std::sqrt((double)o.field28 * o.field28 +
+                  (double)o.field2c * o.field2c);
+    CHECK(hs >= 1.0 && hs <= 3.0);               // [0.5,1.5)*2.0
+  }
+  // 0xbe obj-VM recEnable: named record bit0 toggle.
+  {
+    ScriptFixture f;
+    auto* rec = new mdk::SurfaceRecord();
+    rec->nameText = "GATE7";
+    rec->queryMask = 0x10;
+    f.arena->surface.records = rec;              // owned: arena frees it
+    f.write(C, {0xbe, 0x01}); f.writeStr(C + 2, "gate7");
+    f.write(C + 9, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK((rec->queryMask & 1u) != 0);           // bit0 set, 0x10 kept
+  }
+
+  // --- obj op 0xec: yaw-offset floor probe (0x44e657 -> FUN_0045d71c
+  // + mode-1 stab). INVERTED polarity: the linkage fires on NO floor.
+  {
+    // Floor at z=10 (makeFloorArena plane +z); probe z0 = pos.z + 3
+    // down to z0 - 6 hits the floor iff pos.z in [7, 16].
+    ScriptFixture f;
+    CollisionFixture cf = makeFloorArena();
+    f.arena->dyn.col.verts = cf.verts.data();
+    f.arena->dyn.col.polys = cf.polys.data();
+    f.arena->dyn.col.nodes = cf.nodes.data();
+    // ec (0,0,0) fc ->C+0x40 ; fall-through + target: ckpt;suspend
+    f.write(C, {0xec});
+    f.writeF(C + 1, 0.0f); f.writeF(C + 5, 0.0f); f.writeF(C + 9, 0.0f);
+    f.write(C + 13, {0xfc}); f.writeW(C + 14, C + 0x40);
+    f.write(C + 18, {0x01, 0xff});
+    f.write(C + 0x40, {0x01, 0xff});
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.arena = &f.arena->dyn;
+    o.pos[2] = 12.0f;                        // probe 15 -> 9 crosses z=10
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 0);           // floor found -> fell through
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 19));
+
+    // No floor: pos.z = 30 -> probe 33 -> 27 misses the z=10 plane.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.arena = &f.arena->dyn;
+    o2.pos[2] = 30.0f;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o2.scriptCallDepth == 1);          // no floor -> call C+0x40
+    CHECK(o2.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x41));
+
+    // Yaw-offset transform: pt = pos - R(yaw)*(x,y). pos=(49,-49),
+    // yaw=0, lx=-20 -> probe lands at x=69 (outside the +-50 floor)
+    // -> link fires; yaw=180 -> x=29 (inside) -> no link.
+    f.write(C, {0xec});
+    f.writeF(C + 1, -20.0f);
+    f.writeF(C + 5, 0.0f); f.writeF(C + 9, 0.0f);
+    mdk::DynamicObject& o3 = f.arena->dyn.allocFront();
+    o3.arena = &f.arena->dyn;
+    o3.pos[0] = 49.0f; o3.pos[1] = -49.0f; o3.pos[2] = 12.0f;
+    o3.yawDeg = 0.0f;
+    o3.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o3);
+    CHECK(o3.scriptCallDepth == 1);          // probe off-tri -> no floor
+    mdk::DynamicObject& o4 = f.arena->dyn.allocFront();
+    o4.arena = &f.arena->dyn;
+    o4.pos[0] = 49.0f; o4.pos[1] = -49.0f; o4.pos[2] = 12.0f;
+    o4.yawDeg = 180.0f;
+    o4.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o4);
+    CHECK(o4.scriptCallDepth == 0);          // probe on-tri -> floor
   }
 }
 
@@ -12965,6 +13485,31 @@ void test_enemy_runtime() {
     CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
   }
 
+  // -- obj op 0x30: period link (rng state 1 -> draw 5137) ------------
+  // OBSERVED (0x43e8fe): fires when FUN_00401ed4(10000) <
+  // (1/30)/period * 10000 — `period` is the mean seconds between
+  // events; per-frame chance = 1/(30*period).
+  {
+    ScriptFixture f;
+    f.write(C, {0x30});
+    f.writeF(C + 1, 0.05f);               // 6667 > 5137 -> fires
+    f.write(C + 5, {0x0c});
+    f.writeW(C + 6, 0x300);
+    f.write(C + 10, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    f.rt.rngState = 1;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+    f.writeF(C + 1, 0.1f);                // 3333 < 5137 -> not
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    f.rt.rngState = 1;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+  }
+
   // -- obj op 0x11: anim-done link --------------------------------------
   {
     ScriptFixture f;
@@ -13064,17 +13609,19 @@ void test_enemy_runtime() {
     f.write(C + 11, {0xff});
     f.write(0x300, {0x44, 0x02, 0x03, 0xff});
     mdk::DynamicObject& o = f.arena->dyn.allocFront();
-    mdk::RuntimeModel::NameRec nr;
-    std::snprintf(nr.name.data(), nr.name.size(), "%s", "FOO");
-    o.model.names.push_back(nr);
-    o.field21e = 1;                         // bound to names[0]
+    o.model.elems.resize(1);                // the mark indexes ELEMENTS
+    o.model.elemNames.resize(1);            // (model+0x20 records), not
+    std::snprintf(o.model.elemNames[0].data(), 12, "%s", "FOO");  // the
+    o.field21e = 1;                         // model name table
     o.field108 = f.image.data() + 4 + C;
     auto r = mdk::traversalObjectScriptTick(f.env, o);
     CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8) &&
           o.field21e == 0);                 // fired mark clears (s1)
     // Wrong name -> fallthrough, mark kept.
     mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
-    o2.model.names.push_back(nr);
+    o2.model.elems.resize(1);
+    o2.model.elemNames.resize(1);
+    std::snprintf(o2.model.elemNames[0].data(), 12, "%s", "FOO");
     o2.field21e = 1;
     o2.field108 = f.image.data() + 4 + C;
     f.write(C + 1, {0x04, 'B', 'A', 'R', 0x00});   // s1 = "BAR"
@@ -13083,6 +13630,118 @@ void test_enemy_runtime() {
     CHECK(!r2.error);
     CHECK(!(o2.scriptFlagsLocal & 8));
     CHECK(o2.field21e == 0);   // kept through 0x2a, cleared by 0xff
+  }
+
+  // -- obj op 0x16: mark-gated link consumes +0x21e ---------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x16, 0x0c});
+    f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field21e = 2;                         // pending mark -> dispatch
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8) &&
+          o.field21e == 0);                 // fired mark clears
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field21e = 0;                        // no mark -> no dispatch
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+    mdk::DynamicObject& o3 = f.arena->dyn.allocFront();
+    o3.field21e = 0xfd;                     // -3 sentinel -> no dispatch
+    o3.field108 = f.image.data() + 4 + C;
+    auto r3 = mdk::traversalObjectScriptTick(f.env, o3);
+    CHECK(r3.halted && !r3.error && !(o3.scriptFlagsLocal & 8) &&
+          o3.field21e == 0);                // kept through 0x16,
+                                            // cleared by 0xff
+  }
+
+  // -- obj op 0x15: path-index set + -2 sentinel ------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x15});
+    f.writeW(C + 1, 7);
+    f.write(C + 5, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && o.fieldE6 == 7);
+    f.writeW(C + 1, 0xfffffffe);            // lo16 = 0xfffe -> -2
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.fieldF0 = 4.7f;                      // trunc(4.7) = 4
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && o2.fieldE6 == 4);
+  }
+
+  // -- obj op 0x55: xform snapshot latch ---------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x55, 0x01, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    for (int i = 0; i < 9; ++i) o.col.xform[i] = 10.0f + i;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.col.flags148 & 0x40));
+    for (int i = 0; i < 9; ++i) CHECK(near(o.rawMatrix[i], 10.0 + i));
+    // Latched: a second pass with changed xform does not resnapshot.
+    for (int i = 0; i < 9; ++i) o.col.xform[i] = 99.0f;
+    o.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(near(o.rawMatrix[0], 10.0));
+    // flag==0 clears bit 0x40 only.
+    f.write(C, {0x55, 0x00, 0xff});
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.col.flags148 = 0x41;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.col.flags148 & 0x40) &&
+          (o2.col.flags148 & 0x01));
+  }
+
+  // -- obj op 0x60: box2d player-region link ------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x60});
+    f.writeF(C + 1, -5.0f); f.writeF(C + 5, -5.0f);
+    f.writeF(C + 9, 5.0f);  f.writeF(C + 13, 5.0f);
+    f.write(C + 17, {0x0c});
+    f.writeW(C + 18, 0x300);
+    f.write(C + 22, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    f.rt.cs.pos[0] = 1.0f; f.rt.cs.pos[1] = 1.0f;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8));
+    f.rt.cs.pos[0] = 50.0f;                 // outside -> no dispatch
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
+  }
+
+  // -- obj op 0xf2: orbit state block ------------------------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0xf2, 0x01});
+    for (int k = 0; k < 12; ++k) f.writeF(C + 2 + k * 4, 1.0f + k);
+    f.write(C + 50, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && o.field2d0 == 1 && o.field2d1 == 0xff);
+    for (int k = 0; k < 6; ++k) CHECK(near(o.field2d2[k], 1.0 + k));
+    for (int k = 0; k < 6; ++k) CHECK(near(o.field2ea[k], 7.0 + k));
+    f.write(C, {0xf2, 0x00, 0xff});         // flag==0: +0x2d1=0 only
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field2d0 = 1; o2.field2d1 = 0xff;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && o2.field2d1 == 0 && o2.field2d0 == 1);
   }
 
   // -- obj op 0x04: broadcast remote call (object ctx) -------------------
@@ -13123,12 +13782,16 @@ void test_enemy_runtime() {
     f.write(0x307, {0x09});
     auto mk = [&](const char* nm) -> mdk::DynamicObject& {
       mdk::DynamicObject& o = f.arena->dyn.allocFront();
-      mdk::RuntimeModel::NameRec nr;
-      std::snprintf(nr.name.data(), nr.name.size(), "%s", nm);
-      o.model.names.push_back(nr);
+      // +0x0c is the class-name pointer (OBSERVED 0x44d197 — the
+      // FUN_0042fa50 compare reads *(obj+0xc), the enemy-table name,
+      // not the geometry record's name-table[0]).
+      o.scriptClass = nm;
+      o.health = 10;                        // +0x08 >0 gate (0x44d1ae)
       return o;
     };
-    mk("FOO"); mk("FOO"); mk("BAR");        // count(FOO) = 2 > 1
+    mk("FOO"); mk("FOO"); mk("FOO"); mk("BAR");  // FOO x3 (front=BAR)
+    f.arena->dyn.storage.back()->health = 0;     // dead FOO excluded:
+                                                 // count(FOO) = 2 > 1
     f.arena->script.pcImageOff = C;
     auto r = mdk::traversalScriptRun(f.env);
     CHECK(r.stopped && !r.error &&
@@ -13156,7 +13819,7 @@ void test_enemy_runtime() {
   {
     ScriptFixture f;
     f.write(C, {0xd8, 0x02, 0x01});         // locals[1] += 30 * (1/30)
-    f.writeW(C + 3, 30);
+    f.writeF(C + 3, 30.0f);                 // OBSERVED `fld dword` — f32
     f.write(C + 7, {0x09});
     f.arena->script.pcImageOff = C;
     f.arena->script.locals[1] = 2.0f;
@@ -15700,16 +16363,21 @@ void test_player_projectiles() {
     std::memcpy(o.col.aabb, wb, sizeof(wb));
     // Blast at the element centre: dmg 150 -> int16 1-150 < 0 ->
     // element death marks + the whole-object kill -> teardown seam.
+    // OBSERVED: FUN_00457cf4 wipes the record in place, so the only
+    // post-death evidence is the seam counts and the inert corpse
+    // (named cleared, health 0 — the element fields are gone).
     const float blast[3] = {8, 0, 15};
     mdk::splashDamage(rt, blast, 150.0f, 50.0f, 1, nullptr, 2, -7);
-    CHECK(o.elemHp[0] == 0 && o.field21c == 1 && o.field220 == 0);
-    CHECK(o.health <= 0 && o.field21e == 1 && o.field21d == 0xf9);
+    CHECK(o.health <= 0 && !o.col.named);
     CHECK(rt.seams.objectDeathCalls == 1 &&
           rt.seams.objectTeardownCalls == 1);
   }
   {
     // The wrap quirk: 1 - 40000 wraps the int16 to +25537 — the
-    // element SURVIVES a massive hit (OBSERVED `sub word`).
+    // element SURVIVES a massive hit (OBSERVED `sub word`). The
+    // object carries the boss-style +0xfde8 health gate so it lives
+    // to expose the wrapped element field (otherwise FUN_00457cf4
+    // wipes the record and the post-death fields are unobservable).
     CollisionFixture f = makeFloorArena();
     mdk::TraversalRuntime rt;
     mdk::TraversalArena* a = makeShotRt(rt, f, "SPL");
@@ -15717,7 +16385,7 @@ void test_player_projectiles() {
     o.model = makeHomingModel({{"0E", 0.0f}});
     o.setPosition(8, 0, 15);
     mdk::initObjectCollision(o);
-    o.health = 10;
+    o.health = 0xfde8;
     o.col.flags149 |= 0x20;
     o.homingPrefix = "0"; o.homingDigitOfs = 0;
     o.elemHp = {1}; o.field2c4 = 1000.0f;
