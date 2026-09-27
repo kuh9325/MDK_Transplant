@@ -13221,6 +13221,71 @@ void test_traversal_object_script() {
     CHECK(r2.halted && !r2.error);
     CHECK(o2.scriptCallDepth == 1);              // stayed in the frame
   }
+
+  // --- obj op 0x87: camera-FX event (0x4401c8) ----------------------
+  // {f32 arg} — consumes the f32, counts the FUN_00465200 presentation
+  // seam, continues. HMO_10 XB3 death stream calls it twice (arg=10.0)
+  // bracketing emitAt before the grp1-bit15 completion writer.
+  {
+    ScriptFixture f;
+    f.write(C, {0x87}); f.writeF(C + 1, 10.0f);
+    f.write(C + 5, {0x24, 0x01});               // f148b1 1
+    f.write(C + 7, {0xff});
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.seams.camFxCalls == 1);
+    CHECK(o.col.flags148 == 0x2);                // 0x24 set +0x148 bit1
+  }
+  {
+    // Two calls on one stream (the HMO_10 0x1ffda/0x1fff8 pair).
+    ScriptFixture f;
+    f.write(C, {0x87}); f.writeF(C + 1, 10.0f);
+    f.write(C + 5, {0x87}); f.writeF(C + 6, 2.0f);
+    f.write(C + 10, {0xff});
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.seams.camFxCalls == 2);
+  }
+
+  // --- obj op 0x56: spawn2 (0x449b77) --------------------------------
+  // {fff pos, lstr class, u32 scriptOff} — shared spawn helper, variant
+  // 1: class resolved through the enemy table, no +0x148 flag tail.
+  // HMO_10 XB3 uses it to spawn XM3 minions (+20344).
+  {
+    ScriptFixture f;
+    f.rt.level.enemies.entries = {{"XM3", 0, false}};
+    f.write(C, {0x56});
+    f.writeF(C + 1, -183.0f); f.writeF(C + 5, 3300.0f);
+    f.writeF(C + 9, -244.0f);
+    f.writeStr(C + 13, "XM3");
+    f.writeW(C + 18, C + 0x80);
+    f.write(C + 22, {0xff});
+    f.write(C + 0x80, {0x01, 0xff});
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    const std::size_t before = f.arena->dyn.storage.size();
+    const std::size_t logged = mdk::traversalSpawnLog().size();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->dyn.storage.size() == before + 1);
+    CHECK(mdk::traversalSpawnLog().size() == logged + 1);
+    mdk::DynamicObject* m = f.arena->dyn.storage.front().get();
+    CHECK(m != &o);
+    CHECK(m->scriptClass == "XM3");
+    CHECK(m->scriptOff == C + 0x80 && m->scriptVariant == 1);
+    CHECK(near(m->pos[0], -183.0, 1e-5) && near(m->pos[1], 3300.0, 1e-5) &&
+          near(m->pos[2], -244.0, 1e-5));
+    CHECK(m->field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x80));
+    CHECK(m->col.flags14a == 0);              // variant 1: no mover bit
+  }
 }
 
 // ---------------------------------------------------------------------------

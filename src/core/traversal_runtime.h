@@ -297,6 +297,10 @@ struct TraversalSeams {
   int refEmitCalls = 0;           // op-0x80 (0x43d227) — refpoint
                                   // emitter attach (FUN_004055f4
                                   // particle record; cosmetic)
+  int camFxCalls = 0;             // op-0x87 (0x4401c8) — FUN_00465200
+                                  // camera-FX event (f32 arg = the
+                                  // event's duration/intensity;
+                                  // cosmetic presentation seam)
 };
 
 struct TraversalFrameResult {

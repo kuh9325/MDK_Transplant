@@ -2679,6 +2679,18 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x56: {                              // spawn2 (0x449b77)
+      // {f32 x,y,z, lstr class, u32 scOff}. OBSERVED: identical
+      // handler for ctx objects and arena ctx — absolute-position
+      // FUN_00454af8 spawn arm 1. LEVEL3 HMO_10 XB3 attack cycle
+      // (+20344) spawns XM3 minions through this op.
+      const float x = r.f32(), y = r.f32(), z = r.f32();
+      const std::string cls = r.str();
+      const std::uint32_t scOff = r.u32();
+      if (!r.ok) { v.fail("spawn2"); return; }
+      traversalScriptSpawn(env, x, y, z, 0.0f, 0, cls, "", scOff, 1);
+      return;
+    }
     case 0x71: {                              // spawn at rotated offset
       // {f32 a, f32 b, f32 c, lstr name, u32 scOff} (0x44a205).
       // OBSERVED: pos = (x - a*cos - b*sin, y - b*cos - a*sin, z + c)
@@ -3651,6 +3663,19 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x87: {                            // camera-FX event (0x4401c8)
+      // {f32 arg}. OBSERVED: the handler reads one f32, pushes it and
+      // calls FUN_00465200 — the camera-FX event queue (screen shake /
+      // flash family; presentation only). Reached on the XB3 death
+      // stream at +1ffda (HMO_10, arg=10.0) right before the
+      // group-flag completion writer. The port consumes the operand
+      // and counts the request; the FX itself is not modelled.
+      const float arg = r.f32();
+      (void)arg;
+      if (!r.ok) { v.fail("camFx"); return; }
+      if (env.rt != nullptr) ++env.rt->seams.camFxCalls;
+      return;
+    }
     case 0x65: {                            // face camera + pitch aim
       // No operands (0x4421ea). OBSERVED: dx/dy = camXY - pos;
       // dz = (camZ + 3.0) - pos; xyDist = FUN_004301bc (XY sqrt).
@@ -4294,7 +4319,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x2f: return "fl";
   case 0xaf: return "bkl";
   case 0x3e: case 0x7f: return "kl";
-  case 0x68: case 0x6a: case 0x7c: return "f";
+  case 0x68: case 0x6a: case 0x7c: case 0x87: return "f";
   case 0xbb: return "ff"; case 0xdc: case 0x4f: return "fff";
   case 0x42: return "bbf"; case 0x04: return "b";
   case 0x02: return "wbbhb";                  // + fff iff mode==0
@@ -4417,6 +4442,7 @@ const char* opcodeName(std::uint8_t op) {
   case 0x21: return "pathLink";
   case 0x12: return "timeLink"; case 0x5c: return "animLink2";
   case 0x82: return "decal";   case 0x84: return "sfxPee";
+  case 0x87: return "camFx";
   case 0x80: return "refEmit"; case 0x81: return "elKill";  case 0xac: return "emitAt";
   case 0x2e: return "mountLink"; case 0x5f: return "wcall";
   case 0x27: return "yawImp";  case 0x3d: return "mdlSpawn"; case 0x39: return "coneLink";

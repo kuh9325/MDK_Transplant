@@ -5368,8 +5368,8 @@ link-target operands, not opcodes.
 | arena | critical | family | watched target | damage target | death/phase watcher | completion writer | boundary |
 |---|---|---|---|---|---|---|---|
 | L7 DANT_10 | YES | scripted-element boss (XB1/PEN_16) | namedLink "XB_HEAD"/ANY on XB1 (+0x21e elem mark) | XB1 elements; gate = source byte +0x21d | object script @0x20e89 → elKill/refEmit → deathRef @0x20ebc | obj script `83 00` @0x20f35 | `0x83` subop 0 |
-| L6 OLYM_4 | NO (mid-level) | spawn arena: 4×XBGUN turrets + SW_H50 + 4×XG walkers; XG1_HEAD handler chain | namedLink "XG1_HEAD" (+0x21e) | XG elements; `health -536` head-shot dmg | namedLink "XG1_HEAD"→0x82f3; timeLink→0x82e4; losLink→0x8302 | none in stream — terminal site is OLYM_10$XB2_0 `83 00` @0x15acd | other (count/link gates) |
-| L3 HMO_10 | YES | boss arena (t3 @0x1fda0) | arena-scripted watch | TBD | TBD | `83 00` @0x1fe35 (t3 stream) | `0x83` subop 0 |
+| L6 OLYM_4 | NO (mid-level) | turret gallery + XG arena: 6×XBGUN (hp 65000 sentinel), SW_H50, 4×XG (XG_BOD hp 60), TARGET1–9 loop | namedLink "XG1_HEAD" (+0x21e elem mark) | XG1_HEAD elem → `health 65000` invulnerable-set + refEmit "XG1_BODY" 2 3 + elKill "XG1_HEAD" (dismount, OBSERVED harness) | handlers @0x82e4/0x82f3/0x8302 (timeLink/namedLink/losLink) in shared XG body @0x7671 | none in stream — terminal site is OLYM_10$XB2_0 `83 00` @0x15acd | other (count/link gates); gaps: `0xdb` XBGUN aim gate, `0x8a` FX rig (t3 tail dies after loop — non-blocking) |
+| L3 HMO_10 | YES | twin-script boss: XB3 mech (PEN_16-family head) + XW3 wheel-turret (PEN_111, 8 elems: 4× XW3_GUN + shell) | `namedLink "XW3_GUN1..4"` (elem mark +0x21e) on XW3 | XW3_GUN elements — direct hits only during `elemUnmask` windows (deploy @0x200ad; re-mask on fire/`elKill` latch) | gun deaths `elKill`+`bitset grp2 bit2..4`+counter → `varcmpLink grp2.0==4` @0x20164 → bcast XB3 death handler @0x1ff73 | grp1-bit15 writer @0x1fffd → arena `brSet` @0x1fe22 → `wait 2`/`setG 0` → `83 00` @0x1fe35 | `0x83` subop 0 — GOLDEN `endLevel=1` |
 | L4 MEAT_10 | YES | boss arena (t3 @0x1a6e2) | arena-scripted watch | TBD | TBD | `83 00` @0x1a856 (t3 stream) | `0x83` subop 0 |
 | L5 MUSE_4 | NO (mid-level) | ammo/pickup scripted arena (t3 @0x61bc; `0xae` ammoLink family) | none | none | none | none — terminal site is MUSE_5-path `83 51` @0xb6e9 | other |
 | L8 GUNT_5 | NO (mid-level) | XG-spawn/computed-call arena (t3 @0xfb8d) | cnt/var gates | TBD | `0xb7` swCall chains | none | other |
@@ -5407,3 +5407,47 @@ Golden: `endLevel=1`, `shotHits=2`, `objDeathCalls=0`,
 600-frame digest `ebdc7b443b437c66`. The object's `+0x11a` rank is
 cleared at the head of the block — same teardown idiom GUNT_10's
 deadlock path lacks.
+
+### HMO_10 — golden proven (OBSERVED, real-data harness)
+
+New object-VM ops (both OBSERVED from the shared dispatch table):
+
+- `0x56` `spawn2` (handler `0x00449b77`): `{f32 x,y,z, lstr class,
+  u32 scriptOff}` — common spawn-helper arm 1, absolute-position spawn
+  resolved through the enemy table; no +0x148 flag tail. XB3 spawns
+  `XM3` minions with it inside the attack-probability block (+20344).
+- `0x87` `camFx` (handler `0x004401c8`): `{f32 arg}` — pushes the f32
+  to `FUN_00465200` (camera-FX event: shake/flash family, presentation
+  only) and continues. Called twice on the XB3 death stream
+  (@0x1ffda/@0x1fff8, arg=10.0) bracketing the `emitAt` remnant at
+  (-173, 3220, -238).
+
+Authentic chain (harness, four `--hit 'XW3@XW3_GUN<i>'` sweeps):
+
+1. XB3 activation @0x1fe9c spawns XM3 minions via `spawn2`; XW3 deploy
+   path @0x20047→0x20060: animBind/sfxBind/spdRamp/xformSnap/sub4e/
+   pathBind → `elemUnmask 4 "XW3_GUN1..4"` @0x200ad — the only damage
+   window (maskB 0x0f -> 0).
+2. Gun loop @0x20100: `brClr grp2 bit2/3/4` dispatch fires each
+   still-living gun (`mdlSpawn BOLT` bound to the gun refpoint, then
+   `elemBind` re-masks it). Gun hits in the window set +0x21e=idx+1 →
+   `namedLink` kill handlers @0x20287/0x2029e/0x202b5/…: `elKill`
+   (mask+permanent latch), `bitset grp2 bit2..4`, counter +=1.0.
+3. `varcmpLink grp2.0 vs 4.0` @0x20164 → all-four-dead → `0x2017d`
+   broadcasts to XB3's death handler @0x1ff73.
+4. XB3 death @0x1ff73: animRate/animBind/wait 0.75 → `elKill` parts
+   (XB3_CSEAT/CWHEL/CFRNT/CSTEM/CPAD) → `bcast 7 link0c:20191 "XW3"`
+   (XW3 teardown) → `camFx 10.0` → f148 set → `animWait 0x7fff` →
+   `emitAt sel0 pos(-173,3220,-238) mag2` → `camFx 10.0` →
+   **`bitset grp1 bit15` @0x1fffd** → `setVar11a 2` → `setF11b 1` →
+   `bcast teardown` → teardown → end.
+5. Arena watcher `brSet grp1 bit15` @0x1fe22 → `wait 2`, `setG 0`,
+   **`83 00` @0x1fe35 → `endLevel=1`**.
+
+Golden (4800f, bounded): `endLevel=1`, `shotHits=264`,
+`objDeathCalls=11`, `diag=0`. The `arenaValid` (gates) flag clears in
+the same frame the teardown runs — the arena's objects die under the
+player, authentic end-of-level, not a port defect. Masked elements are
+NOT hittable: `objectProbe` skips `elemMaskB` — OBSERVED consistent
+with the original probe semantics; guns are only vulnerable inside
+deploy/fire unmask windows, matching the script's design.
