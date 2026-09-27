@@ -2426,6 +2426,39 @@ void objScriptInsn(ObjScriptPass& v) {
       if (!r.ok) { v.fail("animsnd"); return; }
       return;
     }
+    case 0x19: {                              // name bind -> +0x154
+      // OBSERVED (handler 0x43a0cd): {lstr} — +0x154 = the inline
+      // string pointer: pc+1 when the length byte is nonzero (the
+      // chars), pc itself when zero (the 0 byte doubles as the empty
+      // string). pc += len+1; execution falls through — no linkage,
+      // no halt. Sole real BUILD_A user: the "XS_EXPL" bind in the
+      // HMO_1$XS / MUSE_1$XS init subroutine. The port keeps the
+      // CMI-offset marker (save fixups resolve +0x154 image-relative).
+      const std::uint32_t lenOff = r.pc;
+      const std::uint8_t len = r.u8();
+      if (!r.ok || r.ptr(r.pc, len) == nullptr) {
+        v.fail("name154"); return;
+      }
+      obj.field154 = static_cast<std::int32_t>(len ? lenOff + 1 : lenOff);
+      r.pc += len;
+      return;
+    }
+    case 0x1a: {                              // name bind -> +0x150
+      // OBSERVED (handler 0x43a088): {lstr} — byte-for-byte the 0x19
+      // body with ctx+0x154 replaced by ctx+0x150: pc+1 when the
+      // length byte is nonzero, pc itself when zero; pc += len+1;
+      // falls through, no linkage/halt. Runs paired with 0x19 in the
+      // real BUILD_A XS init subroutine: +0x154="XS_EXPL" then
+      // +0x150="ALDIE". Same CMI-offset marker form as field154.
+      const std::uint32_t lenOff = r.pc;
+      const std::uint8_t len = r.u8();
+      if (!r.ok || r.ptr(r.pc, len) == nullptr) {
+        v.fail("name150"); return;
+      }
+      obj.field150 = static_cast<std::int32_t>(len ? lenOff + 1 : lenOff);
+      r.pc += len;
+      return;
+    }
     case 0x41: {                              // setVar {mode,idx,u32}
       std::uint8_t mode = r.u8(), idx = r.u8();
       std::uint32_t bits = r.u32();
@@ -4986,6 +5019,8 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x0a: return "sbl";
   case 0x03: case 0x3b: return "w";    // anim bind {u32 imgref}
   case 0x18: return "bs";              // anim sound {u8 mark, str}
+  case 0x19: return "s";               // name bind {lstr} -> +0x154
+  case 0x1a: return "s";               // name bind {lstr} -> +0x150
   case 0x75: case 0x76: return "w";    // flag-mask / +0x118 target
   default: return nullptr;
   }
@@ -5044,7 +5079,9 @@ const char* opcodeName(std::uint8_t op) {
   case 0x41: return "setVar";
   case 0xc6: return "elemset"; case 0xc7: return "setF104";
   case 0x03: return "animBind"; case 0x3b: return "animLoop";
-  case 0x18: return "animSnd";  case 0x75: return "clr148";
+  case 0x18: return "animSnd";  case 0x19: return "name154";
+  case 0x1a: return "name150";
+  case 0x75: return "clr148";
   case 0x76: return "animTgt";
   case 0x08: return "setYaw";  case 0x10: return "health";
   case 0x17: return "f148b0";  case 0x23: return "f148b2";

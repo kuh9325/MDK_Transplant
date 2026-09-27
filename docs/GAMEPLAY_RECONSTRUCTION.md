@@ -5797,3 +5797,56 @@ match the decoded arm contents 1:1, `endLevel=0`/`ending=0` as
 designed — exits are XCORRDOR portals, progression is door-driven.
 LEVEL8's terminal stays GUNT_10's `83 00` at `0x21ff7` (deferred
 oracle, per the classification table).
+
+## 196. Phase 15B — `0x19`/`0x1a` paired string binds (implemented)
+
+Traversal-coverage cleanup after Phase 15A: the LEVEL3/LEVEL5
+60-frame traversal runs surfaced `Unrecognised object op 0x19` on
+the `XS`/`XS_ALL` walkers — `HMO_1$XS` at `+5a39` (diag=1) and
+`MUSE_1$XS` at `+920` (diag=2, one per spawned walker). Both sites
+are the same `fd`-terminated subroutine, `fc`-called from the `e8`
+fxLink in the `$XS` init prologue (`23`/`24`/`10`/`0b`/`54` then
+`e8 01 fc <sub>`); the subroutine stream is identical on both
+levels:
+
+    19 08 "XS_EXPL"   1a 06 "ALDIE"   fd   ff
+
+**Semantics (OBSERVED — dispatch-table dump, MDK95.EXE BUILD_A):**
+`0x19` handler `0x0043a0cd`, `0x1a` handler `0x0043a088` —
+byte-for-byte identical bodies differing only in the ctx slot.
+Operand `{lstr}` (u8 length + `len` bytes incl. NUL). The length
+byte selects the stored pointer: `pc+1` (the string chars) when
+nonzero, `pc` itself when zero — the 0 byte doubles as the empty
+string. `pc += len+1`; execution falls through — no linkage, no
+branch, no helper call, no subtype/flag gate, no halt. `0x19`
+writes ctx `+0x154`; `0x1a` writes ctx `+0x150`. The port keeps
+the established CMI-offset marker form (`field154`/`field150`,
+the image-relative value the save fixups resolve). `0x1a`
+surfaced only because `0x19` began executing — same subroutine,
+same family, implemented as a bounded pair.
+
+Effect on the failed run: the `0x19` diag killed the `$XS` init
+pass mid-subroutine (`+0x154`/`+0x150`/`fd` never ran; `+0x108`
+cleared, then rebound to the spawn record's tick PC — the walker
+tick loops were unaffected). With both binds implemented the init
+completes: LEVEL3 `insn 1788→1791`, LEVEL5 `insn 1909→1915` (two
+walkers ×3 insns), both `diag=0`.
+
+**Traversal-wide status restored:** all six LEVEL3–8 60f runs now
+report `diag=0`. Canonical digests (the previous canonical values
+predate Phase 15A's opcode coverage):
+
+| level | new canonical digest (60f) | vs old canonical |
+|---|---|---|
+| L3 | `a1a1427c25fdaaf8` | EXPECTED SEMANTIC EVOLUTION — XS init now runs `0x19`/`0x1a`/`fd` (scriptInsnTotal fold) on top of Phase 15A |
+| L4 | `e8d1c89e4fc0a36e` | UNCHANGED |
+| L5 | `2cf8bdf33da64931` | EXPECTED SEMANTIC EVOLUTION — same XS init completion ×2 objects |
+| L6 | `2c42b85a14331f8d` | EXPECTED SEMANTIC EVOLUTION — Phase 15A opcode/state coverage only (no `0x19`/`0x1a` user; byte-identical pre/post-15B) |
+| L7 | `2be55ac4d4c31212` | UNCHANGED |
+| L8 | `92c4b8a3576ac12c` | EXPECTED SEMANTIC EVOLUTION — Phase 15A opcode/state coverage only (no `0x19`/`0x1a` user; byte-identical pre/post-15B) |
+
+Regression: mdk_tests 5214/0 (incl. the paired-bind unit tests),
+CTest 1/1, pytest 19/0, selftests 4/4, freefall 5/5, campaign
+handoff 5/5, campaign sequence `23c84c9f241af58b`, arena-render
+60/60, frontend 60/0, Godot default/L6/L8 frames30, BUILD_A
+manifest 141/141.

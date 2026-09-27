@@ -12252,6 +12252,103 @@ void test_traversal_object_init() {
     CHECK((o.connState & 0xf) == 1);             // open
     CHECK(o.col.flags148 & 0x10);
   }
+
+  // Opcode 0x19 — inline-name bind -> +0x154 (handler 0x43a0cd,
+  // OBSERVED): {lstr}. The length byte selects the stored pointer:
+  // pc+1 (the chars) when nonzero, pc itself when zero — the 0 byte
+  // doubles as the empty string. pc += len+1, then execution falls
+  // through with no linkage/halt. Mirrors the real BUILD_A stream:
+  // the HMO_1$XS / MUSE_1$XS init subroutine binds "XS_EXPL" here.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C, {0x19});
+    f.writeStr(C + 1, "XS_EXPL");              // len 8 incl NUL -> C+9
+    f.write(C + 10, {0x0b, 0x09, 0xff});       // setVar11a; end
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field154 == C + 2);                // +0x154 = off of 'X'
+    CHECK(f.image[f.env.imageBase + o.field154] == std::byte('X'));
+    CHECK(o.field11a == 9);                    // fell through: no halt
+  }
+
+  // 0x19 zero-length edge: the +0x154 marker lands on the length
+  // byte itself (the 0 byte IS the empty string — OBSERVED the
+  // handler's JZ branch), not on pc+1.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C, {0x19, 0x00});                  // empty name
+    f.write(C + 2, {0x0b, 0x09, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field154 == C + 1);                // points AT the 0 byte
+    CHECK(o.field11a == 9);
+  }
+
+  // 0x19 decode: the disassembler consumes the lstr operand.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C, {0x19});
+    f.writeStr(C + 1, "XS_EXPL");
+    f.write(C + 10, {0xff});
+    auto d = mdk::traversalScriptDecode(f.image, 4, C);
+    CHECK(d.opcode == 0x19 && d.length == 10); // op + len + 8 chars
+    CHECK(d.text.find("XS_EXPL") != std::string::npos);
+  }
+
+  // Opcode 0x1a — the paired name bind -> +0x150 (handler 0x43a088,
+  // OBSERVED): identical body to 0x19, different slot. Real BUILD_A
+  // sequence in the HMO_1$XS / MUSE_1$XS init subroutine:
+  //   19 08 "XS_EXPL"  1a 06 "ALDIE"  fd
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C, {0x19});
+    f.writeStr(C + 1, "XS_EXPL");              // -> C+9, next op C+10
+    f.write(C + 10, {0x1a});
+    f.writeStr(C + 11, "ALDIE");               // -> C+17, next op C+18
+    f.write(C + 18, {0x0b, 0x09, 0xff});       // setVar11a; end
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field154 == C + 2);                // "XS_EXPL" chars
+    CHECK(o.field150 == C + 12);               // "ALDIE" chars
+    CHECK(f.image[f.env.imageBase + o.field150] == std::byte('A'));
+    CHECK(o.field11a == 9);                    // fell through both
+  }
+
+  // 0x1a zero-length edge: marker lands on the length byte itself.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C, {0x1a, 0x00});
+    f.write(C + 2, {0x0b, 0x09, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    mdk::initObjectDefaults(o);
+    auto r = mdk::traversalObjectInitScript(f.env, o, C);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field150 == C + 1);
+    CHECK(o.field11a == 9);
+  }
+
+  // 0x1a decode: the disassembler consumes the lstr operand.
+  {
+    ScriptFixture f;
+    const std::uint32_t C = 0x200;
+    f.write(C, {0x1a});
+    f.writeStr(C + 1, "ALDIE");
+    f.write(C + 8, {0xff});
+    auto d = mdk::traversalScriptDecode(f.image, 4, C);
+    CHECK(d.opcode == 0x1a && d.length == 8);  // op + len + 6 chars
+    CHECK(d.text.find("ALDIE") != std::string::npos);
+  }
 }
 
 // ---------------------------------------------------------------------------
