@@ -1018,6 +1018,11 @@ SaveError applyFullSaveToTraversal(const SaveGame& save,
       DynamicObject& o = curArena->dyn.allocBack();
       ObjRefs r;
       applyObjectRecord(pkt.payload, o, r);
+      // +0x04 enemy-table index is the save's class key (the original
+      // carries no name string); re-derive the port's scriptClass
+      // cache so named scans / VM traces resolve post-restore.
+      if (o.enemyIndex < rt.level.enemies.entries.size())
+        o.scriptClass = rt.level.enemies.entries[o.enemyIndex].name;
       if (r.saveId > 0) refs.byId[r.saveId] = &o;
       else rep.warnings.emplace_back("ALIE record has no save id");
       objFixups.emplace_back(&o, r);

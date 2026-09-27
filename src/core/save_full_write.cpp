@@ -126,6 +126,23 @@ struct Toks {
     return static_cast<std::int32_t>(q - cmiImg);
   }
 
+  // Anim-record pointer -> offset-or-(-1) with a warning. OBSERVED
+  // real saves carry stale heap pointers here; the original loader's
+  // remap turns any out-of-image value into the 0xffXX "no record"
+  // sentinel, so a degrading token is the faithful write for the
+  // port's MTO-resolved records (mtoBytes lies outside cmiBytes).
+  // Script-PC refs keep the fatal path — a dropped pc corrupts the
+  // restored object.
+  std::int32_t cmiAnimTok(const void* p) {
+    if (p == nullptr) return -1;
+    const auto* q = static_cast<const std::byte*>(p);
+    if (q < cmiImg || static_cast<std::size_t>(q - cmiImg) >= cmiImgSize) {
+      warn("cmi-anim", p);
+      return -1;
+    }
+    return static_cast<std::int32_t>(q - cmiImg);
+  }
+
   // CMI string operand -> the char-position offset (-1 = none).
   // The bytecode operand is {u8 len}{chars}{NUL} (len includes the
   // terminator); the original stores the chars pointer, so the saved
@@ -235,7 +252,7 @@ void emitObjectRecord(Img& img, const DynamicObject& o, Toks& tk,
   img.i32(0x108, tk.cmiTok(o.field108));
   img.i32(0x10c, tk.cmiTok(o.field10c));
   img.i32(0x110, tk.cmiTok(o.field110));
-  img.i32(0x114, tk.cmiTok(o.animRec));
+  img.i32(0x114, tk.cmiAnimTok(o.animRec));
   img.i16(0x118, o.animLatch);
   img.u8(0x11a, o.field11a);
   img.u8(0x11b, o.field11b);
@@ -369,8 +386,8 @@ void emitObjectRecord(Img& img, const DynamicObject& o, Toks& tk,
   if (isMover) img.i32(0x312, tk.objTok(o.moverChild));
   if (isConn) {
     img.i32(0x302, tk.arenaTok(o.connDest));
-    img.i32(0x306, tk.cmiTok(o.animRecNear));
-    img.i32(0x30a, tk.cmiTok(o.animRecFar));
+    img.i32(0x306, tk.cmiAnimTok(o.animRecNear));
+    img.i32(0x30a, tk.cmiAnimTok(o.animRecFar));
     img.f32(0x30e, o.connRadius);
     img.i32(0x316, tk.cmiStrTok(o.connSound316));
     img.i32(0x31a, tk.cmiStrTok(o.connSound31a));

@@ -5539,6 +5539,25 @@ sweep (10 shotHits → 6 qualifying dips → `wait12` continuation →
 sets `+0x108/+0x230` directly — the runtime `objectDeathBoundary`
 seam isn't on this path), `diag=0`.
 
+**Mid-fight save/restore golden (OBSERVED):** `--traversal-runtime`
+with `--save-write-full` snapshots a live fight (51285B full stream,
+19 AREN/29 ALIE/FAND×2, `levelId=3`); `--save-restore` then continues
+the same `--hit 'XC:2x30'` sweep → `endLevel=1` (shotHitCount
+serialized at GAME `+0x288`, 9 carried + 6 new). Restored XC/XCBOSS
+resume at `+1ae25`/`+1af50` with health, counters, and `grp1` state
+intact. Two representation gaps surfaced and fixed on evidence:
+
+- ALIE `+0x04` is the enemy-table index (no name string in the
+  save); the port now re-derives `scriptClass` from the index on
+  restore — otherwise name-keyed scans (and `0xc1` sel3 class
+  lookups) silently miss restored objects.
+- `+0x114`/`+0x306`/`+0x30a` anim-record pointers degrade to `−1`
+  + warning rather than failing the write — OBSERVED real saves
+  carry stale heap pointers there, and the original loader's remap
+  produces the same "no record" sentinel for out-of-image values
+  (the port's MTO-resolved records live outside `cmiBytes`).
+  Script-PC refs keep the hard-fail path.
+
 ### MUSE_4 — NON-CRITICAL, wave/turret gallery (OBSERVED, real-data harness)
 
 Reclassified after a full-span boundary scan: **MUSE_4 owns no
