@@ -5355,3 +5355,55 @@ chain (XBSHIP T1–T7 element kills → `+21d6a` six-`XG` spawn →
   dead XGs soaked the "XG" shot specs. Aiming reads `boss->pos`
   plus the live element-aabb union rather than the frozen
   collision box.
+
+## 195. Phase 15A — completion-producer classification + DANT_10 (implemented)
+
+### Classification (OBSERVED — stream decode + `83 xx 09 ff` idiom scan)
+
+The seven candidate arenas do not all own completion sites. The only
+real `0x83 xx 09 ff` completion idioms in LEVEL3–8 are the six CFG-
+verified sites (§189); byte-level candidates inside other streams are
+link-target operands, not opcodes.
+
+| arena | critical | family | watched target | damage target | death/phase watcher | completion writer | boundary |
+|---|---|---|---|---|---|---|---|
+| L7 DANT_10 | YES | scripted-element boss (XB1/PEN_16) | namedLink "XB_HEAD"/ANY on XB1 (+0x21e elem mark) | XB1 elements; gate = source byte +0x21d | object script @0x20e89 → elKill/refEmit → deathRef @0x20ebc | obj script `83 00` @0x20f35 | `0x83` subop 0 |
+| L6 OLYM_4 | NO (mid-level) | spawn arena: 4×XBGUN turrets + SW_H50 + 4×XG walkers; XG1_HEAD handler chain | namedLink "XG1_HEAD" (+0x21e) | XG elements; `health -536` head-shot dmg | namedLink "XG1_HEAD"→0x82f3; timeLink→0x82e4; losLink→0x8302 | none in stream — terminal site is OLYM_10$XB2_0 `83 00` @0x15acd | other (count/link gates) |
+| L3 HMO_10 | YES | boss arena (t3 @0x1fda0) | arena-scripted watch | TBD | TBD | `83 00` @0x1fe35 (t3 stream) | `0x83` subop 0 |
+| L4 MEAT_10 | YES | boss arena (t3 @0x1a6e2) | arena-scripted watch | TBD | TBD | `83 00` @0x1a856 (t3 stream) | `0x83` subop 0 |
+| L5 MUSE_4 | NO (mid-level) | ammo/pickup scripted arena (t3 @0x61bc; `0xae` ammoLink family) | none | none | none | none — terminal site is MUSE_5-path `83 51` @0xb6e9 | other |
+| L8 GUNT_5 | NO (mid-level) | XG-spawn/computed-call arena (t3 @0xfb8d) | cnt/var gates | TBD | `0xb7` swCall chains | none | other |
+| L8 GUNT_8 | NO (precursor) | ship/support scripted arena (t3 @0x1b256) | cnt/var gates | TBD | TBD | none — terminal site is GUNT_10 `83 00` @0x21ff7 | other |
+| L8 GUNT_10 | YES (deferred) | XGUNTAM/XBO multi-stage | `cntLink "XG" 6` | XBSHIP T1–T7 elems | object handlers @+21d6a | `83 00` @0x21ff7 | `0x83` subop 0 — INDETERMINATE retail outcome (stale-leader rank gate; strong lean ORIGINAL DEADLOCK); no native fix; live oracle DEFERRED |
+
+### DANT_10 — golden proven (OBSERVED, real-data harness)
+
+New object-VM op `0xc3` (handler `0x0043cf42`, OBSERVED):
+`{i8 src, linkage}` — compares the signed operand to ctx+0x21d (the
+damage-source byte: shot type 0..4 on direct hits, -7 splash mask,
+-3/-4 punch marks). True → dispatch (`0xfc`/`0xfe` → call a — fe's
+else operand is decoded but NEVER used, NOT the two-way arm; `0x0c` →
+goto; `0xfd` → return). False → falls through on every mode. Arena-VM
+side maps +0x21d to `TraversalScriptState::eventByte` (the FUN_004546ac
+synthetic event channel); object side to `DynamicObject::field21d`.
+
+Authentic chain (harness `--hit 'XB1@XB_HEAD:2'`):
+
+1. Type-2/3 hit on element `XB_HEAD` → `+0x21d=2/3`, `+0x21e`=elem idx+1.
+2. `namedLink "XB_HEAD"` (linkfc @+20a4e) fires → call `0x20e89`.
+3. `c3 02`/`c3 03` source gates: type 2 or 3 → `0x20e9c`:
+   `elKill 2 "XB_HEAD"` + `refEmit "XB_CHEST" 2 3` + `rgoto 0x20ebc`.
+4. Death block @0x20ebc: `setVar11a 0` → `bcast link0c:20f39` ×6
+   (`XF`,`XE`,`XG`,`XBANG`,`BOLT`,`BIGBOLT` — teardown receivers) →
+   `83 5d` cine → `bitset` → `health 10000` → `deathRef 0` →
+   `animBind/animRate/animWait 32767` → `f148` clear → `83 5c` →
+   `wait 2` → **`83 00` @0x20f35 → `endLevelRequest`** → stop/end.
+   (`+0x21e` latched `0xfe` during the beat; `field230=+20f39` carries
+   the teardown-receiver offset.)
+5. Type-0/1 head shots fail both `0xc3` gates: hp −8/hit, mark
+   consumed, `fd ret` — the head survives (vulnerability gate proven).
+
+Golden: `endLevel=1`, `shotHits=2`, `objDeathCalls=0`,
+600-frame digest `ebdc7b443b437c66`. The object's `+0x11a` rank is
+cleared at the head of the block — same teardown idiom GUNT_10's
+deadlock path lacks.

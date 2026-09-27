@@ -986,6 +986,32 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       if (!applyLink(L, go)) return res;
       break;
     }
+    case 0xc3: {                            // damage-source link (0x43cf42)
+      // {i8 src, linkage}. OBSERVED: same handler as the object VM —
+      // compares the signed operand to ctx+0x21d (the script event
+      // byte; FUN_004546ac writes it on synthetic contexts). A true
+      // compare dispatches: 0xfc/0xfe call target-a (the fe else
+      // operand is decoded but never used — NOT a two-way arm), 0x0c
+      // goto, 0xfd return; false falls through on every mode.
+      const std::int8_t want = static_cast<std::int8_t>(r.u8());
+      Linkage L;
+      if (!readLinkage(r, L)) { fail("srclink"); return res; }
+      if (static_cast<std::int8_t>(st.eventByte) == want) {
+        switch (L.mode) {
+        case 0xfe:
+        case 0xfc: if (!doCall(L.a)) return res; break;
+        case 0x0c: doGoto(L.a); break;
+        case 0xfd:
+          if (st.callDepth <= 0) { fail("Gosub underflow"); return res; }
+          --st.callDepth;
+          r.pc = st.retPc[st.callDepth];
+          st.pcImageOff = st.savedPc[st.callDepth];
+          break;
+        default: break;
+        }
+      }
+      break;
+    }
 
     // ---------------------------------------------------------------
     // Surface opcodes — Phase 5F SurfaceObjectState
@@ -1458,6 +1484,28 @@ void objScriptInsn(ObjScriptPass& v) {
     case 0x0c: if (cond) v.doGoto(L.a); break;
     case 0xfd: if (cond) v.doReturn(); break;
     default: break;
+    }
+    return;
+  }
+  case 0xc3: {                            // damage-source link (0x43cf42)
+    // {i8 src, linkage}. OBSERVED: cond is ctx+0x21d (signed) == src —
+    // the damage-source byte the hit path writes (shot type 0..4,
+    // -7 splash mask, -3/-4 punch marks). A true compare dispatches
+    // the linkage: 0xfc and 0xfe both call target-a (0xfe decodes its
+    // else operand but never uses it — NOT the usual two-way arm),
+    // 0x0c goto, 0xfd return; a false compare falls through to the
+    // next instruction on every mode.
+    const std::int8_t want = static_cast<std::int8_t>(r.u8());
+    Linkage L;
+    if (!readLinkage(r, L)) { v.fail("srclink"); return; }
+    if (static_cast<std::int8_t>(obj.field21d) == want) {
+      switch (L.mode) {
+      case 0xfe:
+      case 0xfc: v.doCall(L.a); break;
+      case 0x0c: v.doGoto(L.a); break;
+      case 0xfd: v.doReturn(); break;
+      default: break;
+      }
     }
     return;
   }
@@ -4277,6 +4325,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x62: case 0xa8: return "bb";
   case 0x41: case 0x63: return "bbw";
   case 0x0c: case 0xfc: return "n";
+  case 0xc3: return "bl";                      // {i8 src, linkage}
   case 0x95: return "ffffwssw";
   case 0x56: case 0xa1: case 0x71: return "fffsw";
   case 0x77: return "skl"; case 0xd3: return "";
@@ -4375,7 +4424,7 @@ const char* opcodeName(std::uint8_t op) {
   case 0x20: return "elemUnmask"; case 0x26: return "velCmp";
   case 0xf3: return "refEsc";
   case 0xd8: return "varAcc";  case 0xd9: return "statAcc";  case 0x59: return "sfxBind";
-  case 0x0e: return "viewLink";
+  case 0x0e: return "viewLink"; case 0xc3: return "srcLink";
   default: return nullptr;
   }
 }

@@ -13121,6 +13121,106 @@ void test_traversal_object_script() {
     mdk::traversalObjectScriptTick(f.env, o4);
     CHECK(o4.scriptCallDepth == 0);          // probe on-tri -> floor
   }
+
+  // --- obj op 0xc3: damage-source link (0x43cf42) ---------------------
+  // {i8 src, linkage}: ctx+0x21d (signed) == src dispatches the link —
+  // fc/fe both call target-a (fe's else operand is decoded but never
+  // used), 0x0c goto, 0xfd return; a false compare falls through.
+  {
+    // fc: field21d == src -> call; != -> fall through.
+    ScriptFixture f;
+    f.write(C, {0xc3, 0x02, 0xfc}); f.writeW(C + 3, C + 0x40);
+    f.write(C + 7, {0x01, 0xff});                 // fall: ckpt;suspend
+    f.write(C + 0x40, {0x01, 0xff});              // target
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field21d = 2;                              // grenade-class source
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 1);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x41));
+
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field21d = 0;                             // basic shot: gate fails
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o2.scriptCallDepth == 0);
+    CHECK(o2.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 8));
+  }
+  {
+    // Signed compare: splash mask -7 (0xf9) matches operand 0xf9; the
+    // 0x0c arm gotos (no frame pushed).
+    ScriptFixture f;
+    f.write(C, {0xc3, 0xf9, 0x0c}); f.writeW(C + 3, C + 0x40);
+    f.write(C + 7, {0x01, 0xff});
+    f.write(C + 0x40, {0x01, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field21d = 0xf9;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 0);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x41));
+  }
+  {
+    // fe: true -> call a only; FALSE -> fall through — NOT the usual
+    // two-way else-call (OBSERVED: +0xffffff4c is never consumed).
+    ScriptFixture f;
+    f.write(C, {0xc3, 0x03, 0xfe}); f.writeW(C + 3, C + 0x40);
+    f.writeW(C + 7, C + 0x60);
+    f.write(C + 11, {0x01, 0xff});
+    f.write(C + 0x40, {0x01, 0xff});
+    f.write(C + 0x60, {0x01, 0xff});
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field21d = 3;
+    o.field108 = f.image.data() + 4 + C;
+    mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(o.scriptCallDepth == 1);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x41));
+
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field21d = 1;
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o2.scriptCallDepth == 0);              // no else-call
+    CHECK(o2.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 12));
+  }
+  {
+    // fd: true -> return (pop the event frame); false -> fall through.
+    ScriptFixture f;
+    f.write(C, {0xc3, 0x02, 0xfd});
+    f.write(C + 3, {0x01, 0xff});
+    f.write(C + 0x30, {0x01, 0xff});
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field21d = 2;
+    o.field108 = f.image.data() + 4 + C;
+    o.scriptCallDepth = 1;
+    o.scriptRetPc[0] = f.image.data() + 4 + C + 0x30;
+    o.scriptSavedPc[0] = f.image.data() + 4 + C + 0x30;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 0);
+
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field21d = 0;
+    o2.field108 = f.image.data() + 4 + C;
+    o2.scriptCallDepth = 1;
+    o2.scriptRetPc[0] = f.image.data() + 4 + C + 0x30;
+    o2.scriptSavedPc[0] = f.image.data() + 4 + C + 0x30;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o2.scriptCallDepth == 1);              // stayed in the frame
+  }
 }
 
 // ---------------------------------------------------------------------------
