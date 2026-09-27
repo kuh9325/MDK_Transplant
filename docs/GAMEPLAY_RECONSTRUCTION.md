@@ -5372,8 +5372,8 @@ link-target operands, not opcodes.
 | L3 HMO_10 | YES | twin-script boss: XB3 mech (PEN_16-family head) + XW3 wheel-turret (PEN_111, 8 elems: 4× XW3_GUN + shell) | `namedLink "XW3_GUN1..4"` (elem mark +0x21e) on XW3 | XW3_GUN elements — direct hits only during `elemUnmask` windows (deploy @0x200ad; re-mask on fire/`elKill` latch) | gun deaths `elKill`+`bitset grp2 bit2..4`+counter → `varcmpLink grp2.0==4` @0x20164 → bcast XB3 death handler @0x1ff73 | grp1-bit15 writer @0x1fffd → arena `brSet` @0x1fe22 → `wait 2`/`setG 0` → `83 00` @0x1fe35 | `0x83` subop 0 — GOLDEN `endLevel=1` |
 | L4 MEAT_10 | YES | glass-shell boss: XCBOSS shell (hp 65000 sentinel, GLASS3) + XC core (hp 10000 pinned, 20-elem perch model) | `0x7f` hpLink `health<9950` on XC | XC via shots detonating on XCBOSS shell tris (aux≈0 inside diag/2; `+0x2c4=2.0` gate rejects borderline blasts; XCBOSS sentinel-immune) | DEADON arm `grp2[0] += 50`/dip → `varcmpLink` ≥300 → `10 00 00` → frag @0x1ae6c → grp1 bit1 | arena `brSet` bit1 → @0x1a84e `wait12`/`setG 0` → `83 00` @0x1a856 | `0x83` subop 0 — GOLDEN `endLevel=1` |
 | L5 MUSE_4 | NO (mid-level) | wave/turret gallery: XGUNTAM gun-turret (hp 65000 sentinel; damage pool = scriptLocals `grp2[0]`=800) + X4_TOWER decor (hp 65000) + ambient XG/XC/XF waves via `wpick` + 11-arm `0x64eb` contextual-resupply dispatcher (grp1 bits 19–31 one-shots + ammo/hp/inv need-checks) | `namedLink "ANY"` typed hits → drain arm `grp2[0] −= 20/80` on XGUNTAM | XGUNTAM `grp2[0]` pool — `varcmpLink` @0x6400 vs 0 → `0x6417` death arm | `0x6417` `bitset grp1 bit13` (sole writer) → `0x64f2` `brSet` halts resupply; tail = anims + `59 "TANKDROP"` sfx + `04` bcast remote-call `0x6469` on X4_TOWER + `4c 0` deathRef-clear + `animWait 0x7fff` hold (corpse park — OBSERVED pc +6459) | none in stream — terminal site is MUSE_5-path `83 51` @0xb6ed | no `0x83`/`0x51` opcode in span `0x61bc..0xa761` (all `83`/`51` bytes are wpick/link operands; `0x83a8`/`0x83d6`/`0x8404` `83 00` stubs are unreachable orphans); grp2 bit29 = wave-sequence tick consumed by `0x82bf`/`0x9434` watchers → maneuver wpicks `0x830c`/`0x9481`, NOT completion |
-| L8 GUNT_5 | NO (mid-level) | XG-spawn/computed-call arena (t3 @0xfb8d) | cnt/var gates | TBD | `0xb7` swCall chains | none | other |
-| L8 GUNT_8 | NO (precursor) | ship/support scripted arena (t3 @0x1b256) | cnt/var gates | TBD | TBD | none — terminal site is GUNT_10 `83 00` @0x21ff7 | other |
+| L8 GUNT_5 | NO (mid-level) | triggered-wave arena (t3 @0xfb8d): XCORRDOR→CGUNT_4 + SW_* pickups + once-only arms grp1 bits 1/2/3/5 (XG/XD/XT waves, XGEN, SW_H01 trail) + SW_KEY/NUKE respawn helper | box2d/box3d player-entry gates | XG/XD/XT/XGEN drones (direct-fire classes) | grp1 once-only latches; bit4 big-room box → `partnerArena "CGUNT_5"` | none — exits door-driven | no `0x83` opcode in span `0xfb8d..0x13677` (all `83` bytes are `e6`/`3b` operands/float-table data — OBSERVED `endLevel=0`, `diag=0`) |
+| L8 GUNT_8 | NO (precursor) | turret gallery + XG pack (t3 @0x1b256): XCORRDOR×2 portals, 3× I7_FAN `volact`, 3× XTGUN, 4× XG id 0x14d, XM3 | box3d wake → `04` bcast remote-call `0x1b59c` on XG pack | XG/XG1_* elem `namedLink` dispatch @`0x1e2b4` → `0x1da3b` | `cntLink "XTGUN"` → `0x1b440` chained SW_H25 resupply (→`0x1b474`→`0x1b4a8`→stop) | none — terminal site is GUNT_10 `83 00` @0x21ff7 | no `0x83` opcode in span `0x1b256..0x1e502` (both `83` bytes are link-target u32 low bytes — OBSERVED `endLevel=0`, `diag=0`) |
 | L8 GUNT_10 | YES (deferred) | XGUNTAM/XBO multi-stage | `cntLink "XG" 6` | XBSHIP T1–T7 elems | object handlers @+21d6a | `83 00` @0x21ff7 | `0x83` subop 0 — INDETERMINATE retail outcome (stale-leader rank gate; strong lean ORIGINAL DEADLOCK); no native fix; live oracle DEFERRED |
 
 ### DANT_10 — golden proven (OBSERVED, real-data harness)
@@ -5656,3 +5656,74 @@ objects tearing down by end-of-run, `objDeathCalls` ~258–360 (wave
 casualties), spawn log covers XG/XC/XF waves + the `0xf1`-gated SW_*
 resupply drops, `endLevel=0`/`ending=0` as designed — MUSE_4's exit
 is the door/route onward, not a script boundary.
+
+### GUNT_5 / GUNT_8 — NON-CRITICAL, triggered-wave galleries (OBSERVED, real-data harness)
+
+Both LEVEL8 arenas verified mid-level — neither span owns a live
+boundary op, `endLevel=0` in the harness is authentic, and `diag=0`
+on every trigger walk.
+
+New object-VM op this phase (OBSERVED — handler `0x44ecc1` disasm +
+GUNT_5 site decode):
+
+- `0xe8` `fxLink` — `{u8 val, linkage}`; cond = `val ==
+  dword[0x54150c]`, the FX/debris-enable global (cheat-toggled,
+  default 1 — same flag `0x80`/`0x81` sel 2 gate on); the `0xfe`
+  else arm calls b on mismatch. GUNT_5 `XG`/`XG_BOD` uses `e8 00` at
+  `+11971` to take the no-debris arm when effects are disabled. The
+  port carries the flag as `TraversalRuntime::fxEnable = 1`.
+  Fall-through + suspend leaves `+0x108` on the `e8` itself — the
+  resume pointer only advances on ckpt/link/wait ops, so the flag is
+  re-polled next tick (OBSERVED semantics, shared with every other
+  fall-through link op).
+
+GUNT_5 (span `0xfb8d..0x13677`) — once-only trigger arms on grp1
+flags, all decoded + live-fired in the harness:
+
+- Mainline `0xfb8d`: XCORRDOR→CGUNT_4 portal, 2× `XG`, SW_KEY/H01/
+  HBOMB/H25 pickups, `XD` script object, `surfop 2/3`, `surfbind`,
+  then four gated trigger waits and `rcall 0xfd48` + `brSet grp1
+  bit4`.
+- `box2d (−260,1640)–(−252,1770)` → `0xfdb4` (grp1 bit1 once-only):
+  7× `XG` + `XD` + 2× `XT` assault wave — OBSERVED fired
+  (`flags58=0x2`, spawn log covers every e6/56 record in the arm).
+- `box2d (−329,1840)–(−292,1890)` → `0xfec7` (bit2): 3× `XGEN` + 2×
+  `XD` + SW_THUMP/LGREN drop pair.
+- `box3d (−189,1630,−162)–(−163,1670,−135)` → `0xfd8e` (bit3): `XT`
+  spawn — OBSERVED fired (`flags58=0x8`).
+- `box2d (−297,1510)–(−261,1550)` → `0xff75` (bit5): 9× `SW_H01`
+  resupply trail.
+- `rcall 0xfd48` — `SW_KEY`/`SW_NUKE` respawn helper (`invLink`/`cntLink`
+  gated once-only pickups).
+- `brSet grp1 bit4` → `0xfd24`: big-room `box2d
+  (−300,1480)–(−36,1980)` → `0xfd3c` = `partnerArena "CGUNT_5"` —
+  the `0x64` op implemented for MUSE_4 is exercised here too.
+- No live `0x83`: the four raw `0x83` bytes (`0xfdd1`, `0xfe4a`,
+  `0x1229a`, `0x125dd`) sit inside `e6`/`3b` operand streams and
+  float tables — operand data, never an instruction start. The
+  apparent `83 04`/`83 1a`/`83 3f` "ops" are misaligned decodes of
+  those operands (zero incoming links, confirmed by byte context).
+
+GUNT_8 (span `0x1b256..0x1e502`) — turret gallery + XG pack + chained
+resupply:
+
+- Mainline `0x1b256`: XCORRDOR→CGUNT_7 + XCORRDOR→CGUNT_9 portals,
+  3× `volact`/`recEnable` I7_FAN fans, 3× `XTGUN` turrets, 4× `XG`
+  drones (all id `0x14d`), `XM3` mech, then `box3d
+  (−210,2800,−307)–(−190,2820,−290)` → `0x1b414`.
+- `0x1b414` wake arm: `04` broadcast remote-call `0x1b59c` on the
+  `XG` pack → `cntLink "XTGUN"` → `0x1b440` — chained `SW_H25`
+  resupply (`0x1b440`→`0x1b474`→`0x1b4a8`→`stop`) gated on entity
+  counts, same family as MUSE_4's `0x64eb` dispatcher.
+- `0x1e2b4`+ region: the `XG1_*` element `namedLink` dispatch
+  (HEAD/TGHR/TGHL/LEGR/LEGL/FOTR/FOTL/TOER/TOEL → `0x1da3b`) —
+  shared walker-mech damage routing, same family as OLYM_4's XG.
+- No live `0x83`: both raw `0x83` bytes (`0x1da79`, `0x1e2b4`) are
+  the low bytes of link-target u32s (`0x1d083`), not ops.
+
+Golden state: `diag=0`, all gate/contact checks PASS with the player
+inside the trigger volumes, trigger bits latch correctly, spawn logs
+match the decoded arm contents 1:1, `endLevel=0`/`ending=0` as
+designed — exits are XCORRDOR portals, progression is door-driven.
+LEVEL8's terminal stays GUNT_10's `83 00` at `0x21ff7` (deferred
+oracle, per the classification table).

@@ -583,6 +583,10 @@ struct TraversalRuntime {
   int fieldDac = 0;               // 0x540dac — damage accumulator (cap 180)
   int fieldHealth = 0;            // 0x541554 — player health (drained)
   int fieldHealthGate = 0;        // 0x541510 — health/difficulty gate
+  int fxEnable = 1;               // 0x54150c — FX/debris-enable flag
+                                  // (cheat-toggled, default on); the
+                                  // 0x80/0x81 sel2 gates and the 0xe8
+                                  // flag-link all test this dword.
   int difficulty = 1;             // 0x54147a — difficulty (0 easy/1/2 hard)
   int hudActive = 0;              // 0x5414d4 — HUD gate for d0c++/blit
   // Phase 10B — combat presentation event log (player_projectiles.h).

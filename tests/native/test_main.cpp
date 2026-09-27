@@ -13515,6 +13515,69 @@ void test_traversal_object_script() {
     auto r = mdk::traversalScriptRun(f.env);
     CHECK(r.error);
   }
+
+  // --- obj op 0xe8: fxLink (0x44ecc1) -------------------------------
+  // {u8 val, linkage} — cond = (val == dword[0x54150c]) — the
+  // FX/debris-enable global (default 1). LEVEL8 GUNT_5 XG/XG_BOD
+  // uses `e8 00` at +11971 to reach the no-debris arm when effects
+  // are disabled.
+  {
+    // val 1 == fxEnable 1 -> 0x0c goto target.
+    ScriptFixture f;
+    f.write(C, {0xe8, 0x01, 0x0c}); f.writeW(C + 3, C + 0x40);
+    f.write(C + 7, {0xff});
+    f.write(C + 0x40, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x40));
+  }
+  {
+    // val 0 != fxEnable 1 -> falls through (no goto).
+    ScriptFixture f;
+    f.write(C, {0xe8, 0x00, 0x0c}); f.writeW(C + 3, C + 0x40);
+    f.write(C + 7, {0xff});
+    f.write(C + 0x40, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    // Fall-through + suspend: +0x108 stays on the `e8` — no ckpt/link
+    // ran, so the next tick re-polls the flag (OBSERVED resume
+    // semantics; plain sequential insns don't advance +0x108).
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C));
+  }
+  {
+    // fxEnable 0 (effects off) + val 0 -> goto target.
+    ScriptFixture f;
+    f.rt.fxEnable = 0;
+    f.write(C, {0xe8, 0x00, 0x0c}); f.writeW(C + 3, C + 0x40);
+    f.write(C + 7, {0xff});
+    f.write(C + 0x40, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 0x40));
+  }
+  {
+    // 0xfe two-way: mismatch calls the else target b.
+    ScriptFixture f;
+    f.write(C, {0xe8, 0x00, 0xfe}); f.writeW(C + 3, C + 0x40);
+    f.writeW(C + 7, C + 0x60);
+    f.write(C + 0x0b, {0xff});
+    f.write(C + 0x40, {0xfd});
+    f.write(C + 0x60, {0xfd});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.scriptCallDepth == 0);       // fd popped the frame
+  }
 }
 
 // ---------------------------------------------------------------------------

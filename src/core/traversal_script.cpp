@@ -3327,6 +3327,28 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0xe8: {                            // fx-flag link (0x44ecc1)
+      // {u8 val, linkage}. OBSERVED: cond = (val == dword[0x54150c])
+      // — the FX/debris-enable global ops 0x80/0x81 sel2 also gate
+      // on; the 0xfe else arm calls b on mismatch. LEVEL8 GUNT_5
+      // XG/XG_BOD @+11971 uses `e8 00` to reach the no-debris arm
+      // when effects are disabled.
+      const std::uint8_t val = r.u8();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("fxlink"); return; }
+      const bool cond = (env.rt != nullptr) &&
+          (static_cast<std::uint32_t>(val) ==
+           static_cast<std::uint32_t>(env.rt->fxEnable));
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
     case 0x7d:                                // clear event stack (0x43bcaa)
       // No operands. OBSERVED: +0x248 = 0 — drops every pending
       // event-call frame.
@@ -4905,6 +4927,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x79: return "fl";                     // {f32 drop, link}
   case 0x7a: return "ff";                     // pitch approach
   case 0xdd: return "bl";                     // {u8 sel, link}
+  case 0xe8: return "bl";                     // {u8 val, link}
   case 0x5c: return "hl";                     // {u16, linkage}
   case 0x2d: case 0x36: return "kl";
   case 0xf1: return "kl";                     // hp cmp link
@@ -5013,7 +5036,7 @@ const char* opcodeName(std::uint8_t op) {
   case 0x0a: return "brObj11a";  case 0x0b: return "setVar11a";
   case 0x73: return "rayLink";  case 0xee: return "axisLink";
   case 0xeb: return "camFace";  case 0x5e: return "wpick";
-  case 0xe7: return "idleLink";
+  case 0xe7: return "idleLink"; case 0xe8: return "fxLink";
   case 0x15: return "pathIdx"; case 0x16: return "markLink";
   case 0x2a: return "namedLink"; case 0x55: return "xformSnap";
   case 0x9a: return "animWait"; case 0xf2: return "orbitBlk";
