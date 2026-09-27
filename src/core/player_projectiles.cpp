@@ -519,6 +519,14 @@ void wallImpactDispatch(TraversalRuntime& rt, TraversalArena& arena,
 
 void detonateShot(TraversalRuntime& rt, PlayerShot& s, int dmg,
                   float radius, DynamicObject* directObj) {
+  if (std::getenv("MDK_SPLASH_DBG") != nullptr) {
+    std::fprintf(stderr,
+        "  [detonate] pos=(%.1f,%.1f,%.1f) type=%d dmg=%d r=%.0f "
+        "direct=%s\n",
+        (double)s.pos[0], (double)s.pos[1], (double)s.pos[2],
+        (int)s.type, dmg, (double)radius,
+        directObj ? directObj->scriptClass.c_str() : "null");
+  }
   splashDamage(rt, s.pos, static_cast<float>(dmg), radius, 1, directObj,
                6, kDetonateExcl);
   const int half =
@@ -707,6 +715,16 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
   // --- objects pass (flags & 2): cur then partner — ca8 && ca4, NO
   // carrier-busy gate (OBSERVED difference from the other passes).
   if ((flags & 2) != 0) {
+    if (splashDbg) {
+      std::fprintf(stderr,
+          "  [splash] entry blast=(%.1f,%.1f,%.1f) csArena=%p "
+          "carrier=%p partner=%d objs0=%p objs1=%p\n",
+          (double)blast[0], (double)blast[1], (double)blast[2],
+          (const void*)rt.cs.arena, (const void*)rt.cs.carrier,
+          rt.partnerActive ? 1 : 0,
+          rt.cs.arena ? (const void*)rt.cs.arena->objects : nullptr,
+          rt.cs.carrier ? (const void*)rt.cs.carrier->objects : nullptr);
+    }
     for (int a = 0; a < 2; ++a) {
       const CollisionArena* arena = nullptr;
       if (a == 0) {
@@ -820,6 +838,19 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
             bestDmg = dmg;
             bestAux = aux;
             std::memcpy(bestCenter, center, sizeof center);
+          }
+          if (splashDbg) {
+            std::fprintf(stderr,
+                "  [splash] obj=%s dmg=%d aux=%.2f gate=%.2f "
+                "center=(%.1f,%.1f,%.1f) aabb=(%.0f..%.0f,"
+                "%.0f..%.0f,%.0f..%.0f) blast=(%.1f,%.1f,%.1f)\n",
+                obj->scriptClass.c_str(), dmg, (double)aux,
+                (double)obj->field2c4, (double)center[0],
+                (double)center[1], (double)center[2],
+                (double)o->aabb[0], (double)o->aabb[3],
+                (double)o->aabb[1], (double)o->aabb[4],
+                (double)o->aabb[2], (double)o->aabb[5],
+                (double)blast[0], (double)blast[1], (double)blast[2]);
           }
         }
         if (bestDmg == 0) { o = next; continue; }

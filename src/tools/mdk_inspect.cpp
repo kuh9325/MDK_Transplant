@@ -2837,6 +2837,26 @@ int main(int argc, char** argv) {
         std::printf("      [f%03d objs=%zu:%s ]\n", f, tot,
                     det.c_str());
       }
+      // Phase 15A — shared-var change detection: the +0x48 per-arena
+      // f32 vars (operand mode 1) drive phase gates like MEAT_10's
+      // XCBOSS wake, so log every edge.
+      static float lastVars[4] = {-1, -1, -1, -1};
+      static std::uint32_t lastF58 = ~0u;
+      if (!bossNames.empty()) {
+        for (const auto& ap : rt.arenas) {
+          if (travArena && ap->name != *travArena) continue;
+          if (std::memcmp(ap->objVars48, lastVars, sizeof lastVars) != 0 ||
+              ap->flags58 != lastF58) {
+            std::printf("      [f%03d vars48=(%.3g,%.3g,%.3g,%.3g) "
+                        "f58=%08x]\n", f,
+                        ap->objVars48[0], ap->objVars48[1],
+                        ap->objVars48[2], ap->objVars48[3],
+                        ap->flags58);
+            std::memcpy(lastVars, ap->objVars48, sizeof lastVars);
+            lastF58 = ap->flags58;
+          }
+        }
+      }
       // Phase 15A — boss change-detection: print when a watched
       // object's health / mark / subtype / pc / flags / elemHp or
       // dead state changes.
@@ -2880,7 +2900,9 @@ int main(int argc, char** argv) {
                   "pc=+%lx f230=%p f148=%04x f149=%02x dead=%d "
                   "f0=%.1f e8=%.2f e6=%d ec=%p "
                   "anim=%p f=%d l=%04x acc=%.2f "
-                  "f11a=%d f11b=%d f138=%s eh=[%d,%d,%d,%d]\n",
+                  "f11a=%d f11b=%d f138=%s eh=[%d,%d,%d,%d] "
+                  "L=[%.3g,%.3g,%.3g,%.3g] "
+                  "aabb=(%.3g..%.3g,%.3g..%.3g,%.3g..%.3g) el=%zd\n",
                   o.scriptClass.c_str(), (int)o.health,
                   (unsigned)o.field21e, (unsigned)o.field11e,
                   static_cast<unsigned long>(pco), o.field230,
@@ -2896,7 +2918,13 @@ int main(int argc, char** argv) {
                   o.elemHp.size() > 0 ? (int)o.elemHp[0] : -1,
                   o.elemHp.size() > 1 ? (int)o.elemHp[1] : -1,
                   o.elemHp.size() > 2 ? (int)o.elemHp[2] : -1,
-                  o.elemHp.size() > 3 ? (int)o.elemHp[3] : -1);
+                  o.elemHp.size() > 3 ? (int)o.elemHp[3] : -1,
+                  (double)o.scriptLocals[0], (double)o.scriptLocals[1],
+                  (double)o.scriptLocals[2], (double)o.scriptLocals[3],
+                  (double)o.col.aabb[0], (double)o.col.aabb[3],
+                  (double)o.col.aabb[1], (double)o.col.aabb[4],
+                  (double)o.col.aabb[2], (double)o.col.aabb[5],
+                  o.model.elems.size());
               it->second = sn;
             }
           }
@@ -3089,8 +3117,14 @@ int main(int argc, char** argv) {
       std::printf("boss-runtime:\n");
       for (const auto& ap : rt.arenas) {
         if (!ap->dyn.storage.empty())
-          std::printf("  [arena %s storage=%zu]\n", ap->name.c_str(),
-                      ap->dyn.storage.size());
+          std::printf("  [arena %s storage=%zu vars48=(%.2f,%.2f,%.2f,"
+                      "%.2f) gVars=(%.2f,%.2f,%.2f,%.2f) flags58=%08x]\n",
+                      ap->name.c_str(), ap->dyn.storage.size(),
+                      ap->objVars48[0], ap->objVars48[1],
+                      ap->objVars48[2], ap->objVars48[3],
+                      rt.scriptGVars[0], rt.scriptGVars[1],
+                      rt.scriptGVars[2], rt.scriptGVars[3],
+                      ap->flags58);
         for (const auto& up : ap->dyn.storage) {
           const mdk::DynamicObject& o = *up;
           bool want = bossNames.empty() && !hitSpecs.empty()

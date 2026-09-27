@@ -107,6 +107,20 @@ ScriptCtxSlots ctxSlots(DynamicObject& o) {
 }
 
 static inline int varIndex(std::uint8_t idx) { return idx < 4 ? idx : 0; }
+
+// FUN_004553d0 (OBSERVED 0x4553d0): quadratic roots of A t^2 + B t + C.
+// Returns false when B^2 - 4AC < 0. r1 = (sqrt(D) - B) / 2A,
+// r2 = (-B - sqrt(D)) / 2A. Used by object-op 0xbd (ballistic homing).
+static inline bool solveQuad553d0(float A, float B, float C,
+                                  float* r1, float* r2) {
+  const float disc = B * B - 4.0f * A * C;
+  if (disc < 0.0f) return false;
+  const float s = std::sqrt(disc);
+  const float denom = 2.0f * A;
+  if (r1) *r1 = (s - B) / denom;
+  if (r2) *r2 = (-B - s) / denom;
+  return true;
+}
 // Resolve a var-operand given an already-read mode byte. mode 3 =
 // inline f32; otherwise a u8 index selects a slot via FUN_00438654.
 float resolveVarMode(std::uint8_t mode, Reader& r,
@@ -813,6 +827,50 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       st.active = false;
       res.stopped = true;
       return res;
+
+    case 0x10: {                            // +0x8 health (0x439f72)
+      // {u16}: the arena's executing ctx is the +0x118 pseudo-object
+      // (eventLatch). Same semantics as the object-VM case: +0x8 = health,
+      // +0x2a2 mirror, >=0xfde8 -> +0x21f sentinel; ==0 -> FUN_004581a4
+      // death boundary: with +0x110 bound the fragment becomes the script
+      // pc (+0x108/+0x230), otherwise the record is destroyed — for the
+      // arena record that is the script gate clearing. OBSERVED: LEVEL4
+      // MEAT_10 routes its grp1-bit1 arm to `10 00 00` at +1a84e.
+      const std::uint16_t hv = r.u16();
+      if (!r.ok) { fail("health operand"); return res; }
+      DynamicObject* latch = env.ctxObject;
+      if (latch != nullptr) {
+        latch->health = static_cast<int>(hv);
+        latch->healthMirror2a2 = hv;
+        if (hv >= 0xfde8) {
+          latch->flag21f = 1;
+          break;
+        }
+      }
+      if (hv == 0) {
+        if (latch != nullptr && latch->field110 != nullptr) {
+          latch->field11e = 0;
+          latch->field22c = 0.0f;
+          latch->col.flags148 |= 0x20;
+          const std::byte* q =
+              static_cast<const std::byte*>(latch->field110);
+          const std::byte* base = env.image.data() + env.imageBase;
+          if (q >= base && q < env.image.data() + env.image.size())
+            st.pcImageOff = static_cast<std::uint32_t>(q - base);
+          else
+            st.pcImageOff = 0;
+          st.waitResumeImageOff = st.pcImageOff;
+          latch->field110 = nullptr;
+        } else {
+          st.pcImageOff = 0;
+          st.callDepth = 0;
+          st.active = false;
+        }
+        res.stopped = true;
+        return res;
+      }
+      break;
+    }
 
     case 0x40: {                            // wait: +0x22c=secs,
       float secs = resolveVar(r, env, ctxSlots(st));  // +0x230=resume, exit
@@ -1542,6 +1600,90 @@ void objScriptInsn(ObjScriptPass& v) {
     }
     return;
   }
+  case 0xb8: {                            // bomb fuse+impact (0x443cf8)
+    // {f32 a, f32 b, f32 k}. OBSERVED: +0x148 |= 0x20; when a!=0 && b!=0
+    // the original calls FUN_0047d59a(ST0=a) -> int (the float->int
+    // round helper, same as the +0x10/+0x14/+0x18 arg conversions in
+    // the 0x4486ae sites), then FUN_00460d44(&pos, n, b, 0, 0, -1, -5)
+    // — the splashDamage dispatcher: full arena blast at the bomb's
+    // own position (flags -1 = objects+player+polys, exclMask -5).
+    // Then mid = (+0x1ac + +0x1a0)*0.5 (0x497bcc=0.5 OBSERVED) and
+    // both fields converge to mid at rate k. Finally FUN_004581a4 —
+    // the face-player + FUN_00458140 death boundary — runs
+    // UNCONDITIONALLY and the pass halts (JMP 0x451e83).
+    // LEVEL4 MEAT_10 XBN_BOMB: the blasts land on the arena floor
+    // ~440 units BELOW XC's perch (anti-player rain) — they cannot
+    // reach XC's +0x2c4=2.0 aux gate. XC's hpLink<9950 dips come from
+    // shots detonating on XCBOSS's shell tris (the blast sits inside
+    // XC's diag/2 sphere -> aux 0 -> full falloff).
+    const float a = r.f32(), b = r.f32(), k = r.f32();
+    if (!r.ok) { v.fail("bombImpact"); return; }
+    obj.col.flags148 |= 0x20;
+    if (a != 0.0f && b != 0.0f && env.rt != nullptr) {
+      ++env.rt->seams.bombBounceCalls;
+      if (std::getenv("MDK_TRACE_B8"))
+        std::fprintf(stderr,
+            "  [b8] %s pos=(%g,%g,%g) splash=%g/%g\n",
+            obj.scriptClass.c_str(), (double)obj.pos[0],
+            (double)obj.pos[1], (double)obj.pos[2],
+            (double)a, (double)b);
+      splashDamage(*env.rt, obj.pos, std::lround(a),
+                   b, /*tallyGate*/ 0, /*directObj*/ nullptr,
+                   /*flags*/ 0xffffffffu, /*exclMask*/ -5);
+    }
+    const float mid = (obj.field1ac + obj.field1a0) * 0.5f;
+    obj.field1ac = (obj.field1ac - mid) * k + mid;
+    obj.field1a0 = (obj.field1a0 - mid) * k + mid;
+    // FUN_004581a4 = FUN_00458140(face-player arg unused in the
+    // fragment arm): +0x110 -> death fragment, else FUN_00457cf4
+    // destroys the record — same shape as op-0x10's zero-health arm.
+    if (obj.field110 != nullptr) {
+      obj.field11e = 0;
+      obj.field22c = 0.0f;
+      obj.col.flags148 |= 0x20;
+      obj.field108 = obj.field230 = obj.field110;
+      obj.field110 = nullptr;
+    } else if (env.rt != nullptr) {
+      objectTeardownNow(*env.rt, obj);
+    }
+    v.done = true;
+    return;
+  }
+  case 0xbd: {                            // ballistic homing (0x448d1c)
+    // {u8 sel, f32 maxSpeed, [f32 targetZ iff sel==0]}. OBSERVED:
+    // sel==1 targets the player Z (0x540c04), sel==0 takes an inline
+    // target Z, any other sel consumes only sel+maxSpeed and skips.
+    // While pos.z < targetZ: solve field48*(-0.5)*t^2 + vel.z*t - dz
+    // = 0 via FUN_004553d0 (0x497c14 = -0.5 OBSERVED), take T = the
+    // larger root; desired horizontal speed = dist/T + field44*0.5*T
+    // (0x497c1c = 0.5) clamped to maxSpeed; vel.x/vel.y = the
+    // horizontal delta to the player scaled to that speed.
+    // LEVEL4 MEAT_10 XBN_BOMB — in-flight steering toward the player.
+    const std::uint8_t sel = r.u8();
+    if (sel > 1) return;                // consumes only the sel byte
+    const float vmax = r.f32();
+    const float tz =
+        (sel == 0) ? r.f32()
+                   : (env.playerPos ? env.playerPos[2] : 0.0f);
+    if (!r.ok) { v.fail("bombHome"); return; }
+    const float dz = tz - obj.pos[2];
+    if (dz > 0.0f && env.playerPos != nullptr) {
+      float r1 = 0.0f, r2 = 0.0f;
+      if (solveQuad553d0(obj.field48 * -0.5f, obj.field30, -dz,
+                         &r1, &r2)) {
+        const float T = (r1 > r2) ? r1 : r2;
+        const float dx = env.playerPos[0] - obj.pos[0];
+        const float dy = env.playerPos[1] - obj.pos[1];
+        const float dist = std::sqrt(dx * dx + dy * dy);
+        float sp = dist / T + obj.field44 * 0.5f * T;
+        if (sp > vmax) sp = vmax;
+        const float s = sp / dist;
+        obj.field28 = dx * s;
+        obj.field2c = dy * s;
+      }
+    }
+    return;
+  }
   case 0x40: {                            // wait {varop} — +0x22c secs,
     float secs = resolveVar(r, env, ctx); // +0x230=resume (0x43bcd0)
     if (!r.ok) { v.fail("wait"); return; }
@@ -2128,6 +2270,7 @@ void objScriptInsn(ObjScriptPass& v) {
     case 0x32: obj.field38 = resolveVar(r, env, ctx); return;  // +0x38
     case 0x33: obj.field3c = resolveVar(r, env, ctx); return;  // +0x3c
     case 0x34: obj.field40 = resolveVar(r, env, ctx); return;  // +0x40
+    case 0x37: obj.field48 = resolveVar(r, env, ctx); return;  // +0x48
     case 0x53: {                              // +0x58 scale
       std::uint8_t mode = r.u8();
       if (mode == 0xff) {                     // ramp form {u8,u32,u32}:
@@ -2689,6 +2832,21 @@ void objScriptInsn(ObjScriptPass& v) {
       const std::uint32_t scOff = r.u32();
       if (!r.ok) { v.fail("spawn2"); return; }
       traversalScriptSpawn(env, x, y, z, 0.0f, 0, cls, "", scOff, 1);
+      return;
+    }
+    case 0x9c: {                              // spawn at ref-point (0x449fae)
+      // {u8 refIdx, lstr class, u32 scOff}. OBSERVED: same
+      // FUN_00454af8 arm as op-0x56 — the position is the object's
+      // own worldRef[refIdx] triple (+0x1b0 + idx*12) instead of
+      // inline operands. LEVEL4 MEAT_10 XCBOSS uses it (+1af8b) to
+      // spawn its helper objects at named ref-points.
+      const std::uint8_t idx = r.u8();
+      const std::string cls = r.str();
+      const std::uint32_t scOff = r.u32();
+      if (!r.ok) { v.fail("spawnRef"); return; }
+      const int i = (idx < 8) ? idx : 0;
+      traversalScriptSpawn(env, obj.worldRef[i][0], obj.worldRef[i][1],
+                           obj.worldRef[i][2], 0.0f, 0, cls, "", scOff, 1);
       return;
     }
     case 0x71: {                              // spawn at rotated offset
@@ -3840,6 +3998,64 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x7f: {                            // object-hp cmp link (0x44db79)
+      // {u8 kind, f32 a, [f32 b if kind==7|8], linkage}. OBSERVED:
+      // FILD(ctx+0x8) — the object's OWN health (not the player's, cf.
+      // op 0xf1) — then FUN_0045ad40(kind, health, a, b); true fires
+      // the linkage (fe reads a,b targets; fc/0c read a; fd returns).
+      // LEVEL4 MEAT_10 uses it as the XCBOSS damage-phase gate
+      // (+1ae43: kind3 vs 9950.0).
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      if (!r.ok) { v.fail("hpcmp"); return; }
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("hpcmp"); return; }
+      const bool cond = cmpOp5ad40(kind, static_cast<float>(obj.health), va, vb);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xaf: {                            // inventory cmp link (0x44112f)
+      // {u8 type, u8 kind, u32 a, [u32 b iff kind 7|8], linkage}.
+      // OBSERVED: sums `charges` over the 0x54155c inventory table
+      // (0x24-stride, count 0x541610) where rec.id == type, then
+      // FUN_0045ad40(kind, acc, a, b) dispatches the linkage — the
+      // same skeleton as 0x7f. LEVEL4 MEAT_10 XCBOSS (+1b01c).
+      const std::uint8_t type = r.u8();
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      if (!r.ok) { v.fail("invLink"); return; }
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("invLink"); return; }
+      std::int32_t acc = 0;
+      if (env.rt != nullptr) {
+        const int n = (env.rt->inventoryCount < 5)
+            ? env.rt->inventoryCount : 5;
+        for (int i = 0; i < n; ++i)
+          if (env.rt->inventory[i].id == type)
+            acc += env.rt->inventory[i].charges;
+      }
+      const bool cond = cmpOp5ad40(kind, static_cast<float>(acc), va, vb);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
     case 0x86: {                            // pitch drift (0x441d58)
       // {varop}: +0x54 += operand * (1/30) — OBSERVED 0x49b6f4 is the
       // frame-time constant. Dead-wrap quirk (OBSERVED 0x441dcf..):
@@ -4294,7 +4510,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x08: case 0x10: return "h";         // i16 yaw / u16 health
   case 0x28: case 0x35: case 0x40: case 0x86: case 0xb1: case 0x3a:
   case 0x52: case 0x54: case 0x5b: case 0x32: case 0x33: case 0x34:
-  case 0xa9: case 0xd2: case 0x27:
+  case 0xa9: case 0xd2: case 0x27: case 0x37:
     return "v";
   case 0x5a: return "sf";                   // {lstr name, f32 angle}
   case 0x17: case 0x23: case 0x24: case 0x29: case 0x3f:
@@ -4321,6 +4537,8 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x3e: case 0x7f: return "kl";
   case 0x68: case 0x6a: case 0x7c: case 0x87: return "f";
   case 0xbb: return "ff"; case 0xdc: case 0x4f: return "fff";
+  case 0xb8: return "fff";                    // bomb fuse/impact
+  case 0xbd: return "bf";                     // + f iff sel==0
   case 0x42: return "bbf"; case 0x04: return "b";
   case 0x02: return "wbbhb";                  // + fff iff mode==0
   case 0xc8: return "ffffl";
@@ -4353,6 +4571,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xc3: return "bl";                      // {i8 src, linkage}
   case 0x95: return "ffffwssw";
   case 0x56: case 0xa1: case 0x71: return "fffsw";
+  case 0x9c: return "bsw";                      // spawnRef {u8,lstr,u32}
   case 0x77: return "skl"; case 0xd3: return "";
   case 0x50: return "fff";                     // velRotAdd
   case 0xe6: return "ffffwsw";
@@ -4389,10 +4608,12 @@ const char* opcodeName(std::uint8_t op) {
   case 0x63: return "surfbind";  case 0xa8: return "surfcfg";
   case 0x0c: return "rgoto";  case 0xfc: return "rcall";
   case 0x95: return "spawn";  case 0x56: return "spawn2";
+  case 0x9c: return "spawnRef";
   case 0xe6: return "spawn3"; case 0xa1: return "spawnNamed";
   case 0x71: return "spawnOfs"; case 0x77: return "cntLink";
   case 0xd3: return "velZero"; case 0xb1: return "auxDist";
   case 0xbb: return "randImpulse"; case 0x25: return "f14cLink";
+  case 0xb8: return "bombImpact"; case 0xbd: return "bombHome";
   case 0x7c: return "faceBias"; case 0xdc: return "spawnX";
   case 0xae: return "ammoLink"; case 0x43: return "varcmpLink";
   case 0x4f: return "setPos"; case 0x72: return "rideLink";
@@ -4559,6 +4780,12 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
       for (int k = 0; k < 12; ++k) {
         std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
       }
+    }
+  }
+  if (out.opcode == 0xbd) {                  // sel==0 -> inline targetZ
+    if (imageBase + codeOff + 1 < image.size() &&
+        static_cast<std::uint8_t>(image[imageBase + codeOff + 1]) == 0) {
+      std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
     }
   }
   if (out.opcode == 0x04) {                  // broadcast operands

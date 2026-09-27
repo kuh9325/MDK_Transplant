@@ -268,6 +268,12 @@ struct DynamicObject {
   // prevPos latch. DAT_0049b6f0 = 1.0, so this is the raw frame
   // displacement. OBSERVED 0x45737b.
   float field18c[3] = {0, 0, 0};
+  // +0x1a0/+0x1ac — the fuse pair op-0xb8 (0x443cf8) blends toward
+  // their midpoint: mid=(a+b)*0.5; a=(a-mid)*k+mid. LEVEL4 MEAT_10
+  // XBN_BOMB — the bomb's convergence pair (HYPOTHESIS: fuse/pulse
+  // timers; the original's exact field role is UNKNOWN).
+  float field1a0 = 0.0f;              // +0x1a0
+  float field1ac = 0.0f;              // +0x1ac
   // +0x28/+0x2c/+0x30 — object velocity. FUN_0045bac0 integrates
   // (vel + +0x294 impulse) * dt and applies +0x44 drag each frame
   // (OBSERVED, Phase 11B). The FUN_00432f84 charged-kill displaces

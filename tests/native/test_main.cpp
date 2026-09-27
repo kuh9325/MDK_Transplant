@@ -13286,6 +13286,85 @@ void test_traversal_object_script() {
           static_cast<const void*>(f.image.data() + 4 + C + 0x80));
     CHECK(m->col.flags14a == 0);              // variant 1: no mover bit
   }
+
+  // --- obj op 0xb8: bomb fuse+impact (0x443cf8) --------------------
+  // {f32 a, f32 b, f32 k} — +0x148 |= 0x20; a!=0 && b!=0 calls
+  // FUN_00460d44 = splashDamage(pos, lround(a), b, 0, null, -1, -5)
+  // at the bomb's own position; then +0x1a0/+0x1ac converge to their
+  // midpoint at rate k; then the unconditional FUN_004581a4 death
+  // boundary (+0x110 -> fragment pc, else teardown). MEAT_10 XBN_BOMB.
+  {
+    ScriptFixture f;
+    f.rt.cs.arena = &f.arena->dyn.col;        // splash scans this list
+    f.write(C, {0xb8});
+    f.writeF(C + 1, 30.0f); f.writeF(C + 5, 30.0f);
+    f.writeF(C + 9, 0.5f);
+
+    // The detonating bomb at (10,0,20) — field110 null -> teardown.
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.setPosition(10.0f, 0.0f, 20.0f);
+    o.field1a0 = 4.0f; o.field1ac = 8.0f;
+
+    // Victim named collision object 4 units away — falloff dmg
+    // = round(30*(30-aux)/30); its aabb (12..16,-2..2,18..22) centre
+    // (14,0,20): dist^2=16, diag^2/4=12 -> aux=2 -> dmg 28.
+    mdk::DynamicObject& v = f.arena->dyn.allocFront();
+    v.model = makeHomingModel({{"0E", 0.0f}});
+    v.setPosition(14.0f, 0.0f, 20.0f);
+    mdk::initObjectCollision(v);
+    v.health = 100; v.field2c4 = 1000.0f;
+    const float vb[6] = {12, -2, 18, 16, 2, 22};
+    std::memcpy(v.col.aabb, vb, sizeof(vb));
+
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(f.rt.seams.bombBounceCalls == 1);
+    CHECK(v.health == 72);                    // 100 - 28 falloff
+    CHECK(v.field21e == 0xfe);                // whole-object mark
+    CHECK(f.rt.seams.objectTeardownCalls == 1);  // null +0x110 path
+  }
+  {
+    // +0x110 bound -> the fragment pc replaces +0x108/+0x230 (no
+    // teardown), matching op-0x10's zero-health arm; the record
+    // survives, so the flag write + midpoint lerp are observable.
+    ScriptFixture f;
+    f.rt.cs.arena = &f.arena->dyn.col;
+    f.write(C, {0xb8});
+    f.writeF(C + 1, 30.0f); f.writeF(C + 5, 30.0f);
+    f.writeF(C + 9, 0.5f);
+    f.write(C + 0x40, {0x01, 0xff});          // fragment stream
+
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.setPosition(10.0f, 0.0f, 20.0f);
+    o.field1a0 = 4.0f; o.field1ac = 8.0f;
+    o.field110 = f.image.data() + 4 + C + 0x40;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(f.rt.seams.objectTeardownCalls == 0);
+    CHECK((o.col.flags148 & 0x20u) != 0);
+    CHECK(near(o.field1ac, 7.0, 1e-5) && near(o.field1a0, 5.0, 1e-5));
+    CHECK(o.field108 == f.image.data() + 4 + C + 0x40);
+    CHECK(o.field230 == f.image.data() + 4 + C + 0x40);
+    CHECK(o.field110 == nullptr);
+  }
+  {
+    // a==0 (or b==0) skips the FUN_00460d44 call but still runs the
+    // lerp + the death boundary.
+    ScriptFixture f;
+    f.rt.cs.arena = &f.arena->dyn.col;
+    f.write(C, {0xb8});
+    f.writeF(C + 1, 0.0f); f.writeF(C + 5, 30.0f);
+    f.writeF(C + 9, 0.5f);
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.setPosition(10.0f, 0.0f, 20.0f);
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(f.rt.seams.bombBounceCalls == 0);
+    CHECK(f.rt.seams.objectTeardownCalls == 1);
+  }
 }
 
 // ---------------------------------------------------------------------------

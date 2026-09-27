@@ -5370,7 +5370,7 @@ link-target operands, not opcodes.
 | L7 DANT_10 | YES | scripted-element boss (XB1/PEN_16) | namedLink "XB_HEAD"/ANY on XB1 (+0x21e elem mark) | XB1 elements; gate = source byte +0x21d | object script @0x20e89 → elKill/refEmit → deathRef @0x20ebc | obj script `83 00` @0x20f35 | `0x83` subop 0 |
 | L6 OLYM_4 | NO (mid-level) | turret gallery + XG arena: 6×XBGUN (hp 65000 sentinel), SW_H50, 4×XG (XG_BOD hp 60), TARGET1–9 loop | namedLink "XG1_HEAD" (+0x21e elem mark) | XG1_HEAD elem → `health 65000` invulnerable-set + refEmit "XG1_BODY" 2 3 + elKill "XG1_HEAD" (dismount, OBSERVED harness) | handlers @0x82e4/0x82f3/0x8302 (timeLink/namedLink/losLink) in shared XG body @0x7671 | none in stream — terminal site is OLYM_10$XB2_0 `83 00` @0x15acd | other (count/link gates); gaps: `0xdb` XBGUN aim gate, `0x8a` FX rig (t3 tail dies after loop — non-blocking) |
 | L3 HMO_10 | YES | twin-script boss: XB3 mech (PEN_16-family head) + XW3 wheel-turret (PEN_111, 8 elems: 4× XW3_GUN + shell) | `namedLink "XW3_GUN1..4"` (elem mark +0x21e) on XW3 | XW3_GUN elements — direct hits only during `elemUnmask` windows (deploy @0x200ad; re-mask on fire/`elKill` latch) | gun deaths `elKill`+`bitset grp2 bit2..4`+counter → `varcmpLink grp2.0==4` @0x20164 → bcast XB3 death handler @0x1ff73 | grp1-bit15 writer @0x1fffd → arena `brSet` @0x1fe22 → `wait 2`/`setG 0` → `83 00` @0x1fe35 | `0x83` subop 0 — GOLDEN `endLevel=1` |
-| L4 MEAT_10 | YES | boss arena (t3 @0x1a6e2) | arena-scripted watch | TBD | TBD | `83 00` @0x1a856 (t3 stream) | `0x83` subop 0 |
+| L4 MEAT_10 | YES | glass-shell boss: XCBOSS shell (hp 65000 sentinel, GLASS3) + XC core (hp 10000 pinned, 20-elem perch model) | `0x7f` hpLink `health<9950` on XC | XC via shots detonating on XCBOSS shell tris (aux≈0 inside diag/2; `+0x2c4=2.0` gate rejects borderline blasts; XCBOSS sentinel-immune) | DEADON arm `grp2[0] += 50`/dip → `varcmpLink` ≥300 → `10 00 00` → frag @0x1ae6c → grp1 bit1 | arena `brSet` bit1 → @0x1a84e `wait12`/`setG 0` → `83 00` @0x1a856 | `0x83` subop 0 — GOLDEN `endLevel=1` |
 | L5 MUSE_4 | NO (mid-level) | ammo/pickup scripted arena (t3 @0x61bc; `0xae` ammoLink family) | none | none | none | none — terminal site is MUSE_5-path `83 51` @0xb6e9 | other |
 | L8 GUNT_5 | NO (mid-level) | XG-spawn/computed-call arena (t3 @0xfb8d) | cnt/var gates | TBD | `0xb7` swCall chains | none | other |
 | L8 GUNT_8 | NO (precursor) | ship/support scripted arena (t3 @0x1b256) | cnt/var gates | TBD | TBD | none — terminal site is GUNT_10 `83 00` @0x21ff7 | other |
@@ -5451,3 +5451,90 @@ player, authentic end-of-level, not a port defect. Masked elements are
 NOT hittable: `objectProbe` skips `elemMaskB` — OBSERVED consistent
 with the original probe semantics; guns are only vulnerable inside
 deploy/fire unmask windows, matching the script's design.
+
+### MEAT_10 — golden proven (OBSERVED, real-data harness)
+
+Object-VM work this phase (all OBSERVED — handler disasm + real-data
+decode):
+
+- `0x7f` `hpLink` — `{u8 kind, u32 a, [u32 b iff kind 7|8], linkage}`;
+  the shared FUN_0045ad40 predicate over ctx `+0x8` health (kind 3 =
+  `v−0.05 < a`). XC's phase gate is `7f 03 <9950> fc +1ae4e`.
+- `0x9c` `spawnRef` — `{u8 refIdx, lstr class, u32 scriptOff}`; the
+  same FUN_00454af8 spawn arm as `0x56` but the position comes from
+  `ctx+0x1b0+refIdx*12` (a bound world ref-point). XCBOSS spawns
+  XCBOMBs onto the perch with it.
+- `0x10` arena-side `health` — `{u16}` on the eventLatch ctx:
+  `+0x8`/`+0x2a2` write, `>=0xfde8` sentinel latch, `==0` → the
+  FUN_004581a4 boundary (fragment pc when `+0x110` is bound, else the
+  arena record's script dies). The bit-1 completion arm routes through
+  it.
+- `0xb8` `bombImpact` — `{f32 a, f32 b, f32 k}`: `+0x148 |= 0x20`;
+  `a!=0 && b!=0` → `FUN_0047d59a` round(a) → **`FUN_00460d44` =
+  `splashDamage(pos, round(a), b, tallyGate 0, directObj null,
+  flags −1, exclMask −5)`** at the bomb's own position; then
+  `+0x1a0`/`+0x1ac` converge to their midpoint at rate k
+  (`0x497bcc=0.5`); then the UNCONDITIONAL `FUN_004581a4` death
+  boundary halts the pass. INITIALLY mis-ported as a physics-only
+  seam — corrected after re-reading the handler: the called function
+  is the splash dispatcher, not a bounce helper.
+- `0xbd` `ballisticHoming` — `{u8 sel, f32 maxSpeed, [f32 targetZ iff
+  sel==0]}`; while `pos.z < targetZ` (sel1 = the player-Z global) the
+  op solves `field48·(−0.5)·t² + vel.z·t − dz = 0` via FUN_004553d0
+  (constants `−0.5`/`0.5` OBSERVED from .rdata) and sets
+  `vel.x`/`vel.y` toward the player at clamped speed. XBN_BOMB
+  in-flight steering — non-blocking for completion.
+- `0x37` (a `+0x48` varop write) and `0xaf` (count-compare over the
+  inventory table, `0xae`'s twin) were flagged "unrecognized" by stale
+  diagnostics; both were already implemented — no code change needed.
+
+Encounter structure (decode + live dumps, all OBSERVED):
+
+- `XC` — the damage-counted core: hp pinned `10000`, real 20-element
+  perch model (the CMI model ref is `val=0`/unresolved — geometry
+  loads from `LEVEL4O.MTO`; the earlier "model=NONE ⇒ unhittable"
+  read was wrong). `+0x2c4` aux gate = `2.0` (self-written `0xb1` op).
+- `XCBOSS` — the glass shell: 3-element GLASS3 colocated with XC,
+  `hp 65000` sentinel → never damageable; `+0x138 = XC` (subordinate).
+  Dormant ckpt/camFace loop; wake = the `0x30` probabilistic link
+  (~12s mean) gated by shared live-bomb counters
+  (`grp1 shared0` = XCBOMB count cap 6, `shared1` = SW_LGREN count).
+- `XGEN` — the 300hp driver: `cntLink "XE"` → post-XE combat region
+  with its own `<225`/`<150` hp ladder + markLink/namedLink handlers.
+- `XE` — 200hp patrol escort; its death opens the driver phase.
+- `XCBOMB` — perched bomb; its script self-kills via `10 00 00` and
+  the death fragment decrements `shared0`. NO `0xb8` — XCBOMBs do not
+  splash.
+- `XBN_BOMB` — the rain bomb: `0xb8 {30,30,5}` detonations land at
+  y≈24120 on the arena floor, **~440 units below XC's perch** —
+  anti-player rain that cannot reach XC's 2.0 aux gate.
+
+Authentic chain (harness `--hit 'XC:2xN'`, player start inside
+MEAT_10 — OBSERVED):
+
+1. Shots probed at the perch hit **XCBOSS's shell tris** (nearest hit
+   along the ray beats XC's own elements) → `detonateShot(150, 25,
+   directObj=XCBOSS)`.
+2. The `FUN_00460d44` objects pass evaluates XC's whole-object
+   falloff: the shell blast sits INSIDE XC's aabb diag/2 sphere →
+   `aux≈0` → passes the `+0x2c4=2.0` gate → **`health −150`**.
+   XCBOSS takes the mark but no damage (`health<0xfde8` gate).
+   Borderline blasts (perch sway moves XC's box: `aux=2.46/2.52/2.58`
+   OBSERVED) are REJECTED by the same gate — genuine
+   invulnerability window.
+3. XC's loop per pass: `health 10000` pin → perch setPos → `eb`
+   camFace → `7f 03 <9950>` gate → on a dipped pass calls the DEADON
+   arm: `0x59 "DEADON"` sfx → `grp2[0] += 50` → `varcmpLink grp2[0] vs
+   300` → `fd` return → re-pin. A dip must be ≥50 within one open
+   window — the −150 detonation qualifies; −8 tracer hits do not.
+4. Six dips → `grp2[0]=300` → `10 00 00` → `+0x110` fragment
+   @0x1ae6c: broadcast teardown cascade + arena `grp1` bit 1.
+5. Arena `brSet grp1 bit1` gate → continuation @0x1a84e → `wait12` →
+   `setG 0` → **`83 00` @0x1a856 → `pendingViewSnap=−1` →
+   `endLevelRequest` → `endLevel=1`**.
+
+Golden: `endLevel=1` latched ~frame 186–190 on a `--hit 'XC:2x30'`
+sweep (10 shotHits → 6 qualifying dips → `wait12` continuation →
+`83 00`), `objDeathCalls=0` (the VM `0x10`/`0xb8` fragment handoff
+sets `+0x108/+0x230` directly — the runtime `objectDeathBoundary`
+seam isn't on this path), `diag=0`.

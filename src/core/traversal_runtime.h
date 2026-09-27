@@ -301,6 +301,9 @@ struct TraversalSeams {
                                   // camera-FX event (f32 arg = the
                                   // event's duration/intensity;
                                   // cosmetic presentation seam)
+  int bombBounceCalls = 0;        // op-0xb8 (0x443cf8) — FUN_00460d44
+                                  // splashDamage dispatch at the bomb's
+                                  // position (a!=0&&b!=0 arm)
 };
 
 struct TraversalFrameResult {
