@@ -53,6 +53,7 @@
 #include "core/gameplay_input.h"
 #include "core/sni_directory.h"
 #include "core/traversal_runtime.h"
+#include "core/player_projectiles.h"
 
 #include "mdk_objid.h"
 
@@ -149,6 +150,11 @@ class MdkBridge : public RefCounted {
   Dictionary diagnostic_start(int64_t arena_index,
                               const Vector3& pos_mdk,
                               double yaw_deg);
+  // NATIVE DIAGNOSTIC — calls the authentic core damage producer
+  // (playerDamageApply = FUN_0046771c). The dispatcher consumes the
+  // accumulator on the next stepped frame — nothing here writes
+  // loco/anim state directly. Test/QA path only.
+  Dictionary diagnostic_damage(int64_t amount);
 
  private:
   // One arena's complete presentation bundle — collision parse,

@@ -15282,6 +15282,7 @@ void test_player_look() {
     rt.cs.objectDataLoaded = 1;
     rt.cs.pos[2] = 12.0f;
     rt.cs.entryPos[2] = 12.0f;
+    rt.fieldHealth = 100;   // alive — the death tail suppresses input
     const mdk::GameplayInputBindings bindings;
     const mdk::FrontendTimingState timing;
     const mdk::RawGameplayInput idle{};
@@ -17184,6 +17185,342 @@ void test_player_projectiles() {
   }
 }
 
+// Phase 16B.1 — the FUN_00463608 damage/death dispatch tail
+// (0x4637f1..0x46422f): the eb8 death-fade countdown, the 0x540d5c
+// accumulator threshold/stab eligibility, and the {9,0x385} tumble /
+// {10,0x3ea} death posts. Damage is driven through the authentic
+// producer (playerDamageApply = FUN_0046771c); no test injects
+// locoState. OBSERVED BUILD_A semantics, pinned field-for-field.
+void test_traversal_damage_dispatch() {
+  using namespace mdk;
+  const float pt[3] = {0.0f, 0.0f, 0.0f};
+  const GameplayInputBindings bindings;
+  const FrontendTimingState timing;        // step1 smoothed1 dt=1/30
+  const RawGameplayInput idle{};
+  const float kDecay = (1.0f / 30.0f) * 2.0f;   // 0x49b6f4 * 0x4986e8
+
+  auto makeLive = [](TraversalRuntime& rt, CollisionFixture& f) {
+    TraversalArena* a = travArenaAdd(rt, "DMG");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    rt.cur = a;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1;
+    rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 12.0f;
+    rt.fieldHealth = 100;
+    rt.difficulty = 1;
+  };
+  auto settle = [&](TraversalRuntime& rt) {
+    for (int i = 0; i < 40 && !(rt.vert.contactFlags & 1); ++i)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+  };
+  // Minimal synthetic sprite table — {u32 count, u32 ofs[count]},
+  // 8-byte frames, the layout test_player_animation's Bank uses.
+  struct TblBuf { std::vector<std::byte> buf; };
+  auto makeTbl = [](TblBuf& tb, int n) {
+    tb.buf.assign(4 + n * 4 + n * 8, std::byte{0});
+    tb.buf[0] = (std::byte)(n & 0xff);
+    for (int i = 0; i < n; ++i) {
+      const std::uint32_t ofs = 4 + n * 4 + i * 8;
+      for (int k = 0; k < 4; ++k)
+        tb.buf[4 + i * 4 + k] = (std::byte)((ofs >> (k * 8)) & 0xff);
+    }
+    return tb.buf.data();
+  };
+  auto ti = [](const char* nm) {
+    for (int i = 0; i < 29; ++i)
+      if (!std::strcmp(playerAnimTableName(i), nm)) return i;
+    return -1;
+  };
+
+  // ---- nonlethal damage -> the {9,0x385} tumble post --------------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    CHECK((rt.vert.contactFlags & 1) != 0);
+    CHECK(rt.locoState == 0x65);
+    playerDamageApply(rt, 10, pt);          // diff1 -> scaled 10
+    CHECK(rt.fieldHealth == 90);
+    CHECK(near(rt.vert.landingAccum, 10.0, 1e-5));
+    // Consumed next frame: accum >= 5.0 (0x40a00000 signed gate) ->
+    // stationary+grounded posts {9,0x385} — no stab needed.
+    const TraversalFrameResult out =
+        stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.locoState == 0x385);
+    CHECK(rt.eventPriority == 9);
+    CHECK(rt.vert.landingAccum == 0.0f);    // 0x4641ae reset on post
+    // e10 armed to 3.0f at post, then the dispatch-tail decay runs.
+    CHECK(near(rt.fieldE10, 3.0 - 1.0 / 30.0, 1e-5));
+    CHECK(rt.fieldEb8 == 0);                // alive — fade never arms
+  }
+
+  // ---- dispatch -> Phase 16A table selection (authentic chain) ----
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    TblBuf bang, bflip, idl;
+    rt.animTables.bang = makeTbl(bang, 4);
+    rt.animTables.bFlip = makeTbl(bflip, 3);
+    rt.animTables.idle = makeTbl(idl, 2);
+    rt.hudActive = 1;
+    settle(rt);
+    playerDamageApply(rt, 10, pt);
+    // The dispatch posts 0x385 mid-frame; the same frame's world-tick
+    // anim handler (FUN_00461954) enters K_BANG[0].
+    const TraversalFrameResult out =
+        stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.locoState == 0x385);
+    CHECK(out.animTableIdx == ti("K_BANG") && out.animFrameIdx == 0);
+    CHECK(out.animDrawn);                   // draw gate unaffected
+    // Lethal — the same chain posts 0x3ea: K_BANG to last, hold.
+    TraversalRuntime rt2; makeLive(rt2, f);
+    rt2.animTables.bang = bang.buf.data();
+    rt2.animTables.bFlip = bflip.buf.data();
+    rt2.hudActive = 1;
+    settle(rt2);
+    playerDamageApply(rt2, 200, pt);
+    const TraversalFrameResult o2 =
+        stepTraversalRuntime(rt2, idle, bindings, timing);
+    CHECK(o2.locoState == 0x3ea);
+    CHECK(o2.animTableIdx == ti("K_BANG") && o2.animFrameIdx == 0);
+    for (int i = 0; i < 6; ++i)
+      stepTraversalRuntime(rt2, idle, bindings, timing);
+    CHECK(rt2.locoState == 0x3ea);          // terminal — no release
+    CHECK(rt2.animFrame == 3);              // clamped at bang count-1
+  }
+
+  // ---- sub-threshold damage -> no post, accumulator decays --------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    playerDamageApply(rt, 4, pt);           // accum 4 < 5.0f
+    CHECK(near(rt.vert.landingAccum, 4.0, 1e-5));
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x65);            // idle restore, no tumble
+    CHECK(near(rt.vert.landingAccum, 4.0 - kDecay, 1e-5));
+    // Accumulation across frames: a second hit pushes past 5.0f.
+    playerDamageApply(rt, 4, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x385);
+    CHECK(rt.eventPriority == 9);
+    CHECK(rt.fieldHealth == 100 - 4 - 4);
+  }
+
+  // ---- lethal damage -> the {10,0x3ea} death post -----------------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    playerDamageApply(rt, 200, pt);         // health 100 -> 0
+    CHECK(rt.fieldHealth == 0);
+    const TraversalFrameResult out =
+        stepTraversalRuntime(rt, idle, bindings, timing);
+    // First dead frame: eb8 arms 0xf0, accum is force-set to 5.0f
+    // (0x463f93) then the grounded post writes {10,0x3ea}.
+    CHECK(out.locoState == 0x3ea);
+    CHECK(rt.eventPriority == 10);
+    CHECK(rt.fieldEb8 == 0xf0);
+    CHECK(rt.vert.landingAccum == 0.0f);
+    CHECK(rt.fieldHealth == 0);
+    // 0x3ea is terminal for the dispatcher: the fade branch skips the
+    // block entirely — stable state, no re-post, eb8 counts down.
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x3ea);
+    CHECK(rt.fieldEb8 == 0xf0 - timing.frameStep);
+    CHECK(rt.eventPriority == 10);
+  }
+
+  // ---- eb8 countdown: accel below 0xd2 + floor at 1 ---------------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    playerDamageApply(rt, 200, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.fieldEb8 == 0xf0);
+    // Plain countdown while eb8 >= 0xd2 (pos steady — entryPos == pos).
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.fieldEb8 == 0xf0 - timing.frameStep);
+    // Run to just past the 0xd2 threshold, then each dead frame takes
+    // an extra -0x1e (pos.z >= prevZ — the body has stopped falling).
+    while (rt.fieldEb8 - timing.frameStep >= 0xd2)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+    const int preAccel = rt.fieldEb8;       // first frame past 0xd2
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.fieldEb8 == preAccel - timing.frameStep - 0x1e ||
+          rt.fieldEb8 == 1);
+    // The floor: eb8 clamps to 1 and the fade branch holds forever.
+    while (rt.fieldEb8 > 1)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.fieldEb8 == 1);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.fieldEb8 == 1);
+    CHECK(rt.locoState == 0x3ea);           // still terminal
+  }
+
+  // ---- death takes priority over a pending lower-priority event ---
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    rt.eventPriority = 8;                   // e.g. scoped event latched
+    playerDamageApply(rt, 200, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x3ea);           // {10,0x3ea} outranks 8
+    CHECK(rt.eventPriority == 10);
+  }
+
+  // ---- suppression window: post-tumble damage is suppressed -------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    playerDamageApply(rt, 10, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x385);
+    CHECK(rt.fieldE10 > 0.0f);
+    // The producer's suppress gates (e10 > 0 AND cac == 0x385): no
+    // health loss, accumulator cleared.
+    const int health = rt.fieldHealth;
+    playerDamageApply(rt, 30, pt);
+    CHECK(rt.fieldHealth == health);
+    CHECK(rt.vert.landingAccum == 0.0f);
+    // ...and the window decays inside the dispatch tail.
+    const float e10 = rt.fieldE10;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(near(rt.fieldE10, e10 - 1.0 / 30.0, 1e-5) ||
+          rt.fieldE10 <= 0.0f);
+  }
+
+  // ---- mounted gate: excludeObj suppresses the dispatcher post ----
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    mdk::DynamicObject mount;
+    mount.col.named = true;
+    mount.health = 10000;                   // energy sentinel — no drain
+    rt.cs.excludeObj = &mount.col;          // mounted (0x540e6c != 0)
+    rt.mountClass = 0x40030u;               // no &1 — hits reach Kurt
+    playerDamageApply(rt, 10, pt);          // hits the player (no &1)
+    CHECK(rt.fieldHealth == 90);
+    CHECK(near(rt.vert.landingAccum, 10.0, 1e-5));
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    // 0x463faa: e6c != 0 -> eligible = 0 -> no post; accum only decays
+    // (post-clamp: 10 > 5 -> 5 - decay).
+    CHECK(rt.locoState != 0x385 && rt.locoState != 0x3ea);
+    CHECK(near(rt.vert.landingAccum, 5.0 - kDecay, 1e-4));
+    // The producer's own redirect gate is unchanged (class & 1).
+    rt.mountClass |= 1u;
+    playerDamageApply(rt, 10, pt);
+    CHECK(rt.fieldHealth == 90);            // redirected to the mount
+    CHECK(rt.seams.mountDamageCalls == 1);
+  }
+
+  // ---- vertSkip gate: 0x540c7c != 0 suppresses the post -----------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    playerDamageApply(rt, 10, pt);
+    rt.vert.vertSkip = 1;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState != 0x385);           // gated — decay only
+    CHECK(near(rt.vert.landingAccum, 5.0 - kDecay, 1e-4));
+    // Clearing the gate lets the NEXT frame post (accum still >= 5).
+    rt.vert.vertSkip = 0;
+    rt.vert.landingAccum = 6.0f;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x385);
+  }
+
+  // ---- airborne: the 13-unit downward stab decides ----------------
+  {
+    // Hit — falling within 13 units of the z=10 floor: the stab lands,
+    // vertVel clamps to -64.0f (0x4986e0), the post still runs.
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    rt.cs.pos[2] = 15.0f; rt.cs.entryPos[2] = 15.0f;
+    rt.vert.vertVel = -20.0f;               // falling, above -64
+    playerDamageApply(rt, 10, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x385);
+    CHECK(rt.vert.vertVel == -64.0f);
+  }
+  {
+    // Miss — high above the floor: no surface within 13 units -> the
+    // post is suppressed; only the accumulator decay runs.
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    rt.cs.pos[2] = 100.0f; rt.cs.entryPos[2] = 100.0f;
+    rt.vert.vertVel = -20.0f;
+    playerDamageApply(rt, 10, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState != 0x385 && rt.locoState != 0x3ea);
+    CHECK(near(rt.vert.landingAccum, 5.0 - kDecay, 1e-4));
+    CHECK(rt.vert.vertVel != -64.0f);       // no clamp on a miss
+  }
+
+  // ---- post side-effects: unscope + look/fire/scope resets --------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    rt.flagC9c = 1;                         // scoped
+    rt.scopeAnimLatch = 1;
+    rt.look.lookPitchOffset = -9.0f;
+    rt.fieldC74 = 1;                        // fire/punch gate latched
+    playerDamageApply(rt, 10, pt);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x385);
+    CHECK(rt.flagC9c == 0);                 // FUN_00461878 unscope
+    CHECK(rt.scopeAnimLatch == 0);          // FUN_00416700 release
+    CHECK(rt.look.lookPitchOffset == 0.0f); // 0x540d58 = 0
+    CHECK(rt.fieldC74 == 0);                // 0x4641c2 fire-latch kill
+  }
+
+  // ---- god-mode zero-health: tumble, never death ------------------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    rt.fieldHealthGate = 1;                 // 0x541510 != 0 — god mode
+    rt.fieldHealth = 0;
+    rt.vert.landingAccum = 10.0f;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x385);           // 0x46421a — not 0x3ea
+    CHECK(rt.eventPriority == 9);
+    CHECK(rt.fieldEb8 == 0);                // no dead-check, no fade
+  }
+
+  // ---- dead while mounted: eb8 still counts, the post is gated ----
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt; makeLive(rt, f);
+    settle(rt);
+    mdk::DynamicObject mount;
+    mount.col.named = true;
+    mount.health = 10000;                   // energy sentinel — no drain
+    rt.cs.excludeObj = &mount.col;
+    rt.mountClass = 0x40030u;               // no &1 -> damage hits Kurt
+    playerDamageApply(rt, 200, pt);         // health -> 0
+    CHECK(rt.fieldHealth == 0);
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.fieldEb8 == 0xf0);             // the fade still arms
+    // Mounted gate suppresses the {10,0x3ea} post — accum is force-set
+    // to 5.0f then decays one tick per OBSERVED ordering.
+    CHECK(rt.locoState != 0x3ea);
+    CHECK(near(rt.vert.landingAccum, 5.0 - kDecay, 1e-4));
+  }
+}
+
 // Phase 16A — Kurt sprite animation (player_animation.h). Synthetic
 // {u32 count, u32 ofs[N], 8-byte frames} tables exercise the machine:
 // FUN_00461954 dispatch, FUN_00464278/0x464308 advance semantics,
@@ -18003,6 +18340,7 @@ void test_player_sniper() {
     rt.cs.objectDataLoaded = 1;
     rt.cs.pos[2] = 12.0f;
     rt.cs.entryPos[2] = 12.0f;
+    rt.fieldHealth = 100;   // alive — death tail gates on health==0
   };
   const mdk::GameplayInputBindings bindings;   // factory: Sniper=57 Fire=29
   const mdk::FrontendTimingState timing;       // step1 smoothed1 dt=1/30
@@ -20747,6 +21085,7 @@ int main() {
   test_player_sniper();
   test_player_fire();
   test_player_projectiles();
+  test_traversal_damage_dispatch();
   test_arena_render();
   test_arena_mesh();
   test_freefall_init();

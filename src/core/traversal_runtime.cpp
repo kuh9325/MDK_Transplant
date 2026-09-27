@@ -7,6 +7,7 @@
 #include "core/traversal_runtime.h"
 
 #include <algorithm>
+#include <bit>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -1210,6 +1211,30 @@ TraversalFrameResult stepTraversalRuntime(
   // at dispatch end in the original, before the tail below).
   rt.prevFrame = nextFrame;
 
+  // OBSERVED (0x4637f1..0x46382b): the death tail. While the health
+  // gate is off and health is zero the dispatch clears the 0x4ce6e0
+  // control block (FUN_0047d20a, 0xd0 bytes — the semantic input the
+  // rest of the frame consumes; the committed prevFrame is the port's
+  // equivalent) and runs the 0x540eb8 death-fade countdown: armed at
+  // 0xf0 on the first dead frame, then -frameStep per frame with an
+  // extra -0x1e whenever pos.z >= 0x540c10 (the prev-frame z commit —
+  // the countdown accelerates once the body stops descending), floored
+  // at 1. eb8 == 1 is the alternate fade gate below — it engages even
+  // when the tumble post was suppressed (mounted/vertSkip death).
+  if (rt.fieldHealthGate == 0 && rt.fieldHealth == 0) {
+    rt.prevFrame = GameplayInputFrame{};
+    if (rt.fieldEb8 == 0) {
+      rt.fieldEb8 = 0xf0;
+    } else {
+      rt.fieldEb8 -= timing.frameStep;
+      if (rt.fieldEb8 < 0xd2 && rt.cs.entryPos[2] <= rt.cs.pos[2])
+        rt.fieldEb8 -= 0x1e;
+      if (rt.fieldEb8 < 1) rt.fieldEb8 = 1;
+    }
+  }
+  ++rt.seams.hudIndicatorCalls;  // FUN_004696d8 (0x46382c) — HUD
+                               // indicator-object scan seam
+
   // Dispatcher tail (OBSERVED 0x4638xx): with no latched event and
   // no post this frame, the idle restore posts the idle state —
   // code 0x65 on the unmounted path (the 100 variant needs the
@@ -1219,6 +1244,84 @@ TraversalFrameResult stepTraversalRuntime(
     rt.eventType = 1;
     rt.eventMag = 0x65;
   }
+
+  // OBSERVED (0x46387a..0x46422f) — the damage/death dispatcher.
+  // cac == 0x3ea or eb8 == 1 is the death-fade branch: the original
+  // accumulates 0x540dac and, past 255, runs the LASTGAME teardown —
+  // that route is the session-level Phase 14B progressionStepDeath;
+  // inside the dispatch the branch skips the tumble evaluation AND
+  // the accumulator/suppress-window decays entirely.
+  if (rt.locoState != 0x3ea && rt.fieldEb8 != 1) {
+    const bool dead = rt.fieldHealthGate == 0 && rt.fieldHealth == 0;
+    if (dead) rt.vert.landingAccum = 5.0f;      // 0x463f93 force
+    // Eligibility (0x463f9d): the accumulator must hold >= 5.0f
+    // (integer compare on the float bits) AND the player must be
+    // unmounted (0x540e6c == 0) with the vertical integrator running
+    // (0x540c7c == 0).
+    bool eligible = false;
+    if (std::bit_cast<std::int32_t>(rt.vert.landingAccum) >=
+        0x40a00000)                                // JGE — signed
+      eligible = rt.vert.vertSkip == 0 && rt.cs.excludeObj == nullptr;
+    if (eligible) {
+      bool post;
+      if (rt.vert.vertVel == 0.0f &&
+          (rt.vert.contactFlags & 1) != 0) {
+        post = true;        // stationary + grounded — post directly
+      } else {
+        // 0x463fd7 — airborne/moving: a 13-unit downward stab at the
+        // player pos decides (0x4986d8 = -13.0f). A hit means the
+        // floor is just below: the fall speed is clamped to -64.0
+        // (0x4986e0 gate) and the post still runs; a miss suppresses
+        // the tumble outright.
+        const float end[3] = {rt.cs.pos[0], rt.cs.pos[1],
+                              rt.cs.pos[2] - 13.0f};
+        float hitPt[3] = {0.0f, 0.0f, 0.0f};
+        post = rt.cs.arena != nullptr &&
+               collisionStab(*rt.cs.arena, rt.cs.pos, end, hitPt) !=
+                   nullptr;
+        if (post && rt.vert.vertVel > -64.0) rt.vert.vertVel = -64.0f;
+      }
+      if (post) {
+        // 0x46412c: unscope (FUN_00461878), release the scope overlay
+        // latch (FUN_00416700), then post — death {10,0x3ea} beats the
+        // tumble {9,0x385} through the latch below.
+        if (rt.flagC9c != 0) sniperReset(rt);
+        if (rt.scopeAnimLatch != 0) {
+          ++rt.seams.scopeOverlayCalls;
+          rt.scopeAnimLatch = 0;
+        }
+        if (dead) {
+          rt.eventMag = 0x3ea;          // 0x464202 (0x49b284 demo
+          rt.eventType = 10;            //   path has no writer)
+        } else {
+          rt.eventMag = 0x385;          // 0x46421a
+          rt.eventType = 9;
+        }
+        rt.look.lookPitchOffset = 0.0f; // d58 = 0
+        rt.vert.landingAccum = 0.0f;
+        rt.fieldE10 = 3.0f;             // suppress window arms 3.0
+        if (rt.fieldC74 != 0) {         // 0x4641c2 — fire latch kill +
+          rt.fieldC74 = 0;              //   FUN_00469668(0, 3.0f): both
+          rt.seams.hudEventCalls += 2;  //   0x54c5e0/e4 HUD pushes
+        }
+      }
+    }
+    // 0x464016..0x464045 — the accumulator decay tail runs on every
+    // non-fade dispatch: >5.0f clamps to 5.0f first, then d5c decays
+    // by the fixed tick * 0x4986e8 (2.0) — i.e. 2.0/second — while >0.
+    if (std::bit_cast<std::int32_t>(rt.vert.landingAccum) <=
+        0x40a00000) {                              // JLE — signed
+      if (rt.vert.landingAccum > 0.0f)
+        rt.vert.landingAccum -= (1.0f / 30.0f) * 2.0f;
+    } else {
+      rt.vert.landingAccum = 5.0f - (1.0f / 30.0f) * 2.0f;
+    }
+    // 0x464048 — the suppress window decays by the fixed 1/30 tick in
+    // the same tail (moved here from the traversal-active section:
+    // the original runs it inside the dispatch, before the latch).
+    if (rt.fieldE10 > 0.0f) rt.fieldE10 -= 1.0f / 30.0f;
+  }
+
   if (rt.eventPriority < rt.eventType) {
     rt.locoState = rt.eventMag;
     rt.eventPriority = rt.eventType;
@@ -1605,10 +1708,8 @@ TraversalFrameResult stepTraversalRuntime(
   // 0x540d2c — frameStep-decayed countdown (0x431dd8..0x431deb):
   // decrements while positive, may go negative (no clamp).
   if (rt.fieldD2c > 0) rt.fieldD2c -= timing.frameStep;
-  // 0x540e10 — the player-damage suppress window; decays by the FIXED
-  // 1/30 tick (0x46404a: fldz; fcomp; else -= DAT_0049b6f4), not
-  // frameStep and not the smoothed units.
-  if (rt.fieldE10 > 0.0f) rt.fieldE10 -= 1.0f / 30.0f;
+  // 0x540e10 — the suppress-window decay moved into the dispatch tail
+  // where the original runs it (0x464048, skipped on the fade branch).
   rt.fieldE14 = 0;
   // OBSERVED (0x436491..0x4364dd): EAX = 0; when flag541548 == 0 the
   // single call is FUN_00436d60(0) — body only, no bracket. When

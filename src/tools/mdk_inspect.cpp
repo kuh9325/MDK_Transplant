@@ -35,6 +35,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
+#include "core/player_projectiles.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
 #include "core/progression_runtime.h"
@@ -95,7 +96,7 @@ int usage() {
                "                            .CMI + <stem>O.MTO, assembles the\n"
                "                            Phase 5G runtime and steps frames.\n"
                "                            Options: --arena NAME --start X Y Z\n"
-               "                            --yaw DEG --frames N)\n"
+               "                            --yaw DEG --frames N --pdamage A@F)\n"
                "       mdk-inspect --data-path DIR --freefall-runtime "
                "<relative-path>\n"
                "                            (a FALL3D.BNI path; reads the\n"
@@ -1276,6 +1277,16 @@ struct HitSpec {
   int count = 1;
 };
 
+// Phase 16B.1 — `--pdamage AMT@FRM`: applies the authentic producer
+// (playerDamageApply = FUN_0046771c) at the END of frame FRM — the
+// same producer the enemy/projectile/splash passes call — so the
+// dispatch tail consumes the accumulator at frame FRM+1 exactly the
+// way an in-level hit does. Nothing here writes loco/anim state.
+struct PDamageSpec {
+  int amount = 0;
+  int frame = -1;
+};
+
 bool combatBossMatches(const mdk::DynamicObject& o, const char* nm) {
   if (nm[0] == '*') return true;
   // Live-only: the shot scan skips +0x08<=0 objects, and dead
@@ -1555,6 +1566,7 @@ int main(int argc, char** argv) {
   std::string scriptDisasmName;
   std::optional<std::uint32_t> scriptDisasmOff;
   std::vector<HitSpec> hitSpecs;
+  std::vector<PDamageSpec> pdmgSpecs;
   std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
@@ -1699,6 +1711,21 @@ int main(int argc, char** argv) {
         h.objName = spec;
       }
       hitSpecs.push_back(h);
+    } else if (!std::strcmp(a, "--pdamage")) {
+      // Phase 16B.1: "AMT@FRM" — playerDamageApply(AMT) at the end of
+      // frame FRM (post-dispatch, matching the in-level producers).
+      const char* v = value(a);
+      if (!v) return usage();
+      PDamageSpec d;
+      const std::string spec = v;
+      const auto at = spec.find('@');
+      if (at == std::string::npos) {
+        std::fprintf(stderr, "--pdamage wants AMT@FRM\n");
+        return usage();
+      }
+      d.amount = std::atoi(spec.substr(0, at).c_str());
+      d.frame = std::atoi(spec.c_str() + at + 1);
+      pdmgSpecs.push_back(d);
     } else if (!std::strcmp(a, "--boss")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -3041,6 +3068,29 @@ int main(int argc, char** argv) {
           (double)out.camera.pos[2],
           out.overheadViewActive ? " OVH" : "",
           out.viewOnPartner ? " VP" : "");
+      // Phase 16B.1 — authentic damage probes: the producer lands at
+      // end-of-frame (post-dispatch), exactly where the in-level
+      // enemy/projectile passes call it; the next frame's dispatch
+      // tail consumes the accumulator.
+      if (!pdmgSpecs.empty()) {
+        std::printf(
+            "      dmg hp=%d accum=%.3f e10=%.3f eb8=%d dac=%d "
+            "st=%03x ev=%d/%d\n",
+            (int)rt.fieldHealth, (double)rt.vert.landingAccum,
+            (double)rt.fieldE10, (int)rt.fieldEb8, (int)rt.fieldDac,
+            (unsigned)rt.locoState, (int)rt.eventType,
+            (int)rt.eventMag);
+        for (const auto& d : pdmgSpecs) {
+          if (d.frame != f) continue;
+          const int hpBefore = rt.fieldHealth;
+          mdk::playerDamageApply(rt, d.amount, rt.cs.pos);
+          std::printf(
+              "      pdmg f=%03d amt=%d hp=%d->%d accum=%.3f "
+              "(authentic FUN_0046771c producer)\n",
+              f, d.amount, hpBefore, (int)rt.fieldHealth,
+              (double)rt.vert.landingAccum);
+        }
+      }
       for (const auto& ap : rt.arenas) {
         static std::uint32_t lastF58[64] = {};
         static std::uint32_t lastPc[64] = {};

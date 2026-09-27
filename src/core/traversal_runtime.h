@@ -243,6 +243,7 @@ struct TraversalSeams {
                                 // FUN_00402014 HUD-resource seams
   int sniperFireCalls = 0;        // FUN_0045f138 projectile spawn
   int animEventCalls = 0;         // FUN_00469668 anim-event seam
+  int hudIndicatorCalls = 0;      // FUN_004696d8 dispatch-tail HUD scan
   int itemUseCalls = 0;           // FUN_00459d28 item activation
   int reticleSpawnCalls = 0;      // FUN_0046153c + FUN_00454794 +
                                 // FUN_00454af8 + FUN_0045612c +

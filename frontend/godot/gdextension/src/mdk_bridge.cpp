@@ -113,6 +113,8 @@ void MdkBridge::_bind_methods() {
       D_METHOD("diagnostic_start", "arena_index", "pos_mdk",
                "yaw_deg"),
       &MdkBridge::diagnostic_start);
+  ClassDB::bind_method(D_METHOD("diagnostic_damage", "amount"),
+                       &MdkBridge::diagnostic_damage);
 }
 
 void MdkBridge::setError_(const std::string& msg) {
@@ -177,6 +179,12 @@ bool MdkBridge::load_level(const String& dti_rel_path) {
     rt_.reset();
     return false;
   }
+  // Standalone arena run — no campaign carry-in, so seed the
+  // observed live-player health (150, per real saves; same
+  // convention as mdk-inspect --traversal-runtime). The
+  // damage/death dispatcher (FUN_00463608 dead-check) treats
+  // health==0 && gate==0 as dead.
+  if (rt_->fieldHealth <= 0) rt_->fieldHealth = 150;
 
   levelStem_ = stem;
   levelDir_ = dir;
@@ -1249,6 +1257,28 @@ Dictionary MdkBridge::diagnostic_start(int64_t arena_index,
   // stepped frame.
   updateDisplaySet_();
   refreshOrders_();
+  return out;
+}
+
+Dictionary MdkBridge::diagnostic_damage(int64_t amount) {
+  Dictionary out;
+  if (!rt_) {
+    setError_("no level loaded");
+    return out;
+  }
+  // The exact producer the enemy/projectile/splash paths call —
+  // FUN_0046771c. The dispatch tail consumes the accumulator on the
+  // next step; nothing here touches loco/anim state.
+  const float pt[3] = {rt_->cs.pos[0], rt_->cs.pos[1],
+                       rt_->cs.pos[2]};
+  mdk::playerDamageApply(*rt_, static_cast<int>(amount), pt);
+  out["ok"] = true;
+  out["health"] = static_cast<int64_t>(rt_->fieldHealth);
+  out["accum"] = static_cast<double>(rt_->vert.landingAccum);
+  out["suppress"] = static_cast<double>(rt_->fieldE10);
+  out["fade"] = static_cast<int64_t>(rt_->fieldEb8);
+  out["loco_state"] = static_cast<int64_t>(rt_->locoState);
+  out["event_priority"] = static_cast<int64_t>(rt_->eventPriority);
   return out;
 }
 

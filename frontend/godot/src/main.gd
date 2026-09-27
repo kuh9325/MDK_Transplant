@@ -1419,6 +1419,72 @@ func _run_smoke(data_root: String) -> void:
 	_check(saw_turn_fire, "turn+fire -> K_TRN45 main frame")
 	_check(saw_overlay, "muzzle overlay presented (K_MUZZF)")
 
+	# ---- 16B.1: authentic damage/death dispatch ----
+	# Damage enters ONLY through the core producer
+	# (diagnostic_damage -> playerDamageApply == FUN_0046771c); the
+	# dispatcher (FUN_00463608, 0x463f9d..0x46422f) consumes the
+	# accumulator on the NEXT frame and posts {9,0x385} or
+	# {10,0x3ea}; Phase 16A selection maps those to K_BANG/K_BFLIP.
+	# Nothing below writes loco/anim state from GDScript.
+	var dd0: Dictionary = bridge.diagnostic_damage(0)
+	var hp0 := int(dd0["health"])
+	var dd1: Dictionary = bridge.diagnostic_damage(15)
+	_check(bool(dd1.get("ok", false)), "damage producer applies")
+	_check(int(dd1["health"]) < hp0 and int(dd1["health"]) > 0,
+		"nonlethal hit reduced health")
+	_check(float(dd1["accum"]) >= 5.0,
+		"accumulator past the 5.0 post gate")
+	var saw_bang := false
+	var saw_bflip := false
+	var tumble_state := false
+	var ktex0 := int(bridge.get_kurt_snapshot()["tex_cache"])
+	for i in 130:
+		_step_n({}, 1)
+		var kd: Dictionary = bridge.get_kurt_snapshot()
+		if int(kd["loco_state"]) == 0x385:
+			tumble_state = true
+		var md: Dictionary = kd["main"]
+		if not md.is_empty():
+			if String(md["table_name"]) == "K_BANG":
+				saw_bang = true
+			elif String(md["table_name"]) == "K_BFLIP":
+				saw_bflip = true
+	_check(tumble_state, "dispatch posted 0x385 tumble state")
+	_check(saw_bang, "tumble presented K_BANG main frames")
+	_check(saw_bflip, "tumble chained into K_BFLIP")
+	# Settle past the suppression window, then the lethal hit —
+	# the producer refuses damage while e10>0 / loco==0x385.
+	_wait_rest(120)
+	var dd2: Dictionary = bridge.diagnostic_damage(500)
+	_check(int(dd2["health"]) == 0, "lethal hit floored health at 0")
+	var death_state := false
+	for i in 40:
+		_step_n({}, 1)
+		var ke: Dictionary = bridge.get_kurt_snapshot()
+		if int(ke["loco_state"]) == 0x3ea:
+			death_state = true
+		var me: Dictionary = ke["main"]
+		if not me.is_empty():
+			_check(String(me["table_name"]) == "K_BANG",
+				"death presents K_BANG")
+			_check(bool(ke["drawn"]), "death sprite drawn")
+	_check(death_state, "dispatch posted 0x3ea death state")
+	# Terminal: 0x3ea never releases; the dead-check fade countdown
+	# is armed and counting (a 0-amount call is a producer no-op —
+	# hp==0 && gate==0 — used here only as a live-state read).
+	var dd3: Dictionary = bridge.diagnostic_damage(0)
+	_check(int(dd3["loco_state"]) == 0x3ea,
+		"0x3ea terminal, no re-entry")
+	_check(int(dd3["event_priority"]) == 10,
+		"death event priority 10")
+	_check(int(dd3["fade"]) > 0, "death fade armed (eb8 countdown)")
+	var ktex1 := int(bridge.get_kurt_snapshot()["tex_cache"])
+	_check(ktex1 - ktex0 < 64,
+		"texture cache bounded through damage/death")
+	var km_end: TextureRect = $KurtLayer/KurtViewport/KurtMain
+	_check(km_end.visible and km_end.texture != null,
+		"KurtMain still presents during death")
+
 	print("smoke: %d failure(s)" % failures)
 
 
