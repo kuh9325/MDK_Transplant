@@ -5371,7 +5371,7 @@ link-target operands, not opcodes.
 | L6 OLYM_4 | NO (mid-level) | turret gallery + XG arena: 6×XBGUN (hp 65000 sentinel), SW_H50, 4×XG (XG_BOD hp 60), TARGET1–9 loop | namedLink "XG1_HEAD" (+0x21e elem mark) | XG1_HEAD elem → `health 65000` invulnerable-set + refEmit "XG1_BODY" 2 3 + elKill "XG1_HEAD" (dismount, OBSERVED harness) | handlers @0x82e4/0x82f3/0x8302 (timeLink/namedLink/losLink) in shared XG body @0x7671 | none in stream — terminal site is OLYM_10$XB2_0 `83 00` @0x15acd | other (count/link gates); gaps: `0xdb` XBGUN aim gate, `0x8a` FX rig (t3 tail dies after loop — non-blocking) |
 | L3 HMO_10 | YES | twin-script boss: XB3 mech (PEN_16-family head) + XW3 wheel-turret (PEN_111, 8 elems: 4× XW3_GUN + shell) | `namedLink "XW3_GUN1..4"` (elem mark +0x21e) on XW3 | XW3_GUN elements — direct hits only during `elemUnmask` windows (deploy @0x200ad; re-mask on fire/`elKill` latch) | gun deaths `elKill`+`bitset grp2 bit2..4`+counter → `varcmpLink grp2.0==4` @0x20164 → bcast XB3 death handler @0x1ff73 | grp1-bit15 writer @0x1fffd → arena `brSet` @0x1fe22 → `wait 2`/`setG 0` → `83 00` @0x1fe35 | `0x83` subop 0 — GOLDEN `endLevel=1` |
 | L4 MEAT_10 | YES | glass-shell boss: XCBOSS shell (hp 65000 sentinel, GLASS3) + XC core (hp 10000 pinned, 20-elem perch model) | `0x7f` hpLink `health<9950` on XC | XC via shots detonating on XCBOSS shell tris (aux≈0 inside diag/2; `+0x2c4=2.0` gate rejects borderline blasts; XCBOSS sentinel-immune) | DEADON arm `grp2[0] += 50`/dip → `varcmpLink` ≥300 → `10 00 00` → frag @0x1ae6c → grp1 bit1 | arena `brSet` bit1 → @0x1a84e `wait12`/`setG 0` → `83 00` @0x1a856 | `0x83` subop 0 — GOLDEN `endLevel=1` |
-| L5 MUSE_4 | NO (mid-level) | ammo/pickup scripted arena (t3 @0x61bc; `0xae` ammoLink family) | none | none | none | none — terminal site is MUSE_5-path `83 51` @0xb6e9 | other |
+| L5 MUSE_4 | NO (mid-level) | wave/turret gallery: XGUNTAM gun-turret (hp 65000 sentinel; damage pool = scriptLocals `grp2[0]`=800) + X4_TOWER decor (hp 65000) + ambient XG/XC/XF waves via `wpick` + 11-arm `0x64eb` contextual-resupply dispatcher (grp1 bits 19–31 one-shots + ammo/hp/inv need-checks) | `namedLink "ANY"` typed hits → drain arm `grp2[0] −= 20/80` on XGUNTAM | XGUNTAM `grp2[0]` pool — `varcmpLink` @0x6400 vs 0 → `0x6417` death arm | `0x6417` `bitset grp1 bit13` (sole writer) → `0x64f2` `brSet` halts resupply; tail = anims + `59 "TANKDROP"` sfx + `04` bcast remote-call `0x6469` on X4_TOWER + `4c 0` deathRef-clear + `animWait 0x7fff` hold (corpse park — OBSERVED pc +6459) | none in stream — terminal site is MUSE_5-path `83 51` @0xb6ed | no `0x83`/`0x51` opcode in span `0x61bc..0xa761` (all `83`/`51` bytes are wpick/link operands; `0x83a8`/`0x83d6`/`0x8404` `83 00` stubs are unreachable orphans); grp2 bit29 = wave-sequence tick consumed by `0x82bf`/`0x9434` watchers → maneuver wpicks `0x830c`/`0x9481`, NOT completion |
 | L8 GUNT_5 | NO (mid-level) | XG-spawn/computed-call arena (t3 @0xfb8d) | cnt/var gates | TBD | `0xb7` swCall chains | none | other |
 | L8 GUNT_8 | NO (precursor) | ship/support scripted arena (t3 @0x1b256) | cnt/var gates | TBD | TBD | none — terminal site is GUNT_10 `83 00` @0x21ff7 | other |
 | L8 GUNT_10 | YES (deferred) | XGUNTAM/XBO multi-stage | `cntLink "XG" 6` | XBSHIP T1–T7 elems | object handlers @+21d6a | `83 00` @0x21ff7 | `0x83` subop 0 — INDETERMINATE retail outcome (stale-leader rank gate; strong lean ORIGINAL DEADLOCK); no native fix; live oracle DEFERRED |
@@ -5538,3 +5538,121 @@ sweep (10 shotHits → 6 qualifying dips → `wait12` continuation →
 `83 00`), `objDeathCalls=0` (the VM `0x10`/`0xb8` fragment handoff
 sets `+0x108/+0x230` directly — the runtime `objectDeathBoundary`
 seam isn't on this path), `diag=0`.
+
+### MUSE_4 — NON-CRITICAL, wave/turret gallery (OBSERVED, real-data harness)
+
+Reclassified after a full-span boundary scan: **MUSE_4 owns no
+completion opcode.** Every `0x83`/`0x51` byte in its span
+`0x61bc..0xa761` is a `wpick`/linkage operand; the three `83 00 00 ff`
+blocks at `0x83a8`/`0x83d6`/`0x8404` are unreachable orphans (zero
+incoming links — dead tails left by script edits). `endLevel=0` in the
+harness is authentic, not a missing watcher. LEVEL5's terminal op is
+`83 51` (cinematic arg > 0x32 → `FUN_0047baf4` → arg `0x51` →
+`FUN_0047b038` → mode 8, §171) at **MUSE_5 `0xb6ed`** — block
+`0xb6e5: animBind 0x173985; animWait 0x7fff; 83 51; stop; end`, linked
+from `0xb6c0`'s `pathLink`/`condLink` arms. The earlier "0x830c =
+ending wpick" read was wrong: `0x830c`/`0x9481` are drone
+**maneuver-variant** wpicks (anim/rayLink/latImp blocks), reached via
+the `0x82bf`/`0x9434` `brSet grp2 bit29` watchers.
+
+Object-VM work this phase (all OBSERVED — handler disasm + real-data
+site decode):
+
+- `0x64` `partnerArena` — arena-side `{lstr}`; `FUN_00432e2c` name →
+  record → `FUN_00432d9c` attach/spawn partner. MUSE_4's `0x6243` wake
+  arm (once-only via grp2 bit2 test-and-set): `surfop 10/11=1` +
+  `partnerArena "CMUSE_4"` — observed `partner=1`.
+- `0xc1` `faceTravel` — `{u8 sel, [lstr iff sel==3]}`; sel1 sets
+  `+0x4c` yaw = bearing(vel.y, vel.x), sel2 adds `+0x13c` pitch =
+  bearing(vel.z, xyLen), sel3 copies a named object's yaw; the
+  normalize loops are dead-code (same quirk family as `0x65`).
+- `0x57` `gazeLink` — `{u16 lo, u16 hi, u8 angle, linkage}`; 3D range
+  + view-cone (`0x540c2c` locomotion yaw, linear threshold
+  `((ang−90)/hi)·dist+90`) + `0x540bfc+5 → obj+2` LOS stab over the
+  current and partner arenas.
+- `0x79` `floorLink` — `{f32 drop, linkage}`; `FUN_00418c60` segment
+  stab `pos → pos.z−drop` on the bound arena (+partner).
+- `0xdd` `wayBind` — `{u8 sel, linkage}`; weighted-random pick over
+  the bound arena's type-8 DTI records (sel1 = nearest-zone±3
+  excluded; else 50–500u ring; weight = `round(500−d2)` +
+  `round(200−dcam)` iff `dcam<200` + `250` player/camera quadrant
+  bonus − `round(|dz|·0.5)`, min 1; `enemyRandBelow` pick) → target
+  xyz → `+0x120`, subtype `0xdd`, mover fields cleared; linkage fires
+  only on a bind. OBSERVED fail on MUSE_4/CMUSE_4 (no type-8 records —
+  authentic).
+- `0x69` `homeSteer` — `{f32 f,l,o,a,j}`; steers `+0x4c`/`+0x13c`
+  toward the `0x54c6c4`-anchored point rotated by `0x54c6c0` yaw +
+  `oz`, with distance-scaled jitter (XF1_MISS missile steer).
+- `0xc9` `latImp` — `{f32 dist, f32 ang}` → `+0x294/+0x298` lateral
+  impulse.
+- `0x7a` `pitchApp` — `{f32 rate, f32 target}`; rate-limited
+  `+0x13c` approach, wrapped delta clamp.
+- `0xf1` `hpLink` — `{u8 kind, f32 a, [f32 b iff 7|8], linkage}`;
+  `FUN_0045ad40(kind, fild(0x541554)=player health, a, b)`. The
+  handler was already in the object VM; the **shared dispatch table
+  serves both contexts**, so the arena VM needed the same case —
+  the `0x64eb` resupply dispatcher's SW_* arms gate on it
+  (`f1 04 <100.0>` ≈ "health < 100 → drop SW_H100", +6580).
+
+Encounter structure (decode + live dumps, all OBSERVED):
+
+- `XGUNTAM` — the gallery boss: hp `65000` sentinel (never damageable
+  directly); the real damage pool is `grp2[0]` = `scriptLocals[0]` =
+  **800**, drained −80/typed-hit via the `namedLink "ANY"` arm.
+- `X4_TOWER` — decor shell (`hp 65000`, 4-elem aabb
+  374..394/241..261/−1750..−1490), bound to XGUNTAM at init via the
+  `04` bcast select (`f138=XGUNTAM` leader, pc → `0x6469` arm).
+- Wave drones — `XG`/`XC`/`XF`/`XTGUN` spawned by `wpick` wave blocks;
+  each runs the shared dispatcher spine (`0x81c0`/`0x89dc`/`0x92a0` —
+  `pathBind`/`camDistLink`/`mountLink`/`floorL`/`probLink`) with
+  per-phase watcher+maneuver chains. `grp2 bit29` is the
+  wave-sequencer tick: set by ~10 phase-transition blocks
+  (`0x8690`, `0x914c`, `0x9805`, `0x9b53`, …), consumed by the
+  `0x82bf`/`0x8adb`/`0x9434` watchers → maneuver wpicks; cleared at
+  `0x937c`. It is NOT a completion flag.
+- `0x927b` phase router — `cntLink "XT"≠0 → 0x81c0`, `cntLink
+  "XC"≠0 → 0x89dc`, else `→ 0x92a0` (the second dispatcher).
+- `0xa4d1` shared event arm — `namedLink "ANY" → 0xa434` (damage
+  routing), `losLink → 0x9eee`, `markLink → 0x9217` (→ `0x9b53`
+  sequencer), `viewLink → 0x9227` (→ `0x9805` attack arm); rcall'd by
+  every wave block.
+
+Authentic chain (harness `--hit 'XGUNTAM:2xN'`, `--start 385 140
+−1560` inside the `0x6210` box3d wake — OBSERVED):
+
+1. Typed hits route `namedLink "ANY"` → drain arm: `grp2[0]` 800 →
+   −80 across ~10 hit batches (`L=[800…−80]` on the boss dump).
+2. `0x6400` `varcmpLink grp2[0] vs 0` gate → `0x6417` death arm:
+   **`bitset grp1 bit13`** (observed `flags58` bit `0x2000`) →
+   `clr148 0x80000000` → death anims `0x49ae1`/`0x49ad5` + `animWait`
+   → `setYaw 270` → `camFx 0` → `59 00 "TANKDROP"` sfx →
+   `04 07 →0x6469` + `04 09 "X4_TOWER"` remote call → `animWait
+   0x7fff` → `4c 0` deathRef-clear → `6e`/`ff` (parked — corpse-hold,
+   pc +6459 OBSERVED 3000f, collapse loop anim still ticking).
+3. `grp1 bit13`'s only consumer: `0x64f2` — the `0x64eb` dispatcher's
+   `brSet 1 13 linkfd` — halts the 11-arm contextual resupply (SW_*
+   drops spawn only during the fight).
+4. `endLevel=0` — **authentic** (no boundary op exists).
+
+XC watchdog spin (OBSERVED, authentic): an XC drone parked under the
+`+72d6` re-check block hits `0x0e viewLink(400u, 30°cone) → 0x6e36`,
+which re-enters the maneuver head inside the same pass while the
+player stays in-cone. After ~100 insns the `0xde` insn-count watchdog
+(`kind 2`, a=100.0) takes the short path `0x6f29 → +72d6` — still
+viewLink-gated — so an in-cone camp spins ~16-op iterations until the
+interpreter's own 1000-command cap fires the OBSERVED "Alien %s
+looped" diagnostic and kills that XC's script (`field108`=0). This is
+the original's own loop guard doing exactly what it was built for —
+`diag=1` in the harness is authentic, not a port defect. (The
+waypoint-less-arena sibling path is `0xdd` bind-fail → `+0x11e`=0 →
+`0x2c subtLink`/`0xec floorL` → 6e36 — same watchdog rescue.)
+
+Golden state (3000–5000f): `diag=0` typical (`diag=1` when the XC
+in-cone spin happens to fire), all gate/contact/partner checks PASS,
+XGUNTAM pool drained to `L=[−80]` and parked at `pc=+6459` (death
+tail), **`flags58` bit13 set** (`0x748024d8`), X4_TOWER woken by the
+`04` broadcast (`pc=+646d`, `f230` resume ptr, `f138=XGUNTAM`), both
+objects tearing down by end-of-run, `objDeathCalls` ~258–360 (wave
+casualties), spawn log covers XG/XC/XF waves + the `0xf1`-gated SW_*
+resupply drops, `endLevel=0`/`ending=0` as designed — MUSE_4's exit
+is the door/route onward, not a script boundary.

@@ -13365,6 +13365,156 @@ void test_traversal_object_script() {
     CHECK(f.rt.seams.bombBounceCalls == 0);
     CHECK(f.rt.seams.objectTeardownCalls == 1);
   }
+
+  // --- MUSE_4 (L5) opcode set ----------------------------------------
+  // Object ops 0x57 gazeLink / 0x69 homeSteer / 0x79 floorLink /
+  // 0x7a pitchApp / 0xc9 latImp / 0xc1 faceTravel / 0xdd wayBind and
+  // arena op 0x64 partnerArena (OBSERVED — handler disasm + MUSE_4
+  // site decode; the wave/turret encounter has no 0x83/0x51 boundary).
+
+  // --- obj op 0x7a: pitchApp (0x44d776) -----------------------------
+  // {f32 rate, f32 target} — +0x13c bank approaches target by
+  // rate*(1/30), wrapped to (-180,180] and clamped to the remaining
+  // delta. XF1_MISS uses it at +6b81/+6b17.
+  {
+    ScriptFixture f;
+    f.write(C, {0x7a});
+    f.writeF(C + 1, 90.0f);  f.writeF(C + 5, 30.0f);
+    f.write(C + 9, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.bankDeg = 0.0f;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(near(o.bankDeg, 3.0, 1e-5));        // 90*(1/30) toward 30
+  }
+  {
+    // Wrap-shortest-path: target 350 vs bank 10 -> dev 340 -> >180 arm
+    // −360 -> −20; negative arm steps −rate*(1/30)=−3 -> bank 7.
+    ScriptFixture f;
+    f.write(C, {0x7a});
+    f.writeF(C + 1, 90.0f);  f.writeF(C + 5, 350.0f);
+    f.write(C + 9, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.bankDeg = 10.0f;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(near(o.bankDeg, 7.0, 1e-5));        // −20° delta, −3 step
+  }
+  {
+    // Step clamps to the remaining delta (no overshoot).
+    ScriptFixture f;
+    f.write(C, {0x7a});
+    f.writeF(C + 1, 90.0f);  f.writeF(C + 5, 1.0f);
+    f.write(C + 9, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.bankDeg = 0.0f;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(near(o.bankDeg, 1.0, 1e-5));
+  }
+
+  // --- obj op 0xc9: latImp (0x441bfb) -------------------------------
+  // {f32 dist, f32 angDeg} — lateral impulse: the handler resolves a
+  // sin/cos pair and writes the +0x294/+0x298 accumulators.
+  {
+    ScriptFixture f;
+    f.write(C, {0xc9});
+    f.writeF(C + 1, 4.0f);  f.writeF(C + 5, 90.0f);
+    f.write(C + 9, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    // OBSERVED convention: ang 90° -> pure lateral — the impulse
+    // lands on the +0x294/+0x298 pair (values per FUN_00437f98).
+    CHECK(near(o.animImpulse[0], 4.0, 1e-4) ||
+          near(o.animImpulse[1], 4.0, 1e-4));
+    CHECK(std::fabs(o.animImpulse[0]) < 1e-3 ||
+          std::fabs(o.animImpulse[1]) < 1e-3);
+  }
+
+  // --- obj op 0xc1: faceTravel (0x441ef5) ---------------------------
+  // {u8 sel[, lstr iff sel==3]} — sel1: +0x4c yaw =
+  // bearing(vel.y, vel.x); sel2 adds +0x13c pitch =
+  // bearing(vel.z, xyLen); sel3 copies a named object's yaw; the
+  // normalize loops are dead-code (same quirk family as 0x65).
+  {
+    ScriptFixture f;
+    f.write(C, {0xc1, 1, 0xff});              // sel1
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.field28 = 0.0f; o.field2c = 10.0f; o.field30 = 0.0f;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(near(o.yawDeg, 90.0, 1e-4));
+  }
+  {
+    ScriptFixture f;
+    f.write(C, {0xc1, 2, 0xff});              // sel2: yaw + pitch
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.field28 = 0.0f; o.field2c = 0.0f; o.field30 = 10.0f;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(near(o.yawDeg, 0.0, 1e-9));         // vx==vy==0 keeps yaw
+    CHECK(near(o.bankDeg, 90.0, 1e-4));       // z-only -> pitch 90
+  }
+  {
+    // sel0/other: no-op.
+    ScriptFixture f;
+    f.write(C, {0xc1, 0, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.field28 = 10.0f; o.field2c = 10.0f;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(!r.error);
+    CHECK(near(o.yawDeg, 0.0, 1e-9));
+  }
+
+  // --- arena op 0x64: partnerArena (0x44c032) ------------------------
+  // {lstr name} -> FUN_00432e2c -> FUN_00432d9c: "" detaches, name ->
+  // scan the arena table -> attach as 0x540ca4 partner (MUSE_4 wake
+  // binds "CMUSE_4"); miss -> "arena not found".
+  {
+    ScriptFixture f;
+    travArenaAdd(f.rt, "CMUSE_4");
+    f.write(C, {0x64});
+    f.writeStr(C + 1, "CMUSE_4");
+    f.write(C + 10, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.partner == f.rt.arenas[1].get());
+    CHECK(f.rt.partnerActive);
+  }
+  {
+    // "" -> detach.
+    ScriptFixture f;
+    mdk::TraversalArena* p = travArenaAdd(f.rt, "CMUSE_4");
+    f.rt.partner = p;
+    f.rt.partnerActive = true;
+    f.write(C, {0x64});
+    f.writeStr(C + 1, "");
+    f.write(C + 3, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.partner == nullptr);
+    CHECK(!f.rt.partnerActive);
+  }
+  {
+    // Unknown name -> diag failure (OBSERVED fatal in the original).
+    ScriptFixture f;
+    f.write(C, {0x64});
+    f.writeStr(C + 1, "NOPE_9");
+    f.write(C + 9, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.error);
+  }
 }
 
 // ---------------------------------------------------------------------------

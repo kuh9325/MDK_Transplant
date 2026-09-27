@@ -5,8 +5,10 @@
 
 #include "core/traversal_script.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "core/traversal_runtime.h"
 #include "core/player_surface.h"
@@ -107,6 +109,16 @@ ScriptCtxSlots ctxSlots(DynamicObject& o) {
 }
 
 static inline int varIndex(std::uint8_t idx) { return idx < 4 ? idx : 0; }
+
+// FUN_00432ec4 — arena-name lookup. The arena record's name is at the
+// record start; the original logs "arena %s not found" on a miss and
+// the 0x95 handler aborts the spawn when it returns 0.
+static TraversalArena* traversalFindArena(TraversalRuntime& rt,
+                                          const std::string& name) {
+  for (const auto& ap : rt.arenas)
+    if (ap && ap->name == name) return ap.get();
+  return nullptr;
+}
 
 // FUN_004553d0 (OBSERVED 0x4553d0): quadratic roots of A t^2 + B t + C.
 // Returns false when B^2 - 4AC < 0. r1 = (sqrt(D) - B) / 2A,
@@ -808,6 +820,26 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       break;
     }
 
+    case 0xf1: {                            // hp cmp link (0x44deb9)
+      // {u8 kind, f32 a, [f32 b if kind==7|8], linkage}. OBSERVED:
+      // same handler the object VM uses — FUN_0045ad40(kind,
+      // fild(0x541554)=player health, a, b). The shared dispatch
+      // table serves both contexts; MUSE_4's resupply dispatcher
+      // gates its SW_* drops on this op (+6580, arena side).
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      if (!r.ok) { fail("hplink args"); return res; }
+      Linkage L;
+      if (!readLinkage(r, L)) { fail("hplink"); return res; }
+      const float hp = (env.rt != nullptr)
+                           ? static_cast<float>(env.rt->fieldHealth)
+                           : 0.0f;
+      applyLink(L, cmpOp5ad40(kind, hp, va, vb));
+      break;
+    }
+
     case 0xd8: {                            // var += f32*(1/30)
       // {u8 mode, u8 idx, f32 scale}. OBSERVED (0x447438) — same
       // handler as the object VM: the 4-byte operand is loaded with
@@ -1108,6 +1140,27 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
         surfacePolyOp(s.polys, s.polyCount, sid, 2);
         s.opMaskB |= (1u << (sid & 31));
       }
+      break;
+    }
+    case 0x64: {                            // partnerArena {lstr} (0x44c032)
+      // {lstr name} -> FUN_00432e2c(name): "" -> FUN_00432d9c(0)
+      // (partner detach); else scan the level arena table
+      // (0x54c670, stride 0x466) -> FUN_00432d9c(rec): rec==cur ->
+      // attach side-effects only; rec!=partner -> 0x540ca4=rec +
+      // geometry ensure + connector pull-in; then 0x540ca8=1 + the
+      // +0x44 bit-2 spawn-once gate. Miss -> "arena %s not found"
+      // (FUN_00408eb0 fatal). LEVEL5 MUSE_4's box3d wake block binds
+      // "CMUSE_4" as the partner arena (+6250).
+      const std::string nm = r.str();
+      if (!r.ok) { fail("partnerArena"); return res; }
+      if (env.rt == nullptr) break;
+      if (nm.empty()) {
+        traversalDetachPartner(*env.rt);
+        break;
+      }
+      TraversalArena* a = traversalFindArena(*env.rt, nm);
+      if (a == nullptr) { fail("arena not found"); return res; }
+      traversalAttachPartner(*env.rt, *a);
       break;
     }
 
@@ -2137,6 +2190,19 @@ void objScriptInsn(ObjScriptPass& v) {
     }
     return;
   }
+  case 0xc9: {                            // lateral impulse (0x441bfb)
+    // {f32 dist, f32 angDeg}. OBSERVED: +0x294/+0x298 +=
+    // dist*(cos,sin)(+0x4c + ang) — a sideways kick into the
+    // animImpulse accumulator (the FUN_00437f98 sincos pair runs
+    // on yaw + operand 2). LEVEL5 MUSE_4 XG/XG_BOD evasion hop.
+    const float dist = r.f32(), ang = r.f32();
+    if (!r.ok) { v.fail("latimp"); return; }
+    float sn, cs;
+    sincosDeg(obj.yawDeg + ang, &sn, &cs);
+    obj.animImpulse[0] += dist * cs;
+    obj.animImpulse[1] += dist * sn;
+    return;
+  }
   case 0xd8: {                            // var += f32*(1/30)
     // {u8 mode, u8 idx, f32 scale}. OBSERVED (0x447438):
     // the operand is loaded with `fld dword` (f32, not integer) —
@@ -2834,6 +2900,59 @@ void objScriptInsn(ObjScriptPass& v) {
       traversalScriptSpawn(env, x, y, z, 0.0f, 0, cls, "", scOff, 1);
       return;
     }
+    case 0x57: {                              // player-gaze link (0x43ef1c)
+      // {u16 lo, u16 hi, u8 angDeg, linkage} — OBSERVED predicate
+      // FUN_0045d9e0: dist3d(ctx+0x10, player 0x540bfc) must land in
+      // [lo,hi]; dev = fabs(0x540c2c - bearing(player->obj)) wrapped
+      // down from >=360 by -360 (the <0 arm is dead after fabs);
+      // thresh = (ang-90)/hi*dist + 90 — the same linear-shrink
+      // family as FUN_0045d880's cone test. Pass iff dev <= thresh
+      // or dev >= 360-thresh, then LOS: FUN_00418c60 stabs the
+      // segment player.z+5 -> obj.z+2 on c48, plus partner when
+      // attached and carrierBusy==0; any hit fails the link.
+      // LEVEL5 MUSE_4 XG/XG_BOD uses it (+900e) as the gaze gate.
+      const float lo = static_cast<float>(r.u16());
+      const float hi = static_cast<float>(r.u16());
+      const float ang = static_cast<float>(r.u8());
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("viewcone"); return; }
+      bool cond = false;
+      if (env.rt != nullptr && env.currentArena != nullptr) {
+        const float* pp = env.rt->cs.pos;            // 0x540bfc
+        const float dx = obj.pos[0] - pp[0];
+        const float dy = obj.pos[1] - pp[1];
+        const float dz = obj.pos[2] - pp[2];
+        const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist >= lo && dist <= hi) {
+          float dev = std::fabs(env.rt->motion.yawDeg -
+                                bearingDeg(dy, dx)); // |yaw - bearing|
+          while (dev >= 360.0f) dev += -360.0f;      // OBSERVED fadd
+          const float thresh = (ang - 90.0f) / hi * dist + 90.0f;
+          if (dev <= thresh || dev >= 360.0f - thresh) {
+            const float a[3] = {pp[0], pp[1], pp[2] + 5.0f};
+            const float b[3] = {obj.pos[0], obj.pos[1],
+                                obj.pos[2] + 2.0f};
+            float hit[3];
+            cond = collisionStab(env.currentArena->dyn.col, a, b,
+                                 hit) == nullptr;
+            if (cond && env.rt->partner != nullptr &&
+                env.rt->cs.carrierBusy == 0) {
+              cond = collisionStab(env.rt->partner->dyn.col, a, b,
+                                   hit) == nullptr;
+            }
+          }
+        }
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
     case 0x9c: {                              // spawn at ref-point (0x449fae)
       // {u8 refIdx, lstr class, u32 scOff}. OBSERVED: same
       // FUN_00454af8 arm as op-0x56 — the position is the object's
@@ -2982,6 +3101,61 @@ void objScriptInsn(ObjScriptPass& v) {
       case 0x0c: if (cond) v.doGoto(L.a); break;
       case 0xfd: if (cond) v.doReturn(); break;
       default: break;
+      }
+      return;
+    }
+    case 0x79: {                              // down-stab link (0x44d447)
+      // {f32 drop, linkage} — OBSERVED: FUN_00418c60 stabs the
+      // segment (pos.x, pos.y, pos.z-drop) -> pos on the bound
+      // arena's collision (the frame's +0x28 descriptor, same
+      // single-arena walk as op-0x73's FUN_00418c60 call). Hit ->
+      // the linkage fires; miss falls through. LEVEL5 MUSE_4
+      // XF/XF1_MISS uses it (+6a74) as a floor-proximity gate.
+      const float drop = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("downlink"); return; }
+      const DynamicArena* bound =
+          (obj.arena != nullptr) ? obj.arena
+                                 : (env.currentArena != nullptr
+                                        ? &env.currentArena->dyn
+                                        : nullptr);
+      bool cond = false;
+      if (bound != nullptr) {
+        const float a[3] = {obj.pos[0], obj.pos[1],
+                            obj.pos[2] - drop};
+        const float b[3] = {obj.pos[0], obj.pos[1], obj.pos[2]};
+        float hit[3];
+        cond = collisionStab(bound->col, a, b, hit) != nullptr;
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0x7a: {                              // pitch approach (0x44d776)
+      // {f32 rate, f32 pitch}. OBSERVED: dev = pitch - +0x13c is
+      // wrapped while <0 (+360) and while >360 (-360), then once
+      // more when >180 (-360) -> (-180,180]; step = rate*(1/30)
+      // clamped to |dev|; +0x13c moves toward pitch by step (the
+      // negative arm flips via fchs — same clamp). Direct write,
+      // no FUN_0045dc18 wrap. LEVEL5 MUSE_4 XF/XF1_MISS.
+      const float rate = r.f32() * 0.03333333507180214f;
+      const float tgt = r.f32();
+      if (!r.ok) { v.fail("pitchapp"); return; }
+      float dev = tgt - obj.bankDeg;
+      while (dev < 0.0f) dev += 360.0f;
+      while (dev > 360.0f) dev += -360.0f;
+      if (dev > 180.0f) dev += -360.0f;
+      if (dev > 0.0f) {
+        obj.bankDeg += (dev < rate) ? dev : rate;
+      } else {
+        const float m = -dev;                // OBSERVED fchs arm
+        obj.bankDeg -= (m < rate) ? m : rate;
       }
       return;
     }
@@ -3284,6 +3458,132 @@ void objScriptInsn(ObjScriptPass& v) {
         xv = hit->pos[0] + -12.0f;
       }
       obj.pos[0] = xv;                          // +0x10 direct write
+      return;
+    }
+    case 0xdd: {                              // waypoint-bind link (0x446a6b)
+      // {u8 sel, linkage} — OBSERVED FUN_0045dd1c: scans the BOUND
+      // arena's (+0x60) type-8 DTI sub-records and binds one as the
+      // patrol/fly-to target. sel==1 first finds the nearest rec
+      // (3D dist) and captures its fields[1]; records whose
+      // fields[1] lands within +-3 of it are then EXCLUDED (patrol
+      // away from the current zone). sel!=1 admits only records at
+      // 2D dist in [50,500]. Each admitted rec gets a scratch
+      // weight written back into its fields[2] (OBSERVED mutation):
+      //   w = round(500 - d2)
+      //   + (dCam < 200   ? round(200 - dCam) : 0)
+      //   + (dPlayer < d2 && dCam > d2 ? 250 : 0)
+      //   - round(|rec.z - obj.z| * 0.5), clamped >= 1
+      // where d2 = 2D rec->obj, dCam = 2D rec->player, dPlayer =
+      // 2D obj->player. FUN_00401ed4(sumW) picks weighted-randomly;
+      // bind writes fields[3..5] -> +0x120..+0x128, +0x11e = 0xdd,
+      // +0x2a0/+0x2a1/+0x2a4/+0x2a8/+0x2ac = 0, flags14c &= ~8. No
+      // type-8 records or a zero weight sum leaves +0x11e = 0 —
+      // the linkage fires only when +0x11e still reads 0xdd after
+      // the call (i.e. a bind happened). LEVEL5 MUSE_4 XC (+7223)
+      // patrols its arena this way.
+      const std::uint8_t sel = r.u8();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("waybind"); return; }
+      bool bound = false;
+      const TraversalArena* home =
+          (obj.arena != nullptr) ? obj.arena->owner : env.selfArena;
+      const DtiArenaRecord* rec =
+          (home != nullptr) ? home->rec : nullptr;
+      if (rec != nullptr) {
+        // scratch weights — the original scribbles them into the
+        // record's fields[2]; kept local here, same net effect.
+        std::vector<int> w(rec->subRecords.size(), 0);
+        int sum = 0;
+        std::uint32_t nearZone = 0;
+        bool haveNear = false;
+        if (sel == 1) {
+          float best = 999996.5f;            // OBSERVED 0x497423f0
+          for (std::size_t i = 0; i < rec->subRecords.size(); ++i) {
+            const DtiSubRecord& s = rec->subRecords[i];
+            if (s.type != 8) continue;
+            const float dx = s.fieldAsFloat(3) - obj.pos[0];
+            const float dy = s.fieldAsFloat(4) - obj.pos[1];
+            const float dz = s.fieldAsFloat(5) - obj.pos[2];
+            const float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d < best) {
+              best = d;
+              nearZone = s.fields[1];
+              haveNear = true;
+            }
+          }
+        }
+        for (std::size_t i = 0; i < rec->subRecords.size(); ++i) {
+          const DtiSubRecord& s = rec->subRecords[i];
+          if (s.type != 8) continue;
+          const float dx = s.fieldAsFloat(3) - obj.pos[0];
+          const float dy = s.fieldAsFloat(4) - obj.pos[1];
+          const float d2 = std::sqrt(dx*dx + dy*dy);
+          if (sel == 1) {
+            if (haveNear) {
+              const std::int64_t idDiff =
+                  static_cast<std::int64_t>(s.fields[1]) -
+                  static_cast<std::int64_t>(nearZone);
+              const std::int64_t ad =
+                  (idDiff < 0) ? -idDiff : idDiff;
+              if (ad <= 3) continue;         // same zone excluded
+            }
+          } else if (d2 < 50.0f || d2 > 500.0f) {
+            continue;
+          }
+          int wt = static_cast<int>(std::lroundf(500.0f - d2));
+          if (env.rt != nullptr) {
+            const float* pp = env.rt->cs.pos;     // 0x540bfc
+            const float cdx = s.fieldAsFloat(3) - pp[0];
+            const float cdy = s.fieldAsFloat(4) - pp[1];
+            const float dCam = std::sqrt(cdx*cdx + cdy*cdy);
+            if (dCam < 200.0f)
+              wt = static_cast<int>(
+                  std::lroundf(static_cast<float>(wt) + 200.0f - dCam));
+            const float pdx = obj.pos[0] - pp[0];
+            const float pdy = obj.pos[1] - pp[1];
+            const float dPlayer = std::sqrt(pdx*pdx + pdy*pdy);
+            if (dPlayer < d2 && dCam > d2) wt += 250;
+          }
+          const float dz = s.fieldAsFloat(5) - obj.pos[2];
+          wt = static_cast<int>(std::lroundf(
+              static_cast<float>(wt) - std::fabs(dz) * 0.5f));
+          if (wt <= 0) wt = 1;
+          w[i] = wt;
+          sum += wt;
+        }
+        if (sum > 0 && env.rt != nullptr) {
+          int pick = enemyRandBelow(env.rt->rngState, sum);
+          for (std::size_t i = 0; i < rec->subRecords.size(); ++i) {
+            const DtiSubRecord& s = rec->subRecords[i];
+            if (s.type != 8) continue;
+            pick -= w[i];
+            if (pick >= 0) continue;
+            obj.field120[0] = s.fieldAsFloat(3);
+            obj.field120[1] = s.fieldAsFloat(4);
+            obj.field120[2] = s.fieldAsFloat(5);
+            obj.field11e = 0xdd;
+            obj.field2a0 = 0;
+            obj.field2a1 = 0;
+            obj.field2a4 = 0.0f;
+            obj.field2a8 = 0.0f;
+            obj.field2ac = 0.0f;
+            obj.col.flags14c = static_cast<std::uint8_t>(
+                obj.col.flags14c & ~8);
+            bound = true;
+            break;
+          }
+        }
+      }
+      if (!bound) obj.field11e = 0;
+      const bool cond = (obj.field11e == 0xdd);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
       return;
     }
     case 0x2d: {                              // camera-dist link (0x443e56)
@@ -3834,6 +4134,46 @@ void objScriptInsn(ObjScriptPass& v) {
       if (env.rt != nullptr) ++env.rt->seams.camFxCalls;
       return;
     }
+    case 0xc1: {                            // face travel dir (0x441ef5)
+      // {u8 sel, [lstr iff sel==3]}. OBSERVED: sel==1 -> +0x4c yaw =
+      // FUN_00437f30(vel.y, vel.x) — the bearing of the velocity —
+      // skipped when vel.x==0 && vel.y==0 (old yaw kept); sel==2 ->
+      // sel1 plus +0x13c = FUN_00437f30(vel.z, len(vel.xy)) — pitch —
+      // skipped when len==0 && vel.z==0; sel==3 -> reads an lstr and
+      // scans the home-arena +0x68 list for a +0x6-named object whose
+      // +0xc name FUN_0042fa50-matches, copying ITS +0x4c (no health
+      // gate). sel==0/other -> no-op. The two normalize loops under
+      // sel1/sel2 are dead code (the >0 arm's test can never run its
+      // +=360 body and the <=0 arm requires >=360 — same dead-wrap
+      // quirk family as op 0x65). LEVEL5 MUSE_4 drones (XF/XG/XC).
+      const std::uint8_t sel = r.u8();
+      if (!r.ok) { v.fail("faceTravel"); return; }
+      if (sel == 3) {
+        const std::string nm = r.str();
+        if (!r.ok) { v.fail("faceTravel-name"); return; }
+        DynamicArena* home = obj.arena;
+        if (home != nullptr) {
+          for (auto& up : home->storage) {
+            DynamicObject& o = *up;
+            if (!o.col.named || o.arena != home) continue;
+            if (objectEnemyName(env, o) != nm) continue;
+            obj.yawDeg = o.yawDeg;                  // +0x4c adopt
+            break;
+          }
+        }
+        return;
+      }
+      if (sel != 1 && sel != 2) return;             // sel 0/other: no-op
+      const float vx = obj.field28, vy = obj.field2c, vz = obj.field30;
+      if (vx != 0.0f || vy != 0.0f)
+        obj.yawDeg = bearingDeg(vy, vx);            // +0x4c (raw)
+      if (sel == 2) {
+        const float len = std::sqrt(vx * vx + vy * vy);
+        if (len != 0.0f || vz != 0.0f)
+          obj.bankDeg = bearingDeg(vz, len);        // +0x13c pitch
+      }
+      return;
+    }
     case 0x65: {                            // face camera + pitch aim
       // No operands (0x4421ea). OBSERVED: dx/dy = camXY - pos;
       // dz = (camZ + 3.0) - pos; xyDist = FUN_004301bc (XY sqrt).
@@ -3926,6 +4266,49 @@ void objScriptInsn(ObjScriptPass& v) {
         }
         obj.yawDeg = yaw;                            // +0x4c, raw store
         obj.bankDeg = bank;                          // +0x13c
+      }
+      return;
+    }
+    case 0x69: {                            // homing steer (0x44355a)
+      // {f32 rate, f32 jitScale, f32 ox, f32 oy, f32 oz}. OBSERVED:
+      // the 0xeb cam-anchor math extended with pitch — pt = camPos
+      // - (ox,oy) rotated by the yaw snapshot (0x54c6c0) and +oz on
+      // z; yawTo = bearing(pt-pos), pitchTo = bearing(ptZ -
+      // (pos.z + zBias), xyDist). jitScale != 100 adds
+      // (rand(0x14)-10)*(100-jit)/(1+xyDist) to yawTo and the same
+      // draw*(4-jit)/(1+4*xyDist) to pitchTo; yawTo is normalized
+      // to [0,360) (pitchTo is NOT). Then +0x4c/+0x13c =
+      // FUN_0045dc18(target, cur, rate*(1/30)). LEVEL5 MUSE_4
+      // XF/XF1_MISS homing aim (+6b00).
+      const float rate = r.f32(), jit = r.f32();
+      const float ox = r.f32(), oy = r.f32(), oz = r.f32();
+      if (!r.ok) { v.fail("homeste"); return; }
+      if (env.rt != nullptr) {
+        const float* cam = env.rt->camera.pose.pos;  // 0x54c6c4..cc
+        float sn, cs;
+        sincosDeg(env.rt->motion.yawDeg, &sn, &cs);  // 0x54c6c0
+        const float px = cam[0] - ox * cs - oy * sn;
+        const float py = cam[1] - oy * cs - ox * sn;
+        const float pz = cam[2] + oz;
+        const float dx = px - obj.pos[0];
+        const float dy = py - obj.pos[1];
+        const float dz = pz - (obj.pos[2] + obj.zBias);
+        const float xyDist = std::sqrt(dx * dx + dy * dy);
+        float yawTo = bearingDeg(dy, dx);            // 0x437f30
+        float pitchTo = bearingDeg(dz, xyDist);
+        if (jit != 100.0f) {
+          yawTo += static_cast<float>(
+                       enemyRandBelow(env.rt->rngState, 0x14) - 10) *
+                   (100.0f - jit) / (1.0f + xyDist);
+          pitchTo += static_cast<float>(
+                         enemyRandBelow(env.rt->rngState, 0x14) - 10) *
+                     (4.0f - jit) / (1.0f + 4.0f * xyDist);
+        }
+        while (yawTo < 0.0f) yawTo += 360.0f;        // OBSERVED wrap
+        while (yawTo >= 360.0f) yawTo += -360.0f;
+        const float step = rate * 0.03333333507180214f;  // C(0x49b6f4)
+        obj.yawDeg = approachAngle5dc18(yawTo, obj.yawDeg, step);
+        obj.bankDeg = approachAngle5dc18(pitchTo, obj.bankDeg, step);
       }
       return;
     }
@@ -4305,8 +4688,9 @@ TraversalScriptResult traversalObjectScriptTick(
     // the original then clears +0x108.
     char buf[160];
     std::snprintf(buf, sizeof buf,
-                  "Alien %s looped %d commands, off %lx", name,
-                  res.instructions, static_cast<unsigned long>(r.pc));
+                  "Alien %s looped %d commands, off %lx [%s]", name,
+                  res.instructions, static_cast<unsigned long>(r.pc),
+                  obj.scriptClass.c_str());
     res.diag = buf;
     if (oenv.diagLog) oenv.diagLog->push_back(res.diag);
     res.error = true;
@@ -4314,18 +4698,6 @@ TraversalScriptResult traversalObjectScriptTick(
   }
   sync();
   return res;
-}
-
-// ---------------------------------------------------------------------------
-// FUN_00432ec4 — arena-name lookup. The arena record's name is at the
-// record start; the original logs "arena %s not found" on a miss and
-// the 0x95 handler aborts the spawn when it returns 0.
-// ---------------------------------------------------------------------------
-static TraversalArena* traversalFindArena(TraversalRuntime& rt,
-                                          const std::string& name) {
-  for (const auto& ap : rt.arenas)
-    if (ap && ap->name == name) return ap.get();
-  return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -4529,6 +4901,10 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x5e: return "p";                      // weighted-pick goto
   case 0xe7: return "l";                      // idle-pending link
   case 0x0e: return "hbl";                    // {u16,u8,link}
+  case 0x57: return "hhbl";                   // {u16,u16,u8,link}
+  case 0x79: return "fl";                     // {f32 drop, link}
+  case 0x7a: return "ff";                     // pitch approach
+  case 0xdd: return "bl";                     // {u8 sel, link}
   case 0x5c: return "hl";                     // {u16, linkage}
   case 0x2d: case 0x36: return "kl";
   case 0xf1: return "kl";                     // hp cmp link
@@ -4536,6 +4912,8 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xaf: return "bkl";
   case 0x3e: case 0x7f: return "kl";
   case 0x68: case 0x6a: case 0x7c: case 0x87: return "f";
+  case 0x69: return "fffff";                  // homing steer
+  case 0xc9: return "ff";                     // lateral impulse
   case 0xbb: return "ff"; case 0xdc: case 0x4f: return "fff";
   case 0xb8: return "fff";                    // bomb fuse/impact
   case 0xbd: return "bf";                     // + f iff sel==0
@@ -4548,8 +4926,9 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xd8: return "bbw"; case 0xd9: return "bw";
   case 0x80: return "sbb";                    // refEmit {lstr,u8,u8}
   case 0x3d: case 0x5f: case 0x84: case 0x1f: case 0x20: case 0x26:
-  case 0x81: case 0xac:
+  case 0x81: case 0xac: case 0xc1:
     return "b";                               // lead u8 + shaped tail
+  case 0x64: return "s";                      // partnerArena {lstr}
   case 0xae: return "bkl"; case 0x43: return "bbkl";
   case 0xb7: return "bbn"; case 0xf9: return "b";
   case 0x6b: return "s";
@@ -4594,6 +4973,11 @@ const char* opcodeName(std::uint8_t op) {
   case 0xff: return "end";    case 0xfd: return "ret";
   case 0x28: return "yawAcc"; case 0x35: return "rate34";
   case 0x3e: return "angleLink"; case 0x65: return "faceCam";
+  case 0x64: return "partnerArena"; case 0xc1: return "faceTravel";
+  case 0x57: return "gazeLink"; case 0x79: return "floorLink";
+  case 0xdd: return "wayBind";
+  case 0x69: return "homeSteer"; case 0xc9: return "latImp";
+  case 0x7a: return "pitchApp";
   case 0x68: return "aim68";  case 0x6a: return "life302";
   case 0x6b: return "voiceBind"; case 0x6d: return "dmg";
   case 0x83: return "endlvl/cine";
@@ -4786,6 +5170,13 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
     if (imageBase + codeOff + 1 < image.size() &&
         static_cast<std::uint8_t>(image[imageBase + codeOff + 1]) == 0) {
       std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+    }
+  }
+  if (out.opcode == 0xc1) {                  // sel==3 -> named-yaw lstr
+    if (imageBase + codeOff + 1 < image.size() &&
+        static_cast<std::uint8_t>(image[imageBase + codeOff + 1]) == 3) {
+      const std::string nm = r.str();
+      std::snprintf(arg, sizeof arg, " \"%s\"", nm.c_str()); text += arg;
     }
   }
   if (out.opcode == 0x04) {                  // broadcast operands
