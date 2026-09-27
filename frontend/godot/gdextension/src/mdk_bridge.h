@@ -45,10 +45,13 @@
 
 #include "core/arena_mesh.h"
 #include "core/arena_render.h"
+#include "core/bni_directory.h"
 #include "core/collision_query.h"
 #include "core/data_root.h"
 #include "core/frontend_machines.h"
+#include "core/fti_sprite.h"
 #include "core/gameplay_input.h"
+#include "core/sni_directory.h"
 #include "core/traversal_runtime.h"
 
 #include "mdk_objid.h"
@@ -89,6 +92,14 @@ class MdkBridge : public RefCounted {
   Dictionary step_frame_input(double dt_ms, const Dictionary& input);
   Dictionary get_player_snapshot() const;
   Dictionary get_camera_snapshot() const;
+  // Phase 16B — the authoritative traversal-Kurt sprite snapshot:
+  // the draw gate, blit anchor, scope y-offset, scale, clip flags,
+  // main/overlay frame identity (+ dims/hotspot/table name), jitter
+  // offsets, muzzle index, and lazily-built palette-expanded
+  // ImageTextures. Textures are cached by {table, frame, palette
+  // digest} and reused across frames — nothing here recomputes any
+  // animation semantics; every field is a verbatim core output.
+  Dictionary get_kurt_snapshot();
   // Collision-world debug data for the PRIMARY displayed arena:
   // poly edge line soup (pairs of points, PRIMITIVE_LINES) +
   // counts. All positions already Godot-space. For every displayed
@@ -196,6 +207,31 @@ class MdkBridge : public RefCounted {
   // Identity digest over spawn-stable fields — used by the ID map
   // to detect same-address reuse. Excludes all mutable state.
   std::uint64_t objectFingerprint_(const mdk::DynamicObject& o);
+
+  // --- Phase 16B — Kurt sprite decode + texture cache -----------
+  // The 29 bound K_ tables (TRAVSPRT.BNI + LEVEL<n>S.SNI) decoded at
+  // level load via decodeSpriteTable, in PlayerAnimTables slot order.
+  struct KurtSprites {
+    std::array<std::optional<mdk::FtiSprite>, 29> tables;
+    std::array<std::string, 29> errors;   // decode failures only
+    int decoded = 0;
+    int missing = 0;                      // name absent from banks
+  };
+  void decodeKurtTables_();
+  // The sprite palette = the primary displayed arena's composed
+  // palette (the global DAC the original blitted into); falls back
+  // to the level palette (SYS_PAL + DTI s3, no region-B copy).
+  void refreshKurtPalette_();
+  // Lazily expands one frame's RLE stream into a palette-mapped
+  // RGBA ImageTexture; cached by {table, frame, palette digest}.
+  Ref<ImageTexture> kurtTexture_(int tableIdx, int frameIdx);
+  Dictionary kurtFrameDict_(int tableIdx, int frameIdx);
+
+  std::optional<KurtSprites> kurt_;
+  std::unordered_map<std::uint64_t, Ref<ImageTexture>> kurtTex_;
+  std::array<std::uint8_t, 768> kurtPalette_{};
+  std::array<std::uint8_t, 768> levelPalette_{};
+  std::uint64_t kurtPalKey_ = 0;   // FNV-64 of kurtPalette_
 
   std::optional<mdk::DataRoot> root_;
   std::unique_ptr<mdk::TraversalRuntime> rt_;

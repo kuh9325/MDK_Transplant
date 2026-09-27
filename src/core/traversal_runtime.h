@@ -358,6 +358,26 @@ struct TraversalFrameResult {
   int animFrameIdx = -1;             //   of animMainFrame (K_ table +
                                      //   frame index; -1 unresolved)
   bool animDrawn = false;            // the 0x4619ce draw-gate result
+  // Phase 16B — the registration/anchor + overlay identity the
+  // Godot frontend consumes verbatim (no projection in GDScript).
+  int animAnchorX = 0, animAnchorY = 0;   // 0x540c4c/50 — blit anchor
+  int animScopeOfs = 0;              // 0x540d34 — scope HUD y-offset
+                                     //   added to the blit y
+  int animScale = 0;                 // 0x540dbc — the +1z probe
+                                     //   pixels-per-unit result
+  float animDepth = 0.0f;            // 0x540c1c — M1 view depth z'
+  float animViewX = 0.0f, animViewY = 0.0f;   // 0x540c14/18 — x'/y'
+  float animScreenX = 0.0f, animScreenY = 0.0f;  // 0x540c20/24
+  float animProbeY = 0.0f;             // probe record's projected sy —
+                                     //   0x540dbc = rint(probeY - c50)
+  int animClipFlags = 0;             // 0x540c28 — projection clip
+                                     //   class (near-clip bit 0x10)
+  bool animRegistered = false;       // FUN_00431300's job-registration
+                                     //   gate evaluated this frame
+  int animOfsX = 0, animOfsY = 0;    // 0x54cb0c/10 — overlay jitter
+  int animOverlayTableIdx = -1;      // overlay frame identity (-1
+  int animOverlayFrameIdx = -1;      //   when none/not a K_ frame)
+  int animMuzzIdx = 0;               // 0x49ba1c — muzzle parity index
   int slideChannel = 0;              // 0x540e24
   bool viewOnPartner = false;        // 0x49b714
   bool partnerActive = false;        // 0x540ca8
@@ -674,6 +694,32 @@ struct TraversalRuntime {
                                              // gate result
                                              // (0x5414d4 &&
                                              // 0x49b740/c9c/ca0)
+
+  // --- Phase 16B — FUN_00431300's player-entry registration ---
+  // The projected state the display-list entry captures per
+  // registered frame (transient — recomputed, never saved). Written
+  // by playerAnimRegistration under the same job-registration gate
+  // the anim machine re-checks; when the gate fails the writes
+  // simply do not happen (stale values persist — OBSERVED).
+  float animViewX = 0.0f, animViewY = 0.0f, animViewZ = 0.0f;
+                                             // 0x540c14/18/1c — M1
+                                             // view coords {x',y',z'}
+  float animScreenX = 0.0f, animScreenY = 0.0f;
+                                             // 0x540c20/24 — the
+                                             // projector's sx/sy
+                                             // (f32 store)
+  int animClipFlags = 0;                       // 0x540c28 — the
+                                             // x'/y'/near-clip class
+  float animProbeY = 0.0f;                     // the pos+(0,0,1)
+                                             // probe's projected sy —
+                                             // scopeScale =
+                                             // rint(probeY - c50)
+  int animAnchorX = 0, animAnchorY = 0;        // 0x540c4c/50 — the
+                                             // rint'd blit anchor
+                                             // (skipped while
+                                             // fieldDa0 != 0)
+  bool animRegistered = false;                 // the registration
+                                             // gate result this frame
 
   // The last collisionApply contact token as a poly pointer — the
   // surface the player most recently touched (0x540e4c's EAX is the

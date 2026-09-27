@@ -75,6 +75,8 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::step_frame_input);
   ClassDB::bind_method(D_METHOD("get_player_snapshot"),
                        &MdkBridge::get_player_snapshot);
+  ClassDB::bind_method(D_METHOD("get_kurt_snapshot"),
+                       &MdkBridge::get_kurt_snapshot);
   ClassDB::bind_method(D_METHOD("get_camera_snapshot"),
                        &MdkBridge::get_camera_snapshot);
   ClassDB::bind_method(D_METHOD("get_collision_snapshot"),
@@ -197,7 +199,271 @@ bool MdkBridge::load_level(const String& dti_rel_path) {
         "MdkBridge: SYS_PAL not found in MDKFONT.FTI — palette head "
         "degrades to black");
   }
+  // Phase 16B — the level fallback sprite palette (SYS_PAL head +
+  // DTI s3 tail, no arena region-B copy) and the decoded K_ tables.
+  // The palette actually applied is refreshKurtPalette_()'s pick:
+  // the primary displayed arena's composed palette when one exists.
+  {
+    const auto& dti = rt_->level.dti;
+    std::span<const std::uint8_t> s3;
+    if (dti.paletteBytes.fileStart + 768 <=
+        rt_->level.dtiBytes.size()) {
+      s3 = std::span<const std::uint8_t>(
+          reinterpret_cast<const std::uint8_t*>(
+              rt_->level.dtiBytes.data()) +
+              dti.paletteBytes.fileStart,
+          768);
+    }
+    std::array<std::uint8_t, 768> lp{};
+    mdk::arenaPaletteCompose(sysPalHead_, s3, {}, dti.paletteCount,
+                             lp.data());
+    levelPalette_ = lp;
+  }
+  kurtPalette_ = levelPalette_;
+  kurtPalKey_ = 0;
+  kurtTex_.clear();
+  decodeKurtTables_();
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 16B — Kurt sprite tables + texture cache
+// ---------------------------------------------------------------------------
+
+void MdkBridge::decodeKurtTables_() {
+  kurt_ = KurtSprites{};
+  if (!rt_) return;
+  // Directory views over the level's two sprite banks. The slot
+  // order is PlayerAnimTables' field order (playerAnimTableName);
+  // the 23 traversal tables live in TRAVSPRT.BNI, the slide/surf
+  // tables in the level's *S.SNI sentinel records — name lookups
+  // mirror playerAnimBindTables' filters exactly.
+  mdk::BniDirectory bd;
+  if (!rt_->level.travsprtBytes.empty()) {
+    bd = mdk::inspectBniDirectory(
+        std::span<const std::byte>(rt_->level.travsprtBytes));
+  }
+  mdk::SniDirectory sd;
+  if (!rt_->level.sniBytes.empty()) {
+    sd = mdk::inspectSniDirectory(
+        std::span<const std::byte>(rt_->level.sniBytes));
+  }
+  for (int i = 0; i < 29; ++i) {
+    const char* nm = mdk::playerAnimTableName(i);
+    std::span<const std::byte> span;
+    // TRAVSPRT.BNI — FUN_004039ec returns payload+4; the table
+    // (frame count at +0) runs to the record's payload end.
+    if (bd.status == mdk::BniDirectoryStatus::kOk) {
+      if (const mdk::BniRecord* r = mdk::findBniRecord(bd, nm)) {
+        const auto* base = rt_->level.travsprtBytes.data();
+        span = std::span<const std::byte>(
+            base + r->payloadFileOffset + 4,
+            r->payloadEnd - r->payloadFileOffset - 4);
+      }
+    }
+    // LEVEL<n>S.SNI — FUN_004289a0's imageBase+ofs+4 sentinel
+    // records carry no byte count; the span is bounded by the next
+    // record's stored position or the 12-byte name trailer.
+    if (span.empty() &&
+        sd.status == mdk::SniDirectoryStatus::kOk) {
+      for (const mdk::SniEntry& e : sd.entries) {
+        if ((e.fieldAt0x0C & 0x8000u) == 0) continue;
+        if (e.name() != nm) continue;
+        const std::uint64_t start = e.payloadFileOffset() + 4;
+        if (start > rt_->level.sniBytes.size()) break;
+        std::uint64_t end = rt_->level.sniBytes.size();
+        if (sd.trailerPresent && end >= 12) end -= 12;
+        for (const mdk::SniEntry& o : sd.entries) {
+          const std::uint64_t p = o.payloadFileOffset();
+          if (p > start && p < end) end = p;
+        }
+        span = std::span<const std::byte>(
+            rt_->level.sniBytes.data() + start, end - start);
+        break;
+      }
+    }
+    if (span.empty()) {
+      ++kurt_->missing;   // table name absent — normal per level
+      continue;
+    }
+    std::string err;
+    auto sp = mdk::decodeSpriteTable(span, &err);
+    if (!sp) {
+      kurt_->errors[std::size_t(i)] = err;
+      UtilityFunctions::printerr("MdkBridge: K_ table decode failed: ",
+                                 nm, " — ", err.c_str());
+      continue;
+    }
+    kurt_->tables[std::size_t(i)] = std::move(*sp);
+    ++kurt_->decoded;
+  }
+}
+
+void MdkBridge::refreshKurtPalette_() {
+  const std::uint8_t* pal = levelPalette_.data();
+  if (arenaIndex_ >= 0) {
+    if (auto it = arenaSets_.find(arenaIndex_);
+        it != arenaSets_.end()) {
+      pal = it->second->palette.data();
+    }
+  }
+  if (std::memcmp(pal, kurtPalette_.data(), 768) != 0) {
+    std::memcpy(kurtPalette_.data(), pal, 768);
+    kurtPalKey_ = fnvAppend(0xcbf29ce484222325ull, pal, 768);
+  } else if (kurtPalKey_ == 0) {
+    kurtPalKey_ = fnvAppend(0xcbf29ce484222325ull, pal, 768);
+  }
+}
+
+Ref<ImageTexture> MdkBridge::kurtTexture_(int tableIdx, int frameIdx) {
+  Ref<ImageTexture> tex;
+  if (!kurt_ || tableIdx < 0 || tableIdx >= 29) return tex;
+  const auto& tab = kurt_->tables[std::size_t(tableIdx)];
+  if (!tab) return tex;
+  const mdk::FtiSpriteFrame* f = tab->frame(std::size_t(frameIdx));
+  if (!f || f->width == 0 || f->height == 0) return tex;
+
+  const std::uint64_t key =
+      (kurtPalKey_ << 32) |
+      (std::uint64_t(std::uint32_t(tableIdx)) << 16) |
+      std::uint64_t(std::uint32_t(frameIdx));
+  if (auto it = kurtTex_.find(key); it != kurtTex_.end()) {
+    return it->second;
+  }
+  if (kurtTex_.size() >= 4096) kurtTex_.clear();   // bounded cache
+
+  // Expand the stream into palette-mapped RGBA — FUN_00415ff0's
+  // semantics minus the framebuffer edge rules (the texture IS the
+  // frame rectangle): literal bytes write nonzero, run packets fill
+  // or skip, byte 0 is transparent, 0xfe next row, 0xff end. Packet
+  // spill continues linearly into the next row — the stream is
+  // trusted exactly as the original trusted it; writes are bounded
+  // to the frame rectangle (the decoder proved 0xff termination).
+  const int w = f->width, hgt = f->height;
+  const std::size_t npix = std::size_t(w) * std::size_t(hgt);
+  PackedByteArray px;
+  px.resize(static_cast<int64_t>(npix) * 4);
+  std::uint8_t* dst = px.ptrw();
+  std::memset(dst, 0, npix * 4);
+  const auto& s = f->stream;
+  int x = 0, y = 0;
+  for (std::size_t i = 0; i < s.size();) {
+    const std::uint8_t cmd = s[i++];
+    if (cmd == mdk::kFtiSpriteStreamEnd) break;
+    if (cmd == mdk::kFtiSpriteRowBreak) {
+      x = 0;
+      ++y;
+      continue;
+    }
+    if (cmd < 0x80) {   // literal packet: cmd+1 bytes follow
+      const int n = cmd + 1;
+      for (int k = 0; k < n && i < s.size(); ++k) {
+        const std::uint8_t v = s[i++];
+        const std::size_t pos = std::size_t(y) * w + x;
+        if (v != 0 && pos < npix) {
+          dst[pos * 4 + 0] = kurtPalette_[v * 3 + 0];
+          dst[pos * 4 + 1] = kurtPalette_[v * 3 + 1];
+          dst[pos * 4 + 2] = kurtPalette_[v * 3 + 2];
+          dst[pos * 4 + 3] = 255;
+        }
+        ++x;
+      }
+      continue;
+    }
+    // run packet: cmd-0x7c copies of one value byte
+    const int n = cmd - mdk::kFtiSpriteRunBase;
+    const std::uint8_t v = i < s.size() ? s[i++] : 0;
+    if (v != 0) {
+      for (int k = 0; k < n; ++k) {
+        const std::size_t pos = std::size_t(y) * w + x;
+        if (pos < npix) {
+          dst[pos * 4 + 0] = kurtPalette_[v * 3 + 0];
+          dst[pos * 4 + 1] = kurtPalette_[v * 3 + 1];
+          dst[pos * 4 + 2] = kurtPalette_[v * 3 + 2];
+          dst[pos * 4 + 3] = 255;
+        }
+        ++x;
+      }
+    } else {
+      x += n;           // transparent run — advance only
+    }
+  }
+  Ref<Image> img = Image::create_from_data(
+      w, hgt, false, Image::FORMAT_RGBA8, px);
+  tex = ImageTexture::create_from_image(img);
+  kurtTex_[key] = tex;
+  return tex;
+}
+
+Dictionary MdkBridge::kurtFrameDict_(int tableIdx, int frameIdx) {
+  Dictionary d;
+  if (!kurt_ || tableIdx < 0 || tableIdx >= 29) return d;
+  const auto& tab = kurt_->tables[std::size_t(tableIdx)];
+  if (!tab) return d;
+  const mdk::FtiSpriteFrame* f = tab->frame(std::size_t(frameIdx));
+  if (!f) return d;
+  d["table"] = tableIdx;
+  d["table_name"] = mdk::playerAnimTableName(tableIdx);
+  d["frame"] = frameIdx;
+  d["frame_count"] = static_cast<int64_t>(tab->frames.size());
+  d["w"] = f->width;
+  d["h"] = f->height;
+  d["hot_x"] = f->hotspotX;
+  d["hot_y"] = f->hotspotY;
+  // The whole-table digest is the frame's stable identity — a
+  // presentation check can assert texture reuse from
+  // {digest, frame, pal_key} alone.
+  d["digest"] = static_cast<int64_t>(mdk::ftiSpriteDigest(*tab));
+  d["tex"] = kurtTexture_(tableIdx, frameIdx);
+  return d;
+}
+
+Dictionary MdkBridge::get_kurt_snapshot() {
+  Dictionary out;
+  if (!rt_ || !hasFrame_) return out;
+  refreshKurtPalette_();
+  // Every field below is a verbatim TraversalFrameResult copy — the
+  // core already owns animation selection, the draw gate, the
+  // anchor projection, the scale probe and the overlay offsets.
+  out["drawn"] = last_.animDrawn;
+  out["registered"] = last_.animRegistered;
+  out["anchor_x"] = last_.animAnchorX;
+  out["anchor_y"] = last_.animAnchorY;
+  out["scope_ofs"] = last_.animScopeOfs;   // added to the blit y
+  out["scale"] = last_.animScale;          // 0x540dbc probe result
+  out["depth"] = last_.animDepth;          // view z' (0x540c1c)
+  out["view_x"] = static_cast<double>(last_.animViewX);
+  out["view_y"] = static_cast<double>(last_.animViewY);
+  out["screen_x"] = static_cast<double>(last_.animScreenX);
+  out["screen_y"] = static_cast<double>(last_.animScreenY);
+  out["probe_y"] = static_cast<double>(last_.animProbeY);
+  out["clip"] = last_.animClipFlags;       // 0x540c28
+  out["table"] = last_.animTableIdx;
+  out["frame"] = last_.animFrameIdx;
+  out["anim_frame"] = last_.animFrame;     // 0x540cb4 counter
+  out["anim_phase"] = static_cast<double>(last_.animPhase);
+  out["loco_state"] = last_.locoState;
+  out["ofs_x"] = last_.animOfsX;           // overlay jitter offsets
+  out["ofs_y"] = last_.animOfsY;
+  out["muzz_idx"] = last_.animMuzzIdx;     // muzzle parity index
+  out["pal_key"] = static_cast<int64_t>(kurtPalKey_);
+  out["tex_cache"] = static_cast<int64_t>(kurtTex_.size());
+  if (kurt_) {
+    out["decoded_tables"] = kurt_->decoded;
+    out["missing_tables"] = kurt_->missing;
+    Array errs;
+    for (int i = 0; i < 29; ++i) {
+      if (!kurt_->errors[std::size_t(i)].empty()) {
+        errs.push_back(String(mdk::playerAnimTableName(i)) + ": " +
+                       kurt_->errors[std::size_t(i)].c_str());
+      }
+    }
+    out["table_errors"] = errs;
+  }
+  out["main"] = kurtFrameDict_(last_.animTableIdx, last_.animFrameIdx);
+  out["overlay"] = kurtFrameDict_(last_.animOverlayTableIdx,
+                                  last_.animOverlayFrameIdx);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +1132,12 @@ Dictionary MdkBridge::objectSnapshot_(mdk::TraversalArena& arena,
   d["spawn_id"] = int64_t(o.spawnId);
   d["pos"] = mdkToGodotVec(o.pos);
   d["pos_mdk"] = Vector3(o.pos[0], o.pos[1], o.pos[2]);
+  // The kill-plane threshold this object is subject to in
+  // FUN_0045bac0: pos.z < home deepFloorZ - 200 (deepFloorZ = the
+  // arena's real AABB minZ since Phase 15A — not a flat 0).
+  d["floor_plane"] =
+      static_cast<double>(o.arena ? o.arena->col.deepFloorZ - 200.0f
+                                  : 0.0f);
   // The COMPLETE core transform — CollisionObject::xform is the
   // authoritative 3x3 (Euler or raw-matrix path, scale baked) and
   // origin is +0x78 (pos, or pos+zBias on the raw path). Conversion
@@ -997,6 +1269,11 @@ void MdkBridge::shutdown() {
   arenaSetFailed_.clear();
   displaySet_.clear();
   objIds_ = mdkfront::MdkObjectIds{};
+  kurt_.reset();
+  kurtTex_.clear();
+  kurtPalette_ = {};
+  levelPalette_ = {};
+  kurtPalKey_ = 0;
   sharedMtiBytes_.clear();
   ftiBytes_.clear();
   sysPalHead_ = {};

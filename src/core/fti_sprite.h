@@ -137,6 +137,34 @@ struct FtiSprite {
 std::optional<FtiSprite> decodeFtiSprite(
     std::span<const std::byte> payload, std::string* err);
 
+// The K_ sprite-table form (Phase 16B) — TRAVSPRT.BNI K_ records and
+// the LEVEL<n>S.SNI slide/surf images consumed by the traversal-Kurt
+// draw (FUN_00409724 -> FUN_00409760 -> FUN_00415ff0, the same chain
+// as the FTI sprite path — OBSERVED at the 0x461a0f call site).
+//
+//   Layout (CODE-CORROBORATED by the consumer FUN_00464278/
+//   FUN_00464308 frame selects + BYTE-CORROBORATED on the real
+//   BUILD_A banks — e.g. K_IDLE count=57, K_MUZZF count=4 with s16
+//   negative hotspots):
+//
+//     +0x00  u32 frameCount
+//     +0x04  u32 frameOffset[frameCount] — each relative to +0x00
+//            (the count field itself; the equivalent FTI offsets are
+//            relative to +0x04 because the FTI record prepends the
+//            blockBytes head — same table body shifted by 4)
+//     frame: +0 u16 width, +2 u16 height,
+//            +4 s16 hotspotX, +6 s16 hotspotY, +8 stream
+//
+//   The 4 bytes immediately BEFORE this table (the record payload
+//   head the original's +4 lookups skip) are opaque to the frame
+//   path and are not part of `table`.
+//
+// `table` is the record span starting at the count field. Same
+// validation contract as decodeFtiSprite. `blockBytes` in the result
+// reports the absent head as 0 (metadata only — never load-bearing).
+std::optional<FtiSprite> decodeSpriteTable(
+    std::span<const std::byte> table, std::string* err);
+
 // Deterministic FNV-1a64 digest over the decoded sprite: block size,
 // per frame {w, h, hx, hy, stream}. Never hashes filesystem data.
 std::uint64_t ftiSpriteDigest(const FtiSprite& sprite);

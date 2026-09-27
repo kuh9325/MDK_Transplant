@@ -265,6 +265,99 @@ bool playerAnimFrameIdentity(const TraversalRuntime& rt,
 }
 
 // ---------------------------------------------------------------------------
+// FUN_00431300's player-entry registration (Phase 16B).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// FUN_0046b4f8's output record ({x',y',z',sx,sy,clipflags}) for one
+// projected point. The transform is the M1 projection-folded 3x4 —
+// row i's dot with the point plus the folded translation.
+struct AnimProjection {
+  float x2 = 0.0f, y2 = 0.0f, z2 = 0.0f;
+  float sx = 0.0f, sy = 0.0f;
+  int clip = 0;
+};
+
+// The mode-0 projector's OBSERVED .rdata constants (0x498d84/8c/94 —
+// FUN_0046ad20) + the near-clip bound (0x498e34). The installable
+// alternates 1..4 (FUN_0046ad58/9c/e0/46ae1c — the sniper/alt
+// viewports) have no install site in the runtime yet.
+constexpr double kProjXDiv = 299.95;
+constexpr double kProjYDiv = 180.4;
+constexpr double kProjBias = 0.05;
+constexpr double kProjNear = 0.05;
+
+// FUN_0046b4f8 + the installed-mode-0 projector, verbatim. Clip
+// classes: y'>z' -> 1, y'<-z' -> 2, |4 when x'>z', |8 when x'<-z',
+// |0x10 when z' < 0.05. The z'<0.05 path zeroes sx/sy AND STILL calls
+// the projector when z' != 0 — the zeroed pair only survives the
+// exact z' == 0 case (OBSERVED 0x46b586..0x46b5b6).
+AnimProjection projectPlayerPoint(const TraversalRuntime& rt,
+                                  const float p[3]) {
+  AnimProjection o;
+  const auto& v = rt.camera.pose.view;
+  o.x2 = v[0][0] * p[0] + v[0][1] * p[1] + v[0][2] * p[2] + v[0][3];
+  o.y2 = v[1][0] * p[0] + v[1][1] * p[1] + v[1][2] * p[2] + v[1][3];
+  o.z2 = v[2][0] * p[0] + v[2][1] * p[1] + v[2][2] * p[2] + v[2][3];
+  if (o.y2 > o.z2) {
+    o.clip = 1;
+  } else if (o.y2 < -o.z2) {
+    o.clip = 2;
+  }
+  if (o.x2 > o.z2) o.clip |= 4;
+  if (o.x2 < -o.z2) o.clip |= 8;
+  if (o.z2 < kProjNear) {
+    o.sx = 0.0f;
+    o.sy = 0.0f;
+    o.clip |= 0x10;
+  }
+  if (o.z2 != 0.0f) {
+    o.sx = static_cast<float>(
+        (static_cast<double>(o.x2) + static_cast<double>(o.z2)) /
+            static_cast<double>(o.z2) * kProjXDiv + kProjBias);
+    o.sy = static_cast<float>(
+        (static_cast<double>(o.y2) + static_cast<double>(o.z2)) /
+            static_cast<double>(o.z2) * kProjYDiv + kProjBias);
+  }
+  return o;
+}
+
+} // namespace
+
+void playerAnimRegistration(TraversalRuntime& rt) {
+  // FUN_00431300's registration gate — the player display-list entry
+  // is skipped when (c9c && ca0) or (e6c && e70&0x20). The same gate
+  // heads playerAnimTick; a skipped frame leaves c14..c50/dbc stale.
+  const bool callGate =
+      (rt.flagC9c == 0 || rt.transitionPhase == 0) &&
+      (rt.cs.excludeObj == nullptr || (rt.mountClass & 0x20) == 0);
+  rt.animRegistered = callGate;
+  if (!callGate) return;
+
+  const float p[3] = {rt.cs.pos[0], rt.cs.pos[1], rt.cs.pos[2]};
+  const AnimProjection pr = projectPlayerPoint(rt, p);
+  rt.animViewX = pr.x2;
+  rt.animViewY = pr.y2;
+  rt.animViewZ = pr.z2;
+  rt.animScreenX = pr.sx;
+  rt.animScreenY = pr.sy;
+  rt.animClipFlags = pr.clip;
+  // 0x431430..0x431455 — the da0 latch skips ONLY the anchor ints.
+  if (rt.fieldDa0 == 0) {
+    rt.animAnchorX = roundNearest(static_cast<double>(pr.sx));
+    rt.animAnchorY = roundNearest(static_cast<double>(pr.sy));
+  }
+  // 0x431485..0x4314b4 — the pos+(0,0,1) probe: dbc = rint(sy2 - c50)
+  // (the pixels-per-unit scale; fild(c50) enters as the int anchor).
+  const float q[3] = {p[0], p[1], p[2] + 1.0f};
+  const AnimProjection pr2 = projectPlayerPoint(rt, q);
+  rt.animProbeY = pr2.sy;
+  rt.scopeScale = roundNearest(static_cast<double>(pr2.sy) -
+                               static_cast<double>(rt.animAnchorY));
+}
+
+// ---------------------------------------------------------------------------
 // FUN_00461954 — the machine.
 // ---------------------------------------------------------------------------
 

@@ -3489,6 +3489,104 @@ void test_fti_sprite() {
   }
 }
 
+// Phase 16B — decodeSpriteTable: the K_* sprite-table form used by
+// TRAVSPRT.BNI / LEVEL<n>S.SNI payloads. Identical to the FTI record
+// minus the leading blockBytes word: {u32 count, u32 ofs[N] relative
+// to the count field, frames}. The bound K_ pointer lands on the
+// count word (BNI lookup returns payload+4; the SNI K_ sentinel the
+// same), so the table starts there.
+void test_sprite_table() {
+  std::string err;
+
+  // K_ builder: offsets relative to the count field at +0.
+  struct KTable {
+    std::vector<std::byte> buf;
+    void u32(std::uint32_t v) {
+      for (int i = 0; i < 4; ++i)
+        buf.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+    }
+    void u16(std::uint16_t v) {
+      buf.push_back(static_cast<std::byte>(v & 0xff));
+      buf.push_back(static_cast<std::byte>(v >> 8));
+    }
+    // n frames at 4+4n+i*8, 8-byte min frames with marker + stream.
+    static KTable make(
+        const std::vector<
+            std::pair<std::array<std::int16_t, 4>,
+                      std::vector<std::uint8_t>>>& frames) {
+      KTable t;
+      t.u32(static_cast<std::uint32_t>(frames.size()));
+      const std::uint32_t data =
+          4 + 4 * static_cast<std::uint32_t>(frames.size());
+      for (std::size_t i = 0; i < frames.size(); ++i) {
+        std::uint32_t ofs = data;
+        for (std::size_t j = 0; j < i; ++j)
+          ofs += 8 + static_cast<std::uint32_t>(frames[j].second.size());
+        t.u32(ofs);
+      }
+      for (const auto& f : frames) {
+        t.u16(static_cast<std::uint16_t>(f.first[0]));  // w
+        t.u16(static_cast<std::uint16_t>(f.first[1]));  // h
+        t.u16(static_cast<std::uint16_t>(f.first[2]));  // hotX
+        t.u16(static_cast<std::uint16_t>(f.first[3]));  // hotY
+        for (const auto v : f.second)
+          t.buf.push_back(static_cast<std::byte>(v));
+      }
+      return t;
+    }
+  };
+
+  // Two frames: negative hotspots decode signed; streams split.
+  {
+    auto t = KTable::make(
+        {{{24, 48, -12, -30}, {0x02, 5, 0, 9, 0xff}},
+         {{2, 2, 0, 1}, {0x00, 7, 0xfe, 0x00, 8, 0xff}}});
+    const auto sp = mdk::decodeSpriteTable(t.buf, &err);
+    CHECK(sp && sp->blockBytes == 0 && sp->frames.size() == 2);
+    CHECK(sp->frames[0].width == 24 && sp->frames[0].height == 48 &&
+          sp->frames[0].hotspotX == -12 &&
+          sp->frames[0].hotspotY == -30);
+    CHECK(sp->frames[0].literalPackets == 1 &&
+          sp->frames[0].opaqueWrites == 2);
+    CHECK(sp->frames[1].width == 2 && sp->frames[1].hotspotY == 1 &&
+          sp->frames[1].rowBreaks == 1);
+    CHECK(mdk::ftiSpriteDigest(*sp) == mdk::ftiSpriteDigest(*sp));
+    // Same blitter consumes the decoded frames. Negative hotspot:
+    // dest = (x - hotX, y - hotY). dest y=130 is below the fb.
+    mdk::IndexedFramebuffer fb(128, 128);
+    fb.clear(0x55);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 30, 100);
+    CHECK(fb.at(42, 127) == 0x55);     // bottom row untouched
+    fb.clear(0x55);
+    mdk::blitFtiSpriteFrame(sp->frames[0], fb, 30, 30);
+    CHECK(fb.at(42, 60) == 5 && fb.at(44, 60) == 9);
+    CHECK(fb.at(43, 60) == 0x55);      // literal 0 = transparent
+  }
+
+  // Rejections: zero frames, OOB offset, truncated frame header,
+  // unterminated stream, truncated offset table, empty input.
+  {
+    KTable z;
+    z.u32(0);
+    CHECK(!mdk::decodeSpriteTable(z.buf, &err));
+    KTable o;
+    o.u32(1);
+    o.u32(0x400);
+    CHECK(!mdk::decodeSpriteTable(o.buf, &err));
+    KTable h;
+    h.u32(1);
+    h.u32(8);
+    h.u16(4); h.u16(4);                // header cut at 4 bytes
+    CHECK(!mdk::decodeSpriteTable(h.buf, &err));
+    auto n = KTable::make({{{1, 1, 0, 0}, {0x00, 5, 0xfe}}});
+    CHECK(!mdk::decodeSpriteTable(n.buf, &err));  // no 0xff
+    std::vector<std::byte> t2 = {std::byte{2}, std::byte{0},
+                               std::byte{0}, std::byte{0}};
+    CHECK(!mdk::decodeSpriteTable(t2, &err));     // needs 2 offsets
+    CHECK(!mdk::decodeSpriteTable({}, &err));
+  }
+}
+
 void test_frontend_menu() {
   std::string err;
 
@@ -17805,6 +17903,78 @@ void test_player_animation() {
     CHECK(rt.animOfsX >= 0 && rt.animOfsX <= 4);
     CHECK(rt.animOfsY >= 0 && rt.animOfsY <= 4);
   }
+
+  // --- Phase 16B — FUN_00431300 registration -------------------------
+  {
+    // Permutation view: x'=px, y'=pz (world z -> view y), z'=py
+    // (world y -> view depth) — world +z is up on screen.
+    mdk::TraversalRuntime rt;
+    float v[3][4] = {{1, 0, 0, 0}, {0, 0, 1, 0}, {0, 1, 0, 0}};
+    std::memcpy(rt.camera.pose.view, v, sizeof(v));
+    rt.cs.pos[0] = 0; rt.cs.pos[1] = 50; rt.cs.pos[2] = 0;
+    mdk::playerAnimRegistration(rt);
+    CHECK(rt.animRegistered);
+    CHECK(near(rt.animViewZ, 50.0, 1e-4));
+    // Mode-0 projector: sx = (x'+z')/z'*299.95+0.05 = 300.0;
+    // sy = (y'+z')/z'*180.4+0.05 = 180.45.
+    CHECK(near(rt.animScreenX, 300.0, 1e-3));
+    CHECK(near(rt.animScreenY, 180.45, 1e-3));
+    CHECK(rt.animAnchorX == 300 && rt.animAnchorY == 180);
+    CHECK(rt.animClipFlags == 0);
+    // +1z probe: y'=1 -> sy2 = 51/50*180.4+0.05 = 184.058;
+    // dbc = rint(184.058 - 180) = 4 (pixels per world unit).
+    CHECK(rt.scopeScale == 4);
+
+    // Off-axis clip classes: x'>z' -> |4, y'<-z' -> |2.
+    rt.cs.pos[0] = 60; rt.cs.pos[1] = 50; rt.cs.pos[2] = -60;
+    mdk::playerAnimRegistration(rt);
+    CHECK(rt.animClipFlags == (4 | 2));
+    // sx = 110/50*299.95+0.05 = 659.94; sy = -10/50*180.4+0.05 = -36.03.
+    CHECK(rt.animAnchorX == 660 && rt.animAnchorY == -36);
+
+    // Near clip z'=0.04: flag 0x10; the projector still runs
+    // (sx/sy land on the real projection, not the zeroed pair).
+    rt.cs.pos[0] = 0; rt.cs.pos[1] = 0.04f; rt.cs.pos[2] = 0;
+    mdk::playerAnimRegistration(rt);
+    CHECK((rt.animClipFlags & 0x10) != 0);
+    CHECK(near(rt.animScreenX, 300.0, 1e-2));
+    // z' == 0 exactly: sx/sy stay 0, flag 0x10.
+    rt.cs.pos[1] = 0.0f;
+    mdk::playerAnimRegistration(rt);
+    CHECK((rt.animClipFlags & 0x10) != 0);
+    CHECK(rt.animScreenX == 0.0f && rt.animScreenY == 0.0f);
+    CHECK(rt.animAnchorX == 0 && rt.animAnchorY == 0);
+
+    // The da0 latch skips ONLY the anchor ints — floats + scale
+    // probe still update; the probe reads the STALE anchor.
+    rt.cs.pos[1] = 50;                      // back to (300,180.45)
+    rt.fieldDa0 = 1;
+    mdk::playerAnimRegistration(rt);
+    CHECK(rt.animAnchorX == 0 && rt.animAnchorY == 0);   // stale
+    CHECK(near(rt.animScreenX, 300.0, 1e-3));
+    // sy2=184.058 vs stale anchor 0 -> dbc = 184.
+    CHECK(rt.scopeScale == 184);
+    rt.fieldDa0 = 0;
+    mdk::playerAnimRegistration(rt);
+    CHECK(rt.animAnchorX == 300 && rt.animAnchorY == 180);
+    CHECK(rt.scopeScale == 4);
+
+    // Registration gate — the display-list entry is skipped; every
+    // registration output keeps its previous value.
+    rt.flagC9c = 1; rt.transitionPhase = 2;
+    rt.cs.pos[0] = 999;
+    const float sx0 = rt.animScreenX;
+    mdk::playerAnimRegistration(rt);
+    CHECK(!rt.animRegistered);
+    CHECK(rt.animAnchorX == 300 && rt.animScreenX == sx0);
+    rt.flagC9c = 0; rt.transitionPhase = 0;
+    CollisionObject fakeObj{};
+    rt.cs.excludeObj = &fakeObj;
+    rt.mountClass = 0x20;
+    mdk::playerAnimRegistration(rt);
+    CHECK(!rt.animRegistered);
+    CHECK(rt.animAnchorX == 300);
+  }
 }
 
 // Phase 5L — sniper scope lifecycle + mounted reticle. OBSERVED
@@ -20533,6 +20703,7 @@ int main() {
   test_stream_context();
   test_fti_font();
   test_fti_sprite();
+  test_sprite_table();
   test_frontend_menu();
   test_frontend_controller();
   test_options_controller();

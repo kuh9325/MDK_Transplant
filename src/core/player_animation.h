@@ -142,6 +142,35 @@ bool playerAnimFrameCrossed(int trig, int dir, int prev, int curr);
 void playerAnimTick(TraversalRuntime& rt,
                     const PlayerAnimEnvironment& env);
 
+// Phase 16B — FUN_00431300's player-entry registration: the
+// projection half the display-list entry performs before the
+// FUN_00461954 callback is queued (OBSERVED, BUILD_A disasm
+// 0x4313ad..0x4314b4):
+//
+//   FUN_0046b4f8(0x540b80, 0x540bfc, &c14) — transform cs.pos by the
+//     M1 projection-folded matrix into the {x',y',z',sx,sy,clip}
+//     record, invoking the installed projector. The clip flags
+//     classify x'/y' against +-z'; z' < 0.05 (f64 0x498e34) forces
+//     sx=sy=0 with flag 0x10.
+//   if (0x540da0 == 0): c4c = rint(sx), c50 = rint(sy) — the blit
+//     anchor ints (FRNDINT + FISTP). da0 skips ONLY this write.
+//   always (when registered): a second FUN_0046b4f8 of the point
+//     pos+(0,0,1) yields sy2; 0x540dbc = rint(sy2 - c50) — the
+//     pixels-per-unit scale the scope HUD consumes.
+//
+//   The projector itself is the installable function pointer
+//   0x49bbe8 (FUN_0046ae60(mode)); BUILD_A traversal uses mode 0
+//   (FUN_0046ad20): sx = ((x'+z')/z')*299.95 + 0.05,
+//   sy = ((y'+z')/z')*180.4 + 0.05 — the alternates (sniper/alt
+//   viewports, modes 1..4) install from paths the runtime does not
+//   yet implement, so this port projects mode 0 only.
+//
+//   Registration itself is gated the same way the callback
+//   registration is (c9c==0 || ca0==0) && (e6c==0 || !(e70&0x20)) —
+//   under the gate the writes simply do not happen and the stale
+//   values persist. This mirrors playerAnimTick's own head gate.
+void playerAnimRegistration(TraversalRuntime& rt);
+
 // Trace helper — maps a selected frame pointer back to
 // {table index 0..28, frame index} for deterministic traces.
 // Returns false when the pointer is not inside a bound table frame

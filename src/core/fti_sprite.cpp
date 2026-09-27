@@ -79,6 +79,73 @@ bool parseStream(std::span<const std::byte> payload, std::size_t pos,
   return true;
 }
 
+// Shared frame-table walk behind decodeFtiSprite/decodeSpriteTable.
+// `tag` prefixes the error strings so the two record forms report
+// their own family.
+std::optional<FtiSprite> decodeFrameTable(
+    std::span<const std::byte> payload, std::uint32_t count,
+    std::uint64_t offsetsPos, std::uint64_t offsetBase,
+    const char* tag, std::string* err) {
+  auto fail = [&](const char* msg) -> std::optional<FtiSprite> {
+    if (err) {
+      *err = std::string(tag) + msg;
+    }
+    return std::nullopt;
+  };
+  BinaryReader r(payload);
+  if (payload.size() < offsetsPos ||
+      count > (payload.size() - offsetsPos) / 4) {
+    return fail(": offset table out of bounds");
+  }
+
+  FtiSprite out;
+  out.payloadBytes = payload.size();
+  out.frames.reserve(count);
+  std::uint64_t lastEnd = offsetsPos + 4 * count;
+
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const auto off = r.peekU32le(offsetsPos + 4 * i);
+    if (!off) {
+      return fail(": truncated offset table");
+    }
+    const std::uint64_t framePos =
+        offsetBase + static_cast<std::uint64_t>(*off);
+    if (framePos > payload.size() ||
+        payload.size() - framePos < kFtiSpriteFrameHeaderBytes) {
+      return fail(": frame header out of bounds");
+    }
+    const auto w = r.peekU16le(framePos + 0);
+    const auto h = r.peekU16le(framePos + 2);
+    const auto hx = r.peekU16le(framePos + 4);
+    const auto hy = r.peekU16le(framePos + 6);
+    if (!w || !h || !hx || !hy) {
+      return fail(": truncated frame header");
+    }
+    FtiSpriteFrame f;
+    f.frameFileOffset = framePos;
+    f.width = *w;
+    f.height = *h;
+    f.hotspotX = static_cast<std::int16_t>(*hx);
+    f.hotspotY = static_cast<std::int16_t>(*hy);
+
+    const std::size_t streamStart = framePos + kFtiSpriteFrameHeaderBytes;
+    std::size_t streamEnd = streamStart;
+    if (!parseStream(payload, streamStart, f, &streamEnd)) {
+      return fail(": stream has no 0xff terminator in bounds or a "
+                  "truncated packet");
+    }
+    f.stream.resize(streamEnd - streamStart);
+    std::transform(payload.begin() + streamStart,
+                   payload.begin() + streamEnd, f.stream.begin(),
+                   [](std::byte b) { return static_cast<std::uint8_t>(b); });
+    lastEnd = std::max<std::uint64_t>(lastEnd, streamEnd);
+    out.frames.push_back(std::move(f));
+  }
+  out.trailingBytes = payload.size() - std::min<std::uint64_t>(
+      lastEnd, payload.size());
+  return out;
+}
+
 } // namespace
 
 std::optional<FtiSprite> decodeFtiSprite(
@@ -103,58 +170,35 @@ std::optional<FtiSprite> decodeFtiSprite(
     return fail("sprite record: zero frames");
   }
   // offsets live at +0x08, each relative to +0x04.
-  if (*count > (payload.size() - kFtiSpriteOffsetsOffset) / 4) {
-    return fail("sprite record: offset table out of bounds");
+  std::string innerErr;
+  auto out = decodeFrameTable(payload, *count, kFtiSpriteOffsetsOffset,
+                              4, "sprite record", &innerErr);
+  if (!out) {
+    return fail(innerErr.c_str());
   }
-
-  FtiSprite out;
-  out.blockBytes = *blockBytes;
-  out.payloadBytes = payload.size();
-  out.frames.reserve(*count);
-  std::uint64_t lastEnd = kFtiSpriteOffsetsOffset + 4 * (*count);
-
-  for (std::uint32_t i = 0; i < *count; ++i) {
-    const auto off =
-        r.peekU32le(kFtiSpriteOffsetsOffset + 4 * i);
-    if (!off) {
-      return fail("sprite record: truncated offset table");
-    }
-    // frame = payload + 4 + offset
-    const std::uint64_t framePos = 4 + static_cast<std::uint64_t>(*off);
-    if (framePos > payload.size() ||
-        payload.size() - framePos < kFtiSpriteFrameHeaderBytes) {
-      return fail("sprite record: frame header out of bounds");
-    }
-    const auto w = r.peekU16le(framePos + 0);
-    const auto h = r.peekU16le(framePos + 2);
-    const auto hx = r.peekU16le(framePos + 4);
-    const auto hy = r.peekU16le(framePos + 6);
-    if (!w || !h || !hx || !hy) {
-      return fail("sprite record: truncated frame header");
-    }
-    FtiSpriteFrame f;
-    f.frameFileOffset = framePos;
-    f.width = *w;
-    f.height = *h;
-    f.hotspotX = static_cast<std::int16_t>(*hx);
-    f.hotspotY = static_cast<std::int16_t>(*hy);
-
-    const std::size_t streamStart = framePos + kFtiSpriteFrameHeaderBytes;
-    std::size_t streamEnd = streamStart;
-    if (!parseStream(payload, streamStart, f, &streamEnd)) {
-      return fail("sprite record: stream has no 0xff terminator "
-                  "in bounds or a truncated packet");
-    }
-    f.stream.resize(streamEnd - streamStart);
-    std::transform(payload.begin() + streamStart,
-                   payload.begin() + streamEnd, f.stream.begin(),
-                   [](std::byte b) { return static_cast<std::uint8_t>(b); });
-    lastEnd = std::max<std::uint64_t>(lastEnd, streamEnd);
-    out.frames.push_back(std::move(f));
-  }
-  out.trailingBytes = payload.size() - std::min<std::uint64_t>(
-      lastEnd, payload.size());
+  out->blockBytes = *blockBytes;
   return out;
+}
+
+std::optional<FtiSprite> decodeSpriteTable(
+    std::span<const std::byte> table, std::string* err) {
+  auto fail = [&](const char* msg) -> std::optional<FtiSprite> {
+    if (err) {
+      *err = msg;
+    }
+    return std::nullopt;
+  };
+
+  BinaryReader r(table);
+  const auto count = r.u32le();
+  if (!count) {
+    return fail("sprite table: truncated header (frameCount)");
+  }
+  if (*count == 0) {
+    return fail("sprite table: zero frames");
+  }
+  // offsets live at +0x04, each relative to +0x00.
+  return decodeFrameTable(table, *count, 4, 0, "sprite table", err);
 }
 
 std::uint64_t ftiSpriteDigest(const FtiSprite& sprite) {

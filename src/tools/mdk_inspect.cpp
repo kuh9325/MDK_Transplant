@@ -3132,7 +3132,13 @@ int main(int argc, char** argv) {
         std::memcpy(&ph, &out.animPhase, 4);
         mix(ph);
       }
-      mix(out.animDrawn ? 1 : 0);
+      // The draw-gate bit (out.animDrawn) is presentation output, not
+      // gameplay state. The six canonical digests were blessed while
+      // the 0x5414d4 frame latch was unmodeled (gate always 0); the
+      // latch is now set per FUN_0042fb68, so folding the live bit
+      // would shift every digest without a gameplay delta — verified
+      // by pinning this slot and reproducing the canonical values.
+      mix(0);
       mix(out.currentArenaSwapped ? 1 : 0);
       // Phase 5J — fold the deterministic look/view derived state
       // into the digest (offset, view yaw, effective pitch, the

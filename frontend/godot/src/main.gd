@@ -47,6 +47,8 @@ var shot_path := ""
 var shot_frames_left := 0
 var frames_left := 0
 var obj_debug := false
+var proxy_debug := false      # F4 — legacy capsule/wire proxy
+var last_kurt := {}           # last applied kurt snapshot (diag)
 
 # Raw mouse accumulators — device deltas for the next frame only.
 var mouse_dx := 0
@@ -189,6 +191,7 @@ func _ready() -> void:
 			return
 
 	_build_player_proxy()
+	_build_kurt_presenter()
 
 	# One idle frame settles the deterministic spawn camera.
 	bridge.step_frame_input(0.0, {})
@@ -196,6 +199,7 @@ func _ready() -> void:
 	_apply_object_snapshots()
 	_apply_player_snapshot()
 	_apply_camera_snapshot()
+	_apply_kurt_snapshot()
 	_update_debug_label()
 
 	if smoke:
@@ -452,6 +456,94 @@ func _apply_player_snapshot() -> void:
 	_update_box_wire(p["box"])
 
 
+# ---------------------------------------------------------------------------
+# Phase 16B — traversal Kurt sprite presentation.
+#
+# The original draws Kurt into the 600x360 indexed work buffer at
+# integer anchors produced by FUN_00431300's registration (the M1
+# transform + mode-0 projector -> rint -> 0x540c4c/50), with the
+# scope/HUD y-offset 0x540d34 added to the blit y. FUN_00409724 then
+# draws the optional overlay FIRST at (x+ofsX, y+ofsY), then the main
+# frame at (x, y) — each through FUN_00409760's hotspot rule
+# (dest = anchor - hotspot) at native 1:1 pixels.
+#
+# Here the 600x360 software space maps onto the real viewport by
+# independent x/y window ratios — the same normalized position the
+# original computes. There is no second projection and no sprite
+# scaling beyond the space->window map: the 0x540dbc scale field is
+# scope/HUD state, never sprite size.
+# ---------------------------------------------------------------------------
+
+const KURT_SCREEN := Vector2(600.0, 360.0)
+
+
+func _build_kurt_presenter() -> void:
+	# The screen-space quads live in the scene (KurtLayer canvas):
+	# KurtOverlay precedes KurtMain in sibling order, so the main
+	# sprite composites on top — the original draws the overlay
+	# first for exactly that stacking. Nearest filtering keeps the
+	# indexed-art edges (no filtering existed in the blit).
+	for n in ["KurtOverlay", "KurtMain"]:
+		var r: TextureRect = $KurtLayer/KurtViewport.get_node(n)
+		r.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+
+
+func _kurt_reject(dx: float, dy: float, w: float, h: float) -> bool:
+	# FUN_00415ff0's entry rejects in 600x360 space: fully outside
+	# draws nothing; the right edge is all-or-nothing (x>=0 && x+w
+	# spills past 600 -> nothing at all). Left/top partial clips
+	# draw — offscreen pixels simply land outside the viewport.
+	if dx >= KURT_SCREEN.x or dy >= KURT_SCREEN.y:
+		return true
+	if dx + w <= 0.0 or dy + h <= 0.0:
+		return true
+	if dx >= 0.0 and dx + w > KURT_SCREEN.x:
+		return true
+	return false
+
+
+func _apply_kurt_snapshot() -> void:
+	var k: Dictionary = bridge.get_kurt_snapshot()
+	if k.is_empty():
+		return
+	last_kurt = k
+	var vp := get_viewport().get_visible_rect().size
+	var sx := vp.x / KURT_SCREEN.x
+	var sy := vp.y / KURT_SCREEN.y
+	var km: TextureRect = $KurtLayer/KurtViewport/KurtMain
+	var ko: TextureRect = $KurtLayer/KurtViewport/KurtOverlay
+	var drawn := bool(k["drawn"])
+	# Blit anchor: x = 0x540c4c, y = 0x540d34 + 0x540c50 — the
+	# scope/HUD offset folds into the blit y for both sprites.
+	var ax := float(k["anchor_x"])
+	var ay := float(k["anchor_y"]) + float(k["scope_ofs"])
+	var ov: Dictionary = k["overlay"]
+	var otex = ov.get("tex")
+	if drawn and not ov.is_empty() and otex != null:
+		# Overlay at (x + 0x54cb0c, y + 0x54cb10), dest -= hotspot.
+		var dx := ax + float(k["ofs_x"]) - float(ov["hot_x"])
+		var dy := ay + float(k["ofs_y"]) - float(ov["hot_y"])
+		ko.visible = not _kurt_reject(dx, dy, float(ov["w"]),
+			float(ov["h"]))
+		ko.position = Vector2(dx * sx, dy * sy)
+		ko.size = Vector2(float(ov["w"]) * sx, float(ov["h"]) * sy)
+		ko.texture = otex
+	else:
+		ko.visible = false
+	var mn: Dictionary = k["main"]
+	var mtex = mn.get("tex")
+	if drawn and not mn.is_empty() and mtex != null:
+		var dx := ax - float(mn["hot_x"])
+		var dy := ay - float(mn["hot_y"])
+		km.visible = not _kurt_reject(dx, dy, float(mn["w"]),
+			float(mn["h"]))
+		km.position = Vector2(dx * sx, dy * sy)
+		km.size = Vector2(float(mn["w"]) * sx, float(mn["h"]) * sy)
+		km.texture = mtex
+	else:
+		km.visible = false
+
+
 func _update_box_wire(box: AABB) -> void:
 	var im: ImmediateMesh = $PlayerBoxWire.mesh
 	im.clear_surfaces()
@@ -480,6 +572,24 @@ func _update_debug_label() -> void:
 			int(dsp["portals_crossed"]),
 			int(dsp["object_migrations"]),
 			bridge.get_object_snapshots().size()]
+	var anim := ""
+	if not last_kurt.is_empty():
+		var anm := "-"
+		var amd: Dictionary = last_kurt["main"]
+		if not amd.is_empty():
+			anm = "%s[%d]" % [String(amd["table_name"]),
+				int(amd["frame"])]
+		var aov := "-"
+		var aod: Dictionary = last_kurt["overlay"]
+		if not aod.is_empty():
+			aov = "%s[%d]" % [String(aod["table_name"]),
+				int(aod["frame"])]
+		anim = ("\nanim %s ov %s  anchor %d,%d  scope %d  " +
+			"scale %d  drawn %s  tex %d") % [
+			anm, aov, int(last_kurt["anchor_x"]),
+			int(last_kurt["anchor_y"]), int(last_kurt["scope_ofs"]),
+			int(last_kurt["scale"]), last_kurt["drawn"],
+			int(last_kurt["tex_cache"])]
 	$DebugUI/DebugLabel.text = (
 		"pos_mdk %.2f %.2f %.2f   yaw %.1f  pitch %.1f\n" %
 		[mp.x, mp.y, mp.z, p["yaw_deg"], p["pitch_deg"]] +
@@ -488,7 +598,7 @@ func _update_debug_label() -> void:
 		p["arena_display"]] +
 		"vel move %.2f  strafe %.2f  vert %.2f  turn %.2f" %
 		[p["move_vel"], p["strafe_vel"], p["vert_vel"],
-		p["turn_vel"]] + portal)
+		p["turn_vel"]] + portal + anim)
 
 
 func _input_mask() -> int:
@@ -565,6 +675,13 @@ func _input(event: InputEvent) -> void:
 					_clear_object_debug(oid)
 		elif event.keycode == KEY_F3:
 			$DebugUI.visible = not $DebugUI.visible
+		elif event.keycode == KEY_F4:
+			# Development-only proxy: the old capsule/marker/wire
+			# stand-in, hidden since the sprite presenter replaced it.
+			proxy_debug = not proxy_debug
+			$PlayerRoot/DebugBody.visible = proxy_debug
+			$PlayerRoot/ForwardMarker.visible = proxy_debug
+			$PlayerBoxWire.visible = proxy_debug
 
 
 func _process(delta: float) -> void:
@@ -614,6 +731,7 @@ func _process(delta: float) -> void:
 	_apply_player_snapshot()
 	_apply_camera_snapshot()
 	_apply_object_snapshots()
+	_apply_kurt_snapshot()
 	_update_debug_label()
 	# Rebuild the presented arena set only when the display digest
 	# changes — a BSP-order change from camera movement, a portal
@@ -723,6 +841,58 @@ func _run_smoke(data_root: String) -> void:
 	_check(player["grounded"] == true, "spawn grounded")
 	_check(int(player["arena"]) == int(player["arena_display"]),
 		"display arena == core arena at spawn")
+
+	# ---- 16B: authoritative Kurt sprite presentation ----
+	var k0: Dictionary = bridge.get_kurt_snapshot()
+	_check(not k0.is_empty(), "kurt snapshot non-empty")
+	_check(int(k0["decoded_tables"]) == 23,
+		"K_ tables decoded == 23 (LEVEL3S.SNI carries none)")
+	_check(int(k0["missing_tables"]) == 6,
+		"6 SNI tables absent on LEVEL3")
+	_check(Array(k0["table_errors"]).is_empty(),
+		"no K_ table decode errors")
+	print("kurt spawn: drawn=%s reg=%s anchor=%d,%d scope=%d scale=%d "
+		% [k0["drawn"], k0["registered"], int(k0["anchor_x"]),
+			int(k0["anchor_y"]), int(k0["scope_ofs"]),
+			int(k0["scale"])] +
+		"depth=%.3f view=%.3f,%.3f screen=%.2f,%.2f clip=%d" %
+		[float(k0["depth"]), float(k0["view_x"]),
+			float(k0["view_y"]), float(k0["screen_x"]),
+			float(k0["screen_y"]), int(k0["clip"])])
+	_check(k0["drawn"] == true, "kurt drawn at spawn (idle)")
+	_check(k0["registered"] == true,
+		"kurt registration gate open")
+	var m0: Dictionary = k0["main"]
+	_check(not m0.is_empty(), "kurt main frame resolved")
+	if not m0.is_empty():
+		_check(String(m0["table_name"]) == "K_IDLE",
+			"spawn anim table == K_IDLE")
+		_check(int(m0["w"]) > 0 and int(m0["h"]) > 0,
+			"main frame dims")
+		_check(m0["tex"] != null, "main ImageTexture built")
+	_check(int(k0["anchor_x"]) > 0 and int(k0["anchor_x"]) < 600 and
+		int(k0["anchor_y"]) > 0 and int(k0["anchor_y"]) < 360,
+		"anchor inside the 600x360 space")
+	# 0x540dbc = rint(probe_y - anchor_y) — the OBSERVED signed
+	# screen-y delta of pos+(0,0,1) (negative when the probe lands
+	# above the anchor, which is the common pose).
+	_check(int(round(float(k0["probe_y"]) - float(k0["anchor_y"])))
+		== int(k0["scale"]),
+		"scale == rint(probe_y - anchor_y) (FUN_00431300 probe)")
+	_check(int(k0["scale"]) != 0, "scale probe non-zero")
+	_check(Dictionary(k0["overlay"]).is_empty(),
+		"no overlay at idle")
+	var kv_main: TextureRect = $KurtLayer/KurtViewport/KurtMain
+	var kv_ov: TextureRect = $KurtLayer/KurtViewport/KurtOverlay
+	_check(kv_main.visible and kv_main.texture != null,
+		"KurtMain quad presents a texture")
+	_check(not kv_ov.visible, "KurtOverlay hidden at idle")
+	_check(kv_main.get_index() > kv_ov.get_index(),
+		"main composites over overlay (overlay drawn first)")
+	_check(not $PlayerRoot/DebugBody.visible and
+		not $PlayerRoot/ForwardMarker.visible and
+		not $PlayerBoxWire.visible,
+		"debug proxy hidden in normal presentation")
 
 	# Deterministic digests — the mdk-inspect folds. Golden values:
 	# geom f1cc72cbe4056174 (camera-independent); order 9ff16337ea1582ec
@@ -837,6 +1007,7 @@ func _run_smoke(data_root: String) -> void:
 	var lat := 0.0
 	var lon := 0.0
 	var gnd_frames := 0
+	var strafe_tables := {}
 	for i in 6:
 		_step_n({"actions": ACT_STRAFE_RIGHT}, 1)
 		var cur: Dictionary = bridge.get_player_snapshot()
@@ -845,12 +1016,17 @@ func _run_smoke(data_root: String) -> void:
 			lat += d.dot(sb.x)
 			lon += abs(d.dot(-sb.z))
 			gnd_frames += 1
+		var km5: Dictionary = bridge.get_kurt_snapshot()["main"]
+		if not km5.is_empty():
+			strafe_tables[String(km5["table_name"])] = true
 		base = cur["pos"]
 	var p3: Dictionary = bridge.get_player_snapshot()
 	_check(float(p3["strafe_vel"]) > 0.1,
 		"E drives strafeVel > 0 (right)")
 	_check(gnd_frames >= 3 and lat > 0.15 and lon < lat,
 		"E displacement lateral-right dominant")
+	_check(strafe_tables.has("K_SIDE"),
+		"E strafe -> K_SIDE main frame")
 	_step_n({}, 6)
 	_wait_rest()  # land wherever the strafe ended up
 
@@ -881,14 +1057,43 @@ func _run_smoke(data_root: String) -> void:
 	_wait_rest()  # the gate needs grounded && exact vertVel==0
 	base = bridge.get_player_snapshot()["pos"]
 	var rose := false
+	var air_tables := {}
 	for i in 8:
 		_step_n({"actions": ACT_JUMP}, 1)
 		var pj: Dictionary = bridge.get_player_snapshot()
 		if float(pj["vert_vel"]) > 1.0 or \
 				Vector3(pj["pos"]).y > base.y + 0.3:
 			rose = true
+		var km2: Dictionary = bridge.get_kurt_snapshot()["main"]
+		if not km2.is_empty():
+			air_tables[String(km2["table_name"])] = true
 	_check(rose, "Space initiates jump (vertical rise)")
-	_wait_rest()  # release + land/settle
+	# Standing jump -> K_JUMP (0x2be); a descent that exhausts the
+	# vertVel threshold table releases to K_FALL (0x2bc). Either is
+	# the core-selected airborne table.
+	_check(air_tables.has("K_JUMP") or air_tables.has("K_RJMP") or
+		air_tables.has("K_FALL"),
+		"airborne -> K_JUMP/K_RJMP/K_FALL main frame")
+	# Grounded on a jump/fall frame -> locoState 0xc8 + K_LAND frame
+	# 0 the same tick; the table then plays out per frameStep. Step
+	# while grounded to observe it (replaces _wait_rest here).
+	var land_seen := false
+	for i in 60:
+		var p5: Dictionary = bridge.get_player_snapshot()
+		var km3: Dictionary = bridge.get_kurt_snapshot()["main"]
+		if not km3.is_empty() and \
+				String(km3["table_name"]) == "K_LAND":
+			land_seen = true
+		if bool(p5["grounded"]) and float(p5["vert_vel"]) == 0.0:
+			for j in 12:
+				_step_n({}, 1)
+				var km4: Dictionary = bridge.get_kurt_snapshot()["main"]
+				if not km4.is_empty() and \
+						String(km4["table_name"]) == "K_LAND":
+					land_seen = true
+			break
+		_step_n({}, 1)
+	_check(land_seen, "landing -> K_LAND main frame")
 
 	# Re-arm the jump gate for the RMB check below. After a SOFT
 	# landing the core posts no event, so locoState stays latched
@@ -949,13 +1154,13 @@ func _run_smoke(data_root: String) -> void:
 	# ---- G3: dynamic objects — the HMO_9 XGS (real spawn record,
 	# real RuntimeModel geometry). Diagnostic re-anchor mirrors
 	# mdk-inspect's --arena/--start selftest path.
-	# OBSERVED: the XGS spawn sits at z=-293, below the arena
-	# deepFloorZ-200 kill plane (+0x44e is provably zero, so the plane
-	# is -200), and FUN_0045bac0's floor-death takes it on the first
-	# object pass — the corpse is then unlinked+freed by the post-pass
-	# FUN_0045cf18 sweep. The snapshot checks therefore run before the
-	# first stepped frame; the stepped check afterwards asserts the
-	# reap itself.
+	# OBSERVED (Phase 15A): FUN_0045bac0's kill plane is the arena's
+	# REAL +0x44e deepFloorZ - 200, not a flat -200 — HMO_9's minZ is
+	# -361 so its plane is -561 and the XGS at z=-293 survives. The
+	# snapshot checks run before the first stepped frame; the stepped
+	# check afterwards asserts survival ABOVE the real plane (the
+	# below-plane reap is exercised by the connector transients and
+	# pinned natively).
 	var ds9: Dictionary = bridge.diagnostic_start(8,
 		Vector3(-174.0, 2635.0, -293.0), 0.0)
 	_check(ds9.get("ok", false), "diagnostic_start into HMO_9")
@@ -963,8 +1168,14 @@ func _run_smoke(data_root: String) -> void:
 	_check(int(dsp9["cur_arena"]) == 8, "display cur == HMO_9")
 	var objs: Array = bridge.get_object_snapshots()
 	_check(objs.size() == 1, "HMO_9 enumerates 1 object")
+	var oid := -1
+	var o_plane := 0.0
+	var o_z := 0.0
 	if objs.size() == 1:
 		var o: Dictionary = objs[0]
+		oid = int(o["id"])
+		o_plane = float(o["floor_plane"])
+		o_z = float(o["pos_mdk"].z)
 		_check(String(o["enemy_name"]) == "XGS",
 			"enemy-table name == XGS")
 		_check(String(o["model"]) == "XG_BOD",
@@ -973,7 +1184,6 @@ func _run_smoke(data_root: String) -> void:
 			int(o["spawn_id"]) == 9, "XGS enemy 30 spawn 9")
 		_check(int(o["arena"]) == 8, "object arena == 8")
 		_check(int(o["elem_count"]) == 25, "XGS elem_count == 25")
-		var oid := int(o["id"])
 		_check(oid > 0 and oid < 0x1000000,
 			"opaque object id (counter, not a pointer)")
 		var t0: Transform3D = o["transform"]
@@ -1035,12 +1245,20 @@ func _run_smoke(data_root: String) -> void:
 		for c in onode.get_children():
 			_check(c.visible,
 				"elem_mask=0 -> all elements visible")
-	# OBSERVED lifecycle: the XGS dies at the -200 kill plane on the
-	# first object pass and the post-pass FUN_0045cf18 sweep unlinks
-	# it — the enumeration drops to zero (no corpse is ever exposed).
+	# OBSERVED lifecycle (corrected Phase-15A semantics): the kill
+	# plane is the arena's REAL deepFloorZ - 200, not a flat -200 —
+	# HMO_9's AABB minZ is -361, so the plane is -561 and the XGS at
+	# z=-293 sits ABOVE it: it survives and stays enumerated, as it
+	# does in MDK95. The below-plane death + FUN_0045cf18 reap is
+	# exercised live by the CHMO_2 connector-door transients below
+	# and pinned natively (above/below-plane boundary test).
+	_check(o_plane < o_z,
+		"XGS sits above the real kill plane (deepFloorZ-200)")
 	_step_n({}, 3)
-	_check(bridge.get_object_snapshots().is_empty(),
-		"below-plane object dies and is reaped (FUN_0045cf18)")
+	var _objs_left: Array = bridge.get_object_snapshots()
+	_check(_objs_left.size() == 1 and
+		int(_objs_left[0]["id"]) == oid,
+		"above-plane object survives (FUN_0045bac0, real floor)")
 
 	# ---- G3: corridor door + portal crossing + arena transfer ----
 	# CHMO_2 has no MTO render block — the partner's geometry carries
@@ -1049,7 +1267,8 @@ func _run_smoke(data_root: String) -> void:
 	# y=1237 portal into HMO_3 (arena 11 -> 2).
 	# OBSERVED lifecycle on this route (FUN_004572ac pass order +
 	# FUN_0045bac0 kill plane + FUN_0045cf18 reap): the corridor door
-	# spawns at z=-935 — below the -200 plane — so each connector is
+	# spawns at z=-935 — below CHMO_2's real deepFloorZ-200 plane —
+	# so each connector is
 	# a ~2-frame transient: the CHMO_2 door opens (attaching HMO_3)
 	# and dies; HMO_3's script then respawns a fresh connector (the
 	# dedup scan sees only named records, so the corpse cannot
@@ -1071,10 +1290,15 @@ func _run_smoke(data_root: String) -> void:
 	var live_door := -1           # connector id enumerated last frame
 	var corridor_checked := false
 	var crossed := false
+	var run_tables := {}
 	var dspc: Dictionary = bridge.get_display_snapshot()
 	for i in 90:
 		_step_n({"actions": ACT_FORWARD}, 1)
 		dspc = bridge.get_display_snapshot()
+		# 16B: a grounded corridor run posts eventMag 0x258 -> K_RUN.
+		var kmr: Dictionary = bridge.get_kurt_snapshot()["main"]
+		if not kmr.is_empty():
+			run_tables[String(kmr["table_name"])] = true
 		var conn_id := -1
 		var conn_count := 0
 		for od in bridge.get_object_snapshots():
@@ -1106,6 +1330,10 @@ func _run_smoke(data_root: String) -> void:
 		if int(dspc["cur_arena"]) == 2:
 			crossed = true
 			break
+	# A grounded corridor run selects K_RUN (the spawn platform's
+	# open reach is too short — W there goes airborne -> K_FALL).
+	_check(run_tables.has("K_RUN"),
+		"corridor run -> K_RUN main frame")
 	_check(door_id >= 0, "connector door enumerated (XCORDOOR)")
 	_check(door_arena0 == 11, "door starts on corridor list")
 	_check(not door_multi, "at most one live connector per snapshot")
@@ -1137,6 +1365,60 @@ func _run_smoke(data_root: String) -> void:
 		seen_ids[k] = true
 	_check(not dupes, "no duplicate object ids in snapshot")
 
+	# ---- 16B: texture-cache stability + firing overlay ----
+	# Same {table,frame} re-presented -> the SAME cached
+	# ImageTexture (stable identity, no per-frame rebuild).
+	var seen_tex := {}
+	var reused := false
+	for i in 120:
+		_step_n({}, 1)
+		var kf: Dictionary = bridge.get_kurt_snapshot()
+		var mf: Dictionary = kf["main"]
+		if mf.is_empty():
+			continue
+		var key := "%s/%d" % [String(mf["table_name"]),
+			int(mf["frame"])]
+		if seen_tex.has(key):
+			if seen_tex[key] == mf["tex"]:
+				reused = true
+		else:
+			seen_tex[key] = mf["tex"]
+	_check(reused, "repeated frame identity reuses ImageTexture")
+
+	# Firing: LMB holds produce K_SHOT/K_RUNFIR main frames. The
+	# standing shot state (0x12c) has NO muzzle block in the
+	# original — K_MUZZF is written only by the strafe/turn/fall/
+	# chute/jump branches while the c74 fire latch is held, on
+	# odd-parity frames (disasm: 0x46239e / 0x462491 / ...). Turn
+	# + fire keeps eventMag at 0x190, so K_TRN45 carries the
+	# overlay — core-selected in both cases.
+	var fired_table := false
+	for i in 24:
+		_step_n({"mouse_buttons": 1}, 1)
+		var kb: Dictionary = bridge.get_kurt_snapshot()
+		var mb: Dictionary = kb["main"]
+		if not mb.is_empty() and \
+				String(mb["table_name"]) in ["K_SHOT", "K_RUNFIR"]:
+			fired_table = true
+	_check(fired_table, "fire -> K_SHOT/K_RUNFIR main frame")
+	var saw_overlay := false
+	var saw_turn_fire := false
+	for i in 32:
+		_step_n({"actions": ACT_TURN_LEFT, "mouse_buttons": 1}, 1)
+		var kb2: Dictionary = bridge.get_kurt_snapshot()
+		var mb2: Dictionary = kb2["main"]
+		if not mb2.is_empty() and \
+				String(mb2["table_name"]) == "K_TRN45":
+			saw_turn_fire = true
+		var ob: Dictionary = kb2["overlay"]
+		if not ob.is_empty():
+			saw_overlay = true
+			if String(ob["table_name"]) != "K_MUZZF":
+				_check(false, "overlay table == K_MUZZF")
+	_step_n({}, 8)
+	_check(saw_turn_fire, "turn+fire -> K_TRN45 main frame")
+	_check(saw_overlay, "muzzle overlay presented (K_MUZZF)")
+
 	print("smoke: %d failure(s)" % failures)
 
 
@@ -1147,6 +1429,18 @@ func _run_smoke_generic(level: String, arena: String) -> void:
 	print("smoke(generic): level=%s arena=%s" % [level, arena])
 	_check(bridge.is_level_loaded(), "level loaded")
 	_check(bridge.get_arena_names().size() > 0, "arena count > 0")
+	# 16B — authoritative Kurt presentation on whatever level the
+	# launcher loaded.
+	var kg: Dictionary = bridge.get_kurt_snapshot()
+	_check(not kg.is_empty(), "kurt snapshot non-empty")
+	_check(int(kg["decoded_tables"]) > 0, "K_ tables decoded")
+	_check(Array(kg["table_errors"]).is_empty(),
+		"no K_ table decode errors")
+	var mg: Dictionary = kg["main"]
+	_check(not mg.is_empty() and mg["tex"] != null,
+		"kurt main frame + texture")
+	_check(kg["drawn"] == true, "kurt drawn")
+	_check(not $PlayerRoot/DebugBody.visible, "debug proxy hidden")
 	var dsp: Dictionary = bridge.get_display_snapshot()
 	_check(not dsp.is_empty(), "display snapshot non-empty")
 	_check(int(dsp["cur_arena"]) >= 0, "current arena resolved")

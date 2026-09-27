@@ -15,16 +15,39 @@ visible = false
 [node name="PlayerRoot" type="Node3D" parent="."]
 
 [node name="DebugBody" type="MeshInstance3D" parent="PlayerRoot"]
+visible = false
 
 [node name="ForwardMarker" type="MeshInstance3D" parent="PlayerRoot"]
+visible = false
 
 [node name="PlayerBoxWire" type="MeshInstance3D" parent="."]
+visible = false
 
 [node name="CollisionDebug" type="MeshInstance3D" parent="."]
 visible = false
 
 [node name="Camera3D" type="Camera3D" parent="."]
 far = 20000.0
+
+[node name="KurtLayer" type="CanvasLayer" parent="."]
+
+[node name="KurtViewport" type="Control" parent="KurtLayer"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="KurtOverlay" type="TextureRect" parent="KurtLayer/KurtViewport"]
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 0
+
+[node name="KurtMain" type="TextureRect" parent="KurtLayer/KurtViewport"]
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 0
 
 [node name="DebugUI" type="CanvasLayer" parent="."]
 

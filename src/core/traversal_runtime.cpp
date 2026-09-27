@@ -961,6 +961,15 @@ TraversalFrameResult stepTraversalRuntime(
   TraversalArena* cur = rt.cur;
   const float dt = timing.deltaSec;
 
+  // FUN_0042fb68 — the original's frame-pacing entry writes
+  // 0x5414d4 = 1 at the top of every main-loop iteration and only
+  // clears it inside the slow-frame catch-up (the 4-skip/0x32ms
+  // window) — a pacing path this port's FrontendTimingState does not
+  // model. Every stepped frame is a presented frame, so the latch is
+  // held set; its readers (the d0c++ cadence counter, the FUN_00461954
+  // draw gate, the HUD blit paths) now see the original steady state.
+  rt.hudActive = 1;
+
   // OBSERVED gate: the whole traversal-active section runs only when
   // mode byte 0x541492 == 3 — this runtime models traversal mode only.
   // Head: FUN_0041b654 (0x540e9c gate) + FUN_00431cf4 — stream/render
@@ -1621,6 +1630,14 @@ TraversalFrameResult stepTraversalRuntime(
     // selection and the original's side-effects). jumpHeld is the
     // same one-frame-latency input block the rest of the pipeline
     // reads (the draw callback read 0x4ce768 directly).
+    //
+    // Phase 16B: FUN_00431300's player-entry half runs FIRST — the
+    // M1 transform + projector write the 0x540c14 record, the
+    // 0x540c4c/50 anchor ints and the 0x540dbc scale probe before
+    // the FUN_00461954 callback drains (the callback may itself move
+    // pos — e.g. the 0x320 mantle — the sprite still draws at the
+    // pre-tick anchor, matching the original's call order).
+    playerAnimRegistration(rt);
     {
       PlayerAnimEnvironment ae;
       ae.frameStep = timing.frameStep;
@@ -1762,7 +1779,27 @@ TraversalFrameResult stepTraversalRuntime(
       out.animTableIdx = ti;
       out.animFrameIdx = fi;
     }
+    int oti = -1, ofi = -1;
+    if (playerAnimFrameIdentity(rt, rt.animOverlayFrame, &oti, &ofi)) {
+      out.animOverlayTableIdx = oti;
+      out.animOverlayFrameIdx = ofi;
+    }
   }
+  out.animAnchorX = rt.animAnchorX;
+  out.animAnchorY = rt.animAnchorY;
+  out.animScopeOfs = rt.scopeHudOffset;
+  out.animScale = rt.scopeScale;
+  out.animDepth = rt.animViewZ;
+  out.animViewX = rt.animViewX;
+  out.animViewY = rt.animViewY;
+  out.animScreenX = rt.animScreenX;
+  out.animScreenY = rt.animScreenY;
+  out.animProbeY = rt.animProbeY;
+  out.animClipFlags = rt.animClipFlags;
+  out.animRegistered = rt.animRegistered;
+  out.animOfsX = rt.animOfsX;
+  out.animOfsY = rt.animOfsY;
+  out.animMuzzIdx = rt.animMuzzIdx;
   out.slideChannel = rt.slideChannel;
   out.viewOnPartner = rt.viewOnPartner;
   out.partnerActive = rt.partnerActive;
