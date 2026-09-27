@@ -5576,11 +5576,14 @@ Continuation: `--save-restore` + `--hit 'XG:2x80'`:
    `pc=+217f0` — because the restored `field138=null` passes the
    broadcast outrank filter (`f138!=null` short-circuits; the
    torn-down record's `f11a=0 >= ctxRank=0` was the live blocker).
-   The degrade mirrors the original exactly: `FUN_0045cf90` memsets
-   the record on despawn → its `+0x7c` is 0 → the original writer
-   emits 0 → the loader restores null. The ORIGINAL's own
-   save/load produces the identical unblocking — this is format
-   fidelity, not a native workaround (no semantics changed).
+   The degrade mirrors the original's documented writer/loader
+   semantics (OBSERVED, static): `FUN_0045cf90` memsets the record
+   on despawn → its `+0x7c` is 0 → the original writer emits 0 →
+   the loader restores null. Under those disassembly-proven
+   semantics the original's save/load boundary would produce the
+   identical unblocking — format fidelity, not a native workaround
+   (no semantics changed). NOT LIVE-OBSERVED: an actual retail
+   BUILD_A save→load inside this fight was never run.
 3. XGUNTAM-2 spawns (`model=XGU_HEAD`, `f148=0010`) → `+21f88` →
    **`83 00` @0x21ff7 → `pendingViewSnap=−1` → `endLevel=1`**,
    latched ~f316–325 post-restore. XGUNTAM-2 parked at
@@ -5592,8 +5595,10 @@ Never-saved control (900f live run, same hits): all six XGs die
 cannot retry. `endLevel=0` permanently. This **confirms the
 stale-leader gate as authentic retail-modeled behavior**: the
 original's identical gate + identical stale record deadlocks the
-same way; only the save/load boundary clears it (in the original
-as well — the format cannot represent the stale ref).
+same way (OBSERVED disasm + native reproduction); under the
+documented save semantics only the save/load boundary clears it —
+the format cannot represent the stale ref (static evidence; no
+live retail save→load was observed).
 
 Verdict: GUNT_10 completion chain is fully implemented and proven —
 door dispatch, XGUNTAM-2 handoff, `+21f88`, `0x83`, `endLevel`.
