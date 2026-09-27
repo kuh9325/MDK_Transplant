@@ -344,9 +344,9 @@ DSOUND).
 4. Alien command interpreter (`tr_alcmd.c` region) — resolved Phase
    11A+11B (see Enemy/AI row): the command bodies, `0x2a`/`0xa6` linkage
    ops, and every opcode the live LEVEL3–8 scripts reach are ported
-   (`diag=0` census). Remaining: op `0x60` (unused by LEVEL3–8 streams),
-   FX/SFX record semantics (`0x4a1220`), inventory (`0x54155c`), and
-   DOS-build parity.
+   (`diag=0` census). Phase 15C: `0x60` is reached (`XGUNTAM`@`+21f0c`,
+   handler `0x444bb0`). Remaining: FX/SFX record semantics (`0x4a1220`),
+   inventory (`0x54155c`), and DOS-build parity.
 5. FLIC/MVE decoder boundaries for future video playback.
 6. Win95 runtime lane (blocked on licensed Windows 95) to validate the
    DDraw/DInput/DSound paths end-to-end.

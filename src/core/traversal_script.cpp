@@ -675,13 +675,15 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       }
       st.retPc[st.callDepth] = r.pc;
       st.savedPc[st.callDepth] = st.pcImageOff;
-      st.marker[st.callDepth] = 0;
       ++st.callDepth;
+      st.marker[st.callDepth] = 0;   // mark[depth+1]=0 (tail reads
+                                     // +0x248 post-increment)
       r.pc = target;
       st.pcImageOff = target;
       return true;
     };
     auto doGoto = [&](std::uint32_t target) {
+      st.marker[st.callDepth] = 0;   // mark[depth]=0 on the jump
       r.pc = target;
       st.pcImageOff = target;
     };

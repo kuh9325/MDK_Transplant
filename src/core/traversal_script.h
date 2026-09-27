@@ -128,7 +128,9 @@ struct TraversalScriptState {
   int callDepth = 0;                 // +0x248 (cap 4)
   std::uint32_t retPc[4] = {};       // +0x24c
   std::uint32_t savedPc[4] = {};     // +0x25c (saved +0x108)
-  std::uint16_t marker[4] = {};      // +0x26c
+  std::uint16_t marker[5] = {};      // +0x26c — slot 4 (+0x274) is
+                                     // reached at max call depth; the
+                                     // AREN record serializes 4
 
   // Native bookkeeping (not original fields):
   bool active = false;               // has a live script (pc!=0)

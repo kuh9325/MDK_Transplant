@@ -11759,6 +11759,39 @@ void test_traversal_script() {
     CHECK(r.stopped);                           // call ran the 09
   }
 
+  // --- conditional linkage mark slots (0x444bb0 tail) ---------------
+  {
+    // Shared-handler semantics: a conditional call clears mark at the
+    // post-increment depth (caller's armed mark survives); a goto
+    // clears mark at the current depth.
+    ScriptFixture f;
+    f.write(C, {0x60});
+    f.writeF(C + 1, 0.0f); f.writeF(C + 5, 0.0f);
+    f.writeF(C + 9, 10.0f); f.writeF(C + 0xd, 10.0f);
+    f.write(C + 0x11, {0xfc});
+    f.writeW(C + 0x12, 0x300);
+    f.write(C + 0x16, {0xff});
+    f.write(0x300, {0xff});
+    f.rt.cs.pos[0] = 5.f; f.rt.cs.pos[1] = 5.f;
+    f.env.playerPos = f.rt.cs.pos;
+    f.arena->script.pcImageOff = C;
+    f.arena->script.marker[0] = 7;             // armed caller mark
+    f.arena->script.marker[1] = 9;             // stale callee mark
+    mdk::traversalScriptRun(f.env);
+    CHECK(f.arena->script.marker[0] == 7);     // caller slot preserved
+    CHECK(f.arena->script.marker[1] == 0);     // callee slot cleared
+    CHECK(f.arena->script.callDepth == 1);
+    // 0x0c goto: mark[depth] cleared on the jump.
+    f.write(C + 0x11, {0x0c});
+    mdk::TraversalScriptState st2;
+    f.arena->script = st2;
+    f.arena->script.pcImageOff = C;
+    f.arena->script.marker[0] = 7;
+    mdk::traversalScriptRun(f.env);
+    CHECK(f.arena->script.marker[0] == 0);
+    CHECK(f.arena->script.pcImageOff == 0x300);
+  }
+
   // --- malformed read: opcode fetch out of bounds --------------------
   {
     ScriptFixture f;

@@ -5215,11 +5215,14 @@ the **only** producer of `0x540ebc=-1` in BUILD_A (writer xref at
 - `0x5e` (jump-by-CALL `pc=eax`) and `0x81` (element blow-off
   `{u8 form,u8 n,n×lstr}`) are script features the port does not yet
   implement — flagged for the boss-phase work.
-- Live harness (`--traversal-runtime LEVEL8 --arena GUNT_10`) shows
-  the spawned boss objects ticking and stopping on three unimplemented
-  object-VM ops: `0x60` at `+21f0c` (inside `XGUNTAM`@`0x21ef5`),
-  `0xf2` at `+21e65`, `0x55` at `+2201d` — the current gates between
-  the GUNT_10 spawn path and the `83 00` tail at `0x21ff7`.
+- Live harness (`--traversal-runtime LEVEL8 --arena GUNT_10`) showed
+  the spawned boss objects stopping on three object-VM ops: `0x60` at
+  `+21f0c` (inside `XGUNTAM`@`0x21ef5`), `0xf2` at `+21e65`, `0x55` at
+  `+2201d`. RESOLVED — all three were implemented during §193's
+  coverage wave; Phase 15C (§197) closes the residual evidence
+  (handlers byte-verified, sites executed, `diag=0`), and the
+  `83 00` tail at `0x21ff7` is proven via the save→restore golden
+  (§195).
 
 ## 192. Phase 15A — `0x83` native bridge (implemented)
 
@@ -5850,3 +5853,96 @@ CTest 1/1, pytest 19/0, selftests 4/4, freefall 5/5, campaign
 handoff 5/5, campaign sequence `23c84c9f241af58b`, arena-render
 60/60, frontend 60/0, Godot default/L6/L8 frames30, BUILD_A
 manifest 141/141.
+
+
+## 197. Phase 15C — GUNT_10 residual object-VM evidence closure
+
+Bounded follow-up on the §191 residual: `0xf2`@`+21e65`,
+`0x60`@`+21f0c`, `0x55`@`+2201d` in the GUNT_10 completion
+neighborhood. Reachability was established **before** any code
+judgment — proximity to the `83 00` tail is not evidence of
+necessity.
+
+### Dispatch + handler verification (OBSERVED)
+
+Dispatch table: `u32[253]` @ VA `0x438a5c`, indexed `(op−1)`
+(the earlier `0x438a58`/`u32[256]` shorthand reads the same memory —
+slot `op` at `0x438a58` ≡ slot `op−1` at `0x438a5c`; entries past
+`0xfd` are not table slots). Verified slots:
+
+| op | slot VA | handler | semantics (disasm-verified, matches port byte-for-byte) |
+|---|---|---|---|
+| `0xf2` | `0x438e20` | `0x451987` | `{u8 flag, [12×f32]}` — flag≠0: `+0x2d0=1`, `+0x2d1=0xff`, store six f32 into orbit lane A (`+0x2d2`) + six into lane B (`+0x2ea`); flag==0: clears `+0x2d1` only |
+| `0x60` | `0x438bd8` | `0x444bb0` | `{f32 x0,y0,x1,y1, linkage}` — 2D player-in-box test; on true: `0xfc`/`0xfe` call, `0x0c` goto, `0xfd` return via the shared conditional-linkage tail; other modes / false → fall-through |
+| `0x55` | `0x438bac` | `0x449524` | `{u8 flag}` — flag≠0: latch `+0x148|0x40` + copy col-transform 3×3 into `rawMatrix` (snapshot taken once, while bit clear); flag==0: clear `+0x148&~0x40` only |
+
+### Reachability (OBSERVED — live `--traversal-runtime` trace)
+
+| op | site | object/script | never-saved | save→restore golden | class |
+|---|---|---|---|---|---|
+| `0xf2` | `+21e65` | `XBN` script head (spawned by `GUNT_10` t3 `@+21e65`) | YES — `pc=+21eac`, progressed into animWait/rgoto park | YES — XBN init re-runs on restore | B — executed, already covered |
+| `0x60` | `+21f0c` | `XGUNTAM` script `@+21ef5` (`60` → `+21f2e` engage block) | YES — `pc=+21f38` inside the block, `mark=00` (markLink path excluded; player inside box) | YES — same per-tick wake test on XGUNTAM-2 | B — executed, already covered |
+| `0x55` | `+2201d` | `XBO` script head (spawned by `GUNT_10` t3 `@+2201d`) | YES — `flags148=0x40` latched at spawn init | YES | B — executed, already covered |
+
+All three are **B-class**: executed on real BUILD_A gameplay paths and
+already byte-faithfully implemented (§193 coverage wave). No new
+handler implementation was required; none was added.
+
+### Verified BUILD_A usage census
+
+The coarse opcode-byte census produced false positives (opcode bytes
+inside strings/link targets/data regions, decoder grammar desyncs).
+Sites verified with the authoritative port decoder
+(`--script-disasm` / `--obj-script-disasm`):
+
+- `0x60` — real sites: LEVEL8 `GUNT_2`@`+51b9`, `GUNT_5`×4 trigger
+  boxes, `XGUNTAM`@`+21f0c` (object-side); plus arena-side
+  player-in-box conditionals throughout LEVEL3–8 (implemented since
+  the §65–71 core).
+- `0xf2` — real sites: LEVEL8 `XBN`@`+21e65`; LEVEL5 `MUSE_5`@`+b2cd`
+  (a second `XBN` orbit block — identical `f2 04` + 4-point idiom).
+  `L5`@`+100015` is a data-region false positive (flag byte 195
+  decodes to garbage).
+- `0x55` — real sites: LEVEL8 `XBO`@`+2201d`; LEVEL6 `OLYM_10`'s
+  `XBO`@`+15ce7` (record start `+15ce3`, code at `+15ce7`). The
+  LEVEL3 `+1551a` hit is a false positive — `24 55 01 00` is the
+  `0x15524` link target (the `XS_EXPL` subroutine), not an opcode.
+
+### Incidental fidelity fix — arena conditional-linkage mark slots
+
+Handler `0x444bb0`'s shared linkage tail writes mark words two ways:
+**call** clears `mark[depth+1]` (the `+0x248` post-increment slot —
+caller's armed mark survives) and **goto** clears `mark[depth]`.
+The object side was already faithful (`scriptMark[5]`); the arena
+side cleared `marker[depth]` on call and never on goto, and
+`TraversalScriptState::marker` was `[4]` while `mark[4]` (+0x274) is
+reachable at max depth. Fixed to the OBSERVED semantics —
+`marker[5]` + post-increment clear on call + current-depth clear on
+goto (`src/core/traversal_script.{h,cpp}`; unit coverage in
+`test_main.cpp` "conditional linkage mark slots"). AREN record
+serialization unchanged at 4 u16 (+0x26c..+0x273) — the in-memory
+slot 4 mirrors the original's +0x274 reach without a format change.
+No observable delta on any real path (arena marker has no live
+readers); verified zero digest drift on all six levels.
+
+### Validation
+
+- GUNT_10 300f: `runs=300 insn=6290 spawned=6 diag=0` — no
+  unknown-op diagnostics (stop rule: none surfaced).
+- Save→restore golden UNCHANGED: six XG deaths → `cntLink "XG" 6` →
+  `+217ca` door dispatch → XGUNTAM-2 → `+21f88` → `83 00`@`0x21ff7`
+  → `endLevel=1` (~f316+ post-restore).
+- Never-saved control UNCHANGED: six XG deaths, `X10_DOOR` parked
+  `f230=+217bf` `mark=fe`, `endLevel=0` — authentic stale-leader
+  deadlock preserved, no workaround added.
+- LEVEL3–8 60f digests UNCHANGED, all `diag=0`:
+  `a1a1427c25fdaaf8` / `e8d1c89e4fc0a36e` / `2cf8bdf33da64931` /
+  `2c42b85a14331f8d` / `2be55ac4d4c31212` / `92c4b8a3576ac12c`.
+- Regression: mdk_tests 5219/0 (+5 mark-slot checks), CTest 1/1,
+  pytest 19/0, selftests 4/4, campaign handoff 5/5, campaign
+  sequence `23c84c9f241af58b`, arena-render 60/60, frontend 60/0,
+  BUILD_A manifest 141/141.
+
+**Phase 15C is CLOSED** — the §191 residual ops are classified
+(executed + already covered), not latent, and no speculative
+behavior was added.
