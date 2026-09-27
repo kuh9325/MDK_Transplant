@@ -3241,7 +3241,7 @@ int main(int argc, char** argv) {
                       "child=%s f14a=%02x f14b=%02x f14c=%02x "
                       "f149=%02x vel=(%.2f,%.2f,%.2f) f34=%.2f f38=%.2f "
                       "t12c=(%.1f,%.1f,%.1f) t120=(%.1f,%.1f,%.1f) "
-                      "fEC=%p f2a0=%d f11a=%02x\n",
+                      "fEC=%p f2a0=%d f11a=%02x f138=%s\n",
                       o.field108,
                       static_cast<unsigned long>(
                           pcOff(o.field108)),
@@ -3262,7 +3262,9 @@ int main(int argc, char** argv) {
                       (double)o.field120[0], (double)o.field120[1],
                       (double)o.field120[2],
                       o.fieldEC, (int)o.field2a0,
-                      (unsigned)o.field11a);
+                      (unsigned)o.field11a,
+                      o.field138 ? o.field138->scriptClass.c_str()
+                                 : "-");
         }
       }
       for (const auto& r : mdk::traversalSpawnLog())

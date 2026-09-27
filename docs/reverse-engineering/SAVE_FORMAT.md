@@ -314,15 +314,26 @@ The native reader maps these onto `SaveError` codes one-for-one.
   non-CMI strings → `-1` + warning — the original saved a wild
   `ptr−base` that only resolved inside its own address space).
 - **Unrepresentable references are fatal**: a live arena pointer not
-  in `rt.arenas`, a live object pointer outside the serialized set
-  (embedded + list records), or a gameplay CMI pointer outside the
-  loaded image cannot be encoded — silently emitting a null/sentinel
-  token would corrupt the restored world (wrong-object id, arena -1,
-  wild CMI offset). The writer collects every such failure and returns
-  an empty buffer with `detail` set rather than producing a parseable
-  but semantically broken save. The only non-fatal degradation left is
-  the non-CMI *string* class above (the original itself could not
-  represent those).
+  in `rt.arenas` or a gameplay CMI pointer outside the loaded image
+  cannot be encoded — silently emitting a null/sentinel token would
+  corrupt the restored world (arena -1, wild CMI offset). The writer
+  collects every such failure and returns an empty buffer with
+  `detail` set rather than producing a parseable but semantically
+  broken save. Three degradations ARE byte-faithful (OBSERVED, Phase
+  15A GUNT_10 mid-fight write):
+  - Object refs outside the serialized set can only reach
+    torn-down/freelist records — `FUN_0045cf90` memsets the record on
+    despawn, so its `+0x7c` stamp is 0 and the original emits 0
+    verbatim (a stale earlier-save id would restore to null
+    identically). Emit `0` + warning.
+  - `+0x114`/`+0x306`/`+0x30a` anim-record pointers and `+0x110`
+    death-handoff values can be out-of-image legitimately (MTO-resolved
+    records, small-int flag values like X10_DOOR's `+0x110==2`) — the
+    remap returns `-1`, matching the loader's own sentinel. Emit `-1`
+    + warning. OBSERVED real saves carry stale heap pointers in
+    `+0x114`.
+  - The non-CMI *string* class above (the original itself could not
+    represent those).
 - **FUN_00426738 record fixup, mirrored**: `+0x0c`/`+0x158` zeroed;
   `+0x60`/`+0x2bc`/conn `+0x302` arena tokens; `+0xec`, `+0x108`,
   `+0x10c`, `+0x110`, `+0x114`, `+0x230`, retPc `+0x24c..`, savedPc

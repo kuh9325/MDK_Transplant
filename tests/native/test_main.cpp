@@ -19597,7 +19597,11 @@ void test_save_full_write() {
 
   // Gameplay-authoritative references that cannot be tokenized must
   // FAIL the write — silently emitting a null token would corrupt the
-  // restored world (object id 0, arena -1, or a wild CMI offset).
+  // restored world (arena -1 or a wild CMI offset). The one object-ref
+  // exception is proven faithful by the GUNT_10 stale-leader case:
+  // an out-of-set pointer can only reach a torn-down/freelist record,
+  // which FUN_0045cf90 memsets on despawn — its +0x7c is 0 and the
+  // original emits 0 verbatim (restore resolves it to null).
   auto freshRt = [&]() -> TraversalRuntime {
     TraversalRuntime r;
     ProgressionSession s;
@@ -19606,7 +19610,8 @@ void test_save_full_write() {
                                         &detail) == SaveError::kOk);
     return r;
   };
-  // 1) object ref -> a record outside the serialized set.
+  // 1) object ref -> a record outside the serialized set: emits 0 +
+  //    warning (the original reads the unstamped target's +0x7c = 0).
   {
     TraversalRuntime rt = freshRt();
     ProgressionSession sx;
@@ -19614,8 +19619,9 @@ void test_save_full_write() {
     rt.arenas[0]->dyn.storage.front()->field138 = &foreign;
     mdk::FullWriteReport rr;
     std::string dd;
-    CHECK(mdk::saveGameWriteFull(rt, sx, in, &rr, &dd).empty());
-    CHECK(dd.find("object") != std::string::npos);
+    const auto nb = mdk::saveGameWriteFull(rt, sx, in, &rr, &dd);
+    CHECK(!nb.empty());
+    CHECK(!rr.warnings.empty());
   }
   // 2) arena ref -> a TraversalArena outside rt.arenas.
   {

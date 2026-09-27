@@ -5374,7 +5374,7 @@ link-target operands, not opcodes.
 | L5 MUSE_4 | NO (mid-level) | wave/turret gallery: XGUNTAM gun-turret (hp 65000 sentinel; damage pool = scriptLocals `grp2[0]`=800) + X4_TOWER decor (hp 65000) + ambient XG/XC/XF waves via `wpick` + 11-arm `0x64eb` contextual-resupply dispatcher (grp1 bits 19–31 one-shots + ammo/hp/inv need-checks) | `namedLink "ANY"` typed hits → drain arm `grp2[0] −= 20/80` on XGUNTAM | XGUNTAM `grp2[0]` pool — `varcmpLink` @0x6400 vs 0 → `0x6417` death arm | `0x6417` `bitset grp1 bit13` (sole writer) → `0x64f2` `brSet` halts resupply; tail = anims + `59 "TANKDROP"` sfx + `04` bcast remote-call `0x6469` on X4_TOWER + `4c 0` deathRef-clear + `animWait 0x7fff` hold (corpse park — OBSERVED pc +6459) | none in stream — terminal site is MUSE_5-path `83 51` @0xb6ed | no `0x83`/`0x51` opcode in span `0x61bc..0xa761` (all `83`/`51` bytes are wpick/link operands; `0x83a8`/`0x83d6`/`0x8404` `83 00` stubs are unreachable orphans); grp2 bit29 = wave-sequence tick consumed by `0x82bf`/`0x9434` watchers → maneuver wpicks `0x830c`/`0x9481`, NOT completion |
 | L8 GUNT_5 | NO (mid-level) | triggered-wave arena (t3 @0xfb8d): XCORRDOR→CGUNT_4 + SW_* pickups + once-only arms grp1 bits 1/2/3/5 (XG/XD/XT waves, XGEN, SW_H01 trail) + SW_KEY/NUKE respawn helper | box2d/box3d player-entry gates | XG/XD/XT/XGEN drones (direct-fire classes) | grp1 once-only latches; bit4 big-room box → `partnerArena "CGUNT_5"` | none — exits door-driven | no `0x83` opcode in span `0xfb8d..0x13677` (all `83` bytes are `e6`/`3b` operands/float-table data — OBSERVED `endLevel=0`, `diag=0`) |
 | L8 GUNT_8 | NO (precursor) | turret gallery + XG pack (t3 @0x1b256): XCORRDOR×2 portals, 3× I7_FAN `volact`, 3× XTGUN, 4× XG id 0x14d, XM3 | box3d wake → `04` bcast remote-call `0x1b59c` on XG pack | XG/XG1_* elem `namedLink` dispatch @`0x1e2b4` → `0x1da3b` | `cntLink "XTGUN"` → `0x1b440` chained SW_H25 resupply (→`0x1b474`→`0x1b4a8`→stop) | none — terminal site is GUNT_10 `83 00` @0x21ff7 | no `0x83` opcode in span `0x1b256..0x1e502` (both `83` bytes are link-target u32 low bytes — OBSERVED `endLevel=0`, `diag=0`) |
-| L8 GUNT_10 | YES (deferred) | XGUNTAM/XBO multi-stage | `cntLink "XG" 6` | XBSHIP T1–T7 elems | object handlers @+21d6a | `83 00` @0x21ff7 | `0x83` subop 0 — INDETERMINATE retail outcome (stale-leader rank gate; strong lean ORIGINAL DEADLOCK); no native fix; live oracle DEFERRED |
+| L8 GUNT_10 | YES | XGUNTAM/XBO multi-stage | `cntLink "XG" 6` | XBSHIP T1–T7 elems | object handlers @+21d6a | `83 00` @0x21ff7 | `0x83` subop 0 — **GOLDEN `endLevel=1` via mid-fight save→restore→continue** (leader-ref degrade `+0x7c→0` is byte-faithful; clears X10_DOOR's stale leader → `+217ca` broadcast fires → XGUNTAM-2 → `+21f88` → `83 00`). Never-saved live path reproducibly DEADLOCKS at the outrank gate — authentic retail-modeled seam, no native fix applied |
 
 ### DANT_10 — golden proven (OBSERVED, real-data harness)
 
@@ -5557,6 +5557,52 @@ intact. Two representation gaps surfaced and fixed on evidence:
   produces the same "no record" sentinel for out-of-image values
   (the port's MTO-resolved records live outside `cmiBytes`).
   Script-PC refs keep the hard-fail path.
+
+### GUNT_10 — golden proven via mid-fight save→restore→continue (OBSERVED)
+
+Checkpoint: `--traversal-runtime LEVEL8 --arena GUNT_10
+--start -60 3420 -380` + `--hit 'XBSHIP@T<i>:2'` ×7 for the T1–T7
+element kills. At frame 300: XBSHIP dead, `flags58=0x2` (grp1
+bit1 = flag(1,1)), six `XG` walkers spawned (+21d6a arm),
+`--save-write-full` → 38795B full stream (levelId=4, three
+byte-faithful degrades: X10_DOOR `+0x110==2` → −1, an MTO anim
+record → −1, X10_DOOR `field138`→torn-down XGUNTAM-1 → 0).
+
+Continuation: `--save-restore` + `--hit 'XG:2x80'`:
+
+1. Six XG deaths (`objDeathCalls=6`) → `cntLink "XG" 6` watcher →
+   door sub → `flags58=0x6` (grp1 bit1+bit2 = flag(1,1)+flag(1,2)).
+2. `+217ca` broadcast **fires** — X10_DOOR `f230=+217ce`,
+   `pc=+217f0` — because the restored `field138=null` passes the
+   broadcast outrank filter (`f138!=null` short-circuits; the
+   torn-down record's `f11a=0 >= ctxRank=0` was the live blocker).
+   The degrade mirrors the original exactly: `FUN_0045cf90` memsets
+   the record on despawn → its `+0x7c` is 0 → the original writer
+   emits 0 → the loader restores null. The ORIGINAL's own
+   save/load produces the identical unblocking — this is format
+   fidelity, not a native workaround (no semantics changed).
+3. XGUNTAM-2 spawns (`model=XGU_HEAD`, `f148=0010`) → `+21f88` →
+   **`83 00` @0x21ff7 → `pendingViewSnap=−1` → `endLevel=1`**,
+   latched ~f316–325 post-restore. XGUNTAM-2 parked at
+   `f230=+21ffb` (immediately after the `83` insn).
+
+Never-saved control (900f live run, same hits): all six XGs die
+(`objDeathCalls=6`), X10_DOOR stays parked at `f230=+217bf` with
+`mark=fe` — the outrank filter skips the `+217ca` broadcast and it
+cannot retry. `endLevel=0` permanently. This **confirms the
+stale-leader gate as authentic retail-modeled behavior**: the
+original's identical gate + identical stale record deadlocks the
+same way; only the save/load boundary clears it (in the original
+as well — the format cannot represent the stale ref).
+
+Verdict: GUNT_10 completion chain is fully implemented and proven —
+door dispatch, XGUNTAM-2 handoff, `+21f88`, `0x83`, `endLevel`.
+The never-saved deadlock is a faithful reproduction of the
+original's own gate (INDETERMINATE→ retail deadlock strongly
+supported by the save-format mechanics: no native mechanism was
+found or needed — the only observed unblocker is the save boundary
+itself). Whether a retail player can reach a mid-fight save slot
+remains UNKNOWN (frontend save-gating question, not a VM issue).
 
 ### MUSE_4 — NON-CRITICAL, wave/turret gallery (OBSERVED, real-data harness)
 

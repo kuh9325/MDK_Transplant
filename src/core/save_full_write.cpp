@@ -126,18 +126,18 @@ struct Toks {
     return static_cast<std::int32_t>(q - cmiImg);
   }
 
-  // Anim-record pointer -> offset-or-(-1) with a warning. OBSERVED
-  // real saves carry stale heap pointers here; the original loader's
-  // remap turns any out-of-image value into the 0xffXX "no record"
-  // sentinel, so a degrading token is the faithful write for the
-  // port's MTO-resolved records (mtoBytes lies outside cmiBytes).
-  // Script-PC refs keep the fatal path — a dropped pc corrupts the
-  // restored object.
-  std::int32_t cmiAnimTok(const void* p) {
+  // Non-authoritative CMI ref -> offset-or-(-1) with a warning.
+  // Covers fields whose live contents can legitimately sit outside
+  // the CMI image: MTO-resolved anim records (OBSERVED real saves
+  // carry stale heap pointers in +0x114 — the original loader's
+  // remap returns the same 0xffXX sentinel) and small-int flag
+  // values like the observed X10_DOOR +0x110==2. Script-PC refs
+  // keep the fatal path — a dropped pc corrupts the object.
+  std::int32_t cmiSoftTok(const void* p) {
     if (p == nullptr) return -1;
     const auto* q = static_cast<const std::byte*>(p);
     if (q < cmiImg || static_cast<std::size_t>(q - cmiImg) >= cmiImgSize) {
-      warn("cmi-anim", p);
+      warn("cmi-soft", p);
       return -1;
     }
     return static_cast<std::int32_t>(q - cmiImg);
@@ -176,13 +176,17 @@ struct Toks {
     return -1;
   }
 
-  // Object ptr -> its stamped +0x7c id (0 = NULL; a non-null pointer
-  // to a record outside the serialized set fails the write).
+  // Object ptr -> its stamped +0x7c id (0 = NULL). An out-of-set
+  // pointer can only reach a torn-down/freelist record — FUN_0045cf90
+  // memsets the record on despawn, so its +0x7c is 0 and the original
+  // writer emits 0 verbatim (restore resolves it to null, same as a
+  // stale never-resolvable id). Emit-0 + warn is byte-faithful there;
+  // a stale id would resolve identically.
   std::int32_t objTok(const DynamicObject* o) {
     if (o == nullptr) return 0;
     auto it = ids.find(o);
     if (it == ids.end()) {
-      failRef("object", o);
+      warn("object-stale", o);
       return 0;
     }
     return it->second;
@@ -251,8 +255,8 @@ void emitObjectRecord(Img& img, const DynamicObject& o, Toks& tk,
   img.f32(0x104, o.field104);
   img.i32(0x108, tk.cmiTok(o.field108));
   img.i32(0x10c, tk.cmiTok(o.field10c));
-  img.i32(0x110, tk.cmiTok(o.field110));
-  img.i32(0x114, tk.cmiAnimTok(o.animRec));
+  img.i32(0x110, tk.cmiSoftTok(o.field110));
+  img.i32(0x114, tk.cmiSoftTok(o.animRec));
   img.i16(0x118, o.animLatch);
   img.u8(0x11a, o.field11a);
   img.u8(0x11b, o.field11b);
@@ -386,8 +390,8 @@ void emitObjectRecord(Img& img, const DynamicObject& o, Toks& tk,
   if (isMover) img.i32(0x312, tk.objTok(o.moverChild));
   if (isConn) {
     img.i32(0x302, tk.arenaTok(o.connDest));
-    img.i32(0x306, tk.cmiAnimTok(o.animRecNear));
-    img.i32(0x30a, tk.cmiAnimTok(o.animRecFar));
+    img.i32(0x306, tk.cmiSoftTok(o.animRecNear));
+    img.i32(0x30a, tk.cmiSoftTok(o.animRecFar));
     img.f32(0x30e, o.connRadius);
     img.i32(0x316, tk.cmiStrTok(o.connSound316));
     img.i32(0x31a, tk.cmiStrTok(o.connSound31a));
