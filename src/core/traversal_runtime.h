@@ -77,6 +77,7 @@
 #include "core/cmi_directory.h"
 #include "core/collision_query.h"
 #include "core/dti_structure.h"
+#include "core/player_animation.h"
 #include "core/traversal_script.h"
 #include "core/dynamic_objects.h"
 #include "core/frontend_machines.h"
@@ -153,8 +154,14 @@ struct TraversalLevel {
   std::vector<std::byte> mtoBytes;
   // TRAVSPRT.BNI — the traversal-context anim bank (the original's
   // DAT_004a1e38 image while traversing). Loaded when present; the
-  // mover's SW_H150 records resolve into it.
+  // mover's SW_H150 records + the 23 Kurt K_* records resolve into it.
   std::vector<std::byte> travsprtBytes;
+  // LEVEL<n>S.SNI — the per-level sprite-name bank (the original's
+  // DAT_0049b3ec image, built by FUN_0042891c from records flagged
+  // byte +0x0d & 0x80 — the parser's sentinel class: K_BSLIDE,
+  // K_FSLIDE, K_SLIDE, K_SLIP, K_SURF, K_SURFJ). OBSERVED caller:
+  // 0x4339c5 (the traversal loader loads "%s\\LEVEL%d\\LEVEL%ds.sni").
+  std::vector<std::byte> sniBytes;
   DtiStructure dti;
   CmiDirectory cmi;
   MtoDirectory mto;
@@ -244,6 +251,16 @@ struct TraversalSeams {
   int reticleDrawCalls = 0;       // FUN_0046911c reticle HUD seam
   int reticleDeathCalls = 0;      // FUN_004581a4 mount-death seam
   int animDriverCalls = 0;        // FUN_00431300/FUN_00461954
+  int animSoundCalls = 0;         // Phase 16A — FUN_0040210c/0x4022b8/
+                                  // 0x402388/0x402658 calls from the
+                                  // anim machine (footsteps, chute,
+                                  // land, tumble, scope — audio seam)
+  int animDiagCalls = 0;          // FUN_00408eb0 "Unknown Damp
+                                  // Animation" — unhandled locoState
+  int animActionCalls = 0;        // FUN_0046a190 — the 0x325 frame-8
+                                  // interact trigger (gameplay seam)
+  int reticleBlockCalls = 0;      // FUN_004372d4 — the anim tail's
+                                  // reticle-aux draw-entry update
   int mountUpdateCalls = 0;       // FUN_00467ac4/FUN_00467ed0 class 1/2
   int weaponSlotCalls = 0;        // FUN_00469cd0 inventory scanner
   int mountUnmountCalls = 0;      // unrecognised-class unmount log
@@ -334,6 +351,13 @@ struct TraversalFrameResult {
   int eventType = 0, eventMag = 0;   // 0x54cb00/08 — the pending
                                      // event slots (cleared each
                                      // dispatch head, OBSERVED)
+  int animFrame = 0;                 // 0x540cb4 — the dispatch's
+                                     // post-handler frame counter
+  float animPhase = 0.0f;            // 0x540cb8 — movement-anim phase
+  int animTableIdx = -1;             // Phase 16A — resolved identity
+  int animFrameIdx = -1;             //   of animMainFrame (K_ table +
+                                     //   frame index; -1 unresolved)
+  bool animDrawn = false;            // the 0x4619ce draw-gate result
   int slideChannel = 0;              // 0x540e24
   bool viewOnPartner = false;        // 0x49b714
   bool partnerActive = false;        // 0x540ca8
@@ -619,6 +643,27 @@ struct TraversalRuntime {
   int fieldDa0 = 0;               // 0x540da0 — scripted transition gate
   int fieldDa4 = 0;               // 0x540da4 — post-tick decay target
   int fieldEb8 = 0;               // 0x540eb8 — death-fade mode byte
+
+  // --- Phase 16A — Kurt animation (player_animation.h) ---
+  // The 29 name-bound sprite tables (0x49b9a8..0x49ba18) + the
+  // selected-frame output of FUN_00461954's dispatch. animMainFrame/
+  // animOverlayFrame are pointers INTO travsprtBytes/sniBytes —
+  // valid while the level stays loaded; nullptr when no table bound.
+  PlayerAnimTables animTables;
+  const std::byte* animMainFrame = nullptr;    // 0x54cb14 — cb14
+  const std::byte* animOverlayFrame = nullptr; // 0x54cb18 — cb18
+                                             // (muzzle overlay,
+                                             // cleared per frame)
+  int animOfsX = 0, animOfsY = 0;              // 0x54cb0c/0x54cb10 —
+                                             // overlay jitter offsets
+  int animMuzzIdx = 0;                         // 0x49ba1c — muzzle
+                                             // counter (rand+1 &3)
+  int animFootAlt = 0;                         // 0x49b924 — footstep
+                                             // alternate toggle
+  bool animDrawn = false;                      // the 0x4619ce draw
+                                             // gate result
+                                             // (0x5414d4 &&
+                                             // 0x49b740/c9c/ca0)
 
   // The last collisionApply contact token as a poly pointer — the
   // surface the player most recently touched (0x540e4c's EAX is the

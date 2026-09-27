@@ -17086,6 +17086,701 @@ void test_player_projectiles() {
   }
 }
 
+// Phase 16A — Kurt sprite animation (player_animation.h). Synthetic
+// {u32 count, u32 ofs[N], 8-byte frames} tables exercise the machine:
+// FUN_00461954 dispatch, FUN_00464278/0x464308 advance semantics,
+// FUN_004375f4 crossing and the FUN_0046445c binder — all transcribed
+// from the OBSERVED BUILD_A disassembly.
+void test_player_animation() {
+  using namespace mdk;
+
+  // --- synthetic table bank ----------------------------------------
+  struct Bank {
+    std::vector<std::byte> buf;
+    Bank() { buf.reserve(1 << 16); }
+    const std::byte* rec(int n) {
+      const std::size_t base = buf.size();
+      const std::size_t data = base + 4 + n * 4;
+      buf.resize(data + n * 8, std::byte{0});
+      buf[base] = (std::byte)(n & 0xff);
+      buf[base + 1] = (std::byte)((n >> 8) & 0xff);
+      buf[base + 2] = (std::byte)((n >> 16) & 0xff);
+      buf[base + 3] = (std::byte)((n >> 24) & 0xff);
+      for (int i = 0; i < n; ++i) {
+        const std::uint32_t ofs =
+            static_cast<std::uint32_t>(data - base + i * 8);
+        for (int k = 0; k < 4; ++k)
+          buf[base + 4 + i * 4 + k] =
+              (std::byte)((ofs >> (k * 8)) & 0xff);
+        buf[data + i * 8] = (std::byte)(0xa0 + i);  // frame marker
+      }
+      return buf.data() + base;
+    }
+  };
+
+  auto ti = [](const char* nm) {
+    for (int i = 0; i < 29; ++i)
+      if (!std::strcmp(mdk::playerAnimTableName(i), nm)) return i;
+    return -1;
+  };
+  const auto ident = [](const mdk::TraversalRuntime& rt,
+                        const std::byte* f, int* ti, int* fi) {
+    return mdk::playerAnimFrameIdentity(rt, f, ti, fi);
+  };
+  auto openRt = [](mdk::TraversalRuntime& rt) {
+    rt.hudActive = 1;      // draw gate open (flag49b740==0 -> drawn)
+    rt.animPrev = -1;
+  };
+  Bank bank;
+
+  // --- record accessors ---------------------------------------------
+  {
+    const std::byte* r = bank.rec(3);
+    CHECK(playerAnimRecCount(r) == 3);
+    CHECK(playerAnimRecFrame(r, 0) == r + 4 + 3 * 4);
+    CHECK(playerAnimRecFrame(r, 2) == r + 4 + 3 * 4 + 16);
+    CHECK(playerAnimRecCount(nullptr) == 0);
+    CHECK(playerAnimRecFrame(nullptr, 0) == nullptr);
+  }
+
+  // --- FUN_004375f4 — wrap-aware crossing ---------------------------
+  {
+    // forward (prev,curr]
+    CHECK(playerAnimFrameCrossed(5, 1, 3, 7));
+    CHECK(!playerAnimFrameCrossed(3, 1, 3, 7));
+    CHECK(playerAnimFrameCrossed(7, 1, 3, 7));
+    CHECK(!playerAnimFrameCrossed(8, 1, 3, 7));
+    // forward wrap: trig > prev or <= curr
+    CHECK(playerAnimFrameCrossed(9, 1, 8, 2));
+    CHECK(playerAnimFrameCrossed(2, 1, 8, 2));
+    CHECK(!playerAnimFrameCrossed(5, 1, 8, 2));
+    CHECK(!playerAnimFrameCrossed(4, 1, 4, 4));  // no delta = no cross
+    // reverse [curr,prev)
+    CHECK(playerAnimFrameCrossed(5, -1, 7, 3));
+    CHECK(playerAnimFrameCrossed(3, -1, 7, 3));
+    CHECK(!playerAnimFrameCrossed(7, -1, 7, 3));
+    // reverse wrap: trig >= curr or < prev
+    CHECK(playerAnimFrameCrossed(8, -1, 3, 8));
+    CHECK(playerAnimFrameCrossed(2, -1, 3, 8));
+    CHECK(!playerAnimFrameCrossed(5, -1, 3, 8));
+    CHECK(playerAnimFrameCrossed(4, 0, 5, 3));   // dir==0 -> reverse
+  }
+
+  // --- table binder (FUN_0046445c): synthetic BNI + SNI -------------
+  {
+    // Synthetic BNI: {u32 len, u32 count, {name[12], u32 imgOff}[],
+    // payloads at 4+imgOff}.
+    std::vector<std::byte> bni(0x400, std::byte{0});
+    auto p32 = [&](std::size_t at, std::uint32_t v) {
+      for (int k = 0; k < 4; ++k)
+        bni[at + k] = (std::byte)((v >> (k * 8)) & 0xff);
+    };
+    p32(0, (std::uint32_t)(bni.size() - 4));
+    p32(4, 2);
+    std::memcpy(bni.data() + 8, "K_BANG", 6);
+    std::memcpy(bni.data() + 24, "K_IDLE", 6);
+    p32(8 + 12, 0x100);
+    p32(24 + 12, 0x200);
+    // payload records: {head u32, count u32, ofs[], frames} — the
+    // bound pointer lands at +4 (the count word).
+    p32(4 + 0x100 + 0, 0x50);  // head (block bytes) — skipped by +4
+    p32(4 + 0x100 + 4, 7);     // count
+    p32(4 + 0x200 + 0, 0x30);
+    p32(4 + 0x200 + 4, 9);
+
+    auto sni = SyntheticSni::build(
+        "LVL.SND", {{"K_SLIDE", 0xffffffffu, 64},
+                    {"K_SURF", 0xffffffffu, 48},
+                    {"NOT_SPRITE", 3, 32}});
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = std::move(bni);
+    rt.level.sniBytes = std::move(sni.buf);
+    mdk::playerAnimBindTables(rt);
+    CHECK(rt.animTables.bang ==
+          rt.level.travsprtBytes.data() + 4 + 0x100 + 4);
+    CHECK(rt.animTables.idle ==
+          rt.level.travsprtBytes.data() + 4 + 0x200 + 4);
+    CHECK(playerAnimRecCount(rt.animTables.bang) == 7);
+    CHECK(playerAnimRecCount(rt.animTables.idle) == 9);
+    CHECK(rt.animTables.run == nullptr);          // absent name
+    const auto sd = inspectSniDirectory(rt.level.sniBytes);
+    CHECK(sd.status == SniDirectoryStatus::kOk);
+    CHECK(rt.animTables.slide ==
+          rt.level.sniBytes.data() +
+              sd.entries[0].payloadFileOffset() + 4);
+    CHECK(rt.animTables.surf ==
+          rt.level.sniBytes.data() +
+              sd.entries[1].payloadFileOffset() + 4);
+    CHECK(rt.animTables.slip == nullptr);         // name absent
+    // flag filter: NOT_SPRITE (field0c=3, no 0x8000) is never a hit.
+    // (K_FSLIDE's name is checked against K_BSLIDE/K_FSLIDE only.)
+  }
+
+  // --- 0x65 idle: hold-last + release (count-1 bound) --------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x65;
+    rt.animTables.idle = bank.rec(4);
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_IDLE") && f == 0);
+    CHECK(rt.animPrev == 0x65);
+    mdk::playerAnimTick(rt, e);              // af 1
+    mdk::playerAnimTick(rt, e);              // af 2
+    rt.eventPriority = 7;
+    mdk::playerAnimTick(rt, e);              // af 3 == count-1 -> clamp+release
+    CHECK(rt.animFrame == 3);
+    CHECK(rt.eventPriority == 0);
+    CHECK(ident(rt, rt.animMainFrame, &t, &f) && f == 3);
+    mdk::playerAnimTick(rt, e);              // holds last frame
+    CHECK(rt.animFrame == 3);
+  }
+
+  // --- 0x64 still: same clamp on K_STILL -----------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x64;
+    rt.animTables.still = bank.rec(3);
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 2);
+    CHECK(rt.eventPriority == 0);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_STILL") && f == 2);
+  }
+
+  // --- 0xc8 land: clamp at count-1 on overshoot ----------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0xc8;
+    rt.animTables.land = bank.rec(4);
+    mdk::PlayerAnimEnvironment e;
+    e.frameStep = 3;
+    rt.eventPriority = 2;
+    mdk::playerAnimTick(rt, e);              // af 0
+    rt.eventPriority = 2;
+    mdk::playerAnimTick(rt, e);              // af 3
+    CHECK(rt.animFrame == 3 && rt.eventPriority == 2);
+    rt.eventPriority = 2;
+    mdk::playerAnimTick(rt, e);              // 6 >= 4 -> clamp 3, release
+    CHECK(rt.animFrame == 3 && rt.eventPriority == 0);
+  }
+
+  // --- 0x258 run: FUN_00464308 speed-driven phase --------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x258;
+    rt.animTables.run = bank.rec(8);
+    rt.motion.moveVel = 1.0f;   // v>2/3: rate = 0.25*1.5 + 0.75 = 1.125
+    rt.motion.moveDirLatch = 1;
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);              // enter: cb8=0
+    CHECK(rt.animFrame == 0 && rt.animPhase == 0.0f);
+    mdk::playerAnimTick(rt, e);              // cb8=1.125 -> rint 1
+    CHECK(rt.animFrame == 1);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_RUN") && f == 1);
+    const int snd = rt.seams.animSoundCalls;
+    rt.motion.moveVel = 2.0f;   // rate = 1.5/frame
+    for (int i = 0; i < 8; ++i) mdk::playerAnimTick(rt, e);
+    // wraps through frame 0 -> footstep sound seam fired.
+    CHECK(rt.seams.animSoundCalls > snd);
+    // negative moveVel: rate floor -0.25/frame -> backwards wrap.
+    rt.locoState = 0x258; rt.animPrev = 0;
+    rt.animPhase = 0.25f; rt.animFrame = 0;
+    rt.motion.moveVel = 0.0f;   // standstill rate = -0.25
+    mdk::playerAnimTick(rt, e); // cb8 = 0 -> rint 0
+    CHECK(rt.animFrame == 0);
+  }
+
+  // --- 0x259 runfir: wrap advance + footstep crossings ---------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x259;
+    rt.animTables.runFir = bank.rec(0x14);   // 20 frames
+    rt.motion.moveDirLatch = 1;
+    mdk::PlayerAnimEnvironment e;
+    const int snd = rt.seams.animSoundCalls;
+    for (int i = 0; i < 5; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 4);                // 0,1,2,3,4 — crossed trig 4
+    CHECK(rt.seams.animSoundCalls == snd + 1);
+    for (int i = 0; i < 14; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 18);               // crossed trig 0x11
+    CHECK(rt.seams.animSoundCalls == snd + 2);
+    CHECK(rt.animFootAlt == 1);              // foot-alternate toggle
+    mdk::playerAnimTick(rt, e);
+    mdk::playerAnimTick(rt, e);              // 20 -> wrap to 0
+    CHECK(rt.animFrame == 0);
+  }
+
+  // --- 0x1f4 strafe: wrap to 0 at count ------------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x1f4;
+    rt.animTables.side = bank.rec(3);
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);                // 0,1,2,0
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_SIDE") && f == 0);
+  }
+
+  // --- 0x12c shot: loop over [0, count-2] ----------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x12c;
+    rt.animTables.shot = bank.rec(5);
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 5; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);                // 0,1,2,3,0 — loop, no 4
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 1);
+  }
+
+  // --- 0x190 turn: proportional yaw index ----------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x190;
+    rt.animTables.trn45 = bank.rec(8);
+    rt.animPrev = 0x190;
+    mdk::PlayerAnimEnvironment e;
+    rt.motion.yawDeg = 90.0f;   // rint(90/180*8) = 4
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 4);
+    rt.motion.yawDeg = 270.0f;  // rint(12) mod 8 = 4
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 4);
+    rt.motion.yawDeg = 5.0f;    // rint(5/180*8)=rint(0.222)=0
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);
+  }
+
+  // --- 0x324 look: proportional pitch + pitch==0 release -------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x324;
+    rt.animTables.lookD = bank.rec(5);
+    rt.animTables.lookU = bank.rec(5);
+    mdk::PlayerAnimEnvironment e;   // arenaScalar=0
+    rt.look.lookPitchOffset = -30.0f;   // rint(-30/-60*4)=2
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 2);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_LOOKU") && f == 2);
+    rt.look.lookPitchOffset = 45.0f;    // rint(45/90*4)=2
+    mdk::playerAnimTick(rt, e);
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_LOOKD") && f == 2);
+    rt.eventPriority = 4;
+    rt.look.lookPitchOffset = 0.0f;     // self-release
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0 && rt.eventPriority == 0);
+  }
+
+  // --- 0x2bc fall: wrap loop + ground-catch land ----------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x2bc;
+    rt.animTables.fall = bank.rec(4);
+    rt.animTables.land = bank.rec(6);
+    rt.vert.vertVel = -10.0f;
+    rt.vert.contactFlags = 0;           // airborne
+    rt.vert.jumpLatch = 1;
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 5; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);           // wrapped 0,1,2,3,0
+    // ground catch: vertVel==0 && grounded -> land transition.
+    rt.vert.vertVel = 0.0f;
+    rt.vert.contactFlags = 1;
+    rt.eventPriority = 9;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.locoState == 0xc8);
+    CHECK(rt.eventPriority == 2);
+    CHECK(rt.animFrame == 0);
+    CHECK(rt.vert.jumpLatch == 0);      // jumpHeld==0 -> c90 cleared
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_LAND") && f == 0);
+    // next frame the 0xc8 land handler runs (post-handler latch).
+    rt.animPrev = 0x2bc;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animPrev == 0xc8);
+  }
+
+  // --- 0x2be stand jump: vertVel-keyed thresholds ---------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x2be;
+    rt.animTables.jump = bank.rec(0x10);
+    rt.animTables.fall = bank.rec(4);
+    rt.vert.vertVel = 30.0f;
+    rt.vert.contactFlags = 0;
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);          // enter: af 0
+    for (int i = 0; i < 10; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0xa);          // climbed to the threshold zone
+    // vertVel 30 > thr[0xa]=0.2 -> stays; drop to -5 -> thr[0xa] passes,
+    // thr[0xb]=-6.3 stops it.
+    rt.vert.vertVel = -5.0f;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0xb);
+    // vertVel=-25 passes the rest of the table -> fall release.
+    rt.vert.vertVel = -25.0f;
+    rt.eventPriority = 9;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.locoState == 0x2bc);
+    CHECK(rt.eventPriority == 7);
+    CHECK(rt.animFrame == 0);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_FALL") && f == 0);
+    // grounded catch inside the endpoint: vertVel==0&&grounded -> land.
+    rt.locoState = 0x2be; rt.animPrev = 0x2be; rt.animFrame = 3;
+    rt.vert.vertVel = 0.0f; rt.vert.contactFlags = 1;
+    rt.animTables.land = bank.rec(4);
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.locoState == 0xc8 && rt.eventPriority == 2);
+  }
+
+  // --- 0x2bf moving jump: thresholds + the K_RJMP +4 ofs quirk --------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x2bf;
+    rt.animTables.rjmp = bank.rec(0x10);
+    rt.animTables.fall = bank.rec(4);
+    rt.vert.vertVel = 30.0f;
+    rt.vert.contactFlags = 0;
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 8; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 7);            // lo bound for the move table
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_RJMP") && f == 11); // cb4 + 4 — OBSERVED +0x14 ofs
+  }
+
+  // --- 0x2bd chute: deploy / ping-pong sustain / release --------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x2bd;
+    rt.animTables.chute = bank.rec(9);
+    rt.animTables.chuteC = bank.rec(4);
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);          // enter -> deploy frame 0
+    CHECK(rt.animFrame == 0);
+    CHECK(rt.seams.animSoundCalls >= 1);
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 4);            // deploy clamps at 4
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_CHUTE") && f == 4);
+    // sustain (jumpSustain): ping-pong on K_CHUTEC.
+    rt.vert.jumpSustain = 1;
+    const int seqExpect[] = {1, 2, 3, 2, 1, 0};
+    for (int s : seqExpect) {
+      mdk::playerAnimTick(rt, e);
+      CHECK(ident(rt, rt.animMainFrame, &t, &f));
+      CHECK(t == ti("K_CHUTEC") && f == s);
+    }
+    // release (jumpSustain==0): the sound query + clamp-hold.
+    rt.vert.jumpSustain = 0;
+    rt.locoState = 0x2bd; rt.animPrev = 0x2bd; rt.animFrame = 7;
+    rt.eventPriority = 9;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 8);            // count-1, holds + releases
+    CHECK(rt.eventPriority == 0);
+  }
+
+  // --- 0x320 mantle: half-rate + root-motion nudge + release ----------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x320;
+    rt.animTables.hang = bank.rec(10);
+    rt.vert.vertSkip = 0;
+    rt.motion.yawDeg = 0.0f;
+    rt.cs.pos[0] = 0.0f; rt.cs.pos[1] = 0.0f; rt.cs.pos[2] = 0.0f;
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);          // enter: af 0, hang[0]
+    mdk::playerAnimTick(rt, e);          // nudge: j=(1+1)/2=1
+    CHECK(rt.animFrame == 1);
+    // dz = kZ[2]-kZ[1] = -0.034 -> pos.z += -0.034*0.35416
+    CHECK(near(rt.cs.pos[2], -0.034 * 0.7083333333333334 * 0.5, 1e-4));
+    // dxy = kXy[2]-kXy[1] = -0.216 -> pos.x -= -0.216*0.35416*cos(0)
+    CHECK(near(rt.cs.pos[0], 0.216 * 0.7083333333333334 * 0.5, 1e-4));
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_HANG") && f == 0);  // hang[af/2]
+    // vertSkip==1 freezes the advance.
+    rt.vert.vertSkip = 1;
+    const int af0 = rt.animFrame;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == af0);
+    rt.vert.vertSkip = 0;
+    // play to the end: 2*count-1 = 19 -> clamp + release + c7c=0.
+    rt.animFrame = 18; rt.animPrev = 0x320;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 19);
+    CHECK(rt.eventPriority == 0);
+    CHECK(rt.vert.vertSkip == 0);
+    CHECK(ident(rt, rt.animMainFrame, &t, &f) && f == 9);
+  }
+
+  // --- 0x321 surf-jump: park + unpin + transition ----------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x321;
+    rt.animTables.surfJ = bank.rec(12);  // half=6
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 7; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 6);            // parked at the midpoint
+    CHECK(rt.locoState == 0x321);
+    // contact edge at af <= half-2 releases early — simulate by
+    // re-entering with contact set and af small.
+    rt.locoState = 0x321; rt.animPrev = 0x321; rt.animFrame = 3;
+    rt.vert.contactObj = 0x1234;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.locoState == 0xc9);
+    CHECK(rt.eventPriority == 2);
+    CHECK(near(rt.camera.eyeHeight, 4.5, 1e-6));
+    // unpin path: af at half/half-1 with contact -> forced to half+1,
+    // then the second half plays out -> transition 0xc9 at count.
+    rt.locoState = 0x321; rt.animPrev = 0x321; rt.animFrame = 6;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 7);            // unpinned into the back half
+    rt.vert.contactObj = 0;
+    rt.animFrame = 11; rt.animPrev = 0x321;
+    mdk::playerAnimTick(rt, e);          // 12 >= count -> transition
+    CHECK(rt.locoState == 0xc9);
+    CHECK(rt.animFrame == 11);
+    CHECK(near(rt.camera.eyeHeight, 4.5, 1e-6));
+  }
+
+  // --- 0xc9 surf sustain: eyeHeight pin + loop + muzzle ---------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0xc9;
+    rt.animTables.surf = bank.rec(4);
+    rt.animTables.muzzF = bank.rec(4);
+    rt.fieldC74 = 1;
+    rt.frameCounter = 1;                 // odd -> muzzle parity gate
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);            // looped [0,count-2]: 0,1,2,0
+    CHECK(near(rt.camera.eyeHeight, 4.5, 1e-6));
+    CHECK(rt.animOverlayFrame != nullptr);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animOverlayFrame, &t, &f));
+    CHECK(t == ti("K_MUZZF"));
+    CHECK(rt.animOfsX >= -42 && rt.animOfsX <= -38);
+    CHECK(rt.animOfsY >= 12 && rt.animOfsY <= 16);
+  }
+
+  // --- 0x327 slip -> 0x328 slide chain; slide loops ---------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x327;
+    rt.animTables.slip = bank.rec(3);
+    rt.animTables.slide = bank.rec(4);
+    rt.animTables.fSlide = bank.rec(5);
+    rt.animTables.bSlide = bank.rec(3);
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.locoState == 0x328);        // chained at slip.count
+    CHECK(rt.animFrame == 0);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_SLIDE") && f == 0);
+    for (int i = 0; i < 5; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 1);            // wrapped 0,1,2,3,0,1
+    // 0x329 fslide: same wrap loop on K_FSLIDE.
+    rt.locoState = 0x329; rt.animPrev = 0; rt.animFrame = 0;
+    for (int i = 0; i < 6; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);            // 0..4,0 — wrapped
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 1);
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_FSLIDE"));
+    // 0x32a bslide: +1/frame hold-last, no release.
+    rt.locoState = 0x32a; rt.animPrev = 0; rt.animFrame = 0;
+    rt.eventPriority = 9;
+    for (int i = 0; i < 5; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 2);            // holds count-1
+    CHECK(rt.eventPriority == 9);        // never released
+  }
+
+  // --- 0x385 tumble: bang -> bFlip combined counter + e44/e48 clear ----
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x385;
+    rt.animTables.bang = bank.rec(3);
+    rt.animTables.bFlip = bank.rec(3);
+    rt.animE44 = 5.0f; rt.animE48 = -3.0f;
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_BFLIP") && f == 0); // af 3 -> bFlip[0]
+    CHECK(rt.animE44 == 0.0f && rt.animE48 == 0.0f);
+    rt.eventPriority = 9;
+    mdk::playerAnimTick(rt, e);          // af 4 -> bFlip[1]
+    CHECK(rt.animFrame == 4);
+    mdk::playerAnimTick(rt, e);          // af 5 = limit -> clamp+release
+    CHECK(rt.animFrame == 5 && rt.eventPriority == 0);
+  }
+
+  // --- 0x3e8 takeoff -> 0x3e9 float chain ------------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x3e8;
+    rt.animTables.takeOf = bank.rec(3);
+    rt.animTables.floatC = bank.rec(4);
+    mdk::PlayerAnimEnvironment e;
+    for (int i = 0; i < 4; ++i) mdk::playerAnimTick(rt, e);
+    // wrap edge on tick 3 (cb4 2->3>=count->0, shadow>cb4) -> chain.
+    CHECK(rt.locoState == 0x3e9);
+    CHECK(rt.animFrame == 0);
+    CHECK(rt.fieldDa0 == 1);
+    mdk::playerAnimTick(rt, e);          // helper continue: af 1
+    CHECK(rt.animFrame == 1);
+    int t = -1, f = -1;
+    CHECK(ident(rt, rt.animMainFrame, &t, &f));
+    CHECK(t == ti("K_FLOATC") && f == 1);
+  }
+
+  // --- 0x3ea terminal: bang to last, hold, no release ------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x3ea;
+    rt.animTables.bang = bank.rec(4);
+    mdk::PlayerAnimEnvironment e;
+    rt.eventPriority = 9;
+    for (int i = 0; i < 6; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 3);            // held at count-1
+    CHECK(rt.eventPriority == 9);        // no release (terminal)
+  }
+
+  // --- 0x325 action: frame-8 interact trigger + hold-last -------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x325;
+    rt.animTables.spewP = bank.rec(0x10);
+    mdk::PlayerAnimEnvironment e;
+    e.frameStep = 3;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.invHudTimer == 60);         // first-frame HUD timer
+    CHECK(rt.animFrame == 0);
+    mdk::playerAnimTick(rt, e);          // cb4 3
+    mdk::playerAnimTick(rt, e);          // cb4 6
+    const int act = rt.seams.animActionCalls;
+    mdk::playerAnimTick(rt, e);          // cb4 9 — crossed trig 8
+    CHECK(rt.animFrame == 9);
+    CHECK(rt.seams.animActionCalls == act + 1);
+    CHECK(rt.invHudTimer == 60);         // re-armed by the trigger
+    rt.eventPriority = 9;
+    for (int i = 0; i < 3; ++i) mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 15);           // hold at count-1
+    CHECK(rt.eventPriority == 0);
+  }
+
+  // --- 0x323/0x384 sniper states (anim-side) ---------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x323;
+    rt.animTables.still = bank.rec(4);
+    rt.scopeScale = 2.0f;
+    rt.camera.eyeHeight = 4.5f;
+    rt.camera.pullback = 8.0f;
+    rt.scopeHudOffset = 0;
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 0);
+    // d34 = rint(scale*eyeHeight + 29) reads the PRE-write eyeHeight.
+    CHECK(rt.scopeHudOffset == 38);      // rint(2*4.5 + 29)
+    CHECK(rt.camera.pullback == 0.0f);
+    CHECK(rt.camera.eyeHeight == 4.0f);
+    CHECK(rt.transitionPhase == 1);      // ca0 0 -> 1 on pending frame
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 1);
+    // unscope: camera restore every frame + overlay seam on continue.
+    rt.locoState = 0x384; rt.animPrev = 0x384;
+    const int ov = rt.seams.scopeOverlayCalls;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.seams.scopeOverlayCalls == ov + 1);
+    CHECK(rt.eventPriority == 0);
+    CHECK(rt.camera.pullback == 8.0f);
+    CHECK(rt.camera.eyeHeight == 4.5f);
+    CHECK(rt.scopeHudOffset == -101);
+  }
+
+  // --- unknown state -> diag + release --------------------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x100;
+    rt.eventPriority = 9;
+    const int d = rt.seams.animDiagCalls;
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.seams.animDiagCalls == d + 1);
+    CHECK(rt.eventPriority == 0);
+    CHECK(rt.animPrev == 0x100);         // latch still runs
+  }
+
+  // --- gates ------------------------------------------------------------
+  {
+    // mount gate: excludeObj + (mountClass & 0x20) -> job skipped.
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x65;
+    rt.animTables.idle = bank.rec(4);
+    CollisionObject fakeObj{};
+    rt.cs.excludeObj = &fakeObj;
+    rt.mountClass = 0x20;
+    rt.animPrev = -1;
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animPrev == -1);            // dispatch skipped entirely
+    CHECK(rt.animMainFrame == nullptr);
+    CHECK(!rt.animDrawn);
+    // head gate: flag4999d0 && flag541548 -> skips dispatch + latch but
+    // still evaluates the draw gate.
+    rt.cs.excludeObj = nullptr; rt.mountClass = 0;
+    rt.flag4999d0 = 1; rt.flag541548 = 1;
+    rt.locoState = 0x65;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animPrev == -1);            // latch skipped too
+    CHECK(rt.animDrawn);                 // draw gate still evaluated
+    // draw gate off: hudActive down -> not drawn.
+    rt.hudActive = 0;
+    rt.flag4999d0 = 0;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animPrev == 0x65);          // dispatch ran
+    CHECK(!rt.animDrawn);
+  }
+
+  // --- muzzle overlay: fieldC74 + odd frameCounter ---------------------
+  {
+    mdk::TraversalRuntime rt; openRt(rt);
+    rt.locoState = 0x1f4;
+    rt.animTables.side = bank.rec(4);
+    rt.animTables.muzzF = bank.rec(4);
+    rt.fieldC74 = 1;
+    rt.frameCounter = 2;                 // even -> parity gate closed
+    mdk::PlayerAnimEnvironment e;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animOverlayFrame == nullptr);
+    rt.frameCounter = 3;                 // odd -> fires
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animOverlayFrame != nullptr);
+    CHECK(rt.animOfsX >= 0 && rt.animOfsX <= 4);
+    CHECK(rt.animOfsY >= 0 && rt.animOfsY <= 4);
+  }
+}
+
 // Phase 5L — sniper scope lifecycle + mounted reticle. OBSERVED
 // constants and ordering from MDK95.EXE BUILD_A disassembly: the
 // dispatch picks mounted > sniper > normal each frame, the scope
@@ -19851,6 +20546,7 @@ int main() {
   test_player_camera();
   test_camera_obstruction();
   test_camera_nudge();
+  test_player_animation();
   test_player_sniper();
   test_player_fire();
   test_player_projectiles();

@@ -57,6 +57,7 @@ add_library(mdk_core STATIC
   src/core/object_path.cpp
   src/core/mto_directory.cpp
   src/core/options_menu.cpp
+  src/core/player_animation.cpp
   src/core/player_camera.cpp
   src/core/player_fire.cpp
   src/core/player_look.cpp

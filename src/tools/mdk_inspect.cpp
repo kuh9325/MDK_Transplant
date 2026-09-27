@@ -3019,9 +3019,13 @@ int main(int argc, char** argv) {
       airborneSeen |= !out.grounded;
       contactSeen |= out.contactObj != 0;
       partnerSeen |= out.partnerArenaIndex >= 0;
+      // Phase 16A — the player-animation identity fields:
+      // st=locoState (hex) af=animFrame at=K_table[frameIdx]
+      // (FUN_00461954's selected sprite) dr=draw gate.
       std::printf(
           "f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "
           "mv=%5.2f sv=%5.2f vv=%6.2f gnd=%d ctc=%08x sld=%d ev=%d/%d "
+          "st=%03x af=%d at=%s[%d]%s "
           "cam=(%8.2f,%8.2f,%8.2f)%s%s\n",
           out.frame, out.curArenaIndex, out.partnerArenaIndex,
           (double)out.pos[0], (double)out.pos[1], (double)out.pos[2],
@@ -3029,6 +3033,10 @@ int main(int argc, char** argv) {
           (double)out.strafeVel, (double)out.vertVel,
           out.grounded ? 1 : 0, out.contactObj, out.slideChannel,
           out.eventType, out.eventMag,
+          out.locoState, out.animFrame,
+          out.animTableIdx >= 0
+              ? mdk::playerAnimTableName(out.animTableIdx) : "-",
+          out.animFrameIdx, out.animDrawn ? " dr" : "",
           (double)out.camera.pos[0], (double)out.camera.pos[1],
           (double)out.camera.pos[2],
           out.overheadViewActive ? " OVH" : "",
@@ -3112,6 +3120,19 @@ int main(int argc, char** argv) {
       mix(out.grounded ? 1 : 0);
       mix(static_cast<std::uint64_t>(out.locoState));
       mix(static_cast<std::uint64_t>(out.slideChannel));
+      // Phase 16A — the player-anim identity: frame counter, resolved
+      // (table, index) identity of the selected sprite record, the
+      // movement-anim phase (bit pattern) and the draw gate. All
+      // deterministic under the injected input stream.
+      mix(static_cast<std::uint64_t>(out.animFrame));
+      mix(static_cast<std::uint64_t>(out.animTableIdx));
+      mix(static_cast<std::uint64_t>(out.animFrameIdx));
+      {
+        std::uint32_t ph;
+        std::memcpy(&ph, &out.animPhase, 4);
+        mix(ph);
+      }
+      mix(out.animDrawn ? 1 : 0);
       mix(out.currentArenaSwapped ? 1 : 0);
       // Phase 5J — fold the deterministic look/view derived state
       // into the digest (offset, view yaw, effective pitch, the

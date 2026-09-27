@@ -5946,3 +5946,229 @@ readers); verified zero digest drift on all six levels.
 **Phase 15C is CLOSED** — the §191 residual ops are classified
 (executed + already covered), not latent, and no speculative
 behavior was added.
+
+# Phase 16A — Kurt / Player Animation Reconstruction
+
+## 198. The original pipeline (OBSERVED — BUILD_A disassembly)
+
+Kurt's traversal animation is driven by **FUN_00461954** — a single
+function that is BOTH the animation state machine AND the draw
+callback. `FUN_00431300` (the player-draw registration inside the
+arena draw driver `FUN_00436EA8` via `FUN_00436D60`) pushes a 48-byte
+draw entry with `fn = FUN_00461954` into the depth-sorted BSP draw
+list; when the arena draw driver drains the list the machine runs
+and the selected sprite frame pair is handed to the blitter.
+
+Call-chain anchors (all OBSERVED):
+
+- player draw registration: `FUN_00431300`
+- arena/world draw driver: `FUN_00436EA8` via `FUN_00436D60`
+- animation selection + draw callback: `FUN_00461954`
+- animation record binding: `FUN_0046445C` (once per traversal
+  context, from the loader `FUN_00433D40`)
+- integer frame advance helper: `FUN_00464278`
+- movement-speed float-phase helper: `FUN_00464308`
+- frame-crossing trigger helper: `FUN_004375F4` (wrap-aware:
+  forward `(prev,curr]`, reverse `[curr,prev)`)
+- sprite-frame draw helper: `FUN_00409760` (thin wrapper
+  `FUN_00409724` calls it twice — main `0x54cb14` + overlay
+  `0x54cb18`)
+- unknown-state diagnostic: `FUN_00408EB0`
+  (`"Unknown Damp Animation"`)
+
+## 199. Data source (OBSERVED on real BUILD_A data)
+
+Kurt is a **2D RLE sprite**, not a CMI/mesh object. Animation
+records are the same `{u32 blockBytes, u32 count, u32 ofs[N],
+8-byte frame headers {u16 w, u16 h, s16 hotX, s16 hotY}, RLE
+stream}` layout `fti_sprite.h` already decodes; the record pointer
+is bound at `payloadFileOffset + 4` (past the block-byte header).
+
+Two banks, 29 tables total (FUN_0046445C, exact slot order):
+
+- `TRAVERSE/TRAVSPRT.BNI` — 23 records resolved by `FUN_004039EC`
+  against the live BNI directory: `K_BANG, K_BFLIP, K_CHUTE,
+  K_CHUTEC, K_CRASHL, K_FALL, K_FLOATC, K_HANG, K_IDLE, K_JUMP,
+  K_LAND, K_LOOKD, K_LOOKU, K_MUZZF, K_RJMP, K_RUN, K_RUNFIR,
+  K_SHOT, K_SIDE, K_SPWEP, K_STILL, K_TAKEOF, K_TRN45`.
+- `LEVEL<n>/LEVEL<n>S.SNI` — the per-level sprite-name bank
+  (records flagged `+0x0D & 0x80`, the parser's sentinel class),
+  resolved by `FUN_004289A0`: `K_BSLIDE, K_FSLIDE, K_SLIDE,
+  K_SLIP, K_SURF, K_SURFJ`. Real levels carry only the records
+  they need (LEVEL6S.SNI: the four slides, no surf pair).
+
+## 200. State machine (OBSERVED — dispatch tree in FUN_00461954)
+
+Dispatch is a range tree over the locomotion state `0x540cac`
+(`locoState`), with the first-frame latch `0x540cb0` (`animPrev`)
+providing the enter detect. The overlay pointer `0x54cb18`
+(`animOverlayFrame`) is cleared at the top of the body each frame
+when the head gate is open; `0x54cb14` (`animMainFrame`) receives
+the selected sprite-frame pointer.
+
+- `0x65` — K_IDLE, hold-last + event release
+- `0x64`/`0x384` — K_STILL (0x384 unscope also runs the overlay
+  release + camera-restore seam every continue frame)
+- `0xc8` — K_LAND, hold-last + release at `count-1`
+- `0xc9` — K_SURF loop `[0,count-2]`, eyeHeight pinned 4.5, muzzle
+- `0x12c` — K_SHOT loop `[0,count-2]`
+- `0x190` — K_TRN45 yaw-proportional `rint(yaw*(1/180)*count) % count`
+- `0x1f4` — K_SIDE wrap loop + muzzle overlay
+- `0x258` — K_RUN via FUN_00464308 (float phase `cb8 += smoothed *
+  rate(1.5*moveVel)`; gear thresholds at `moveVel ±2/3`, nonzero
+  floors `±0.25` at standstill; `cb4 = rint(cb8)`)
+- `0x259` — K_RUNFIR integer advance + footstep crossings at
+  frames 4 and `0x11` (sound seam + foot-alternate toggle)
+- `0x2bc` — K_FALL wrap loop; `vertVel==0 && grounded` → 0xc8 land
+- `0x2bd` — K_CHUTE deploy (clamp 4), then K_CHUTEC ping-pong
+  (`idx = cb4-4` for `cb4 < count+4`, else `2*count+2-cb4`; reset
+  to 4 at `2*count+2`) while `jumpSustain != 0`; release path does
+  the sound query/refire and holds `count-1` + release
+- `0x2be` — K_JUMP: `cb4 < 0xa` runs `+1/frame`, then frames are
+  keyed by `vertVel` against the constant threshold table
+  (climbs while `vertVel <= thr[cb4]`, `cb4 < 0x10`); reaching
+  `0x10` releases to 0x2bc/`cbc=7`; grounded catch → 0xc8/`cbc=2`
+  + `airCharge += 0.5*dt*vertVel` (the shared `0x540c84` write the
+  movement machine drains)
+- `0x2bf` — K_RJMP: same shape as 0x2be but `cb4 < 7` runs `+1`,
+  thresholds `thr'[cb4]`, release at `0x0c`, and the frame read is
+  `ofs[cb4 + 4]` — the OBSERVED `+0x14` anomaly (skips the first
+  four frame offsets)
+- `0x320` — K_HANG mantle, half-rate `hang[cb4/2]` over
+  `2*count-1`; root-motion nudge `pos += (kZ[j+1]-kZ[j],
+  ±(kXy[j+1]-kXy[j])*0.35416)` keyed by yaw, gated by `vertSkip==1`;
+  clamp at `2*count-1` + release + `vertSkip=0`
+- `0x321` — K_SURFJ: advances to `count/2`, parks there until
+  `contactObj`; early contact at `cb4 <= count/2-2` → 0xc9; else
+  `cb4` is forced to `count/2+1` and the back half plays to
+  `count` → 0xc9; eyeHeight integrates toward 4.5
+- `0x323` — scope-in: `scopeHudOffset = rint(scopeScale*eyeHeight
+  + 29)` reads the PRE-write eyeHeight, then `pullback=0`,
+  `eyeHeight=4.0`, `transitionPhase` 0→1 on pending frames
+- `0x324` — look up/down: `rint(pitch/bound*(count-1))` picks
+  K_LOOKU (`pitch<0`, bound `arenaScalar-60`) or K_LOOKD
+  (`pitch>0`, bound `arenaScalar+90`); `pitch==0` self-releases
+  (`cbc=0`, frame 0)
+- `0x325` — K_SPWEP hold-last; `invHudTimer=60` on enter; the
+  frame-8 crossing re-arms the timer and calls `FUN_0046A190`
+  (interact action seam)
+- `0x326` — K_CRASHL hard landing, half-rate `crashL[cb4/2]`; pins
+  at sub-frame 8 while falling without contact
+- `0x327` — K_SLIP `+1` per frame (NOT frameStep); at `count`
+  chains to `0x328` on K_SLIDE
+- `0x328`/`0x329` — K_SLIDE / K_FSLIDE wrap loops (`cb4 -= count`)
+- `0x32a` — K_BSLIDE `+1` per frame, holds `count-1`, no release
+- `0x385` — tumble: K_BANG for `cb4 < bang.count`, else K_BFLIP
+  `bFlip[cb4-bang.count]` + slide-vector `e44/e48` cleared; limit
+  `bang.count + bFlip.count - 1` → clamp + release
+- `0x3e8` — K_TAKEOF wrap; wrap edge chains to `0x3e9` +
+  `fieldDa0=1`
+- `0x3e9` — K_FLOATC wrap loop (da1 service seam observed)
+- `0x3ea` — K_BANG `+1` per frame, holds `count-1`, no release
+  (terminal death pose)
+- `0x2c0..0x31f` band, `0x322`, `0x32b..0x383` band — unknown-state
+  diagnostic (`FUN_00408EB0` + `cbc=0`, latch still runs)
+
+Gates (OBSERVED): mount gate `excludeObj && (mountClass & 0x20)`
+skips the job; head gate `flag4999d0 && flag541548` skips dispatch
++ latch but still evaluates the draw gate `hudActive != 0 &&
+(flag49b740 == 0 || (flagC9c != 0 && transitionPhase >= 2))`.
+Muzzle overlay fires when `fieldC74 != 0 && (frameCounter & 1)`
+with `enemyRandBelow` jitter offsets (bias +20/0 — or `-42/+12` on
+the surf state).
+
+## 201. Native implementation (IMPLEMENTED)
+
+`src/core/player_animation.{h,cpp}` — transcribed from the
+disassembly, preserving all quirks:
+
+- `playerAnimBindTables` — the `FUN_0046445C` binder over
+  `rt.level.travsprtBytes` (BNI) + `rt.level.sniBytes` (SNI,
+  flag-`0x80` records only); called from the traversal loader
+  after BNI load (per-level `LEVEL<n>S.SNI` is loaded beside it).
+- `playerAnimTick` — the `FUN_00461954` machine: gates, dispatch,
+  frame select, all handler side-effects (locoState/eventPriority/
+  airCharge/eyeHeight/pullback/invHudTimer/fieldDa0/e44-e48/
+  vertSkip writes, sound/diag/action seams, the mantle nudge).
+- `playerAnimFrameCrossed` — `FUN_004375F4`.
+- `playerAnimFrameIdentity` — resolves a selected frame pointer to
+  `{table index, frame index}` for deterministic traces; the 29
+  slot order is `K_BANG, K_BFLIP, K_BSLIDE, K_CHUTE, K_CHUTEC,
+  K_CRASHL, K_FALL, K_FLOATC, K_FSLIDE, K_HANG, K_IDLE, K_JUMP,
+  K_LAND, K_LOOKD, K_LOOKU, K_MUZZF, K_RJMP, K_RUN, K_RUNFIR,
+  K_SHOT, K_SIDE, K_SLIDE, K_SLIP, K_SPWEP, K_STILL, K_SURF,
+  K_SURFJ, K_TAKEOF, K_TRN45`.
+
+Runtime integration (`traversal_runtime.{h,cpp}`): the tick runs
+inside the world/draw driver where the draw callback originally
+ran, with `frameStep/smoothed/deltaSec/arenaScalar/jumpHeld` fed
+from the timing block + input. `TraversalFrameResult` now carries
+`animFrame`, `animPhase`, `animTableIdx`, `animFrameIdx`,
+`animDrawn`; the `--traversal-runtime` trace prints
+`st=<locoState> af=<frame> at=<table>[<idx>] dr` and the digest
+folds the same fields. Save/restore already persists the
+machine's authoritative globals at their original addresses
+(`locoState`@0xb0, `animPrev`@0xb4, `animFrame`@0xb8,
+`animPhase`@0xbc, `eventPriority`@0xc0, `moveDirLatch`@0xc4,
+`airCharge`@0x88, `jumpLatch`@0x94, `animE44/48`@0x248/0x24c); the
+frame-pair outputs are per-frame transient and unsaved — matching
+the original.
+
+PRESERVED QUIRKS: the `K_RJMP +0x14` ofs shift; `FUN_00464308`'s
+unclamped `rint(cb8)` index (standstill wrap can reach `count` —
+the pointer forms but the frame is consumed before the edge
+matters); `0x322` in the unknown band; `0x327`'s explicit `INC`
+advance ignoring frameStep; the `0x325` enter re-arming
+`invHudTimer`.
+
+## 202. Freefall boundary (SEPARATE — OBSERVED)
+
+Freefall Kurt is NOT this pipeline. The Phase 13A freefall core
+owns its own globals (`0x4ce…/0x4dc…/0x4edc…` range), its own
+pickup/pad animation records out of `FALL3D.BNI`, and its own
+draw path — `FUN_00461954`, `0x540cac`, and the K_* sprite tables
+appear nowhere in it. Classification: **SEPARATE**. Phase 16A is
+traversal-only; the freefall player representation stays in the
+freefall runtime.
+
+## 203. Validation
+
+- Focused native tests (`test_player_animation`, synthetic
+  `{count, ofs[], frames}` tables): record accessors, the BNI+SNI
+  binder incl. the flag filter + `+4` offsets, the crossing
+  helper's four interval shapes, and every dispatched state —
+  idle/still/land clamps, run speed-phase, runfir footstep
+  crossings + footAlt, strafe/shot loops, yaw/look-proportional
+  frames, fall→land, both jump tables (incl. the K_RJMP `+4`
+  identity), chute deploy/sustain ping-pong/release, mantle
+  half-rate + root-motion nudge + vertSkip freeze, surf-jump
+  park/unpin/early-contact, slip→slide chain, all three slide
+  loops, tumble combined-counter, takeoff→float chain, terminal,
+  the 0x325 trigger, scope/unscope seams, unknown-state diag,
+  all gates, muzzle parity.
+- LEVEL3–8 `--traversal-runtime` (60f): all PASS, `diag=0`,
+  script insn unchanged (1791/128/1915/1771/458/2828).
+- Real-data traces: `st=065 at=K_IDLE[0..10]` → `st=258
+  at=K_RUN` (speed-phase sub-integer advance) → `st=2be
+  at=K_JUMP` with the vertVel-threshold park at `K_JUMP[10]`
+  (LEVEL6 60f). Digest deterministic across runs.
+- New canonical 60f digests (fold now includes the animation
+  state — expected evolution, first set captured post-extension):
+  L3 `cdb1ea884dc0876d`, L4 `f3c517ed777e87e6`,
+  L5 `50259d6fd931bf5e`, L6 `58a2587aabe57d91`,
+  L7 `37eb67e2b5cf3e8d`, L8 `0a8aa8bfde3ed2cd`.
+- Regression: mdk_tests 5408/0 (+189 animation checks),
+  CTest 1/1, pytest 19/0.
+
+PRESENTATION DEFERRED: `FUN_00409760`'s sprite blit and the
+`0x540c4c/0x540c50` screen-anchor projection (M1 projection →
+rint → anchor + `0x540dbc` pixels/unit scale + `0x540d34`
+scope-hide offset) — the selected frame pointers, jitter offsets,
+and `animDrawn` gate are surfaced on the runtime for a later
+presentation phase. No Godot Kurt rendering yet.
+
+**Phase 16A CLOSED — TRAVERSAL KURT ANIMATION SEMANTICS:
+CLOSED FOR BUILD_A.** Data source, table binding, state
+selection/priority, timing, transitions, model/pose identity, and
+native representation are all OBSERVED + implemented with real
+data; deterministic traces pass on LEVEL3–8.

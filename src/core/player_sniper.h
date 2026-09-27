@@ -151,20 +151,6 @@ void sniperReset(TraversalRuntime& rt);
 // is the raw drain (mounted-reticle energy deficit or land damage).
 void sniperDamageDrain(TraversalRuntime& rt, int amount);
 
-// FUN_00461954 subset — the animation/state machine's sniper-lifecycle
-// states (0x323 scope-in, 0x384 unscope). The full machine (frame-table
-// pointers 0x54cb14/0x54cb18 and the movement/idle handlers) is
-// deferred; the states the sniper depends on are reproduced.
-//
-// OBSERVED gates (in order):
-//   FUN_00431300 — the player anim job runs only when
-//     (!c9c || ca0==0) && (!e6c || !(e70 & 0x20)).
-//   FUN_00461954 head — !(0x4999d0 && 0x541548) or it skips to the
-//     HUD tail (the cb0 latch is skipped too).
-// The cb0 = cac first-frame latch runs for every dispatched state,
-// handled or not. `frameStep` is DAT_0049b6e8 (the cb4 increment).
-void playerAnimAdvance(TraversalRuntime& rt, int frameStep);
-
 } // namespace mdk
 
 #endif // MDK_CORE_PLAYER_SNIPER_H

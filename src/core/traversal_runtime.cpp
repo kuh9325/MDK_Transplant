@@ -798,6 +798,24 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
     }
   }
 
+  // LEVEL<n>S.SNI — the per-level sprite-name bank (DAT_0049b3ec).
+  // OBSERVED: the traversal loader formats "%s\\LEVEL%d\\LEVEL%ds.sni"
+  // (0x4339a6..0x4339c5) inside the same context-init that binds the
+  // Kurt anim tables (FUN_0046445c). Derived here from the DTI path:
+  // "…/LEVEL3/LEVEL3.DTI" -> "…/LEVEL3/LEVEL3S.SNI". Non-fatal —
+  // levels without the bank leave the six slide/surf tables null.
+  {
+    const auto dot = dtiPath.find_last_of('.');
+    const std::string stem =
+        (dot == std::string::npos) ? dtiPath : dtiPath.substr(0, dot);
+    auto sni = root.readFile(stem + "S.SNI", kMaxDataFileBytes, detail);
+    if (sni) rt.level.sniBytes = std::move(*sni);
+  }
+
+  // FUN_0046445c — bind the 29 Kurt sprite tables (23 TRAVSPRT.BNI
+  // records via payload+4; 6 LEVEL<n>S.SNI records via blob+ofs+4).
+  playerAnimBindTables(rt);
+
   // The loader's arena work records: verbatim 36-byte sub-record
   // table + name fixups + connect pairing.
   rt.level.work = rt.level.dti.arenas;
@@ -1599,10 +1617,19 @@ TraversalFrameResult stepTraversalRuntime(
   const auto run36d60Body = [&]() {
     ++rt.seams.animDriverCalls;
     // FUN_00436ea8 -> FUN_00431300 -> FUN_00461954: the
-    // animation/state machine. The bounded subset handles the
-    // sniper-lifecycle states (0x323 scope-in, 0x384 unscope) + the
-    // cb0 first-frame latch; the rest of the machine is deferred.
-    playerAnimAdvance(rt, timing.frameStep);
+    // animation/state machine (Phase 16A — full dispatch, frame
+    // selection and the original's side-effects). jumpHeld is the
+    // same one-frame-latency input block the rest of the pipeline
+    // reads (the draw callback read 0x4ce768 directly).
+    {
+      PlayerAnimEnvironment ae;
+      ae.frameStep = timing.frameStep;
+      ae.smoothed = timing.smoothed;
+      ae.deltaSec = timing.deltaSec;
+      ae.arenaScalar = cur->scalar;
+      ae.jumpHeld = rt.prevFrame.jump;
+      playerAnimTick(rt, ae);
+    }
     // Scope gate A (0x436dd3): c9c != 0 && ca0 > 1 -> the shot-pool
     // render pass FUN_0045f030(0) + the charge probe FUN_00437aa8
     // (which writes the 0x540e14 live flag).
@@ -1726,6 +1753,16 @@ TraversalFrameResult stepTraversalRuntime(
   out.locoState = rt.locoState;
   out.eventType = rt.eventType;
   out.eventMag = rt.eventMag;
+  out.animFrame = rt.animFrame;
+  out.animPhase = rt.animPhase;
+  out.animDrawn = rt.animDrawn;
+  {
+    int ti = -1, fi = -1;
+    if (playerAnimFrameIdentity(rt, rt.animMainFrame, &ti, &fi)) {
+      out.animTableIdx = ti;
+      out.animFrameIdx = fi;
+    }
+  }
   out.slideChannel = rt.slideChannel;
   out.viewOnPartner = rt.viewOnPartner;
   out.partnerActive = rt.partnerActive;
