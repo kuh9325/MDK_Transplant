@@ -455,15 +455,24 @@ void playerAnimTick(TraversalRuntime& rt,
             (rt.animFrame < cc + 4) ? rt.animFrame - 4
                                     : 2 * cc + 2 - rt.animFrame;
         setMain(t.chuteC, idx);
-        ++rt.seams.animSoundCalls;       // FUN_00402388(0x54c604)
+        // FUN_00402388(0x54c604,0) — ensure-playing: starts CHUTEON if
+        // not already playing, no-op when it is. OBSERVED via the
+        // sound-name binds (0x4974c0 "CHUTEON" -> 0x54c604).
+        ++rt.seams.animSoundCalls;
+        rt.animChuteLoop = 1;
         muzzle(20, 0);
       } else {
-        // FUN_00402658(0x54c604) "still playing" query — the audio
-        // seam models the sustained loop (the refire pair has no
-        // gameplay feedback). UNKNOWN: exact query polarity.
+        // 0x4629d2 — FUN_00402658(0x54c604) walks the live-instance
+        // list: nonzero when CHUTEON is still playing -> stop it
+        // (FUN_0040210c) + play CHUTEIN (FUN_004022b8, 0x54c600).
+        // Playing only after a sustain frame ran the ensure-playing
+        // call — so the refire pair fires at most once per release.
         ++rt.seams.animSoundCalls;       // the query itself
-        ++rt.seams.animSoundCalls;       // FUN_0040210c(0x54c604)
-        ++rt.seams.animSoundCalls;       // FUN_004022b8(0x54c600)
+        if (rt.animChuteLoop != 0) {
+          rt.animChuteLoop = 0;          // FUN_0040210c stop
+          ++rt.seams.animSoundCalls;     // FUN_0040210c(0x54c604)
+          ++rt.seams.animSoundCalls;     // FUN_004022b8(0x54c600) CHUTEIN
+        }
         rt.animFrame += step;
         const int last = static_cast<int>(recCount(t.chute)) - 1;
         if (rt.animFrame >= last) {
@@ -518,7 +527,10 @@ void playerAnimTick(TraversalRuntime& rt,
       // mantle — half-rate hang frames + root-motion nudge while
       // c7c != 1; end: cb4 = 2*count-1, release, c7c = 0.
       if (enter) {
-        ++rt.seams.animSoundCalls;       // FUN_0040210c(0x54c604)
+        // FUN_0040210c(0x54c604) — stops CHUTEON (mantle cancels the
+        // chute loop) + clears the playing latch.
+        ++rt.seams.animSoundCalls;
+        rt.animChuteLoop = 0;
         rt.animFrame = 0; shadow = 0;
       } else if (rt.vert.vertSkip != 1) {
         for (int i = 0; i < step; ++i) {

@@ -6022,8 +6022,22 @@ the selected sprite-frame pointer.
 - `0x2bc` — K_FALL wrap loop; `vertVel==0 && grounded` → 0xc8 land
 - `0x2bd` — K_CHUTE deploy (clamp 4), then K_CHUTEC ping-pong
   (`idx = cb4-4` for `cb4 < count+4`, else `2*count+2-cb4`; reset
-  to 4 at `2*count+2`) while `jumpSustain != 0`; release path does
-  the sound query/refire and holds `count-1` + release
+  to 4 at `2*count+2`) while `jumpSustain != 0`. Sustain also runs
+  `FUN_00402388(0x54c604,0)` per frame — an ensure-playing pump on
+  the CHUTEON loop (sound-object names OBSERVED: `0x4974ac`
+  CHUTEOUT→`0x54c5fc` deploy, `0x4974b8` CHUTEIN→`0x54c600`
+  release, `0x4974c0` CHUTEON→`0x54c604` sustain loop,
+  `0x4974c8` LAND→`0x54c608`, `0x4974d0..` FOOT1–4→
+  `0x54c60c..0x54c618`). The release path (`jumpSustain==0`) calls
+  `FUN_00402658(0x54c604)` every frame — walks the live-instance
+  list `0x49ff90`, returns nonzero while CHUTEON is playing; when
+  nonzero it stops the loop (`FUN_0040210c`) and fires CHUTEIN
+  (`FUN_004022b8`). The pair therefore fires exactly once — on the
+  first release frame after ≥1 sustain frame — then the query is
+  false. `0x320` mantle enter also stops CHUTEON
+  (`FUN_0040210c(0x54c604)` — mantle cancels the chute). Frame
+  advance `cb4 += step` clamps at `count-1` + `cbc=0`; the query/
+  refire run BEFORE the advance each release frame.
 - `0x2be` — K_JUMP: `cb4 < 0xa` runs `+1/frame`, then frames are
   keyed by `vertVel` against the constant threshold table
   (climbs while `vertVel <= thr[cb4]`, `cb4 < 0x10`); reaching
@@ -6140,7 +6154,9 @@ freefall runtime.
   idle/still/land clamps, run speed-phase, runfir footstep
   crossings + footAlt, strafe/shot loops, yaw/look-proportional
   frames, fall→land, both jump tables (incl. the K_RJMP `+4`
-  identity), chute deploy/sustain ping-pong/release, mantle
+  identity), chute deploy/sustain ping-pong/release incl. the
+  CHUTEON playing-latch (refire fires once after sustain, never
+  without it, mantle-enter stop clears it), mantle
   half-rate + root-motion nudge + vertSkip freeze, surf-jump
   park/unpin/early-contact, slip→slide chain, all three slide
   loops, tumble combined-counter, takeoff→float chain, terminal,
@@ -6151,14 +6167,28 @@ freefall runtime.
 - Real-data traces: `st=065 at=K_IDLE[0..10]` → `st=258
   at=K_RUN` (speed-phase sub-integer advance) → `st=2be
   at=K_JUMP` with the vertVel-threshold park at `K_JUMP[10]`
-  (LEVEL6 60f). Digest deterministic across runs.
-- New canonical 60f digests (fold now includes the animation
-  state — expected evolution, first set captured post-extension):
-  L3 `cdb1ea884dc0876d`, L4 `f3c517ed777e87e6`,
+  (LEVEL6 60f). Digest deterministic across runs. The 400f LEVEL4
+  trace exercises 0x2be→0x2bc→0xc8; the scripted input never
+  holds jump through the apex so 0x2bd is not reachable cheaply
+  on real data (per-phase rule: focused tests + complete
+  disassembly evidence carry that state).
+- Canonical 60f digests (fold now includes the animation
+  state): L3 `cdb1ea884dc0876d`, L4 `f3c517ed777e87e6`,
   L5 `50259d6fd931bf5e`, L6 `58a2587aabe57d91`,
-  L7 `37eb67e2b5cf3e8d`, L8 `0a8aa8bfde3ed2cd`.
-- Regression: mdk_tests 5408/0 (+189 animation checks),
+  L7 `37eb67e2b5cf3e8d`, L8 `0a8aa8bfde3ed2cd` — unchanged by the
+  0x2bd seam fix (the goldens never reach the chute state).
+- Regression: mdk_tests 5415/0 (+196 animation checks),
   CTest 1/1, pytest 19/0.
+
+`animFootAlt` (`0x49b924`) — **TRANSIENT** (classification C):
+a `.data` global beside the anim-table pointers, written/read only
+by `FUN_00461954` to select the FOOT1/FOOT3 vs FOOT2/FOOT4 sample
+parity at the run/runfir crossings. The save DAMP record covers
+`0x540bfc + 724B` — `0x49b924` is far outside it; no original
+writer/loader serializes it, and sound-object state is not in the
+save image. A stale value after load only flips footstep sample
+parity — cosmetic, not gameplay-visible. No save/load change;
+`rt.animFootAlt` intentionally stays out of the save map.
 
 PRESENTATION DEFERRED: `FUN_00409760`'s sprite blit and the
 `0x540c4c/0x540c50` screen-anchor projection (M1 projection →
@@ -6167,8 +6197,10 @@ scope-hide offset) — the selected frame pointers, jitter offsets,
 and `animDrawn` gate are surfaced on the runtime for a later
 presentation phase. No Godot Kurt rendering yet.
 
-**Phase 16A CLOSED — TRAVERSAL KURT ANIMATION SEMANTICS:
+**Phase 16A.1 CLOSED — TRAVERSAL KURT ANIMATION SEMANTICS:
 CLOSED FOR BUILD_A.** Data source, table binding, state
-selection/priority, timing, transitions, model/pose identity, and
-native representation are all OBSERVED + implemented with real
-data; deterministic traces pass on LEVEL3–8.
+selection/priority, timing, transitions, model/pose identity,
+native representation, the 0x2bd CHUTEON query polarity, and the
+animFootAlt persistence classification are all OBSERVED +
+implemented with real data; deterministic traces pass on
+LEVEL3–8.

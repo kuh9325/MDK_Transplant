@@ -660,6 +660,16 @@ struct TraversalRuntime {
                                              // counter (rand+1 &3)
   int animFootAlt = 0;                         // 0x49b924 — footstep
                                              // alternate toggle
+  int animChuteLoop = 0;                       // CHUTEON (0x54c604)
+                                             // instance-playing seam
+                                             // state: set by the
+                                             // sustain-path
+                                             // ensure-playing call,
+                                             // cleared by the release
+                                             // stop + the 0x320 enter
+                                             // stop. Not a Kurt field —
+                                             // models the live sound
+                                             // node's observable state.
   bool animDrawn = false;                      // the 0x4619ce draw
                                              // gate result
                                              // (0x5414d4 &&

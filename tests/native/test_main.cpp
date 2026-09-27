@@ -17480,7 +17480,8 @@ void test_player_animation() {
     int t = -1, f = -1;
     CHECK(ident(rt, rt.animMainFrame, &t, &f));
     CHECK(t == ti("K_CHUTE") && f == 4);
-    // sustain (jumpSustain): ping-pong on K_CHUTEC.
+    // sustain (jumpSustain): ping-pong on K_CHUTEC + the CHUTEON
+    // ensure-playing call leaves the loop-playing latch set.
     rt.vert.jumpSustain = 1;
     const int seqExpect[] = {1, 2, 3, 2, 1, 0};
     for (int s : seqExpect) {
@@ -17488,13 +17489,38 @@ void test_player_animation() {
       CHECK(ident(rt, rt.animMainFrame, &t, &f));
       CHECK(t == ti("K_CHUTEC") && f == s);
     }
-    // release (jumpSustain==0): the sound query + clamp-hold.
+    CHECK(rt.animChuteLoop == 1);
+    // release (jumpSustain==0): FUN_00402658 query always runs;
+    // the stop+CHUTEIN pair fires only while CHUTEON was playing
+    // (first release frame after sustain), then never again.
     rt.vert.jumpSustain = 0;
     rt.locoState = 0x2bd; rt.animPrev = 0x2bd; rt.animFrame = 7;
     rt.eventPriority = 9;
-    mdk::playerAnimTick(rt, e);
+    int snd2 = rt.seams.animSoundCalls;
+    mdk::playerAnimTick(rt, e);          // query true -> refire pair
+    CHECK(rt.seams.animSoundCalls == snd2 + 3);
+    CHECK(rt.animChuteLoop == 0);
     CHECK(rt.animFrame == 8);            // count-1, holds + releases
     CHECK(rt.eventPriority == 0);
+    snd2 = rt.seams.animSoundCalls;
+    mdk::playerAnimTick(rt, e);          // query now false -> query only
+    CHECK(rt.seams.animSoundCalls == snd2 + 1);
+    // release with NO prior sustain: the loop never started -> the
+    // refire pair never fires.
+    rt.animChuteLoop = 0;
+    rt.locoState = 0x2bd; rt.animPrev = 0x2bd; rt.animFrame = 5;
+    rt.eventPriority = 9;
+    snd2 = rt.seams.animSoundCalls;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.seams.animSoundCalls == snd2 + 1);
+    CHECK(rt.animChuteLoop == 0);
+    // mantle enter stops CHUTEON (FUN_0040210c) — clears the latch.
+    rt.animChuteLoop = 1;
+    rt.locoState = 0x320; rt.animPrev = 0; rt.animFrame = 0;
+    rt.animTables.hang = bank.rec(10);
+    rt.vert.vertSkip = 1;
+    mdk::playerAnimTick(rt, e);
+    CHECK(rt.animChuteLoop == 0);
   }
 
   // --- 0x320 mantle: half-rate + root-motion nudge + release ----------
