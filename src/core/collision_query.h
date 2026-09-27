@@ -327,6 +327,30 @@ const CollisionNode* collisionStabMode1(const CollisionArena& arena,
 void collisionObjectProbe(const CollisionObject* obj, const float* start,
                           float* end, int* outElem, int* outTri);
 
+// ---------------------------------------------------------------------------
+// Diagnostic query counters (native-only; no original state). Written
+// unconditionally — a handful of u64 increments per call is negligible —
+// and dumped by tools that opt in (mdk-inspect --col-profile).
+// ---------------------------------------------------------------------------
+struct CollisionProfile {
+  std::uint64_t stabCalls = 0;       // collisionStab/collisionStabFull
+  std::uint64_t stabNodes = 0;       // node visits inside stabWalk
+  std::uint64_t stabPolyTests = 0;   // pointInTri calls in stabPolyScan
+  std::uint64_t stabM1Calls = 0;     // collisionStabMode1
+  std::uint64_t stabM1Nodes = 0;
+  std::uint64_t sweepCalls = 0;      // collisionSweep entries
+  std::uint64_t sweepIters = 0;      // slide/contact iterations
+  std::uint64_t sweepNodes = 0;      // node visits inside bspSweep
+  std::uint64_t sweepPolyTests = 0;  // boxTri calls in polyScan
+  std::uint64_t probeCalls = 0;      // collisionObjectProbe
+  std::uint64_t probeTris = 0;       // segTri tests inside objectProbe
+  std::uint64_t splashCalls = 0;     // splashDamage entries
+  std::uint64_t falloffCalls = 0;    // splashFalloff entries
+};
+
+CollisionProfile& collisionProfile();
+void collisionProfileReset();
+
 } // namespace mdk
 
 #endif // MDK_CORE_COLLISION_QUERY_H

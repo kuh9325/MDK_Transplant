@@ -379,6 +379,7 @@ int segTri(const float* start, float* end, const float* verts,
 
 void objectProbe(const CollisionObject* obj, const float* start, float* end,
                  int* outElem, int* outTri) {
+  ++collisionProfile().probeCalls;
   const float* m = obj->xform;
   const float invS2 = 1.0f / (obj->scale * obj->scale);
   float ls[3], le[3];
@@ -399,6 +400,7 @@ void objectProbe(const CollisionObject* obj, const float* start, float* end,
     if ((1u << (e & 31)) & obj->elemMaskB) continue;
     const CollisionElement& el = set->elems[e];
     for (int t = 0; t < el.triCount; ++t) {
+      ++collisionProfile().probeTris;
       const std::uint16_t* tri =
           reinterpret_cast<const std::uint16_t*>(el.tris + t * 0x24);
       if (segTri(ls, le, el.verts, tri)) {
@@ -480,6 +482,7 @@ int stabPolyScan(StabState& s, const CollisionNode* node,
   const CollisionPoly* rec = s.polys + (set >> 16);
   const float n[3] = {node->nx, node->ny, node->nz};
   for (int i = 0; i < count; ++i, ++rec) {
+    ++collisionProfile().stabPolyTests;
     if (rec->flags & 0x20) continue;
     const float* v0 = s.verts + (std::uint32_t)rec->v[0] * 3;
     const float* v1 = s.verts + (std::uint32_t)rec->v[1] * 3;
@@ -502,6 +505,7 @@ int stabPolyScan(StabState& s, const CollisionNode* node,
 const CollisionNode* stabWalkMode1(StabState& s,
                                    const CollisionNode* node) {
   while (node) {
+    ++collisionProfile().stabM1Nodes;
     const float dStart = s.cand1[1] * node->ny + s.cand1[0] * node->nx +
                          s.cand1[2] * node->nz + node->d;
     const float dEnd = s.cand2[1] * node->ny + s.cand2[0] * node->nx +
@@ -538,6 +542,7 @@ const CollisionNode* stabWalkMode1(StabState& s,
 const CollisionNode* stabWalk(StabState& s, const CollisionNode* node) {
   static const bool traceStab = std::getenv("MDK_TRACE_STAB") != nullptr;
   while (node) {
+    ++collisionProfile().stabNodes;
     if (traceStab && ++s.dbgVisits > 40) {
       std::fprintf(stderr,
           "  [stab] visits=%d node=%ld far=%d near=%d "
@@ -577,6 +582,15 @@ const CollisionNode* stabWalk(StabState& s, const CollisionNode* node) {
 
 } // namespace
 
+CollisionProfile& collisionProfile() {
+  static CollisionProfile p;
+  return p;
+}
+
+void collisionProfileReset() {
+  collisionProfile() = CollisionProfile{};
+}
+
 // FUN_0045cd38 / FUN_0045c838 / FUN_00418c60 — exported wrappers over
 // the file-local originals (the object pass + grounding probe of the
 // Phase 5M camera obstruction call FUN_00430bf8).
@@ -601,6 +615,7 @@ const CollisionNode* collisionStabFull(const CollisionArena& arena,
                                        const float* from, const float* to,
                                        float* outPos,
                                        const CollisionPoly** outPoly) {
+  ++collisionProfile().stabCalls;
   if (outPoly) *outPoly = nullptr;
   if (!arena.verts || !arena.nodes) return nullptr;
   StabState s;
@@ -626,6 +641,7 @@ const CollisionNode* collisionStabFull(const CollisionArena& arena,
 const CollisionNode* collisionStabMode1(const CollisionArena& arena,
                                         const float* from,
                                         const float* to) {
+  ++collisionProfile().stabM1Calls;
   if (!arena.verts || !arena.nodes) return nullptr;
   StabState s;
   s.verts = arena.verts;
@@ -674,6 +690,7 @@ int polyScan(SweepState& s, std::uint32_t set, const float* contact,
   const int count = (int)(set & 0xffff);
   const CollisionPoly* rec = s.polys + (set >> 16);
   for (int i = 0; i < count; ++i, ++rec) {
+    ++collisionProfile().sweepPolyTests;
     if (rec->flags & 0x20) continue;
     const float* v0 = s.verts + (std::uint32_t)rec->v[0] * 3;
     const float* v1 = s.verts + (std::uint32_t)rec->v[1] * 3;
@@ -693,6 +710,7 @@ int polyScan(SweepState& s, std::uint32_t set, const float* contact,
 
 void bspSweep(SweepState& s, const CollisionNode* node) {
   for (;;) {
+    ++collisionProfile().sweepNodes;
     const float margin = std::fabs(s.ext[2] * node->nz) +
                          std::fabs(s.ext[0] * node->nx) +
                          std::fabs(s.ext[1] * node->ny);
@@ -805,6 +823,7 @@ const CollisionPoly* collisionSweep(CollisionState& cs, const float* start,
                                     const float* ext, float scale,
                                     float* outPos,
                                     const CollisionNode** outNode) {
+  ++collisionProfile().sweepCalls;
   if (outNode) *outNode = nullptr;
   if (!arena.verts || !arena.nodes) {
     std::memcpy(outPos, target, 3 * sizeof(float));
@@ -835,6 +854,7 @@ const CollisionPoly* collisionSweep(CollisionState& cs, const float* start,
     for (int i = 0; i < 3; ++i) s.delta[i] = s.target[i] - s.pos[i];
     s.slideProduced = 0;
     s.bestT = 5000.0f;
+    ++collisionProfile().sweepIters;
     bspSweep(s, s.nodes);
     if (s.slideProduced) {
       std::memcpy(s.target, s.slideTarget, sizeof(s.target));

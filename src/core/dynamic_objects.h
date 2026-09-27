@@ -567,6 +567,13 @@ struct DynamicObject {
   // (FUN_00402160 seam child). +0x15c — its model-name token.
   DynamicObject* field158 = nullptr;
   std::string field15c;
+  // +0x160..+0x17c — eight refpoint emitter handles managed by op
+  // 0x80 (0x43d227): attach FUN_004055f4 binds a particle-emitter
+  // record to worldRef[slot] (cosmetic); release frees the slot.
+  // The port keeps opaque non-zero tokens — the handles are pure
+  // render/audio state with no gameplay observer; teardown's
+  // +0x160 sweep maps onto the record wipe.
+  std::uint32_t field160[8] = {};
   // +0x2b0 — floor-contact handle from the vertical sweep
   // (FUN_0045bac0 stores FUN_0045d174's hit poly; released via
   // FUN_00412ef0 conveyor query next frame).

@@ -458,6 +458,7 @@ void flyRibbon(TraversalRuntime& rt, PlayerShot& s, float smoothed) {
 int splashFalloff(TraversalRuntime& rt, const float aabb[6],
                   float centreOut[3], const float blast[3],
                   int dmgScale, float range, float* auxOut) {
+  ++collisionProfile().falloffCalls;
   centreOut[0] = static_cast<float>((aabb[0] + aabb[3]) * kAabbMid);
   centreOut[1] = static_cast<float>((aabb[1] + aabb[4]) * kAabbMid);
   centreOut[2] = static_cast<float>((aabb[2] + aabb[5]) * kAabbMid);
@@ -695,6 +696,11 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
                   float dmgScaleF, float range, int tallyGate,
                   DynamicObject* directObj, std::uint32_t flags,
                   std::int8_t exclMask) {
+  ++collisionProfile().splashCalls;
+  static const bool splashDbg =
+      std::getenv("MDK_SPLASH_DBG") != nullptr;
+  const std::uint64_t stabMark =
+      splashDbg ? collisionProfile().stabCalls : 0;
   const int dmgScale = static_cast<int>(dmgScaleF);
   const float rangeSq = range * range;
 
@@ -709,7 +715,35 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
         arena = rt.cs.carrier;
       }
       if (arena == nullptr) continue;
+      std::uint64_t dbgIter = 0;                 // MDK_SPLASH_DBG only
       for (const CollisionObject* o = arena->objects; o != nullptr;) {
+        if (splashDbg) {
+          ++dbgIter;
+          const std::uint64_t stabs =
+              collisionProfile().stabCalls - stabMark;
+          if (dbgIter > 100000 || stabs > 2000000) {
+            std::fprintf(stderr,
+                "  [splash] objects runaway: arena=%d o=%p next=%p "
+                "iter=%llu stabs=%llu\n",
+                a, (const void*)o, (const void*)o->next,
+                (unsigned long long)dbgIter,
+                (unsigned long long)stabs);
+            // Walk the (cyclic) list once more, naming members.
+            const CollisionObject* w = arena->objects;
+            for (int k = 0; k < 32 && w; ++k, w = w->next) {
+              const DynamicObject* wo = objectOf(w);
+              std::fprintf(stderr,
+                  "    node[%02d] %p next=%p named=%d model=%s "
+                  "arena=%s dead=%d\n",
+                  k, (const void*)w, (const void*)w->next,
+                  w->named ? 1 : 0,
+                  wo->model.modelName().c_str(),
+                  wo->arena ? "set" : "null",
+                  0);
+            }
+            return;
+          }
+        }
         // The original saves [o]->next BEFORE the damage/death writes
         // (0x460f02) — teardown wipes the record, so iterate the
         // snapshot, not o->next.
@@ -728,6 +762,13 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
         // Standable objects — the per-element falloff + int16 damage.
         if ((o->flags149 & 0x20) != 0 && o->elements != nullptr) {
           const CollisionElementSet& set = *o->elements;
+          if (splashDbg && (set.count < 0 || set.count > 200)) {
+            std::fprintf(stderr,
+                "  [splash] obj=%p set.count=%d elems=%p "
+                "flags149=%02x named=%d\n",
+                (const void*)o, (int)set.count, (const void*)set.elems,
+                (unsigned)o->flags149, o->named ? 1 : 0);
+          }
           for (std::int32_t e = 0; e < set.count; ++e) {
             if ((o->elemMaskB & (1u << (e & 0x1f))) != 0) continue;
             const std::string nm = obj->model.elemName(e);
@@ -781,8 +822,8 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
             std::memcpy(bestCenter, center, sizeof center);
           }
         }
-        if (bestDmg == 0) continue;
-        if (bestAux > obj->field2c4) continue;    // the +0x2c4 gate
+        if (bestDmg == 0) { o = next; continue; }
+        if (bestAux > obj->field2c4) { o = next; continue; }  // the +0x2c4 gate
         const float bearing =
             bearingDeg(bestCenter[1] - blast[1],
                        bestCenter[0] - blast[0]);
@@ -860,6 +901,16 @@ void splashDamage(TraversalRuntime& rt, const float blast[3],
       const CollisionArena& ca = arena->dyn.col;
       if (ca.verts == nullptr) continue;
       for (std::int32_t p = 0; p < arena->surface.polyCount; ++p) {
+        if (splashDbg) {
+          const std::uint64_t stabs =
+              collisionProfile().stabCalls - stabMark;
+          if (stabs > 2000000) {
+            std::fprintf(stderr,
+                "  [splash] poly-pass runaway: p=%d stabs=%llu\n",
+                (int)p, (unsigned long long)stabs);
+            return;
+          }
+        }
         CollisionPoly* poly = arena->surface.polys + p;
         if ((poly->flags & 0x20) != 0) continue;         // skip bit
         const int surfIdx = static_cast<int>(poly->surface) - 1;

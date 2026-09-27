@@ -268,6 +268,16 @@ const CollisionPoly* objectSweptMove(TraversalRuntime& rt,
   o.pos[0] += outPos[0] - start[0];
   o.pos[1] += outPos[1] - start[1];
   o.pos[2] += outPos[2] - start[2];
+  static const char* swpDbg = std::getenv("MDK_COL_OBJ");
+  if (swpDbg != nullptr && o.scriptClass == swpDbg) {
+    std::fprintf(stderr,
+        "    [swp] %s dz=%.3f start=(%.2f,%.2f,%.2f) "
+        "tgt=(%.2f,%.2f,%.2f) out=(%.2f,%.2f,%.2f) hit=%p\n",
+        o.scriptClass.c_str(), (double)dz, (double)start[0],
+        (double)start[1], (double)start[2], (double)target[0],
+        (double)target[1], (double)target[2], (double)outPos[0],
+        (double)outPos[1], (double)outPos[2], (const void*)hit);
+  }
   if (hit != nullptr) {
     // FUN_0040b5d0 per contact (secondary/context = 0x10).
     objectSurfaceDispatch(o, hit, outPos, start);
@@ -309,6 +319,9 @@ void objectGravity(TraversalRuntime& rt, DynamicObject& o,
 void objectCollide(TraversalRuntime& rt, DynamicObject& o,
                    DynamicArena& home, TraversalArena* otherArena,
                    float dt) {
+  static const char* colDbg = std::getenv("MDK_COL_OBJ");
+  const bool dbg = colDbg != nullptr && o.scriptClass == colDbg;
+  float prePos[3] = {o.pos[0], o.pos[1], o.pos[2]};
   o.col.flags14c &= 0xec;                      // clear contact bits 0/1/4
   // Drag — 3D for non-gravity objects, XY-only for +0x148&2 (OBSERVED).
   if ((o.col.flags148 & 2) == 0) {
@@ -406,6 +419,24 @@ void objectCollide(TraversalRuntime& rt, DynamicObject& o,
       o.field2c += ny * k;
       o.field30 += nz * k;
     }
+  }
+  if (dbg) {
+    std::fprintf(stderr,
+        "  [col] %s pre=(%.3f,%.3f,%.3f) post=(%.3f,%.3f,%.3f) "
+        "disp=(%.4f,%.4f,%.4f) "
+        "hit1=%p hit2=%p n2=%p imp=(%.3f,%.3f,%.3f) f2b0=%p "
+        "aabb=(%.1f..%.1f,%.1f..%.1f,%.1f..%.1f) ext3..5=(%.2f,%.2f,%.2f)\n",
+        o.scriptClass.c_str(), (double)prePos[0], (double)prePos[1],
+        (double)prePos[2], (double)o.pos[0], (double)o.pos[1],
+        (double)o.pos[2], (double)disp[0], (double)disp[1],
+        (double)disp[2], (const void*)hit, (const void*)hit2,
+        (const void*)node2, (double)o.animImpulse[0],
+        (double)o.animImpulse[1], (double)o.animImpulse[2],
+        (const void*)o.field2b0,
+        (double)o.col.aabb[0], (double)o.col.aabb[3],
+        (double)o.col.aabb[1], (double)o.col.aabb[4],
+        (double)o.col.aabb[2], (double)o.col.aabb[5],
+        (double)ext[3], (double)ext[4], (double)ext[5]);
   }
   // Impulse consumed every frame (OBSERVED clear order).
   o.animImpulse[2] = 0.0f;

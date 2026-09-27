@@ -2795,11 +2795,36 @@ int main(int argc, char** argv) {
           }
         }
       }
+      const bool colProfFrame =
+          std::getenv("MDK_COL_PROFILE_FRAME") != nullptr;
+      const mdk::CollisionProfile colPrev =
+          colProfFrame ? mdk::collisionProfile() : mdk::CollisionProfile{};
       const auto out =
           mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
       ++framesRun;
       sawEndLevel = sawEndLevel || out.endLevelRequested;
       sawEnding = sawEnding || out.endingRequested;
+      if (colProfFrame) {
+        const mdk::CollisionProfile& cp = mdk::collisionProfile();
+        std::printf(
+            "      col f=%03d stab=+%llu/%llun m1=+%llu/%llun "
+            "sweep=+%llu/%llun/%llup probe=+%llu/%llut "
+            "splash=+%llu falloff=+%llu\n",
+            f,
+            (unsigned long long)(cp.stabCalls - colPrev.stabCalls),
+            (unsigned long long)(cp.stabNodes - colPrev.stabNodes),
+            (unsigned long long)(cp.stabM1Calls - colPrev.stabM1Calls),
+            (unsigned long long)(cp.stabM1Nodes - colPrev.stabM1Nodes),
+            (unsigned long long)(cp.sweepCalls - colPrev.sweepCalls),
+            (unsigned long long)(cp.sweepNodes - colPrev.sweepNodes),
+            (unsigned long long)(cp.sweepPolyTests -
+                                 colPrev.sweepPolyTests),
+            (unsigned long long)(cp.probeCalls - colPrev.probeCalls),
+            (unsigned long long)(cp.probeTris - colPrev.probeTris),
+            (unsigned long long)(cp.splashCalls - colPrev.splashCalls),
+            (unsigned long long)(cp.falloffCalls -
+                                 colPrev.falloffCalls));
+      }
       // Phase 15A — storage census per frame (object-lifetime debug).
       if (!bossNames.empty() && bossNames[0][0] == '*') {
         std::size_t tot = 0;
@@ -3095,7 +3120,10 @@ int main(int argc, char** argv) {
             return (b >= base && b < end) ? b - base : -1;
           };
           std::printf("] pc=%p(+%lx) f230=%p f110=%p f148=%04x dead=%d "
-                      "child=%s\n",
+                      "child=%s f14a=%02x f14b=%02x f14c=%02x "
+                      "f149=%02x vel=(%.2f,%.2f,%.2f) f34=%.2f f38=%.2f "
+                      "t12c=(%.1f,%.1f,%.1f) t120=(%.1f,%.1f,%.1f) "
+                      "fEC=%p f2a0=%d f11a=%02x\n",
                       o.field108,
                       static_cast<unsigned long>(
                           pcOff(o.field108)),
@@ -3103,7 +3131,20 @@ int main(int argc, char** argv) {
                       (unsigned)o.col.flags148,
                       (o.col.flags148 & 0x20) ? 1 : 0,
                       o.field158 ? o.field158->scriptClass.c_str()
-                                 : "-");
+                                 : "-",
+                      (unsigned)o.col.flags14a,
+                      (unsigned)o.col.flags14b,
+                      (unsigned)o.col.flags14c,
+                      (unsigned)o.col.flags149,
+                      (double)o.field28, (double)o.field2c,
+                      (double)o.field30,
+                      (double)o.field34, (double)o.field38,
+                      (double)o.field12c[0], (double)o.field12c[1],
+                      (double)o.field12c[2],
+                      (double)o.field120[0], (double)o.field120[1],
+                      (double)o.field120[2],
+                      o.fieldEC, (int)o.field2a0,
+                      (unsigned)o.field11a);
         }
       }
       for (const auto& r : mdk::traversalSpawnLog())
@@ -3117,6 +3158,26 @@ int main(int argc, char** argv) {
           rt.pendingViewSnap == -1 ? 1 : 0,
           rt.seams.pendingViewSnaps, rt.seams.objectDeathCalls,
           rt.shotHitCount);
+      if (std::getenv("MDK_COL_PROFILE") != nullptr) {
+        const mdk::CollisionProfile& cp = mdk::collisionProfile();
+        std::printf(
+            "  colProfile: stab=%llu/%llun/%llup m1=%llu/%llun "
+            "sweep=%llu/%lluit/%llun/%llup probe=%llu/%llut "
+            "splash=%llu falloff=%llu\n",
+            (unsigned long long)cp.stabCalls,
+            (unsigned long long)cp.stabNodes,
+            (unsigned long long)cp.stabPolyTests,
+            (unsigned long long)cp.stabM1Calls,
+            (unsigned long long)cp.stabM1Nodes,
+            (unsigned long long)cp.sweepCalls,
+            (unsigned long long)cp.sweepIters,
+            (unsigned long long)cp.sweepNodes,
+            (unsigned long long)cp.sweepPolyTests,
+            (unsigned long long)cp.probeCalls,
+            (unsigned long long)cp.probeTris,
+            (unsigned long long)cp.splashCalls,
+            (unsigned long long)cp.falloffCalls);
+      }
     }
     // Bounded checks: gates + at least one grounded frame. Arenas
     // with their own MTO collision blob must also show a collision

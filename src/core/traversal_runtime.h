@@ -294,6 +294,9 @@ struct TraversalSeams {
                                   // debris shard emit (FUN_0041c420
                                   // alloc path); mask+latch lands,
                                   // shard geometry is cosmetic
+  int refEmitCalls = 0;           // op-0x80 (0x43d227) — refpoint
+                                  // emitter attach (FUN_004055f4
+                                  // particle record; cosmetic)
 };
 
 struct TraversalFrameResult {

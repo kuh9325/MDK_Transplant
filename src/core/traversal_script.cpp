@@ -828,23 +828,31 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
     case 0x0c: {                            // standalone rgoto:
       std::uint8_t n = r.u8();              // {u8 n, n×u32} random-pick
       if (!r.ok || n == 0) { fail("rgoto"); return res; }
+      const int pick =                      // n>1: one FUN_00401ed4(n)
+          (n > 1 && env.rt != nullptr)      // draw (OBSERVED 0x43b0fe)
+              ? enemyRandBelow(env.rt->rngState, n)
+              : 0;
       std::uint32_t tgt = 0;
       for (std::uint8_t k = 0; k < n; ++k) {
         std::uint32_t o = r.u32();
-        if (k == 0) tgt = o;                // n=1 deterministic;
-      }                                     // n>1 = rand pick (seam:
-      if (!r.ok) { fail("rgoto offs"); return res; } // rand() not
-      doGoto(tgt);                          // modelled — first entry)
+        if (k == pick) tgt = o;
+      }
+      if (!r.ok) { fail("rgoto offs"); return res; }
+      doGoto(tgt);
       break;
     }
 
     case 0xfc: {                            // standalone rcall:
       std::uint8_t n = r.u8();              // {u8 n, n×u32} random call
       if (!r.ok || n == 0) { fail("rcall"); return res; }
+      const int pick =                      // n>1: one FUN_00401ed4(n)
+          (n > 1 && env.rt != nullptr)      // draw (OBSERVED 0x43b0fe)
+              ? enemyRandBelow(env.rt->rngState, n)
+              : 0;
       std::uint32_t tgt = 0;
       for (std::uint8_t k = 0; k < n; ++k) {
         std::uint32_t o = r.u32();
-        if (k == 0) tgt = o;
+        if (k == pick) tgt = o;
       }
       if (!r.ok) { fail("rcall offs"); return res; }
       if (!doCall(tgt)) return res;
@@ -858,6 +866,14 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       std::uint8_t grp = r.u8(), bit = r.u8();
       if (!r.ok) { fail("bit op"); return res; }
       std::uint32_t& f = resolveFlag(grp, env, ctxSlots(st));
+      static const bool dbgFlag =
+          std::getenv("MDK_TRACE_FLAG") != nullptr;
+      if (dbgFlag)
+        std::fprintf(stderr, "  [fl] arena +%05x op=%02x grp=%d "
+                     "bit=%d arena=%s f=%08x\n",
+                     insnOff, op, grp, bit,
+                     env.selfArena ? env.selfArena->name.c_str() : "-",
+                     (unsigned)f);
       if (op == 0x44) f |= (1u << (bit & 31));
       else f &= ~(1u << (bit & 31));
       break;
@@ -1289,14 +1305,18 @@ struct ObjScriptPass {
     obj.scriptMark[obj.scriptCallDepth] = 0;
     r.pc = target;
   }
-  // Random-pick seam: FUN_00401ed4's RNG is deterministic here —
-  // index 0 / first positive weight, matching the arena VM's rcall
-  // convention.
+  // OBSERVED (0x43b0fe): n>1 consumes one FUN_00401ed4(n) draw —
+  // (rand*n)>>15 — and the picked index's u32 is the target. n<=1
+  // draws nothing and takes index 0.
   std::uint32_t pickList(std::uint8_t n) {
+    const int pick =
+        (n > 1 && env.rt != nullptr)
+            ? enemyRandBelow(env.rt->rngState, n)
+            : 0;
     std::uint32_t tgt = 0;
     for (std::uint8_t k = 0; k < n; ++k) {
       std::uint32_t o = r.u32();
-      if (k == 0) tgt = o;
+      if (k == pick) tgt = o;
     }
     return tgt;
   }
@@ -1364,9 +1384,14 @@ void objScriptInsn(ObjScriptPass& v) {
   if (!r.ok) { v.fail("opcode fetch out of bounds"); return; }
   static const char* traceCls = std::getenv("MDK_TRACE_OBJ");
   if (traceCls != nullptr && obj.scriptClass == traceCls) {
-    std::fprintf(stderr, "    [vm] %s +%05x op=%02x mark=%02x f=%d\n",
+    std::fprintf(stderr, "    [vm] %s +%05x op=%02x mark=%02x f=%d "
+                 "p=(%.1f,%.1f,%.1f) v=(%.1f,%.1f,%.1f) c=%02x\n",
                  obj.scriptClass.c_str(), insnOff, op,
-                 (unsigned)obj.field21e, (int)obj.animFrame);
+                 (unsigned)obj.field21e, (int)obj.animFrame,
+                 (double)obj.pos[0], (double)obj.pos[1],
+                 (double)obj.pos[2], (double)obj.field28,
+                 (double)obj.field2c, (double)obj.field30,
+                 (unsigned)obj.col.flags14c);
   }
 
   switch (op) {
@@ -1590,6 +1615,15 @@ void objScriptInsn(ObjScriptPass& v) {
     if (!r.ok) { v.fail("flagop"); return; }
     std::uint32_t& f = resolveFlag(grp, env, ctx);
     const std::uint32_t m = 1u << (bit & 0x1f);
+    static const bool dbgFlag =
+        std::getenv("MDK_TRACE_FLAG") != nullptr;
+    if (dbgFlag)
+      std::fprintf(stderr, "  [fl] %s +%05x op=%02x grp=%d bit=%d "
+                   "arena=%s f=%08x\n",
+                   obj.scriptClass.c_str(), insnOff, op,
+                   grp, bit,
+                   env.selfArena ? env.selfArena->name.c_str() : "-",
+                   (unsigned)f);
     if (op == 0x44) f |= m;
     else if (op == 0x45) f &= ~m;
     else f ^= m;
@@ -1771,8 +1805,8 @@ void objScriptInsn(ObjScriptPass& v) {
     switch (kind) {                             // FUN_0045ad40
     case 1: cond = dist < va; break;
     case 2: cond = dist > va; break;
-    case 3: cond = dist - 0.05f < va; break;    // C(0x4981cc) = -0.05
-    case 4: cond = dist + 0.05f > va; break;    // C(0x4981c4) = +0.05
+    case 3: cond = dist - 0.05f > va; break;    // C(0x4981cc) = -0.05
+    case 4: cond = dist + 0.05f < va; break;    // C(0x4981c4) = +0.05
     case 5: cond = std::fabs(dist - va) < 0.05f; break;
     case 6: cond = std::fabs(dist - va) >= 0.05f; break;
     case 7: cond = dist >= va && dist <= vb; break;
@@ -1794,7 +1828,7 @@ void objScriptInsn(ObjScriptPass& v) {
     // angle = bearing(camXY - pos) - +0x4c, normalized to [0,180]
     // (+=360 while <0, -=360 while >360, 360-angle when >180); cond =
     // FUN_0045ad40(kind, angle, a, b) — the angle is the comparator's
-    // first stack arg (x), so kind 1 = angle>=a, 2 = angle>a,
+    // first stack arg (x), so kind 1 = angle<a, 2 = angle>a,
     // 3 = angle-0.05>a, 4 = angle+0.05<a, 5 = |angle-a|<0.05,
     // 6 = |angle-a|>=0.05, 7 = a<=angle<=b, 8 = angle<=a||angle>=b.
     const std::uint8_t kind = r.u8();
@@ -1812,7 +1846,7 @@ void objScriptInsn(ObjScriptPass& v) {
       while (ang > 360.0f) ang += -360.0f;
       if (ang > 180.0f) ang = 360.0f - ang;
       switch (kind) {                           // FUN_0045ad40
-      case 1: cond = ang >= va; break;
+      case 1: cond = ang < va; break;
       case 2: cond = ang > va; break;
       case 3: cond = ang - 0.05f > va; break;   // C(0x4981cc) = -0.05
       case 4: cond = ang + 0.05f < va; break;   // C(0x4981c4) = +0.05
@@ -1922,6 +1956,17 @@ void objScriptInsn(ObjScriptPass& v) {
     if (!r.ok) { v.fail("varacc"); return; }
     if (float* slot = resolveVarRef(mode, idx, env, ctx))
       *slot += sc * 0.03333333507180214f;
+    return;
+  }
+  case 0xd9: {                            // stat += u32 (0x44ff04)
+    // {u8 sel, u32 val}. OBSERVED: sel 1 adds val to the
+    // script-incremented counter 0x540e88 (kill/progress stat,
+    // mirrored into the end-of-level stats block); other sels are
+    // consumed but inert.
+    const std::uint8_t sel = r.u8();
+    const std::uint32_t val = r.u32();
+    if (!r.ok) { v.fail("statacc"); return; }
+    if (sel == 1 && env.rt != nullptr) env.rt->fieldE88 += val;
     return;
   }
   case 0xa6: {                            // LOS-to-cmd2 link (0x442a11)
@@ -2684,6 +2729,212 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x73: {                              // forward ray link (0x44ccf8)
+      // {f32 ang, f32 dist, linkage} — OBSERVED: the predicate is
+      // FUN_0045d684: from = +0x10 pos (+4.0 z when +0x148 bit1 —
+      // C(0x498358)); to = from + dist*(cos,sin)(+0x4c + ang) on x/y
+      // (z carried); FUN_00418c60 stabs the bound arena (+0x60) mode
+      // 0 — the same segment query as the camera probe. Hit -> target1
+      // (fe/fc call, fd return, else goto); miss -> fe calls target2,
+      // other modes fall through.
+      const float ang = r.f32(), dist = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("raylink"); return; }
+      const DynamicArena* bound =
+          (obj.arena != nullptr) ? obj.arena
+                                 : (env.currentArena != nullptr
+                                        ? &env.currentArena->dyn
+                                        : nullptr);
+      bool cond = false;
+      if (bound != nullptr) {
+        float sn, cs;
+        sincosDeg(obj.yawDeg + ang, &sn, &cs);   // FUN_00437f98
+        float from[3] = {obj.pos[0], obj.pos[1], obj.pos[2]};
+        if ((obj.col.flags148 & 2) != 0) from[2] += 4.0f;
+        const float to[3] = {from[0] + dist * cs,
+                             from[1] + dist * sn,
+                             from[2]};
+        float hit[3];
+        cond = collisionStab(bound->col, from, to, hit) != nullptr;
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xee: {                              // axis-compare link (0x44565b)
+      // {u8 axis, u8 kind, f32 a, [f32 b if kind==7|8], linkage}.
+      // OBSERVED: axis selects the operand — 0 -> +0x10 (pos.x),
+      // 1 -> +0x14 (pos.y), else -> +0x18 (pos.z); cond =
+      // FUN_0045ad40(axisVal, a, b) with kind in EAX (kind 1 = x<a,
+      // 2 = x>a, 3 = x-0.05>a, 4 = x+0.05<a, 5 = |x-a|<0.05,
+      // 6 = |x-a|>=0.05, 7 = a<=x<=b, 8 = x<=a||x>=b).
+      const std::uint8_t axis = r.u8();
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("axislink"); return; }
+      const float x = (axis == 0) ? obj.pos[0]
+                      : (axis == 1) ? obj.pos[1] : obj.pos[2];
+      bool cond;
+      switch (kind) {                           // FUN_0045ad40
+      case 1: cond = x < va; break;
+      case 2: cond = x > va; break;
+      case 3: cond = x - 0.05f > va; break;     // C(0x4981cc) = -0.05
+      case 4: cond = x + 0.05f < va; break;     // C(0x4981c4) = +0.05
+      case 5: cond = std::fabs(x - va) < 0.05f; break;
+      case 6: cond = std::fabs(x - va) >= 0.05f; break;
+      case 7: cond = x >= va && x <= vb; break;
+      case 8: cond = x <= va || x >= vb; break;
+      default: cond = false; break;
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0x67: {                              // player-box link (0x444f09)
+      // {6×f32, linkage} — OBSERVED: min/max triple compared against
+      // 0x540bfc..0x540c04 (cs.pos, the player chase anchor):
+      // in = min.x<=pos.x<=max.x && min.y<=pos.y<=max.y &&
+      // min.z<=pos.z<=max.z; the linkage fires when the point is in
+      // the box (fe/fc call t1, fd return, else goto; fe miss calls
+      // t2).
+      float b[6];
+      for (int k = 0; k < 6; ++k) b[k] = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("pbox3d"); return; }
+      bool cond = false;
+      if (env.rt != nullptr) {
+        const float* p = env.rt->cs.pos;
+        cond = p[0] >= b[0] && p[0] <= b[3] && p[1] >= b[1] &&
+               p[1] <= b[4] && p[2] >= b[2] && p[2] <= b[5];
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xed: {                              // obj-box link (0x4452b2)
+      // {6×f32, linkage} — OBSERVED: same min/max box test as 0x67 but
+      // anchored on the running object's own +0x10/+0x14/+0x18 (pos),
+      // not the player. in = min<=pos<=max per axis; linkage fires on
+      // in (fe/fc call, fd return-pops +0x248, else goto target —
+      // which also clears +0x26c[callDepth]); fe miss calls t2.
+      float b[6];
+      for (int k = 0; k < 6; ++k) b[k] = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("obox3d"); return; }
+      const float* p = obj.pos;
+      const bool cond = p[0] >= b[0] && p[0] <= b[3] &&
+                        p[1] >= b[1] && p[1] <= b[4] &&
+                        p[2] >= b[2] && p[2] <= b[5];
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xeb: {                            // cam-anchor face (0x4432fa)
+      // {f32 rate, f32 accuracy, f32 fwd, f32 side}. OBSERVED:
+      // pt = camPos - (fwd,side) rotated by the yaw snapshot
+      // (0x54c6c0 <- 0x540c2c player yaw): pt.x = camX - fwd*cs -
+      // side*sn, pt.y = camY - fwd*sn - side*cs; ang =
+      // FUN_00437f30(pt.y-pos.y, pt.x-pos.x) wrapped to [0,360) and
+      // +0x4c normalized the same way; accuracy != 100 adds
+      // (rand(0x14)-10)*(100-accuracy)/(1+dist2d) to ang; then
+      // +0x4c = FUN_0045dc18(ang, +0x4c, rate*(1/30)).
+      const float rate = r.f32(), acc = r.f32();
+      const float fwd = r.f32(), side = r.f32();
+      if (!r.ok) { v.fail("camface"); return; }
+      if (env.rt != nullptr) {
+        const float* cam = env.rt->camera.pose.pos;  // 0x54c6c4..c8
+        float sn, cs;
+        sincosDeg(env.rt->motion.yawDeg, &sn, &cs);  // 0x54c6c0
+        const float px = cam[0] - fwd * cs - side * sn;
+        const float py = cam[1] - fwd * sn - side * cs;
+        const float dx = px - obj.pos[0], dy = py - obj.pos[1];
+        const float dist = std::sqrt(dx * dx + dy * dy); // 0x4301bc
+        float ang = bearingDeg(dy, dx);                  // 0x437f30
+        while (ang < 0.0f) ang += 360.0f;
+        while (ang >= 360.0f) ang += -360.0f;
+        while (obj.yawDeg < 0.0f) obj.yawDeg += 360.0f;
+        while (obj.yawDeg >= 360.0f) obj.yawDeg += -360.0f;
+        if (acc != 100.0f) {
+          ang += static_cast<float>(
+                     enemyRandBelow(env.rt->rngState, 0x14) - 10) *
+                 (100.0f - acc) / (1.0f + dist);
+        }
+        obj.yawDeg = approachAngle5dc18(ang, obj.yawDeg,
+                                        rate * (1.0f / 30.0f));
+      }
+      return;
+    }
+    case 0x5e: {                            // weighted-pick goto (0x43b6e4)
+      // {u8 n, n×{u8 weight, u32 target}} — OBSERVED: weights are
+      // summed, roll = FUN_00401ed4(total) = (rand*total)>>15, then
+      // the pairs are re-walked and the first whose cumulative weight
+      // exceeds the roll wins; the linkage mode is forced to 0x0c —
+      // a plain goto (remaining operands are still consumed).
+      const std::uint8_t n = r.u8();
+      if (!r.ok) { v.fail("wpick"); return; }
+      const std::size_t base = r.pc;
+      int total = 0;
+      for (std::uint8_t k = 0; k < n; ++k) { total += r.u8(); r.u32(); }
+      if (!r.ok) { v.fail("wpick"); return; }
+      int roll = (env.rt != nullptr)
+                     ? enemyRandBelow(env.rt->rngState, total)
+                     : 0;
+      r.pc = base;
+      std::uint32_t tgt = 0;
+      int acc = 0;
+      for (std::uint8_t k = 0; k < n; ++k) {
+        const int w = r.u8();
+        const std::uint32_t o = r.u32();
+        acc += w;
+        if (roll < acc) { tgt = o; roll = 0x7ffffff; }
+      }
+      if (!r.ok) { v.fail("wpick"); return; }
+      v.doGoto(tgt);
+      return;
+    }
+    case 0xe7: {                            // idle-pending link (0x439c47)
+      // {linkage}. OBSERVED: cond = (+0x11e == 0) && (+0x2a0 != 0) —
+      // no active subtype op and a pending mover/anim flag.
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("idlelink"); return; }
+      const bool cond = obj.field11e == 0 && obj.field2a0 != 0;
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
     case 0x7d:                                // clear event stack (0x43bcaa)
       // No operands. OBSERVED: +0x248 = 0 — drops every pending
       // event-call frame.
@@ -3221,6 +3472,19 @@ void objScriptInsn(ObjScriptPass& v) {
       obj.yawDeg += val * (1.0f / 30.0f);
       return;
     }
+    case 0x27: {                            // yaw impulse add (0x441b51)
+      // {varop}. OBSERVED: val = *FUN_00438654(sel,idx) — sel==3 reads
+      // an inline f32 — then FUN_00437f98(+0x4c) gives the yaw dir and
+      // +0x294 += val·cos, +0x298 += val·sin (the root-motion impulse
+      // accumulators consumed by FUN_0045bac0's integration).
+      const float val = resolveVar(r, env, ctx);
+      if (!r.ok) { v.fail("yawimp"); return; }
+      float sn = 0.0f, cs = 0.0f;
+      sincosDeg(obj.yawDeg, &sn, &cs);
+      obj.animImpulse[0] += val * cs;
+      obj.animImpulse[1] += val * sn;
+      return;
+    }
     case 0x59: {                            // sfx bind (0x43a112)
       // {u8 mode, [mode&0x10|0x40 -> 3f32 | mode&0x20 -> u8], lstr sfx}.
       // OBSERVED: the position locals (own +0x10 / literal / refpoint
@@ -3245,6 +3509,31 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       if ((mode & 0x80) != 0 && env.rt != nullptr) {
         ++env.rt->seams.fireSoundCalls;     // FUN_004022b8/402388 seam
+      }
+      return;
+    }
+    case 0x80: {                            // refpoint emitter (0x43d227)
+      // {lstr name, u8 s1, u8 s2}. OBSERVED: gated on the FX-enable
+      // global 0x54150c (cheat-toggled, default on). The name is
+      // strcmp'd against an empty constant (0x4979f8): name=="" AND
+      // s1==s2 releases slot s1 (FUN_00404084 when occupied); any
+      // other combination attaches a particle emitter when the slot
+      // is free — FUN_004055f4(ctx, &ctx->+0x1b0+s1*12, s1, s2)
+      // binds an emitter record to the object's transform at
+      // worldRef[s1] and the handle lands in +0x160[s1]. Emitters
+      // are cosmetic; the port stores a non-zero token so the
+      // occupied/free checks keep original semantics.
+      const std::string nm = r.str();
+      const std::uint8_t s1 = r.u8();
+      const std::uint8_t s2 = r.u8();
+      if (!r.ok) { v.fail("refemit"); return; }
+      if (s1 < 8) {
+        if (nm.empty() && s1 == s2) {
+          obj.field160[s1] = 0;
+        } else if (obj.field160[s1] == 0) {
+          obj.field160[s1] = 0x8000u | (static_cast<std::uint32_t>(s2) << 8) | s1;
+          if (env.rt != nullptr) ++env.rt->seams.refEmitCalls;
+        }
       }
       return;
     }
@@ -3451,6 +3740,31 @@ void objScriptInsn(ObjScriptPass& v) {
       if (dmg == 1) dmg = 5;
       if (env.rt != nullptr && env.rt->fieldE10 <= 0.0f)
         env.rt->vert.landingAccum = static_cast<float>(dmg);
+      return;
+    }
+    case 0xf1: {                            // hp cmp link (0x44deb9)
+      // {u8 kind, f32 a, [f32 b if kind==7|8], linkage}. OBSERVED:
+      // FUN_0045ad40(kind, fild(0x541554)=player health, a, b) — fires
+      // the linkage when the health compare is true.
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      if (!r.ok) { v.fail("hplink"); return; }
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("hplink"); return; }
+      const float hp = (env.rt != nullptr)
+                           ? static_cast<float>(env.rt->fieldHealth)
+                           : 0.0f;
+      const bool cond = cmpOp5ad40(kind, hp, va, vb);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
       return;
     }
     case 0x86: {                            // pitch drift (0x441d58)
@@ -3739,6 +4053,14 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
                           float z, float yaw, std::uint32_t flags,
                           const std::string& cls, const std::string& name,
                           std::uint32_t scriptOff, int variant) {
+  static const bool dbgSpawn =
+      std::getenv("MDK_TRACE_SPAWN") != nullptr;
+  if (dbgSpawn)
+    std::fprintf(stderr,
+                 "  [sp] cls=%s nm=%s v=%d sc=%05x arena=%s rt=%d\n",
+                 cls.c_str(), name.c_str(), variant, scriptOff,
+                 env.selfArena ? env.selfArena->name.c_str() : "-",
+                 env.rt ? 1 : 0);
   if (!env.rt || !env.selfArena) return;
   TraversalRuntime& rt = *env.rt;
   TraversalArena* self = env.selfArena;
@@ -3899,7 +4221,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x08: case 0x10: return "h";         // i16 yaw / u16 health
   case 0x28: case 0x35: case 0x40: case 0x86: case 0xb1: case 0x3a:
   case 0x52: case 0x54: case 0x5b: case 0x32: case 0x33: case 0x34:
-  case 0xa9: case 0xd2:
+  case 0xa9: case 0xd2: case 0x27:
     return "v";
   case 0x5a: return "sf";                   // {lstr name, f32 angle}
   case 0x17: case 0x23: case 0x24: case 0x29: case 0x3f:
@@ -3912,9 +4234,15 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x7b: case 0x0d: case 0x2e:
     return "l";
   case 0x12: return "fl";
+  case 0x73: return "ffl";                    // forward ray link
+  case 0xee: return "bkl";                    // axis-compare link
+  case 0xeb: return "ffff";                   // cam-anchor face
+  case 0x5e: return "p";                      // weighted-pick goto
+  case 0xe7: return "l";                      // idle-pending link
   case 0x0e: return "hbl";                    // {u16,u8,link}
   case 0x5c: return "hl";                     // {u16, linkage}
   case 0x2d: case 0x36: return "kl";
+  case 0xf1: return "kl";                     // hp cmp link
   case 0x2f: return "fl";
   case 0xaf: return "bkl";
   case 0x3e: case 0x7f: return "kl";
@@ -3923,10 +4251,11 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x42: return "bbf"; case 0x04: return "b";
   case 0x02: return "wbbhb";                  // + fff iff mode==0
   case 0xc8: return "ffffl";
-  case 0xec: return "fffl";
+  case 0xec: return "fffl";  case 0xed: return "ffffffl";
   case 0x39: return "hbb";                    // + targets per mode
   case 0xcf: return "ff";                     // + link | ff u8
-  case 0xd8: return "bbw";
+  case 0xd8: return "bbw"; case 0xd9: return "bw";
+  case 0x80: return "sbb";                    // refEmit {lstr,u8,u8}
   case 0x3d: case 0x5f: case 0x84: case 0x1f: case 0x20: case 0x26:
   case 0x81: case 0xac:
     return "b";                               // lead u8 + shaped tail
@@ -3976,11 +4305,12 @@ const char* opcodeName(std::uint8_t op) {
   case 0x6b: return "voiceBind"; case 0x6d: return "dmg";
   case 0x83: return "endlvl/cine";
   case 0x6e: return "teardown"; case 0x7f: return "cmpLink";
-  case 0x86: return "pitchDrift";
+  case 0x86: return "pitchDrift"; case 0xf1: return "hpLink";
   case 0x40: return "wait";   case 0x44: return "bitset";
   case 0x45: return "bitclr"; case 0x46: return "brSet2";
   case 0x47: return "brSet";  case 0x48: return "brClr";
   case 0x60: return "box2d";  case 0x67: return "box3d";
+  case 0xed: return "obox3d";
   case 0x61: return "setObj148"; case 0x62: return "surfop";
   case 0x63: return "surfbind";  case 0xa8: return "surfcfg";
   case 0x0c: return "rgoto";  case 0xfc: return "rcall";
@@ -4002,6 +4332,9 @@ const char* opcodeName(std::uint8_t op) {
   case 0x05: return "gFloat"; case 0x7b: return "ifPartner";
   case 0x0d: return "linkGate"; case 0xe0: return "deflect";
   case 0x0a: return "brObj11a";  case 0x0b: return "setVar11a";
+  case 0x73: return "rayLink";  case 0xee: return "axisLink";
+  case 0xeb: return "camFace";  case 0x5e: return "wpick";
+  case 0xe7: return "idleLink";
   case 0x15: return "pathIdx"; case 0x16: return "markLink";
   case 0x2a: return "namedLink"; case 0x55: return "xformSnap";
   case 0x9a: return "animWait"; case 0xf2: return "orbitBlk";
@@ -4035,13 +4368,13 @@ const char* opcodeName(std::uint8_t op) {
   case 0x21: return "pathLink";
   case 0x12: return "timeLink"; case 0x5c: return "animLink2";
   case 0x82: return "decal";   case 0x84: return "sfxPee";
-  case 0x81: return "elKill";  case 0xac: return "emitAt";
+  case 0x80: return "refEmit"; case 0x81: return "elKill";  case 0xac: return "emitAt";
   case 0x2e: return "mountLink"; case 0x5f: return "wcall";
-  case 0x3d: return "mdlSpawn"; case 0x39: return "coneLink";
+  case 0x27: return "yawImp";  case 0x3d: return "mdlSpawn"; case 0x39: return "coneLink";
   case 0xcf: return "yawMorph"; case 0x1f: return "elemBind";
   case 0x20: return "elemUnmask"; case 0x26: return "velCmp";
   case 0xf3: return "refEsc";
-  case 0xd8: return "varAcc";  case 0x59: return "sfxBind";
+  case 0xd8: return "varAcc";  case 0xd9: return "statAcc";  case 0x59: return "sfxBind";
   case 0x0e: return "viewLink";
   default: return nullptr;
   }
@@ -4104,6 +4437,18 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
       for (std::uint8_t k = 0; k < n; ++k) {
         std::uint32_t o = r.u32();
         std::snprintf(arg, sizeof arg, "->%x", o); text += arg;
+        out.linkTargets.push_back(o);
+      }
+      break;
+    }
+    case 'p': {                              // weighted-pick pairs
+      std::uint8_t n = r.u8();
+      std::snprintf(arg, sizeof arg, " n%u", n); text += arg;
+      for (std::uint8_t k = 0; k < n; ++k) {
+        std::uint8_t w = r.u8();
+        std::uint32_t o = r.u32();
+        std::snprintf(arg, sizeof arg, " w%u->%x", w, o);
+        text += arg;
         out.linkTargets.push_back(o);
       }
       break;
