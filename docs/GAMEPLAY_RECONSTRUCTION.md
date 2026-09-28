@@ -6345,6 +6345,13 @@ hides while mode 2 is live and restores after the handoff.
   `5686edbf38de3fda`/`57bdd179a944a4c9`/`2edeb4aa6c7ef486`),
   freefall c0-c4 (`ba5ffd4ee90e6d10`/`2bdb2d0406748d28`/
   `a2dee1b1ed981475`/`8fa58b04419ad8d8`/`3c5867b3e7901c8c`).
+  Freefall canonical invocation (verified Phase 17A pre-closure —
+  reproduces on both d0f9d84 and later HEADs, repeat runs
+  byte-identical): `mdk-inspect --data-path <installed>
+  --freefall-runtime FALL3D/FALL3D.BNI --course N --skill 1
+  --seed 12648430 --frames 1200` — skill 1 (the canonical skill,
+  not the tool's 0 default), seed 0xC0FFEE; each course runs its
+  natural course and stops at `finished` on frame 1141.
 - Correction folded in: the traversal smoke's `spawn anim table`
   check expected `K_IDLE` — authored in 16B before the 16B.2
   `FUN_00401ed4(100)` reroll port (§204). The seeded post-load roll
