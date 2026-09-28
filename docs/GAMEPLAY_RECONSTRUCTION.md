@@ -6529,3 +6529,192 @@ state-only; enemy-projectile presentation is exercised only where
 a shooter is reachable (not in the L6/L8 spawn view sets).
 
 **TRAVERSAL COMBAT GODOT PRESENTATION: CLOSED FOR BUILD_A**
+
+# Phase 17B — Traversal HUD + Scope Presentation (RE CHECKPOINT)
+
+IMPLEMENTATION STATUS: **NOT STARTED.** This checkpoint records only
+the reverse-engineered BUILD_A contract; `src/core/traversal_hud.h`
+declares the planned API surface and has no implementation file, no
+includers, and no callers. No runtime/gameplay behaviour changed.
+
+GODOT VALIDATION STATUS: **NOT PERFORMED.** One direct
+`Godot --headless --smoke` process started at baseline was found hung
+(3h52m elapsed vs ~1m CPU) and was terminated; a bounded baseline
+smoke must be verified before any Phase 17B Godot-side validation
+claims are made.
+
+All findings below are OBSERVED at instruction level in BUILD_A's
+MDK95.EXE unless marked otherwise (constants re-dumped with the
+AUTO/DGROUP VA->file maps -0x400c00 / -0x401c00).
+
+## 217. Projector modes (OBSERVED — call-site census)
+
+The projector install takes a mode selector:
+
+- mode 0 — standard traversal projection; installed by the
+  per-frame path when `0x5414bc == 0` and by init/menu/camera sites.
+- mode 1 — the scope viewport; the frame driver selects it when
+  `0x5414bc != 0` (`mode = (0x5414bc != 0) ? 1 : 0`). Target rect in
+  fb space: `(108, 80, 384x280)` (composite args `0x49b758/0x49b760`).
+- modes 2/3/4 — the three bullet-cam windows; `FUN_0045ee08` installs
+  `mode = slot + 2` per active shot slot and renders the arena into
+  the shot HUD rects `{72,10,140,70}`, `{228,0,140,70}`,
+  `{384,10,140,70}` — matching the Phase 17A window layout.
+- `FUN_00437660` (scripted secondary camera / flythrough) temporarily
+  runs mode 0 inside a scoped frame; `FUN_0042f310` installs mode 1
+  for the object-showcase path. Normal BUILD_A traversal reachability
+  is established for modes 0–4 via these selectors.
+
+## 218. Scope presentation (OBSERVED)
+
+- Scoped composite: the fb region `(108,80,384,280)` — the mode-1
+  viewport — vs unscoped `(0,0,600,360)` (`0x49b750`).
+- `SNIPERS1` — a verbatim 640x480 indexed image (no header) uploaded
+  to the bezel surface by `FUN_0046c92c`. It composites **under** the
+  fb: fb pixels land on top; the aperture is painted black, not a
+  transparency hole. The fb sits at ~(20,55) in the 640x480 surface
+  (HYPOTHESIS from monitor-aperture alignment, +-1px); the bezel's
+  bottom chin remains exposed below it.
+- Bezel top band has three transparent monitor apertures for the
+  bullet-cam feeds (x0 = 93/249/405, top rows ~60 — aligning with the
+  shot HUD rects once the (20,55) fb offset is applied).
+- `FUN_00436f08` (gate `0x5414d4`): `FUN_00436088` draws CROSS frame 0
+  at (299,219) — the mode-1 viewport centre — then `FUN_0040c7c0`
+  decodes the `SNIPERS2` pen stream over it.
+- Scope gate for the whole tail: `c9c != 0 && ca0 > 1`
+  (rt.flagC9c && rt.transitionPhase > 1). `FUN_0045f030` runs only
+  under it — bullet-cam windows are scope monitors in the original.
+- Deferred: `FUN_00437aa8` per-row zoom-transition warp (cosmetic);
+  `FUN_0041664c`/`FUN_00416700` palette fades.
+
+## 219. HUD pen stream — `FUN_0040c7c0` (OBSERVED)
+
+u16 command stream over the 600-stride fb, cursor from fb top-left:
+
+- `cmd < 0x8000` — literal packet: copy `cmd` **dwords** (4*cmd bytes)
+  verbatim.
+- `cmd & 0x8000`, `cmd>>8 != 0xff` — transparent skip of `cmd & 0xfff`
+  pixels.
+- `cmd == 0xffNN` (NN != 0) — literal NN bytes.
+- `cmd == 0xff00` — end of stream.
+
+SNIPERS2 binds payload+4 (u32 head = stream length field, unconsumed).
+The decoded stream tiles 600x360 exactly — the scoped scanline/dither
+overlay. Single caller: the scoped HUD tail.
+
+`FUN_00418688` builds the 21-entry HUD record table `0x54b434`
+(`{w32,h32,w*h32}` + px ptr `0x54b3e0[i]`) from the name table
+`0x49a7d4` via the `{w16,h16,px@+4}` image reader `FUN_00403a00`:
+`[2]=SC_STAT, [3]=SC_BSTAT, [5]=SNIP_RNG, [6]=SNIP_WEP, [7]=SNIP_TXT,
+[8..13]=SNIP_L1..6, [14..19]=SNIP_W1..6`. CROSS/BOMBTARG/SNIPERGA/
+PICKUPS bind as K_-form sprite tables at payload+4
+(`FUN_004039d8`/`FUN_004039ec` variant); SNIPERS1 binds raw
+(`FUN_004039c8`).
+
+## 220. Health HUD (OBSERVED)
+
+`FUN_00417e20` draws every frame (ungated by scope):
+
+- Mission-timer pie: SC_STAT blit at `(600-w-16, 360-h-10)` =
+  (500,287) for the 84x63 record. The elapsed wedge — angle span
+  `(1 - t/max) * 2PI` between latch `0x5414a8` and current `0x5414a0`,
+  re-stamped only when the delta exceeds `0.017453` rad (1 deg) —
+  stamps SC_BSTAT mask pixels into the SC_STAT working buffer via the
+  FPTAN-slope stamper `FUN_00418378` under the `FUN_004182a0`
+  normalise/split wrapper ([0,2PI) wrap; PI-split constants
+  `0x40490fb1`/`0x40490fdb`).
+- Health digits: `0x541554` centred in the pie at (542,312) via the
+  `FUN_004181c0` centred printer (8px SNIP_TXT column slices, 999 cap).
+- Blink: digits suppressed when `0x540e10 > 0` on odd `0x5414d8`
+  frames, or when health <= 20 on `blinkPhase (0x49a8dc, &0x1f) > 15`.
+- Digit path pre-gate: skipped when `0x541544 != 0 && 0x4999d0 != 0`.
+
+## 221. Weapon / ammo HUD (OBSERVED — scoped tail)
+
+Under `c9c && ca0 > 1 && 0x541492 == 3`:
+
+- zoom% digits at (564,155): `rint(clamp((b58-1)^2 * 1.0519395, 0, 1)
+  * 100)`.
+- SNIP_RNG vertical gauge at x=552: latch `0x49a8e0` tracks
+  `rint(h * zoomfrac)` at +-4/frame; the bottom `latch` rows of the
+  20x88 image blit into window y=176..264.
+- SNIP_WEP frame at (112,304); SNIP_W[i] icons at the `0x49a8ac`/
+  `0x49a8b0` pairs {(0,256),(0,280),(0,300),(4,320),(16,336),(32,344)}
+  gated by `ammo[i]` (slot 0 unconditional); SNIP_L[sel] mark at the
+  `0x49a87c`/`0x49a880` pairs {(12,268),(12,288),(12,308),(20,320),
+  (24,328),(36,336)}; ammo digits centred x=64 y=315 for the selected
+  weapon only (`sel = 0x541616>>24`); slot-0 value -1 suppresses.
+- Inventory FSM `FUN_00469f7c`: per-record slide = `anim +=
+  animVel * (1/30)` with velocity-sign overshoot clamps; `0x541558`
+  re-arms to 60 unscoped, pins 0 while scoped (`c9c || ca0` — icons
+  hidden); border box at (8+48*sel, ~304) +-1px; ~46x46 shade-LUT
+  remap inside (deferred — see material seam). Icons from the PICKUPS
+  K_-table (`id` selects the frame) at `(rint(animX), rint(animY))`;
+  `charges > 1` draws count digits; id-6 count mirrors `ammo[0]`.
+
+## 222. Status HUD (OBSERVED — `FUN_00436f2c` tail)
+
+- Mounted reticle `FUN_0046911c` (gate `0x540e6c != 0 &&
+  (0x540e72 & 4)`, skip when obj `+0x14b & 4`): BOMBTARG at (300,180),
+  CROSS at the reticle pixel channels (rint `0x540d48`/`0x540d4c` —
+  core moveVel/strafeVel), bomb count right-aligned x=472 y=56 in
+  FONTBIG via the `0x498be8` "%d" format.
+- Event bars under `hudActive` + `eventTimer (0x540eb0) > 0`:
+  `w1 = rint(obj->health(+0x08) * 500/900)` clamp [0,500] -> solid
+  rect pen 3; `w2 = rint(obj->healthMirror2a2(+0x2a2, u16) *
+  500/900)` clamp -> hollow outline pen 4; rows y=4..10.
+- `FUN_0041cb44` message flush runs unconditionally (counted seam —
+  the OOT_L%d/status posts land there).
+- SKULL death overlay (outside `hudActive`): `0x541554==0 &&
+  0x540dac>0 && 0x540cac==0x3ea` -> `FUN_00403a40` scaled blit,
+  256x256 -> `dac x dac` centred at (300,180).
+- Mission timer `FUN_0041b654` (the `FUN_00436100` head, gated
+  `0x540e9c == 0`): `0x5414a0 -= 1.0` per call while `a0>0`,
+  `0x541498 != 5`, `0x540d9c == 0` — frame-rate coupled, NOT
+  frameStep-scaled. Expiry: a0 clamps 0, shake magnitude arms >= 5.0
+  (`FUN_00465200`), OOT_L%d status post, `0x540d9b |= 0x20`. No
+  energy drain, no death. Init difficulty-keyed: 40000/54000/36000.
+
+## 223. Muzzle flash (already classified — no Phase 17B work)
+
+K_MUZZF is a K_-form Kurt overlay table (anim-table bind
+`FUN_0046445c`), already bridged (`kurt_snapshot.overlay`) and drawn
+by `KurtLayer` in Phase 17A. Nothing further is required here.
+
+## 224. Material/shade seam (deferred — must not block)
+
+`0x540b20` is a 96KB per-level blend/shade LUT built by
+`FUN_0042b270` (raster-subsystem data, no native core counterpart).
+Its only HUD consumer is the 46x46 darken remap on the selected
+inventory cell. The border box draws; the darken is skipped and
+counted as a seam. This does **not** block the Phase 17B core HUD.
+
+## 225. Corrections to earlier notes
+
+- `0x541498` is the **level id** (progression census `0x4999e8`
+  table), not "weapon-5 charge" — the field comment in
+  `traversal_runtime.h` is stale.
+- `0x540d9b` is a status flag byte (`|= 0x20` on timer expiry); the
+  earlier bit7/'A'-fmt note is dropped as unverified.
+- Event-bar scale is `field * (500.0/900.0)` clamped 500, not the
+  earlier `* 0.0011111111`-only form (the two multiply: `500.0` then
+  `1/900`).
+- `FUN_00469f7c` record stride is 0x24; the visibility timer
+  re-arms to 60 every unscoped frame (icons stay live while records
+  exist) rather than being a pickup-edge timer.
+- Type-4 expired shot slots draw the SNIPERGA gauge animation
+  (`remnantIdx(+0xf4)>>1`, counter +=1/frame capped `2*count-1`) in
+  the window rect — not the pen-3 fill the Phase 17A frontend uses.
+  Non-type-4 expired slots keep the pen fill (3/0x3c/0xf4).
+
+## 226. Bounded implementation contract (when resumed)
+
+Draw order to compose into a 600x360 indexed overlay (pen 0
+transparent): inventory icons/selection -> (scoped) window fills +
+SNIPERGA gauges -> CROSS + SNIPERS2 overlay -> mounted reticle ->
+event bars -> pie/health digits -> scoped tail -> SKULL; the
+FUN_0041cb44 message flush is a counted seam; fade stays above all.
+Bezel under the fb. Existing decoders only: `decodeSpriteTable` /
+`blitFtiSpriteFrame` (K_ tables), the `{w16,h16,px}` image form,
+`drawFtiText`/`measureFtiText` (FONTBIG), active palette via
+`get_active_palette`. No new decoders, no embedded original data.
