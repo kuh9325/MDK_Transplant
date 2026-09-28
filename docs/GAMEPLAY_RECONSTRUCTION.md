@@ -6204,3 +6204,36 @@ native representation, the 0x2bd CHUTEON query polarity, and the
 animFootAlt persistence classification are all OBSERVED +
 implemented with real data; deterministic traces pass on
 LEVEL3–8.
+
+# Phase 16B.2 — Traversal Player Residual Dispatcher Seams (CLOSEOUT)
+
+## 204. Canonical digests after the idle-reroll port
+
+The `FUN_00401ed4(100)` idle reroll (0x540d00 gate, 0x463f37) now draws
+the shared CRT RNG on every eligible idle frame and reposts K_STILL
+(`0x64`, 95%) or K_IDLE (`0x65`, 5%) — the pre-16B.2 canonicals
+(unconditional `0x65`, no draw) are superseded. Expected semantic
+evolution only: all six LEVEL3–8 60f runs report `diag=0`, identical
+digests AND instruction counts across repeated runs, `move=0` (the
+0x540d9c gate never armed — `pendingViewSnap` never went −1) and
+`floor-obj=0` (the carrier scan never hit — ride attach/follow
+unreached). The drift is the reroll's RNG draw + repost stream alone.
+
+New canonical 60f digests (supersede the Phase 16A.1 set):
+
+| level | digest (60f) |
+|---|---|
+| L3 | `25766a67ce50ea46` |
+| L4 | `950219ddeae8b679` |
+| L5 | `2379f7e90204e671` |
+| L6 | `5686edbf38de3fda` |
+| L7 | `57bdd179a944a4c9` |
+| L8 | `2edeb4aa6c7ef486` |
+
+Closeout regression (f52aa5f): mdk_tests 5582/0, CTest 1/1, pytest
+19/0 (canonical Godot binary), selftests 4/4, campaign handoff 5/5,
+campaign sequence `23c84c9f241af58b` unchanged, save-restore +
+write-full `equiv: OK` / `identity=ok`, arena-render 60/60.
+
+**SCRIPTED TAKEOFF / RIDE-FOLLOW / IDLE-REROLL: CLOSED FOR BUILD_A —
+TRAVERSAL PLAYER CORE: CLOSED FOR BUILD_A.**
