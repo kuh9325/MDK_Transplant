@@ -949,6 +949,103 @@ TraversalLoadError traversalRuntimeDiagnosticStart(
   return TraversalLoadError::kOk;
 }
 
+// FUN_0040e958 — the scripted takeoff flight integrator. Runs in
+// place of the whole dispatcher while 0x540da0 != 0 (OBSERVED
+// 0x463998). All constants lifted from BUILD_A .data:
+//   0x4948e4/ec = 236.0/206.0 joystick-channel scales (neg side),
+//   0x4948e8/f0 = 300.0/270.0 channel offsets,
+//   0x4948f4    = 106.0 channel-B scale (positive side),
+//   0x4948fc    = 2.5  spin-channel cap (double),
+//   0x494904    = 3.0  rise-channel boost threshold (double),
+//   0x49490c    = 2.0  extra accel multiplier,
+//   0x494910    = -60.0 pitch base, 0x494914 = 0.5 threshold scale,
+//   0x49491c    = 22.5 pitch step/sec, 0x494924 = 90.0 view-yaw const.
+// The joystick channels (0x4ce740/44) come from FUN_00407ddc's device
+// probe — unmodelled, so they hold 0 and the integer channel targets
+// resolve to the centered-stick constants.
+void takeoffFlightStep(TraversalRuntime& rt, const TraversalArena& cur,
+                       const FrontendTimingState& timing) {
+  ++rt.seams.takeoffInputCalls;              // 0x40e963 FUN_00407ddc
+  const float chanA = 0.0f, chanB = 0.0f;    // 0x4ce740 / 0x4ce744
+  // 0x40e968/0x40e99d/0x40eb87 — the integer channel targets.
+  const int tgtA = static_cast<int>(
+      std::lrint(chanA * 236.0f + 300.0f));            // FUN_0047d59a
+  int tgtB = 0x10e;                                    // chanB == 0
+  if (chanB > 0.0f) {
+    tgtB = static_cast<int>(std::lrint(chanB * 106.0f + 270.0f));
+  } else if (chanB < 0.0f) {
+    tgtB = static_cast<int>(std::lrint(chanB * 206.0f + 270.0f));
+  }
+  // 0x40e9b7 — the 0x540c4c/50 blit anchors smooth 7:1 toward the
+  // targets, once per frameStep tick (int math, arithmetic shifts).
+  for (int i = 0; i < timing.frameStep; ++i) {
+    rt.animAnchorX = (rt.animAnchorX * 7 + tgtA) >> 3;
+    rt.animAnchorY = (rt.animAnchorY * 7 + tgtB) >> 3;
+  }
+  // 0x40e9fc — the spin channel (d48/moveVel) ramps while below the
+  // 2.5 cap. fcomp against the DOUBLE 2.5.
+  if ((double)rt.motion.moveVel < 2.5)
+    rt.motion.moveVel = (float)((double)rt.motion.moveVel +
+                                (double)rt.takeoffSpinRate *
+                                    (double)timing.smoothed);
+  // 0x40ea25 — rise accel: step = 0x49a058 * frameStepF; the rise
+  // channel (d50/turnVel) integrates into pos.z and the altitude
+  // tracker (0x49a050) by the same d50*f0 product.
+  const float riseStep =
+      rt.takeoffRiseAccel * timing.smoothed;           // ebp-0x18
+  rt.motion.turnVel += riseStep;                       // d50 += step
+  const float dz = rt.motion.turnVel * timing.smoothed;
+  rt.cs.pos[2] += dz;                                  // 0x540c04
+  rt.takeoffAlt += dz;                                 // 0x49a050
+  // 0x40ea61 — past the 3.0 threshold the rise channel gains the
+  // extra accel and the pitch sweep toward (-60 - cur->462) * 0.5
+  // runs; the whiteout counter only advances once the sweep has
+  // settled at that threshold.
+  if ((double)rt.motion.turnVel > 3.0) {
+    rt.motion.turnVel += riseStep * 2.0f;              // 0x40ea7f
+    const double pitchThresh =
+        (-60.0 - (double)cur.scalar) * 0.5;            // ebp-0x44
+    const double pitchNow = (double)rt.look.lookPitchOffset;
+    if (pitchNow <= pitchThresh) {
+      // 0x40eb98 — pitch settled: 0x49a65c += frameStep*8, the
+      // palette blends toward white (cosmetic), and the exit latch
+      // sets once the counter passes 300.
+      rt.takeoffWhiteout += timing.frameStep * 8;
+      ++rt.seams.takeoffPaletteCalls;        // FUN_0046d208 upload
+      if (rt.takeoffWhiteout > 0x12c) rt.takeoffDone = 1;
+    } else {
+      // 0x40eaba — sweep the pitch offset down by tick*22.5; on the
+      // crossing frame the whiteout counter restarts and the palette
+      // source snapshots, then d58 clamps to the threshold.
+      const double stepped = pitchNow - (double)timing.deltaSec * 22.5;
+      rt.look.lookPitchOffset = (float)stepped;
+      if (stepped <= pitchThresh) {
+        rt.takeoffWhiteout = 0;
+        ++rt.seams.takeoffPaletteCalls;      // FUN_0046d614 snapshot
+        rt.look.lookPitchOffset = (float)pitchThresh;
+      }
+    }
+  }
+  // 0x40eb06 — the yaw unwinds by the spin channel, the view yaw
+  // mirrors 90 - yaw, and the horizontal position rotates around the
+  // arm-time seed point (FUN_00437f98 sin/cos of d48).
+  const double spinRad =
+      (double)rt.motion.moveVel * (3.141592653589793 / 180.0);
+  const float s = (float)std::sin(spinRad);            // ebp-0x20
+  const float c = (float)std::cos(spinRad);            // ebp-0x1c
+  const double yawNew =
+      (double)rt.motion.yawDeg - (double)rt.motion.moveVel;
+  rt.motion.yawDeg = (float)yawNew;                    // c2c -= d48
+  rt.view.viewYawDeg =
+      (float)(90.0 - yawNew);                          // b50 = 90 - c2c
+  const double dx = (double)rt.cs.pos[0] - (double)rt.takeoffSeed[0];
+  const double dy = (double)rt.cs.pos[1] - (double)rt.takeoffSeed[1];
+  rt.cs.pos[0] = (float)((double)rt.takeoffSeed[0] + dx * (double)c -
+                        dy * (double)s);
+  rt.cs.pos[1] = (float)((double)rt.takeoffSeed[1] + dy * (double)c +
+                        dx * (double)s);
+}
+
 // ---------------------------------------------------------------------------
 // One traversal frame — FUN_00436100's traversal-active section.
 // ---------------------------------------------------------------------------
@@ -995,336 +1092,409 @@ TraversalFrameResult stepTraversalRuntime(
 
   // FUN_00437e80 (frontend) + FUN_0042534 stream-drain — seams.
   // ======================= player dispatch (FUN_00463608) =========
-  // OBSERVED dispatch head (0x463608): the pending-event slots
-  // 0x54cb00/0x54cb08 are cleared every frame; the current event
-  // priority 0x540cbc is reset while the dispatched state sits in
-  // the transient set {300, 400, 500, 600, 601}.
-  rt.eventType = 0;
-  rt.eventMag = 0;
-  if (rt.locoState == 300 || rt.locoState == 400 ||
-      rt.locoState == 500 || rt.locoState == 600 ||
-      rt.locoState == 601)
-    rt.eventPriority = 0;
-
-  // OBSERVED (0x463608): the dispatch picks ONE branch per frame —
-  // mounted object (e6c && +0x14b&2) > sniper (c9c) > unscoped
-  // (cac >= 800 scripted, else the FUN_00465228 normal path).
-  const bool mounted = rt.cs.excludeObj != nullptr &&
-                       (rt.cs.excludeObj->flags14b & 0x02) != 0;
+  // OBSERVED dispatch head (0x463616): 0x540e68 plus the scratch
+  // slots 0x54cb04/0x540cc4 clear EVERY frame — before the da0 gate;
+  // the pending-event pair 0x54cb00/0x54cb08 clears only on the
+  // normal path (the takeoff path keeps whatever was posted).
+  rt.cs.lastObjContact = nullptr;                  // 0x540e68 = 0
+  // The collision layer's ride-dismount edge is FUN_00461878 —
+  // runtime-scoped (it resets the scope + idle state), so the hook
+  // rebinds to this runtime each frame.
+  rt.cs.dismountHook = [&rt](CollisionState&) { sniperReset(rt); };
   PlayerMotionOutput mo{};
   PlayerVerticalFrame vf{};
   float appliedZ = 0.0f;
   bool positionChanged = false;
-
-  // The shared vertical environment — the sniper's gravity-only call
-  // (FUN_00467180) and the normal/scripted jump+gravity (FUN_00466740)
-  // both read it. vec/cvec hold the ribbon-query out-vectors and must
-  // outlive the calls below (ribbonVelZ points into them).
-  float vec[3] = {0, 0, rt.vert.vertVel};
-  float cvec[3] = {0, 0, rt.vert.vertVel};
-  const auto makeVertEnv = [&](bool moveConsumed) {
-    PlayerVerticalEnvironment ve;
-    ve.smoothed = timing.smoothed;
-    ve.deltaSeconds = dt;
-    ve.frameStep = timing.frameStep;
-    ve.jumpHeld = rt.prevFrame.jump != 0;
-    ve.moveConsumed = moveConsumed;
-    ve.locoState = rt.locoState;
-    ve.eventWordType = rt.eventType;
-    ve.vertEnable = rt.vertEnable;   // 0x540c6c — set at traversal init
-    ve.slideMode = rt.slideChannel != 0;
-    ve.sharedGateE6C = rt.cs.excludeObj != nullptr;
-    // 0x540e72 = byte2 of the e70 mount-class dword; bit1 silences the
-    // hard-landing flash (set for class 2/XSNOWB, e70 = 0x20002).
-    ve.flagE72bit1 = ((rt.mountClass >> 16) & 2) != 0;
-    ve.carrierObj = rt.cs.carrier != nullptr;
-    ve.carrierCheckGate = rt.cs.carrierBusy != 0;
-    // FUN_00412e94(player,1,&pos,&vec) — real type-7 volume query.
-    const bool inRibbon =
-        surfaceVolumeQuery(cur->surface, 1, rt.cs.pos, dt, vec) != 0;
-    ve.insideRibbonVolume = inRibbon;
-    ve.ribbonVelZ = inRibbon ? &vec[2] : nullptr;
-    if (ve.carrierObj && !ve.carrierCheckGate && rt.partner &&
-        rt.partnerActive) {
-      ve.carrierInsideRibbonVolume = surfaceVolumeQuery(
-          rt.partner->surface, 1, rt.cs.pos, dt, cvec) != 0;
-    }
-    ve.slideVec = nullptr;   // FUN_0046603c's leftover — deferred
-    ve.deepFloorZ = cur->dyn.col.deepFloorZ;
-    return ve;
-  };
-
-  if (mounted) {
-    // 0x463a6a — the mounted-class dispatch (byte2 of the e70 dword).
-    // The per-class update is self-contained; no normal vertical/look.
-    playerReticleDispatchMounted(rt, raw, bindings, rt.prevFrame,
-                                 timing.smoothed, dt, timing.frameStep);
-  } else if (rt.flagC9c != 0) {
-    // 0x463ad7 — the sniper branch.
-    if (rt.transitionPhase == 0) {
-      // 0x463ae9 — ca0==0 (scope-in pending): the semantic channels
-      // are cleared; the sniper core stays idle until ca0 != 0.
-      rt.motion.moveVel = 0.0f;
-      rt.motion.strafeVel = 0.0f;
-      rt.motion.turnVel = 0.0f;
-      rt.motion.zoomChannel = 0.0f;
-    } else {
-      // 0x463b06 — FUN_00464624 (gravity-only vertical + the lateral
-      // sweep + aim + zoom), then the FUN_00469b98 weapon-select seam.
-      // The gravity frame / applied Z / lateral move are surfaced so the
-      // out-diagnostics match the normal branch's reporting.
-      const PlayerVerticalEnvironment sEnv = makeVertEnv(false);
-      sniperCoreUpdate(rt, raw, bindings, rt.prevFrame, sEnv,
-                       timing.smoothed, &vf, &appliedZ, &positionChanged);
-      playerWeaponSelect(rt, rt.prevFrame);   // FUN_00469b98
-    }
+  if (rt.fieldDa0 != 0) {
+    // 0x463998 — da0 latched: the whole dispatcher short-circuits to
+    // FUN_0040e958 (the scripted takeoff flight) and returns — the
+    // event clears, branch dispatch, prevFrame commit, and every
+    // tail below are all skipped on this path.
+    takeoffFlightStep(rt, *cur, timing);
   } else {
-    // Unscoped + unmounted — the >=800 scripted branch or the
-    // FUN_00465228 normal path.
-    const bool scripted = rt.locoState >= 0x320;
-    PlayerMotionEnvironment motionEnv;
-    motionEnv.smoothed = timing.smoothed;
-    motionEnv.masterGate = rt.masterMoveGate;
-    motionEnv.groundContact = rt.vert.contactObj != 0;
-    motionEnv.lowFriction =
-        rt.vert.contactObj != 0 && rt.lastContactPoly != nullptr &&
-        (rt.lastContactPoly->flags & 4) != 0;
-    motionEnv.moveBlocked =
-        rt.vert.moveBlocker0 != 0 && rt.vert.moveBlockerFlag != 0;
-    // Conveyor contribution — FUN_00412ef0 on the standing surface.
-    float conv[3] = {0, 0, 0};
-    if (rt.lastContactPoly)
-      surfaceConveyorDelta(cur->surface, rt.lastContactPoly, dt, conv);
-    motionEnv.conveyorX = conv[0];
-    motionEnv.conveyorY = conv[1];
-    motionEnv.conveyorZ = conv[2];
+    // OBSERVED dispatch head (0x463638): the pending-event slots
+    // 0x54cb00/0x54cb08 are cleared every frame; the current event
+    // priority 0x540cbc is reset while the dispatched state sits in
+    // the transient set {300, 400, 500, 600, 601}.
+    rt.eventType = 0;
+    rt.eventMag = 0;
+    if (rt.locoState == 300 || rt.locoState == 400 ||
+        rt.locoState == 500 || rt.locoState == 600 ||
+        rt.locoState == 601)
+      rt.eventPriority = 0;
 
-    if (!scripted) {
-      mo = integratePlayerMotion(rt.prevFrame, motionEnv, rt.motion);
-      // Horizontal collision — FUN_004630d4(disp, scale 0.75).
-      const float preX = rt.cs.pos[0], preY = rt.cs.pos[1],
-                  preZ = rt.cs.pos[2];
-      const CollisionPoly* hContact = collisionApply(
-          rt.cs, mo.dispX, mo.dispY, mo.dispZ, 0.75f, nullptr, nullptr);
-      positionChanged = rt.cs.pos[0] != preX || rt.cs.pos[1] != preY ||
-                        rt.cs.pos[2] != preZ;
-      playerMotionPostStep(motionEnv, positionChanged, rt.motion, mo);
-      // 0x540e4c — every apply's EAX is stored (0 clears).
-      rt.vert.contactObj = asToken(hContact);
-      rt.lastContactPoly = hContact;
-      // The motion post feeds the shared pending slots (cb00/cb08).
-      if (mo.eventMag != 0) {
-        rt.eventType = mo.eventType;
-        rt.eventMag = mo.eventMag;
+    // OBSERVED (0x463608): the dispatch picks ONE branch per frame —
+    // mounted object (e6c && +0x14b&2) > sniper (c9c) > unscoped
+    // (cac >= 800 scripted, else the FUN_00465228 normal path).
+    const bool mounted = rt.cs.excludeObj != nullptr &&
+                         (rt.cs.excludeObj->flags14b & 0x02) != 0;
+
+    // The shared vertical environment — the sniper's gravity-only call
+    // (FUN_00467180) and the normal/scripted jump+gravity (FUN_00466740)
+    // both read it. vec/cvec hold the ribbon-query out-vectors and must
+    // outlive the calls below (ribbonVelZ points into them).
+    float vec[3] = {0, 0, rt.vert.vertVel};
+    float cvec[3] = {0, 0, rt.vert.vertVel};
+    const auto makeVertEnv = [&](bool moveConsumed) {
+      PlayerVerticalEnvironment ve;
+      ve.smoothed = timing.smoothed;
+      ve.deltaSeconds = dt;
+      ve.frameStep = timing.frameStep;
+      ve.jumpHeld = rt.prevFrame.jump != 0;
+      ve.moveConsumed = moveConsumed;
+      ve.locoState = rt.locoState;
+      ve.eventWordType = rt.eventType;
+      ve.vertEnable = rt.vertEnable;   // 0x540c6c — set at traversal init
+      ve.slideMode = rt.slideChannel != 0;
+      ve.sharedGateE6C = rt.cs.excludeObj != nullptr;
+      // 0x540e72 = byte2 of the e70 mount-class dword; bit1 silences the
+      // hard-landing flash (set for class 2/XSNOWB, e70 = 0x20002).
+      ve.flagE72bit1 = ((rt.mountClass >> 16) & 2) != 0;
+      ve.carrierObj = rt.cs.carrier != nullptr;
+      ve.carrierCheckGate = rt.cs.carrierBusy != 0;
+      // FUN_00412e94(player,1,&pos,&vec) — real type-7 volume query.
+      const bool inRibbon =
+          surfaceVolumeQuery(cur->surface, 1, rt.cs.pos, dt, vec) != 0;
+      ve.insideRibbonVolume = inRibbon;
+      ve.ribbonVelZ = inRibbon ? &vec[2] : nullptr;
+      if (ve.carrierObj && !ve.carrierCheckGate && rt.partner &&
+          rt.partnerActive) {
+        ve.carrierInsideRibbonVolume = surfaceVolumeQuery(
+            rt.partner->surface, 1, rt.cs.pos, dt, cvec) != 0;
       }
-    } else {
-      // OBSERVED scripted-branch write (0x463705..): the semantic
-      // channels d48/d4c/d50/d54 are cleared to e6c (= 0 unmounted).
-      rt.motion.moveVel = 0.0f;
-      rt.motion.strafeVel = 0.0f;
-      rt.motion.turnVel = 0.0f;
-      rt.motion.zoomChannel = 0.0f;
-    }
+      ve.slideVec = nullptr;   // FUN_0046603c's leftover — deferred
+      ve.deepFloorZ = cur->dyn.col.deepFloorZ;
+      return ve;
+    };
 
-    // SEAM: FUN_0046603c slide helper — runs on both branches.
-    ++rt.seams.slideHelperCalls;
-
-    // ------------------------- vertical --------------------------
-    const PlayerVerticalEnvironment vertEnv =
-        makeVertEnv(mo.moveConsumed);
-    rt.vert.posX = rt.cs.pos[0];
-    rt.vert.posY = rt.cs.pos[1];
-    rt.vert.posZ = rt.cs.pos[2];
-    vf = integratePlayerVertical(vertEnv, rt.motion, rt.vert);
-    if (vf.collisionIssued) {
-      const CollisionPoly* vContact = playerVerticalApplyCollision(
-          vertEnv, rt.cs, rt.motion, rt.vert, vf, &appliedZ);
-      if (vContact) rt.lastContactPoly = vContact;
-    }
-    playerVerticalPostStep(vertEnv, rt.vert);
-    rt.vert.posX = rt.cs.pos[0];
-    rt.vert.posY = rt.cs.pos[1];
-    rt.vert.posZ = rt.cs.pos[2];
-    // The vertical post overwrites the pending slots — OBSERVED
-    // producer order inside FUN_00465228 (motion events, then
-    // FUN_00466740's jump/landing events, then the look integrator).
-    if (vf.eventMag != 0) {
-      rt.eventType = vf.eventType;
-      rt.eventMag = vf.eventMag;
-    }
-    if (vf.deepFloorReset) ++rt.seams.deepFloorFallbacks;
-    if (mo.forwardIntent) ++rt.seams.mantleCalls;
-
-    // FUN_00465c4c — the semantic look integrator; runs after the jump
-    // machine on both dispatch branches (N-1 merged look controls).
-    PlayerLookEnvironment lookEnv;
-    lookEnv.deltaSeconds = dt;
-    lookEnv.arenaScalar = cur->scalar;
-    lookEnv.eventPriority = rt.eventPriority;
-    lookEnv.locoState = rt.locoState;
-    lookEnv.vertVelZero = rt.vert.vertVel == 0.0f;
-    lookEnv.grounded = (rt.vert.contactFlags & 1) != 0;
-    const PlayerLookFrame lk =
-        integratePlayerLook(rt.prevFrame, lookEnv, rt.look);
-    if (lk.eventPosted) {
-      rt.eventType = kLookEventPri;
-      rt.eventMag = kLookEventCode;
-    }
-
-    if (!scripted) {
-      // FUN_00465228 tail — itemUse (ce774) seam, then the sniper
-      // entry, then the normal-fire latch (a deferred seam).
-      if (rt.prevFrame.itemUse != 0) ++rt.seams.itemUseCalls;
-      if (rt.prevFrame.sniperPulse != 0 && rt.eventPriority < 8 &&
-          rt.eventType < 8) {
-        // eligibility: c6c == 0 -> free; else vertVel == +-0 &&
-        // grounded && no dying-surface record under the contact.
-        const bool eligible =
-            !rt.vertEnable ||
-            (rt.vert.vertVel == 0.0f &&
-             (rt.vert.contactFlags & 1) != 0 &&
-             !sniperDyingSurface(rt, rt.lastContactPoly));
-        if (eligible) {
-          rt.fieldC74 = 0;
-          ++rt.seams.hudEventCalls;   // FUN_00469668(0)
-          rt.flagC9c = 1;
-          rt.transitionPhase = 0;
-          rt.motion.moveVel = 0.0f;
-          rt.motion.strafeVel = 0.0f;
-          rt.motion.turnVel = 0.0f;
-          rt.motion.zoomChannel = 0.0f;
-          rt.eventMag = 0x323;
-          rt.eventType = 8;
-        }
-      }
-      // normal-fire latch (0x465717+) — FUN_00465228's tail: the
-      // 0x540c74 punch gate + the 0x12c/0x259 fire anim event.
-      playerFireLatch(rt, rt.prevFrame);
-      ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
-      playerReticleMountScan(rt);   // the mount-scan + class entry
-    } else {
-      ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
-    }
-  }
-
-  // Commit the N+1 merge — the latency hand-off (FUN_00406f14 runs
-  // at dispatch end in the original, before the tail below).
-  rt.prevFrame = nextFrame;
-
-  // OBSERVED (0x4637f1..0x46382b): the death tail. While the health
-  // gate is off and health is zero the dispatch clears the 0x4ce6e0
-  // control block (FUN_0047d20a, 0xd0 bytes — the semantic input the
-  // rest of the frame consumes; the committed prevFrame is the port's
-  // equivalent) and runs the 0x540eb8 death-fade countdown: armed at
-  // 0xf0 on the first dead frame, then -frameStep per frame with an
-  // extra -0x1e whenever pos.z >= 0x540c10 (the prev-frame z commit —
-  // the countdown accelerates once the body stops descending), floored
-  // at 1. eb8 == 1 is the alternate fade gate below — it engages even
-  // when the tumble post was suppressed (mounted/vertSkip death).
-  if (rt.fieldHealthGate == 0 && rt.fieldHealth == 0) {
-    rt.prevFrame = GameplayInputFrame{};
-    if (rt.fieldEb8 == 0) {
-      rt.fieldEb8 = 0xf0;
-    } else {
-      rt.fieldEb8 -= timing.frameStep;
-      if (rt.fieldEb8 < 0xd2 && rt.cs.entryPos[2] <= rt.cs.pos[2])
-        rt.fieldEb8 -= 0x1e;
-      if (rt.fieldEb8 < 1) rt.fieldEb8 = 1;
-    }
-  }
-  ++rt.seams.hudIndicatorCalls;  // FUN_004696d8 (0x46382c) — HUD
-                               // indicator-object scan seam
-
-  // Dispatcher tail (OBSERVED 0x4638xx): with no latched event and
-  // no post this frame, the idle restore posts the idle state —
-  // code 0x65 on the unmounted path (the 100 variant needs the
-  // mount/mounted-idle path — deferred). Then the priority latch
-  // adopts the frame's winning event.
-  if (rt.eventPriority == 0 && rt.eventType == 0) {
-    rt.eventType = 1;
-    rt.eventMag = 0x65;
-  }
-
-  // OBSERVED (0x46387a..0x46422f) — the damage/death dispatcher.
-  // cac == 0x3ea or eb8 == 1 is the death-fade branch: the original
-  // accumulates 0x540dac and, past 255, runs the LASTGAME teardown —
-  // that route is the session-level Phase 14B progressionStepDeath;
-  // inside the dispatch the branch skips the tumble evaluation AND
-  // the accumulator/suppress-window decays entirely.
-  if (rt.locoState != 0x3ea && rt.fieldEb8 != 1) {
-    const bool dead = rt.fieldHealthGate == 0 && rt.fieldHealth == 0;
-    if (dead) rt.vert.landingAccum = 5.0f;      // 0x463f93 force
-    // Eligibility (0x463f9d): the accumulator must hold >= 5.0f
-    // (integer compare on the float bits) AND the player must be
-    // unmounted (0x540e6c == 0) with the vertical integrator running
-    // (0x540c7c == 0).
-    bool eligible = false;
-    if (std::bit_cast<std::int32_t>(rt.vert.landingAccum) >=
-        0x40a00000)                                // JGE — signed
-      eligible = rt.vert.vertSkip == 0 && rt.cs.excludeObj == nullptr;
-    if (eligible) {
-      bool post;
-      if (rt.vert.vertVel == 0.0f &&
-          (rt.vert.contactFlags & 1) != 0) {
-        post = true;        // stationary + grounded — post directly
+    if (mounted) {
+      // 0x463a6a — the mounted-class dispatch (byte2 of the e70 dword).
+      // The per-class update is self-contained; no normal vertical/look.
+      playerReticleDispatchMounted(rt, raw, bindings, rt.prevFrame,
+                                   timing.smoothed, dt, timing.frameStep);
+    } else if (rt.flagC9c != 0) {
+      // 0x463ad7 — the sniper branch.
+      if (rt.transitionPhase == 0) {
+        // 0x463ae9 — ca0==0 (scope-in pending): the semantic channels
+        // are cleared; the sniper core stays idle until ca0 != 0.
+        rt.motion.moveVel = 0.0f;
+        rt.motion.strafeVel = 0.0f;
+        rt.motion.turnVel = 0.0f;
+        rt.motion.zoomChannel = 0.0f;
       } else {
-        // 0x463fd7 — airborne/moving: a 13-unit downward stab at the
-        // player pos decides (0x4986d8 = -13.0f). A hit means the
-        // floor is just below: the fall speed is clamped to -64.0
-        // (0x4986e0 gate) and the post still runs; a miss suppresses
-        // the tumble outright.
-        const float end[3] = {rt.cs.pos[0], rt.cs.pos[1],
-                              rt.cs.pos[2] - 13.0f};
-        float hitPt[3] = {0.0f, 0.0f, 0.0f};
-        post = rt.cs.arena != nullptr &&
-               collisionStab(*rt.cs.arena, rt.cs.pos, end, hitPt) !=
-                   nullptr;
-        if (post && rt.vert.vertVel > -64.0) rt.vert.vertVel = -64.0f;
+        // 0x463b06 — FUN_00464624 (gravity-only vertical + the lateral
+        // sweep + aim + zoom), then the FUN_00469b98 weapon-select seam.
+        // The gravity frame / applied Z / lateral move are surfaced so the
+        // out-diagnostics match the normal branch's reporting.
+        const PlayerVerticalEnvironment sEnv = makeVertEnv(false);
+        sniperCoreUpdate(rt, raw, bindings, rt.prevFrame, sEnv,
+                         timing.smoothed, &vf, &appliedZ, &positionChanged);
+        playerWeaponSelect(rt, rt.prevFrame);   // FUN_00469b98
       }
-      if (post) {
-        // 0x46412c: unscope (FUN_00461878), release the scope overlay
-        // latch (FUN_00416700), then post — death {10,0x3ea} beats the
-        // tumble {9,0x385} through the latch below.
-        if (rt.flagC9c != 0) sniperReset(rt);
-        if (rt.scopeAnimLatch != 0) {
-          ++rt.seams.scopeOverlayCalls;
-          rt.scopeAnimLatch = 0;
-        }
-        if (dead) {
-          rt.eventMag = 0x3ea;          // 0x464202 (0x49b284 demo
-          rt.eventType = 10;            //   path has no writer)
-        } else {
-          rt.eventMag = 0x385;          // 0x46421a
-          rt.eventType = 9;
-        }
-        rt.look.lookPitchOffset = 0.0f; // d58 = 0
-        rt.vert.landingAccum = 0.0f;
-        rt.fieldE10 = 3.0f;             // suppress window arms 3.0
-        if (rt.fieldC74 != 0) {         // 0x4641c2 — fire latch kill +
-          rt.fieldC74 = 0;              //   FUN_00469668(0, 3.0f): both
-          rt.seams.hudEventCalls += 2;  //   0x54c5e0/e4 HUD pushes
-        }
-      }
-    }
-    // 0x464016..0x464045 — the accumulator decay tail runs on every
-    // non-fade dispatch: >5.0f clamps to 5.0f first, then d5c decays
-    // by the fixed tick * 0x4986e8 (2.0) — i.e. 2.0/second — while >0.
-    if (std::bit_cast<std::int32_t>(rt.vert.landingAccum) <=
-        0x40a00000) {                              // JLE — signed
-      if (rt.vert.landingAccum > 0.0f)
-        rt.vert.landingAccum -= (1.0f / 30.0f) * 2.0f;
     } else {
-      rt.vert.landingAccum = 5.0f - (1.0f / 30.0f) * 2.0f;
-    }
-    // 0x464048 — the suppress window decays by the fixed 1/30 tick in
-    // the same tail (moved here from the traversal-active section:
-    // the original runs it inside the dispatch, before the latch).
-    if (rt.fieldE10 > 0.0f) rt.fieldE10 -= 1.0f / 30.0f;
-  }
+      // Unscoped + unmounted — the >=800 scripted branch or the
+      // FUN_00465228 normal path.
+      const bool scripted = rt.locoState >= 0x320;
+      PlayerMotionEnvironment motionEnv;
+      motionEnv.smoothed = timing.smoothed;
+      motionEnv.masterGate = rt.masterMoveGate;
+      motionEnv.groundContact = rt.vert.contactObj != 0;
+      motionEnv.lowFriction =
+          rt.vert.contactObj != 0 && rt.lastContactPoly != nullptr &&
+          (rt.lastContactPoly->flags & 4) != 0;
+      motionEnv.moveBlocked =
+          rt.vert.moveBlocker0 != 0 && rt.vert.moveBlockerFlag != 0;
+      // Conveyor contribution — FUN_00412ef0 on the standing surface.
+      float conv[3] = {0, 0, 0};
+      if (rt.lastContactPoly)
+        surfaceConveyorDelta(cur->surface, rt.lastContactPoly, dt, conv);
+      motionEnv.conveyorX = conv[0];
+      motionEnv.conveyorY = conv[1];
+      motionEnv.conveyorZ = conv[2];
 
-  if (rt.eventPriority < rt.eventType) {
-    rt.locoState = rt.eventMag;
-    rt.eventPriority = rt.eventType;
+      if (!scripted) {
+        mo = integratePlayerMotion(rt.prevFrame, motionEnv, rt.motion);
+        // Horizontal collision — FUN_004630d4(disp, scale 0.75).
+        const float preX = rt.cs.pos[0], preY = rt.cs.pos[1],
+                    preZ = rt.cs.pos[2];
+        const CollisionPoly* hContact = collisionApply(
+            rt.cs, mo.dispX, mo.dispY, mo.dispZ, 0.75f, nullptr, nullptr);
+        positionChanged = rt.cs.pos[0] != preX || rt.cs.pos[1] != preY ||
+                          rt.cs.pos[2] != preZ;
+        playerMotionPostStep(motionEnv, positionChanged, rt.motion, mo);
+        // 0x540e4c — every apply's EAX is stored (0 clears).
+        rt.vert.contactObj = asToken(hContact);
+        rt.lastContactPoly = hContact;
+        // The motion post feeds the shared pending slots (cb00/cb08).
+        if (mo.eventMag != 0) {
+          rt.eventType = mo.eventType;
+          rt.eventMag = mo.eventMag;
+        }
+      } else {
+        // OBSERVED scripted-branch write (0x463705..): the semantic
+        // channels d48/d4c/d50/d54 are cleared to e6c (= 0 unmounted).
+        rt.motion.moveVel = 0.0f;
+        rt.motion.strafeVel = 0.0f;
+        rt.motion.turnVel = 0.0f;
+        rt.motion.zoomChannel = 0.0f;
+      }
+
+      // SEAM: FUN_0046603c slide helper — runs on both branches.
+      ++rt.seams.slideHelperCalls;
+
+      // ------------------------- vertical --------------------------
+      const PlayerVerticalEnvironment vertEnv =
+          makeVertEnv(mo.moveConsumed);
+      rt.vert.posX = rt.cs.pos[0];
+      rt.vert.posY = rt.cs.pos[1];
+      rt.vert.posZ = rt.cs.pos[2];
+      vf = integratePlayerVertical(vertEnv, rt.motion, rt.vert);
+      if (vf.collisionIssued) {
+        const CollisionPoly* vContact = playerVerticalApplyCollision(
+            vertEnv, rt.cs, rt.motion, rt.vert, vf, &appliedZ);
+        if (vContact) rt.lastContactPoly = vContact;
+      }
+      playerVerticalPostStep(vertEnv, rt.vert);
+      rt.vert.posX = rt.cs.pos[0];
+      rt.vert.posY = rt.cs.pos[1];
+      rt.vert.posZ = rt.cs.pos[2];
+      // The vertical post overwrites the pending slots — OBSERVED
+      // producer order inside FUN_00465228 (motion events, then
+      // FUN_00466740's jump/landing events, then the look integrator).
+      if (vf.eventMag != 0) {
+        rt.eventType = vf.eventType;
+        rt.eventMag = vf.eventMag;
+      }
+      if (vf.deepFloorReset) ++rt.seams.deepFloorFallbacks;
+      if (mo.forwardIntent) ++rt.seams.mantleCalls;
+
+      // FUN_00465c4c — the semantic look integrator; runs after the jump
+      // machine on both dispatch branches (N-1 merged look controls).
+      PlayerLookEnvironment lookEnv;
+      lookEnv.deltaSeconds = dt;
+      lookEnv.arenaScalar = cur->scalar;
+      lookEnv.eventPriority = rt.eventPriority;
+      lookEnv.locoState = rt.locoState;
+      lookEnv.vertVelZero = rt.vert.vertVel == 0.0f;
+      lookEnv.grounded = (rt.vert.contactFlags & 1) != 0;
+      const PlayerLookFrame lk =
+          integratePlayerLook(rt.prevFrame, lookEnv, rt.look);
+      if (lk.eventPosted) {
+        rt.eventType = kLookEventPri;
+        rt.eventMag = kLookEventCode;
+      }
+
+      if (!scripted) {
+        // FUN_00465228 tail — itemUse (ce774) seam, then the sniper
+        // entry, then the normal-fire latch (a deferred seam).
+        if (rt.prevFrame.itemUse != 0) ++rt.seams.itemUseCalls;
+        if (rt.prevFrame.sniperPulse != 0 && rt.eventPriority < 8 &&
+            rt.eventType < 8) {
+          // eligibility: c6c == 0 -> free; else vertVel == +-0 &&
+          // grounded && no dying-surface record under the contact.
+          const bool eligible =
+              !rt.vertEnable ||
+              (rt.vert.vertVel == 0.0f &&
+               (rt.vert.contactFlags & 1) != 0 &&
+               !sniperDyingSurface(rt, rt.lastContactPoly));
+          if (eligible) {
+            rt.fieldC74 = 0;
+            ++rt.seams.hudEventCalls;   // FUN_00469668(0)
+            rt.flagC9c = 1;
+            rt.transitionPhase = 0;
+            rt.motion.moveVel = 0.0f;
+            rt.motion.strafeVel = 0.0f;
+            rt.motion.turnVel = 0.0f;
+            rt.motion.zoomChannel = 0.0f;
+            rt.eventMag = 0x323;
+            rt.eventType = 8;
+          }
+        }
+        // normal-fire latch (0x465717+) — FUN_00465228's tail: the
+        // 0x540c74 punch gate + the 0x12c/0x259 fire anim event.
+        playerFireLatch(rt, rt.prevFrame);
+        ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
+        playerReticleMountScan(rt);   // the mount-scan + class entry
+      } else {
+        ++rt.seams.weaponSlotCalls;   // FUN_00469cd0
+      }
+    }
+
+    // Commit the N+1 merge — the latency hand-off (FUN_00406f14 runs
+    // at dispatch end in the original, before the tail below).
+    rt.prevFrame = nextFrame;
+
+    // OBSERVED (0x4637f1..0x46382b): the death tail. While the health
+    // gate is off and health is zero the dispatch clears the 0x4ce6e0
+    // control block (FUN_0047d20a, 0xd0 bytes — the semantic input the
+    // rest of the frame consumes; the committed prevFrame is the port's
+    // equivalent) and runs the 0x540eb8 death-fade countdown: armed at
+    // 0xf0 on the first dead frame, then -frameStep per frame with an
+    // extra -0x1e whenever pos.z >= 0x540c10 (the prev-frame z commit —
+    // the countdown accelerates once the body stops descending), floored
+    // at 1. eb8 == 1 is the alternate fade gate below — it engages even
+    // when the tumble post was suppressed (mounted/vertSkip death).
+    if (rt.fieldHealthGate == 0 && rt.fieldHealth == 0) {
+      rt.prevFrame = GameplayInputFrame{};
+      if (rt.fieldEb8 == 0) {
+        rt.fieldEb8 = 0xf0;
+      } else {
+        rt.fieldEb8 -= timing.frameStep;
+        if (rt.fieldEb8 < 0xd2 && rt.cs.entryPos[2] <= rt.cs.pos[2])
+          rt.fieldEb8 -= 0x1e;
+        if (rt.fieldEb8 < 1) rt.fieldEb8 = 1;
+      }
+    }
+    ++rt.seams.hudIndicatorCalls;  // FUN_004696d8 (0x46382c) — HUD
+                                 // indicator-object scan seam
+
+    // Dispatcher tail (OBSERVED 0x463831..0x463f4a): with no latched
+    // event and no post this frame, the idle restore runs the 0x540d00
+    // gate. d00 == 0 rolls FUN_00401ed4(100): a roll < 5 (5%) falls
+    // through to the mount check at 0x463850, >= 5 (95%) takes the
+    // 0x64 branch directly. d00 != 0 skips the roll to the same check.
+    // The check: mounted (e6c != 0) posts {1, 0x64} — K_STILL — and
+    // clears the anim previous-state latch (0x540cb0 = 0); unmounted
+    // writes d00 = e6c (always 0 — the only d00 writer) and posts
+    // {1, 0x65} — K_IDLE — leaving animPrev alone. d00 has no other
+    // writer, so in live play the e6c check is reached only on the 5%.
+    if (rt.eventPriority == 0 && rt.eventType == 0) {
+      const bool mountChecked =
+          rt.fieldD00 != 0.0f ||
+          enemyRandBelow(rt.rngState, 100) < 5;
+      if (mountChecked && rt.cs.excludeObj == nullptr) {
+        rt.fieldD00 = 0.0f;                  // d00 = e6c (== 0 here)
+        rt.eventType = 1;                    // {cb00=1, cb08=0x65}
+        rt.eventMag = 0x65;
+      } else {
+        rt.animPrev = 0;                     // 0x540cb0 = 0 (0x463f56)
+        rt.eventType = 1;                    // {cb00=1, cb08=0x64}
+        rt.eventMag = 0x64;
+      }
+    }
+
+    // OBSERVED (0x46387a..0x46422f) — the damage/death dispatcher.
+    // cac == 0x3ea or eb8 == 1 is the death-fade branch: the original
+    // accumulates 0x540dac and, past 255, runs the LASTGAME teardown —
+    // that route is the session-level Phase 14B progressionStepDeath;
+    // inside the dispatch the branch skips the tumble evaluation AND
+    // the accumulator/suppress-window decays entirely.
+    if (rt.locoState != 0x3ea && rt.fieldEb8 != 1) {
+      const bool dead = rt.fieldHealthGate == 0 && rt.fieldHealth == 0;
+      if (dead) rt.vert.landingAccum = 5.0f;      // 0x463f93 force
+      // Eligibility (0x463f9d): the accumulator must hold >= 5.0f
+      // (integer compare on the float bits) AND the player must be
+      // unmounted (0x540e6c == 0) with the vertical integrator running
+      // (0x540c7c == 0).
+      bool eligible = false;
+      if (std::bit_cast<std::int32_t>(rt.vert.landingAccum) >=
+          0x40a00000)                                // JGE — signed
+        eligible = rt.vert.vertSkip == 0 && rt.cs.excludeObj == nullptr;
+      if (eligible) {
+        bool post;
+        if (rt.vert.vertVel == 0.0f &&
+            (rt.vert.contactFlags & 1) != 0) {
+          post = true;        // stationary + grounded — post directly
+        } else {
+          // 0x463fd7 — airborne/moving: a 13-unit downward stab at the
+          // player pos decides (0x4986d8 = -13.0f). A hit means the
+          // floor is just below: the fall speed is clamped to -64.0
+          // (0x4986e0 gate) and the post still runs; a miss suppresses
+          // the tumble outright.
+          const float end[3] = {rt.cs.pos[0], rt.cs.pos[1],
+                                rt.cs.pos[2] - 13.0f};
+          float hitPt[3] = {0.0f, 0.0f, 0.0f};
+          post = rt.cs.arena != nullptr &&
+                 collisionStab(*rt.cs.arena, rt.cs.pos, end, hitPt) !=
+                     nullptr;
+          if (post && rt.vert.vertVel > -64.0) rt.vert.vertVel = -64.0f;
+        }
+        if (post) {
+          // 0x46412c: unscope (FUN_00461878), release the scope overlay
+          // latch (FUN_00416700), then post — death {10,0x3ea} beats the
+          // tumble {9,0x385} through the latch below.
+          if (rt.flagC9c != 0) sniperReset(rt);
+          if (rt.scopeAnimLatch != 0) {
+            ++rt.seams.scopeOverlayCalls;
+            rt.scopeAnimLatch = 0;
+          }
+          if (dead) {
+            rt.eventMag = 0x3ea;          // 0x464202 (0x49b284 demo
+            rt.eventType = 10;            //   path has no writer)
+          } else {
+            rt.eventMag = 0x385;          // 0x46421a
+            rt.eventType = 9;
+          }
+          rt.look.lookPitchOffset = 0.0f; // d58 = 0
+          rt.vert.landingAccum = 0.0f;
+          rt.fieldE10 = 3.0f;             // suppress window arms 3.0
+          if (rt.fieldC74 != 0) {         // 0x4641c2 — fire latch kill +
+            rt.fieldC74 = 0;              //   FUN_00469668(0, 3.0f): both
+            rt.seams.hudEventCalls += 2;  //   0x54c5e0/e4 HUD pushes
+          }
+        }
+      }
+      // 0x464016..0x464045 — the accumulator decay tail runs on every
+      // non-fade dispatch: >5.0f clamps to 5.0f first, then d5c decays
+      // by the fixed tick * 0x4986e8 (2.0) — i.e. 2.0/second — while >0.
+      if (std::bit_cast<std::int32_t>(rt.vert.landingAccum) <=
+          0x40a00000) {                              // JLE — signed
+        if (rt.vert.landingAccum > 0.0f)
+          rt.vert.landingAccum -= (1.0f / 30.0f) * 2.0f;
+      } else {
+        rt.vert.landingAccum = 5.0f - (1.0f / 30.0f) * 2.0f;
+      }
+      // 0x464048 — the suppress window decays by the fixed 1/30 tick in
+      // the same tail (moved here from the traversal-active section:
+      // the original runs it inside the dispatch, before the latch).
+      if (rt.fieldE10 > 0.0f) rt.fieldE10 -= 1.0f / 30.0f;
+    }
+
+    if (rt.eventPriority < rt.eventType) {
+      rt.locoState = rt.eventMag;
+      rt.eventPriority = rt.eventType;
+    }
+
+    // 0x4638da — the ride-follow tail (OBSERVED): while dc0/dc8 are
+    // live the carrier's world x/y (+0x10/+0x14) replace the player's
+    // outright, and the player is raised to carrier z (+0x18) + the
+    // floor offset 0x540c5c only when below — the carrier lifts but
+    // never pulls down (fcomp/jae skips the store).
+    if (rt.cs.rideObj != nullptr && rt.cs.rideActive != 0) {
+      const DynamicObject& carrier =
+          *reinterpret_cast<const DynamicObject*>(rt.cs.rideObj);
+      rt.cs.pos[0] = carrier.pos[0];
+      rt.cs.pos[1] = carrier.pos[1];
+      const float rideZ = carrier.pos[2] + rt.cs.floorOffset;
+      if (rt.cs.pos[2] < rideZ) rt.cs.pos[2] = rideZ;
+    }
+
+    // 0x463923 — the scripted takeoff gate (0x540d9c). While armed the
+    // dispatcher forces cac = 0x3e8 (K_TAKEOF) at priority 10 with the
+    // motion channels + anim previous-state latch cleared — a direct
+    // write, not a posted event. Once the grounded contact bit
+    // (0x540c54 & 1) drops, it chains to 0x3e9 (K_FLOATC) and latches
+    // 0x540da0 — the dispatch head then runs FUN_0040e958 each frame.
+    // (FUN_00461954's 0x3e8 anim-completion case is the other 0x3e9/da0
+    // writer — player_animation.cpp already models it.)
+    if (rt.masterMoveGate) {
+      if (rt.locoState != 0x3e8) {
+        if (rt.flagC9c != 0) sniperReset(rt);   // 0x463941
+        rt.motion.zoomChannel = 0.0f;           // 0x540d54 = 0
+        rt.motion.turnVel = 0.0f;               // 0x540d50 = 0
+        rt.motion.strafeVel = 0.0f;             // 0x540d4c = 0
+        rt.motion.moveVel = 0.0f;               // 0x540d48 = 0
+        rt.animPrev = 0;                        // 0x540cb0 = 0
+        rt.locoState = 0x3e8;                   // 0x540cac
+        rt.animFrame = 0;                       // 0x540cb4 = 0
+        rt.eventPriority = 10;                  // 0x540cbc = 10
+      }
+      if ((rt.vert.contactFlags & 1) == 0) {    // 0x463981 — airborne
+        rt.fieldDa0 = 1;                        // 0x540da0 = 1
+        rt.locoState = 0x3e9;                   // 0x540cac = 0x3e9
+        rt.eventPriority = 10;                  // 0x540cbc = 10
+      }
+    }
   }
 
   // ================= traversal-active section =====================
@@ -1814,6 +1984,32 @@ TraversalFrameResult stepTraversalRuntime(
     rt.cs.arenaValid = 0;
     rt.fieldC74 = 0;
     ++rt.seams.animEventCalls;    // FUN_00469668 notify
+    // FUN_0040dde0 (OBSERVED 0x40dded..0x40e088): health floors at 1,
+    // the master gate latches, the script flag group mirrors to
+    // 0x54163f, the confetti emitter records take 3 rand draws each
+    // (8 records, 0x40de4a..0x40de9b — the stream position matters),
+    // and the movsd x3 block seeds 0x49a040..57 from {pos, entryPos}
+    // verbatim — the 500.0/0.15/100000.0 literals written earlier to
+    // 0x49a050/54/4c are dead stores (overwritten by entryPos).
+    // The 0x499f90 path-list alloc/chain + record-key/audio calls
+    // stay behind takeoffArmCalls (the unported FUN_0040e19c sweep's
+    // working storage — world-side presentation).
+    if (rt.fieldHealth <= 0) rt.fieldHealth = 1;    // 0x40dded/0x40e00b
+    rt.masterMoveGate = true;                       // 0x540d9c = 1
+    rt.scriptFlagsMirror = rt.scriptGFlags;         // 0x54163f = d98
+    rt.takeoffSpinRate = 0.15f;                     // 0x49a054 (dead store)
+    rt.takeoffRiseAccel = 0.025f;                   // 0x49a058 = 0.025
+    for (int i = 0; i < 24; ++i) (void)enemyRandNext(rt.rngState);
+    rt.takeoffAlt = 500.0f;                         // 0x49a050 (dead store)
+    rt.takeoffCeiling = 100000.0f;                  // 0x49a04c (dead store)
+    // movsd x3: 0x49a040..57 <- {0x540bfc..0x540c13} verbatim —
+    // {pos, entryPos}: the 100000.0/500.0/0.15 literals stored to
+    // 0x49a04c/50/54 just above are all overwritten here.
+    for (int i = 0; i < 3; ++i) rt.takeoffSeed[i] = rt.cs.pos[i];
+    rt.takeoffCeiling = rt.cs.entryPos[0];          // 49a04c <- 0x540c08
+    rt.takeoffAlt = rt.cs.entryPos[1];              // 49a050 <- 0x540c0c
+    rt.takeoffSpinRate = rt.cs.entryPos[2];         // 49a054 <- 0x540c10
+    ++rt.seams.takeoffArmCalls;
     rt.endLevelRequest = 1;
     ++rt.seams.endLevelRequests;
   }
@@ -1907,6 +2103,8 @@ TraversalFrameResult stepTraversalRuntime(
   out.currentArenaSwapped = swapped;
   out.portalCandidate = portalCand;
   out.endLevelRequested = rt.endLevelRequest != 0;
+  out.takeoffActive = rt.fieldDa0 != 0;
+  out.takeoffDone = rt.takeoffDone != 0;
   out.endingRequested = rt.endingRequest != 0;
   out.eventTimer = rt.eventTimer;
   out.viewScalar = rt.viewScalar;

@@ -15292,6 +15292,11 @@ void test_player_look() {
       mdk::stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK((rt.vert.contactFlags & 1) != 0);
     CHECK(rt.vert.vertVel == 0.0f);
+    // The 0x540d00 idle restore is a 95/5 FUN_00401ed4(100) roll —
+    // rngState 0 draws 0 (<5) so the unmounted arm posts 0x65.
+    rt.eventPriority = 0;
+    rt.rngState = 0;
+    mdk::stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK(rt.locoState == 0x65);       // idle restore latched
 
     // Hold lookUp through the raw key path (factory code 30) — the
@@ -15331,7 +15336,9 @@ void test_player_look() {
     CHECK(rt.look.lookPitchOffset == 0.0f);
     CHECK(rt.eventPriority == 0);      // the anim-end fold ran
     CHECK(out.locoState == mdk::kLookEventCode);
-    // The NEXT dispatch's idle restore returns cac.
+    // The NEXT dispatch's idle restore returns cac — the 95/5
+    // 0x540d00 roll is pinned to the 0x65 arm by rngState 0.
+    rt.rngState = 0;
     out = mdk::stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK(out.locoState == 0x65);      // idle restore returned cac
   }
@@ -17244,6 +17251,11 @@ void test_traversal_damage_dispatch() {
     TraversalRuntime rt; makeLive(rt, f);
     settle(rt);
     CHECK((rt.vert.contactFlags & 1) != 0);
+    // Pin the 0x540d00 idle reroll to the 0x65 arm (rngState 0 ->
+    // roll 0 < 5) so the state is deterministic across the roll.
+    rt.eventPriority = 0;
+    rt.rngState = 0;
+    stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK(rt.locoState == 0x65);
     playerDamageApply(rt, 10, pt);          // diff1 -> scaled 10
     CHECK(rt.fieldHealth == 90);
@@ -17302,6 +17314,9 @@ void test_traversal_damage_dispatch() {
     settle(rt);
     playerDamageApply(rt, 4, pt);           // accum 4 < 5.0f
     CHECK(near(rt.vert.landingAccum, 4.0, 1e-5));
+    // Pin the 95/5 idle reroll to 0x65 (rngState 0 -> roll 0 < 5).
+    rt.eventPriority = 0;
+    rt.rngState = 0;
     stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK(rt.locoState == 0x65);            // idle restore, no tumble
     CHECK(near(rt.vert.landingAccum, 4.0 - kDecay, 1e-5));
@@ -18405,7 +18420,11 @@ void test_player_sniper() {
     CHECK(rt.camera.zoom == 2.4f);
     CHECK(rt.scopeHudOffset == -101);
     // The 0x384 anim steady-state then the idle restore -> idle 0x65.
+    // 0x540d00 != 0 pins the 95/5 reroll to the unmounted-0x65 arm
+    // regardless of which frame the anim-end fold frees the slot.
     mdk::stepTraversalRuntime(rt, idle, bindings, timing);
+    rt.eventPriority = 0;
+    rt.fieldD00 = 1.0f;
     mdk::stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK(rt.locoState == 0x65);
   }
@@ -18422,17 +18441,23 @@ void test_player_sniper() {
 
     // A standalone mount object: named + +0x14b&2 + the X_STRIKE
     // model name. Standalone (not in col.objects) so the object
-    // prepass can't touch it; lastObjContact is the mount candidate.
+    // prepass can't touch it. The candidate enters via the
+    // 0x540dc0/0x540dc8 ride latch — the dispatch head clears
+    // 0x540e68 every frame (OBSERVED), so a bare lastObjContact
+    // write no longer survives to the mount scan.
     mdk::DynamicObject mount;
     mount.col.named = true;
     mount.col.flags14b |= 0x02;
+    mount.col.flags14a |= 0x80;   // mountable carrier — keeps dc8 live
     mount.model = makePlatformModel("X_STRIKE", "ELEM", 0.0f);
     mount.yawDeg = 90.0f;
     mount.pos[0] = 3.0f;
     mount.pos[1] = 4.0f;
     mount.pos[2] = 10.0f;
     mount.health = 10000;    // the reticle energy sentinel -> no drain
-    rt.cs.lastObjContact = &mount.col;
+    mount.col.baseZ = 10.0f; // +0x18 — the ride-offset reference
+    rt.cs.rideObj = &mount.col;
+    rt.cs.rideActive = 1;
 
     // The mount-scan (normal-path tail) -> class4Entry -> MOUNT.
     mdk::stepTraversalRuntime(rt, idle, bindings, timing);
@@ -18470,6 +18495,277 @@ void test_player_sniper() {
     for (int i = 0; i < 40; ++i)
       mdk::stepTraversalRuntime(rt, idle, bindings, timing);
     CHECK(rt.bombs == 10);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 16B.2 — the three residual dispatcher seams:
+//   0x540d9c     scripted takeoff gate (0x3e8 -> 0x3e9 -> 0x540da0),
+//   0x540dc0/dc8 ride-follow tail (x/y snap, upward-only z),
+//   0x540d00     idle reroll (95/5 FUN_00401ed4(100) -> 0x64/0x65).
+// All constants/ordering from the BUILD_A disasm; see
+// traversal_runtime.cpp's OBSERVED notes.
+// ---------------------------------------------------------------------------
+void test_traversal_residual_dispatch() {
+  using namespace mdk;
+  const GameplayInputBindings bindings;
+  const FrontendTimingState timing;      // frameStep 1, smoothed 1, dt 1/30
+  const RawGameplayInput idle{};
+  auto makeRt = [](TraversalRuntime& rt, CollisionFixture& f) {
+    TraversalArena* a = travArenaAdd(rt, "SNP_A");
+    a->dyn.col.verts = f.verts.data();
+    a->dyn.col.polys = f.polys.data();
+    a->dyn.col.nodes = f.nodes.data();
+    a->dyn.col.deepFloorZ = -1000.0f;
+    rt.cur = a;
+    rt.cs.arena = &a->dyn.col;
+    rt.cs.queryEnabled = 1;
+    rt.cs.arenaValid = 1;
+    rt.cs.objectDataLoaded = 1;
+    rt.fieldHealth = 100;
+  };
+
+  // ---- end-level arm: FUN_0040dde0 writes + dead-store quirk -------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt;
+    makeRt(rt, f);
+    rt.cs.pos[0] = 4.0f; rt.cs.pos[1] = -5.0f; rt.cs.pos[2] = 11.0f;
+    for (int i = 0; i < 30 && !(rt.vert.contactFlags & 1); ++i)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.vert.contactFlags & 1);                // landed on the floor
+    rt.scriptGFlags = 0xABCD;
+    rt.fieldHealth = 0;            // arm floors health to 1
+    const std::uint32_t rngBefore = rt.rngState;
+    rt.pendingViewSnap = -1;       // 0x540ebc == -1 — the arm trigger
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.endLevelRequest == 1);
+    CHECK(rt.seams.takeoffArmCalls == 1);
+    CHECK(rt.masterMoveGate);                       // 0x540d9c
+    CHECK(rt.scriptFlagsMirror == 0xABCDu);         // 0x54163f mirror
+    CHECK(rt.fieldHealth == 1);                     // floored
+    // movsd x3: 0x49a040..57 <- {pos, entryPos} — and entryPos is the
+    // prev-pos commit (0x430272 runs earlier the same frame), so the
+    // 100000.0/500.0/0.15 literals are dead stores that land as the
+    // arm-time pos.x / pos.y / pos.z.
+    CHECK(near(rt.takeoffSeed[0], rt.cs.pos[0]) &&
+          near(rt.takeoffSeed[2], rt.cs.pos[2]));
+    CHECK(near(rt.takeoffCeiling, rt.cs.pos[0]));   // <- entryPos[0]
+    CHECK(near(rt.takeoffAlt, rt.cs.pos[1]));       // <- entryPos[1]
+    CHECK(near(rt.takeoffSpinRate, rt.cs.pos[2]));  // <- entryPos[2]
+    CHECK(near(rt.takeoffRiseAccel, 0.025));        // 0x49a058 survives
+    // The confetti emitter records take 24 rand draws (8 x 3).
+    std::uint32_t want = rngBefore;
+    for (int i = 0; i < 24; ++i) (void)enemyRandNext(want);
+    CHECK(rt.rngState == want);
+    // Same frame's tail already ran (the arm is post-tail) — the d9c
+    // gate engages next frame: grounded -> 0x3e8 forced directly.
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x3e8);
+    CHECK(rt.eventPriority == 10);
+    CHECK(rt.animPrev == rt.locoState);   // tick latched after dispatch
+    CHECK(rt.motion.moveVel == 0.0f && rt.motion.turnVel == 0.0f &&
+          rt.motion.strafeVel == 0.0f && rt.motion.zoomChannel == 0.0f);
+    // Grounded: stays 0x3e8 (da0 waits for the airborne edge).
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x3e8);
+    CHECK(rt.fieldDa0 == 0);
+  }
+
+  // ---- airborne edge: 0x3e8 -> 0x3e9 + da0, then e958 owns frames ---
+  {
+    CollisionFixture f = makeEmptyArena();   // no floor — never grounded
+    TraversalRuntime rt;
+    makeRt(rt, f);
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 0.0f;   // spin rate seed — keep the spin tame
+    rt.pendingViewSnap = -1;
+    stepTraversalRuntime(rt, idle, bindings, timing);   // arm
+    CHECK(rt.masterMoveGate);
+    // Frame 2: the gate forces 0x3e8 then sees airborne (c54&1 == 0)
+    // -> 0x3e9 + da0 in the same tail.
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x3e9);
+    CHECK(rt.fieldDa0 == 1);
+    CHECK(rt.eventPriority == 10);
+    // Frame 3+: the dispatch head short-circuits to FUN_0040e958 —
+    // the pending event pair is NOT cleared and prevFrame is not
+    // committed on this path.
+    rt.eventType = 7;
+    rt.eventMag = 0x777;
+    rt.prevFrame.moveVel = 42.0f;
+    const float z0 = rt.cs.pos[2];
+    const TraversalFrameResult out =
+        stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.takeoffActive);
+    CHECK(!out.takeoffDone);
+    CHECK(rt.eventType == 7 && rt.eventMag == 0x777);  // untouched
+    CHECK(rt.prevFrame.moveVel == 42.0f);              // not committed
+    CHECK(rt.seams.takeoffInputCalls == 1);            // FUN_00407ddc
+    // Rise: turnVel += 0.025*smoothed, pos.z += turnVel*smoothed; the
+    // alt tracker (0x49a050) follows pos.z by the same dz — it was
+    // seeded from entryPos[1] == pos.y == 0 at arm.
+    CHECK(near(rt.motion.turnVel, 0.025, 1e-6));
+    CHECK(near(rt.cs.pos[2], z0 + 0.025, 1e-5));
+    CHECK(near(rt.takeoffAlt, 0.025, 1e-6));
+    // Second frame: the channel accrues first (0.05) then integrates
+    // with the post-add value — pos.z gains 0.05.
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(near(rt.motion.turnVel, 0.05, 1e-6));
+    CHECK(near(rt.cs.pos[2], z0 + 0.075, 1e-5));
+  }
+
+  // ---- whiteout: pitch sweep settles -> +8/frame -> 49a030 ---------
+  {
+    CollisionFixture f = makeEmptyArena();
+    TraversalRuntime rt;
+    makeRt(rt, f);
+    rt.cs.pos[2] = 12.0f;
+    rt.fieldDa0 = 1;
+    rt.locoState = 0x3e9;
+    rt.motion.turnVel = 3.5f;               // past the 3.0 boost gate
+    rt.cur->scalar = 0.0f;                  // pitch threshold = (-60-0)*0.5
+    rt.look.lookPitchOffset = -20.0f;       // above threshold -> sweeps down
+    // 22.5 deg/s * (1/30) = 0.75/frame — ~14 frames to settle at -30.
+    for (int i = 0; i < 15; ++i)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(near(rt.look.lookPitchOffset, -30.0, 1e-4));  // clamped
+    CHECK(rt.takeoffWhiteout <= 15 * 8);   // accum only after settle
+    // Settled frames accumulate 8/frame; >300 latches 0x49a030.
+    for (int i = 0; i < 50 && rt.takeoffDone == 0; ++i)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.takeoffDone == 1);
+    CHECK(rt.takeoffWhiteout > 0x12c);
+    CHECK(rt.seams.takeoffPaletteCalls > 0);
+    TraversalFrameResult out =
+        stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(out.takeoffDone);
+    // The spin channel spins yaw and mirrors 90 - yaw into view yaw.
+    // (moveVel ramps via takeoffSpinRate = entryPos[2] == 0 here.)
+    CHECK(near(rt.view.viewYawDeg, 90.0 - rt.motion.yawDeg, 1e-4));
+  }
+
+  // ---- ride-follow tail: x/y snap + upward-only z -------------------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt;
+    makeRt(rt, f);
+    rt.cs.pos[2] = 12.0f;
+    for (int i = 0; i < 30 && !(rt.vert.contactFlags & 1); ++i)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+    mdk::DynamicObject carrier;
+    carrier.col.named = true;
+    carrier.col.flags149 = 1;
+    carrier.col.flags14a = 0x80;           // mountable
+    carrier.pos[0] = 7.0f; carrier.pos[1] = 8.0f; carrier.pos[2] = 20.0f;
+    carrier.col.baseZ = 20.0f;
+    rt.cs.rideObj = &carrier.col;
+    rt.cs.rideActive = 1;
+    rt.cs.floorOffset = 0.25f;             // 0x540c5c saved at mount
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(near(rt.cs.pos[0], 7.0, 1e-5));  // carrier x/y replace player
+    CHECK(near(rt.cs.pos[1], 8.0, 1e-5));
+    CHECK(near(rt.cs.pos[2], 20.25, 1e-4)); // raised to carrier z + ofs
+    // Carrier below the player: the z snap never pulls down.
+    carrier.pos[2] = 5.0f;
+    carrier.col.baseZ = 5.0f;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(near(rt.cs.pos[0], 7.0, 1e-5));
+    CHECK(rt.cs.pos[2] > 5.25f);           // not dragged down
+  }
+
+  // ---- ride attach: the landing-adopt writes dc0/dc4/dc8 ------------
+  {
+    CollisionFixture f = makeEmptyArena();
+    ObjectFixture o;
+    initFloorObject(o, 10.0f);
+    o.obj.flags14a = 0x80;                 // mountable carrier
+    CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10.05f;
+    cs.floorObj = &o.obj;                  // the scan's c60 candidate
+    cs.floorElemMask = 1;
+    PlayerVerticalEnvironment env;
+    env.deepFloorZ = -1000.0f;
+    PlayerMotionState ms;
+    PlayerVerticalState vs;
+    vs.posZ = 10.05f;
+    PlayerVerticalFrame vf{};
+    vf.collisionIssued = true;
+    vf.preLand = true;                     // the 0x46739b route
+    vf.dispZ = -0.05f;
+    static int attachDismounts = 0;
+    attachDismounts = 0;
+    cs.dismountHook = [](CollisionState&) { ++attachDismounts; };
+    float appliedZ = 0.0f;
+    playerVerticalApplyCollision(env, cs, ms, vs, vf, &appliedZ);
+    CHECK(cs.rideObj == &o.obj);           // dc0 = c60
+    CHECK(cs.rideElemMask == 1);           // dc4 = c64
+    CHECK(cs.rideActive == 1);             // dc8 = 1 (flag80 set)
+    CHECK(attachDismounts == 0);
+    // Non-mountable candidate while riding -> dismount hook + dc8 = 0.
+    ObjectFixture o2;
+    initFloorObject(o2, 10.0f);            // flags14a = 0
+    cs.floorObj = &o2.obj;
+    PlayerVerticalFrame vf2 = vf;
+    playerVerticalApplyCollision(env, cs, ms, vs, vf2, &appliedZ);
+    CHECK(cs.rideObj == &o2.obj);          // dc0 still adopts
+    CHECK(cs.rideActive == 0);             // dc8 cleared
+    CHECK(attachDismounts == 1);           // FUN_00461878 edge fired
+  }
+
+  // ---- idle reroll: the 95/5 FUN_00401ed4(100) arms -----------------
+  {
+    CollisionFixture f = makeFloorArena();
+    TraversalRuntime rt;
+    makeRt(rt, f);
+    rt.cs.pos[2] = 12.0f;
+    rt.cs.entryPos[2] = 12.0f;
+    for (int i = 0; i < 30 && !(rt.vert.contactFlags & 1); ++i)
+      stepTraversalRuntime(rt, idle, bindings, timing);
+
+    // Roll < 5, unmounted -> {1,0x65}; fieldD00 stays 0; animPrev kept.
+    rt.eventPriority = 0;
+    rt.rngState = 0;                       // draw 0 -> roll 0 < 5
+    const std::uint32_t s0 = rt.rngState;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x65);
+    CHECK(rt.fieldD00 == 0.0f);            // d00 = e6c (always 0)
+    std::uint32_t s1 = s0;
+    (void)enemyRandNext(s1);
+    CHECK(rt.rngState == s1);              // exactly one draw consumed
+
+    // Roll >= 5 -> {1,0x64} and the anim previous-state latch cleared.
+    rt.eventPriority = 0;
+    rt.rngState = 1;                       // draw 51 -> >= 5 arm
+    rt.locoState = 0x64;
+    rt.animPrev = 0x64;
+    rt.animFrame = 2;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x64);
+    // cb0 = 0 forced the anim re-entry — the tick reset the frame.
+    CHECK(rt.animFrame == 0);
+
+    // d00 != 0 skips the roll entirely — rngState untouched.
+    rt.eventPriority = 0;
+    rt.fieldD00 = 1.0f;
+    const std::uint32_t s2 = rt.rngState;
+    stepTraversalRuntime(rt, idle, bindings, timing);
+    CHECK(rt.locoState == 0x65);           // unmounted -> 0x65
+    CHECK(rt.rngState == s2);              // no draw consumed
+    CHECK(rt.fieldD00 == 0.0f);            // d00 = e6c cleared
+
+    // Mounted (e6c != 0) forces the 0x64 arm even on a <5 roll.
+    TraversalRuntime rt2;
+    makeRt(rt2, f);
+    rt2.cs.pos[2] = 12.0f;
+    for (int i = 0; i < 30 && !(rt2.vert.contactFlags & 1); ++i)
+      stepTraversalRuntime(rt2, idle, bindings, timing);
+    mdk::DynamicObject mount;
+    rt2.cs.excludeObj = &mount.col;        // e6c set; flags14b&2 clear
+    rt2.eventPriority = 0;
+    rt2.rngState = 0;                      // roll 0 -> mount-check arm
+    stepTraversalRuntime(rt2, idle, bindings, timing);
+    CHECK(rt2.locoState == 0x64);          // mounted -> K_STILL post
   }
 }
 
@@ -21086,6 +21382,7 @@ int main() {
   test_player_fire();
   test_player_projectiles();
   test_traversal_damage_dispatch();
+  test_traversal_residual_dispatch();
   test_arena_render();
   test_arena_mesh();
   test_freefall_init();

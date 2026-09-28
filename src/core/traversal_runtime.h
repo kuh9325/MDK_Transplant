@@ -322,6 +322,18 @@ struct TraversalSeams {
   int bombBounceCalls = 0;        // op-0xb8 (0x443cf8) — FUN_00460d44
                                   // splashDamage dispatch at the bomb's
                                   // position (a!=0&&b!=0 arm)
+  // --- Phase 16B.2 — scripted takeoff seams ---
+  int takeoffArmCalls = 0;        // FUN_0040dde0's unported cluster —
+                                  // the 0x499f90 path-list alloc/chain,
+                                  // confetti emitter records, and the
+                                  // record-key/FUN_004022b8 call pair
+  int takeoffInputCalls = 0;      // FUN_00407ddc — the joystick channel
+                                  // probe inside FUN_0040e958 (the port
+                                  // has no analog source; channels = 0)
+  int takeoffPaletteCalls = 0;    // FUN_0046d614/0046d208 — the whiteout
+                                  // palette snapshot/blend/upload
+                                  // (cosmetic; the 0x49a65c counter and
+                                  // 0x49a030 latch are real state)
 };
 
 struct TraversalFrameResult {
@@ -386,6 +398,11 @@ struct TraversalFrameResult {
   int portalCandidate = -1;          // dest arena idx (fields[0])
   bool endLevelRequested = false;    // rt.endLevelRequest (FUN_0040dde0
                                      // edge — 0x540ebc == -1 consumed)
+  bool takeoffActive = false;        // rt.fieldDa0 — the dispatch ran
+                                     // the FUN_0040e958 scripted
+                                     // takeoff short-circuit this frame
+  bool takeoffDone = false;          // rt.takeoffDone — 0x49a030 latched
+                                     // (whiteout counter passed 300)
   bool endingRequested = false;      // rt.endingRequest (op 0x83 0x51
                                      // — FUN_0047b038 mode-8 edge)
   float eventTimer = 0.0f;           // 0x540eb0
@@ -513,7 +530,32 @@ struct TraversalRuntime {
                                   // machine + the 54161b world-tick decay
   int fieldCc8 = 0;               // 0x540cc8 — cleared per frame
   int fieldE14 = 0;               // 0x540e14 — cleared per frame
-  bool masterMoveGate = false;    // 0x540d9c — FUN_0040e19c gate
+  bool masterMoveGate = false;    // 0x540d9c — FUN_0040e19c gate;
+                                  // also the dispatch's scripted-
+                                  // takeoff arm (0x463923: forces
+                                  // cac=0x3e8, then 0x3e9 + da0 once
+                                  // airborne — OBSERVED)
+  // --- Phase 16B.2 — scripted end-level takeoff ------------------
+  // FUN_0040dde0's arm writes + FUN_0040e958's per-frame integrator
+  // state. The arm's movsd block copies {pos (0x540bfc..04), entryPos
+  // (0x540c08..10)} verbatim over 0x49a040..57 — so the literal
+  // 100000.0 / 500.0 / 0.15 stores to 0x49a04c/50/54 are dead stores
+  // overwritten by entryPos[0]/[1]/[2] (OBSERVED 0x40defb..0x40df13).
+  // The alloc'd path-node list (0x499f90..) and confetti emitters stay
+  // behind takeoffArmCalls — presentation/world-side, not player state.
+  float takeoffSeed[3] = {0, 0, 0};  // 0x49a040/44/48 — pos at arm
+  float takeoffCeiling = 0.0f;       // 0x49a04c — 100000.0 (no reader
+                                     // outside the unported sweep)
+  float takeoffAlt = 0.0f;           // 0x49a050 — rises with the
+                                     // player (+= d50*f0 per frame)
+  float takeoffSpinRate = 0.0f;      // 0x49a054 — d48 ramp step
+  float takeoffRiseAccel = 0.0f;     // 0x49a058 — 0.025, d50 accel
+  int takeoffWhiteout = 0;           // 0x49a65c — += frameStep*8 while
+                                     // the pitch sweep is settled
+  int takeoffDone = 0;               // 0x49a030 — >300 latches the
+                                     // mode-dispatch exit (0x401497)
+  std::uint32_t scriptFlagsMirror = 0; // 0x54163f — 0x540d98 mirror
+                                       // at arm
   bool vertEnable = true;         // 0x540c6c — vertical master gate;
                                   // set at traversal init. Read by the
                                   // sniper abort/entry gates and fed

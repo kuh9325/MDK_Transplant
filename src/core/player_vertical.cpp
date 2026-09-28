@@ -321,6 +321,21 @@ const CollisionPoly* playerVerticalApplyCollision(
   vres.blocker0Flag80 =
       cs.floorObj && (cs.floorObj->flags14a & 0x80);
   applyPlayerVerticalCollision(env, ms, vs, vres, frame);
+  // 0x46739b — the attach block's dc0/dc4 writes land here (OBSERVED):
+  // on the no-contact pre-land route the probed carrier is adopted as
+  // the ride object. dc8 latches only when the carrier is mountable
+  // (+0x14a & 0x80); a non-mountable candidate while still riding
+  // calls FUN_00461878(0) then clears dc8 (0x4675a0).
+  if (frame.blockerRefresh) {
+    cs.rideObj = cs.floorObj;
+    cs.rideElemMask = cs.floorElemMask;
+    if (vres.blocker0Flag80) {
+      cs.rideActive = 1;
+    } else if (cs.rideActive != 0) {
+      if (cs.dismountHook) cs.dismountHook(cs);   // FUN_00461878(0)
+      cs.rideActive = 0;
+    }
+  }
   return vContact;
 }
 

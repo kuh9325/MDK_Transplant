@@ -55,6 +55,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace mdk {
 
@@ -167,7 +168,10 @@ using CollisionContactHook = void (*)(
     const CollisionPoly* poly);
 
 // Hook replacing FUN_00461878 (dismount/reset on the ride state).
-using CollisionDismountHook = void (*)(struct CollisionState& cs);
+// std::function: the traversal layer binds the runtime-scoped
+// sniperReset; bare-CollisionState tests still assign plain lambdas.
+using CollisionDismountHook =
+    std::function<void(struct CollisionState& cs)>;
 
 // Phase 5F — the collision object's surface-effect block (player_surface.h).
 struct SurfaceObjectState;
