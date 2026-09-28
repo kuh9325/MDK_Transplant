@@ -2623,9 +2623,25 @@ func _run_smoke(data_root: String) -> void:
 	var ks0: Dictionary = bridge.get_kurt_snapshot()
 	var ktex0 := int(ks0["tex_cache"])
 	var kpal0 := int(ks0["pal_key"])
+	# Texture-cache invariant, measured directly: each snapshot call
+	# requests {pal_key,table,frame} textures for its main/overlay
+	# frames. Collect the exact key set requested during the window —
+	# the cache may only grow by keys it was actually asked for, and
+	# already-seen keys must reuse their ImageTexture (no re-entry).
+	var collect := func(kd: Dictionary, into: Dictionary) -> void:
+		if kd.is_empty():
+			return
+		var pk := int(kd["pal_key"])
+		for part in [&"main", &"overlay"]:
+			var pd: Dictionary = kd[part]
+			if not pd.is_empty() and pd.get("tex") != null:
+				into["%x:%d:%d" % [pk, int(pd["table"]),
+						int(pd["frame"])]] = true
+	var kset := {}
 	for i in 130:
 		_step_n({}, 1)
 		var kd: Dictionary = bridge.get_kurt_snapshot()
+		collect.call(kd, kset)
 		if int(kd["loco_state"]) == 0x385:
 			tumble_state = true
 		var md: Dictionary = kd["main"]
@@ -2646,6 +2662,7 @@ func _run_smoke(data_root: String) -> void:
 	for i in 40:
 		_step_n({}, 1)
 		var ke: Dictionary = bridge.get_kurt_snapshot()
+		collect.call(ke, kset)
 		if int(ke["loco_state"]) == 0x3ea:
 			death_state = true
 		var me: Dictionary = ke["main"]
@@ -2666,11 +2683,38 @@ func _run_smoke(data_root: String) -> void:
 	var ks1: Dictionary = bridge.get_kurt_snapshot()
 	var ktex1 := int(ks1["tex_cache"])
 	var kpal1 := int(ks1["pal_key"])
-	_check(ktex1 - ktex0 < 64,
-		"texture cache bounded through damage/death " +
-		"(delta=%d pal=%x->%x arena=%d)" %
-		[ktex1 - ktex0, kpal0, kpal1,
+	# Growth bound: delta may never exceed the count of unique
+	# {palette,table,frame} keys actually requested — any larger
+	# delta means unrequested entries or duplicate inserts.
+	_check(ktex1 - ktex0 <= kset.size(),
+		"tex cache grew only for requested keys " +
+		"(delta=%d unique_keys=%d pal=%x->%x arena=%d)" %
+		[ktex1 - ktex0, kset.size(), kpal0, kpal1,
 			int(bridge.get_player_snapshot()["arena"])])
+	_check(ktex1 <= 4096,
+		"tex cache within the 4096-entry bound")
+	# Same-key reuse: a second snapshot with no intervening step
+	# re-requests the identical key set -> zero new entries.
+	var ktex_r := int(bridge.get_kurt_snapshot()["tex_cache"])
+	_check(ktex_r == ktex1,
+		"tex cache reuses identical key (delta=%d)" %
+		[ktex_r - ktex1])
+	# Replay: keep stepping the terminal death presentation — every
+	# repeated key must hit the cache; only genuinely new
+	# {palette,table,frame} tuples may add entries.
+	var kset_b := {}
+	var ktex_b0 := int(bridge.get_kurt_snapshot()["tex_cache"])
+	for i in 40:
+		_step_n({}, 1)
+		collect.call(bridge.get_kurt_snapshot(), kset_b)
+	var ktex_b1 := int(bridge.get_kurt_snapshot()["tex_cache"])
+	var new_b := 0
+	for k in kset_b:
+		if not kset.has(k):
+			new_b += 1
+	_check(ktex_b1 - ktex_b0 <= new_b,
+		"replay adds only newly-requested keys " +
+		"(delta=%d new_keys=%d)" % [ktex_b1 - ktex_b0, new_b])
 	var km_end: TextureRect = $KurtLayer/KurtViewport/KurtMain
 	_check(km_end.visible and km_end.texture != null,
 		"KurtMain still presents during death")
