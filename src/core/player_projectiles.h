@@ -171,12 +171,14 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace mdk {
 
 struct TraversalRuntime;
 struct TraversalArena;
 struct DynamicObject;
+struct CollisionArena;
 
 // ---------------------------------------------------------------------------
 // The FUN_004572ac tail — the 3-slot shot-pool update. Runs once per
@@ -254,8 +256,17 @@ struct PlayerShotVisual {
   float spinDeg = 0.0f;      // +0x0c streak spin
   float fieldCc = 0.0f;      // +0xcc render scalar (0x540b58/0x540b64)
   bool ribbonBound = false;  // +0xf8 bit0
-  // Mode-0 gate: the original submits geometry iff the record is
-  // active (state != 0 && lifetime > 0).
+  // +0x1c — the shot's class/model binding: -1 = the built-in slot-1
+  // record (FUN_0042b270 binds "KURT" there — STREAM.BNI), else a
+  // level enemy-table index (SW_HOME/SW_SGREN/SW_HGREN/SW_LGREN).
+  int classIdx = -1;
+  // World-mesh submit gate (0x431503, OBSERVED): the shot's class
+  // model is submitted into the display list only while state == 1
+  // (in flight). Dying/impact states 2-5 draw nothing world-side.
+  bool meshRenderable = false;
+  // Bullet-cam window gate (FUN_0045ee7c mode-0, OBSERVED): while
+  // state != 0 && lifetime > 0 the slot's HUD window re-renders the
+  // display list from the shot's tail camera (FUN_0045ee08).
   bool worldRenderable = false;
   // Mode-1 HUD indicator frame select (FUN_0045ee7c iVar7): -1 for an
   // active record (no indicator drawn), else 0 (free) / 3 (state 4
@@ -302,19 +313,51 @@ enum class CombatFxKind : int {
 
 struct CombatFxEvent {
   CombatFxKind kind = CombatFxKind::kShotWallImpact;
-  // FUN_00437444 ECX arg — particle palette/scale select: 0 -> {0xd|3,
-  // 3, 1.0}, 1 -> {0x25, 0xf0, 0.5}, else(3) -> {10, 3, 1.0}. 0 on
-  // non-00437444 events.
+  // FUN_00437444 ECX arg — the particle COUNT: ESI's loop counter
+  // (0x437589/0x4374cf DEC ESI loop, OBSERVED). 1 or 3 on shot wall
+  // hits, 1 on punch wall hits, flag21f on survived object hits.
+  // 0 on non-00437444 events.
   int mode = 0;
-  // FUN_00437444 stack arg — particle COUNT (the spawn loop runs
-  // count times). flag21f on object hits (0/1), handler-ran 2 else 1
-  // on wall hits.
+  // FUN_00437444 stack arg ([EBP+8]) — the palette/life/scale
+  // SELECT (0x43745f..0x43751d, OBSERVED): 0 -> {pen 0xd or 3
+  // (0x54150c gate), life 3, scale 1.0}, 1 -> {pen 0x25, life 0xf0,
+  // scale 0.5}, else -> {pen 10, life 3, scale 1.0}. 2 or 1 on shot
+  // wall hits (handler-ran else not), flag21f on object hits.
   int variant = 0;
   // FUN_00437444 EBX arg — per-object impact-sound name override
   // (obj +0x150). Null/empty selects a random RICO1/2/3 handle.
   std::int32_t aux = 0;
   float pos[3] = {0, 0, 0};  // the EDX vector (hit/contact point)
   const DynamicObject* obj = nullptr;  // subject object, if any
+  // The shard's home arena — FUN_00403f6c binds each particle record
+  // to the dispatch arena (record +0x08), and FUN_00406a0c's contact
+  // stab consults it first (then 0x540c48, then 0x540ca4). The
+  // frontend needs it for the shard-bounce stab; null on events with
+  // no shard spawn.
+  const CollisionArena* arena = nullptr;
+  // --- Remnant/corpse presentation fields (Phase 17A) -------------
+  // These are snapshotted at emission because the object record is
+  // wiped in place by FUN_0045828c (objectTeardownNow) before the
+  // frontend drains the queue — `obj` must NOT be dereferenced for
+  // model data on kObjectTeardown.
+  //
+  // scale — FUN_004575fc's stack arg on kDetonation (2.0f on the shot
+  //   path; 2.0/3.0 on fxShockwave callers). On kObjectTeardown it is
+  //   the corpse's normalized scale: (obj aabb z-span / EXPLODE
+  //   record z-span) * 1.5 (0x457f36..0x457f74, OBSERVED).
+  float scale = 0.0f;
+  // facingDeg — kObjectTeardown: the die-facing yaw arg (+0x4c/+0x50
+  //   on the corpse). kDetonation: bearing to the render camera (the
+  //   FUN_004575fc corpse faces the viewer).
+  float facingDeg = 0.0f;
+  // bankDeg — the corpse's +0x13c tilt: bearingDeg(camZ+5-posZ,
+  //   horizDist) when |horiz| > dz or |dz| > 8, else 0
+  //   (0x457efb..0x458135, OBSERVED).
+  float bankDeg = 0.0f;
+  // modelName — the victim's model name captured pre-teardown for
+  //   kObjectTeardown (the record is wiped; the frontend resolves
+  //   geometry by name). Empty on other kinds.
+  std::string modelName;
 };
 
 } // namespace mdk

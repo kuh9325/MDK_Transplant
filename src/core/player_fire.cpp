@@ -851,6 +851,7 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
     fx.aux = obj.field150;
     fx.pos[0] = hitPt[0]; fx.pos[1] = hitPt[1]; fx.pos[2] = hitPt[2];
     fx.obj = bestObj;
+    fx.arena = bestObj->arena ? &bestObj->arena->col : nullptr;
     rt.combatFx.push_back(fx);
     return;
   }
@@ -898,6 +899,7 @@ void playerPunch(TraversalRuntime& rt, int frameStep) {
     ev.mode = 1;
     ev.variant = (res & 1) ? 2 : 1;
     ev.pos[0] = hitPt[0]; ev.pos[1] = hitPt[1]; ev.pos[2] = hitPt[2];
+    ev.arena = arena;            // FUN_00403f6c's record +0x08 bind
     rt.combatFx.push_back(ev);
     return;
   }

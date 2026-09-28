@@ -111,6 +111,32 @@ float bearingDeg(float dy, float dx) {
   return d;
 }
 
+// FUN_004575fc head (0x45760a..0x45763e) — the remnant faces the
+// render camera: yaw = bearingDeg(camY-posY, camX-posX).
+float remnantFacingYaw(const TraversalRuntime& rt, const float pos[3]) {
+  return bearingDeg(rt.camera.pose.pos[1] - pos[1],
+                    rt.camera.pose.pos[0] - pos[0]);
+}
+
+// The +0x13c tilt (0x457641..0x45769a / 0x457efb..0x458135):
+//   dz    = camZ + zLift - posZ      (zLift 3.0 detonation / 5.0 corpse)
+//   horiz = sqrt(dx^2+dy^2)
+//   gate  = |horiz| > horizGate      (5.0 detonation)
+//           | |horiz| > dz           (horizGate < 0 — the corpse's
+//                                   signed-dz compare, OBSERVED quirk)
+//   bank  = gate || |dz| > 8.0 ? bearingDeg(dz, horiz) : 0
+float remnantBankDeg(const TraversalRuntime& rt, const float pos[3],
+                     float zLift, float horizGate) {
+  const float dz = rt.camera.pose.pos[2] + zLift - pos[2];
+  const float dx = rt.camera.pose.pos[0] - pos[0];
+  const float dy = rt.camera.pose.pos[1] - pos[1];
+  const float horiz = std::sqrt(dx * dx + dy * dy);
+  const bool gate = (horizGate >= 0.0f) ? (horiz > horizGate)
+                                      : (horiz > dz);
+  if (!gate && std::fabs(dz) <= 8.0f) return 0.0f;
+  return bearingDeg(dz, horiz);
+}
+
 // ---------------------------------------------------------------------------
 // RNG — FUN_0047d2b5 (MSVC CRT rand) + FUN_00401ed4
 // ---------------------------------------------------------------------------
@@ -897,20 +923,6 @@ void fxAfterimage(TraversalRuntime& rt, DynamicObject& o) {
   (void)o;
 }
 
-void fxShockwave(TraversalRuntime& rt, DynamicObject& o, float scale) {
-  // FUN_004575fc — the detonation remnant seam (CombatFxEvent kind
-  // kDetonation carries scale).
-  rt.seams.remnantSpawnCalls++;
-  CombatFxEvent ev;
-  ev.kind = CombatFxKind::kDetonation;
-  ev.obj = &o;
-  ev.variant = static_cast<int>(scale * 1000.0f);
-  ev.pos[0] = o.pos[0];
-  ev.pos[1] = o.pos[1];
-  ev.pos[2] = o.pos[2];
-  rt.combatFx.push_back(ev);
-}
-
 // cmd1 — FUN_00459330 (lunge): dummy-anim re-arm + touch scan + timer.
 void cmdBody1(TraversalRuntime& rt, DynamicObject& o, DynamicArena& home,
               TraversalArena* other) {
@@ -1174,6 +1186,23 @@ void cmdDropperSpawn(TraversalRuntime& rt, DynamicObject& o,
 }
 
 } // namespace
+
+void fxShockwave(TraversalRuntime& rt, DynamicObject& o, float scale) {
+  // FUN_004575fc — the detonation remnant seam (CombatFxEvent kind
+  // kDetonation carries scale + the camera-facing orientation).
+  rt.seams.remnantSpawnCalls++;
+  CombatFxEvent ev;
+  ev.kind = CombatFxKind::kDetonation;
+  ev.obj = &o;
+  ev.scale = scale;
+  ev.facingDeg = remnantFacingYaw(rt, o.pos);
+  ev.bankDeg = remnantBankDeg(rt, o.pos, 3.0f, 5.0f);
+  ev.pos[0] = o.pos[0];
+  ev.pos[1] = o.pos[1];
+  ev.pos[2] = o.pos[2];
+  ev.arena = o.arena ? &o.arena->col : nullptr;
+  rt.combatFx.push_back(ev);
+}
 
 // ---------------------------------------------------------------------------
 // FUN_0045897c — enemy command dispatch (+0x149&0x10 gate)

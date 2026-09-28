@@ -28,6 +28,12 @@ visible = false
 [node name="CollisionDebug" type="MeshInstance3D" parent="."]
 visible = false
 
+[node name="ShotRoot" type="Node3D" parent="."]
+
+[node name="FxRoot" type="Node3D" parent="."]
+
+[node name="ShotCamRoot" type="Node" parent="."]
+
 [node name="Camera3D" type="Camera3D" parent="."]
 far = 20000.0
 
@@ -50,6 +56,9 @@ stretch_mode = 0
 mouse_filter = 2
 expand_mode = 1
 stretch_mode = 0
+
+[node name="ShotCamLayer" type="CanvasLayer" parent="."]
+layer = 2
 
 [node name="DebugUI" type="CanvasLayer" parent="."]
 

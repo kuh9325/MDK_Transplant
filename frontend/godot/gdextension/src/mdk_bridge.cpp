@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "core/dti_structure.h"
+#include "core/enemy_runtime.h"
 #include "core/fti_directory.h"
 #include "core/keyboard_menu.h"
 #include "core/mto_directory.h"
@@ -115,6 +116,23 @@ void MdkBridge::_bind_methods() {
       &MdkBridge::diagnostic_start);
   ClassDB::bind_method(D_METHOD("diagnostic_damage", "amount"),
                        &MdkBridge::diagnostic_damage);
+  ClassDB::bind_method(D_METHOD("diagnostic_kill", "object_id"),
+                       &MdkBridge::diagnostic_kill);
+  ClassDB::bind_method(D_METHOD("diagnostic_shockwave", "object_id"),
+                       &MdkBridge::diagnostic_shockwave);
+  // Phase 17A — traversal combat presentation.
+  ClassDB::bind_method(D_METHOD("get_shot_snapshots"),
+                       &MdkBridge::get_shot_snapshots);
+  ClassDB::bind_method(D_METHOD("drain_combat_fx"),
+                       &MdkBridge::drain_combat_fx);
+  ClassDB::bind_method(D_METHOD("get_shot_geometry", "class_idx"),
+                       &MdkBridge::get_shot_geometry);
+  ClassDB::bind_method(D_METHOD("get_named_geometry", "name"),
+                       &MdkBridge::get_named_geometry);
+  ClassDB::bind_method(D_METHOD("get_active_palette"),
+                       &MdkBridge::get_active_palette);
+  ClassDB::bind_method(D_METHOD("fx_stab", "from", "to", "arena_index"),
+                       &MdkBridge::fx_stab);
   // Phase 16C — freefall (mode 2).
   ClassDB::bind_method(
       D_METHOD("load_freefall", "course", "skill", "seed"),
@@ -572,6 +590,14 @@ mdk::TraversalArena* MdkBridge::arenaByIndex_(int idx) {
 int MdkBridge::indexOfArena_(const mdk::DynamicArena* dyn) const {
   if (dyn == nullptr || dyn->owner == nullptr) return -1;
   return dyn->owner->index;
+}
+
+int MdkBridge::indexOfColArena_(const mdk::CollisionArena* col) const {
+  if (col == nullptr || !rt_) return -1;
+  for (const auto& a : rt_->arenas) {
+    if (&a->dyn.col == col) return a->index;
+  }
+  return -1;
 }
 
 std::vector<mdk::TraversalArena*> MdkBridge::viewArenas_() const {
@@ -1317,6 +1343,271 @@ Dictionary MdkBridge::diagnostic_damage(int64_t amount) {
   out["fade"] = static_cast<int64_t>(rt_->fieldEb8);
   out["loco_state"] = static_cast<int64_t>(rt_->locoState);
   out["event_priority"] = static_cast<int64_t>(rt_->eventPriority);
+  return out;
+}
+
+Dictionary MdkBridge::diagnostic_kill(int64_t object_id) {
+  Dictionary out;
+  out["ok"] = false;
+  if (!rt_ || object_id <= 0) return out;
+  const void* p = objIds_.find(std::uint64_t(object_id));
+  if (p == nullptr) return out;   // stale/unknown id — not an error
+  auto& o = *const_cast<mdk::DynamicObject*>(
+      static_cast<const mdk::DynamicObject*>(p));
+  // The authentic death boundary — FUN_004581a4's die-facing wrapper
+  // -> FUN_00458140. The +0x110-script handoff or the FUN_00457cf4
+  // teardown emits the corresponding combat event; the record wipe
+  // is the core's own semantics, not the diagnostic's.
+  const std::size_t before = rt_->combatFx.size();
+  mdk::objectDieFacingPlayer(*rt_, o);
+  out["ok"] = true;
+  out["events"] = int64_t(rt_->combatFx.size() - before);
+  if (!rt_->combatFx.empty()) {
+    out["kind"] = int64_t(rt_->combatFx.back().kind);
+  }
+  return out;
+}
+
+Dictionary MdkBridge::diagnostic_shockwave(int64_t object_id) {
+  Dictionary out;
+  out["ok"] = false;
+  if (!rt_ || object_id <= 0) return out;
+  const void* p = objIds_.find(std::uint64_t(object_id));
+  if (p == nullptr) return out;
+  auto& o = *const_cast<mdk::DynamicObject*>(
+      static_cast<const mdk::DynamicObject*>(p));
+  // The real FUN_004575fc seam with the observed 2.0 arg (the shot
+  // detonation callsite) — emits the kDetonation remnant event.
+  const std::size_t before = rt_->combatFx.size();
+  mdk::fxShockwave(*rt_, o, 2.0f);
+  out["ok"] = true;
+  out["events"] = int64_t(rt_->combatFx.size() - before);
+  if (!rt_->combatFx.empty()) {
+    out["kind"] = int64_t(rt_->combatFx.back().kind);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17A — traversal combat presentation
+// ---------------------------------------------------------------------------
+
+// FUN_0045e9a0's camera-block basis: view yaw/pitch -> right/down/back
+// rows, bank 0 (same construction as the player camera's banked-up
+// path at 0x4304ed..0x430594 with sinB=0/cosB=1). Only used for the
+// shot bullet-cam pose.
+static void shotCamRows_(float yawDeg, float pitchDeg,
+                         float rows[3][4]) {
+  constexpr float kRd = 3.14159265358979323846f / 180.0f;
+  const float sy = std::sin(yawDeg * kRd);
+  const float cy = std::cos(yawDeg * kRd);
+  const float sp = std::sin(pitchDeg * kRd);
+  const float cp = std::cos(pitchDeg * kRd);
+  const float back[3] = {-sy * cp, -cy * cp, sp};
+  const float up[3] = {sy * sp, cy * sp, cp};
+  const float right[3] = {up[1] * back[2] - up[2] * back[1],
+                          up[2] * back[0] - up[0] * back[2],
+                          up[0] * back[1] - up[1] * back[0]};
+  const float down[3] = {-(back[1] * right[2] - back[2] * right[1]),
+                         -(back[2] * right[0] - back[0] * right[2]),
+                         -(back[0] * right[1] - back[1] * right[0])};
+  rows[0][0] = right[0]; rows[0][1] = right[1];
+  rows[0][2] = right[2]; rows[0][3] = 0.0f;
+  rows[1][0] = down[0];  rows[1][1] = down[1];
+  rows[1][2] = down[2];  rows[1][3] = 0.0f;
+  rows[2][0] = back[0];  rows[2][1] = back[1];
+  rows[2][2] = back[2];  rows[2][3] = 0.0f;
+}
+
+Dictionary MdkBridge::get_shot_snapshots() const {
+  Dictionary out;
+  Array shots;
+  out["shots"] = shots;
+  if (!rt_) return out;
+  out["scoped"] = mdk::playerShotRenderGate(*rt_);
+  out["hud_active"] = rt_->hudActive != 0;
+  // 0x54150c — the FX/debris-enable cheat flag: FUN_00437444's
+  // select-0 shard pen is 3 when set, 0xd when clear.
+  out["fx_enable"] = rt_->fxEnable != 0;
+  const auto vis = mdk::playerShotVisuals(*rt_);
+  for (const auto& v : vis) {
+    Dictionary d;
+    d["slot"] = int64_t(v.slot);
+    d["state"] = int64_t(v.state);
+    d["type"] = int64_t(v.type);
+    d["class_idx"] = int64_t(v.classIdx);
+    d["mesh_renderable"] = v.meshRenderable;
+    d["window_active"] = v.worldRenderable;
+    d["pos"] = mdkToGodotVec(v.pos);
+    d["pos_mdk"] = Vector3(v.pos[0], v.pos[1], v.pos[2]);
+    d["tail"] = mdkToGodotVec(v.tail);
+    d["tail_mdk"] = Vector3(v.tail[0], v.tail[1], v.tail[2]);
+    d["tail_len"] = double(v.tailLen);
+    d["yaw_deg"] = double(v.yawDeg);
+    d["pitch_deg"] = double(v.pitchDeg);
+    d["billboard_yaw_deg"] = double(v.billboardYawDeg);
+    d["billboard_pitch_deg"] = double(v.billboardPitchDeg);
+    d["spin_deg"] = double(v.spinDeg);
+    d["render_scalar"] = double(v.fieldCc);
+    d["ribbon_bound"] = v.ribbonBound;
+    d["hud_frame"] = int64_t(v.hudFrame);
+    d["arena_index"] =
+        v.arena ? indexOfArena_(&v.arena->dyn) : -1;
+    // FUN_0045f8b8's model submit (0x431503 gate, OBSERVED): the
+    // class record mesh placed by buildObjectMatrix — type 0 banks on
+    // spinDeg at scale 1.0; types 1-4 fix bank 90 / pitch 0 at scale
+    // 0.5; all yaw = yawDeg + 180 about pos.
+    float xf[9], org[3];
+    mdk::buildObjectMatrix(v.type == 0 ? v.spinDeg : 0.0f,
+                           v.type == 0 ? 0.0f : 90.0f,
+                           v.yawDeg + 180.0f,
+                           v.type == 0 ? 1.0f : 0.5f, v.pos, xf, org);
+    const mdkfront::Vec3 vorg{org[0], org[1], org[2]};
+    d["mesh_transform"] = mdkToGodotObjectTransform(
+        mdkfront::mdkTransformToGodot(xf, vorg));
+    // FUN_0045e9a0's camera block: origin = tail, view basis from
+    // (billboardYawDeg, billboardPitchDeg), scales {1.0, 2.0, -1.0}.
+    // The 140x70 window's projector divisors {69.95, 34.95} give a
+    // ~90x90 degree frustum — the 2:1 window is an anisotropic
+    // squash, so GDScript renders a square SubViewport and stretches.
+    float rows[3][4];
+    shotCamRows_(v.billboardYawDeg, v.billboardPitchDeg, rows);
+    d["cam_transform"] = Transform3D(
+        mdkToGodotBasis(mdkfront::mdkCameraBasisToGodot(rows))
+            .orthonormalized(),
+        mdkToGodotVec(v.tail));
+    shots.push_back(d);
+  }
+  return out;
+}
+
+Array MdkBridge::drain_combat_fx() {
+  Array out;
+  if (!rt_) return out;
+  for (const auto& ev : rt_->combatFx) {
+    Dictionary d;
+    d["kind"] = int64_t(ev.kind);
+    d["mode"] = int64_t(ev.mode);
+    d["variant"] = int64_t(ev.variant);
+    d["aux"] = int64_t(ev.aux);
+    d["pos"] = mdkToGodotVec(ev.pos);
+    d["pos_mdk"] = Vector3(ev.pos[0], ev.pos[1], ev.pos[2]);
+    // Non-minting lookup: a torn-down subject's id may already be
+    // re-minted or freed — 0 is always safe, never misleading.
+    d["obj_id"] = int64_t(ev.obj ? objIds_.lookup(ev.obj) : 0u);
+    d["arena_index"] = indexOfColArena_(ev.arena);
+    d["scale"] = double(ev.scale);
+    d["facing_deg"] = double(ev.facingDeg);
+    d["bank_deg"] = double(ev.bankDeg);
+    d["model_name"] = String(ev.modelName.c_str());
+    // The remnant/corpse spawn (FUN_004575fc / the FUN_00457cf4
+    // teardown path, OBSERVED): a dead EXPLODE-class object placed
+    // at pos, yaw = facingDeg (+0x4c/+0x50), bank = bankDeg
+    // (+0x13c — the camera-tilt), scale = ev.scale (+0x58). The
+    // object build matrix is the same FUN_0046b2f8 convention.
+    if (ev.kind == mdk::CombatFxKind::kDetonation ||
+        ev.kind == mdk::CombatFxKind::kObjectTeardown) {
+      float xf[9], org[3];
+      mdk::buildObjectMatrix(0.0f, ev.bankDeg, ev.facingDeg,
+                             ev.scale, ev.pos, xf, org);
+      const mdkfront::Vec3 vorg{org[0], org[1], org[2]};
+      d["transform"] = mdkToGodotObjectTransform(
+          mdkfront::mdkTransformToGodot(xf, vorg));
+    }
+    out.push_back(d);
+  }
+  rt_->combatFx.clear();
+  return out;
+}
+
+Dictionary MdkBridge::get_shot_geometry(int64_t class_idx) {
+  Dictionary out;
+  if (!rt_) return out;
+  const mdk::RuntimeModel* m =
+      mdk::traversalShotModel(rt_->level, int(class_idx));
+  if (m == nullptr) return out;
+  const ObjectGeometry g = objectGeometryFromModel(*m);
+  out["mesh"] = g.mesh;
+  out["surface_elems"] = g.surfaceElems;
+  out["elem_names"] = g.elemNames;
+  out["vert_count"] = g.vertCount;
+  out["tri_count"] = g.triCount;
+  out["elem_count"] = int64_t(m->elems.size());
+  out["geom_key"] = int64_t(g.geomKey);
+  out["model"] = String(m->modelName().c_str());
+  return out;
+}
+
+Dictionary MdkBridge::get_named_geometry(const String& name) {
+  Dictionary out;
+  if (!rt_) return out;
+  const mdk::RuntimeModel* m =
+      mdk::traversalNamedModel(rt_->level, name.utf8().get_data());
+  if (m == nullptr) return out;
+  const ObjectGeometry g = objectGeometryFromModel(*m);
+  out["mesh"] = g.mesh;
+  out["surface_elems"] = g.surfaceElems;
+  out["elem_names"] = g.elemNames;
+  out["vert_count"] = g.vertCount;
+  out["tri_count"] = g.triCount;
+  out["elem_count"] = int64_t(m->elems.size());
+  out["geom_key"] = int64_t(g.geomKey);
+  out["model"] = String(m->modelName().c_str());
+  return out;
+}
+
+PackedByteArray MdkBridge::get_active_palette() {
+  PackedByteArray out;
+  out.resize(768);
+  // Same pick as refreshKurtPalette_(): the displayed arena's
+  // composed palette, else the level fallback (SYS_PAL head +
+  // region-B + DTI-s3 compose). The FUN_00437444 shard pens and the
+  // HUD rectfill both index this active display palette.
+  const std::uint8_t* pal = levelPalette_.data();
+  if (arenaIndex_ >= 0) {
+    if (auto it = arenaSets_.find(arenaIndex_);
+        it != arenaSets_.end()) {
+      pal = it->second->palette.data();
+    }
+  }
+  std::memcpy(out.ptrw(), pal, 768);
+  return out;
+}
+
+Dictionary MdkBridge::fx_stab(const Vector3& from, const Vector3& to,
+                              int64_t arena_index) {
+  Dictionary out;
+  if (!rt_) return out;
+  // Godot->MDK is the inverse of mdkVecToGodot: (-gz, -gx, gy).
+  const float f[3] = {-from.z, -from.x, from.y};
+  const float t[3] = {-to.z, -to.x, to.y};
+  // FUN_00406a0c's arena order (OBSERVED): the record's bound arena,
+  // then 0x540c48 (cur) when different, then 0x540ca4 (partner) when
+  // non-null, !0x540d3c (carrierBusy), and different from the bound.
+  const mdk::CollisionArena* order[3] = {};
+  int n = 0;
+  mdk::TraversalArena* bound = arenaByIndex_(int(arena_index));
+  const mdk::CollisionArena* boundCol =
+      bound != nullptr ? &bound->dyn.col : nullptr;
+  if (boundCol != nullptr) order[n++] = boundCol;
+  if (rt_->cur != nullptr && &rt_->cur->dyn.col != boundCol)
+    order[n++] = &rt_->cur->dyn.col;
+  if (rt_->partner != nullptr && rt_->cs.carrierBusy == 0 &&
+      &rt_->partner->dyn.col != boundCol &&
+      (n == 0 || &rt_->partner->dyn.col != order[n - 1]))
+    order[n++] = &rt_->partner->dyn.col;
+  float hit[3];
+  const mdk::CollisionPoly* poly = nullptr;
+  for (int i = 0; i < n; ++i) {
+    const mdk::CollisionNode* node =
+        mdk::collisionStabFull(*order[i], f, t, hit, &poly);
+    if (node == nullptr) continue;
+    out["pos"] = mdkToGodotVec(hit);
+    const float nm[3] = {node->nx, node->ny, node->nz};
+    out["normal"] = mdkToGodotVec(nm);
+    out["arena_index"] = int64_t(indexOfColArena_(order[i]));
+    return out;
+  }
   return out;
 }
 

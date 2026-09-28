@@ -68,6 +68,72 @@ var mouse_dx := 0
 var mouse_dy := 0
 var mouse_dz := 0
 
+# Phase 17A — traversal combat presentation state. mdk_core owns
+# every gameplay fact; these are view-side node/resource caches only.
+var combat_diag := false          # --combat-diag flag
+var shot_nodes: Array = []        # [Node3D] per slot, under ShotRoot
+var shot_geom := {}               # class_idx -> {key:int, meshes:Array}
+var named_geom := {}              # model name -> {key:int, meshes:Array}
+var shot_vps: Array = []          # [SubViewport] per slot
+var shot_cams: Array = []         # [Camera3D] per slot
+var shot_wins: Array = []         # [TextureRect] per slot (HUD windows)
+var shot_fills: Array = []        # [ColorRect] per slot (HUD fills)
+var fx_palette := PackedByteArray()  # get_active_palette() (768)
+var shard_mats := {}              # palette pen -> StandardMaterial3D
+var shard_tetra: Array = []       # jittered-tetra mesh bank
+var fx_enable_live := false       # 0x54150c gate (per-frame)
+var shards: Array = []            # live shard dicts {mi, vel, ttl}
+var remnant_seq := 0              # remnant node counter
+var remnants: Array = []          # live EXPLODE remnant Node3Ds
+var fx_seq := 0                   # deterministic jitter counter (see
+                                  #   _fx_rand — never touches core RNG)
+var fx_recent: Array = []         # last drained events (diag, cap 16)
+var fx_stats := {"events": 0, "shards": 0, "remnants": 0,
+	"kinds": {}}                # --combat-diag counters
+
+# The original 600x360 HUD window rects (0x49b900/0x49b8e8, OBSERVED).
+const SHOT_HUD_RECT := [
+	Rect2(72, 10, 140, 70),
+	Rect2(228, 0, 140, 70),
+	Rect2(384, 10, 140, 70),
+]
+# FUN_00437444's paletteMode table — select -> {pen, shadeByte,
+# scale} (0x43745f..0x43751d, OBSERVED):
+#   0  -> {pen 3 when 0x54150c set else 0xd, shade 3,    scale 1.0}
+#   1  -> {pen 0x25,                           shade 0xf0, scale 0.5}
+#   >=2-> {pen 10,                             shade 3,    scale 1.0}
+# The select-0 gate needs the live 0x54150c — resolved per frame
+# from the bridge's fx_enable, not folded into this const.
+const SHARD_SEL1 := {"pen": 0x25, "shade": 0xf0, "scale": 0.5}
+const SHARD_SEL2 := {"pen": 10, "shade": 3, "scale": 1.0}
+const SHARD_SEL0_ON := {"pen": 3, "shade": 3, "scale": 1.0}
+const SHARD_SEL0_OFF := {"pen": 0xd, "shade": 3, "scale": 1.0}
+# The death-teardown burst (FUN_00457cf4 -> FUN_00404108, OBSERVED):
+# 16 shards at pen 0x30, shade 0x10, scale 1.0, spawn pos = victim.
+const TEAR_SHARDS := 16
+const TEAR_PEN := 0x30
+const TEAR_SHADE := 0x10
+const SHARD_CAP := 512            # the original pool is bounded too
+# FUN_00404108's tetra vertex directions (0x403dd0) in Godot axes —
+# MDK (x,y,z) -> (-y, z, -x) already folded in.
+const SHARD_DIR := [
+	Vector3(0.0, 0.5, 0.0),
+	Vector3(0.0, -0.5, -0.5),
+	Vector3(-0.5, -0.5, 0.5),
+	Vector3(0.5, -0.5, 0.5),
+]
+# Face indices verbatim (u16 triples at +0x96/+0xba/+0xde/+0x102).
+const SHARD_FACES := [
+	[0, 2, 1], [0, 3, 2], [0, 1, 3], [1, 2, 3],
+]
+# Bullet-cam projector: window divisors {69.95,34.95} over the 140x70
+# rect -> tan(hfov/2)=70/69.95, tan(vfov/2)=35/34.95 — a ~90x90 deg
+# frustum squashed into 2:1. We render a square viewport (equal
+# h/v fov) and let the TextureRect squash it to the rect.
+const SHOT_CAM_FOV := 90.08       # 2*atan(35/34.95) in degrees
+const SHARD_TICKS_PER_SEC := 30.0 # the +0x196 countdown is frameStep
+                                  # units — the 30Hz tick domain
+
 # Presentation resources (built in _build_player_proxy).
 var body_mat: StandardMaterial3D
 var marker_mat: StandardMaterial3D
@@ -131,6 +197,9 @@ func _check(cond: bool, label: String) -> void:
 func _ready() -> void:
 	var args := OS.get_cmdline_user_args()
 	smoke = "--smoke" in args
+	# Phase 17A diagnostics — combat-FX counters in the F3 label.
+	# Observational only: never touches core state or RNG.
+	combat_diag = "--combat-diag" in args
 	var data_root := _arg_value(args, "--data-path",
 		OS.get_environment("MDK_DATA_ROOT"))
 	if data_root.is_empty():
@@ -218,6 +287,7 @@ func _ready() -> void:
 
 	_build_player_proxy()
 	_build_kurt_presenter()
+	_build_combat_presenter()
 
 	# One idle frame settles the deterministic spawn camera.
 	bridge.step_frame_input(0.0, {})
@@ -588,6 +658,417 @@ func _update_box_wire(box: AABB) -> void:
 		im.surface_add_vertex(box.position + e[0] * box.size)
 		im.surface_add_vertex(box.position + e[1] * box.size)
 	im.surface_end()
+
+
+# ---------------------------------------------------------------------------
+# Phase 17A — traversal combat presentation.
+#
+# Everything below is FUN_0045f030's domain: the scoped shot render
+# pass (world class-mesh per slot + the three bullet-cam HUD windows
+# + the indicator fills) and the combat FX that FUN_00437444 /
+# FUN_004575fc / FUN_00457cf4 spawn. Core owns every gameplay fact —
+# snapshots/events arrive already converted; this file only turns
+# them into nodes.
+#
+# Deferred seams (documented, not emulated):
+#   - the per-face lambert shade depth (pen - +0x95 * max(0, n.L) in
+#     FUN_00405c58) — shards draw unshaded in their base pen, the
+#     same convention as object element materials.
+#   - the 0x404e40 emitter variant (25% of effScale>=1.0 shards that
+#     trail 0x196==0xb stationary children every +0x1a2 ticks).
+#   - the second 0x412e94 sweep-damp on contact and the +0x186&8
+#     expire->FUN_004575fc remnant path (not set on this pool's
+#     records, so expiry just frees).
+#   - RICO1-3 impact sounds and +0x150 per-object sound overrides
+#     (aux carries the marker; no audio here).
+#   - FUN_0046ec60 heading-indicator sprite and FUN_00409760's type-4
+#     +0xf4 HUD counter — HUD garnish beyond the combat pass.
+# ---------------------------------------------------------------------------
+
+
+func _build_combat_presenter() -> void:
+	# Per-slot world mesh — children rebuild when the bound class
+	# record's geom_key changes.
+	for i in 3:
+		var n := Node3D.new()
+		n.name = "Shot_%d" % i
+		n.visible = false
+		$ShotRoot.add_child(n)
+		shot_nodes.append(n)
+		# Bullet-cam: a square SubViewport (the window's 140x70 squash
+		# is handled by stretching — the projector's 69.95/34.95
+		# divisors give ~90 deg on both axes). Shares the main world
+		# so the display list the window re-renders matches.
+		var vp := SubViewport.new()
+		vp.name = "ShotVP_%d" % i
+		vp.size = Vector2i(140, 140)
+		vp.world_3d = get_viewport().world_3d
+		vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+		var cam := Camera3D.new()
+		cam.fov = SHOT_CAM_FOV
+		cam.near = 0.05
+		cam.far = 20000.0
+		vp.add_child(cam)
+		$ShotCamRoot.add_child(vp)
+		shot_vps.append(vp)
+		shot_cams.append(cam)
+		var vt := ViewportTexture.new()
+		vt.viewport_path = vp.get_path()
+		var win := TextureRect.new()
+		win.name = "ShotWin_%d" % i
+		win.texture = vt
+		win.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		win.stretch_mode = TextureRect.STRETCH_SCALE
+		win.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		win.visible = false
+		$ShotCamLayer.add_child(win)
+		shot_wins.append(win)
+		# The expired/free-slot indicator fill (FUN_00416aa8 rectfill
+		# of the window rect in the hudFrame pen).
+		var fill := ColorRect.new()
+		fill.name = "ShotFill_%d" % i
+		fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		fill.visible = false
+		$ShotCamLayer.add_child(fill)
+		shot_fills.append(fill)
+	fx_palette = bridge.get_active_palette()
+
+
+func _pen_color(pen: int) -> Color:
+	var p := clampi(pen, 0, 255) * 3
+	if fx_palette.size() < 768:
+		return Color(0, 0, 0)
+	return Color(fx_palette[p] / 255.0, fx_palette[p + 1] / 255.0,
+		fx_palette[p + 2] / 255.0)
+
+
+func _shard_material(pen: int) -> StandardMaterial3D:
+	var key := clampi(pen, 0, 255)
+	if shard_mats.has(key):
+		return shard_mats[key]
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	m.albedo_color = _pen_color(key)
+	shard_mats[key] = m
+	return m
+
+
+func _fx_rand() -> float:
+	# Deterministic presentation jitter (SplitMix-ish over a local
+	# counter) — NEVER touches core RNG, so diagnostics and draw
+	# order can't perturb gameplay randomness.
+	fx_seq = (fx_seq + 1) & 0x7fffffff
+	var z := (fx_seq * 0x6c8e9cf5) & 0x7fffffff
+	z = (z ^ (z >> 15)) & 0x7fffffff
+	z = (z * 0x2c1b3c6d) & 0x7fffffff
+	z = (z ^ (z >> 12)) & 0x7fffffff
+	return float(z & 0xffff) / 65536.0
+
+
+func _shard_mesh(jit_seed: int) -> ArrayMesh:
+	# FUN_00404108's tetra (OBSERVED): verts = (dirTable[i] +
+	# (rand-0x4000)*2e-5 per comp) * effScale — the dir entry is
+	# +-0.5 and the jitter spans +-0.33, so each shard is a visibly
+	# irregular tetra. A bank of jittered variants keeps the draw
+	# cheap while preserving the observed deformation range.
+	var seed := jit_seed
+	var verts := PackedVector3Array()
+	for i in 4:
+		var v: Vector3 = SHARD_DIR[i]
+		seed = (seed * 1103515245 + 12345) & 0x7fffffff
+		v.x += ((seed & 0x7fff) / 32768.0 - 0.5) * 0.65536
+		seed = (seed * 1103515245 + 12345) & 0x7fffffff
+		v.y += ((seed & 0x7fff) / 32768.0 - 0.5) * 0.65536
+		seed = (seed * 1103515245 + 12345) & 0x7fffffff
+		v.z += ((seed & 0x7fff) / 32768.0 - 0.5) * 0.65536
+		verts.append(v)
+	var idx := PackedInt32Array()
+	for f in SHARD_FACES:
+		for vi in f:
+			idx.append(vi)
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_INDEX] = idx
+	var m := ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return m
+
+
+func _spawn_shards(pos: Vector3, count: int, select: int,
+		arena_idx: int) -> void:
+	# FUN_00437444's spawn loop: count records through the +0x5c
+	# pool, each FUN_00404108-inited (pos jitter, random velocity,
+	# 60+(rand>>9) tick life, effScale = select.scale * (1+-0.5)).
+	var mode: Dictionary
+	if select == 1:
+		mode = SHARD_SEL1
+	elif select == 0:
+		mode = SHARD_SEL0_ON if fx_enable_live else SHARD_SEL0_OFF
+	else:
+		mode = SHARD_SEL2
+	var pen := int(mode["pen"])
+	var scale := float(mode["scale"])
+	for i in count:
+		if shards.size() >= SHARD_CAP:
+			break
+		var mi := MeshInstance3D.new()
+		# Jittered-tetra bank — 8 variants is plenty for the
+		# +-0.33 vert-perturbation range to read as irregular.
+		while shard_tetra.size() < 8:
+			shard_tetra.append(_shard_mesh(shard_tetra.size() * 7919))
+		mi.mesh = shard_tetra[fx_seq & 7]
+		mi.material_override = _shard_material(pen)
+		# effScale = select.scale * (1 + (rand-0x4000)*3.0517e-5)
+		mi.scale = Vector3.ONE * (scale * (0.5 + _fx_rand()))
+		# +0x20/+0x30/+0x40: pos + jitter — +-1.0 horiz (2^-14),
+		# +-0.5 vertical (2^-15), MDK axes folded: -y,x->godot -x,-z.
+		mi.position = pos + Vector3(
+			(_fx_rand() - 0.5) * 2.0,
+			(_fx_rand() - 0.5) * 1.0,
+			(_fx_rand() - 0.5) * 2.0)
+		$FxRoot.add_child(mi)
+		# +0x18a/+0x18e/+0x192 velocity (units/tick): +-1.0 horiz,
+		# (rand-0x800)*2^-14 vertical -> [-0.125, +1.875) up-biased.
+		var vel := Vector3(
+			(_fx_rand() - 0.5) * 2.0,
+			_fx_rand() * 2.0 - 0.125,
+			(_fx_rand() - 0.5) * 2.0)
+		# +0x196 countdown: 60 + (rand>>9) ticks (0x404417, OBSERVED).
+		var ttl := 60.0 + floorf(_fx_rand() * 64.0)
+		# 0x46b180 tumble — random per-axis rates (~+-14 deg/tick).
+		var spin := Vector3((_fx_rand() - 0.5) * 28.0,
+			(_fx_rand() - 0.5) * 28.0, (_fx_rand() - 0.5) * 28.0)
+		shards.append({"mi": mi, "vel": vel, "ttl": ttl,
+			"arena": arena_idx, "spin": spin})
+		fx_stats["shards"] = int(fx_stats["shards"]) + 1
+
+
+func _spawn_tear_shards(pos: Vector3, arena_idx: int) -> void:
+	# FUN_00457cf4's 16-shard child burst — the same 0x404108 init
+	# (random vel/ttl/jitter) at pen 0x30, shade 0x10, scale 1.0.
+	if shards.size() >= SHARD_CAP:
+		return
+	for i in TEAR_SHARDS:
+		if shards.size() >= SHARD_CAP:
+			break
+		var mi := MeshInstance3D.new()
+		while shard_tetra.size() < 8:
+			shard_tetra.append(_shard_mesh(shard_tetra.size() * 7919))
+		mi.mesh = shard_tetra[(fx_seq + i) & 7]
+		mi.material_override = _shard_material(TEAR_PEN)
+		mi.scale = Vector3.ONE * (0.5 + _fx_rand())
+		mi.position = pos + Vector3(
+			(_fx_rand() - 0.5) * 2.0,
+			(_fx_rand() - 0.5) * 1.0,
+			(_fx_rand() - 0.5) * 2.0)
+		$FxRoot.add_child(mi)
+		shards.append({"mi": mi,
+			"vel": Vector3((_fx_rand() - 0.5) * 2.0,
+				_fx_rand() * 2.0 - 0.125, (_fx_rand() - 0.5) * 2.0),
+			"ttl": 60.0 + floorf(_fx_rand() * 64.0),
+			"arena": arena_idx,
+			"spin": Vector3((_fx_rand() - 0.5) * 28.0,
+				(_fx_rand() - 0.5) * 28.0, (_fx_rand() - 0.5) * 28.0)})
+		fx_stats["shards"] = int(fx_stats["shards"]) + 1
+
+
+func _spawn_remnant(ev: Dictionary) -> void:
+	# FUN_004575fc / the FUN_00457cf4 corpse — an EXPLODE-class dead
+	# object at the event transform (the bridge folds facingDeg +
+	# bankDeg + scale through buildObjectMatrix). Persist until the
+	# arena tears down — the original record is +0x06-flagged and
+	# survives the FUN_0045cf18 sweep.
+	if not named_geom.has("EXPLODE"):
+		named_geom["EXPLODE"] = _load_geom_entry(
+			bridge.get_named_geometry("EXPLODE"))
+	var ent: Dictionary = named_geom["EXPLODE"]
+	if ent["meshes"].is_empty():
+		return
+	var n := Node3D.new()
+	n.name = "Remnant_%d" % remnant_seq
+	remnant_seq += 1
+	n.transform = ev["transform"]
+	for sm in ent["meshes"]:
+		var mi := MeshInstance3D.new()
+		mi.mesh = sm["mesh"]
+		mi.material_override = _elem_material(String(sm["name"]))
+		n.add_child(mi)
+	$FxRoot.add_child(n)
+	remnants.append(n)
+	fx_stats["remnants"] = int(fx_stats["remnants"]) + 1
+
+
+func _load_geom_entry(g: Dictionary) -> Dictionary:
+	# Normalize a get_*_geometry dict into {key, meshes:[{mesh,name}]}
+	# for per-element material naming (same convention as objects).
+	if g.is_empty():
+		return {"key": -1, "meshes": []}
+	var meshes := []
+	var names: PackedStringArray = g["elem_names"]
+	for sm in _object_geom_meshes(g):
+		var nm := ""
+		var ei := int(sm["elem"])
+		if ei >= 0 and ei < names.size():
+			nm = names[ei]
+		meshes.append({"mesh": sm["mesh"], "name": nm})
+	return {"key": int(g["geom_key"]), "meshes": meshes}
+
+
+func _apply_shot_snapshots() -> void:
+	var ss: Dictionary = bridge.get_shot_snapshots()
+	if ss.is_empty():
+		return
+	var scoped := bool(ss["scoped"])
+	var hud := bool(ss["hud_active"])
+	fx_enable_live = bool(ss["fx_enable"])
+	# The active palette follows the displayed arena — refresh per
+	# frame and drop stale pen materials when it changes.
+	var pal: PackedByteArray = bridge.get_active_palette()
+	if pal != fx_palette:
+		fx_palette = pal
+		shard_mats.clear()
+	var vp := get_viewport().get_visible_rect().size
+	var sx := vp.x / KURT_SCREEN.x
+	var sy := vp.y / KURT_SCREEN.y
+	var arr: Array = ss["shots"]
+	for i in mini(shot_nodes.size(), arr.size()):
+		var s: Dictionary = arr[i]
+		var node: Node3D = shot_nodes[i]
+		# World mesh — the 0x431503 submit gate is state == 1 only,
+		# independent of the scope state (a shot stays live after
+		# unscoping until it dies).
+		if bool(s["mesh_renderable"]):
+			var ci := int(s["class_idx"])
+			if not shot_geom.has(ci):
+				shot_geom[ci] = _load_geom_entry(
+					bridge.get_shot_geometry(ci))
+			var ent: Dictionary = shot_geom[ci]
+			var gkey := int(ent["key"])
+			if int(node.get_meta("geom_key", -1)) != gkey:
+				for c in node.get_children():
+					node.remove_child(c)
+					c.free()
+				for sm in ent["meshes"]:
+					var mi := MeshInstance3D.new()
+					mi.mesh = sm["mesh"]
+					mi.material_override = _elem_material(
+						String(sm["name"]))
+					node.add_child(mi)
+				node.set_meta("geom_key", gkey)
+			node.transform = s["mesh_transform"]
+			node.visible = gkey >= 0
+		else:
+			node.visible = false
+		# The slot's HUD window rect in scaled 600x360 space.
+		var rect: Rect2 = SHOT_HUD_RECT[i]
+		var pos2 := Vector2(rect.position.x * sx,
+			rect.position.y * sy)
+		var size2 := Vector2(rect.size.x * sx, rect.size.y * sy)
+		var win: TextureRect = shot_wins[i]
+		var fill: ColorRect = shot_fills[i]
+		var vps: SubViewport = shot_vps[i]
+		# Mode 0 (bullet cam): state!=0 && lifetime>0 under the
+		# scoped gate — the window re-renders the display list from
+		# the tail camera (FUN_0045ee08).
+		var wact := scoped and bool(s["window_active"])
+		win.visible = wact
+		vps.render_target_update_mode = \
+			SubViewport.UPDATE_ALWAYS if wact else \
+			SubViewport.UPDATE_DISABLED
+		if wact:
+			win.position = pos2
+			win.size = size2
+			shot_cams[i].transform = s["cam_transform"]
+		# Mode 1 (FUN_00416aa8 rectfill): expired/free slots draw the
+		# hudFrame pen over the window — gated on hudActive
+		# (0x5414d4); an active slot's -1 frame draws nothing.
+		var hf := int(s["hud_frame"])
+		var fact := scoped and hud and hf >= 0
+		fill.visible = fact
+		if fact:
+			fill.position = pos2
+			fill.size = size2
+			fill.color = _pen_color(hf)
+
+
+func _drain_combat_fx() -> void:
+	var evs: Array = bridge.drain_combat_fx()
+	for ev in evs:
+		fx_stats["events"] = int(fx_stats["events"]) + 1
+		fx_recent.append(ev)
+		while fx_recent.size() > 16:
+			fx_recent.pop_front()
+		var k := int(ev["kind"])
+		var kinds: Dictionary = fx_stats["kinds"]
+		kinds[k] = int(kinds.get(k, 0)) + 1
+		match k:
+			0, 1, 2, 3:
+				# FUN_00437444 — the shard burst. count = mode (ECX),
+				# palette/life/scale select = variant ([EBP+8]).
+				_spawn_shards(ev["pos"], int(ev["mode"]),
+					int(ev["variant"]), int(ev["arena_index"]))
+			4:
+				# FUN_004575fc — the EXPLODE detonation remnant.
+				_spawn_remnant(ev)
+			5:
+				# +0x110 death-script handoff — the object's script
+				# owns whatever it shows; nothing to spawn here.
+				pass
+			6:
+				# FUN_00457cf4 — 16-shard burst + the EXPLODE corpse
+				# (both spawned inside the teardown, OBSERVED).
+				_spawn_tear_shards(ev["pos"], int(ev["arena_index"]))
+				_spawn_remnant(ev)
+
+
+func _tick_combat_fx(delta: float) -> void:
+	if shards.is_empty():
+		return
+	var step := delta * SHARD_TICKS_PER_SEC
+	var keep := []
+	for sh in shards:
+		var mi: MeshInstance3D = sh["mi"]
+		var vel: Vector3 = sh["vel"]
+		# FUN_00405014 (OBSERVED): newPos = pos + vel*smoothed, then
+		# the FUN_00406a0c contact stab (record arena -> cur ->
+		# partner). On contact: life -20, vel -= 1.4*(vel.n)*n
+		# (0x4943ec lossy reflect), pos = crossing point. On a miss:
+		# vel.z_mdk = 0.0711 - vel.z_mdk — the 0.2844*0.25 flutter
+		# (0x4943dc*0x4943e4) — z_mdk is Godot +Y.
+		var np: Vector3 = mi.position + vel * step
+		var hit: Dictionary = bridge.fx_stab(mi.position, np,
+			int(sh["arena"]))
+		if not hit.is_empty():
+			mi.position = hit["pos"]
+			var n: Vector3 = hit["normal"]
+			vel = vel - n * (1.4 * vel.dot(n))
+			sh["ttl"] = float(sh["ttl"]) - 20.0
+		else:
+			mi.position = np
+			vel.y = 0.0711 - vel.y
+		sh["vel"] = vel
+		# +0x196 -= frameStep (0x49b6e8 — ~1 per 30Hz tick); the
+		# countdown is frame-domain, so ttl decrements per tick.
+		sh["ttl"] = float(sh["ttl"]) - step
+		# The 0x46b180 tumble — cosmetic random-axis spin.
+		var sp: Vector3 = sh["spin"]
+		mi.rotation += sp * (step * (PI / 180.0))
+		if float(sh["ttl"]) <= 0.0:
+			mi.queue_free()
+		else:
+			keep.append(sh)
+	shards = keep
+
+
+func _combat_diag_text() -> String:
+	if not combat_diag:
+		return ""
+	return ("\nfx ev %d  shards %d live %d  remnants %d  kinds %s" %
+		[int(fx_stats["events"]), int(fx_stats["shards"]),
+		shards.size(), int(fx_stats["remnants"]),
+		str(fx_stats["kinds"])])
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1553,7 @@ func _update_debug_label() -> void:
 		p["arena_display"]] +
 		"vel move %.2f  strafe %.2f  vert %.2f  turn %.2f" %
 		[p["move_vel"], p["strafe_vel"], p["vert_vel"],
-		p["turn_vel"]] + portal + anim)
+		p["turn_vel"]] + portal + anim + _combat_diag_text())
 
 
 func _input_mask() -> int:
@@ -1229,6 +1710,12 @@ func _process(delta: float) -> void:
 	_apply_camera_snapshot()
 	_apply_object_snapshots()
 	_apply_kurt_snapshot()
+	# Phase 17A — combat presentation. Order mirrors the original:
+	# the combat FX drain runs once per rendered frame; shot windows
+	# and shard lifetimes refresh on the same cadence.
+	_apply_shot_snapshots()
+	_drain_combat_fx()
+	_tick_combat_fx(delta)
 	_update_debug_label()
 	# Rebuild the presented arena set only when the display digest
 	# changes — a BSP-order change from camera movement, a portal
@@ -1920,6 +2407,201 @@ func _run_smoke(data_root: String) -> void:
 	_check(saw_turn_fire, "turn+fire -> K_TRN45 main frame")
 	_check(saw_overlay, "muzzle overlay presented (K_MUZZF)")
 
+	# ---- Phase 17A: traversal combat presentation -----------------
+	# The scoped sniper fire path — the only shot-render path in the
+	# original (0x436dd3: flagC9c && transitionPhase > 1). Re-anchor
+	# in HMO_9 so a live object is enumerated for the remnant/corpse
+	# events, then scope in via the real input path. Yaw 270 is a
+	# probe-verified clear line — it points away from the XGS spawn
+	# (yaw 90 sent the tracer straight into it, killing the object
+	# before the kill-diagnostic section could enumerate it).
+	var pre_c: Dictionary = bridge.get_player_snapshot()
+	var dsc: Dictionary = bridge.diagnostic_start(8,
+		Vector3(-174.0, 2625.0, -293.0), 270.0)
+	_check(dsc.get("ok", false), "combat: diagnostic_start into HMO_9")
+	var ss0: Dictionary = bridge.get_shot_snapshots()
+	_check(not ss0.is_empty() and ss0["shots"].size() == 3,
+		"combat: shot snapshot carries the 3-slot pool")
+	_step_n({"mouse_buttons": 4}, 1)     # MMB edge -> scope toggle
+	_step_n({}, 8)                       # transitionPhase advances
+	var ss1: Dictionary = bridge.get_shot_snapshots()
+	if not bool(ss1["scoped"]):
+		# A pulse arriving inside a transition can be swallowed —
+		# retry the edge after settling.
+		_step_n({"mouse_buttons": 4}, 1)
+		_step_n({}, 8)
+		ss1 = bridge.get_shot_snapshots()
+	_check(bool(ss1["scoped"]), "combat: scoped after MMB pulse")
+	# 0x464a56's gate is level-triggered (ctrl.fire != 0) but also
+	# needs fireCadence == 0 — the earlier unscoped punches left the
+	# cadence timer hot, and it only decays while scoped. Hold LMB
+	# through the decay; the first shot may die the same tick (an
+	# HMO_9 spawn sits on the yaw-90 line), so the state-1 transient
+	# is caught per-frame rather than on the first nonzero slot.
+	var ss2: Dictionary
+	var live := -1
+	var saw_state1 := false
+	var mesh_node_ok := false
+	var win_ok := false
+	var fill_ok := false
+	var saw_kind := {}
+	var shards0 := int(fx_stats["shards"])
+	for i in 90:
+		_step_n({"mouse_buttons": 1}, 1)
+		ss2 = bridge.get_shot_snapshots()
+		_drain_combat_fx()
+		for ev in fx_recent:
+			saw_kind[int(ev["kind"])] = ev
+		fx_recent.clear()
+		_apply_shot_snapshots()
+		for j in 3:
+			var sj: Dictionary = ss2["shots"][j]
+			if int(sj["state"]) != 0 and live < 0:
+				live = j
+			if int(sj["state"]) == 1:
+				saw_state1 = true
+				var sn := $ShotRoot.get_node_or_null("Shot_%d" % j)
+				if sn != null and sn.visible and \
+						sn.get_child_count() > 0:
+					mesh_node_ok = true
+			if bool(sj["window_active"]) and shot_wins[j].visible:
+				win_ok = true
+			if bool(ss2["hud_active"]) and \
+					int(sj["state"]) == 0 and shot_fills[j].visible:
+				fill_ok = true
+		if saw_state1 and mesh_node_ok:
+			break
+	_check(live >= 0, "combat: scoped LMB spawned a shot")
+	_check(saw_state1,
+		"combat: state==1 -> world-mesh submit gate open")
+	if live >= 0:
+		var sv: Dictionary = ss2["shots"][live]
+		_check(int(sv["class_idx"]) == -1,
+			"combat: default shot binds class slot -1 (KURT)")
+	_check(mesh_node_ok,
+		"combat: shot world-mesh node built+visible")
+	_check(win_ok, "combat: bullet-cam window texture-rect shown")
+	_check(fill_ok, "combat: free-slot HUD indicator fill drawn")
+	var sg: Dictionary = bridge.get_shot_geometry(-1)
+	_check(not sg.is_empty() and int(sg["vert_count"]) > 0,
+		"combat: KURT geometry resolves from STREAM.BNI")
+	if live >= 0:
+		# Fly to impact — a tracer dies by wall hit (kShotWallImpact),
+		# object hit (kShotObjectImpact), or lifetime expiry (no
+		# event). LMB released: whatever remains in the pool decays.
+		for i in 90:
+			_step_n({}, 1)
+			_apply_shot_snapshots()
+			_drain_combat_fx()
+			_tick_combat_fx(1.0 / 30.0)
+			for ev in fx_recent:
+				saw_kind[int(ev["kind"])] = ev
+			fx_recent.clear()
+			var any_live := false
+			for sj in bridge.get_shot_snapshots()["shots"]:
+				if int(sj["state"]) != 0:
+					any_live = true
+			if saw_kind.has(0) or saw_kind.has(1) or not any_live:
+				break
+		if saw_kind.has(0) or saw_kind.has(1):
+			var iev: Dictionary = saw_kind.get(0, saw_kind.get(1))
+			_check(int(iev["arena_index"]) >= 0,
+				"combat: impact event carries its arena")
+			_check(int(fx_stats["shards"]) > shards0,
+				"combat: impact spawned FUN_00404108 shards")
+		# else: expired in flight — no event is the OBSERVED contract
+		# for types 0/1.
+
+	# Remnant + corpse events — the XGS (enemy 30) is the guaranteed
+	# enumerated object in HMO_9. diagnostic_shockwave runs the real
+	# FUN_004575fc seam; diagnostic_kill runs FUN_00458140's boundary.
+	var cobj := -1
+	for od in bridge.get_object_snapshots():
+		cobj = int(od["id"])
+		break
+	_check(cobj > 0, "combat: live object enumerated for FX events")
+	if cobj > 0:
+		var rem0 := remnants.size()
+		var wv: Dictionary = bridge.diagnostic_shockwave(cobj)
+		_check(bool(wv.get("ok", false)),
+			"combat: shockwave diagnostic ran")
+		_drain_combat_fx()
+		var det_ev := {}
+		for ev in fx_recent:
+			if int(ev["kind"]) == 4:
+				det_ev = ev
+		fx_recent.clear()
+		_check(not det_ev.is_empty(),
+			"combat: kDetonation event drained")
+		if not det_ev.is_empty():
+			_check(abs(float(det_ev["scale"]) - 2.0) < 1e-4,
+				"combat: detonation remnant scale == 2.0")
+			_check(det_ev.has("transform"),
+				"combat: detonation carries the spawn transform")
+			_check(remnants.size() > rem0,
+				"combat: remnant node spawned under FxRoot")
+		# Kill — the XGS binds a deathRef (+0x110), so the first
+		# boundary call posts the script-handoff event; the teardown
+		# (kind 6) follows when the script or a second boundary call
+		# reaches the FUN_00457cf4 path.
+		var shards1 := int(fx_stats["shards"])
+		var rem1 := remnants.size()
+		var sw0: Dictionary = bridge.diagnostic_kill(cobj)
+		_check(bool(sw0.get("ok", false)),
+			"combat: kill diagnostic ran on the object")
+		var saw5 := false
+		var saw6 := false
+		for i in 40:
+			_step_n({}, 1)
+			_drain_combat_fx()
+			for ev in fx_recent:
+				var k := int(ev["kind"])
+				if k == 5:
+					saw5 = true
+				elif k == 6:
+					saw6 = true
+			fx_recent.clear()
+			if saw6:
+				break
+		if not saw6:
+			# +0x110 already consumed — a second boundary call lands
+			# on the teardown path directly.
+			bridge.diagnostic_kill(cobj)
+			_drain_combat_fx()
+			for ev in fx_recent:
+				if int(ev["kind"]) == 6:
+					saw6 = true
+			fx_recent.clear()
+		_check(saw5 or saw6,
+			"combat: death boundary event drained (handoff or teardown)")
+		_check(saw6, "combat: kObjectTeardown event drained")
+		if saw6:
+			_check(int(fx_stats["shards"]) >= shards1 + TEAR_SHARDS,
+				"combat: teardown emitted the 16-shard burst")
+			_check(remnants.size() > rem1,
+				"combat: teardown spawned the EXPLODE corpse")
+	# Shard reap — the +0x196 countdown (60+(rand>>9) ticks) expires
+	# every live shard; the pool empties back to zero.
+	for i in 8:
+		_tick_combat_fx(1.0)
+		if shards.is_empty():
+			break
+	_check(shards.is_empty(), "combat: shards reaped on ttl expiry")
+	# Unscope, then restore the pre-combat anchor — the damage/death
+	# blocks below are palette-epoch sensitive (the Kurt texture
+	# cache keys on the displayed arena's palette).
+	for i in 4:
+		if not bool(bridge.get_shot_snapshots()["scoped"]):
+			break
+		_step_n({"mouse_buttons": 4}, 1)
+		_step_n({}, 8)
+	_check(not bool(bridge.get_shot_snapshots()["scoped"]),
+		"combat: unscoped for downstream blocks")
+	if not pre_c.is_empty():
+		bridge.diagnostic_start(int(pre_c["arena"]),
+			pre_c["pos_mdk"], float(pre_c["yaw_deg"]))
+		_step_n({}, 8)
+
 	# ---- 16B.1: authentic damage/death dispatch ----
 	# Damage enters ONLY through the core producer
 	# (diagnostic_damage -> playerDamageApply == FUN_0046771c); the
@@ -1938,7 +2620,9 @@ func _run_smoke(data_root: String) -> void:
 	var saw_bang := false
 	var saw_bflip := false
 	var tumble_state := false
-	var ktex0 := int(bridge.get_kurt_snapshot()["tex_cache"])
+	var ks0: Dictionary = bridge.get_kurt_snapshot()
+	var ktex0 := int(ks0["tex_cache"])
+	var kpal0 := int(ks0["pal_key"])
 	for i in 130:
 		_step_n({}, 1)
 		var kd: Dictionary = bridge.get_kurt_snapshot()
@@ -1979,9 +2663,14 @@ func _run_smoke(data_root: String) -> void:
 	_check(int(dd3["event_priority"]) == 10,
 		"death event priority 10")
 	_check(int(dd3["fade"]) > 0, "death fade armed (eb8 countdown)")
-	var ktex1 := int(bridge.get_kurt_snapshot()["tex_cache"])
+	var ks1: Dictionary = bridge.get_kurt_snapshot()
+	var ktex1 := int(ks1["tex_cache"])
+	var kpal1 := int(ks1["pal_key"])
 	_check(ktex1 - ktex0 < 64,
-		"texture cache bounded through damage/death")
+		"texture cache bounded through damage/death " +
+		"(delta=%d pal=%x->%x arena=%d)" %
+		[ktex1 - ktex0, kpal0, kpal1,
+			int(bridge.get_player_snapshot()["arena"])])
 	var km_end: TextureRect = $KurtLayer/KurtViewport/KurtMain
 	_check(km_end.visible and km_end.texture != null,
 		"KurtMain still presents during death")

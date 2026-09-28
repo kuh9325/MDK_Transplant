@@ -3327,8 +3327,10 @@ particle pool or sound engine.
 
 ## 141. `FUN_00437444` — impact presentation dispatch (OBSERVED callsites)
 
-Signature `(EAX ctx, EDX &pos, EBX sndName, ECX paletteMode,
-stack count)`. Internally: `paletteMode` selects
+Signature `(EAX ctx, EDX &pos, EBX sndName, ECX count,
+stack paletteMode)` — the asm pins ECX as the spawn-loop counter
+(ESI, `0x4374cf`/`0x4375e2` DEC+JNZ loop) and `[EBP+8]` as the
+select (`0x43745f` TEST/CMP chain). Internally: `paletteMode` selects
 `{life|color, scale}` — `0 → {0xd or 3 (0x54150c gate), 3, 1.0}`,
 `1 → {0x25, 0xf0, 0.5}`, `else → {10, 3, 1.0}`; `sndName` null or
 empty-string → random RICO1/2/3 handle (`FUN_00401ed4` bounded
@@ -3338,21 +3340,24 @@ spawn through the `FUN_00403f6c`/`FUN_00404108` pool
 (presentation-only, depth-evicted).
 
 - Shot wall (`FUN_00460164` tail, `0x4601a8`/`0x4601c3`):
-  `surfaceDispatch` bit0 set → `{mode 1, count 2}` else
-  `{mode 3, count 1}`; EBX `0`.
+  `surfaceDispatch` bit0 set → `{select 2, count 1}` else
+  `{select 1, count 3}`; EBX `0`.
 - Shot object survived (`FUN_0045ff9d`, `0x460059`):
-  `{mode 3, count flag21f}`, EBX `= obj+0x150`, pos `=&obj+0x210`.
-- Punch object survived (`0x4334b0`): `{mode 1, count flag21f}`,
-  EBX `= obj+0x150`, pos `=&hitPt` (element or whole-object).
-- Punch wall (`0x43371f`/`0x43377e` vs `0x43379b`): `{mode 1,
-  count 2}` when the surface handler ran else `{mode 1, count 1}`;
-  EBX `0`.
+  `{select flag21f, count 3}`, EBX `= obj+0x150`,
+  pos `=&obj+0x210`.
+- Punch object survived (`0x4334b0`): `{select flag21f,
+  count 1}`, EBX `= obj+0x150`, pos `=&hitPt` (element or
+  whole-object).
+- Punch wall (`0x43371f`/`0x43377e` vs `0x43379b`): `{select 2,
+  count 1}` when the surface handler ran else `{select 1,
+  count 1}`; EBX `0`.
 - `FUN_0045bec8` water splash (`0x45c068`/`0x45c087`):
-  `{mode 1, count 1|0}` — sits on the generic `FUN_004533d4`
-  sweep chain, not the shot path; classified, not emitted.
+  `{select 1, count 1}` / `{select 0, count 1}` — sits on the
+  generic `FUN_004533d4` sweep chain, not the shot path;
+  classified, not emitted.
 - Native: one `CombatFxEvent` per callsite carrying
-  `kind/mode(palette)/variant(count)/aux(sndName)/pos/obj` on
-  `rt.combatFx`. `field150` is kept as an int32 marker — the
+  `kind/mode(ECX count)/variant(stack select)/aux(sndName)/pos/obj`
+  on `rt.combatFx`. `field150` is kept as an int32 marker — the
   pointed-at name data is not ported.
 
 ## 142. `FUN_004575fc` — detonation remnant (OBSERVED, gameplay-inert)

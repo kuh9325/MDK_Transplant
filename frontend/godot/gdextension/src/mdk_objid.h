@@ -88,6 +88,14 @@ public:
     return it == byId_.end() ? nullptr : it->second;
   }
 
+  // Forward lookup WITHOUT minting — the combat-FX drain resolves
+  // event subject ids this way (a torn-down object's id may already
+  // be re-minted; 0 is always safe).
+  uint64_t lookup(const void* key) const {
+    auto it = byKey_.find(key);
+    return it == byKey_.end() ? 0u : it->second.id;
+  }
+
   std::size_t size() const { return byKey_.size(); }
 
 private:

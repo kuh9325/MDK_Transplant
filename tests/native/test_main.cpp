@@ -16773,6 +16773,9 @@ void test_player_projectiles() {
     mdk::PlayerShot& s = rt.shots[0];
     s.state = 1; s.type = 4; s.flyKind = mdk::kShotFlyLobbed;
     s.arena = a; s.lifetime = 1; s.pos[2] = 20;
+    // Camera 10 units behind on -y so the camera-facing math is
+    // nontrivial.
+    rt.camera.pose.pos[1] = -10.0f;
     mdk::playerShotPoolTick(rt, 1, kDt, 1.0f);
     CHECK(s.state == 5 && s.lifetime == 30 && s.dyingTimer == 30 &&
           s.remnantIdx == 0);
@@ -16780,8 +16783,27 @@ void test_player_projectiles() {
     // Phase 10B — the detonation posts a kDetonation presentation
     // event at the shot position (FUN_004575fc remnant seam).
     CHECK(rt.combatFx.size() == 1);
-    CHECK(rt.combatFx[0].kind == mdk::CombatFxKind::kDetonation);
-    CHECK(near(rt.combatFx[0].pos[2], s.pos[2], 1e-5));
+    const mdk::CombatFxEvent& fx = rt.combatFx[0];
+    CHECK(fx.kind == mdk::CombatFxKind::kDetonation);
+    CHECK(near(fx.pos[2], s.pos[2], 1e-5));
+    // Phase 17A — the remnant spawn payload (OBSERVED): scale = the
+    // callsite's 2.0 arg; yaw = bearing to the render camera; the
+    // +0x13c bank = bearingDeg(camZ+3-posZ, horiz) when |horiz|>5 or
+    // |dz|>8; the shard-pool arena binding for the frontend stab.
+    CHECK(near(fx.scale, 2.0, 1e-6));
+    CHECK(fx.arena == &a->dyn.col);
+    {
+      const float dxp = rt.camera.pose.pos[0] - s.pos[0];
+      const float dyp = rt.camera.pose.pos[1] - s.pos[1];
+      const float horiz = std::sqrt(dxp * dxp + dyp * dyp);
+      const float dz = rt.camera.pose.pos[2] + 3.0f - s.pos[2];
+      CHECK(near(fx.facingDeg, mdk::bearingDeg(dyp, dxp), 1e-4));
+      CHECK(near(fx.bankDeg,
+                 (horiz > 5.0f || std::fabs(dz) > 8.0f)
+                     ? mdk::bearingDeg(dz, horiz) : 0.0f,
+                 1e-4));
+    }
+    CHECK(fx.modelName.empty());            // remnant is class-bound
   }
 
   // ---- Phase 10B — the shot-render gate (0x436dd3): only the fully
@@ -16809,6 +16831,7 @@ void test_player_projectiles() {
     s.lifetime = 75;
     s.pos[0] = 100; s.pos[1] = 50; s.pos[2] = 20;
     s.tail[0] = 90; s.tail[1] = 45; s.tail[2] = 20;
+    s.classIdx = 2;
     auto vs = mdk::playerShotVisuals(rt);
     const mdk::PlayerShotVisual& v = vs[0];
     CHECK(v.slot == 0 && v.state == 1 && v.type == 0);
@@ -16821,9 +16844,21 @@ void test_player_projectiles() {
     CHECK(near(v.spinDeg, 45.0, 1e-6) && near(v.fieldCc, 1.5, 1e-6));
     CHECK(v.worldRenderable);
     CHECK(v.hudFrame == -1);                      // active -> no frame
+    // Phase 17A — the +0x1c class binding passes through verbatim,
+    // and the 0x431503 world-mesh submit gate is state == 1 only.
+    CHECK(v.classIdx == 2);
+    CHECK(v.meshRenderable);
+    // A dying shot keeps the bullet-cam window (state!=0 &&
+    // lifetime>0) but drops the world mesh.
+    s.state = 4;
+    auto vs2 = mdk::playerShotVisuals(rt);
+    CHECK(!vs2[0].meshRenderable && vs2[0].worldRenderable);
+    s.state = 1;
     // Free + expired slots expose HUD frames (FUN_0045ee7c iVar7).
     CHECK(vs[1].hudFrame == 0);                   // state 0 -> frame 0
     CHECK(!vs[1].worldRenderable);
+    CHECK(vs[1].classIdx == -1);                  // untouched default
+    CHECK(!vs[1].meshRenderable);
   }
 
   // ---- Phase 10B — snapshot: type-4 velocity-derived billboard ----
@@ -16940,7 +16975,17 @@ void test_player_projectiles() {
     CHECK(rt.combatFx[0].kind == mdk::CombatFxKind::kShotObjectImpact);
     CHECK(rt.combatFx[0].mode == 3 && rt.combatFx[0].obj == &o);
     CHECK(near(rt.combatFx[0].pos[0], o.field210[0], 1e-5));
+    // Phase 17A — the shard burst binds the victim's arena
+    // (FUN_00403f6c record +0x08, OBSERVED).
+    CHECK(rt.combatFx[0].arena == &a->dyn.col);
     // Killed -> state 2 + the tally/death boundary.
+    // Seed a resolvable EXPLODE class record (z-span 5) so the corpse
+    // scale math (victimSpan/explodeSpan * 1.5) is exercised.
+    rt.level.enemies.entries = {{"EXPLODE", 0, false}};
+    rt.level.models.resize(1);
+    rt.level.models[0] = makePlatformModel("EXPLODE", "EX", 0.0f);
+    rt.level.models[0]->elems[0].localAabb[2] = -2.0f;
+    rt.level.models[0]->elems[0].localAabb[5] = 3.0f;
     mdk::DynamicObject& o2 = a->dyn.allocFront();
     o2.model = makePlatformModel("PLAT", "ELEM", 0.0f);
     o2.setPosition(8, 2, 40);
@@ -16957,8 +17002,32 @@ void test_player_projectiles() {
     CHECK(rt.seams.objectDeathCalls == 1);
     // Phase 10B — the kill posts kObjectTeardown (no +0x110 script).
     CHECK(rt.combatFx.size() == 2);
-    CHECK(rt.combatFx[1].kind == mdk::CombatFxKind::kObjectTeardown);
-    CHECK(rt.combatFx[1].obj == &o2);
+    const mdk::CombatFxEvent& tfx = rt.combatFx[1];
+    CHECK(tfx.kind == mdk::CombatFxKind::kObjectTeardown);
+    CHECK(tfx.obj == &o2);
+    // Phase 17A — the corpse presentation payload is snapshotted
+    // before the FUN_0045828c wipe (OBSERVED): the victim's model
+    // name, the die-facing yaw (bearing player - obj), the +0x13c
+    // camera tilt, the arena bind, and scale = victimZ-span /
+    // EXPLODE-span * 1.5 = (45-35)/(3-(-2)) * 1.5 = 3.0.
+    CHECK(tfx.modelName == "PLAT");
+    CHECK(tfx.arena == &a->dyn.col);
+    CHECK(near(tfx.scale, 3.0, 1e-5));
+    {
+      const float pt2[3] = {8, 2, 43};        // obj.pos + z+3
+      CHECK(near(tfx.facingDeg,
+                 mdk::bearingDeg(rt.cs.pos[1] - pt2[1],
+                                 rt.cs.pos[0] - pt2[0]), 1e-4));
+      const float dxp = rt.camera.pose.pos[0] - pt2[0];
+      const float dyp = rt.camera.pose.pos[1] - pt2[1];
+      const float horiz = std::sqrt(dxp * dxp + dyp * dyp);
+      const float dz = rt.camera.pose.pos[2] + 5.0f - pt2[2];
+      // horizGate < 0 -> the signed |horiz| > dz compare (OBSERVED).
+      CHECK(near(tfx.bankDeg,
+                 (horiz > dz || std::fabs(dz) > 8.0f)
+                     ? mdk::bearingDeg(dz, horiz) : 0.0f,
+                 1e-4));
+    }
     // pitchDeg bits are nonzero -> the tally gate ran, but "PLAT"
     // is not in the 34-name table -> no tally.
     CHECK(rt.killTally == 0);
@@ -17190,6 +17259,59 @@ void test_player_projectiles() {
     // Two arena invocations -> the shared pool ticked twice.
     CHECK(rt.seams.shotPoolTickCalls == 2);
     CHECK(s.dyingTimer == 100 - 2 * timing.frameStep);
+  }
+
+  // ---- Phase 17A — the shot model binding (+0x1c, OBSERVED) ------
+  // classIdx < 0 resolves the built-in class-table slot-1 record —
+  // "KURT" from STREAM\STREAM.BNI; classIdx >= 0 resolves the level
+  // enemy table; traversalNamedModel resolves a named entry
+  // (EXPLODE — the remnant/corpse model).
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.enemies.entries = {{"EXPLODE", 0, false},
+                                {"SW_HOME", 7, false}};
+    rt.level.models.resize(2);
+    rt.level.modelTried.assign(2, false);
+    rt.level.models[1] = makePlatformModel("SW_HOME", "HOME", 0.0f);
+    // STREAM.BNI carrying a synthetic KURT geometry record (no
+    // original data). BNI payloads omit the leading flag word — the
+    // original passes it as FUN_00428400's EDX arg — so the fixture
+    // writes the flag-less stream the production path re-heads.
+    const auto kurtFull = makeGeoRecord(1, {"KURT"},
+        {{"K_BODY", {0, 0, 0, 4, 0, 0, 0, 4, 0}, {0, 1, 2}}}, {});
+    const std::vector<std::uint8_t> kurtRec(
+        kurtFull.begin() + 4, kurtFull.end());
+    auto sb = SyntheticBni::build(
+        {{"KURT", static_cast<std::uint32_t>(kurtRec.size())}});
+    const auto bd = mdk::inspectBniDirectory(sb.buf);
+    CHECK(bd.status == mdk::BniDirectoryStatus::kOk);
+    if (bd.status != mdk::BniDirectoryStatus::kOk) return;
+    std::memcpy(sb.buf.data() + bd.records[0].payloadFileOffset,
+                kurtRec.data(), kurtRec.size());
+    rt.level.streamBniBytes = sb.buf;
+    // classIdx -1 -> the STREAM.BNI KURT record (lazy, cached).
+    const mdk::RuntimeModel* km =
+        mdk::traversalShotModel(rt.level, -1);
+    CHECK(km != nullptr);
+    if (km == nullptr) return;
+    CHECK(km->modelName() == "KURT");
+    CHECK(mdk::traversalShotModel(rt.level, -1) == km);   // cached
+    // classIdx >= 0 -> the level enemy table entry.
+    CHECK(mdk::traversalShotModel(rt.level, 1) ==
+          &*rt.level.models[1]);
+    CHECK(mdk::traversalShotModel(rt.level, 0) == nullptr); // no model
+    // Named lookup — EXPLODE has no bound model here.
+    CHECK(mdk::traversalNamedModel(rt.level, "EXPLODE") == nullptr);
+    CHECK(mdk::traversalNamedModel(rt.level, "SW_HOME") ==
+          &*rt.level.models[1]);
+    CHECK(mdk::traversalNamedModel(rt.level, "NOPE") == nullptr);
+    // No STREAM.BNI -> the default shot model is unresolvable.
+    mdk::TraversalRuntime rt2;
+    CHECK(mdk::traversalShotModel(rt2.level, -1) == nullptr);
+    // Garbage BNI bytes -> nullptr, cached miss.
+    rt2.level.streamBniBytes.assign(64, std::byte{0});
+    CHECK(mdk::traversalShotModel(rt2.level, -1) == nullptr);
+    CHECK(mdk::traversalShotModel(rt2.level, -1) == nullptr);
   }
 }
 

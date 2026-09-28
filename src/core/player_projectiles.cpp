@@ -21,9 +21,13 @@
 
 namespace mdk {
 
-// enemy_runtime.cpp — FUN_0045828c in-place record wipe. Forward
+// enemy_runtime.cpp — FUN_0045828c in-place record wipe + the
+// FUN_004575fc/FUN_00457cf4 remnant orientation math. Forward
 // declared: including enemy_runtime.h here would collide bearingDeg.
 void objectTeardownNow(TraversalRuntime& rt, DynamicObject& o);
+float remnantFacingYaw(const TraversalRuntime& rt, const float pos[3]);
+float remnantBankDeg(const TraversalRuntime& rt, const float pos[3],
+                     float zLift, float horizGate);
 
 namespace {
 
@@ -509,6 +513,7 @@ void wallImpactDispatch(TraversalRuntime& rt, TraversalArena& arena,
   ev.mode = (res & 1) ? 1 : 3;
   ev.variant = (res & 1) ? 2 : 1;
   ev.pos[0] = hitPt[0]; ev.pos[1] = hitPt[1]; ev.pos[2] = hitPt[2];
+  ev.arena = &arena.dyn.col;   // FUN_00403f6c's record +0x08 bind
   rt.combatFx.push_back(ev);
 }
 
@@ -538,6 +543,13 @@ void detonateShot(TraversalRuntime& rt, PlayerShot& s, int dmg,
   CombatFxEvent fx;
   fx.kind = CombatFxKind::kDetonation;
   fx.pos[0] = s.pos[0]; fx.pos[1] = s.pos[1]; fx.pos[2] = s.pos[2];
+  // FUN_004575fc's camera-facing orientation (OBSERVED): yaw = the
+  // bearing to the render camera; bank(+0x13c) = bearingDeg(dz,
+  // horiz) gated on |horiz| > 5.0 || |dz| > 8.0, dz = camZ+3.0-posZ.
+  fx.scale = 2.0f;                // the callsite's scale arg
+  fx.facingDeg = remnantFacingYaw(rt, s.pos);
+  fx.bankDeg = remnantBankDeg(rt, s.pos, 3.0f, 5.0f);
+  fx.arena = s.arena ? &s.arena->dyn.col : nullptr;
   rt.combatFx.push_back(fx);
   s.state = 5;
   s.lifetime = kImpactLife;
@@ -592,6 +604,7 @@ void objectDeathBoundary(TraversalRuntime& rt, DynamicObject& obj,
     fx.kind = CombatFxKind::kObjectDeathScript;
     fx.obj = &obj;
     fx.pos[0] = obj.pos[0]; fx.pos[1] = obj.pos[1]; fx.pos[2] = obj.pos[2];
+    fx.arena = obj.arena ? &obj.arena->col : nullptr;
     rt.combatFx.push_back(fx);
     obj.field11e = 0;
     obj.health = 0;
@@ -618,6 +631,32 @@ void objectDeathBoundary(TraversalRuntime& rt, DynamicObject& obj,
     fx.obj = &obj;
     fx.pos[0] = obj.pos[0]; fx.pos[1] = obj.pos[1];
     fx.pos[2] = obj.pos[2];
+    // Snapshot before the FUN_0045828c wipe — the corpse fields below
+    // must survive objectTeardownNow for the frontend drain.
+    fx.modelName = obj.model.modelName();
+    fx.facingDeg = facingDeg;                  // corpse +0x4c/+0x50
+    fx.bankDeg = remnantBankDeg(rt, hitPt, 5.0f, -1.0f);  // +0x13c tilt
+    // Corpse scale (0x457e82..0x457f74, OBSERVED):
+    //   (obj aabb z-span / EXPLODE class-record z-span) * 1.5.
+    // The record span is the EXPLODE model's local z union.
+    const float victimSpan = obj.col.aabb[5] - obj.col.aabb[2];
+    float explodeSpan = 0.0f;
+    if (const RuntimeModel* em =
+            traversalNamedModel(rt.level, "EXPLODE")) {
+      float lo = 1e30f, hi = -1e30f;
+      for (const auto& e : em->elems) {
+        lo = std::min(lo, e.localAabb[2]);
+        hi = std::max(hi, e.localAabb[5]);
+      }
+      if (hi > lo) explodeSpan = hi - lo;
+    }
+    fx.scale = (explodeSpan > 0.0f)
+        ? victimSpan / explodeSpan * 1.5f
+        : 1.0f;                 // unresolvable record — degrade, not inf
+    // The teardown's 16-shard burst children bind the victim's arena
+    // (0x457e4d..0x457e7d — records allocated off the object's +0x5c
+    // list carry its arena at +0x08).
+    fx.arena = obj.arena ? &obj.arena->col : nullptr;
     rt.combatFx.push_back(fx);
   }
   if (obj.field11e == 0xf) rt.fieldD2c = 0xa;
@@ -1263,6 +1302,7 @@ void updateShot(TraversalRuntime& rt, PlayerShot& s, int frameStep,
       fx.pos[0] = hitObj->field210[0]; fx.pos[1] = hitObj->field210[1];
       fx.pos[2] = hitObj->field210[2];
       fx.obj = hitObj;
+      fx.arena = hitObj->arena ? &hitObj->arena->col : nullptr;
       rt.combatFx.push_back(fx);
       s.state = 3;
       s.lifetime = kImpactLife;
@@ -1352,6 +1392,7 @@ playerShotVisuals(const TraversalRuntime& rt) {
     v.spinDeg = s.spinDeg;
     v.fieldCc = s.fieldCc;
     v.ribbonBound = (s.flags & 1u) != 0;
+    v.classIdx = s.classIdx;
     if (s.type == 4) {
       // OBSERVED: atan2 over the horizontal pos-tail delta (the
       // +0x20/+0x24 minus +0xc0/+0xc4 pair), pitch from speedV.
@@ -1365,7 +1406,9 @@ playerShotVisuals(const TraversalRuntime& rt) {
       v.billboardYawDeg = 90.0f - s.yawDeg;       // 0x498498 = 90.0
       v.billboardPitchDeg = s.pitchDeg;
     }
-    // FUN_0045ee7c's frame/gate selection.
+    // FUN_0045ee7c's frame/gate selection plus the 0x431503 world-mesh
+    // gate (submits only while the shot is in flight).
+    v.meshRenderable = (s.state == 1);
     v.worldRenderable = (s.state != 0 && s.lifetime > 0);
     v.hudFrame = (s.state == 0) ? 0
                : (s.lifetime < 1)

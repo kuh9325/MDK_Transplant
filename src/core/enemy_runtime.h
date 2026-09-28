@@ -123,6 +123,24 @@ void objectRollRide(DynamicObject& o);
 // passthrough. Shared by the seek ops and the script view-cone/
 // face-camera ops.
 float bearingDeg(float dy, float dx);
+// The remnant orientation math shared by FUN_004575fc (detonation
+// remnant) and the FUN_00457cf4 corpse (OBSERVED):
+//   remnantFacingYaw — bearingDeg(camY-posY, camX-posX): the EXPLODE
+//     remnant faces the render camera (0x540b28).
+//   remnantBankDeg — the +0x13c tilt: dz = camZ + zLift - posZ,
+//     horiz = |xy delta to camera|; bank = bearingDeg(dz, horiz) when
+//     the gate holds, else 0. horizGate >= 0 selects the FUN_004575fc
+//     "|horiz| > horizGate || |dz| > 8" gate; horizGate < 0 selects the
+//     FUN_00457cf4 "|horiz| > dz || |dz| > 8" gate.
+float remnantFacingYaw(const TraversalRuntime& rt, const float pos[3]);
+float remnantBankDeg(const TraversalRuntime& rt, const float pos[3],
+                     float zLift, float horizGate);
+// FUN_004575fc — the detonation remnant seam: emits the kDetonation
+// CombatFxEvent (scale = the callsite's arg — 2.0 shot path /
+// 2.0/3.0 script callers, OBSERVED). Presentation-only; the script
+// opcode bodies call it too. Exported so the frontend diagnostics
+// can drive the same seam the opcodes reach.
+void fxShockwave(TraversalRuntime& rt, DynamicObject& o, float scale);
 // FUN_00437f98 — degree sin/cos pair (deg * pi/180 -> {sin,cos}).
 void sincosDeg(float deg, float* sinOut, float* cosOut);
 // The shared seek-op tail (OBSERVED in the 0x4e/0x2b/0x2b-broadcast

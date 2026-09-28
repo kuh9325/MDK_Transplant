@@ -162,6 +162,17 @@ struct TraversalLevel {
   // K_FSLIDE, K_SLIDE, K_SLIP, K_SURF, K_SURFJ). OBSERVED caller:
   // 0x4339c5 (the traversal loader loads "%s\\LEVEL%d\\LEVEL%ds.sni").
   std::vector<std::byte> sniBytes;
+  // STREAM/STREAM.BNI — the stream-context bank loaded by
+  // FUN_0042b270 (the traversal/gameplay init). Holds the built-in
+  // class records the static slot map binds: slot 1 "KURT" is the
+  // default player-shot model (+0x1c = class record 0x4edd48). Only
+  // the geometry records are consumed here.
+  std::vector<std::byte> streamBniBytes;
+  // Lazy parse of the STREAM.BNI "KURT" geometry record — the
+  // default (-1 classIdx) player-shot model. tried/resolved state
+  // mirrors the models/modelTried contract above.
+  std::optional<RuntimeModel> streamKurtModel;
+  bool streamKurtTried = false;
   DtiStructure dti;
   CmiDirectory cmi;
   MtoDirectory mto;
@@ -915,6 +926,18 @@ void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt);
 // table). Resolves enemy-table index -> RuntimeModel, parsing on
 // first touch (ctx = &rt.level).
 const RuntimeModel* traversalModelFor(int idx, void* ctx);
+
+// The player-shot model binding: classIdx < 0 resolves the built-in
+// slot-1 record ("KURT" — STREAM/STREAM.BNI via FUN_0042b270, lazy
+// parse into level.streamKurtModel); classIdx >= 0 goes through
+// traversalModelFor.
+const RuntimeModel* traversalShotModel(TraversalLevel& lv,
+                                       int classIdx);
+
+// Enemy-table model by name (e.g. "EXPLODE" — the class-table record
+// the detonation remnant and death corpse bind). nullptr when absent.
+const RuntimeModel* traversalNamedModel(TraversalLevel& lv,
+                                        const std::string& name);
 
 // FUN_004555bc — per-object animation advance (the generic driver —
 // any object may bind +0x114 via ops 0x03/0x3b). Advances +0xdc by

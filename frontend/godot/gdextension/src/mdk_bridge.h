@@ -158,6 +158,68 @@ class MdkBridge : public RefCounted {
   // accumulator on the next stepped frame — nothing here writes
   // loco/anim state directly. Test/QA path only.
   Dictionary diagnostic_damage(int64_t amount);
+  // NATIVE DIAGNOSTIC — runs the authentic FUN_00458140 death
+  // boundary on a live snapshot id (objectDieFacingPlayer — the same
+  // entry the shot/punch kill paths reach). Emits the real
+  // kObjectDeathScript / kObjectTeardown event; the teardown object
+  // record is wiped in place as usual. Test/QA path only.
+  Dictionary diagnostic_kill(int64_t object_id);
+  // NATIVE DIAGNOSTIC — calls the real FUN_004575fc remnant seam
+  // (fxShockwave, the same function the script opcodes dispatch to)
+  // with the observed 2.0 scale arg. Emits a kDetonation event.
+  // Test/QA path only.
+  Dictionary diagnostic_shockwave(int64_t object_id);
+
+  // --- Phase 17A — traversal combat presentation ----------------
+  // All of this is copy-out presentation state produced by the core
+  // combat system (playerShotVisuals + TraversalRuntime::combatFx).
+  // Nothing here mutates gameplay.
+
+  // The 3-slot player-shot pool. Top-level dict:
+  //   "scoped"     — playerShotRenderGate (flagC9c && phase>1)
+  //   "hud_active" — 0x5414d4 HUD gate
+  //   "shots"      — Array of 3 dicts, each:
+  //     slot, state, type, class_idx, mesh_renderable (state==1
+  //     world-mesh gate), window_active (state!=0 && lifetime>0 —
+  //     the bullet-cam gate), pos/pos_mdk, tail/tail_mdk, tail_len,
+  //     yaw_deg, pitch_deg, billboard_yaw_deg, billboard_pitch_deg,
+  //     spin_deg, render_scalar (+0xcc), ribbon_bound, hud_frame,
+  //     arena_index, and cam_transform — the FUN_0045e9a0 bullet-cam
+  //     pose (origin = tail, basis from the billboard yaw/pitch)
+  //     converted to Godot space.
+  Dictionary get_shot_snapshots() const;
+
+  // Drains TraversalRuntime::combatFx — the core accumulates; each
+  // event reaches GDScript exactly once. Dict fields: kind (the
+  // CombatFxKind int), mode, variant, aux, pos/pos_mdk, obj_id
+  // (opaque; 0 when none — do NOT expect it to resolve for a
+  // torn-down object), scale, facing_deg, bank_deg, model_name.
+  Array drain_combat_fx();
+
+  // The shot's bound model: class_idx < 0 -> the built-in slot-1
+  // record (STREAM.BNI "KURT"); >= 0 -> the level enemy-table model.
+  // Same dict shape as get_object_geometry. Empty when unresolvable.
+  Dictionary get_shot_geometry(int64_t class_idx);
+
+  // A level enemy-table model by name — the class-record identity
+  // the corpse/remnant binds ("EXPLODE"). Same dict shape as
+  // get_object_geometry. Empty when the name is not in the table.
+  Dictionary get_named_geometry(const String& name);
+
+  // The active display palette (768 RGB bytes — the palette the
+  // shard colors and HUD indicator fills index into).
+  PackedByteArray get_active_palette();
+
+  // FUN_00406a0c — the shard tick's contact stab: `from`->`to` in
+  // Godot space against the record-arena BSP (arena_index, from the
+  // event's "arena_index"), falling back to the displayed current
+  // arena then the active partner (0x540c48/0x540ca4 order, gated on
+  // !carrierBusy — 0x540d3c, OBSERVED). Returns {} on a miss, else
+  // {"pos", "normal", "arena_index"} — the crossing point and the
+  // hit node's split-plane normal, both Godot space. Presentation
+  // query only — reads collision, writes nothing.
+  Dictionary fx_stab(const Vector3& from, const Vector3& to,
+                     int64_t arena_index);
 
   // --- Phase 16C — freefall (mode 2) ------------------------------
   // FUN_0040ef28's domain: loads the FALL3D course bundle (BNI +
@@ -236,6 +298,11 @@ class MdkBridge : public RefCounted {
   // Arena lookup helpers.
   mdk::TraversalArena* arenaByIndex_(int idx);
   int indexOfArena_(const mdk::DynamicArena* dyn) const;
+  // Inverse of the above for a raw CollisionArena — linear scan of
+  // rt_->arenas matching `&a->dyn.col` (the combat-FX events carry
+  // the CollisionArena the FUN_00403f6c record bound, not the
+  // TraversalArena).
+  int indexOfColArena_(const mdk::CollisionArena* col) const;
   // The traversal view set: {cur} + {partner when partnerActive
   // and partner != cur}. Objects are enumerated from this set even
   // when an arena has no MTO render block (corridors).

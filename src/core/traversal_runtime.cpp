@@ -131,6 +131,61 @@ const RuntimeModel* traversalModelFor(int idx, void* ctx) {
   return &*lv.models[idx];
 }
 
+// The player-shot model binding (PlayerShot::classIdx, +0x1c —
+// OBSERVED): a negative index means the built-in class-table slot 1
+// record, which FUN_0042b270 binds to the "KURT" geometry record from
+// STREAM\STREAM.BNI at gameplay init (the static slot map at
+// 0x49a664/0x49a67c: slot byte 0x81 -> {bit7 = FUN_00428400's named-
+// elements flag, bits0-6 = class-table slot} = flag 1, slot 1, name
+// "KURT"). Non-negative indices go through the level enemy table
+// (SW_HOME/SW_SGREN/SW_HGREN/SW_LGREN).
+//
+// BNI payloads omit the record's leading flag word — the original
+// passes it as FUN_00428400's EDX arg (same convention as the FALL3D
+// roster in freefall_scene.cpp), so the record is re-headed with the
+// slot byte's bit7 flag for the shared parseGeometryRecord.
+const RuntimeModel* traversalShotModel(TraversalLevel& lv,
+                                       int classIdx) {
+  if (classIdx >= 0) return traversalModelFor(classIdx, &lv);
+  if (lv.streamKurtModel) return &*lv.streamKurtModel;
+  if (lv.streamKurtTried) return nullptr;
+  lv.streamKurtTried = true;
+  if (lv.streamBniBytes.empty()) return nullptr;
+  const BniDirectory bd = inspectBniDirectory(
+      std::span<const std::byte>(lv.streamBniBytes));
+  if (bd.status != BniDirectoryStatus::kOk) return nullptr;
+  const BniRecord* rec = findBniRecord(bd, "KURT");
+  if (!rec) return nullptr;
+  if (rec->payloadEnd > lv.streamBniBytes.size()) return nullptr;
+  const auto* base = reinterpret_cast<const std::uint8_t*>(
+      lv.streamBniBytes.data()) + rec->payloadFileOffset;
+  const auto* end = reinterpret_cast<const std::uint8_t*>(
+      lv.streamBniBytes.data()) + rec->payloadEnd;
+  // slot byte 0x81 -> flag 1 (named-element path: KURT is the 18
+  // element player model, HEAD/... matching KURTANIM channels).
+  std::vector<std::uint8_t> headed(4 + (end - base));
+  const std::uint8_t fl[4] = {1, 0, 0, 0};
+  std::memcpy(headed.data(), fl, 4);
+  std::memcpy(headed.data() + 4, base,
+              static_cast<std::size_t>(end - base));
+  auto model = parseGeometryRecord(
+      headed.data(), headed.data() + headed.size());
+  if (!model) return nullptr;
+  lv.streamKurtModel = std::move(model);
+  return &*lv.streamKurtModel;
+}
+
+// Enemy-table model by name — the class-record path the original
+// resolves through the static slot map + per-record class bytes
+// (e.g. EXPLODE, bound at class-table record 0 — the detonation
+// remnant and death-corpse model). Returns nullptr when absent.
+const RuntimeModel* traversalNamedModel(TraversalLevel& lv,
+                                        const std::string& name) {
+  const int idx = lv.enemies.indexOf(name);
+  if (idx < 0) return nullptr;
+  return traversalModelFor(idx, &lv);
+}
+
 // ---------------------------------------------------------------------------
 // Arena / level teardown
 // ---------------------------------------------------------------------------
@@ -797,6 +852,16 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
         rt.animH150R = payload4("H150_R");    // 0x54c6b0
       }
     }
+  }
+
+  // STREAM\STREAM.BNI — the stream-context bank FUN_0042b270 loads at
+  // gameplay init. The port consumes it for the built-in class records
+  // the static slot map binds — slot 1 "KURT" is the default player-
+  // shot model (PlayerShot::classIdx == -1). Non-fatal: tests/fixtures
+  // without the bank leave the built-in shot model unresolved.
+  if (auto bni = root.readFile("STREAM/STREAM.BNI", kMaxDataFileBytes,
+                               detail)) {
+    rt.level.streamBniBytes = std::move(*bni);
   }
 
   // LEVEL<n>S.SNI — the per-level sprite-name bank (DAT_0049b3ec).
