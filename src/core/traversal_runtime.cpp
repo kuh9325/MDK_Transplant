@@ -18,6 +18,7 @@
 #include "core/data_root.h"
 #include "core/enemy_runtime.h"
 #include "core/frontend_machines.h"
+#include "core/fti_directory.h"
 #include "core/object_animation.h"
 #include "core/object_path.h"
 #include "core/player_fire.h"
@@ -878,6 +879,53 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
     if (sni) rt.level.sniBytes = std::move(*sni);
   }
 
+  // 0x541498 — the level id (OBSERVED write: the 0x427904 mode/level
+  // path stores its [ebp-0x20] level parameter there). The original
+  // receives it as a dispatch parameter; the port's analog is the
+  // LEVEL%d in the DTI path ("…/LEVEL3/LEVEL3.DTI" -> 3). Readers:
+  // the FUN_0041b654 level-5 gate, the enemy medium-damp level-1 arm
+  // and the weapon-5 fire latch (level >= 4).
+  {
+    const std::string base = dtiPath.substr(
+        dtiPath.find_last_of("/\\") == std::string::npos
+            ? 0
+            : dtiPath.find_last_of("/\\") + 1);
+    const auto lvl = base.find("LEVEL");
+    int id = 0;
+    for (std::size_t i = lvl + 5;
+         lvl != std::string::npos && i < base.size() &&
+         base[i] >= '0' && base[i] <= '9';
+         ++i)
+      id = id * 10 + (base[i] - '0');
+    rt.field541498 = id;
+  }
+
+  // Phase 17B — the traversal HUD bind: FUN_00418688's 21-name record
+  // table + the K_-style sprite tables + the SNIPERS2 stream decode
+  // (all TRAVSPRT.BNI) plus FUN_00433d40's difficulty-keyed mission-
+  // timer init. Non-fatal — tests/fixtures without the bank keep the
+  // unbound state and compose degrades to the empty overlay.
+  traversalHudBind(rt);
+
+  // FONTBIG — the reticle's %d printer resolves MISC/MDKFONT.FTI at
+  // the same context init (FUN_004149c4). Non-fatal: unbound keeps
+  // fontBigOk clear and the bomb-count digits are skipped.
+  if (auto fti = root.readFile("MISC/MDKFONT.FTI", kMaxDataFileBytes,
+                               detail)) {
+    const FtiDirectory fd =
+        inspectFtiDirectory(std::span<const std::byte>(*fti));
+    if (const FtiRecord* r = findFtiRecord(fd, "FONTBIG");
+        r && r->payloadEnd <= fti->size()) {
+      std::string ferr;
+      if (auto font = decodeFtiFont(
+              std::span<const std::byte>(
+                  fti->data() + r->payloadFileOffset,
+                  r->payloadEnd - r->payloadFileOffset),
+              &ferr))
+        traversalHudBindFontBig(rt, *font);
+    }
+  }
+
   // FUN_0046445c — bind the 29 Kurt sprite tables (23 TRAVSPRT.BNI
   // records via payload+4; 6 LEVEL<n>S.SNI records via blob+ofs+4).
   playerAnimBindTables(rt);
@@ -1133,11 +1181,20 @@ TraversalFrameResult stepTraversalRuntime(
   // draw gate, the HUD blit paths) now see the original steady state.
   rt.hudActive = 1;
 
+  // Frame-head timing mirrors: the frontend tick bumps 0x541518 by
+  // frameStep and 0x5414d8 by 1 per frame (OBSERVED frontend tick
+  // sites); the HUD ticks read the same step through hud.frameStep.
+  rt.hud.frameStep = timing.frameStep;
+  rt.field541518 += timing.frameStep;
+  ++rt.field5414d8;
+
   // OBSERVED gate: the whole traversal-active section runs only when
   // mode byte 0x541492 == 3 — this runtime models traversal mode only.
-  // Head: FUN_0041b654 (0x540e9c gate) + FUN_00431cf4 — stream/render
-  // seams; BOUNDED model keeps gates drained.
-  rt.seams.streamStageCalls += 2;
+  // Head: FUN_0041b654 (0x540e9c gate) is FIRST in the original's head
+  // — now the real mission countdown; FUN_00431cf4 stays a stream
+  // seam.
+  if (rt.fieldE9c == 0) traversalHudMissionTick(rt);
+  rt.seams.streamStageCalls += 1;
 
   // FUN_00402388 — input consume sits BEFORE the dispatch in the
   // original (0x4361d2). It produces the merged control for frame
@@ -1960,6 +2017,12 @@ TraversalFrameResult stepTraversalRuntime(
   // BUILD_A (all 27 xrefs are reads) — the dual-call bracket is a
   // dead second-viewport path in this build.
   const auto run36d60Body = [&]() {
+    // FUN_0046ec60 — the viewport register setter (0x436d8d..0x436db5):
+    // under 0x5414d4 it runs every frame — (c9c && ca0 != 0) takes the
+    // scoped arm (0x49b758/0x49b760), else the unscoped arm
+    // (0x49b750/0). Writes the view-window registers — presentation
+    // side, counted not applied.
+    if (rt.hudActive != 0) ++rt.seams.hudViewportModes;
     ++rt.seams.animDriverCalls;
     // FUN_00436ea8 -> FUN_00431300 -> FUN_00461954: the
     // animation/state machine (Phase 16A — full dispatch, frame
@@ -1990,9 +2053,10 @@ TraversalFrameResult stepTraversalRuntime(
       ++rt.seams.shotRenderCalls;   // FUN_0045f030(0)
       playerChargeProbe(rt);         // FUN_00437aa8
     }
-    // FUN_00469f7c — the unconditional inventory/HUD icon updater.
-    // Out of the fire scope; counted as a HUD seam.
-    ++rt.seams.hudEventCalls;
+    // FUN_00469f7c — the unconditional inventory/HUD icon updater:
+    // the 0x541558 visibility-timer FSM + per-record slide lerp
+    // (Phase 17B — real now, no longer a counted seam).
+    traversalHudUpdate(rt);
     // Scope gate B (0x436e1c): c9c != 0 && ca0 > 1 -> FUN_0045f030(1)
     // + FUN_00436f08 (the shared d0c fire-cadence counter) +
     // FUN_00437660 (the cadence/burst/ammo machine).
@@ -2001,6 +2065,11 @@ TraversalFrameResult stepTraversalRuntime(
       if (rt.hudActive != 0 && rt.fieldD0c < 999) ++rt.fieldD0c;
       playerWeaponCadence(rt, dt);
     }
+    // FUN_00436f2c — the HUD tail: mounted reticle (FUN_0046911c),
+    // then under 0x5414d4 the event bars + FUN_00417e20 (mission pie,
+    // health digits, scoped tail), the message-flush seam and the
+    // SKULL death overlay — composed into rt.hud.fb (Phase 17B).
+    traversalHudCompose(rt);
   };
   if (rt.flag541548) {
     ++rt.seams.extraWorldTickCalls; // FUN_0042b20c + the -1/+1 calls

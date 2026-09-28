@@ -90,6 +90,7 @@
 #include "core/player_motion.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
+#include "core/traversal_hud.h"
 
 namespace mdk {
 
@@ -345,6 +346,18 @@ struct TraversalSeams {
                                   // palette snapshot/blend/upload
                                   // (cosmetic; the 0x49a65c counter and
                                   // 0x49a030 latch are real state)
+  // --- Phase 17B — traversal HUD seams (counted, not composed) ---
+  int hudViewportModes = 0;       // FUN_0046ec60 — the scoped/unscoped
+                                  // viewport register setter in the
+                                  // FUN_00436d60 head (0x436d8d..b5)
+  int hudMsgPosts = 0;            // FUN_0041cad0 — OOT_L%d posts the
+                                  // mission timer makes on expiry
+  int hudMsgFlush = 0;            // FUN_0041cb44 — the status-message
+                                  // flush inside FUN_00436f2c
+  int hudLutRemaps = 0;           // the 0x540b20 per-level shade-LUT
+                                  // remap on the selected inventory
+                                  // cell (46x46 interior — the border
+                                  // box itself IS drawn)
 };
 
 struct TraversalFrameResult {
@@ -642,7 +655,10 @@ struct TraversalRuntime {
                               // select dword (survives the reset)
   int invHudTimer = 0;          // 0x541558 — FUN_00469f7c HUD anim
                               // countdown (60-tick writes)
-  int field541498 = 0;            // 0x541498 — weapon-5 charge level
+  int field541498 = 0;            // 0x541498 — the LEVEL id (OBSERVED:
+                                  // 0x433d77 indexes the 0x4999e8 level
+                                  // table with it); the mission timer
+                                  // reads it for the level-5 gate
   int field54163b = 0;            // 0x54163b — weapon-5 fire latch
   int weapon5Probe = 0;           // PORT test hook: when nonzero the
                                   // charge probe is forced live
@@ -813,6 +829,12 @@ struct TraversalRuntime {
   int field541518 = 0;               // 0x541518 — MORE+0x18; the
                                      // frontend tick mirror (the live
                                      // counter is frontend-owned)
+  int field541544 = 0;               // 0x541544 — the FUN_00417e20
+                                     // blink-suppress pre-gate (with
+                                     // 0x4999d0 it skips the blinkPhase
+                                     // increment only); steady-state 0
+                                     // in traversal — UNKNOWN writer
+                                     // (unported init path)
   std::int8_t g541534 = 0;           // 0x541534 — script byte (op 0xca)
   float scriptGVars[8] = {};         // 0x540d88 — script operand
                                      // group 0 (slots 4..7 alias
@@ -823,6 +845,12 @@ struct TraversalRuntime {
   // mirror the proven slots; +0x04..+0xc3 is the stats/inventory
   // region with no typed consumer yet — kept raw, not guessed.
   std::array<std::byte, 239> savePlayBlock = {};
+
+  // Phase 17B — the traversal HUD compositor state (traversal_hud.h):
+  // bound resources, the SNIPERS2 overlay layer, the SC_STAT wedge
+  // working copy, latch counters and the composed 600x360 indexed
+  // overlay (pen 0 = transparent).
+  TraversalHudState hud;
 
   TraversalSeams seams;
 };

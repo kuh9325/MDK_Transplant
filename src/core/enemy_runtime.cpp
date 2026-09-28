@@ -321,7 +321,8 @@ void objectGravity(TraversalRuntime& rt, DynamicObject& o,
   if ((o.col.flags148 & 2) == 0) return;
   o.field30 -= o.field48 * dt;                 // +0x30 -= +0x48*dt
   // Water/medium damp — skipped for raw-matrix objects while the
-  // weapon-5 charge level sits at 1 (OBSERVED 0x541498 gate).
+  // level id sits at 1 (OBSERVED 0x541498 gate — the field is the
+  // level index, 0x433d77, not a charge counter).
   if (!(rt.field541498 == 1 && (o.col.flags148 & 0x40) != 0)) {
     float vec[3] = {0, 0, 0};
     if (home.owner != nullptr &&

@@ -1,12 +1,8 @@
-// Phase 17B — RE CONTRACT ONLY. This header is the evidence-derived
-// declaration surface for the traversal HUD / scope-view
-// reconstruction (the FUN_00436d60 draw tail and the HUD-side state
-// ticks it depends on). IMPLEMENTATION IS NOT STARTED: there is no
-// traversal_hud.cpp, no compilation unit includes this header, and no
-// caller depends on any symbol here. Every declared behaviour is the
-// observed original contract recorded for the implementation phase —
-// not a redesign. See docs/GAMEPLAY_RECONSTRUCTION.md "Phase 17B —
-// RE checkpoint".
+// Phase 17B — the traversal HUD / scope-view declaration surface
+// (the FUN_00436d60 draw tail and the HUD-side state ticks it
+// depends on). Implemented by traversal_hud.cpp (Phase 17B.1) — the
+// observed original contract, not a redesign. See
+// docs/GAMEPLAY_RECONSTRUCTION.md "Phase 17B — RE checkpoint".
 //
 // Everything below is OBSERVED at instruction level in BUILD_A's
 // MDK95.EXE (Ghidra disassembly; constants re-dumped from the file
@@ -92,6 +88,12 @@ struct TraversalHudState {
                                       //   |= 0x20 on timer expiry
                                       //   (OBSERVED); other bits
                                       //   UNKNOWN
+  int frameStep = 1;                  // 0x49b6e8 — the FrontendTiming
+                                      //   mirror the HUD ticks read
+                                      //   (invHudTimer dec, +0xf4
+                                      //   remnant tick, blink, RNG
+                                      //   latch); set per frame by
+                                      //   stepTraversalRuntime
 
   IndexedFramebuffer fb{600, 360};    // the composed overlay
 };
@@ -111,8 +113,9 @@ void traversalHudBindFontBig(TraversalRuntime& rt, const FtiFont& font);
 // frame-rate coupled, NOT frameStep-scaled. On expiry: a0 clamps 0,
 // camera shakeMag arms >= 5.0 (FUN_00465200), the OOT_L%d status
 // message posts (FUN_0041cad0 — counted as a hudMsg seam here), and
-// 0x540d9b |= 0x20. Call site: the FUN_00436100 head, gated
-// fieldE9c == 0.
+// 0x540d9b |= 0x20 when its own bit7 (0x80000000 on the 0x540d98
+// dword — scriptGFlags) is set, else |= 0x40. Call site: the
+// FUN_00436100 head, gated fieldE9c == 0.
 void traversalHudMissionTick(TraversalRuntime& rt);
 
 // FUN_00469f7c — the per-frame inventory update + the type-4 shot

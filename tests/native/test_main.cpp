@@ -21768,6 +21768,542 @@ void test_save_full_write() {
   fs::remove_all(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 17B.1 — traversal HUD compositor (synthetic fixtures).
+// ---------------------------------------------------------------------------
+namespace {
+
+// Synthetic .BNI: u32 len-4, u32 count, N x {name[12], u32 ofs},
+// payloads sequential from the directory end.
+std::vector<std::byte> hudTestBni(
+    const std::vector<std::pair<std::string, std::vector<std::byte>>>&
+        recs) {
+  std::vector<std::byte> out;
+  const std::uint32_t dirEnd =
+      8 + static_cast<std::uint32_t>(recs.size()) * 16;
+  const auto u32 = [](std::vector<std::byte>& v, std::uint32_t x) {
+    for (int i = 0; i < 4; ++i)
+      v.push_back(static_cast<std::byte>((x >> (i * 8)) & 0xff));
+  };
+  const auto u16 = [](std::vector<std::byte>& v, std::uint32_t x) {
+    for (int i = 0; i < 2; ++i)
+      v.push_back(static_cast<std::byte>((x >> (i * 8)) & 0xff));
+  };
+  (void)u16;
+  // size computed after payload accumulation — reserve the head.
+  const std::size_t sizeField = out.size();
+  u32(out, 0);
+  u32(out, static_cast<std::uint32_t>(recs.size()));
+  std::uint32_t ofs = dirEnd - 4;   // image-relative (image = file+4)
+  std::vector<std::uint32_t> offs;
+  for (const auto& [name, pl] : recs) {
+    std::array<std::byte, 12> nm{};
+    for (std::size_t i = 0; i < name.size() && i < 11; ++i)
+      nm[i] = static_cast<std::byte>(name[i]);
+    for (std::byte b : nm) out.push_back(b);
+    u32(out, ofs);
+    offs.push_back(ofs);
+    ofs += static_cast<std::uint32_t>(pl.size());
+  }
+  for (const auto& [name, pl] : recs)
+    for (std::byte b : pl) out.push_back(b);
+  const std::uint32_t len = static_cast<std::uint32_t>(out.size()) - 4;
+  for (int i = 0; i < 4; ++i)
+    out[sizeField + i] =
+        static_cast<std::byte>((len >> (i * 8)) & 0xff);
+  return out;
+}
+
+// {u16 w, u16 h, px} — the FUN_00403a00 image form.
+std::vector<std::byte> hudTestImage(int w, int h, std::uint8_t pen) {
+  std::vector<std::byte> v = {
+      static_cast<std::byte>(w & 0xff),
+      static_cast<std::byte>((w >> 8) & 0xff),
+      static_cast<std::byte>(h & 0xff),
+      static_cast<std::byte>((h >> 8) & 0xff)};
+  v.insert(v.end(), static_cast<std::size_t>(w) * h,
+           static_cast<std::byte>(pen));
+  return v;
+}
+
+// {u32 pad, u32 count, u32 ofs[count], frames} — the K_-style sprite
+// table the bind consumes at payload+4 (ofs relative to table base).
+std::vector<std::byte> hudTestSpriteTable(
+    const std::vector<std::vector<std::uint8_t>>& streams) {
+  std::vector<std::byte> v = {std::byte(0), std::byte(0), std::byte(0),
+                              std::byte(0)};
+  const auto u32 = [](std::vector<std::byte>& o, std::uint32_t x) {
+    for (int i = 0; i < 4; ++i)
+      o.push_back(static_cast<std::byte>((x >> (i * 8)) & 0xff));
+  };
+  const std::size_t tbl = v.size();          // table base = payload+4
+  u32(v, static_cast<std::uint32_t>(streams.size()));
+  const std::size_t ofsPos = v.size();
+  for (std::size_t i = 0; i < streams.size(); ++i) u32(v, 0);
+  for (std::size_t i = 0; i < streams.size(); ++i) {
+    const std::uint32_t rel =
+        static_cast<std::uint32_t>(v.size() - tbl);
+    for (int j = 0; j < 4; ++j)
+      v[ofsPos + i * 4 + j] =
+          static_cast<std::byte>((rel >> (j * 8)) & 0xff);
+    // Frame header {w=2,h=2,hx=0,hy=0} + the command stream.
+    v.insert(v.end(), {std::byte(2), std::byte(0), std::byte(2),
+                       std::byte(0), std::byte(0), std::byte(0),
+                       std::byte(0), std::byte(0)});
+    for (std::uint8_t b : streams[i]) v.push_back(std::byte(b));
+  }
+  return v;
+}
+
+// Stream for a 2x2 pen-`pen` sprite: literal-2, row break, literal-2.
+std::vector<std::uint8_t> hudTestStream(std::uint8_t pen) {
+  return {0x01, pen, pen, 0xfe, 0x01, pen, pen, 0xff};
+}
+
+std::vector<std::byte> hudTestTravsprt() {
+  std::vector<std::pair<std::string, std::vector<std::byte>>> recs;
+  recs.push_back({"CROSS", hudTestSpriteTable({hudTestStream(9)})});
+  recs.push_back({"BOMBTARG", hudTestSpriteTable({hudTestStream(10)})});
+  recs.push_back({"SNIPERGA", hudTestSpriteTable({hudTestStream(11),
+                                                  hudTestStream(12)})});
+  // PICKUPS frames 0..7 — ids index directly (frame(rec.id)).
+  recs.push_back({"PICKUPS", hudTestSpriteTable(
+      {hudTestStream(20), hudTestStream(21), hudTestStream(22),
+       hudTestStream(23), hudTestStream(24), hudTestStream(25),
+       hudTestStream(26), hudTestStream(27)})});
+  // SNIPERS2 u16 stream: literal 4px 'A'-'D', skip 2, literal 'E'-'H',
+  // end. Layer: [0..3]=A-D, [4,5]=0, [6..9]=E-H.
+  std::vector<std::byte> sn2 = {std::byte(0), std::byte(0), std::byte(0),
+                                std::byte(0)};
+  const std::uint16_t s2[] = {0x0001,
+                              'A' | ('B' << 8), 'C' | ('D' << 8),
+                              0x8002,
+                              0x0001,
+                              'E' | ('F' << 8), 'G' | ('H' << 8),
+                              0xff00};
+  for (std::uint16_t w : s2) {
+    sn2.push_back(static_cast<std::byte>(w & 0xff));
+    sn2.push_back(static_cast<std::byte>(w >> 8));
+  }
+  recs.push_back({"SNIPERS2", std::move(sn2)});
+  recs.push_back({"SNIPERS1", {std::byte(1), std::byte(2), std::byte(3),
+                               std::byte(4)}});
+  recs.push_back({"SC_STAT", hudTestImage(32, 16, 5)});
+  recs.push_back({"SC_BSTAT", hudTestImage(32, 16, 6)});
+  recs.push_back({"SNIP_RNG", hudTestImage(4, 8, 7)});
+  recs.push_back({"SNIP_WEP", hudTestImage(8, 4, 8)});
+  recs.push_back({"SNIP_TXT", hudTestImage(80, 8, 0)});
+  for (int i = 1; i <= 6; ++i) {
+    recs.push_back({"SNIP_L" + std::to_string(i),
+                    hudTestImage(4, 4, static_cast<std::uint8_t>(i))});
+    recs.push_back({"SNIP_W" + std::to_string(i),
+                    hudTestImage(4, 4,
+                                 static_cast<std::uint8_t>(40 + i))});
+  }
+  recs.push_back({"SKULL", hudTestImage(4, 4, 31)});
+  return hudTestBni(recs);
+}
+
+} // namespace
+
+void test_traversal_hud() {
+  // ---- bind: record tables, images, stream layer, bezel ----------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    rt.difficulty = 1;
+    mdk::traversalHudBind(rt);
+    CHECK(rt.hud.bound);
+    CHECK(rt.hud.scStat.w == 32 && rt.hud.scStat.h == 16);
+    CHECK(rt.hud.scStat.px != nullptr);
+    CHECK(rt.hud.statWork.size() == 32u * 16);
+    CHECK(rt.hud.statWork[0] == 5);             // verbatim copy
+    CHECK(rt.hud.cross.frames.size() == 1);
+    CHECK(rt.hud.bombtarg.frames.size() == 1);
+    CHECK(rt.hud.sniperga.frames.size() == 2);
+    CHECK(rt.hud.pickups.frames.size() == 8);
+    CHECK(rt.hud.overlayPx.size() == 600u * 360u);
+    CHECK(rt.hud.overlayPx[0] == 'A' && rt.hud.overlayPx[1] == 'B' &&
+          rt.hud.overlayPx[2] == 'C' && rt.hud.overlayPx[3] == 'D');
+    CHECK(rt.hud.overlayPx[4] == 0 && rt.hud.overlayPx[5] == 0); // skip
+    CHECK(rt.hud.overlayPx[6] == 'E' && rt.hud.overlayPx[9] == 'H');
+    CHECK(rt.hud.overlayPx[10] == 0);           // untouched = 0
+    CHECK(rt.hud.bezelPx.size() == 4);
+    CHECK(rt.fadeTimer5414a0 == 54000.0f);      // difficulty 1 init
+    CHECK(rt.fadeTimer5414a4 == 54000.0f);
+    CHECK(rt.fadeTimer5414a8 == 54000.0f);
+  }
+  // Difficulty-keyed inits: 0 -> 81000, 2 -> 36000.
+  for (int d = 0; d < 3; ++d) {
+    mdk::TraversalRuntime rt;
+    rt.difficulty = d;
+    mdk::traversalHudBind(rt);
+    const float want = d == 0 ? 81000.0f : (d == 1 ? 54000.0f : 36000.0f);
+    CHECK(rt.fadeTimer5414a0 == want);
+    CHECK(rt.fadeTimer5414a4 == want && rt.fadeTimer5414a8 == want);
+  }
+
+  // ---- mission tick (FUN_0041b654): fixed -1.0, gates, expiry ----
+  {
+    mdk::TraversalRuntime rt;
+    rt.fadeTimer5414a0 = 3.0f;
+    rt.field541498 = 3;
+    mdk::traversalHudMissionTick(rt);
+    CHECK(rt.fadeTimer5414a0 == 2.0f);          // fixed step, not dt
+    mdk::traversalHudMissionTick(rt);
+    CHECK(rt.fadeTimer5414a0 == 1.0f);
+    // level-5 gate: no decrement.
+    rt.field541498 = 5;
+    mdk::traversalHudMissionTick(rt);
+    CHECK(rt.fadeTimer5414a0 == 1.0f);
+    rt.field541498 = 3;
+    // master-move gate.
+    rt.masterMoveGate = true;
+    mdk::traversalHudMissionTick(rt);
+    CHECK(rt.fadeTimer5414a0 == 1.0f);
+    rt.masterMoveGate = false;
+    // Expiry: clamp, shakeMag >= 5 arm, OOT post seam, |=0x40 arm
+    // (bit7 of 0x540d9b clear).
+    mdk::traversalHudMissionTick(rt);
+    CHECK(rt.fadeTimer5414a0 == 0.0f);
+    CHECK(rt.camera.shakeMag == 5.0f);
+    CHECK(rt.seams.hudMsgPosts == 1);
+    CHECK((rt.scriptGFlags & 0x40000000u) != 0);
+    CHECK(rt.hud.fieldD9b == 0x40);
+    // Already-dead timer early-outs (no double expiry).
+    mdk::traversalHudMissionTick(rt);
+    CHECK(rt.seams.hudMsgPosts == 1);
+    // The |=0x20 arm when 0x540d9b bit7 is set.
+    mdk::TraversalRuntime rt2;
+    rt2.fadeTimer5414a0 = 1.0f;
+    rt2.scriptGFlags = 0x80000000u;
+    mdk::traversalHudMissionTick(rt2);
+    CHECK((rt2.scriptGFlags & 0x20000000u) != 0);
+    CHECK(rt2.hud.fieldD9b == 0xa0);            // 0x80 | 0x20
+    // Prior larger shakeMag is not reduced (>= keeps max).
+    mdk::TraversalRuntime rt3;
+    rt3.fadeTimer5414a0 = 1.0f;
+    rt3.camera.shakeMag = 9.0f;
+    mdk::traversalHudMissionTick(rt3);
+    CHECK(rt3.camera.shakeMag == 9.0f);
+  }
+
+  // ---- inventory update (FUN_00469f7c/00469e94) -------------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.inventoryCount = 2;
+    rt.inventorySel = 0;
+    rt.inventory[0].id = 5;
+    rt.inventory[0].slotX = 8; rt.inventory[0].slotY = 304;
+    rt.inventory[0].animX = 0.0f; rt.inventory[0].animY = 0.0f;
+    rt.inventory[0].animVel = 240.0f; rt.inventory[0].animAux = 240.0f;
+    rt.inventory[1].id = 0;   // dead record — untouched
+    rt.invHudTimer = 17;
+    // Unscoped: rearm 60, lerp animX += vel*(1/30), tail -= frameStep.
+    mdk::traversalHudUpdate(rt);
+    CHECK(rt.invHudTimer == 59);                // 60 - frameStep(1)
+    CHECK(near(rt.inventory[0].animX, 240.0f / 30.0f, 1e-4));
+    CHECK(near(rt.inventory[0].animY, 240.0f / 30.0f, 1e-4));
+    // Overshoot clamps on velocity sign.
+    rt.inventory[0].animVel = 240.0f;
+    rt.inventory[0].animX = 10.0f;   // > slotX=8 with positive vel
+    mdk::traversalHudUpdate(rt);
+    CHECK(rt.inventory[0].animX == 8.0f);
+    // Negative velocity, undershoot.
+    rt.inventory[0].animVel = -240.0f;
+    rt.inventory[0].animX = 4.0f;
+    mdk::traversalHudUpdate(rt);
+    CHECK(rt.inventory[0].animX == 8.0f);
+    // Scoped: timer pinned to 0, lerp still runs.
+    rt.flagC9c = 1;
+    rt.transitionPhase = 1;
+    rt.inventory[0].animX = 4.0f;
+    rt.inventory[0].animVel = 240.0f;
+    mdk::traversalHudUpdate(rt);
+    CHECK(rt.invHudTimer == 0);
+    CHECK(rt.inventory[0].animX == 8.0f);       // lerped + clamped
+    // count==0 early-out: timer untouched.
+    mdk::TraversalRuntime rt0;
+    rt0.invHudTimer = 42;
+    mdk::traversalHudUpdate(rt0);
+    CHECK(rt0.invHudTimer == 42);
+    // id==6 charge sync inside the draw path (timer != 0).
+    mdk::TraversalRuntime rt6;
+    rt6.inventoryCount = 1;
+    rt6.inventory[0].id = 6;
+    rt6.inventory[0].animX = 8.0f; rt6.inventory[0].animY = 304.0f;
+    rt6.inventory[0].slotX = 8; rt6.inventory[0].slotY = 304; // settled
+    rt6.ammo[0] = 9;
+    mdk::traversalHudUpdate(rt6);
+    CHECK(rt6.inventory[0].charges == 9);       // settled record still
+                                                // syncs (inside draw)
+  }
+
+  // ---- compose: unscoped inventory draw ---------------------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    rt.hudActive = 1;
+    mdk::traversalHudBind(rt);
+    rt.inventoryCount = 1;
+    rt.inventorySel = 0;
+    rt.inventory[0].id = 5;
+    rt.inventory[0].charges = 1;
+    rt.inventory[0].animX = 100.0f; rt.inventory[0].animY = 200.0f;
+    rt.inventory[0].slotX = 100; rt.inventory[0].slotY = 200;
+    rt.invHudTimer = 30;
+    mdk::traversalHudCompose(rt);
+    // Selection box at (8,304)-(55,351), pen 1.
+    CHECK(rt.hud.fb.at(8, 304) == 1);
+    CHECK(rt.hud.fb.at(55, 304) == 1);
+    CHECK(rt.hud.fb.at(8, 351) == 1);
+    CHECK(rt.hud.fb.at(55, 351) == 1);
+    CHECK(rt.hud.fb.at(8, 328) == 1);           // side column mid
+    CHECK(rt.hud.fb.at(55, 328) == 1);
+    // PICKUPS frame 5 (2x2 pen 25) top-left at (100,200).
+    CHECK(rt.hud.fb.at(100, 200) == 25);
+    CHECK(rt.hud.fb.at(101, 201) == 25);
+    // Timer 0 (scoped pin) hides the whole inventory draw.
+    rt.invHudTimer = 0;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(8, 304) == 0);
+    CHECK(rt.hud.fb.at(100, 200) == 0);
+    // id==6 selected: no box, icon still draws.
+    rt.inventory[0].id = 6;
+    rt.invHudTimer = 30;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(8, 304) == 0);
+    CHECK(rt.hud.fb.at(100, 200) == 26);        // frame 6's pen
+  }
+
+  // ---- compose: scoped gate — CROSS, SNIPERS2, SNIPERGA ----------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    mdk::traversalHudBind(rt);
+    rt.hudActive = 1;
+    rt.flagC9c = 1;
+    rt.transitionPhase = 2;
+    rt.hud.frameStep = 1;
+    mdk::traversalHudCompose(rt);
+    // CROSS frame 0 (pen 9) at (299,219).
+    CHECK(rt.hud.fb.at(299, 219) == 9);
+    CHECK(rt.hud.fb.at(300, 220) == 9);
+    // SNIPERS2 layer: px 0..3 stamped at fb origin.
+    CHECK(rt.hud.fb.at(0, 0) == 'A');
+    CHECK(rt.hud.fb.at(4, 0) == 0);              // skip stays clear
+    CHECK(rt.hud.fb.at(6, 0) == 'E');
+    // Scoped tail: SNIP_WEP (8x4 pen 8) at (112,304); SNIP_W1 at
+    // (0,256); zoom% digits need snipTxt — the fixture's SNIP_TXT is
+    // all-zero so only geometry is checked below.
+    CHECK(rt.hud.fb.at(112, 304) == 8);
+    CHECK(rt.hud.fb.at(0, 256) == 41);           // SNIP_W1 pen
+    // SNIP_L1 (default wpnSel1=0 -> index 0) at (12,268), pen 1.
+    CHECK(rt.hud.fb.at(12, 268) == 1);
+    // SNIPERGA: state-4 expired slot 0 draws frame 0 (pen 11) at
+    // (141,44) and ticks remnantIdx += min(step,2) capped 2*2-1=3.
+    rt.shots[0].state = 4;
+    rt.shots[0].lifetime = 0;
+    rt.shots[0].remnantIdx = 0;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(141, 44) == 11);
+    CHECK(rt.shots[0].remnantIdx == 1);
+    rt.shots[0].remnantIdx = 2;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(141, 44) == 12);          // frame 1 (remnant>>1)
+    CHECK(rt.shots[0].remnantIdx == 3);          // capped at 3
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.shots[0].remnantIdx == 3);
+    // Unscoped: no CROSS/overlay/gauge.
+    rt.flagC9c = 0;
+    rt.transitionPhase = 0;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(299, 219) == 0);
+    CHECK(rt.hud.fb.at(0, 0) == 0);
+    CHECK(rt.hud.fb.at(141, 44) == 0);
+  }
+
+  // ---- compose: mounted reticle -----------------------------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    mdk::traversalHudBind(rt);
+    rt.hudActive = 1;
+    // FONTBIG with digit glyphs (w=6, top=7, bottom=0, pen 15).
+    mdk::FtiFont font;
+    font.glyphs.resize(256);
+    for (char c = '0'; c <= '9'; ++c) {
+      mdk::FtiGlyph g;
+      g.code = static_cast<std::uint8_t>(c);
+      g.top = 7;
+      g.bottom = 0;
+      g.width = 6;
+      g.pixels.assign(6 * 8, 15);
+      font.glyphs[static_cast<std::uint8_t>(c)] = g;
+    }
+    mdk::traversalHudBindFontBig(rt, font);
+    mdk::CollisionObject mounted{};
+    mounted.flags14b = 0;
+    rt.cs.excludeObj = &mounted;
+    rt.mountClass = 0x40000u;
+    rt.motion.moveVel = 50.7f;
+    rt.motion.strafeVel = -20.3f;
+    rt.bombs = 7;
+    mdk::traversalHudCompose(rt);
+    // BOMBTARG frame 0 (pen 10) at (300,180).
+    CHECK(rt.hud.fb.at(300, 180) == 10);
+    // CROSS frame 0 (pen 9) at (trunc(moveVel), trunc(strafeVel)) =
+    // (50,-20) — off-screen, clipped. Positive strafe draws.
+    rt.motion.moveVel = 50.7f;
+    rt.motion.strafeVel = 20.3f;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(50, 20) == 9);            // CROSS pen 9
+    // Bomb count "7": right-aligned at 472 -> 472-6=466, pen 15 at
+    // row 56-7=49.
+    CHECK(rt.hud.fb.at(466, 49) == 15);
+    CHECK(rt.hud.fb.at(471, 49) == 15);
+    // Gate off: flags14b bit2 suppresses the whole reticle.
+    mounted.flags14b = 4;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(300, 180) == 0);
+    CHECK(rt.hud.fb.at(466, 49) == 0);
+  }
+
+  // ---- compose: event bars + health digits + skull ----------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    mdk::traversalHudBind(rt);
+    rt.hudActive = 1;
+    mdk::DynamicObject obj{};
+    obj.health = 900;
+    obj.healthMirror2a2 = 450;
+    rt.eventTimerObj = &obj;
+    rt.eventTimer = 5.0f;
+    mdk::traversalHudCompose(rt);
+    // w1 = 900*500/900 = 500 -> solid pen 3 rows 4..10 x 0..500,
+    // then the hollow pen-4 border draws OVER it (0..250).
+    CHECK(rt.hud.fb.at(300, 7) == 3);            // interior solid
+    CHECK(rt.hud.fb.at(500, 10) == 3);
+    CHECK(rt.hud.fb.at(500, 4) == 3);
+    // w2 = 250 -> hollow pen 4 border at x=0..250.
+    CHECK(rt.hud.fb.at(250, 4) == 4);
+    CHECK(rt.hud.fb.at(250, 10) == 4);
+    CHECK(rt.hud.fb.at(0, 4) == 4);              // hollow wins the
+    CHECK(rt.hud.fb.at(10, 7) == 3);             // border overlap
+    // No event timer -> bars cleared.
+    rt.eventTimer = 0.0f;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(0, 4) == 0);
+    // Negative health clamps the solid width to 0.
+    rt.eventTimer = 5.0f;
+    obj.health = -100;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(0, 4) == 4);              // hollow border only
+    obj.health = 900;
+    // Health digits: 8px SNIP_TXT column slices, digit d at src d*8
+    // with pen d+1 (synthetic fixture).
+    mdk::TraversalHudImage txt;
+    txt.w = 80; txt.h = 8;
+    static std::vector<std::uint8_t> txtpx(80 * 8, 0);
+    for (int d = 0; d < 10; ++d)
+      for (int y = 0; y < 8; ++y)
+        for (int x = 0; x < 8; ++x)
+          txtpx[y * 80 + d * 8 + x] =
+              static_cast<std::uint8_t>(d + 1);
+    txt.px = txtpx.data();
+    rt.hud.snipTxt = txt;
+    rt.fieldHealth = 7;
+    rt.hud.blinkPhase = 0;
+    rt.hud.frameStep = 1;
+    mdk::traversalHudCompose(rt);
+    // SC_STAT at (600-32-16, 360-16-10) = (552,334); digit '7' is pen
+    // 8 centered -> penX = 552+16-4 = 564, cy = 334+(16-8)/2 = 338.
+    CHECK(rt.hud.fb.at(564, 338) == 8);
+    CHECK(rt.hud.fb.at(571, 338) == 8);
+    // Low-health blink: the counter increments BEFORE the gate, so a
+    // pre-compose phase of 16 (and 15 -> 16) suppresses the digits.
+    rt.hud.blinkPhase = 15;
+    rt.fieldHealth = 15;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(552, 338) == 5);          // SC_STAT pen only
+    rt.hud.blinkPhase = 14;                       // -> 15: still drawn
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(564, 338) == 2);          // '1' slice pen
+    CHECK(rt.hud.fb.at(571, 338) == 6);          // '5' slice pen
+    // Damage window: fieldE10>0 suppresses on EVEN field5414d8.
+    rt.fieldHealth = 100;
+    rt.fieldE10 = 1.0f;
+    rt.field5414d8 = 2;                           // even -> suppressed
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(564, 338) == 5);
+    rt.field5414d8 = 3;                           // odd -> drawn
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(564, 338) != 5);
+    // SKULL: health==0 && dac>0 && locoState==0x3ea -> 4x4 pen-31
+    // scaled by dac (dac=180 -> effW=4*180>>8=2, 2x2 at (299,179)).
+    rt.fieldHealth = 0;
+    rt.fieldDac = 180;
+    rt.locoState = 0x3ea;
+    rt.camera.pose.viewW = 600;
+    rt.camera.pose.viewH = 360;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(299, 179) == 31);
+    CHECK(rt.hud.fb.at(300, 180) == 31);
+    // Wrong locoState -> no skull.
+    rt.locoState = 0x320;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(299, 179) == 0);
+  }
+
+  // ---- mission pie wedge (FUN_004182a0/00418378) ------------------
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    mdk::traversalHudBind(rt);
+    rt.hudActive = 1;
+    // cur=(1-a0/a4)*2pi vs latch=(1-a8/a4)*2pi: with a0 well below a8
+    // the interval exceeds eps (pi/180) — the wedge stamps SC_BSTAT's
+    // mask (all pen 6) into statWork and latches a8 <- a0.
+    rt.fadeTimer5414a4 = 1000.0f;
+    rt.fadeTimer5414a8 = 1000.0f;
+    rt.fadeTimer5414a0 = 500.0f;                  // half elapsed -> pi
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.fadeTimer5414a8 == 500.0f);          // latch advanced
+    bool anyMask = false;
+    for (std::uint8_t p : rt.hud.statWork)
+      anyMask = anyMask || p == 6;
+    CHECK(anyMask);                             // mask pixels stamped
+    // Same frame again: cur <= latch now (a8 == a0) — no re-stamp
+    // (the stamped px persist — the copy is cumulative like the
+    // original's in-place buffer).
+    const auto stamped = rt.hud.statWork;
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.statWork == stamped);
+    // Epsilon gate: a0 just inside eps of a8 -> no stamp.
+    rt.fadeTimer5414a4 = 1000000.0f;
+    rt.fadeTimer5414a8 = 1000000.0f;
+    rt.fadeTimer5414a0 = 999999.0f;               // ~2pi/1e6 << eps
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.fadeTimer5414a8 == 1000000.0f);      // latch untouched
+  }
+
+  // ---- transparent pen semantics ----------------------------------
+  {
+    mdk::TraversalRuntime rt;                    // unbound: no assets
+    rt.hudActive = 1;
+    mdk::traversalHudCompose(rt);
+    int nonzero = 0;
+    for (std::size_t i = 0; i < rt.hud.fb.pixelCount(); ++i)
+      nonzero += rt.hud.fb.pixels()[i] != 0;
+    CHECK(nonzero == 0);
+    // Compose is idempotent-clear: reuse keeps pen-0 transparent.
+    rt.hud.fb.put(10, 10, 42);
+    mdk::traversalHudCompose(rt);
+    CHECK(rt.hud.fb.at(10, 10) == 0);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -21852,6 +22388,7 @@ int main() {
   test_progression_death_restore();
   test_save_full_restore();
   test_save_full_write();
+  test_traversal_hud();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

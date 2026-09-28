@@ -427,7 +427,10 @@ void playerFireDispatch(TraversalRuntime& rt) {
       ++rt.seams.fireDenyCalls;   // FUN_00402388(1, 0x54c650)
       return;
     }
-    if (rt.field541498 > 3) rt.field54163b = 1;   // charge >= 4
+    if (rt.field541498 > 3) rt.field54163b = 1;   // level id >= 4
+                                                // (0x541498 is the
+                                                // level index —
+                                                // OBSERVED 0x433d77)
     rt.burstIndex -= 1;
     rt.fireCadence += 1.0f;
     rt.ammo[5] -= 1;               // 0x541633
