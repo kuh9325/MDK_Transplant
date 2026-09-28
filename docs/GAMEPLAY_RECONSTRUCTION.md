@@ -6362,3 +6362,170 @@ hides while mode 2 is live and restores after the handoff.
 kind-2 model path is presented end to end; kinds 1/3/4/5 (radar
 marker, BANG frame-block, trail, launch glow), the ZOOM intro
 sprites, and sound remain documented state-only seams.
+
+# Phase 17A — Traversal Combat Godot Presentation (CLOSEOUT)
+
+## 210. Architecture — three domains, one direction
+
+Traversal combat presentation is split strictly by authority:
+
+- **GAMEPLAY AUTHORITATIVE: core.** `mdk_core` owns the 0x540ed4
+  three-slot `PlayerShot` pool (`player_projectiles.cpp`), the
+  `FUN_0045f138` fire dispatch, flight/integration, collision stabs,
+  damage, the `FUN_00458140` death boundary, the `FUN_00457cf4`
+  teardown, and `FUN_004575fc`/`FUN_00437444`/`FUN_00404108` FX
+  production. Every combat fact originates there; nothing in Godot
+  integrates motion, damage, AI, or timing.
+- **PRESENTATION RECONSTRUCTED: Godot.** `frontend/godot/src/main.gd`
+  mirrors copy-out snapshots into nodes: `get_shot_snapshots()` (the
+  `playerShotVisuals` view — state, class index, mesh submit gate,
+  tail/billboard fields, the `FUN_0045e9a0` bullet-cam pose),
+  `get_object_snapshots()` (DynamicObject twins), and
+  `get_arena_render_snapshots()` (the core-driven display set).
+- **TRANSIENT / NOT SERIALIZED: `combatFx` + presentation nodes.**
+  `rt.combatFx` is a native transient event queue drained once per
+  presented frame via `drain_combat_fx()`; shard bursts, EXPLODE
+  remnant nodes, bullet-cam windows/fills, and all FX bookkeeping
+  live only as Godot nodes. None of it is ever written back or
+  serialized.
+
+## 211. Player projectile families + bullet cam (IMPLEMENTED)
+
+The scoped sniper fire is the original's only shot-render path
+(`0x436dd3`: `flagC9c && transitionPhase > 1`). `state==1` opens
+the `0x431503` world-mesh submit gate; the shot binds a class
+record — `class_idx < 0` resolves the built-in STREAM.BNI `KURT`
+slot-1 record (`get_shot_geometry`), `>= 0` resolves the level
+enemy-table model. The submit transform is `FUN_0045f8b8`'s
+`buildObjectMatrix` (type 0 banks on `spinDeg` at scale 1.0; types
+1–4 fix bank 90/pitch 0 at scale 0.5; yaw = `yawDeg + 180`).
+
+Bullet-cam windows reproduce the 0x49b900/0x49b8e8 140x70 rects:
+`state != 0 && lifetime > 0` under the scoped gate → a square
+SubViewport (the 69.95/34.95 divisors give ~90° on both axes — the
+2:1 rect squashes an isotropic frustum) re-rendering the shared
+world from the tail camera. Expired/free slots under `hudActive`
+(0x5414d4) draw the `FUN_00416aa8` pen fill (`hud_frame`).
+
+## 212. Enemy projectile binding (OBSERVED — object path)
+
+Enemy-side projectiles are plain DynamicObjects (the `+0x11e==0x3d`
+timed projectile-move driver — pos += `+0x34*dt*dir`, `+0x302`
+countdown, `collisionStab` on the home-arena BSP, then
+`objectDieFacingPlayer`). They present through the same
+`get_object_snapshots()`/`get_object_geometry()` path as every
+other live object — no separate channel, no special-casing. In the
+bounded spawn-arena scenarios no enemy fire was reachable (the XG
+shooters live in GUNT_10, off the GUNT_1 view set) — documented
+reachability note, not a missing binding.
+
+## 213. Impact / detonation / death-remnant lifecycle
+
+`combatFx` kinds (drained exactly once — the queue clears on read):
+
+- kinds `0..3` — `FUN_00437444` shard bursts (`mode` = count, the
+  `variant` = pen/shade/scale select: `0` → pen `3`/`0xd` by the
+  `0x54150c` fx-enable gate, `1` → `0x25`, `>=2` → `10`). Shards
+  spawn through `FUN_00404108`'s jittered-tetra init, tick via
+  `FUN_00405014` (gravity-flutter z-swap + the `FUN_00406a0c`
+  contact stab — `fx_stab` on the record arena, cur, then partner,
+  OBSERVED order), die on the `60+(rand>>9)`-tick `+0x196`
+  countdown; reaped to empty.
+- kind `4` — `FUN_004575fc` detonation remnant: an EXPLODE-class
+  corpse marker at the event transform (scale 2.0 at the shot
+  callsite; spawn facing/bank folded through `buildObjectMatrix`).
+- kind `5` — the `+0x110` death-script handoff: the object's own
+  script owns further presentation; Godot spawns nothing.
+- kind `6` — `FUN_00457cf4` object teardown: the 16-shard burst
+  (pen `0x30`, shade `0x10`, scale 1.0) plus the EXPLODE corpse —
+  both emitted inside the teardown (OBSERVED).
+
+Remnant nodes persist under `FxRoot` until the arena tears down —
+matching the original's `+0x06`-flagged corpse semantics
+(`FUN_0045cf18` never sweeps them). Where a level's enemy table
+lacks an `EXPLODE` record the corpse has no model — logged, not
+emulated.
+
+## 214. Cache semantics
+
+All presentation caches are content- or session-keyed, never
+gameplay state: `geom_cache` (geom_key → element meshes),
+`shot_geom`/`named_geom` (class/record → mesh entries), `elem_mats`
+(element name → deterministic unshaded material — model material
+fields are not evidenced; documented seam), `shard_mats`
+(palette pen → material; flushed when the active palette changes),
+`shard_tetra` (the 8-variant jitter bank), `kurtTex_`
+({table,frame,palette-digest} → ImageTexture). The combat pool is
+bounded (`SHARD_CAP` 512 — the original's pool is bounded too).
+
+## 215. Save → restore presentation reconstruction (IMPLEMENTED)
+
+`MdkBridge::save_game_full()` runs `saveGameWriteFull` (the
+FUN_00426a0c full stream — SAVE/THMB/GAME/MORE/PLAY/DAMP/CAME/
+AREN/ALIE×N/FAND×N/BULL×3/SEND) over the live `rt_`; standalone
+`load_level` seeds `sess_.levelId` via the 0x4999e8 inverse so the
+GAME packet is restorable.
+
+`MdkBridge::restore_save(bytes)` parses strictly
+(`saveGameParse`), rejects header-only saves, then runs
+`applyFullSaveToTraversal` — the FUN_00427218 path shared with
+`mdk-inspect --save-restore` — into a fresh `TraversalRuntime`,
+swap-installed only on success. The bridge then drops every
+runtime-derived presentation structure (`objIds_`, arena sets,
+display set, timing/key-edge/frame state, any live freefall mode)
+and re-runs `presentTraversalLevel_` (shared MTI + SYS_PAL +
+palette compose + K_ tables) resolved from the restored session's
+level id.
+
+`main.gd::_reset_presentation_for_restore()` tears down all
+transient/id-keyed nodes: shot slot meshes + bullet-cam windows +
+fills, `FxRoot` children (live AND reap-pending shards, remnant
+nodes), `DynamicObjectRoot`, debug wires/tags, `ArenaRoot`, and the
+`shot_geom`/`named_geom`/`geom_cache`/`elem_mats`/`shard_mats`/
+`fx_*` bookkeeping. Nothing in that set is serialized; the next
+apply pass rebuilds it all from restored snapshots.
+
+The BULL records carry authoritative shot-pool state, so a live
+mid-flight shot restores at its serialized slot/pos/class verbatim
+— verified by the golden; post-restore `drain_combat_fx` is empty
+(the fresh runtime's queue carries no pre-restore events), stale
+object ids resolve to nothing, and post-restore impact/detonation/
+teardown events render exactly once.
+
+## 216. Validation
+
+- LEVEL3 — the canonical `_run_smoke` combat block (HMO_9): 25
+  checks green (scope, state-1 KURT shot, bullet-cam window/fill,
+  impact shards, detonation remnant, death handoff → teardown
+  burst + corpse, ttl reap, unscope).
+- LEVEL6 (`--smoke --level TRAVERSE/LEVEL6/LEVEL6.DTI
+  --arena OLYM_1`) — generic object checks + the level-agnostic
+  `_run_combat_exercise`: scoped, state-1 shot mesh, bullet-cam
+  window, HUD fill, KURT bind, wall/object impact + shard burst,
+  one-shot drain, boundary kill → kind-6 teardown + 16 shards +
+  EXPLODE remnant, reap, no duplicate nodes, palette 768. 5 view-set
+  objects enumerated. 0 failures.
+- LEVEL8 (`--smoke --level TRAVERSE/LEVEL8/LEVEL8.DTI
+  --arena GUNT_1`) — same exercise over the GUNT spawn view set
+  (12 objects: XCORRDOR + SW_* movers + spawn drops): all green,
+  teardown/remnant/reap intact, no GUNT_10 semantics touched.
+  Metal 4.0 Forward+ clean under `--combat-demo` scripted
+  scoped-fire on both levels.
+- Save→restore golden (`--smoke --save-restore`, LEVEL3 HMO_9):
+  live shot saved → post-save divergence (more flight, shockwave
+  remnant, boundary kill) → restore → BULL shot re-appears at the
+  serialized slot/pos/class, pre-restore FX gone and never
+  replayed, stale ids dead, restored objects re-enumerated with
+  fresh ids, post-restore impact + teardown render exactly once.
+- Regression at closeout: mdk_tests 5679/0, CTest 1/1, pytest
+  25/0/0-skipped, traversal L3–L8 `diag=0` with unchanged 60f
+  digests, freefall c0–c4 unchanged digests.
+
+Unresolved presentation seams (documented, not emulated): object
+element materials are deterministic debug colors (the model
+material record is not evidenced); the HUD indictor-fill pen
+stream, muzzle-flash sprites, and sound callsites remain
+state-only; enemy-projectile presentation is exercised only where
+a shooter is reachable (not in the L6/L8 spawn view sets).
+
+**TRAVERSAL COMBAT GODOT PRESENTATION: CLOSED FOR BUILD_A**

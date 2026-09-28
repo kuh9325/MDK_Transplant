@@ -29,6 +29,10 @@ extends Node3D
 #   --seed N          RNG seed for --freefall (default 0xC0FFEE —
 #                     the mdk-inspect freefall digest seed)
 #   --smoke           headless deterministic check, then quit
+#   --save-restore    with --smoke: run the save->restore combat
+#                     golden (LEVEL3/HMO_9) instead of the smoke
+#   --combat-demo     scripted scoped-fire input for real-renderer
+#                     runs (pairs with --frames / interactive)
 #   --screenshot P    after 8 frames, save a PNG capture then quit
 #                     (requires a real renderer — not --headless)
 #   --frames N        run N process frames then quit (startup proof)
@@ -55,6 +59,9 @@ var frames_left := 0
 var obj_debug := false
 var proxy_debug := false      # F4 — legacy capsule/wire proxy
 var last_kurt := {}           # last applied kurt snapshot (diag)
+var combat_demo := false      # --combat-demo: scripted scoped-fire
+                              # input under the real renderer
+var demo_frame := 0
 
 # Phase 16C — mode-2 freefall presentation state. All gameplay lives
 # in the core; these are view-side caches only.
@@ -200,6 +207,10 @@ func _ready() -> void:
 	# Phase 17A diagnostics — combat-FX counters in the F3 label.
 	# Observational only: never touches core state or RNG.
 	combat_diag = "--combat-diag" in args
+	# --combat-demo: drive a scoped shot through the live input path
+	# (MMB edge, then held LMB) so a real-renderer run exercises the
+	# combat presentation without a harness.
+	combat_demo = "--combat-demo" in args
 	var data_root := _arg_value(args, "--data-path",
 		OS.get_environment("MDK_DATA_ROOT"))
 	if data_root.is_empty():
@@ -302,7 +313,16 @@ func _ready() -> void:
 		_update_debug_label()
 
 	if smoke:
-		if freefall:
+		if "--save-restore" in args:
+			# Phase 17A closeout — the save->restore golden is bound
+			# to the canonical LEVEL3 combat arena (HMO_9).
+			if freefall or level != "TRAVERSE/LEVEL3/LEVEL3.DTI":
+				printerr("--save-restore smoke requires the " +
+					"default LEVEL3 launch")
+				get_tree().quit(2)
+				return
+			_run_smoke_restore()
+		elif freefall:
 			_run_smoke_freefall(int(ff_course), ff_skill, ff_seed)
 		elif level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
 				arena == "HMO_1" and start.is_empty():
@@ -1071,6 +1091,60 @@ func _combat_diag_text() -> String:
 		str(fx_stats["kinds"])])
 
 
+func _reset_presentation_for_restore() -> void:
+	# Restore boundary — bridge.restore_save() swapped in a fresh
+	# authoritative TraversalRuntime. Everything below presented the
+	# DISCARDED timeline: shot meshes, bullet-cam windows, transient
+	# shard/remnant nodes, and every id-keyed cache. None of it is
+	# serialized state — it rebuilds from the first post-restore
+	# snapshot pass. Immediate free() (not queue_free) so the reset
+	# is complete before the caller inspects the tree.
+	for i in shot_nodes.size():
+		var n: Node3D = shot_nodes[i]
+		for c in n.get_children():
+			n.remove_child(c)
+			c.free()
+		n.set_meta("geom_key", -1)
+		n.visible = false
+		shot_wins[i].visible = false
+		shot_fills[i].visible = false
+		shot_vps[i].render_target_update_mode = \
+			SubViewport.UPDATE_DISABLED
+	shot_geom.clear()
+	named_geom.clear()
+	# FxRoot carries shards + remnant nodes — sweep the whole child
+	# set (ttl-reaped shards are queue-pending but still children).
+	for child in $FxRoot.get_children():
+		$FxRoot.remove_child(child)
+		child.free()
+	shards.clear()
+	remnants.clear()
+	remnant_seq = 0
+	fx_seq = 0
+	fx_recent.clear()
+	fx_stats = {"events": 0, "shards": 0, "remnants": 0, "kinds": {}}
+	fx_enable_live = false
+	# The palette is re-read on the next apply — drop it so a
+	# different level's palette can't alias.
+	fx_palette = PackedByteArray()
+	shard_mats.clear()
+	shard_tetra.clear()
+	# Every minted object id died with the old runtime (the bridge
+	# re-mints from an empty map) — drop the node set wholesale.
+	for child in $DynamicObjectRoot.get_children():
+		$DynamicObjectRoot.remove_child(child)
+		child.free()
+	for oid in obj_wires.keys():
+		_clear_object_debug(oid)
+	# Arena nodes rebind to the restored display set.
+	for child in $ArenaRoot.get_children():
+		$ArenaRoot.remove_child(child)
+		child.free()
+	last_display_digest = -1
+	geom_cache.clear()
+	elem_mats.clear()
+
+
 # ---------------------------------------------------------------------------
 # Phase 16C — mode-2 freefall presentation.
 #
@@ -1684,6 +1758,15 @@ func _process(delta: float) -> void:
 		mouse_dy = 0
 		mouse_dz = 0
 		input.merge(_ff_input(), true)
+		if combat_demo and mode == 3:
+			# MMB edge at frame 4 scopes in; LMB holds from frame 10
+			# — the cadence decay runs while scoped, then the shot
+			# fires and the bullet-cam window/impact path render.
+			demo_frame += 1
+			if demo_frame == 4:
+				input["mouse_buttons"] = 4
+			elif demo_frame >= 10:
+				input["mouse_buttons"] = 1
 		bridge.step_frame_input(delta * 1000.0, input)
 		# The freefall->traversal handoff can flip the mode inside the
 		# step — re-read so the apply path follows the live runtime.
@@ -2822,3 +2905,443 @@ func _run_smoke_generic(level: String, arena: String) -> void:
 					"mover node transform == core snapshot")
 	print("smoke(generic): %d object(s) enumerated, %d failure(s)" %
 		[objs1.size(), failures])
+	# Phase 17A closeout — a bounded combat exercise on whatever
+	# arena the launcher brought up (LEVEL6/LEVEL8 closeout runs it
+	# on OLYM_1/GUNT_1). Skipped only when the player can't scope
+	# (a --start anchored mid-air).
+	_run_combat_exercise("generic")
+
+
+func _run_combat_exercise(tag: String) -> void:
+	# The same scoped-fire/drain/tick path _run_smoke exercises on
+	# LEVEL3, level-agnostic: scope in, catch a state-1 shot's world
+	# mesh + bullet-cam window, fly it to the OBSERVED wall/object
+	# impact (kind 0/1 -> the FUN_00437444 shard burst), then run
+	# the death boundary on whatever object the view set enumerates
+	# (kind 5/6 -> teardown 16-shard burst + EXPLODE remnant).
+	# Everything asserted here is presentation; gameplay is core's.
+	var pre_c: Dictionary = bridge.get_player_snapshot()
+	if not bool(pre_c.get("grounded", false)):
+		print("  combat(%s): skipped — player not grounded" % tag)
+		return
+	# Palette sanity — the level's own composed palette feeds shard
+	# colors; never a LEVEL3 carry-over.
+	_apply_shot_snapshots()
+	_check(fx_palette.size() == 768,
+		"combat(%s): active palette resolves (768)" % tag)
+	var shards0 := int(fx_stats["shards"])
+	_step_n({"mouse_buttons": 4}, 1)     # MMB edge -> scope toggle
+	_step_n({}, 8)                       # transitionPhase advances
+	var ss1: Dictionary = bridge.get_shot_snapshots()
+	if not bool(ss1["scoped"]):
+		# A pulse inside a transition can be swallowed — retry.
+		_step_n({"mouse_buttons": 4}, 1)
+		_step_n({}, 8)
+		ss1 = bridge.get_shot_snapshots()
+	_check(bool(ss1["scoped"]),
+		"combat(%s): scoped after MMB pulse" % tag)
+	var ss2 := {}
+	var saw_state1 := false
+	var mesh_node_ok := false
+	var win_ok := false
+	var saw_hud := false
+	var live := -1
+	for i in 90:
+		_step_n({"mouse_buttons": 1}, 1)
+		ss2 = bridge.get_shot_snapshots()
+		_drain_combat_fx()
+		fx_recent.clear()
+		_apply_shot_snapshots()
+		for j in 3:
+			var sj: Dictionary = ss2["shots"][j]
+			if int(sj["state"]) != 0 and live < 0:
+				live = j
+			if int(sj["state"]) == 1:
+				saw_state1 = true
+				var sn := $ShotRoot.get_node_or_null("Shot_%d" % j)
+				if sn != null and sn.visible and \
+						sn.get_child_count() > 0:
+					mesh_node_ok = true
+			if bool(sj["window_active"]) and shot_wins[j].visible:
+				win_ok = true
+			if bool(ss2["hud_active"]):
+				saw_hud = true
+		if saw_state1 and mesh_node_ok:
+			break
+	_check(live >= 0,
+		"combat(%s): scoped LMB spawned a shot" % tag)
+	_check(saw_state1,
+		"combat(%s): state==1 -> world-mesh gate open" % tag)
+	if live >= 0:
+		var sv: Dictionary = ss2["shots"][live]
+		_check(int(sv["class_idx"]) == -1,
+			"combat(%s): default shot binds class -1 (KURT)" % tag)
+	_check(mesh_node_ok,
+		"combat(%s): shot world-mesh node built+visible" % tag)
+	_check(win_ok,
+		"combat(%s): bullet-cam window texture-rect shown" % tag)
+	if saw_hud:
+		var fill_ok := false
+		for j in 3:
+			if int(ss2["shots"][j]["state"]) == 0 and \
+					shot_fills[j].visible:
+				fill_ok = true
+		_check(fill_ok,
+			"combat(%s): free-slot HUD indicator fill drawn" % tag)
+	var sg: Dictionary = bridge.get_shot_geometry(-1)
+	_check(not sg.is_empty() and int(sg["vert_count"]) > 0,
+		"combat(%s): KURT geometry resolves (STREAM.BNI)" % tag)
+	# Enemy-side projectiles present through the same object
+	# snapshot path — count any the fight spawns (BOLT family et al);
+	# absence is a reachability note, not a failure.
+	var enemy_proj := {}
+	# Flight — bounded by the shot's full +0x11e lifetime (~240
+	# ticks); kinds 0/1 are the OBSERVED wall/object impacts and
+	# lifetime expiry is silent for types 0/1.
+	var impact := {}
+	for i in 280:
+		_step_n({}, 1)
+		_apply_shot_snapshots()
+		_drain_combat_fx()
+		_tick_combat_fx(1.0 / 30.0)
+		for ev in fx_recent:
+			var k := int(ev["kind"])
+			if k == 0 or k == 1:
+				impact = ev
+		fx_recent.clear()
+		for o in bridge.get_object_snapshots():
+			var en := String(o["enemy_name"])
+			if en.contains("BOLT"):
+				enemy_proj[en] = true
+		var any_live := false
+		for sj in bridge.get_shot_snapshots()["shots"]:
+			if int(sj["state"]) != 0:
+				any_live = true
+		if not impact.is_empty() or not any_live:
+			break
+	# The queue is one-shot — a second drain in the same frame must
+	# be empty (no duplicate visual events).
+	_check(bridge.drain_combat_fx().is_empty(),
+		"combat(%s): combatFx drains once (no replay)" % tag)
+	if not impact.is_empty():
+		_check(int(impact["arena_index"]) >= 0,
+			"combat(%s): impact event carries its arena" % tag)
+		_check(int(fx_stats["shards"]) > shards0,
+			"combat(%s): impact spawned the shard burst" % tag)
+	else:
+		print("  combat(%s): shot expired in flight — no impact" % tag)
+	if not enemy_proj.is_empty():
+		print("  combat(%s): enemy projectile(s) seen: %s" %
+			[tag, str(enemy_proj.keys())])
+	# Death boundary on whatever the view set enumerates — movers
+	# included (the FUN_00457cf4 teardown path is generic).
+	var cobj := -1
+	for od in bridge.get_object_snapshots():
+		cobj = int(od["id"])
+		break
+	if cobj > 0:
+		var shards1 := int(fx_stats["shards"])
+		var rem1 := remnants.size()
+		var sw0: Dictionary = bridge.diagnostic_kill(cobj)
+		_check(bool(sw0.get("ok", false)),
+			"combat(%s): kill diagnostic ran" % tag)
+		var saw5 := false
+		var saw6 := false
+		for i in 40:
+			_step_n({}, 1)
+			_drain_combat_fx()
+			for ev in fx_recent:
+				var k := int(ev["kind"])
+				if k == 5:
+					saw5 = true
+				elif k == 6:
+					saw6 = true
+			fx_recent.clear()
+			if saw6:
+				break
+		if not saw6:
+			# +0x110 already consumed — a second boundary call lands
+			# on the teardown path directly.
+			bridge.diagnostic_kill(cobj)
+			_drain_combat_fx()
+			for ev in fx_recent:
+				if int(ev["kind"]) == 6:
+					saw6 = true
+			fx_recent.clear()
+		_check(saw5 or saw6,
+			"combat(%s): death boundary event drained" % tag)
+		_check(saw6,
+			"combat(%s): kObjectTeardown event drained" % tag)
+		if saw6:
+			_check(int(fx_stats["shards"]) >= shards1 + TEAR_SHARDS,
+				"combat(%s): teardown 16-shard burst" % tag)
+			# The EXPLODE corpse binds a level enemy-table record —
+			# only assert the node when this level carries one.
+			if not bridge.get_named_geometry("EXPLODE").is_empty():
+				_check(remnants.size() > rem1,
+					"combat(%s): teardown EXPLODE remnant" % tag)
+	else:
+		print("  combat(%s): no object enumerated — kill skipped" %
+			tag)
+	# Reap — the +0x196 countdown expires every shard.
+	for i in 8:
+		_tick_combat_fx(1.0)
+		if shards.is_empty():
+			break
+	_check(shards.is_empty(),
+		"combat(%s): shards reaped on ttl expiry" % tag)
+	# No duplicate combat nodes: the pool is exactly 3 slots and
+	# FxRoot carries only live transients (reaped shards are
+	# queue-pending until a frame boundary — excluded here).
+	_check($ShotRoot.get_child_count() == 3,
+		"combat(%s): shot node pool stays 3" % tag)
+	var fx_live := 0
+	for c in $FxRoot.get_children():
+		if not c.is_queued_for_deletion():
+			fx_live += 1
+	_check(fx_live == remnants.size() + shards.size(),
+		"combat(%s): FxRoot holds only live transients" % tag)
+	# Unscope + restore the launch anchor for any later blocks.
+	for i in 4:
+		if not bool(bridge.get_shot_snapshots()["scoped"]):
+			break
+		_step_n({"mouse_buttons": 4}, 1)
+		_step_n({}, 8)
+	_check(not bool(bridge.get_shot_snapshots()["scoped"]),
+		"combat(%s): unscoped" % tag)
+	if not pre_c.is_empty():
+		bridge.diagnostic_start(int(pre_c["arena"]),
+			pre_c["pos_mdk"], float(pre_c["yaw_deg"]))
+		_step_n({}, 8)
+
+
+func _run_smoke_restore() -> void:
+	# Phase 17A closeout — the bounded save->restore golden:
+	#   combat active + live shot -> save_game_full() ->
+	#   keep fighting (the timeline diverges: new FX, a death) ->
+	#   restore_save() -> presentation rebuilt from the restored
+	#   authoritative BULL/ALIE/DAMP state ONLY.
+	# Asserts: the saved shot re-appears at its serialized state,
+	# pre-restore transient FX neither survive nor replay, stale ids
+	# resolve to nothing, and post-restore events render exactly
+	# once. Anchored to LEVEL3 HMO_9 — the proven combat arena.
+	print("smoke(restore): save->restore presentation golden")
+	var dsc: Dictionary = bridge.diagnostic_start(8,
+		Vector3(-174.0, 2625.0, -293.0), 270.0)
+	_check(dsc.get("ok", false), "restore: diagnostic_start into HMO_9")
+	_step_n({"mouse_buttons": 4}, 1)
+	_step_n({}, 8)
+	if not bool(bridge.get_shot_snapshots()["scoped"]):
+		_step_n({"mouse_buttons": 4}, 1)
+		_step_n({}, 8)
+	_check(bool(bridge.get_shot_snapshots()["scoped"]),
+		"restore: scoped")
+	# Catch a live state-1 shot; remember its serialized fields.
+	var saved_shot := {}
+	var saved_slot := -1
+	for i in 90:
+		_step_n({"mouse_buttons": 1}, 1)
+		_apply_shot_snapshots()
+		var ss: Dictionary = bridge.get_shot_snapshots()
+		for j in 3:
+			var sj: Dictionary = ss["shots"][j]
+			if int(sj["state"]) == 1:
+				saved_shot = sj
+				saved_slot = j
+		if saved_slot >= 0:
+			break
+	_check(saved_slot >= 0, "restore: live shot at save time")
+	var pre_ids := {}
+	for od in bridge.get_object_snapshots():
+		pre_ids[int(od["id"])] = true
+	var stale_id: int = pre_ids.keys()[0] if not pre_ids.is_empty() \
+		else -1
+	# Diagnostic counts — pre-save.
+	var pre_shots := 0
+	for sj in bridge.get_shot_snapshots()["shots"]:
+		if int(sj["state"]) != 0:
+			pre_shots += 1
+	print(("  restore: pre-save shots=%d objs=%d " +
+		"shot_nodes=%d fx_nodes=%d") % [pre_shots, pre_ids.size(),
+		$ShotRoot.get_child_count(), $FxRoot.get_child_count()])
+	# ---- save ----
+	var save: PackedByteArray = bridge.save_game_full()
+	_check(save.size() > 100, "restore: save_game_full wrote bytes")
+	# ---- diverge the timeline ----
+	# More frames + LMB: the saved shot flies on (may impact — the
+	# transient shards are pre-restore evidence), and a shockwave +
+	# boundary kill add remnant/teardown transients.
+	for i in 12:
+		_step_n({"mouse_buttons": 1}, 1)
+		_apply_shot_snapshots()
+		_drain_combat_fx()
+		_tick_combat_fx(1.0 / 30.0)
+	if stale_id > 0:
+		bridge.diagnostic_shockwave(stale_id)
+		_drain_combat_fx()
+		fx_recent.clear()
+		bridge.diagnostic_kill(stale_id)
+		for i in 30:
+			_step_n({}, 1)
+			_drain_combat_fx()
+			_tick_combat_fx(1.0 / 30.0)
+		fx_recent.clear()
+	var fx_pre := $FxRoot.get_child_count()
+	_check(fx_pre > 0,
+		"restore: transient combat nodes exist pre-restore")
+	# ---- restore ----
+	var rep: Dictionary = bridge.restore_save(save)
+	_check(bool(rep.get("ok", false)), "restore: core restore ran")
+	_check(bool(rep.get("identity_ok", false)),
+		"restore: CMI identity check passed")
+	_check(int(rep.get("level_dir", -1)) == 3,
+		"restore: save resolved to LEVEL3")
+	_check(int(rep.get("shots_active", -1)) >= 1,
+		"restore: BULL carried >=1 active shot")
+	_reset_presentation_for_restore()
+	# Teardown proved out — every transient node is gone and no
+	# pre-restore event replays out of the fresh runtime.
+	_check($FxRoot.get_child_count() == 0,
+		"restore: no transient FX nodes survive")
+	_check(bridge.drain_combat_fx().is_empty(),
+		"restore: no pre-restore combat events replay")
+	for i in 3:
+		_check(shot_nodes[i].get_child_count() == 0 and
+			not shot_nodes[i].visible,
+			"restore: shot slot %d cleared" % i)
+	# Stale ids resolve to nothing — the old object's id must not
+	# run a boundary call on the restored world.
+	if stale_id > 0:
+		var stale: Dictionary = bridge.diagnostic_kill(stale_id)
+		_check(not bool(stale.get("ok", false)),
+			"restore: stale object id does not resolve")
+	# ---- rebuilt presentation from the restored runtime ----
+	var rss: Dictionary = bridge.get_shot_snapshots()
+	_apply_shot_snapshots()
+	var rshot := {}
+	var rslot := -1
+	var rlive := 0
+	for j in 3:
+		var sj: Dictionary = rss["shots"][j]
+		if int(sj["state"]) != 0:
+			rlive += 1
+			if int(sj["state"]) == 1 and rslot < 0:
+				rslot = j
+				rshot = sj
+	_check(rlive >= 1,
+		"restore: a BULL-restored shot is live again")
+	# The saved slot's shot re-appears at its serialized pos —
+	# post-save flight never happened on this timeline.
+	if saved_slot >= 0 and rslot >= 0:
+		_check(rslot == saved_slot,
+			"restore: restored shot keeps its pool slot")
+		var rp: Vector3 = rshot["pos_mdk"]
+		var sp: Vector3 = saved_shot["pos_mdk"]
+		_check(rp.distance_to(sp) < 0.01,
+			"restore: restored shot at its serialized pos")
+		_check(int(rshot["class_idx"]) ==
+			int(saved_shot["class_idx"]),
+			"restore: restored shot keeps class binding")
+	if rslot >= 0:
+		var sn := $ShotRoot.get_node_or_null("Shot_%d" % rslot)
+		_check(sn != null and sn.visible and
+			sn.get_child_count() > 0,
+			"restore: restored shot world-mesh node built")
+	# The discarded post-save timeline leaves no phantom shots —
+	# slot liveness comes verbatim from BULL state.
+	var phantom := 0
+	for j in 3:
+		var sj: Dictionary = rss["shots"][j]
+		var sn := $ShotRoot.get_node_or_null("Shot_%d" % j)
+		var shown: bool = sn != null and sn.visible
+		if shown != (int(sj["state"]) == 1):
+			phantom += 1
+	_check(phantom == 0,
+		"restore: shot nodes mirror BULL state exactly")
+	# Authoritative objects rebuilt — the node set mirrors the
+	# restored view set exactly (ids re-mint from an empty map;
+	# counter values are session-scoped, so the pre/post id sets are
+	# not comparable — the NODES are what matter).
+	_step_n({}, 2)
+	_apply_object_snapshots()
+	var post_ids := {}
+	for od in bridge.get_object_snapshots():
+		var oid := int(od["id"])
+		post_ids[oid] = true
+		var nd := $DynamicObjectRoot.get_node_or_null(
+			"Object_%d" % oid)
+		_check(nd != null,
+			"restore: object node rebuilt for id %d" % oid)
+	_check(post_ids.size() > 0,
+		"restore: restored objects enumerated")
+	_check($DynamicObjectRoot.get_child_count() == post_ids.size(),
+		"restore: object nodes == restored snapshot set")
+	print(("  restore: post shots=%d objs=%d " +
+		"shot_nodes=%d fx_nodes=%d geom_cache=%d") %
+		[rlive, post_ids.size(), $ShotRoot.get_child_count(),
+		$FxRoot.get_child_count(), geom_cache.size()])
+	# ---- post-restore events render exactly once ----
+	# A fresh wall impact: the restored shot (or a new one) dies
+	# against geometry — one event, one burst, queue empty after.
+	var shards_r0 := int(fx_stats["shards"])
+	var got_hit := false
+	for i in 300:
+		_step_n({"mouse_buttons": 1}, 1)
+		_apply_shot_snapshots()
+		_drain_combat_fx()
+		_tick_combat_fx(1.0 / 30.0)
+		for ev in fx_recent:
+			var k := int(ev["kind"])
+			if k == 0 or k == 1:
+				got_hit = true
+		fx_recent.clear()
+		if got_hit:
+			break
+	_check(got_hit,
+		"restore: post-restore impact event drained")
+	_check(int(fx_stats["shards"]) > shards_r0,
+		"restore: post-restore impact spawned shards once")
+	_check(bridge.drain_combat_fx().is_empty(),
+		"restore: post-restore drain is one-shot")
+	# A fresh death boundary on a restored object — the 5/6 event
+	# sequence and the corpse appear exactly once.
+	var nobj := -1
+	for od in bridge.get_object_snapshots():
+		nobj = int(od["id"])
+		break
+	if nobj > 0:
+		var rem_r := remnants.size()
+		var shards_r1 := int(fx_stats["shards"])
+		bridge.diagnostic_kill(nobj)
+		var saw6 := false
+		for i in 40:
+			_step_n({}, 1)
+			_drain_combat_fx()
+			for ev in fx_recent:
+				if int(ev["kind"]) == 6:
+					saw6 = true
+			fx_recent.clear()
+			if saw6:
+				break
+		if not saw6:
+			bridge.diagnostic_kill(nobj)
+			_drain_combat_fx()
+			for ev in fx_recent:
+				if int(ev["kind"]) == 6:
+					saw6 = true
+			fx_recent.clear()
+		_check(saw6,
+			"restore: post-restore teardown event drained once")
+		if saw6:
+			_check(int(fx_stats["shards"]) >=
+				shards_r1 + TEAR_SHARDS,
+				"restore: post-restore teardown burst once")
+			_check(remnants.size() == rem_r + 1,
+				"restore: post-restore remnant exactly once")
+	# Display set + palette rebound to the restored level.
+	_apply_arena_snapshots()
+	_check($ArenaRoot.get_child_count() > 0,
+		"restore: arena nodes rebuilt for the display set")
+	_check(bridge.get_active_palette().size() == 768,
+		"restore: active palette rebound (768)")
+	print("smoke(restore): %d failure(s)" % failures)

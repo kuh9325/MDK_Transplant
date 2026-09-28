@@ -152,5 +152,79 @@ class GodotFreefallSmoke(unittest.TestCase):
                           extra=("bones flyby on course>=4",))
 
 
+def have_level(num):
+    data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
+    d = f"LEVEL{num}"
+    return (Path(data) / "TRAVERSE" / d / f"{d}.DTI").exists()
+
+
+@unittest.skipUnless(*have_prereqs())
+class GodotCombatCloseout(unittest.TestCase):
+    """Phase 17A — traversal combat presentation closeout.
+
+    LEVEL6/LEVEL8 run the generic smoke + the bounded combat exercise
+    (scope, state-1 shot mesh, bullet-cam window, impact shards,
+    death boundary -> teardown burst + EXPLODE remnant, ttl reap).
+    The save->restore golden runs on LEVEL3: a live mid-combat shot
+    round-trips through the native full-save stream and presentation
+    rebuilds from the restored authoritative state only.
+    """
+
+    def run_smoke(self, *extra):
+        return subprocess.run(
+            [str(RUN_SH), "--smoke", *extra],
+            capture_output=True, text=True, timeout=600)
+
+    def check_level_combat(self, level_dti, arena):
+        proc = self.run_smoke("--level", level_dti, "--arena", arena)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("SCRIPT ERROR", out)
+        self.assertNotIn("FAIL ", out)
+        m = re.search(
+            r"smoke\(generic\): \d+ object\(s\) enumerated, "
+            r"(\d+) failure", out)
+        self.assertIsNotNone(m, f"no smoke verdict in output:\n{out}")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"godot exited {proc.returncode}:\n{out}")
+        # The combat exercise ran and passed — a level-load alone is
+        # not the validation.
+        self.assertIn("combat(generic): scoped after MMB pulse", out)
+        self.assertIn("combat(generic): impact spawned the shard "
+                      "burst", out)
+        self.assertIn("combat(generic): kObjectTeardown event "
+                      "drained", out)
+        self.assertIn("combat(generic): unscoped", out)
+
+    def test_level6_combat(self):
+        if not have_level(6):
+            self.skipTest("no LEVEL6 data in data root")
+        self.check_level_combat(
+            "TRAVERSE/LEVEL6/LEVEL6.DTI", "OLYM_1")
+
+    def test_level8_combat(self):
+        if not have_level(8):
+            self.skipTest("no LEVEL8 data in data root")
+        self.check_level_combat(
+            "TRAVERSE/LEVEL8/LEVEL8.DTI", "GUNT_1")
+
+    def test_save_restore_golden(self):
+        proc = self.run_smoke("--save-restore")
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("SCRIPT ERROR", out)
+        m = re.search(r"smoke\(restore\): (\d+) failure", out)
+        self.assertIsNotNone(m, f"no verdict in output:\n{out}")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"godot exited {proc.returncode}:\n{out}")
+        self.assertEqual(m.group(1), "0", f"failures:\n{out}")
+        # Spot-check the golden's load-bearing lines.
+        for pat in ("restore: BULL carried >=1 active shot",
+                    "restore: restored shot at its serialized pos",
+                    "restore: no pre-restore combat events replay",
+                    "restore: post-restore remnant exactly once"):
+            self.assertIn(pat, out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

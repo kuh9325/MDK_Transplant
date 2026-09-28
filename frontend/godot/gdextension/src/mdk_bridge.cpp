@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/dti_structure.h"
@@ -21,6 +22,8 @@
 #include "core/fti_directory.h"
 #include "core/keyboard_menu.h"
 #include "core/mto_directory.h"
+#include "core/save_full_restore.h"
+#include "core/save_full_write.h"
 
 #include "arena_presenter.h"
 #include "mdk_convert.h"
@@ -120,6 +123,11 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::diagnostic_kill);
   ClassDB::bind_method(D_METHOD("diagnostic_shockwave", "object_id"),
                        &MdkBridge::diagnostic_shockwave);
+  // Phase 17A closeout — full save/restore.
+  ClassDB::bind_method(D_METHOD("save_game_full"),
+                       &MdkBridge::save_game_full);
+  ClassDB::bind_method(D_METHOD("restore_save", "bytes"),
+                       &MdkBridge::restore_save);
   // Phase 17A — traversal combat presentation.
   ClassDB::bind_method(D_METHOD("get_shot_snapshots"),
                        &MdkBridge::get_shot_snapshots);
@@ -205,6 +213,21 @@ bool MdkBridge::load_level(const String& dti_rel_path) {
   // health==0 && gate==0 as dead.
   if (rt_->fieldHealth <= 0) rt_->fieldHealth = 150;
   mode_ = 3;
+  // Standalone loads carry no campaign context; seed the session row
+  // a full save serializes. GAME+0x04 needs the internal level id —
+  // the 0x4999e8 table inverse on the LEVEL<n> dir number, the same
+  // convention mdk-inspect --save-write-full uses. A path outside
+  // the table leaves levelId=-1 and the writer reports it.
+  sess_ = mdk::ProgressionSession{};
+  sess_.mode = 3;
+  sess_.health = rt_->fieldHealth;
+  sess_.field54163b = rt_->field54163b;
+  sess_.levelId = -1;
+  if (const char* p = std::strstr(stem.c_str(), "LEVEL")) {
+    const int levelDir = static_cast<int>(std::strtol(p + 5, nullptr, 10));
+    for (int i = 0; i < 8; ++i)
+      if (mdk::progressionLevelDir(i) == levelDir) sess_.levelId = i;
+  }
   return presentTraversalLevel_(stem, dir);
 }
 
@@ -1385,6 +1408,120 @@ Dictionary MdkBridge::diagnostic_shockwave(int64_t object_id) {
   if (!rt_->combatFx.empty()) {
     out["kind"] = int64_t(rt_->combatFx.back().kind);
   }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17A closeout — full save/restore
+// ---------------------------------------------------------------------------
+
+PackedByteArray MdkBridge::save_game_full() {
+  PackedByteArray out;
+  if (mode_ != 3 || !rt_) {
+    setError_("save_game_full: no traversal session is live");
+    return out;
+  }
+  mdk::SaveWriteFullInput in;   // seed 0, no thumbnail preview
+  mdk::FullWriteReport rep;
+  std::string detail;
+  const auto bytes =
+      mdk::saveGameWriteFull(*rt_, sess_, in, &rep, &detail);
+  for (const std::string& w : rep.warnings)
+    UtilityFunctions::printerr("MdkBridge: save write — ", w.c_str());
+  if (bytes.empty()) {
+    setError_("save write failed: " + detail);
+    return out;
+  }
+  out.resize(static_cast<int64_t>(bytes.size()));
+  std::memcpy(out.ptrw(), bytes.data(), bytes.size());
+  return out;
+}
+
+Dictionary MdkBridge::restore_save(const PackedByteArray& bytes) {
+  Dictionary out;
+  out["ok"] = false;
+  if (!root_) {
+    setError_("restore_save: initialize() first");
+    return out;
+  }
+  mdk::SaveGame sg;
+  const mdk::SaveError pe = mdk::saveGameParse(
+      reinterpret_cast<const std::byte*>(bytes.ptr()),
+      std::size_t(bytes.size()), sg, true);
+  out["parse"] = String(mdk::saveErrorName(pe));
+  if (pe != mdk::SaveError::kOk) {
+    setError_(std::string("restore parse: ") + mdk::saveErrorName(pe));
+    return out;
+  }
+  if (!sg.game.full()) {
+    setError_("restore_save: header-only save — no world packets");
+    return out;
+  }
+  // The authoritative path — FUN_00427218 rebuilds the whole runtime
+  // (fresh level load + packet application) inside `trav`.
+  auto trav = std::make_unique<mdk::TraversalRuntime>();
+  mdk::FullRestoreReport rep;
+  std::string detail;
+  const mdk::SaveError re = mdk::applyFullSaveToTraversal(
+      sg, *root_, sess_, *trav, &rep, &detail);
+  out["restore"] = String(mdk::saveErrorName(re));
+  out["detail"] = String(detail.c_str());
+  if (re != mdk::SaveError::kOk) {
+    setError_("restore failed: " + detail);
+    return out;   // the old session stays live — restore is atomic
+  }
+  // Install. The fresh runtime carries none of the discarded
+  // session's transient state (combatFx, pending lists, stale
+  // object identity) — the loader's own semantics.
+  rt_ = std::move(trav);
+  mode_ = 3;
+  hasFrame_ = false;
+  timing_ = mdk::FrontendTimingState{};
+  last_ = mdk::TraversalFrameResult{};
+  prevKeyLevel_ = {};
+  ff_.reset();
+  ffScene_.reset();
+  ffTex_.clear();
+  ffHandoffDone_ = false;
+  ffHandoffRoute_ = -1;
+  ffHandoffDetail_.clear();
+  // Presentation state derived from the discarded runtime — ids
+  // re-mint, arena sets re-parse, the display set rebinds from the
+  // restored cur/partner.
+  objIds_ = mdkfront::MdkObjectIds{};
+  arenaSets_.clear();
+  arenaSetFailed_.clear();
+  displaySet_.clear();
+  arenaIndex_ = -1;
+  arenaName_.clear();
+  arenaLoaded_ = false;
+  const int dir = mdk::progressionLevelDir(sess_.levelId);
+  char stemBuf[16], dirBuf[32];
+  std::snprintf(stemBuf, sizeof(stemBuf), "LEVEL%d", dir);
+  std::snprintf(dirBuf, sizeof(dirBuf), "TRAVERSE/LEVEL%d/", dir);
+  if (!presentTraversalLevel_(stemBuf, dirBuf)) {
+    // rt_ is authoritatively restored — only the presentation tail
+    // degraded (missing shared-MTI/FTI bytes). Report, keep runtime.
+    out["detail"] = String(lastError_.c_str());
+    return out;
+  }
+  updateDisplaySet_();
+  refreshOrders_();
+  out["ok"] = true;
+  out["mode"] = mode_;
+  out["level_id"] = int64_t(sess_.levelId);
+  out["level_dir"] = int64_t(dir);
+  out["identity_ok"] = rep.identityOk;
+  out["aren_applied"] = int64_t(rep.arenApplied);
+  out["objects_allocated"] = int64_t(rep.objectsAllocated);
+  out["shot_slots"] = int64_t(rep.shotSlots);
+  out["shots_active"] = int64_t(rep.shotsActive);
+  out["cur_arena_index"] = int64_t(rep.curArenaIndex);
+  out["partner_arena_index"] = int64_t(rep.partnerArenaIndex);
+  out["health"] = int64_t(rep.health);
+  out["player_pos_mdk"] =
+      Vector3(rep.playerPos[0], rep.playerPos[1], rep.playerPos[2]);
+  out["warnings"] = int64_t(rep.warnings.size());
   return out;
 }
 

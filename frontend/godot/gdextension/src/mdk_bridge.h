@@ -170,6 +170,25 @@ class MdkBridge : public RefCounted {
   // Test/QA path only.
   Dictionary diagnostic_shockwave(int64_t object_id);
 
+  // --- Phase 17A closeout — full save/restore -------------------
+  // Serializes the live traversal session through the original
+  // full-save stream (core/save_full_write.h — SAVE/THMB/GAME/MORE/
+  // PLAY/DAMP/CAME/AREN/ALIE/FAND/BULL x3/SEND). Copy-out only;
+  // empty when no traversal session is live. No Godot presentation
+  // state participates — combatFx/shard/remnant nodes are transient
+  // by design and are never serialized.
+  PackedByteArray save_game_full();
+  // Restores a full save into the live session via
+  // applyFullSaveToTraversal (FUN_00427218 — the same path
+  // mdk-inspect --save-restore and the golden tests run): parses,
+  // rebuilds a fresh TraversalRuntime in place (level resolved from
+  // the save's own level id), rebinds arena/object/CMI references,
+  // and returns a restore report dict. On success the previous
+  // runtime — and every presentation structure derived from it —
+  // is dead; GDScript rebuilds from the first post-restore
+  // snapshot. Header-only saves (no MORE packet) are rejected.
+  Dictionary restore_save(const PackedByteArray& bytes);
+
   // --- Phase 17A — traversal combat presentation ----------------
   // All of this is copy-out presentation state produced by the core
   // combat system (playerShotVisuals + TraversalRuntime::combatFx).
