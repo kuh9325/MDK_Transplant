@@ -50,4 +50,36 @@ std::uint64_t objectGeomKey(const mdk::RuntimeModel& m);
 // hardening contract — never fatal.
 ObjectGeometry objectGeometryFromModel(const mdk::RuntimeModel& m);
 
+// Phase 16C — freefall model geometry. FALL3D records share the
+// traversal 0x24-byte triangle record AND evidence the fields the
+// G3 path skips: the model name table is the material-name list
+// (KURT's {CB3,CF3} resolve in FALL3D_<course>.MTI), the s16 at
+// tri+6 selects it (negative = palette pen, (-mat)&0xff), and
+// f32 uv[3][2] at tri+8 holds pixel-space texcoords.
+//
+// Surfaces are grouped one per (element, material index) in record
+// encounter order; verts are expanded per-tri (non-indexed) so a
+// vertex shared across materials keeps each surface's UV set. UVs
+// stay in texture-pixel space — the surface material's uv1_scale
+// folds in the material's {w,h} at bind time.
+//
+// For animated models (the freefall twins) elemVerts mutate per
+// frame — geomKey is objectGeomKey(m), so every mutated frame
+// re-keys and the caller rebuilds (same contract as G3).
+struct FreefallGeometry {
+  Ref<ArrayMesh> mesh;
+  PackedInt32Array surfaceElems;    // surface -> element index
+  PackedInt32Array surfaceMatIdx;   // surface -> raw s16 at tri+6
+  PackedStringArray surfaceMats;    // surface -> name-table string
+                                    //   ("" for negative/OOB index)
+  PackedInt32Array surfacePenIdx;   // surface -> palette index for
+                                    //   raw-negative tris, else -1
+  PackedStringArray elemNames;      // all elements
+  int64_t vertCount = 0;            // expanded output verts
+  int64_t triCount = 0;
+  std::uint64_t geomKey = 0;
+};
+
+FreefallGeometry freefallGeometryFromModel(const mdk::RuntimeModel& m);
+
 }  // namespace godot

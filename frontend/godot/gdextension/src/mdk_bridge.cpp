@@ -115,6 +115,20 @@ void MdkBridge::_bind_methods() {
       &MdkBridge::diagnostic_start);
   ClassDB::bind_method(D_METHOD("diagnostic_damage", "amount"),
                        &MdkBridge::diagnostic_damage);
+  // Phase 16C — freefall (mode 2).
+  ClassDB::bind_method(
+      D_METHOD("load_freefall", "course", "skill", "seed"),
+      &MdkBridge::load_freefall);
+  ClassDB::bind_method(D_METHOD("get_mode"), &MdkBridge::get_mode);
+  ClassDB::bind_method(D_METHOD("get_freefall_snapshot"),
+                       &MdkBridge::get_freefall_snapshot);
+  ClassDB::bind_method(D_METHOD("get_freefall_object_snapshots"),
+                       &MdkBridge::get_freefall_object_snapshots);
+  ClassDB::bind_method(
+      D_METHOD("get_freefall_object_geometry", "pool_slot", "part"),
+      &MdkBridge::get_freefall_object_geometry);
+  ClassDB::bind_method(D_METHOD("get_freefall_material", "name"),
+                       &MdkBridge::get_freefall_material);
 }
 
 void MdkBridge::setError_(const std::string& msg) {
@@ -153,19 +167,6 @@ bool MdkBridge::load_level(const String& dti_rel_path) {
                               : dti.substr(0, slash + 1);
   const std::string cmi = dir + stem + ".CMI";
   const std::string mto = dir + stem + "O.MTO";
-  const std::string mti = dir + stem + "S.MTI";
-
-  std::string err;
-  auto mtiBytes = root_->readFile(mti, 1 << 28, &err);
-  if (!mtiBytes) {
-    setError_("shared material bank read failed: " + mti + " — " + err);
-    return false;
-  }
-  auto fti = root_->readFile("MISC/MDKFONT.FTI", 1 << 28, &err);
-  if (!fti) {
-    setError_("MISC/MDKFONT.FTI read failed (SYS_PAL): " + err);
-    return false;
-  }
 
   rt_ = std::make_unique<mdk::TraversalRuntime>();
   timing_ = mdk::FrontendTimingState{};
@@ -185,6 +186,30 @@ bool MdkBridge::load_level(const String& dti_rel_path) {
   // damage/death dispatcher (FUN_00463608 dead-check) treats
   // health==0 && gate==0 as dead.
   if (rt_->fieldHealth <= 0) rt_->fieldHealth = 150;
+  mode_ = 3;
+  return presentTraversalLevel_(stem, dir);
+}
+
+// The presentation tail shared by load_level and the freefall
+// handoff: the shared MTI bank + MDKFONT.FTI reads, the SYS_PAL
+// head span, the level-fallback palette compose, and the Kurt
+// sprite-table decode. Requires rt_ to be the loaded traversal
+// runtime for `stem`.
+bool MdkBridge::presentTraversalLevel_(const std::string& stem,
+                                       const std::string& dir) {
+  const std::string mti = dir + stem + "S.MTI";
+
+  std::string err;
+  auto mtiBytes = root_->readFile(mti, 1 << 28, &err);
+  if (!mtiBytes) {
+    setError_("shared material bank read failed: " + mti + " — " + err);
+    return false;
+  }
+  auto fti = root_->readFile("MISC/MDKFONT.FTI", 1 << 28, &err);
+  if (!fti) {
+    setError_("MISC/MDKFONT.FTI read failed (SYS_PAL): " + err);
+    return false;
+  }
 
   levelStem_ = stem;
   levelDir_ = dir;
@@ -474,6 +499,64 @@ Dictionary MdkBridge::get_kurt_snapshot() {
   return out;
 }
 
+// QA action mask + raw input dictionary -> RawGameplayInput (the
+// shared keyboard/mouse fold — mode-independent device state; the
+// per-mode readers consume the channels they own).
+mdk::RawGameplayInput MdkBridge::buildRawInput_(
+    int64_t action_mask, const Dictionary* input) {
+  mdk::RawGameplayInput raw{};
+  // QA action mask -> the bound internal key codes (level state).
+  for (std::uint32_t bit = 1; bit; bit <<= 1) {
+    if (!(action_mask & bit)) continue;
+    const int slot = slotForAction(bit);
+    if (slot < 0) continue;
+    const int gi = mdk::kKeyboardSlotToGlobal[slot];
+    const int code = bindings_.keys[gi];
+    if (code > 0 && code < mdk::kGameplayKeyCount) {
+      raw.keyLevel[code >> 5] |= 1u << (code & 31);
+    }
+  }
+  if (input != nullptr) {
+    // "keys" — held internal key codes (0..127, the original
+    // FUN_0046b688 domain). The frontend translates its device key
+    // events into these codes; configured bindings stay in core.
+    if (input->has("keys")) {
+      const Variant kv = (*input)["keys"];
+      PackedInt32Array codes;
+      if (kv.get_type() == Variant::PACKED_INT32_ARRAY) {
+        codes = kv;
+      } else if (kv.get_type() == Variant::ARRAY) {
+        const Array arr = kv;
+        codes.resize(arr.size());
+        for (int64_t i = 0; i < arr.size(); ++i) {
+          codes.set(i, int64_t(arr[i]));
+        }
+      }
+      for (int64_t i = 0; i < codes.size(); ++i) {
+        const int code = codes[i];
+        if (code > 0 && code < mdk::kGameplayKeyCount) {
+          raw.keyLevel[code >> 5] |= 1u << (code & 31);
+        }
+      }
+    }
+    // DIMOUSESTATE deltas + the 4-button nibble — forwarded raw;
+    // the core's W-set axis letters/scales and per-button action
+    // masks own all semantics (FUN_00406f14).
+    raw.mouseDx = int32_t(int64_t(input->get("mouse_dx", 0)));
+    raw.mouseDy = int32_t(int64_t(input->get("mouse_dy", 0)));
+    raw.mouseDz = int32_t(int64_t(input->get("mouse_dz", 0)));
+    raw.mouseButtons =
+        uint32_t(int64_t(input->get("mouse_buttons", 0))) & 0xf;
+  }
+  // keyEdge = level & ~prev — the original's per-poll new-press
+  // bitmap (FUN_0046b688 latch diff).
+  for (int w = 0; w < mdk::kGameplayKeyBitmapWords; ++w) {
+    raw.keyEdge[w] = raw.keyLevel[w] & ~prevKeyLevel_[w];
+    prevKeyLevel_[w] = raw.keyLevel[w];
+  }
+  return raw;
+}
+
 // ---------------------------------------------------------------------------
 // Display set — arenas the traversal view currently presents
 // ---------------------------------------------------------------------------
@@ -719,61 +802,16 @@ Dictionary MdkBridge::step_frame_input(double dt_ms,
 Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
                                 const Dictionary* input) {
   Dictionary out;
+  // Mode routing (0x541492): mode 2 runs the freefall core, mode 3
+  // (and the standalone load_level path) runs traversal.
+  if (mode_ == 2) return stepFreefall_(dt_ms, action_mask, input);
   if (!rt_) {
     setError_("no level loaded");
     return out;
   }
   mdk::frontendTimingUpdate(timing_, dt_ms);
-  mdk::RawGameplayInput raw{};
-  // QA action mask -> the bound internal key codes (level state).
-  for (std::uint32_t bit = 1; bit; bit <<= 1) {
-    if (!(action_mask & bit)) continue;
-    const int slot = slotForAction(bit);
-    if (slot < 0) continue;
-    const int gi = mdk::kKeyboardSlotToGlobal[slot];
-    const int code = bindings_.keys[gi];
-    if (code > 0 && code < mdk::kGameplayKeyCount) {
-      raw.keyLevel[code >> 5] |= 1u << (code & 31);
-    }
-  }
-  if (input != nullptr) {
-    // "keys" — held internal key codes (0..127, the original
-    // FUN_0046b688 domain). The frontend translates its device key
-    // events into these codes; configured bindings stay in core.
-    if (input->has("keys")) {
-      const Variant kv = (*input)["keys"];
-      PackedInt32Array codes;
-      if (kv.get_type() == Variant::PACKED_INT32_ARRAY) {
-        codes = kv;
-      } else if (kv.get_type() == Variant::ARRAY) {
-        const Array arr = kv;
-        codes.resize(arr.size());
-        for (int64_t i = 0; i < arr.size(); ++i) {
-          codes.set(i, int64_t(arr[i]));
-        }
-      }
-      for (int64_t i = 0; i < codes.size(); ++i) {
-        const int code = codes[i];
-        if (code > 0 && code < mdk::kGameplayKeyCount) {
-          raw.keyLevel[code >> 5] |= 1u << (code & 31);
-        }
-      }
-    }
-    // DIMOUSESTATE deltas + the 4-button nibble — forwarded raw;
-    // the core's W-set axis letters/scales and per-button action
-    // masks own all semantics (FUN_00406f14).
-    raw.mouseDx = int32_t(int64_t(input->get("mouse_dx", 0)));
-    raw.mouseDy = int32_t(int64_t(input->get("mouse_dy", 0)));
-    raw.mouseDz = int32_t(int64_t(input->get("mouse_dz", 0)));
-    raw.mouseButtons =
-        uint32_t(int64_t(input->get("mouse_buttons", 0))) & 0xf;
-  }
-  // keyEdge = level & ~prev — the original's per-poll new-press
-  // bitmap (FUN_0046b688 latch diff).
-  for (int w = 0; w < mdk::kGameplayKeyBitmapWords; ++w) {
-    raw.keyEdge[w] = raw.keyLevel[w] & ~prevKeyLevel_[w];
-    prevKeyLevel_[w] = raw.keyLevel[w];
-  }
+  const mdk::RawGameplayInput raw =
+      buildRawInput_(action_mask, input);
 
   last_ = mdk::stepTraversalRuntime(*rt_, raw, bindings_, timing_);
   hasFrame_ = true;
@@ -1291,6 +1329,461 @@ Array MdkBridge::get_arena_names() const {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 16C — freefall (mode 2)
+// ---------------------------------------------------------------------------
+
+bool MdkBridge::load_freefall(int64_t course, int64_t skill,
+                              int64_t seed) {
+  if (!root_) {
+    setError_("initialize() first");
+    return false;
+  }
+  shutdown();   // drops rt_/ff_/buffers on reload; root_ is kept
+  if (course < 0 || course > 4 || skill < 0 || skill > 2) {
+    setError_("load_freefall: course 0..4, skill 0..2");
+    return false;
+  }
+
+  // FUN_0040ef28's presentation loads — BNI records, the per-course
+  // MTI material bank, the FALLP palette, the FALLPU pickup list.
+  ffScene_ = std::make_unique<mdk::FreefallScene>();
+  std::string detail;
+  const auto se = mdk::freefallSceneLoad(*root_, int(course),
+                                         ffScene_.get(), &detail);
+  if (se != mdk::FreefallSceneError::kOk) {
+    setError_(std::string("freefall scene load failed: ") +
+              mdk::freefallSceneErrorName(se) + " — " + detail);
+    ffScene_.reset();
+    return false;
+  }
+
+  ff_ = std::make_unique<mdk::FreefallRuntime>();
+  mdk::FreefallCourseData data;
+  data.course = int(course);
+  data.skill = int(skill);
+  data.pickups = ffScene_->pickups;
+  // explodeAnimFrames keeps the runtime default — the EXPLODE
+  // model-slot anims-table entry (+0xc >> 16) is an undecoded seam
+  // (mdk-inspect's digest runs use the same default).
+  mdk::freefallInit(*ff_, data, std::uint32_t(seed));
+
+  // The orchestrator globals: levelId IS the freefall course (541498
+  // selects both FALL3D_<c+1> and the traversal 0x4999e8 table); the
+  // LCG state is the shared stream the handoff syncs back out.
+  sess_ = mdk::ProgressionSession{};
+  sess_.levelId = int(course);
+  sess_.skill = int(skill);
+  sess_.health = 100;
+  sess_.rng = std::uint32_t(seed);
+  mdk::progressionEnterFreefall(sess_);
+
+  timing_ = mdk::FrontendTimingState{};
+  prevKeyLevel_ = {};
+  ffHandoffDone_ = false;
+  ffHandoffRoute_ = -1;
+  ffHandoffDetail_.clear();
+  ffTex_.clear();
+  mode_ = 2;
+  hasFrame_ = false;
+  return true;
+}
+
+Dictionary MdkBridge::stepFreefall_(double dt_ms,
+                                    int64_t action_mask,
+                                    const Dictionary* input) {
+  Dictionary out;
+  if (!ff_ || !ffScene_) {
+    setError_("load_freefall() first");
+    return out;
+  }
+  mdk::frontendTimingUpdate(timing_, dt_ms);
+  const mdk::RawGameplayInput raw =
+      buildRawInput_(action_mask, input);
+
+  // Mode-2 input — FUN_00407e50's pre-fold state: the bound
+  // direction keys (KeyLeft/Right/Up/Down — the same keyboard
+  // globals the traversal reader uses) plus the analog axes. The
+  // dict path may override the digital channels with explicit
+  // booleans and supply "axis_x"/"axis_y" (0x54b538/3c) directly.
+  mdk::FreefallInput fi{};
+  const auto held = [&](int slot) -> bool {
+    const int gi = mdk::kKeyboardSlotToGlobal[slot];
+    const int code = bindings_.keys[gi];
+    return code > 0 && code < mdk::kGameplayKeyCount &&
+           ((raw.keyLevel[code >> 5] >> (code & 31)) & 1u) != 0;
+  };
+  fi.left = held(0);
+  fi.right = held(1);
+  fi.up = held(2);
+  fi.down = held(3);
+  if (input != nullptr) {
+    fi.left = bool(input->get("left", Variant(fi.left)));
+    fi.right = bool(input->get("right", Variant(fi.right)));
+    fi.up = bool(input->get("up", Variant(fi.up)));
+    fi.down = bool(input->get("down", Variant(fi.down)));
+    fi.axisX = float(double(input->get("axis_x", 0.0)));
+    fi.axisY = float(double(input->get("axis_y", 0.0)));
+  }
+
+  const bool done = mdk::freefallStep(*ff_, fi, timing_.frameStep,
+                                      timing_.smoothed,
+                                      timing_.deltaSec);
+  // Presentation twins — stepped with the SAME dtSec the gameplay
+  // step consumed (objectAnimTickDt's rate*animRate*dtSec ==
+  // frameUnits for the rate-1.0 records).
+  mdk::freefallSceneStep(*ffScene_, *ff_, timing_.deltaSec);
+  if (done && !ffHandoffDone_) freefallHandoff_();
+
+  out["mode"] = mode_;
+  out["done"] = done;
+  out["phase"] = int64_t(ff_->phase);
+  out["timeline"] = double(ff_->timeline);
+  out["health"] = int64_t(ff_->health);
+  out["fade"] = double(ff_->fade);
+  out["camera"] = get_freefall_snapshot()["camera"];
+  if (ffHandoffDone_) {
+    out["handoff_route"] = ffHandoffRoute_;
+    out["handoff_detail"] = String(ffHandoffDetail_.c_str());
+  }
+  Dictionary inp;
+  inp["left"] = fi.left;
+  inp["right"] = fi.right;
+  inp["up"] = fi.up;
+  inp["down"] = fi.down;
+  inp["axis_x"] = fi.axisX;
+  inp["axis_y"] = fi.axisY;
+  out["input"] = inp;
+  return out;
+}
+
+void MdkBridge::freefallHandoff_() {
+  ffHandoffDone_ = true;
+  if (!ff_ || !root_) return;
+  auto trav = std::make_unique<mdk::TraversalRuntime>();
+  mdk::ProgressionHandoff ho;
+  std::string detail;
+  const auto e = mdk::progressionFreefallHandoff(
+      *root_, sess_, *ff_, trav.get(), ho, &detail);
+  ffHandoffDetail_ = detail;
+  if (e != mdk::ProgressionError::kOk) {
+    setError_(std::string("freefall handoff: ") +
+              mdk::progressionErrorName(e) + " — " + detail);
+    return;   // mode stays 2 — the terminal frame keeps presenting
+  }
+  ffHandoffRoute_ = static_cast<int>(ho.route);
+  if (ho.route != mdk::ProgressionRoute::kTraversal) {
+    mode_ = 0;   // frontend route — death (health <= 0)
+    return;
+  }
+  // Traversal route — FUN_004346e8/FUN_00433d40 already ran inside
+  // the handoff (the runtime is loaded with health/rng/ammo
+  // carried). Install it and run the same presentation tail
+  // load_level uses so arena sets/materials/Kurt tables exist.
+  rt_ = std::move(trav);
+  mode_ = 3;
+  hasFrame_ = false;
+  // ho.dtiPath = TRAVERSE/LEVEL<n>/LEVEL<n>.DTI — stem/dir derive
+  // the same way load_level parses them.
+  const std::string& dti = ho.dtiPath;
+  const auto slash = dti.find_last_of("/\\");
+  const auto dot = dti.find_last_of('.');
+  const std::size_t nameOff = slash == std::string::npos ? 0 : slash + 1;
+  const std::string stem = dti.substr(nameOff, dot - nameOff);
+  const std::string dir = slash == std::string::npos
+                              ? "" : dti.substr(0, slash + 1);
+  if (presentTraversalLevel_(stem, dir)) {
+    updateDisplaySet_();
+    refreshOrders_();
+  }
+}
+
+Dictionary MdkBridge::get_freefall_snapshot() {
+  Dictionary out;
+  if (!ff_ || !ffScene_) return out;
+  const mdk::FreefallRuntime& f = *ff_;
+  out["mode"] = mode_;
+  out["phase"] = int64_t(f.phase);        // 0 intro · 1 play ·
+                                        // 2 dead · 3 done
+  out["finished"] = f.finished;
+  out["died"] = f.died;
+  out["intro_countdown"] = int64_t(f.introCountdown);
+  out["intro_progress"] = double(f.introProgress);
+  out["zoom_frame"] = int64_t(f.zoomFrame);   // ZOOM sprite idx seam
+  out["zoom_sub"] = int64_t(f.zoomSub);
+  out["timeline"] = double(f.timeline);
+  out["health"] = int64_t(f.health);
+  out["fade"] = double(f.fade);           // palette-bright factor:
+                                          // 1 full · 0 black · >1
+                                          // damage flash
+  out["fade_target"] = double(f.fadeTarget);
+  out["fade_rate"] = double(f.fadeRate);
+  out["palette_cycle"] = double(f.palette);
+  out["radar_timer"] = int64_t(f.radarTimer);
+  out["pickup_timer"] = int64_t(f.pickupTimer);
+  out["missile_timer"] = int64_t(f.missileTimer);
+  out["missile_budget"] = int64_t(f.missileBudget);
+  out["pickups_remaining"] = int64_t(f.pickupsRemaining);
+  out["bones_course"] = f.bonesCourse;
+  out["finish_latch"] = f.finishLatch;
+  out["course"] = int64_t(f.course);
+  out["skill"] = int64_t(f.skill);
+  out["list_head"] = int64_t(f.listHead);
+  out["bones_idx"] = int64_t(f.bonesIdx);
+  out["events_total"] = int64_t(f.events.size());
+  out["handoff_done"] = ffHandoffDone_;
+  out["handoff_route"] = ffHandoffRoute_;
+
+  // The FALLP_<course+1> palette bound at 0x4edc28 — pen/index
+  // materials and GDScript debug views resolve colors through it.
+  PackedByteArray pal;
+  pal.resize(768);
+  std::memcpy(pal.ptrw(), ffScene_->palette.data(), 768);
+  out["palette"] = pal;
+  out["palette_ok"] = ffScene_->paletteOk;
+
+  // FUN_004123f4's camera block, converted. The pose rows are the
+  // [right,down,back] convention (mdk_math.h): the raw M2 row2
+  // (0,0,-1) is +viewdir because the freefall scaleZ is +1, so the
+  // semantic back row is +Z_mdk = (0,0,1). The zoom global 0x540b58
+  // has no mode-2 writer in BUILD_A — the boot value 2.4 stands.
+  const float zoom = 2.4f;
+  mdk::PlayerCameraPose p{};
+  p.pos[0] = f.cameraPos[0];
+  p.pos[1] = f.cameraPos[1];
+  p.pos[2] = f.cameraPos[2];
+  p.basis[0][0] = 1.0f;  p.basis[0][1] = 0.0f;  p.basis[0][2] = 0.0f;
+  p.basis[0][3] = -f.cameraPos[0];
+  p.basis[1][0] = 0.0f;  p.basis[1][1] = -1.0f; p.basis[1][2] = 0.0f;
+  p.basis[1][3] = f.cameraPos[1];
+  p.basis[2][0] = 0.0f;  p.basis[2][1] = 0.0f;  p.basis[2][2] = 1.0f;
+  p.basis[2][3] = -f.cameraPos[2];
+  p.scaleX = 1.0f / (zoom * 0.5f);
+  p.scaleY = 1.0f / (zoom * 0.3f);
+  p.scaleZ = 1.0f;
+  p.viewW = 600;
+  p.viewH = 360;
+  p.viewCX = 300;
+  p.viewCY = 180;
+  p.viewOX = 0;
+  p.viewOY = 0;
+  out["camera"] = mdkToGodotCameraTransform(p);
+  out["camera_pos"] = mdkToGodotVec(p.pos);
+  out["camera_pos_mdk"] =
+      Vector3(f.cameraPos[0], f.cameraPos[1], f.cameraPos[2]);
+  out["camera_aim_mdk"] =
+      Vector3(f.camX, f.camY, f.camZ);      // 0x4ce69c block
+  const float xDiv = float(p.viewW) * 0.4999f;
+  const float yDiv = float(p.viewH) * 0.5011f;
+  out["fov_deg"] = mdkfront::mdkCameraFovYDeg(
+      p.scaleY, float(p.viewH), yDiv);
+  out["aspect"] = mdkfront::mdkCameraAspect(
+      p.scaleX, p.scaleY, float(p.viewW), float(p.viewH), xDiv, yDiv);
+  out["scale_x"] = p.scaleX;
+  out["scale_y"] = p.scaleY;
+  out["scale_z"] = p.scaleZ;
+  out["zoom"] = double(zoom);
+
+  // The player record — pool[listHead] is both list anchor and
+  // player handle (0x4edaec).
+  const mdk::FreefallObject* pl =
+      f.listHead >= 0 ? &f.pool[std::size_t(f.listHead)] : nullptr;
+  if (pl != nullptr) {
+    Dictionary pd;
+    pd["pool_slot"] = int64_t(f.listHead);
+    pd["pos"] = mdkToGodotVec(&pl->px);
+    pd["pos_mdk"] = Vector3(pl->px, pl->py, pl->pz);
+    pd["vel_mdk"] = Vector3(pl->vx, pl->vy, pl->vz);
+    pd["yaw_deg"] = double(pl->yaw);
+    pd["roll_deg"] = double(pl->roll);
+    pd["scale"] = double(pl->scale);
+    pd["anim_handle"] = int64_t(pl->animHandle);
+    pd["anim_acc"] = double(pl->animAcc);
+    pd["anim_frame"] = int64_t(pl->animFrame);
+    pd["anim_sentinel"] = int64_t(pl->animSentinel);
+    pd["alive"] = pl->alive != 0;
+    out["player"] = pd;
+  }
+  return out;
+}
+
+Array MdkBridge::get_freefall_object_snapshots() {
+  Array out;
+  if (!ff_ || !ffScene_) return out;
+  // The FUN_004109d8 entry domain: the active list walked from
+  // listHead. Depth sorting is the software renderer's painter
+  // algorithm — Godot's depth buffer makes it redundant, so the
+  // snapshots keep list order.
+  for (int i = ff_->listHead; i >= 0; i = ff_->pool[i].next) {
+    if (i >= 399) break;   // corrupt-link hardening
+    const mdk::FreefallObject& o = ff_->pool[std::size_t(i)];
+    const int slot = mdk::freefallObjectModelSlot(*ff_, o);
+    const mdk::FreefallScene::Twin* t =
+        mdk::freefallSceneTwin(*ffScene_, i);
+    Dictionary d;
+    d["pool_slot"] = int64_t(i);
+    d["type"] = int64_t(o.type);            // 0..5 dispatch
+    d["alive"] = o.alive != 0;
+    d["model"] = int64_t(o.model);          // FreefallModelTag
+    d["model_slot"] = int64_t(slot);
+    d["pos"] = mdkToGodotVec(&o.px);
+    d["pos_mdk"] = Vector3(o.px, o.py, o.pz);
+    d["vel_mdk"] = Vector3(o.vx, o.vy, o.vz);
+    d["yaw_deg"] = double(o.yaw);
+    d["roll_deg"] = double(o.roll);
+    d["scale"] = double(o.scale);
+    d["anim_handle"] = int64_t(o.animHandle);
+    d["anim_acc"] = double(o.animAcc);
+    d["anim_frame"] = int64_t(o.animFrame);
+    d["anim_sentinel"] = int64_t(o.animSentinel);
+    d["flags148"] = int64_t(o.flags);
+    d["timer"] = int64_t(o.timer);
+    d["sub_timer"] = int64_t(o.subTimer);
+    d["pickup_rec"] = int64_t(o.pickupRec);
+    // The kind-4 trail / kind-3 BANG gates — state only (the FX
+    // renders stay documented seams).
+    d["trail_fx"] = int64_t(o.fx);
+    d["explode_flag"] = int64_t(o.explodeFlag);
+    // +0x306 — the chute attachment entry (second kind-2 under the
+    // same object basis; its geometry comes from part 1).
+    d["chute"] = o.chute != 0;
+    d["presented"] = t != nullptr;
+    if (t != nullptr) {
+      const mdk::DynamicObject& tw = t->obj;
+      const mdkfront::Vec3 org = {tw.col.origin[0], tw.col.origin[1],
+                                  tw.col.origin[2]};
+      d["transform"] = mdkToGodotObjectTransform(
+          mdkfront::mdkTransformToGodot(tw.col.xform, org));
+      d["geom_key"] = int64_t(objectGeomKey(tw.model));
+      // The driver's own outputs — distinct from the runtime's
+      // gameplay-side animFrame (the twin is the presented frame).
+      d["drv_anim_frame"] = int64_t(tw.animFrame);
+      d["drv_anim_latch"] = int64_t(tw.animLatch);
+      d["model_name"] =
+          String(tw.model.modelName().c_str());
+      d["elem_count"] = int64_t(tw.model.elems.size());
+      std::int64_t vc = 0, tc = 0;
+      for (std::size_t e = 0; e < tw.model.elems.size(); ++e) {
+        vc += int64_t(tw.model.elemVerts[e].size() / 3);
+        tc += int64_t(tw.model.elemTris[e].size() / 0x24);
+      }
+      d["vert_count"] = vc;
+      d["tri_count"] = tc;
+      if (o.chute != 0) {
+        const mdk::RuntimeModel* cm =
+            mdk::freefallSceneChuteModel(*ffScene_);
+        if (cm != nullptr) {
+          d["chute_geom_key"] = int64_t(objectGeomKey(*cm));
+        }
+      }
+    }
+    out.push_back(d);
+  }
+  return out;
+}
+
+Dictionary MdkBridge::get_freefall_object_geometry(
+    int64_t pool_slot, int64_t part) {
+  Dictionary out;
+  if (!ff_ || !ffScene_ || pool_slot < 0 || pool_slot >= 399) {
+    return out;
+  }
+  const mdk::RuntimeModel* m = nullptr;
+  std::string tag;
+  if (part == 1) {
+    // The +0x306 chute attachment — a kind-2 entry exists only while
+    // the object's chute flag is set; it renders under the object's
+    // own basis (no separate transform).
+    if (ff_->pool[std::size_t(pool_slot)].chute == 0) return out;
+    m = mdk::freefallSceneChuteModel(*ffScene_);
+    tag = "CHUTE";
+  } else {
+    const mdk::FreefallScene::Twin* t =
+        mdk::freefallSceneTwin(*ffScene_, int(pool_slot));
+    if (t == nullptr) return out;
+    m = &t->obj.model;
+    tag = m->modelName();
+  }
+  if (m == nullptr) return out;
+  const FreefallGeometry g = freefallGeometryFromModel(*m);
+  out["mesh"] = g.mesh;
+  out["surface_elems"] = g.surfaceElems;
+  out["surface_mats"] = g.surfaceMats;
+  out["surface_mat_idx"] = g.surfaceMatIdx;
+  out["surface_pen"] = g.surfacePenIdx;
+  out["elem_names"] = g.elemNames;
+  out["vert_count"] = g.vertCount;
+  out["tri_count"] = g.triCount;
+  out["elem_count"] = int64_t(m->elems.size());
+  out["geom_key"] = int64_t(g.geomKey);
+  out["model"] = String(tag.c_str());
+  return out;
+}
+
+Dictionary MdkBridge::get_freefall_material(const String& name) {
+  Dictionary out;
+  if (!ffScene_) return out;
+  const std::string nm = std::string(name.utf8().get_data());
+  const mdk::FreefallMaterial* m =
+      mdk::freefallSceneMaterial(*ffScene_, nm);
+  if (m == nullptr) return out;
+  out["name"] = name;
+  out["valid"] = m->valid;
+  out["palette_index"] = int64_t(m->paletteIndex);
+  if (m->paletteIndex >= 0) {
+    // Flat pen / index record — the color is the palette entry.
+    // paletteIndex 256 = NONE (the original's no-draw flat-0xff).
+    if (m->paletteIndex < 256 && ffScene_->paletteOk) {
+      const std::uint8_t* p =
+          ffScene_->palette.data() + std::size_t(m->paletteIndex) * 3;
+      out["palette_color"] =
+          Color(p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f);
+    }
+    out["no_draw"] = m->paletteIndex >= 256;
+    return out;
+  }
+  out["w"] = int64_t(m->width);
+  out["h"] = int64_t(m->height);
+  out["frames"] = int64_t(m->frameCount);
+  out["tex"] = freefallTexture_(*m);
+  return out;
+}
+
+Ref<ImageTexture> MdkBridge::freefallTexture_(
+    const mdk::FreefallMaterial& m) {
+  Ref<ImageTexture> tex;
+  if (m.pixels.empty() || m.width <= 0 || m.height <= 0) return tex;
+  if (auto it = ffTex_.find(m.name); it != ffTex_.end()) {
+    return it->second;
+  }
+  // Frame 0 of the indexed strip — palette-mapped RGBA (the FALLP
+  // bank is fixed for the loaded course, so the name key suffices).
+  const std::size_t npix =
+      std::size_t(m.width) * std::size_t(m.height);
+  PackedByteArray px;
+  px.resize(static_cast<int64_t>(npix) * 4);
+  std::uint8_t* dst = px.ptrw();
+  for (std::size_t i = 0; i < npix; ++i) {
+    const std::uint8_t v = m.pixels[i];
+    if (v == 0 || !ffScene_->paletteOk) {
+      dst[i * 4 + 3] = v == 0 ? 0 : 255;   // index 0 = transparent
+      if (v != 0) {
+        dst[i * 4 + 0] = dst[i * 4 + 1] = dst[i * 4 + 2] = v;
+      }
+      continue;
+    }
+    dst[i * 4 + 0] = ffScene_->palette[v * 3 + 0];
+    dst[i * 4 + 1] = ffScene_->palette[v * 3 + 1];
+    dst[i * 4 + 2] = ffScene_->palette[v * 3 + 2];
+    dst[i * 4 + 3] = 255;
+  }
+  Ref<Image> img = Image::create_from_data(
+      m.width, m.height, false, Image::FORMAT_RGBA8, px);
+  tex = ImageTexture::create_from_image(img);
+  ffTex_[m.name] = tex;
+  return tex;
+}
+
 void MdkBridge::shutdown() {
   arenaLoaded_ = false;
   arenaIndex_ = -1;
@@ -1309,6 +1802,14 @@ void MdkBridge::shutdown() {
   sysPalHead_ = {};
   prevKeyLevel_ = {};
   rt_.reset();
+  ff_.reset();
+  ffScene_.reset();
+  sess_ = mdk::ProgressionSession{};
+  ffHandoffDone_ = false;
+  ffHandoffRoute_ = -1;
+  ffHandoffDetail_.clear();
+  ffTex_.clear();
+  mode_ = 0;
   hasFrame_ = false;
   lastError_.clear();
 }

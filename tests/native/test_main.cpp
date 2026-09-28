@@ -18,6 +18,7 @@
 #include "core/file_family.h"
 #include "core/framebuffer.h"
 #include "core/freefall_runtime.h"
+#include "core/freefall_scene.h"
 #include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
@@ -19707,6 +19708,333 @@ void test_freefall_freelist() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 16C — freefall presentation scene (freefall_scene.h): FALL3D
+// record load, roster/proto decode, twin anim sync, material resolve.
+// Synthetic bundle in the OBSERVED layouts only.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A FALL3D.BNI model record in its OBSERVED flag-less form — the
+// shared geometry stream minus the leading u32 flag word (the flag
+// arrives as FUN_00428400's register arg; the scene re-heads it from
+// the 0x49a664 roster byte — bit7 named elements, low7 model slot).
+std::vector<std::uint8_t> ffGeoRecord(
+    std::uint32_t rosterFlag, std::initializer_list<const char*> names,
+    const std::vector<GeoElemSpec>& elems) {
+  auto rec =
+      makeGeoRecord((rosterFlag & 0x80) ? 1 : 0, names, elems, {});
+  rec.erase(rec.begin(), rec.begin() + 4);   // drop the flag word
+  return rec;
+}
+
+// A single-channel ObjectAnimView record (the OBSERVED KURTANIM /
+// KURT_HIT shape): delta channel with an absolute basePose, then
+// {i16 frame, vc*3 i8 deltas} keys terminated by -1. Each listed key
+// carries +4 on every vertex's x (the applier scales deltas by
+// +0x10 — 0.5 here — so each key adds +2 x).
+std::vector<std::uint8_t> ffAnimRecord(
+    const char* chanName, std::initializer_list<float> basePose,
+    float scale, int frameCount,
+    std::initializer_list<int> keyFrames) {
+  std::vector<std::uint8_t> rec;
+  aF(rec, 1.0f);
+  aW(rec, 1);
+  aW(rec, static_cast<std::uint32_t>(frameCount));
+  const std::size_t offPos = rec.size();
+  aW(rec, 0);                                 // chanOff[0] (patched)
+  for (int f = 0; f < frameCount; ++f) aV3(rec, 0, 0, 0);
+  aW(rec, 0);                                 // refCount
+  const std::size_t chanAt = rec.size();
+  for (int k = 0; k < 4; ++k)
+    rec[offPos + k] =
+        static_cast<std::uint8_t>((chanAt - 4) >> (k * 8));
+  aName(rec, chanName);
+  aW(rec, static_cast<std::uint32_t>(basePose.size() / 3));
+  aF(rec, scale);
+  for (float v : basePose) aF(rec, v);
+  for (int kf : keyFrames) {
+    aH(rec, static_cast<std::int16_t>(kf));
+    for (std::size_t i = 0; i < basePose.size(); ++i)
+      rec.push_back(static_cast<std::uint8_t>(i % 3 == 0 ? 4 : 0));
+  }
+  aH(rec, -1);
+  return rec;
+}
+
+void bniPutPayload(SyntheticBni& s, const char* rec,
+                   const std::vector<std::uint8_t>& bytes) {
+  mdk::BniDirectory d =
+      mdk::inspectBniDirectory(std::span<const std::byte>(s.buf));
+  const mdk::BniRecord* r = mdk::findBniRecord(d, rec);
+  CHECK(r != nullptr && r->payloadSize() >= bytes.size());
+  std::memcpy(s.buf.data() + r->payloadFileOffset, bytes.data(),
+              bytes.size());
+}
+
+void mtiPutPayload(SyntheticMti& s, const char* rec,
+                   const std::vector<std::uint8_t>& bytes) {
+  mdk::MtiDirectory d =
+      mdk::inspectMtiDirectory(std::span<const std::byte>(s.buf));
+  for (const mdk::MtiEntry& e : d.entries) {
+    if (e.name() == rec) {
+      std::memcpy(s.buf.data() + e.payloadFileOffset(), bytes.data(),
+                  bytes.size());
+      return;
+    }
+  }
+  CHECK(false);   // record must exist in the synthetic bank
+}
+
+} // namespace
+
+void test_freefall_scene() {
+  namespace fs = std::filesystem;
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_ffscene";
+  fs::remove_all(tmp);
+  fs::create_directories(tmp / "FALL3D");
+
+  // -- the FALL3D bundle ------------------------------------------------------
+  // Roster records in flag-less form: KURT/MISSILE/CHUTE named
+  // (0x8n), SW_H25/EXPLODE anonymous. KURT's single element "ELEM" is
+  // the anim channel's name-bind target; its name table is the MTI
+  // material pair {CB3, CF3}.
+  const auto kurt = ffGeoRecord(0x81, {"CB3", "CF3"},
+      {{"ELEM", {0, 0, 0, 1, 0, 0, 2, 0, 0}, {0, 1, 2}}});
+  const auto missile = ffGeoRecord(0x83, {"MISSILE"},
+      {{"M1", {0, 0, 0, 0, 1, 0, 0, 0, 1}, {0, 1, 2}}});
+  const auto chute = ffGeoRecord(0x84, {"CHUTE"},
+      {{"C1", {0, 0, 0, 1, 0, 0, 0, 1, 0}, {0, 1, 2}}});
+  const auto sw25 = ffGeoRecord(0x0f, {},
+      {{"", {0, 0, 0, 1, 0, 0, 0, 1, 0}, {0, 1, 2}}});
+  const auto explode = ffGeoRecord(0x18, {},
+      {{"", {0, 0, 0, 2, 0, 0, 0, 2, 0}, {0, 1, 2}}});
+  // KURTANIM: 4-frame record, delta keys at frames 1 and 2.
+  const auto kurtAnim = ffAnimRecord(
+      "ELEM", {0, 0, 0, 1, 0, 0, 2, 0, 0}, 0.5f, 4, {1, 2});
+  // KURT_HIT: 2-frame record with a distinct base pose.
+  const auto kurtHit = ffAnimRecord(
+      "ELEM", {10, 0, 0, 11, 0, 0, 12, 0, 0}, 0.5f, 2, {});
+  std::vector<std::uint8_t> pal(768);
+  for (int i = 0; i < 768; ++i)
+    pal[std::size_t(i)] = static_cast<std::uint8_t>(i);
+  std::vector<std::uint8_t> fallpu(24, 0);    // {name8,u32} + NUL rec
+  std::memcpy(fallpu.data(), "SW_H25", 6);
+
+  auto bni = SyntheticBni::build({
+      {"KURT",     static_cast<std::uint32_t>(kurt.size())},
+      {"MISSILE",  static_cast<std::uint32_t>(missile.size())},
+      {"CHUTE",    static_cast<std::uint32_t>(chute.size())},
+      {"SW_H25",   static_cast<std::uint32_t>(sw25.size())},
+      {"EXPLODE",  static_cast<std::uint32_t>(explode.size())},
+      {"KURTANIM", static_cast<std::uint32_t>(kurtAnim.size())},
+      {"KURT_HIT", static_cast<std::uint32_t>(kurtHit.size())},
+      {"FALLP1",   768u},
+      {"FALLPU_1", 24u},
+  });
+  bniPutPayload(bni, "KURT", kurt);
+  bniPutPayload(bni, "MISSILE", missile);
+  bniPutPayload(bni, "CHUTE", chute);
+  bniPutPayload(bni, "SW_H25", sw25);
+  bniPutPayload(bni, "EXPLODE", explode);
+  bniPutPayload(bni, "KURTANIM", kurtAnim);
+  bniPutPayload(bni, "KURT_HIT", kurtHit);
+  bniPutPayload(bni, "FALLP1", pal);
+  bniPutPayload(bni, "FALLPU_1", fallpu);
+  std::ofstream(tmp / "FALL3D" / "FALL3D.BNI", std::ios::binary)
+      .write(reinterpret_cast<const char*>(bni.buf.data()),
+             static_cast<std::streamsize>(bni.buf.size()));
+
+  // FALL3D_1.MTI — CB3/CF3 texture payloads ({u16 w, u16 h, px[w*h]})
+  // and the GREY16 index record (+0x0c = the palette pen).
+  std::vector<std::uint8_t> cb3;
+  aH(cb3, 4); aH(cb3, 4);
+  for (int i = 0; i < 16; ++i) cb3.push_back(std::uint8_t(i));
+  std::vector<std::uint8_t> cf3;
+  aH(cf3, 2); aH(cf3, 2);
+  for (int i = 0; i < 4; ++i) cf3.push_back(std::uint8_t(0x40 + i));
+  auto mti = SyntheticMti::build("FALL3D_1.MTI", {
+      {"CB3",    0u,           0u,  0u,
+       static_cast<std::uint32_t>(cb3.size())},
+      {"CF3",    0u,           0u,  0u,
+       static_cast<std::uint32_t>(cf3.size())},
+      {"GREY16", 0xffffffffu, 16u, 0u, 0u},
+  });
+  mtiPutPayload(mti, "CB3", cb3);
+  mtiPutPayload(mti, "CF3", cf3);
+  std::ofstream(tmp / "FALL3D" / "FALL3D_1.MTI", std::ios::binary)
+      .write(reinterpret_cast<const char*>(mti.buf.data()),
+             static_cast<std::streamsize>(mti.buf.size()));
+
+  // -- load -------------------------------------------------------------------
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+  mdk::FreefallScene s;
+  CHECK(mdk::freefallSceneLoad(*root, 0, &s, &err) ==
+        mdk::FreefallSceneError::kOk);
+  CHECK(s.paletteOk && s.palette[1] == 1 && s.palette[767] == 255);
+  CHECK(s.pickups.size() == 1 &&
+        std::strncmp(s.pickups[0].name, "SW_H25", 9) == 0);
+  CHECK(s.anims[mdk::kFfAnimKurt].rec != nullptr);
+  CHECK(s.anims[mdk::kFfAnimKurtHit].rec != nullptr);
+  CHECK(s.anims[mdk::kFfAnimBones].rec == nullptr);  // absent record
+
+  // -- runtime: spawn the player through the intro path -----------------------
+  mdk::FreefallCourseData data = ffCourse(0, 0);
+  data.pickups = s.pickups;
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, data, 7);
+  rt.introCountdown = 90;          // spawn lands inside this step
+  ffStep(rt, {});                  // spawn (acc -1) + intro +=units -> 0
+  CHECK(rt.listHead == 0);
+  FreefallObject& pl = rt.pool[0];
+  CHECK(pl.type == 0 && pl.model == mdk::kFfModelKurt);
+  CHECK(pl.animHandle == mdk::kFfAnimKurt);
+  CHECK(near(pl.animAcc, 0.0, 1e-6) && pl.animFrame == -1);
+
+  // -- model-slot resolution (0x49a664 roster / FUN_00454794 names) ------------
+  CHECK(mdk::freefallObjectModelSlot(rt, pl) == 1);
+  {
+    FreefallObject m{}; m.model = mdk::kFfModelMissile;
+    CHECK(mdk::freefallObjectModelSlot(rt, m) == 3);
+    FreefallObject r{}; r.model = mdk::kFfModelRadar;
+    CHECK(mdk::freefallObjectModelSlot(rt, r) == -1);  // sprite seam
+    FreefallObject p{}; p.model = mdk::kFfModelPickup; p.pickupRec = 0;
+    CHECK(mdk::freefallObjectModelSlot(rt, p) == 0x0f);  // "SW_H25"
+    FreefallObject b{}; b.model = mdk::kFfModelBang;
+    CHECK(mdk::freefallObjectModelSlot(rt, b) == 0x18);  // EXPLODE
+    FreefallObject u{}; u.model = mdk::kFfModelPickup + 9;
+    CHECK(mdk::freefallObjectModelSlot(rt, u) == -1);    // OOB rec idx
+  }
+
+  // -- twin bind + driver step --------------------------------------------------
+  // The spawn write precedes the frame's accumulator increment
+  // (write-before-step): the twin backs the post-step acc up by one
+  // driver step so its tick lands on the runtime's value — frame 0,
+  // the channel's absolute base pose.
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  const mdk::FreefallScene::Twin* tp =
+      mdk::freefallSceneTwin(s, rt.listHead);
+  CHECK(tp != nullptr && tp->modelSlot == 1 && tp->type == 0);
+  CHECK(tp->animTag == mdk::kFfAnimKurt);
+  CHECK(tp->obj.animRec == s.anims[mdk::kFfAnimKurt].rec);
+  CHECK(tp->obj.animFrame == 0);
+  CHECK(tp->obj.model.elems.size() == 1 &&
+        tp->obj.model.elemVerts[0].size() == 9);
+  CHECK(near(tp->obj.model.elemVerts[0][0], 0.0, 1e-6));
+  CHECK(near(tp->obj.model.elemVerts[0][6], 2.0, 1e-6));
+  // FUN_0046b2f8 basis — the twin carries the object transform.
+  CHECK(near(tp->obj.col.origin[0], pl.px, 1e-5));
+  CHECK(near(tp->obj.col.origin[1], pl.py, 1e-5));
+  CHECK(near(tp->obj.col.origin[2], pl.pz, 1e-5));
+
+  // Next frame: acc 0 -> 1 = the frame-1 delta key (+2 x per vert).
+  ffStep(rt, {});
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  CHECK(tp->obj.animFrame == 1);
+  CHECK(near(tp->obj.model.elemVerts[0][0], 2.0, 1e-5));
+  CHECK(near(tp->obj.model.elemVerts[0][3], 3.0, 1e-5));
+  CHECK(near(tp->obj.model.elemVerts[0][6], 4.0, 1e-5));
+
+  // -- KURT -> KURT_HIT: write-AFTER-step ordering -----------------------------
+  // The missile-hit site writes the player inside missileTick — AFTER
+  // the player's own driver step ran on the old handle. The twin
+  // reproduces the frame: one step on the old record (frame 2 -> the
+  // second +2x key), then the rebind lands at -1/-1 unticked.
+  pl.animHandle = mdk::kFfAnimKurtHit;
+  pl.animAcc = -1.0f;
+  pl.animFrame = -1;
+  pl.animSentinel = -1;
+  pl.flags &= ~0x8u;
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  CHECK(tp->animTag == mdk::kFfAnimKurtHit);
+  CHECK(tp->obj.animRec == s.anims[mdk::kFfAnimKurtHit].rec);
+  CHECK(tp->obj.animFrame == -1 && near(tp->obj.animAcc, -1.0, 1e-6));
+  CHECK(near(tp->obj.model.elemVerts[0][0], 4.0, 1e-5));
+  // Next frame the new record ticks acc -1 -> 0: frame 0 copies the
+  // hit pose absolutely (x = 10/11/12).
+  ffStep(rt, {});
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  CHECK(tp->obj.animFrame == 0);
+  CHECK(near(tp->obj.model.elemVerts[0][0], 10.0, 1e-5));
+  CHECK(near(tp->obj.model.elemVerts[0][6], 12.0, 1e-5));
+  // acc 0 -> 1 = frameCount-1 on the non-looping clip -> 0xff00 latch.
+  ffStep(rt, {});
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  CHECK(tp->obj.animFrame == 1);
+  CHECK(static_cast<std::uint16_t>(tp->obj.animLatch) == 0xff00u);
+
+  // -- restore: write-BEFORE-step ordering ------------------------------------
+  // The restore gate writes -1/-1/KURT before the frame's +=frameUnits
+  // (post-step acc 0): the twin binds with the pre-step accumulator so
+  // its tick applies exactly frame 0 — the base pose restores.
+  pl.animHandle = mdk::kFfAnimKurt;
+  pl.animAcc = 0.0f;
+  pl.animFrame = -1;
+  pl.animSentinel = -1;
+  pl.flags |= 0x8u;
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  CHECK(tp->animTag == mdk::kFfAnimKurt);
+  CHECK(tp->obj.animFrame == 0);
+  CHECK(static_cast<std::uint16_t>(tp->obj.animLatch) != 0xff00u);
+  CHECK(near(tp->obj.model.elemVerts[0][0], 0.0, 1e-5));
+  CHECK(near(tp->obj.model.elemVerts[0][6], 2.0, 1e-5));
+
+  // -- other object kinds bind + unbind ---------------------------------------
+  // A missile (named MISSILE) and a FALLPU pickup (anonymous SW_H25)
+  // resolve through the roster; leaving the active list unbinds.
+  rt.pool[5].type = 1;
+  rt.pool[5].model = mdk::kFfModelMissile;
+  rt.pool[5].alive = 1;
+  rt.pool[5].next = -1;
+  rt.pool[6].type = 4;
+  rt.pool[6].model = mdk::kFfModelPickup;
+  rt.pool[6].pickupRec = 0;
+  rt.pool[6].alive = 1;
+  rt.pool[6].next = -1;
+  pl.next = 5;
+  rt.pool[5].next = 6;
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  const mdk::FreefallScene::Twin* tm = mdk::freefallSceneTwin(s, 5);
+  const mdk::FreefallScene::Twin* tq = mdk::freefallSceneTwin(s, 6);
+  CHECK(tm != nullptr && tm->modelSlot == 3 && tm->type == 1);
+  CHECK(tm->obj.model.elems.size() == 1);
+  CHECK(tq != nullptr && tq->modelSlot == 0x0f && tq->type == 4);
+  CHECK(tq->obj.model.elems.size() == 1);      // anonymous 1-elem
+  CHECK(tq->obj.animRec == nullptr);           // animHandle 0 = no rec
+  pl.next = -1;
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  CHECK(mdk::freefallSceneTwin(s, 5) == nullptr);
+  CHECK(mdk::freefallSceneTwin(s, 6) == nullptr);
+
+  // -- material resolution ------------------------------------------------------
+  const mdk::FreefallMaterial* cm =
+      mdk::freefallSceneMaterial(s, "CB3");
+  CHECK(cm != nullptr && cm->valid && cm->pixels.size() == 16);
+  CHECK(cm->width == 4 && cm->height == 4 && cm->frameCount == 1);
+  const mdk::FreefallMaterial* gr =
+      mdk::freefallSceneMaterial(s, "GREY16");
+  CHECK(gr != nullptr && gr->paletteIndex == 16 && gr->pixels.empty());
+  const mdk::FreefallMaterial* pen =
+      mdk::freefallSceneMaterial(s, "PEN_33");
+  CHECK(pen != nullptr && pen->paletteIndex == 33);  // name->index
+  const mdk::FreefallMaterial* none =
+      mdk::freefallSceneMaterial(s, "NONE");
+  CHECK(none != nullptr && none->paletteIndex == 256);  // no-draw
+  CHECK(mdk::freefallSceneMaterial(s, "BOGUS") == nullptr);
+
+  // -- chute attachment + load failure ------------------------------------------
+  const mdk::RuntimeModel* ch = mdk::freefallSceneChuteModel(s);
+  CHECK(ch != nullptr && ch->elems.size() == 1);
+  mdk::FreefallScene s2;
+  CHECK(mdk::freefallSceneLoad(*root, 4, &s2, &err) ==
+        mdk::FreefallSceneError::kReadMti);     // FALL3D_5.MTI absent
+
+  fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 13B — freefall→traversal handoff coordinator.
 // ---------------------------------------------------------------------------
 
@@ -21395,6 +21723,7 @@ int main() {
   test_freefall_completion_death();
   test_freefall_determinism();
   test_freefall_freelist();
+  test_freefall_scene();
   test_progression_handoff();
   test_progression_campaign();
   test_save_game();

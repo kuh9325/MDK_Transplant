@@ -48,9 +48,12 @@
 #include "core/bni_directory.h"
 #include "core/collision_query.h"
 #include "core/data_root.h"
+#include "core/freefall_runtime.h"
+#include "core/freefall_scene.h"
 #include "core/frontend_machines.h"
 #include "core/fti_sprite.h"
 #include "core/gameplay_input.h"
+#include "core/progression_runtime.h"
 #include "core/sni_directory.h"
 #include "core/traversal_runtime.h"
 #include "core/player_projectiles.h"
@@ -156,6 +159,47 @@ class MdkBridge : public RefCounted {
   // loco/anim state directly. Test/QA path only.
   Dictionary diagnostic_damage(int64_t amount);
 
+  // --- Phase 16C — freefall (mode 2) ------------------------------
+  // FUN_0040ef28's domain: loads the FALL3D course bundle (BNI +
+  // FALL3D_<course+1>.MTI + FALLP_<course+1> palette + FALLPU pickups)
+  // into a FreefallScene, inits FreefallRuntime, and arms the
+  // progression session so the freefall-exit handoff routes to
+  // TRAVERSE/LEVEL<table[course]> exactly like the campaign path.
+  // `skill` is 0..2 (54147a); `seed` loads the shared LCG state.
+  bool load_freefall(int64_t course, int64_t skill, int64_t seed);
+  // The bridge's active mode — the 0x541492 values: 0 = nothing
+  // loaded (frontend), 2 = freefall, 3 = traversal.
+  int64_t get_mode() const { return mode_; }
+  // Mode-2 frame state — verbatim FreefallRuntime fields (phase,
+  // intro countdown/progress, zoom sprite indices, timeline, health,
+  // fade accumulator + target, radar/pickup/missile timers, the
+  // camera block 0x4ce69c..0x540b28) plus the FUN_004123f4 camera
+  // converted for Godot. The palette fade reaches GDScript as raw
+  // `fade` (1.0 = full bright, 0 = black, >1 = the damage flash).
+  Dictionary get_freefall_snapshot();
+  // Copy-safe snapshots for every object on the active list
+  // (listHead chain — the FUN_004109d8 entry domain): pool slot,
+  // type, model tag/resolved slot, the FUN_0046b2f8 transform
+  // (Godot-space), anim fields, chute/explode flags. The dicts carry
+  // only presentation inputs — gameplay stays in FreefallRuntime.
+  Array get_freefall_object_snapshots();
+  // Live kind-2 geometry for one bound pool slot: the twin's
+  // animated RuntimeModel as an ArrayMesh grouped one surface per
+  // (element, material index), pixel-space UVs, the material name
+  // per surface, vert/tri counts and a geom_key digest that changes
+  // whenever the anim driver mutates verts (rebuild trigger — same
+  // contract as traversal's get_object_geometry). `part` 1 returns
+  // the CHUTE attachment model (the +0x306 entry — same object
+  // basis, own mesh). Empty dict for an unbound slot.
+  Dictionary get_freefall_object_geometry(int64_t pool_slot,
+                                          int64_t part);
+  // One FALL3D material by name-table string: palette-expanded
+  // ImageTexture + {w, h, frames} for payload records; a flat
+  // `palette_color` (and `palette_index`) for index/pen records;
+  // `palette_index` 256 = the NONE no-draw marker. Unresolvable
+  // names return an empty dict.
+  Dictionary get_freefall_material(const String& name);
+
  private:
   // One arena's complete presentation bundle — collision parse,
   // render data, palette-composed textures, ordered tris, and the
@@ -183,6 +227,10 @@ class MdkBridge : public RefCounted {
   // Shared frame step behind step_frame/step_frame_input.
   Dictionary stepCore_(double dt_ms, int64_t action_mask,
                        const Dictionary* input);
+  // The shared QA-mask/raw-dict -> RawGameplayInput fold (device
+  // state only; the per-mode readers own channel semantics).
+  mdk::RawGameplayInput buildRawInput_(int64_t action_mask,
+                                       const Dictionary* input);
   void setError_(const std::string& msg);
 
   // Arena lookup helpers.
@@ -238,6 +286,39 @@ class MdkBridge : public RefCounted {
   std::array<std::uint8_t, 768> kurtPalette_{};
   std::array<std::uint8_t, 768> levelPalette_{};
   std::uint64_t kurtPalKey_ = 0;   // FNV-64 of kurtPalette_
+
+  // --- Phase 16C — freefall (mode 2) ------------------------------
+  // The presentation tail load_level and the freefall handoff share:
+  // shared MTI bank + MDKFONT.FTI reads, SYS_PAL head, level palette
+  // compose, Kurt table decode. Requires rt_ to be the loaded
+  // traversal runtime for `stem`.
+  bool presentTraversalLevel_(const std::string& stem,
+                              const std::string& dir);
+  // The mode-2 step behind stepCore_ when mode_ == 2: folds input
+  // through the same QA/binding path, runs freefallStep with the
+  // frontend timing block, steps the scene twins with the same
+  // dtSec, and drives the one-shot progression handoff on `done`.
+  Dictionary stepFreefall_(double dt_ms, int64_t action_mask,
+                           const Dictionary* input);
+  // FUN_0040fa68 + the 0x4014bc health branch via
+  // progressionFreefallHandoff: on the traversal route the loaded
+  // TraversalRuntime becomes rt_ and the presentation tail runs so
+  // the display set/arena data stay coherent; on the frontend
+  // route the mode flips to 0. One-shot per freefall entry.
+  void freefallHandoff_();
+  // Palette-expands one freefall material's frame 0 into an
+  // ImageTexture (cached by material name — the FALLP palette is
+  // fixed for the loaded course).
+  Ref<ImageTexture> freefallTexture_(const mdk::FreefallMaterial& m);
+
+  int mode_ = 0;                     // 0x541492 domain
+  std::unique_ptr<mdk::FreefallRuntime> ff_;
+  std::unique_ptr<mdk::FreefallScene> ffScene_;
+  mdk::ProgressionSession sess_{};
+  bool ffHandoffDone_ = false;
+  int ffHandoffRoute_ = -1;          // ProgressionRoute, or -1
+  std::string ffHandoffDetail_;
+  std::unordered_map<std::string, Ref<ImageTexture>> ffTex_;
 
   std::optional<mdk::DataRoot> root_;
   std::unique_ptr<mdk::TraversalRuntime> rt_;

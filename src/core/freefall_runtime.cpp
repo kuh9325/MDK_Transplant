@@ -86,8 +86,14 @@ constexpr float kFlashHit = 3.0f;               // 0x40400000 imm
 constexpr float kFlashMissile = -0.2f;          // 0x494cd8
 constexpr float kFlashMissileMin = 0.5f;        // 0x494cc0 (0x3f000000)
 constexpr float kRandUnit = 6.103515625e-5f;    // 1/16384
-constexpr int16_t kKurtHitFrames = 18;          // KURT_HIT anim frame
-                                                // count (BNI census)
+constexpr int16_t kKurtHitLastFrame = 29;       // KURT_HIT frameCount-1 —
+                                                // the record carries 30
+                                                // frames (BNI census); the
+                                                // original latches 0xff00
+                                                // when the clip reaches its
+                                                // last frame (FUN_004555bc)
+                                                // and the hit site free-runs
+                                                // (+0x118 = -1, FUN_00410e9c).
 
 // FUN_0047d59a — the x87 rint used for the explosion frame index.
 inline float ffRound(float v) { return std::nearbyint(v); }
@@ -306,9 +312,14 @@ void playerTick(FreefallRuntime& rt, FreefallObject& o,
   }
   // FUN_004555bc — anim sequencer seam. Modeled subset: the clip
   // accumulator advances in frame units; a latched KURT_HIT expires
-  // into the -256 sentinel after its frame count (18 — BNI census).
+  // into the -256 sentinel when the accumulator reaches the record's
+  // last frame — the driver displays lround(acc), so the latch is
+  // lround(acc) == 29 on the 30-frame KURT_HIT record (free-run from
+  // the hit site's +0x118=-1; CORROBORATED, BNI census + FUN_00410e9c
+  // + the FUN_004555bc latch condition).
   o.animAcc += frameUnits;
-  if (o.animHandle == kFfAnimKurtHit && o.animAcc >= kKurtHitFrames) {
+  if (o.animHandle == kFfAnimKurtHit &&
+      static_cast<int>(lroundf(o.animAcc)) >= kKurtHitLastFrame) {
     o.animSentinel = -256;
   }
 

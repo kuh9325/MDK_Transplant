@@ -6237,3 +6237,116 @@ write-full `equiv: OK` / `identity=ok`, arena-render 60/60.
 
 **SCRIPTED TAKEOFF / RIDE-FOLLOW / IDLE-REROLL: CLOSED FOR BUILD_A —
 TRAVERSAL PLAYER CORE: CLOSED FOR BUILD_A.**
+
+# Phase 16C — Freefall Kurt Godot Presentation
+
+## 205. The mode-2 presentation contract (OBSERVED — BUILD_A disasm)
+
+Freefall is a separate render pipeline from traversal (§202). Its
+frame renderer `FUN_00410920` walks the active object list and emits
+up to six depth-sorted entries per object (`FUN_004109d8`): the
+kind-1 radar marker sprite, kind-4 trail, kind-5 launch glow, the
+kind-3 BANG explosion frame-block, the object's kind-2 model
+(`+0x0c`), and the kind-2 chute attachment (`+0x306` — the SAME
+object basis, no separate transform). Kind-2 entries draw a
+`RuntimeModel` through the shared projector `FUN_0046b4f8` under the
+object's `+0xac` basis (`FUN_0046b2f8`: pitch/roll/yaw/scale + pos).
+
+Camera: `FUN_004123f4` writes the shared projection block for a
+fixed-orientation view — M1 rows `[sX,0,0,-sX*camX]`,
+`[0,-sY,0,sY*camY]`, `[0,0,-1,camZ]` with `sX = 1/(zoom*0.5)`,
+`sY = 1/(zoom*0.3)` on the 600x360 viewport; zoom 2.4 gives the same
+~71.36 deg vertical FOV as traversal. M2 rows are
+right=`(1,0,0)`, down=`(0,-1,0)`, back=`(0,0,-1)` — the camera looks
+down world -Z; the `scaleZ=+1` "overhead" variant of the pose
+contract converts it (semantic back = `(0,0,+1)`).
+
+## 206. The FALL3D data model (OBSERVED — record census + FUN_00428400)
+
+FALL3D.BNI model records are the shared `FUN_00428400` stream MINUS
+the leading flag u32 — the flag arrives as a register arg from the
+23-entry `.data` roster (name block 0x49a67c, flag bytes 0x49a664:
+bit7 = named-element form, low7 = the 0x4edcc0 model-slot index).
+`kFreefallModelTable` reproduces the pair verbatim. Slot 2 (radar)
+carries no record — its visual is the kind-1 sprite.
+
+KURT: 18 named elements (HEAD, ...) matching all 18 KURTANIM channel
+names, 227 verts / 363 tris on real data; name table `{CB3, CF3}` =
+the FALL3D_<course+1>.MTI material names. Per-tri `s16` material at
+`+0x06` indexes that name table (<0 = palette pen), with pixel-space
+UVs at `+0x08`.
+
+Anim records are `ObjectAnimView` layout (`{rate, chanCount,
+frameCount, chanOffs, rootKeys, refCount, refKeys, channels}` —
+KURTANIM 18ch/199f, KURT_HIT 18ch/30f, BONESANM for the course>=4
+flyby). `FALLPU_<course+1>` is the 12B `{name[8], u32}` pickup list
+(NUL-terminated); `FALLP_<course+1>` the 768B palette bound at
+0x4edc28.
+
+## 207. The twin presentation model (IMPLEMENTED)
+
+`src/core/freefall_scene.{h,cpp}` owns the presentation product.
+Each live pool object gets a `DynamicObject` twin: the deep-copied
+`RuntimeModel` proto (per-slot lazy parse via `protoForSlot`) plus
+the mirrored anim fields — stepped by the REAL `objectAnimTickDt`
+driver once per `freefallStep` with the live dtSec. For the rate-1.0
+records the driver's `rate*+0xe0*dtSec` equals the runtime's
+`frameUnits` increment exactly (`animRate = 30`).
+
+Handle switches reproduce the original's field-write ordering
+(OBSERVED sites): the missile-hit write lands AFTER the player's own
+driver step (the twin ticks the old record once, then rebinds
+unticked); spawn/restore/bones writes land BEFORE the frame's
+accumulator increment (the twin binds with the pre-step accumulator
+so the tick lands on the runtime's post-frame value). The
+write-after-step discriminator is `acc == -1.0f && frame == -1`
+post-step — exact only at the hit site.
+
+Correction folded in: the runtime's KURT_HIT latch was transcribed
+as 18 (the channel count); the record is 30 frames and the hit site
+free-runs (`+0x118 = -1`), so the latch is `lround(acc) >= 29` — the
+driver's own `frameCount-1` predicate. Digest-neutral (anim fields
+aren't hashed).
+
+## 208. Bridge + Godot (IMPLEMENTED)
+
+`MdkBridge` mode-2 surface: `load_freefall(course, skill, seed)`,
+`get_freefall_snapshot` (phase/timeline/health/fade/camera),
+`get_freefall_object_snapshots` (the active-list walk — one entry
+per kind-2-bearing object), `get_freefall_object_geometry(slot,
+part)` (part 0 = model, part 1 = the chute attachment), and
+`get_freefall_material(name)` (texture / palette pen / no-draw).
+`step_frame` dispatches mode 2; completion runs
+`progressionFreefallHandoff` in-place (route 0 -> the traversal
+level loads and mode becomes 3; route 1 -> mode 0 death route).
+`main.gd` presents `FreefallRoot` (`FFObj_<slot>` nodes, twin
+transforms verbatim, `geom_key`-gated mesh rebuilds), the fade
+overlay, and the fixed-orientation camera; traversal presentation
+hides while mode 2 is live and restores after the handoff.
+
+## 209. Validation
+
+- `test_freefall_scene` (native): synthetic FALL3D bundle in the
+  OBSERVED layouts — flag-less named/anon records, the roster decode,
+  anim binding, both switch orderings, twin unbind, material
+  resolution (texture/index/PEN_n/NONE/miss), palette + pickups
+  parse, chute proto, MTI-miss load failure.
+- Godot smoke `--smoke --freefall C --skill S --seed N`, real data:
+  c0/c2 handoff to mode 3; c4 exercises the bones flyby and the
+  health-gated death route (mode 0). KURT 18e/227v/363t presented as
+  animated mesh; textured (CB3) + flat-pen (PEN_16) materials.
+- Canonical digests unchanged: traversal L3-L8
+  (`25766a67ce50ea46`/`950219ddeae8b679`/`2379f7e90204e671`/
+  `5686edbf38de3fda`/`57bdd179a944a4c9`/`2edeb4aa6c7ef486`),
+  freefall c0-c4 (`ba5ffd4ee90e6d10`/`2bdb2d0406748d28`/
+  `a2dee1b1ed981475`/`8fa58b04419ad8d8`/`3c5867b3e7901c8c`).
+- Correction folded in: the traversal smoke's `spawn anim table`
+  check expected `K_IDLE` — authored in 16B before the 16B.2
+  `FUN_00401ed4(100)` reroll port (§204). The seeded post-load roll
+  deterministically lands the 95% branch, so the observed spawn
+  table is `K_STILL`; the check now pins that outcome.
+
+**FREEFALL KURT GODOT PRESENTATION: CLOSED FOR BUILD_A** — the
+kind-2 model path is presented end to end; kinds 1/3/4/5 (radar
+marker, BANG frame-block, trail, launch glow), the ZOOM intro
+sprites, and sound remain documented state-only seams.

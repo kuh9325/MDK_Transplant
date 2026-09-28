@@ -22,6 +22,12 @@ extends Node3D
 #   --start X Y Z     diagnostic re-anchor into --arena (native
 #                     diagnostic — test/QA path, not original flow)
 #   --start-yaw DEG   yaw for --start (default 0)
+#   --freefall N      mode-2 freefall course 0..4 instead of --level
+#                     (Phase 16C; hands off to traversal on landing,
+#                     or the frontend route on death)
+#   --skill N         difficulty 0..2 for --freefall (default 0)
+#   --seed N          RNG seed for --freefall (default 0xC0FFEE —
+#                     the mdk-inspect freefall digest seed)
 #   --smoke           headless deterministic check, then quit
 #   --screenshot P    after 8 frames, save a PNG capture then quit
 #                     (requires a real renderer — not --headless)
@@ -49,6 +55,13 @@ var frames_left := 0
 var obj_debug := false
 var proxy_debug := false      # F4 — legacy capsule/wire proxy
 var last_kurt := {}           # last applied kurt snapshot (diag)
+
+# Phase 16C — mode-2 freefall presentation state. All gameplay lives
+# in the core; these are view-side caches only.
+var freefall := false        # --freefall launcher flag
+var ff_materials := {}       # "m:<name>" / "pen:<n>" -> StandardMaterial3D
+var ff_palette := PackedByteArray()  # FALLP_<c+1> bytes (768)
+var ff_handoff_seen := false # printed the mode transition once
 
 # Raw mouse accumulators — device deltas for the next frame only.
 var mouse_dx := 0
@@ -133,6 +146,12 @@ func _ready() -> void:
 	var arena := _arg_value(args, "--arena", "HMO_1")
 	var start := _arg_value(args, "--start", "")
 	var start_yaw := float(_arg_value(args, "--start-yaw", "0"))
+	var ff_course := _arg_value(args, "--freefall", "")
+	var ff_skill := int(_arg_value(args, "--skill", "0"))
+	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
+	# digest runs use, so driven courses are cross-checkable.
+	var ff_seed := int(_arg_value(args, "--seed", "12648430"))
+	freefall = not ff_course.is_empty()
 	shot_path = _arg_value(args, "--screenshot", "")
 	if shot_path.is_relative_path() and not shot_path.is_empty():
 		var launch_dir := OS.get_environment("PWD")
@@ -155,15 +174,22 @@ func _ready() -> void:
 		printerr("MdkBridge.initialize failed: ", bridge.get_last_error())
 		get_tree().quit(1)
 		return
-	if not bridge.load_level(level):
-		printerr("MdkBridge.load_level failed: ", bridge.get_last_error())
-		get_tree().quit(1)
-		return
-	if not bridge.load_arena(arena):
-		printerr("MdkBridge.load_arena failed: ", bridge.get_last_error())
-		get_tree().quit(1)
-		return
-	if not start.is_empty():
+	if freefall:
+		if not bridge.load_freefall(int(ff_course), ff_skill, ff_seed):
+			printerr("MdkBridge.load_freefall failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
+	else:
+		if not bridge.load_level(level):
+			printerr("MdkBridge.load_level failed: ", bridge.get_last_error())
+			get_tree().quit(1)
+			return
+		if not bridge.load_arena(arena):
+			printerr("MdkBridge.load_arena failed: ", bridge.get_last_error())
+			get_tree().quit(1)
+			return
+	if not freefall and not start.is_empty():
 		# NATIVE DIAGNOSTIC — re-anchor into --arena at the given MDK
 		# position (mirrors mdk-inspect's --arena/--start selftests).
 		var parts := start.split(" ", false)
@@ -195,15 +221,20 @@ func _ready() -> void:
 
 	# One idle frame settles the deterministic spawn camera.
 	bridge.step_frame_input(0.0, {})
-	_apply_arena_snapshots()
-	_apply_object_snapshots()
-	_apply_player_snapshot()
-	_apply_camera_snapshot()
-	_apply_kurt_snapshot()
-	_update_debug_label()
+	if freefall:
+		_apply_freefall()
+	else:
+		_apply_arena_snapshots()
+		_apply_object_snapshots()
+		_apply_player_snapshot()
+		_apply_camera_snapshot()
+		_apply_kurt_snapshot()
+		_update_debug_label()
 
 	if smoke:
-		if level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
+		if freefall:
+			_run_smoke_freefall(int(ff_course), ff_skill, ff_seed)
+		elif level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
 				arena == "HMO_1" and start.is_empty():
 			_run_smoke(data_root)
 		else:
@@ -225,10 +256,15 @@ func _ready() -> void:
 	if interactive:
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
-	print(("mdk-godot: arena=%s arenas=%d  (WASD/QE move+strafe, " +
-		"AD turn, RF look, Space jump, mouse=captured, F1 collision, " +
-		"F2 object debug, Esc release/quit)") %
-		[arena, bridge.get_arena_names().size()])
+	if freefall:
+		print(("mdk-godot: FREEFALL course=%d skill=%d seed=%08x  " +
+			"(arrows/WASD steer, F3 debug, Esc release/quit)") %
+			[int(ff_course), ff_skill, ff_seed])
+	else:
+		print(("mdk-godot: arena=%s arenas=%d  (WASD/QE move+strafe, " +
+			"AD turn, RF look, Space jump, mouse=captured, F1 " +
+			"collision, F2 object debug, Esc release/quit)") %
+			[arena, bridge.get_arena_names().size()])
 
 
 func _build_player_proxy() -> void:
@@ -554,6 +590,444 @@ func _update_box_wire(box: AABB) -> void:
 	im.surface_end()
 
 
+# ---------------------------------------------------------------------------
+# Phase 16C — mode-2 freefall presentation.
+#
+# The original's mode-2 frame (FUN_004103d8) runs the object walk
+# (FUN_00410e38) then the render pass (FUN_00410920 → FUN_004109d8):
+# per active object, kind-2 entries emit the +0x0c model (and the
+# +0x306 chute attachment) under the object's +0xac basis, through the
+# fixed-orientation camera FUN_004123f4 writes. The scene twins in
+# mdk_core already apply FUN_004555bc's vertex animation to the models
+# — everything below only mirrors copy-safe snapshots into nodes.
+#
+# Deferred seams (never presented — documented, not emulated):
+#   kind-1 radar sprite (+0x10c), kind-3 BANG frame-block overlay
+#   (+0x110), kind-4 trail (+0x60), kind-5 launch glow (+0x108),
+#   ZOOM intro sprites, palette cycling, and all sounds.
+# ---------------------------------------------------------------------------
+
+
+func _ff_input() -> Dictionary:
+	# Mode-2 direction channels — the dict booleans land directly on
+	# FreefallInput (the same fold FUN_00407e50 gives the bound
+	# direction keys: left=-X right=+X up=+Y down=-Y).
+	return {
+		"left": Input.is_key_pressed(KEY_LEFT) or
+			Input.is_key_pressed(KEY_A),
+		"right": Input.is_key_pressed(KEY_RIGHT) or
+			Input.is_key_pressed(KEY_D),
+		"up": Input.is_key_pressed(KEY_UP) or
+			Input.is_key_pressed(KEY_W),
+		"down": Input.is_key_pressed(KEY_DOWN) or
+			Input.is_key_pressed(KEY_S),
+	}
+
+
+func _ff_pen_color(idx: int) -> Color:
+	if idx >= 0 and idx < 256 and ff_palette.size() == 768:
+		return Color(ff_palette[idx * 3] / 255.0,
+			ff_palette[idx * 3 + 1] / 255.0,
+			ff_palette[idx * 3 + 2] / 255.0)
+	return Color(0, 0, 0)
+
+
+func _ff_no_draw_material() -> StandardMaterial3D:
+	# NONE / index-256 — the original's no-draw flat (0x4edc28 bank's
+	# 256th entry is the transparent black a no-op texel resolves to).
+	var key := "<nodraw>"
+	if ff_materials.has(key):
+		return ff_materials[key]
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.albedo_color = Color(0, 0, 0, 0)
+	ff_materials[key] = m
+	return m
+
+
+func _ff_fallback_material(name: String) -> StandardMaterial3D:
+	# Unresolved material name (absent MTI record, no PEN_<n> digits)
+	# — the bridge returns empty; present a stable neutral gray so
+	# the surface still proves the geometry.
+	var key := "miss:%s" % name
+	if ff_materials.has(key):
+		return ff_materials[key]
+	var h := 5381
+	for i in name.length():
+		h = ((h * 33) + name.unicode_at(i)) & 0x7fffffff
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	m.albedo_color = Color.from_hsv(float(h % 360) / 360.0, 0.3, 0.7)
+	ff_materials[key] = m
+	return m
+
+
+func _ff_material(mat_name: String, pen: int) -> StandardMaterial3D:
+	# Surface material for one (element, material-index) group. Tri
+	# records carry a signed s16: >=0 indexes the model's name table
+	# (a FALL3D_<c+1>.MTI name — texture, index, or PEN_<n> record);
+	# <0 encodes a flat palette pen directly (-mi & 0xff).
+	if pen >= 0:
+		var pk := "pen:%d" % pen
+		if ff_materials.has(pk):
+			return ff_materials[pk]
+		var pm := StandardMaterial3D.new()
+		pm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		pm.cull_mode = BaseMaterial3D.CULL_DISABLED
+		pm.albedo_color = _ff_pen_color(pen)
+		ff_materials[pk] = pm
+		return pm
+	if mat_name.is_empty():
+		return _ff_fallback_material("")
+	var mk := "m:%s" % mat_name
+	if ff_materials.has(mk):
+		return ff_materials[mk]
+	var d: Dictionary = bridge.get_freefall_material(mat_name)
+	if d.is_empty() or not bool(d.get("valid", false)):
+		return _ff_fallback_material(mat_name)
+	if int(d.get("palette_index", -1)) >= 0:
+		# Index record or PEN_<n> — a flat palette pen. 256 is the
+		# bank's no-draw slot (NONE).
+		if bool(d.get("no_draw", false)):
+			return _ff_no_draw_material()
+		var pm2 := StandardMaterial3D.new()
+		pm2.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		pm2.cull_mode = BaseMaterial3D.CULL_DISABLED
+		pm2.albedo_color = d.get("palette_color",
+			_ff_pen_color(int(d["palette_index"])))
+		ff_materials[mk] = pm2
+		return pm2
+	# Texture record — pixel-space UVs are normalized by uv1_scale,
+	# which belongs to the resolved texture (per-material, so the
+	# name-keyed cache is exact). Nearest filter: the software
+	# rasterizer texel-fetches — no filtering existed.
+	var tm := StandardMaterial3D.new()
+	tm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	tm.cull_mode = BaseMaterial3D.CULL_DISABLED
+	tm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	tm.albedo_texture = d["tex"]
+	var tw := float(d["w"])
+	var th := float(d["h"])
+	if tw > 0.0 and th > 0.0:
+		tm.uv1_scale = Vector3(1.0 / tw, 1.0 / th, 1.0)
+	ff_materials[mk] = tm
+	return tm
+
+
+func _ff_bind_mesh(mi: MeshInstance3D, g: Dictionary) -> void:
+	# The bridge mesh carries one surface per (element, material
+	# index) group — materialize each through the shared bank.
+	var mesh: ArrayMesh = g["mesh"]
+	var names: PackedStringArray = g["surface_mats"]
+	var pens: PackedInt32Array = g["surface_pen"]
+	for s in mesh.get_surface_count():
+		var nm := String(names[s]) if s < names.size() else ""
+		var pn := int(pens[s]) if s < pens.size() else -1
+		mesh.surface_set_material(s, _ff_material(nm, pn))
+	mi.mesh = mesh
+
+
+func _apply_freefall() -> void:
+	var ff: Dictionary = bridge.get_freefall_snapshot()
+	if ff.is_empty():
+		return
+	if ff_palette.is_empty() and bool(ff.get("palette_ok", false)):
+		ff_palette = ff["palette"]
+
+	# FUN_004123f4's camera — fixed orientation (right=+X, down=-Y,
+	# back=+Z semantic rows) at cameraPos, fov from scaleY at the
+	# 600x360 projection divisors.
+	var ct: Transform3D = ff["camera"]
+	$Camera3D.global_transform = ct
+	$Camera3D.fov = float(ff["fov_deg"])
+
+	# 0x4edc04 — palette-bright factor applied at upload: <1 dims to
+	# black (fade), >1 saturates (damage flash / missile-bump).
+	var fade := float(ff["fade"])
+	var fr: ColorRect = $FadeLayer/FadeRect
+	if fade < 1.0:
+		fr.color = Color(0, 0, 0, 1.0 - fade)
+		fr.visible = true
+	elif fade > 1.0:
+		# Saturating multiply approximated as a white-out — the
+		# original clamps every channel at 255 (fade=3 -> alpha ~.67).
+		fr.color = Color(1, 1, 1, min(1.0, 1.0 - 1.0 / fade))
+		fr.visible = true
+	else:
+		fr.visible = false
+
+	# The FUN_004109d8 entry domain: walk the active list from
+	# listHead. Painter-depth sorting is a software-renderer artifact;
+	# Godot's depth buffer supersedes it, so nodes keep list order.
+	var snaps: Array = bridge.get_freefall_object_snapshots()
+	var live := {}
+	for o in snaps:
+		var slot := int(o["pool_slot"])
+		live[slot] = true
+		var node: Node3D = $FreefallRoot.get_node_or_null(
+			"FFObj_%d" % slot)
+		if node == null:
+			node = Node3D.new()
+			node.name = "FFObj_%d" % slot
+			node.set_meta("geom_key", -1)
+			var mi := MeshInstance3D.new()
+			mi.name = "Body"
+			node.add_child(mi)
+			$FreefallRoot.add_child(node)
+		var presented := bool(o.get("presented", false))
+		node.visible = presented
+		var body: MeshInstance3D = node.get_node("Body")
+		if presented:
+			# The twin's elemVerts mutate every animated frame — the
+			# geom_key digest gates the mesh rebuild (same contract
+			# the traversal object path uses).
+			var gkey := int(o.get("geom_key", -1))
+			if gkey != int(node.get_meta("geom_key")):
+				var g: Dictionary = \
+					bridge.get_freefall_object_geometry(slot, 0)
+				if not g.is_empty():
+					_ff_bind_mesh(body, g)
+				node.set_meta("geom_key", gkey)
+			# Core-authoritative world basis — +0xac verbatim.
+			node.transform = o["transform"]
+		# +0x306 — the chute attachment: a second kind-2 entry under
+		# the object's own basis while the flag is set.
+		var chute: MeshInstance3D = node.get_node_or_null("Chute")
+		if presented and bool(o.get("chute", false)):
+			if chute == null:
+				chute = MeshInstance3D.new()
+				chute.name = "Chute"
+				chute.set_meta("geom_key", -1)
+				node.add_child(chute)
+			var ck := int(o.get("chute_geom_key", -1))
+			if ck != int(chute.get_meta("geom_key")):
+				var cg: Dictionary = \
+					bridge.get_freefall_object_geometry(slot, 1)
+				if not cg.is_empty():
+					_ff_bind_mesh(chute, cg)
+				chute.set_meta("geom_key", ck)
+			chute.visible = true
+		elif chute != null:
+			chute.visible = false
+	for child in $FreefallRoot.get_children():
+		var slot := int(child.name.trim_prefix("FFObj_"))
+		if not live.has(slot):
+			child.queue_free()
+
+	_update_ff_debug(ff)
+
+
+func _update_ff_debug(ff: Dictionary) -> void:
+	if not $DebugUI.visible:
+		return
+	var objs: Array = bridge.get_freefall_object_snapshots()
+	var pline := ""
+	var pd: Dictionary = ff.get("player", {})
+	if not pd.is_empty():
+		var pp: Vector3 = pd["pos_mdk"]
+		pline = ("\nplayer pos_mdk %.1f %.1f %.1f  yaw %.1f roll %.1f" +
+			"  anim h%d acc %.2f f%d s%d") % [pp.x, pp.y, pp.z,
+			float(pd["yaw_deg"]), float(pd["roll_deg"]),
+			int(pd["anim_handle"]), float(pd["anim_acc"]),
+			int(pd["anim_frame"]), int(pd["anim_sentinel"])]
+	var cp: Vector3 = ff["camera_pos_mdk"]
+	$DebugUI/DebugLabel.text = (
+		"FREEFALL c%d s%d phase %d t=%.2f hp=%d fade=%.2f->%.2f\n" %
+		[int(ff["course"]), int(ff["skill"]), int(ff["phase"]),
+		float(ff["timeline"]), int(ff["health"]),
+		float(ff["fade"]), float(ff["fade_target"])] +
+		"intro %d zoom %d/%d  cam_mdk %.1f %.1f %.1f  objs %d" %
+		[int(ff["intro_countdown"]), int(ff["zoom_frame"]),
+		int(ff["zoom_sub"]), cp.x, cp.y, cp.z, objs.size()] + pline)
+
+
+func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
+	# Headless freefall smoke — asserts the presentation contract
+	# end-to-end: mode 2 load, intro cadence, the spawned KURT model
+	# node with live vertex animation, camera/F0V, material decode,
+	# steering, and the completion handoff into traversal.
+	print("smoke(freefall): course=%d skill=%d seed=%08x" %
+		[course, skill, seed])
+	_check(int(bridge.get_mode()) == 2, "mode == 2 (freefall)")
+	var f0: Dictionary = bridge.get_freefall_snapshot()
+	_check(not f0.is_empty(), "freefall snapshot non-empty")
+	_check(int(f0["phase"]) == 0, "phase == intro at load")
+	# The _ready settle frame consumed one frameStep (150 -> 149).
+	_check(int(f0["intro_countdown"]) >= 140 and
+		int(f0["intro_countdown"]) <= 150, "intro countdown ~150")
+	_check(int(f0["course"]) == course and int(f0["skill"]) == skill,
+		"course/skill echoed")
+	_check(PackedByteArray(f0["palette"]).size() == 768 and
+		bool(f0["palette_ok"]), "FALLP palette bound (768B)")
+	_check(abs(float(f0["zoom"]) - 2.4) < 1e-4,
+		"zoom == 2.4 (0x540b58 boot value)")
+	var ct0: Transform3D = f0["camera"]
+	_check(abs(ct0.basis.determinant() - 1.0) < 1e-3,
+		"freefall camera basis orthonormal")
+	_check(abs(float(f0["fov_deg"]) - 71.36) < 0.5,
+		"freefall fov ~= 71.36 deg")
+
+	# Intro cadence: the 0x4edcb8 countdown ticks by frameStep; the
+	# player is absent until the t<90 spawn edge.
+	for i in 30:
+		_step_n({}, 1)
+	var f1: Dictionary = bridge.get_freefall_snapshot()
+	_check(int(f1["intro_countdown"]) < 150 and
+		int(f1["intro_countdown"]) > 0,
+		"intro countdown ticking")
+	_check(int(f1["phase"]) == 0, "still intro mid-countdown")
+
+	# Past the countdown spawn edge — the type-0 player enters the
+	# active list with the KURT model bound.
+	for i in 80:
+		_step_n({}, 1)
+	var f2: Dictionary = bridge.get_freefall_snapshot()
+	_check(int(f2["list_head"]) >= 0, "player spawned (list head)")
+	var pd2: Dictionary = f2.get("player", {})
+	_check(not pd2.is_empty() and bool(pd2.get("alive", false)),
+		"player record alive")
+	var objs2: Array = bridge.get_freefall_object_snapshots()
+	_check(objs2.size() >= 1, "active objects enumerated")
+	var pl := {}
+	for o in objs2:
+		if int(o["type"]) == 0:
+			pl = o
+	_check(not pl.is_empty(), "type-0 player in object list")
+	if not pl.is_empty():
+		# model_slot 1 = the KURT roster entry (model_name is the
+		# record's first material-table entry — "CB3" — not the BNI
+		# record name).
+		_check(int(pl["model_slot"]) == 1,
+			"player model slot == KURT (1)")
+		_check(int(pl["model"]) == 1,
+			"player model tag == kFfModelKurt")
+		_check(int(pl["elem_count"]) == 18,
+			"KURT elems == 18 (BNI census)")
+		_check(int(pl["vert_count"]) == 227 and
+			int(pl["tri_count"]) == 363,
+			"KURT geometry 227v/363t")
+		_check(int(pl["anim_handle"]) == 1,
+			"player bound to KURTANIM (handle 1)")
+		var pxf: Transform3D = pl["transform"]
+		_check(abs(pxf.basis.determinant() - 1.0) < 1e-3,
+			"player basis orthonormal")
+		# The node tree is populated by the apply path — smoke steps
+		# bypass _process, so run one apply explicitly.
+		_apply_freefall()
+		var pslot := int(pl["pool_slot"])
+		var pnode := $FreefallRoot.get_node_or_null(
+			"FFObj_%d" % pslot)
+		_check(pnode != null and pnode.visible,
+			"KURT node presented under FreefallRoot")
+		if pnode != null:
+			var pbody: MeshInstance3D = pnode.get_node("Body")
+			_check(pbody.mesh != null and
+				pbody.mesh.get_surface_count() > 0,
+				"KURT node carries a surfaced mesh")
+		# Live vertex animation: the twin driver mutates elemVerts,
+		# so geom_key must move while the clip plays.
+		var gk0 := int(pl["geom_key"])
+		var moved := false
+		for i in 40:
+			_step_n({}, 1)
+			var pl_now := {}
+			for o in bridge.get_freefall_object_snapshots():
+				if int(o["type"]) == 0:
+					pl_now = o
+			if not pl_now.is_empty() and \
+					int(pl_now["geom_key"]) != gk0:
+				moved = true
+				break
+		_check(moved, "KURTANIM mutates verts (geom_key churn)")
+
+	# Materials: texture + index/pen + miss paths through the
+	# FALL3D_<c+1>.MTI bank.
+	var mcb3: Dictionary = bridge.get_freefall_material("CB3")
+	_check(bool(mcb3.get("valid", false)) and mcb3["tex"] != null,
+		"CB3 resolves to a texture material")
+	var mpen: Dictionary = bridge.get_freefall_material("PEN_16")
+	_check(bool(mpen.get("valid", false)) and
+		int(mpen.get("palette_index", -1)) == 16,
+		"PEN_16 resolves to flat palette index 16")
+	# A name with no digits cannot resolve — the PEN_<n> digit
+	# convention is the only non-MTI route.
+	_check(bridge.get_freefall_material("NO_SUCH_MATERIAL").is_empty(),
+		"unresolved material name -> empty")
+
+	# Steering — the digital fold (left=-X) moves the player on the
+	# control-axis within the 0..30s window.
+	var pxy0: Vector3 = pl.get("pos_mdk", Vector3()) \
+		if not pl.is_empty() else Vector3()
+	_step_n({"left": true}, 12)
+	var p3m: Vector3 = Vector3()
+	for o in bridge.get_freefall_object_snapshots():
+		if int(o["type"]) == 0:
+			p3m = o["pos_mdk"]
+	_check(abs(p3m.x - pxy0.x) > 0.01 or abs(p3m.y - pxy0.y) > 0.01,
+		"direction input moves the player")
+
+	# Fade field sanity — the damage flash (>1) may legitimately
+	# appear during play; the state is asserted via the machine's
+	# own fields, not the overlay.
+	var f3: Dictionary = bridge.get_freefall_snapshot()
+	_check(float(f3["fade"]) >= 0.0, "fade in range")
+
+	# Completion handoff — run the course out. The exit branch is
+	# health-gated (OBSERVED 0x541554): >0 -> traversal (mode 3), <=0
+	# -> the death fade ends into the frontend route (mode 0). Which
+	# route a given course/skill/seed takes is the runtime's call —
+	# assert the route's consistency, not a forced survival.
+	var done := false
+	var route := -1
+	var seen_types := {}
+	var seen_anims := {}
+	var saw_chute := false
+	for i in 1400:
+		var r: Dictionary = _step_n({}, 1)
+		for o in bridge.get_freefall_object_snapshots():
+			seen_types[int(o["type"])] = true
+			if int(o["type"]) == 0:
+				seen_anims[int(o["anim_handle"])] = true
+			if bool(o.get("chute", false)):
+				saw_chute = true
+		if bool(r.get("done", false)):
+			done = true
+			route = int(r.get("handoff_route", -1))
+			break
+	_check(done, "freefall course completed")
+	print("  types seen: %s  player anims: %s  chute: %s" %
+		[seen_types.keys(), seen_anims.keys(), saw_chute])
+	_check(seen_types.has(0), "type-0 player enumerated")
+	_check(seen_anims.has(1), "KURTANIM bound during play")
+	var fend: Dictionary = bridge.get_freefall_snapshot()
+	# bones_course (0x4edaf4) is the course>=4 flyby gate.
+	if bool(fend.get("bones_course", false)):
+		_check(seen_types.has(5), "bones flyby on course>=4")
+	else:
+		_check(not seen_types.has(5),
+			"no bones flyby below course 4")
+	var died := bool(fend.get("died", false))
+	_check(route == 0 or route == 1, "handoff route resolved")
+	_check(died == (route == 1),
+		"death state == frontend route (health gate)")
+	if route == 0:
+		# Traversal route — FUN_004346e8's load already ran inside the
+		# handoff; a couple of steps make the runtime live.
+		_step_n({}, 2)
+		_check(int(bridge.get_mode()) == 3,
+			"handoff installed mode 3 (traversal)")
+		var tp: Dictionary = bridge.get_player_snapshot()
+		_check(not tp.is_empty(),
+			"traversal snapshot live post-handoff")
+	else:
+		_check(int(bridge.get_mode()) == 0,
+			"death route -> mode 0 (frontend)")
+
+	print("smoke(freefall): %d failure(s)" % failures)
+
+
 func _update_debug_label() -> void:
 	if not $DebugUI.visible:
 		return
@@ -715,7 +1189,8 @@ func _process(delta: float) -> void:
 			print("frames: startup proof complete")
 			get_tree().quit(0)
 			return
-	if shot_path.is_empty():
+	var mode := int(bridge.get_mode())
+	if shot_path.is_empty() and (mode == 2 or mode == 3):
 		# Screenshot mode keeps the exact frame-0 spawn pose.
 		var input := {
 			"actions": _input_mask(),
@@ -727,7 +1202,29 @@ func _process(delta: float) -> void:
 		mouse_dx = 0
 		mouse_dy = 0
 		mouse_dz = 0
+		input.merge(_ff_input(), true)
 		bridge.step_frame_input(delta * 1000.0, input)
+		# The freefall->traversal handoff can flip the mode inside the
+		# step — re-read so the apply path follows the live runtime.
+		# (Traversal sessions are always mode != 2; only a session
+		# that STARTED in mode 2 logs the transition.)
+		mode = int(bridge.get_mode())
+		if freefall and mode != 2 and not ff_handoff_seen:
+			ff_handoff_seen = true
+			print("mdk-godot: freefall handoff -> mode %d" % mode)
+	if mode == 2:
+		# Mode-2 freefall — the FUN_004109d8 model walk + the
+		# FUN_004123f4 fixed-orientation camera + 0x4edc04 fade.
+		_apply_freefall()
+		return
+	if mode == 0:
+		# Frontend route (post-death handoff or unload) — the mode-0
+		# shell is a documented seam; freeze the last frame.
+		return
+	# Mode 3 (traversal — reached directly or via the handoff).
+	if $FreefallRoot.visible:
+		$FreefallRoot.visible = false
+		$FadeLayer/FadeRect.visible = false
 	_apply_player_snapshot()
 	_apply_camera_snapshot()
 	_apply_object_snapshots()
@@ -865,8 +1362,12 @@ func _run_smoke(data_root: String) -> void:
 	var m0: Dictionary = k0["main"]
 	_check(not m0.is_empty(), "kurt main frame resolved")
 	if not m0.is_empty():
-		_check(String(m0["table_name"]) == "K_IDLE",
-			"spawn anim table == K_IDLE")
+		# The spawn post is the dispatcher tail's seeded roll
+		# (OBSERVED 0x463f37): FUN_00401ed4(100) < 5 posts K_IDLE
+		# (0x65), >= 5 posts K_STILL (0x64). LEVEL3's post-load
+		# rngState deterministically lands the 95% branch.
+		_check(String(m0["table_name"]) == "K_STILL",
+			"spawn anim table == K_STILL (seeded 95% branch)")
 		_check(int(m0["w"]) > 0 and int(m0["h"]) > 0,
 			"main frame dims")
 		_check(m0["tex"] != null, "main ImageTexture built")

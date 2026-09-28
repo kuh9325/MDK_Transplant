@@ -41,6 +41,7 @@ add_library(mdk_core STATIC
   src/core/file_family.cpp
   src/core/framebuffer.cpp
   src/core/freefall_runtime.cpp
+  src/core/freefall_scene.cpp
   src/core/frontend_flow.cpp
   src/core/frontend_menu.cpp
   src/core/frontend_settings.cpp

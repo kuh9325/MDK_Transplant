@@ -110,3 +110,100 @@ ObjectGeometry godot::objectGeometryFromModel(
   g.mesh = mesh;
   return g;
 }
+
+FreefallGeometry godot::freefallGeometryFromModel(
+    const mdk::RuntimeModel& m) {
+  FreefallGeometry g;
+  g.geomKey = objectGeomKey(m);
+  g.elemNames.resize(static_cast<int64_t>(m.elems.size()));
+
+  Ref<ArrayMesh> mesh;
+  mesh.instantiate();
+
+  for (std::size_t e = 0; e < m.elems.size(); ++e) {
+    g.elemNames.set(static_cast<int64_t>(e),
+                    String(m.elemName(e).c_str()));
+    const auto& src = m.elemVerts[e];
+    const auto& tris = m.elemTris[e];
+    const std::size_t vertCount = src.size() / 3;
+    const std::size_t triCount = tris.size() / 0x24;
+    g.triCount += static_cast<int64_t>(triCount);
+    if (vertCount == 0 || triCount == 0) continue;
+
+    // Group the element's tris by raw material index in encounter
+    // order — the software path rasterized tris in record order;
+    // the surface split is the same stream minus interleaving.
+    std::vector<std::int16_t> mats;
+    for (std::size_t t = 0; t < triCount; ++t) {
+      const std::uint8_t* rec = tris.data() + t * 0x24;
+      std::int16_t mi;
+      std::memcpy(&mi, rec + 6, 2);
+      bool seen = false;
+      for (std::int16_t x : mats) seen |= (x == mi);
+      if (!seen) mats.push_back(mi);
+    }
+
+    for (std::int16_t mi : mats) {
+      std::size_t n = 0;
+      for (std::size_t t = 0; t < triCount; ++t) {
+        std::int16_t x;
+        std::memcpy(&x, tris.data() + t * 0x24 + 6, 2);
+        n += (x == mi);
+      }
+      PackedVector3Array verts;
+      PackedVector2Array uvs;
+      verts.resize(static_cast<int64_t>(n) * 3);
+      uvs.resize(static_cast<int64_t>(n) * 3);
+      std::size_t w = 0, bad = 0;
+      for (std::size_t t = 0; t < triCount; ++t) {
+        const std::uint8_t* rec = tris.data() + t * 0x24;
+        std::int16_t x;
+        std::memcpy(&x, rec + 6, 2);
+        if (x != mi) continue;
+        for (int k = 0; k < 3; ++k) {
+          std::uint16_t idx;
+          std::memcpy(&idx, rec + k * 2, 2);
+          if (idx >= vertCount) { idx = 0; ++bad; }
+          verts.set(static_cast<int64_t>(w),
+                    mdkToGodotVec(&src[std::size_t(idx) * 3]));
+          float uv[2];
+          std::memcpy(uv, rec + 8 + std::size_t(k) * 8, 8);
+          uvs.set(static_cast<int64_t>(w), Vector2(uv[0], uv[1]));
+          ++w;
+        }
+      }
+      if (bad != 0) {
+        UtilityFunctions::printerr(
+            "MdkBridge: model '", m.modelName().c_str(), "' elem ",
+            int64_t(e), " has ", int64_t(bad),
+            " out-of-range tri indices (clamped)");
+      }
+
+      Array arrays;
+      arrays.resize(Mesh::ARRAY_MAX);
+      arrays[Mesh::ARRAY_VERTEX] = verts;
+      arrays[Mesh::ARRAY_TEX_UV] = uvs;
+      mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
+      g.vertCount += static_cast<int64_t>(w);
+      g.surfaceElems.push_back(static_cast<int32_t>(e));
+      g.surfaceMatIdx.push_back(static_cast<int32_t>(mi));
+      if (mi >= 0 &&
+          std::size_t(mi) < m.names.size()) {
+        std::string nm(m.names[std::size_t(mi)].name.data(),
+                       strnlen(m.names[std::size_t(mi)].name.data(),
+                               m.names[std::size_t(mi)].name.size()));
+        g.surfaceMats.push_back(String(nm.c_str()));
+        g.surfacePenIdx.push_back(-1);
+      } else if (mi < 0) {
+        g.surfaceMats.push_back(String());
+        g.surfacePenIdx.push_back(
+            static_cast<int32_t>((-mi) & 0xff));
+      } else {
+        g.surfaceMats.push_back(String());   // OOB — unresolved
+        g.surfacePenIdx.push_back(-1);
+      }
+    }
+  }
+  g.mesh = mesh;
+  return g;
+}

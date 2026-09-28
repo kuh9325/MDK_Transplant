@@ -100,5 +100,57 @@ class GodotFrontendSmoke(unittest.TestCase):
         self.assertIn(GOLDEN_ORDER, proc.stdout)
 
 
+def have_freefall_data():
+    data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
+    return (Path(data) / "FALL3D" / "FALL3D.BNI").exists()
+
+
+@unittest.skipUnless(*have_prereqs())
+class GodotFreefallSmoke(unittest.TestCase):
+    """Phase 16C — mode-2 freefall presentation smoke.
+
+    Runs the canonical launcher over representative courses: c0/c2
+    cover the model/anim/material/camera contract plus the
+    traversal handoff; c4 additionally gates the bones flyby. The
+    exit route is health-gated by the runtime (success -> mode 3,
+    death -> mode 0); the smoke asserts route consistency itself.
+    """
+
+    def run_smoke(self, course, skill, seed):
+        return subprocess.run(
+            [str(RUN_SH), "--smoke", "--freefall", str(course),
+             "--skill", str(skill), "--seed", str(seed)],
+            capture_output=True, text=True, timeout=600)
+
+    def check_course(self, course, skill, seed, extra=()):
+        if not have_freefall_data():
+            self.skipTest("no FALL3D data in data root")
+        proc = self.run_smoke(course, skill, seed)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("SCRIPT ERROR", out)
+        m = re.search(r"smoke\(freefall\): (\d+) failure", out)
+        self.assertIsNotNone(m, f"no smoke verdict in output:\n{out}")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"godot exited {proc.returncode}:\n{out}")
+        self.assertEqual(m.group(1), "0", f"smoke failures:\n{out}")
+        for pat in extra:
+            self.assertIn(pat, out)
+
+    def test_freefall_course0(self):
+        # Survival at this seed/skill -> traversal handoff.
+        self.check_course(0, 0, 0xC0FFEE,
+                          extra=("freefall handoff -> mode 3",))
+
+    def test_freefall_course2(self):
+        self.check_course(2, 1, 0xC0FFEE,
+                          extra=("freefall handoff -> mode 3",))
+
+    def test_freefall_course4(self):
+        # Bones flyby (course>=4); the health gate decides the route.
+        self.check_course(4, 2, 0xC0FFEE,
+                          extra=("bones flyby on course>=4",))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

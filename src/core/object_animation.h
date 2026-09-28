@@ -115,6 +115,15 @@ void objectAnimApply(DynamicObject& o, const ObjectAnimView& anim,
 // (+0x140 clear on frame crossing) is preserved as state.
 void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit);
 
+// The same driver with an explicit seconds delta: the original's
+// accumulator step is `rate * +0xe0 * DAT_0049b6f4` where 0x49b6f4 is
+// the live per-frame dtSec — not a hardwired 1/30. objectAnimTick is
+// the locked-timing (dt = 1/30) call convention; the freefall object
+// walk runs every mode-2 frame with the real dt, so its twins use
+// this form (Phase 16C).
+void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
+                      float dtSec);
+
 } // namespace mdk
 
 #endif // MDK_CORE_OBJECT_ANIMATION_H

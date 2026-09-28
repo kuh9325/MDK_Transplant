@@ -261,7 +261,8 @@ void objectAnimApply(DynamicObject& o, const ObjectAnimView& anim,
 // ---------------------------------------------------------------------------
 // FUN_004555bc — the per-tick driver.
 // ---------------------------------------------------------------------------
-void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit) {
+void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
+                      float dtSec) {
   // +0x04 == -1 -> FUN_00455500 (classless timing path). The original
   // resolves a timing record through FUN_0041a5ec (source UNKNOWN —
   // bounded seam): it advances +0xdc by +0xe0 * DT (no rate field),
@@ -271,7 +272,7 @@ void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit) {
   // otherwise; the vertex applier is never invoked — OBSERVED, the
   // +0x04==-1 path does not run FUN_00455890.
   if (o.enemyIndex == 0xffff) {
-    o.animAcc += o.animRate * kFrameDt;
+    o.animAcc += o.animRate * dtSec;
     o.animFrame = static_cast<std::int16_t>(lroundf(o.animAcc));
     ObjectAnimView av{reinterpret_cast<const std::uint8_t*>(o.animRec),
                       recLimit};
@@ -308,7 +309,7 @@ void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit) {
   // +0x144 mark the original emits the +0x140 name once and clears it.
   // Audio is a documented seam — the name text and the consume-on-
   // cross state transition are preserved.
-  const float step = rate * o.animRate * kFrameDt;
+  const float step = rate * o.animRate * dtSec;
   if (!o.animSoundName.empty() &&
       o.animAcc < static_cast<float>(o.animSoundMark) &&
       static_cast<float>(o.animSoundMark) <= o.animAcc + step) {
@@ -346,6 +347,10 @@ void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit) {
   // not aimed at a +0x118 target.
   if (o.animFrame == fc - 1 && !loop && o.animFrame != o.animLatch)
     o.animLatch = static_cast<std::int16_t>(0xff00);
+}
+
+void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit) {
+  objectAnimTickDt(o, recLimit, kFrameDt);
 }
 
 } // namespace mdk

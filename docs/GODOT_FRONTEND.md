@@ -127,15 +127,21 @@ frontend/godot/run.sh --screenshot /tmp/shot.png
 # overrides — forwarded verbatim:
 frontend/godot/run.sh --data-path /path/to/installed \
     --level TRAVERSE/LEVEL4/LEVEL4.DTI --arena SOME_ARENA
+
+# mode-2 freefall course (16C) — same entry point, no traversal load:
+frontend/godot/run.sh --freefall 0 --skill 1 --seed 12648430
+frontend/godot/run.sh --smoke --freefall 4 --skill 2   # smoke checks
 ```
 
 Direct Godot invocation works identically; `run.sh` only adds
 discovery + defaults. `--data-path DIR` (default `$MDK_DATA_ROOT`,
 else `<repo>/original/installed` relative to the project),
 `--level RELDTI`, `--arena NAME` (default `HMO_1`; `""` = spawn
-arena), `--smoke`, `--screenshot PATH`, `--frames N`. Relative
-paths resolve against the launch directory (`$PWD`) because Godot
-chdirs into the project directory.
+arena), `--freefall COURSE` (0..4 — mode 2 instead of `--level`),
+`--skill N` (0..2) and `--seed N` for it (default `0xC0FFEE`, the
+mdk-inspect digest seed), `--smoke`, `--screenshot PATH`,
+`--frames N`. Relative paths resolve against the launch directory
+(`$PWD`) because Godot chdirs into the project directory.
 
 ### GDExtension discovery (important)
 
@@ -196,6 +202,15 @@ b.diagnostic_start(idx,pos,yaw)# test-only player re-anchor
 b.get_arena_names()            # level arena list
 b.is_level_loaded() / b.is_arena_loaded() / b.get_last_error()
 b.shutdown()
+
+# mode-2 freefall (16C) — load_freefall replaces load_level; the
+# runtime hands off to traversal on completion automatically:
+b.load_freefall(course, skill, seed)     # bool — FALL3D bundle
+b.get_freefall_snapshot()                # phase/timeline/health/fade/
+                                         # camera/FOV/palette-zoom
+b.get_freefall_object_snapshots()        # active-list walk, kind-2
+b.get_freefall_object_geometry(slot, part)  # twin mesh (part1=chute)
+b.get_freefall_material(name)            # MTI texture / pen index
 ```
 
 Only copy-safe values cross the boundary — packed arrays,
@@ -458,6 +473,55 @@ enemy index and spawn id. Wires/tags are keyed by the same opaque
 id and freed with the object node. F1 keeps the arena collision
 soup — now the union of every displayed arena's `collision_lines`.
 
+## Freefall presentation (16C)
+
+`--freefall COURSE` (with `--skill`, `--seed`) loads a mode-2 course
+instead of a traversal level — `load_freefall` runs the same course
+init as the mode-2 entry (`FUN_0040ef28` subset): `FreefallRuntime`
+gameplay plus `FreefallScene` presentation data (the FALL3D.BNI
+records, the `FALL3D_<course+1>.MTI` material bank, the
+`FALLP_<course+1>` palette).
+
+The presentation model mirrors the original render walk
+(`FUN_004109d8`, OBSERVED): every live pool object that carries a
+model resolves to a `FreefallRoot` node (`FFObj_<pool_slot>`) whose
+transform is the object's `+0xac` world basis verbatim. The model
+mesh is the *animated* one — the scene keeps a `DynamicObject` twin
+per active object and steps the real `objectAnimTick` driver each
+`freefallStep`, so `get_freefall_object_geometry(slot, 0)` returns
+`elemVerts` exactly as the shared anim driver mutates them (the
+`geom_key` digest gates mesh rebuilds, same contract as G3). A
+second geometry part (`part=1`) serves the `+0x306` chute
+attachment — the kind-2 entry that shares the object's basis.
+
+Materials resolve through `get_freefall_material(name)`: MTI payload
+records surface indexed `ImageTexture`s (palette index 0 keyed
+transparent), MTI index records and `PEN_<n>`/`GREY*`/`NONE` names
+resolve to flat palette pens (`palette_index`; 256+ is the no-draw
+pen). Per-tri material indices group surfaces by the model's
+name-table entry; negative indices are palette pens directly.
+
+The camera is the fixed-orientation `FUN_004123f4` block — the
+bridge surfaces it through the same pose/basis contract as the
+traversal camera (right/down/back rows, `scaleZ=+1` "overhead"
+variant, 600×360 zoom-2.4 projection → ~71.36° vertical FOV).
+`fade` drives a full-viewport overlay (the palette-brightness
+machine: 1 = full, 0 = black, >1 = the damage flash).
+
+Completion is health-gated exactly like the dispatcher's mode-2
+tail: `step_frame` returns `done` plus `handoff_route`; route 0
+(health > 0) runs `progressionFreefallHandoff` inside the bridge —
+the traversal level loads natively and the presentation flips back
+to the G1/G2/G3 path on the same step — while route 1 (health ≤ 0,
+death fade elapsed) reports the frontend mode 0 without touching
+traversal state. No freefall gameplay state lives in GDScript; the
+runtime stays authoritative.
+
+Deferred presentation seams (surfaced as state only): the kind-1
+radar marker sprite, the kind-3 BANG frame-block overlay (the
+EXPLODE model mesh still renders), the missile trail/launch glow
+(kinds 4/5), the `ZOOM%04d` intro sprite sequence, and all sounds.
+
 ## Arena transitions + display set (G3)
 
 The old single-arena path (switch `ArenaMesh` to `curArenaIndex`
@@ -629,6 +693,17 @@ creation, mover transform mirroring against live snapshots
 (reports how many watched movers actually animate; 0 on the
 tested GUNT_9 view — a script-VM seam, wired but undriven), masked
 element visibility, and display-set coherence.
+
+Freefall (16C): `--smoke --freefall C --skill S --seed N` runs the
+mode-2 course end to end — snapshot/camera/palette contract, KURT
+geometry census (18 elements / 227 verts / 363 tris), the KURTANIM
+vertex-animation churn (`geom_key` movement), texture + pen
+material resolution, input motion, the dynamic object census
+(player/missile/explosion/radar/pickup, bones on course >= 4), the
+KURT_HIT handle switch, the chute attachment, completion, and the
+health-gated route (traversal handoff vs. mode-0 death) with the
+route's own consistency check. `GodotFreefallSmoke` in
+`tests/test_godot_frontend.py` covers courses 0, 2, and 4.
 
 `tests/test_godot_frontend.py` orchestrates the headless run and
 the inspect cross-check; it skips cleanly when Godot, the dylib, or
