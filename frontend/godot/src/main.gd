@@ -98,6 +98,19 @@ var fx_recent: Array = []         # last drained events (diag, cap 16)
 var fx_stats := {"events": 0, "shards": 0, "remnants": 0,
 	"kinds": {}}                # --combat-diag counters
 
+# Phase 17C.2 — traversal audio. mdk_core owns every audio semantic
+# (the TraversalAudioMixer voice pool + the ported FUN_0040282c/
+# 00402b00 updater math); this presenter only maps voice-slot handles
+# to AudioStreamPlayer nodes and applies the computed dB/pan/pitch.
+# Per-voice pan runs through a dedicated AudioEffectPanner bus —
+# AudioStreamPlayer has no pan channel and AudioStreamPlayer3D would
+# apply Godot's own distance model, which is NOT the original's.
+const AUDIO_VOICES := 63        # the original's pool cap (FUN_00402604)
+var audio_players := []         # [63] AudioStreamPlayer | null
+var audio_panners := []         # [63] AudioEffectPanner (bus effect)
+var audio_stats := {"cmds": 0, "starts": 0, "params": 0,
+	"stops": 0, "names": {}}   # --smoke/diag counters
+
 # Phase 17B.2 — traversal HUD / view presentation state. The core
 # composes the 600x360 indexed framebuffer and owns every semantic;
 # these are view-side node/resource caches only.
@@ -307,6 +320,7 @@ func _ready() -> void:
 	_build_kurt_presenter()
 	_build_combat_presenter()
 	_build_hud_presenter()
+	_build_audio_presenter()
 
 	# One idle frame settles the deterministic spawn camera.
 	bridge.step_frame_input(0.0, {})
@@ -363,6 +377,20 @@ func _ready() -> void:
 			"AD turn, RF look, Space jump, mouse=captured, F1 " +
 			"collision, F2 object debug, Esc release/quit)") %
 			[arena, bridge.get_arena_names().size()])
+
+
+func _exit_tree() -> void:
+	# Live players hold AudioStreamPlayback objects server-side —
+	# stop them before the tree teardown. (Under the headless Dummy
+	# audio driver the server never mixes, so its playback list
+	# isn't reaped until shutdown — a bounded exit-time artifact;
+	# the real driver reaps them on stop.)
+	_reset_audio()
+	# Drop the per-voice panner buses added in the build pass.
+	for i in AUDIO_VOICES:
+		var idx := AudioServer.get_bus_index("mdkfx%d" % i)
+		if idx >= 0:
+			AudioServer.remove_bus(idx)
 
 
 func _build_player_proxy() -> void:
@@ -1090,6 +1118,94 @@ func _tick_combat_fx(delta: float) -> void:
 	shards = keep
 
 
+# --- Phase 17C.2 — traversal audio presenter -----------------------
+# One AudioEffectPanner bus per voice slot — the pool is bounded to
+# the original's 63 instances, so the bus count is bounded too. All
+# mixing math (attenuation, cone, doppler, volume-domain conversion)
+# is computed in mdk_core; the dicts carry ready dB/pan/pitch values.
+func _build_audio_presenter() -> void:
+	audio_players.resize(AUDIO_VOICES)
+	audio_players.fill(null)
+	for i in AUDIO_VOICES:
+		var bus := AudioServer.bus_count
+		AudioServer.add_bus(bus)
+		AudioServer.set_bus_name(bus, "mdkfx%d" % i)
+		var panner := AudioEffectPanner.new()
+		AudioServer.add_bus_effect(bus, panner)
+		AudioServer.set_bus_send(bus, "Master")
+		audio_panners.append(panner)
+
+
+func _drain_audio_fx() -> void:
+	# The bridge applies the core event batch to its voice pool and
+	# ticks the updater once — this consumes the original's
+	# drain-once contract exactly like _drain_combat_fx.
+	if int(bridge.get_mode()) != 3:
+		# Freefall/frontend — a traversal voice can't exist outside
+		# mode 3; if one survived a mode flip, drop it.
+		for p in audio_players:
+			if p != null:
+				_reset_audio()
+				break
+		return
+	var cmds: Array = bridge.drain_audio_fx()
+	for c in cmds:
+		audio_stats["cmds"] = int(audio_stats["cmds"]) + 1
+		var names: Dictionary = audio_stats["names"]
+		var nm := String(c["name"])
+		names[nm] = int(names.get(nm, 0)) + 1
+		var id := int(c["id"])
+		match String(c["op"]):
+			"start":
+				var p: AudioStreamPlayer = audio_players[id]
+				if p == null:
+					p = AudioStreamPlayer.new()
+					p.name = "voice%d" % id
+					p.bus = "mdkfx%d" % id
+					$AudioRoot.add_child(p)
+					audio_players[id] = p
+				if c.has("stream"):
+					p.stream = c["stream"]
+				p.volume_db = float(c.get("db", 0.0))
+				p.pitch_scale = float(c.get("pitch", 1.0))
+				audio_panners[id].pan = float(c.get("pan", 0.0))
+				if p.stream != null:
+					p.play()
+					audio_stats["starts"] = \
+						int(audio_stats["starts"]) + 1
+			"params":
+				var p: AudioStreamPlayer = audio_players[id]
+				if p != null:
+					p.volume_db = float(c.get("db", p.volume_db))
+					p.pitch_scale = float(
+						c.get("pitch", p.pitch_scale))
+					audio_panners[id].pan = float(c.get("pan", 0.0))
+					audio_stats["params"] = \
+						int(audio_stats["params"]) + 1
+			"stop":
+				var p: AudioStreamPlayer = audio_players[id]
+				if p != null:
+					p.stop()
+					audio_stats["stops"] = \
+						int(audio_stats["stops"]) + 1
+
+
+func _reset_audio() -> void:
+	# Restore/transition boundary — every live player belongs to the
+	# discarded timeline. The bridge-side pool is already reset; the
+	# GDScript side only stops and clears its nodes. Nothing audio
+	# is serialized or resurrected.
+	for i in audio_players.size():
+		var p: AudioStreamPlayer = audio_players[i]
+		if p != null and is_instance_valid(p):
+			p.stop()
+			p.stream = null
+			audio_players[i] = null
+			p.free()
+	audio_stats = {"cmds": 0, "starts": 0, "params": 0,
+		"stops": 0, "names": {}}
+
+
 func _combat_diag_text() -> String:
 	if not combat_diag:
 		return ""
@@ -1131,6 +1247,9 @@ func _reset_presentation_for_restore() -> void:
 	fx_seq = 0
 	fx_recent.clear()
 	fx_stats = {"events": 0, "shards": 0, "remnants": 0, "kinds": {}}
+	# Phase 17C.2 — audio voices from the discarded timeline stop;
+	# nothing crosses the restore boundary.
+	_reset_audio()
 	fx_enable_live = false
 	# The palette is re-read on the next apply — drop it so a
 	# different level's palette can't alias.
@@ -1945,6 +2064,7 @@ func _process(delta: float) -> void:
 	# and shard lifetimes refresh on the same cadence.
 	_apply_shot_snapshots()
 	_drain_combat_fx()
+	_drain_audio_fx()
 	_tick_combat_fx(delta)
 	# Phase 17B.2 — the composed HUD overlay + bezel/scope view. All
 	# state comes from the post-step snapshot; nothing is derived
@@ -1963,6 +2083,10 @@ func _step_n(input: Dictionary, n: int, dt_ms: float = 33.333) -> Dictionary:
 	var res := {}
 	for i in n:
 		res = bridge.step_frame_input(dt_ms, input)
+		# The audio event batch is drain-once — smoke paths never run
+		# _process, so the drain rides the shared step helper to keep
+		# rt.audioFx bounded and exercise the presenter.
+		_drain_audio_fx()
 	return res
 
 
@@ -2156,6 +2280,7 @@ func _run_smoke(data_root: String) -> void:
 	# cache, so this run double-checks texture rebuild).
 	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
 		"hud: reload for canonical run")
+	_reset_audio()
 	_check(bridge.load_arena("HMO_1"), "hud: arena rebind")
 	# The load path composes once at load; one settle step matches
 	# _ready's contract (the settle IS the diagnostic's frame 0).
@@ -2287,6 +2412,7 @@ func _run_smoke(data_root: String) -> void:
 	# pristine spawn pose/RNG, which the canonical stream consumed.
 	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
 		"hud: reload back to spawn")
+	_reset_audio()
 	_check(bridge.load_arena("HMO_1"), "hud: spawn arena rebind")
 	bridge.step_frame_input(0.0, {})
 	player = bridge.get_player_snapshot()
@@ -3170,6 +3296,43 @@ func _run_smoke(data_root: String) -> void:
 	_check(km_end.visible and km_end.texture != null,
 		"KurtMain still presents during death")
 
+	# ---- Phase 17C.2: traversal audio playback ---------------------
+	# Everything above stepped through _step_n, which drains the core
+	# event batch into the voice pool + presenter. The landed jump,
+	# scope enter/exit, scoped fire, and shockwave detonation all
+	# emitted real events; verify they became audible playbacks —
+	# BEFORE the level reload below clears the counters.
+	var ast: Dictionary = bridge.get_audio_stats()
+	print("smoke(audio): banks=%d resolved=%d missing=%d cache=%d " %
+		[int(ast["banks"]), int(ast["resolved"]),
+		int(ast["missing"]), int(ast["cache"])] +
+		"active=%d exhausted=%d starts=%d params=%d stops=%d" %
+		[int(ast["active"]), int(ast["pool_exhausted"]),
+		int(audio_stats["starts"]), int(audio_stats["params"]),
+		int(audio_stats["stops"])])
+	print("smoke(audio): names=%s" % str(audio_stats["names"]))
+	_check(int(ast["banks"]) == 3,
+		"audio: level+traverse+global banks bound")
+	_check(int(ast["resolved"]) > 0, "audio: records resolved+decoded")
+	_check(int(audio_stats["starts"]) > 0,
+		"audio: one-shot events became playback")
+	# The scope-enter path's restart (SNIPERON) and the scoped fire
+	# one-shot (SNIPERSHOT) are both guaranteed by the checks above.
+	_check(audio_stats["names"].has("SNIPERON"),
+		"audio: scope-enter SNIPERON emitted")
+	_check(audio_stats["names"].has("SNIPERSHOT"),
+		"audio: scoped fire SNIPERSHOT emitted")
+	_check(int(ast["pool_exhausted"]) == 0,
+		"audio: 63-pool never exhausted on this path")
+	_check(int(ast["active"]) <= 63, "audio: pool bound respected")
+	# Players actually instantiated under AudioRoot (bounded).
+	var live_players := 0
+	for p in audio_players:
+		if p != null:
+			live_players += 1
+	_check(live_players > 0 and live_players <= AUDIO_VOICES,
+		"audio: presenter players bounded (%d)" % live_players)
+
 	# ---- Phase 17B.2: level transition ----
 	# shutdown() drops the HUD/bezel cache; a reload must rebuild
 	# every surface from the fresh runtime — nothing stale survives.
@@ -3177,6 +3340,7 @@ func _run_smoke(data_root: String) -> void:
 	var tex_pre = hpre["tex"]
 	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
 		"transition: LEVEL3 reload")
+	_reset_audio()
 	_check(bridge.load_arena("HMO_1"), "transition: arena rebind")
 	_step_n({}, 2)
 	var hpost: Dictionary = bridge.get_hud_snapshot()
@@ -3193,6 +3357,18 @@ func _run_smoke(data_root: String) -> void:
 	_check(not $BezelLayer/BezelRect.visible and
 		not $ScopeLayer/ScopeRect.visible,
 		"transition: no stale bezel/scope post-reload")
+	# Audio seam — the reload reset the bridge-side pool: no voice or
+	# stream survives into the fresh session, and the presenter
+	# dropped its players.
+	var ast2: Dictionary = bridge.get_audio_stats()
+	_check(int(ast2["active"]) == 0,
+		"audio: pool cleared across level reload")
+	live_players = 0
+	for p in audio_players:
+		if p != null:
+			live_players += 1
+	_check(live_players == 0,
+		"audio: presenter players cleared across reload")
 
 	print("smoke: %d failure(s)" % failures)
 
@@ -3528,6 +3704,22 @@ func _run_combat_exercise(tag: String) -> void:
 		bridge.diagnostic_start(int(pre_c["arena"]),
 			pre_c["pos_mdk"], float(pre_c["yaw_deg"]))
 		_step_n({}, 8)
+	# Phase 17C.2 — the scope/fire/impact/teardown steps above all
+	# drained the audio batch through _step_n. The level-agnostic
+	# invariants: banks bound, at least the SNIPERON restart and
+	# SNIPERSHOT one-shot decoded + played, pool bounded.
+	var astc: Dictionary = bridge.get_audio_stats()
+	print("  combat(%s) audio: resolved=%d missing=%d active=%d" %
+		[tag, int(astc["resolved"]), int(astc["missing"]),
+		int(astc["active"])] +
+		" starts=%d names=%s" %
+		[int(audio_stats["starts"]), str(audio_stats["names"])])
+	_check(int(astc["banks"]) == 3,
+		"combat(%s): audio banks bound" % tag)
+	_check(audio_stats["names"].has("SNIPERSHOT"),
+		"combat(%s): SNIPERSHOT decoded+played" % tag)
+	_check(int(astc["active"]) <= AUDIO_VOICES,
+		"combat(%s): voice pool bounded" % tag)
 
 
 func _run_smoke_restore() -> void:

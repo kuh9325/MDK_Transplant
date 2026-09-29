@@ -25,6 +25,7 @@
 // background work, no shared mutable state.
 #pragma once
 
+#include <godot_cpp/classes/audio_stream_wav.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
@@ -36,6 +37,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -55,6 +57,8 @@
 #include "core/gameplay_input.h"
 #include "core/progression_runtime.h"
 #include "core/sni_directory.h"
+#include "core/sni_wave.h"
+#include "core/traversal_audio_mixer.h"
 #include "core/traversal_runtime.h"
 #include "core/player_projectiles.h"
 
@@ -224,6 +228,21 @@ class MdkBridge : public RefCounted {
   // the corpse/remnant binds ("EXPLODE"). Same dict shape as
   // get_object_geometry. Empty when the name is not in the table.
   Dictionary get_named_geometry(const String& name);
+
+  // --- Phase 17C.2 — traversal audio presentation ----------------
+  // Drains TraversalRuntime::audioFx through the C++ voice pool
+  // (TraversalAudioMixer — the BUILD_A instance-pool semantics) and
+  // returns the player command batch for the GDScript presenter.
+  // Each dict: "op" ("start"/"params"/"stop"), "id" (voice slot
+  // 0..62), "name"; start adds "stream" (Ref<AudioStreamWAV>) and
+  // "loop"; start/params add "db" (Godot volume_db), "pan"
+  // (AudioEffectPanner -1..1), "pitch" (pitch_scale). The event
+  // stream is consumed exactly once — repeated calls see only new
+  // work, like drain_combat_fx.
+  Array drain_audio_fx();
+  // Development counters: resolved/missing records, stream cache
+  // size, active voice count, pool-exhaustion count.
+  Dictionary get_audio_stats() const;
 
   // The active display palette (768 RGB bytes — the palette the
   // shard colors and HUD indicator fills index into).
@@ -499,6 +518,41 @@ class MdkBridge : public RefCounted {
 
   // Opaque object IDs (see mdk_objid.h for lifetime rules).
   mdkfront::MdkObjectIds objIds_;
+
+  // --- Phase 17C.2 — traversal audio ------------------------------
+  // One SNI sound bank, search-ordered (level S.SNI first — the same
+  // record-list order the original's FUN_00402fe8 first-match sees,
+  // OBSERVED via the FUN_0041b7b4/0042322c load order).
+  struct AudioBank_ {
+    std::span<const std::byte> bytes;   // aliases audioBankStore_ /
+                                        // rt_->level.sniBytes
+    mdk::SniDirectory dir;
+  };
+  // Memoized record resolve+decode — keyed by name (zero cross-bank
+  // collisions OBSERVED in the corpus; rebuilt per level anyway).
+  struct AudioEntry_ {
+    bool resolved = false;
+    mdk::TraversalAudioSoundDef def;    // vol/rate/frames/loop
+    Ref<AudioStreamWAV> stream;         // null on decode failure
+  };
+  void loadSoundBanks_();
+  const AudioEntry_* audioEntry_(const std::string& name);
+  bool audioResolve_(const std::string& name,
+                     mdk::TraversalAudioSoundDef& def);
+  // 0x20000 live-pos refresh — ownerKey is a real DynamicObject* (or
+  // the kPlayer tag) in THIS process; scanned across arena storage.
+  bool audioOwnerPos_(int cat, const void* key, float pos[3]);
+
+  std::deque<std::vector<std::byte>> audioBankStore_;
+  std::vector<AudioBank_> audioBanks_;
+  std::unordered_map<std::string, AudioEntry_> audioEntries_;
+  mdk::TraversalAudioMixer audioMixer_;
+  mdk::TraversalAudioListener audioListener_;
+  double lastDtSec_ = 0.0;             // stepCore_'s dt — mixer playhead
+  // FUN_0040202c's SFX master (0x541308) — the SoundFX menu scalar;
+  // the frontend never parses the user's MDK.CFG, so the OBSERVED
+  // factory default (70 — frontend_settings' @0x49b0fc table).
+  int audioSfxPct_ = 70;
 
   std::string lastError_;
 };

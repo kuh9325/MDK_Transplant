@@ -73,9 +73,12 @@ add_library(mdk_core STATIC
   src/core/save_full_write.cpp
   src/core/save_game.cpp
   src/core/sni_directory.cpp
+  src/core/sni_wave.cpp
   src/core/sound_menu.cpp
   src/core/stream_context.cpp
   src/core/traversal_audio.cpp
+  src/core/traversal_audio_dsp.cpp
+  src/core/traversal_audio_mixer.cpp
   src/core/traversal_hud.cpp
   src/core/traversal_runtime.cpp
   src/core/traversal_script.cpp

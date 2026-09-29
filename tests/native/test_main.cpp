@@ -45,8 +45,11 @@
 #include "core/save_full_write.h"
 #include "core/save_game.h"
 #include "core/sni_directory.h"
+#include "core/sni_wave.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
+#include "core/traversal_audio_dsp.h"
+#include "core/traversal_audio_mixer.h"
 #include "core/traversal_runtime.h"
 #include "core/traversal_script.h"
 #include "core/viewport.h"
@@ -22698,6 +22701,721 @@ void test_traversal_audio() {
   }
 }
 
+// ---------------------------------------------------------------------
+// Phase 17C.2: SNI payload RIFF/WAVE decode + the BUILD_A updater port.
+// All fixtures are synthetic — no proprietary waveform data.
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Synthetic RIFF/WAVE: PCM fmt (18 bytes like the observed corpus,
+// cbSize=0) + optional extra chunks + data.
+struct SyntheticWave {
+  std::vector<std::byte> buf;
+
+  void put8(std::uint8_t v) { buf.push_back(std::byte{v}); }
+  void put16(std::uint16_t v) {
+    put8(static_cast<std::uint8_t>(v));
+    put8(static_cast<std::uint8_t>(v >> 8));
+  }
+  void put32(std::uint32_t v) {
+    put16(static_cast<std::uint16_t>(v));
+    put16(static_cast<std::uint16_t>(v >> 16));
+  }
+  void putTag(const char* t) {
+    for (int i = 0; i < 4; ++i) put8(static_cast<std::uint8_t>(t[i]));
+  }
+  void putChunk(const char* id, const std::vector<std::byte>& body) {
+    putTag(id);
+    put32(static_cast<std::uint32_t>(body.size()));
+    buf.insert(buf.end(), body.begin(), body.end());
+    if (body.size() & 1u) put8(0);              // RIFF pad byte
+  }
+
+  static std::vector<std::byte> fmtChunk(std::uint16_t tag,
+                                         std::uint16_t ch,
+                                         std::uint32_t rate,
+                                         std::uint16_t bits) {
+    std::vector<std::byte> f;
+    auto w16 = [&](std::uint16_t v) {
+      f.push_back(std::byte{static_cast<std::uint8_t>(v)});
+      f.push_back(std::byte{static_cast<std::uint8_t>(v >> 8)});
+    };
+    auto w32 = [&](std::uint32_t v) {
+      w16(static_cast<std::uint16_t>(v));
+      w16(static_cast<std::uint16_t>(v >> 16));
+    };
+    const std::uint16_t ba =
+        static_cast<std::uint16_t>(ch * (bits / 8));
+    w16(tag);
+    w16(ch);
+    w32(rate);
+    w32(rate * ba);     // nAvgBytesPerSec
+    w16(ba);
+    w16(bits);
+    w16(0);             // cbSize — the observed corpus's fmt is 18B
+    return f;
+  }
+
+  static SyntheticWave build(std::uint16_t tag, std::uint16_t ch,
+                             std::uint32_t rate, std::uint16_t bits,
+                             std::initializer_list<int> samples) {
+    SyntheticWave w;
+    w.putTag("RIFF");
+    const std::size_t sizeFieldPos = w.buf.size();
+    w.put32(0);
+    w.putTag("WAVE");
+    w.putChunk("fmt ", fmtChunk(tag, ch, rate, bits));
+    std::vector<std::byte> d;
+    if (bits == 8) {
+      for (int s : samples) d.push_back(std::byte{static_cast<std::uint8_t>(s)});
+    } else {
+      for (int s : samples) {
+        d.push_back(std::byte{static_cast<std::uint8_t>(s)});
+        d.push_back(std::byte{static_cast<std::uint8_t>(s >> 8)});
+      }
+    }
+    w.putChunk("data", d);
+    // Patch the RIFF size field = file size - 8.
+    const std::uint32_t sz =
+        static_cast<std::uint32_t>(w.buf.size() - 8);
+    w.buf[sizeFieldPos] = std::byte{static_cast<std::uint8_t>(sz)};
+    w.buf[sizeFieldPos + 1] = std::byte{static_cast<std::uint8_t>(sz >> 8)};
+    w.buf[sizeFieldPos + 2] = std::byte{static_cast<std::uint8_t>(sz >> 16)};
+    w.buf[sizeFieldPos + 3] = std::byte{static_cast<std::uint8_t>(sz >> 24)};
+    return w;
+  }
+};
+
+} // namespace
+
+void test_sni_wave() {
+  using mdk::SniWave;
+  using mdk::SniWaveStatus;
+  using mdk::decodeSniWave;
+
+  // Mono 8-bit PCM at 11025 (the FOOT-step-adjacent corpus class).
+  {
+    auto w = SyntheticWave::build(1, 1, 11025, 8, {128, 200, 30, 255});
+    SniWave out;
+    CHECK(decodeSniWave(w.buf, &out) == SniWaveStatus::kOk);
+    CHECK(out.rateHz == 11025 && out.channels == 1);
+    CHECK(out.bitsPerSample == 8 && out.blockAlign == 1);
+    CHECK(out.frames == 4 && out.pcm.size() == 4);
+    CHECK(out.pcm[1] == 200 && out.pcm[3] == 255);
+  }
+
+  // Mono 16-bit PCM at 22050 (FOOT1-4 class), verbatim LE bytes.
+  {
+    auto w = SyntheticWave::build(1, 1, 22050, 16, {0x0102, -4, 0x7fff});
+    SniWave out;
+    CHECK(decodeSniWave(w.buf, &out) == SniWaveStatus::kOk);
+    CHECK(out.rateHz == 22050 && out.bitsPerSample == 16);
+    CHECK(out.blockAlign == 2 && out.frames == 3);
+    CHECK(out.pcm.size() == 6);
+    CHECK(out.pcm[0] == 0x02 && out.pcm[1] == 0x01);
+    CHECK(out.pcm[5] == 0x7f);
+  }
+
+  // Observed 6000 Hz low-rate variant still decodes (rate kept verbatim).
+  {
+    auto w = SyntheticWave::build(1, 1, 6000, 8, {0, 128});
+    SniWave out;
+    CHECK(decodeSniWave(w.buf, &out) == SniWaveStatus::kOk);
+    CHECK(out.rateHz == 6000 && out.frames == 2);
+  }
+
+  // Odd-size chunk between fmt and data is skipped (word-align pad).
+  {
+    SyntheticWave w;
+    w.putTag("RIFF");
+    w.put32(0);
+    w.putTag("WAVE");
+    w.putChunk("fmt ", SyntheticWave::fmtChunk(1, 1, 8000, 8));
+    w.putChunk("JUNK", {std::byte{1}, std::byte{2}, std::byte{3}});
+    w.putChunk("data", {std::byte{9}, std::byte{8}});
+    SniWave out;
+    CHECK(decodeSniWave(w.buf, &out) == SniWaveStatus::kOk);
+    CHECK(out.frames == 2 && out.pcm[0] == 9);
+  }
+
+  // Rejections — all safe, all structured.
+  {
+    SniWave out;
+    std::vector<std::byte> empty;
+    CHECK(decodeSniWave(empty, &out) == SniWaveStatus::kNotWave);
+
+    auto notRiff = SyntheticWave::build(1, 1, 8000, 8, {1});
+    notRiff.buf[0] = std::byte{'X'};
+    CHECK(decodeSniWave(notRiff.buf, &out) == SniWaveStatus::kNotWave);
+
+    // Stereo — outside the reachable corpus.
+    auto stereo = SyntheticWave::build(1, 2, 8000, 8, {1, 2, 3, 4});
+    CHECK(decodeSniWave(stereo.buf, &out) ==
+          SniWaveStatus::kUnsupportedChannels);
+
+    // 24-bit — outside the reachable corpus.
+    auto wide = SyntheticWave::build(1, 1, 8000, 24, {1, 2, 3});
+    CHECK(decodeSniWave(wide.buf, &out) == SniWaveStatus::kUnsupportedBits);
+
+    // Non-PCM tag (e.g. ADPCM=2) — rejected, never guessed.
+    auto adpcm = SyntheticWave::build(2, 1, 8000, 8, {1, 2});
+    CHECK(decodeSniWave(adpcm.buf, &out) == SniWaveStatus::kBadFormat);
+
+    // No data chunk.
+    {
+      SyntheticWave w;
+      w.putTag("RIFF");
+      w.put32(0);
+      w.putTag("WAVE");
+      w.putChunk("fmt ", SyntheticWave::fmtChunk(1, 1, 8000, 8));
+      CHECK(decodeSniWave(w.buf, &out) == SniWaveStatus::kBadData);
+    }
+
+    // Truncated mid-fmt.
+    {
+      auto w = SyntheticWave::build(1, 1, 8000, 8, {1});
+      w.buf.resize(20);   // inside the fmt chunk body
+      const auto st = decodeSniWave(w.buf, &out);
+      CHECK(st == SniWaveStatus::kBadFormat ||
+            st == SniWaveStatus::kBadData ||
+            st == SniWaveStatus::kTruncated);
+    }
+
+    // Zero-frame data chunk.
+    {
+      SyntheticWave w;
+      w.putTag("RIFF");
+      w.put32(0);
+      w.putTag("WAVE");
+      w.putChunk("fmt ", SyntheticWave::fmtChunk(1, 1, 8000, 8));
+      w.putChunk("data", {});
+      CHECK(decodeSniWave(w.buf, &out) == SniWaveStatus::kBadData);
+    }
+  }
+
+  // Status names exist for diagnostics.
+  CHECK(mdk::sniWaveStatusName(SniWaveStatus::kOk) == "ok");
+  CHECK(mdk::sniWaveStatusName(SniWaveStatus::kNotWave) == "not_wave");
+}
+
+void test_traversal_audio_dsp() {
+  using mdk::TraversalAudioListener;
+  using mdk::TraversalAudioPush;
+  using mdk::TraversalAudioVoice;
+  using mdk::traversalAudioDsPan;
+  using mdk::traversalAudioMilliBel;
+  using mdk::traversalAudioPanUnit;
+  using mdk::traversalAudioScaledVol;
+  using mdk::traversalAudioVoiceActive;
+  using mdk::traversalAudioVoiceInit;
+  using mdk::traversalAudioVoiceTick;
+  using mdk::traversalAudioVolDb;
+
+  // Identity listener at the origin; +z faces the listener (a source at
+  // z<0 is "in front" for the 3D cone's relz>0 == behind rule).
+  TraversalAudioListener L;
+  L.m[0][0] = 1.f;
+  L.m[1][1] = 1.f;
+  L.m[2][2] = 1.f;
+  L.zoom = 1.0f;
+  L.frame = 1.0f;
+  L.mode3d = false;
+
+  // -- flat one-shot (FUN_004022b8): mode=1 -> no updater bits --------
+  {
+    TraversalAudioVoice v;
+    traversalAudioVoiceInit(v, 1, nullptr, 0x5000, 1.0f, 0.0f, 11025);
+    CHECK(v.effVol == 0x5000);            // mode&1 -> vol seed
+    CHECK(v.freqHz == 11025);             // trunc(recRate * 1.0)
+    CHECK(v.prevDist < 0.0f);
+    CHECK(!traversalAudioVoiceActive(v));
+    const TraversalAudioPush p = traversalAudioVoiceTick(v, L);
+    CHECK(!p.vol && !p.pan && !p.freq);   // updater never runs
+    CHECK(v.effVol == 0x5000);            // untouched
+  }
+
+  // -- 2D positional (mode 0x1000e): baked pos, all updater bits ------
+  {
+    TraversalAudioVoice v;
+    const float pos[3] = {0.f, 0.f, -100.f};   // 100 in front
+    traversalAudioVoiceInit(v, 0x1000e, pos, 0x7fff, 1.0f, 50.0f, 22050);
+    CHECK(v.effVol == 0);                 // bit0 clear -> silent seed
+    CHECK(v.freqHz == 22050);
+    // Tick 1: sentinel prevDist<0 -> fields computed, nothing pushed.
+    TraversalAudioPush p = traversalAudioVoiceTick(v, L);
+    CHECK(!p.vol && !p.pan && !p.freq);
+    CHECK(near(v.prevDist, 100.0));
+    // vol = trunc(32767 * (250-100) * (1/230)) = trunc(21369.78) = 21369
+    CHECK(v.effVol == 21369);
+    // Tick 2+: prevOk -> pushes now fire.
+    p = traversalAudioVoiceTick(v, L);
+    CHECK(p.vol && p.pan && p.freq);
+    CHECK(v.effVol == 21369);
+    CHECK(v.pan == 0);                    // dead ahead -> centered
+    // doppler: dist unchanged -> shift 1.0 -> freq = recRate*rate.
+    CHECK(v.freqHz == 22050);
+    CHECK(traversalAudioVoiceActive(v));  // no latch -> keeps running
+  }
+
+  // -- 2D distance bands: <20 base, 20..250 falloff, >250 silent ------
+  {
+    TraversalAudioVoice v;
+    const float near_[3] = {0.f, 0.f, -10.f};
+    traversalAudioVoiceInit(v, 0x1000e, near_, 0x7fff, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v, L);
+    CHECK(v.effVol == 0x7fff);            // dist<20 -> baseVol verbatim
+    const float far_[3] = {0.f, 0.f, -300.f};
+    v.pos[0] = far_[0]; v.pos[1] = far_[1]; v.pos[2] = far_[2];
+    traversalAudioVoiceTick(v, L);
+    CHECK(v.effVol == 0);                 // dist>250 -> silent
+  }
+
+  // -- 2D pan: dot(n, listener row2 xy) * 32767 ------------------------
+  {
+    // Yaw the listener so row2 = (1,0,0): pan = nz*32767 - nx*0.
+    TraversalAudioListener R = L;
+    R.m[0][0] = 0.f;  R.m[0][2] = -1.f;
+    R.m[2][0] = 1.f;  R.m[2][2] = 0.f;
+    // rel under R for src (0,0,-100): rx = (0,0,-1).p = 100,
+    // rz = (1,0,0).p = 0 -> nz=0 -> pan = 0 - 1*0 = 0.
+    TraversalAudioVoice v2;
+    const float side[3] = {0.f, 0.f, -100.f};
+    traversalAudioVoiceInit(v2, 0x1000e, side, 0x7fff, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v2, R);
+    CHECK(v2.pan == 0);
+    // src (100,0,0): rz = 100, rx = 0 -> nz=1 ->
+    // pan = (nz*m20 - nx*m21)*32767 = 1*1*32767 = 32767.
+    TraversalAudioVoice v3;
+    const float px[3] = {100.f, 0.f, 0.f};
+    traversalAudioVoiceInit(v3, 0x1000e, px, 0x7fff, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v3, R);
+    CHECK(v3.pan == 32767);
+  }
+
+  // -- doppler: closing source raises freq; clamps at 3.0 --------------
+  {
+    TraversalAudioVoice v;
+    const float p1[3] = {0.f, 0.f, -200.f};
+    traversalAudioVoiceInit(v, 0x1000e, p1, 0x7fff, 1.0f, 50.0f, 10000);
+    traversalAudioVoiceTick(v, L);            // sentinel tick
+    v.pos[2] = -190.f;                        // closed 10 in 1 frame
+    traversalAudioVoiceTick(v, L);
+    // shift = 1 + (200-190)*30/(1*1100) = 1 + 300/1100 = 1.2727..
+    CHECK(v.freqHz == static_cast<int>(10000.0 * (1.0 + 300.0/1100.0)));
+    // Teleport hugely closer -> shift clamped at 3.0.
+    v.pos[2] = -1.f;
+    traversalAudioVoiceTick(v, L);
+    CHECK(v.freqHz == static_cast<int>(10000.0 * 3.0));
+  }
+
+  // -- mode-0x10106 latch: one pushed update, then flat ---------------
+  {
+    TraversalAudioVoice v;
+    const float pos[3] = {0.f, 0.f, -100.f};
+    traversalAudioVoiceInit(v, 0x10106, pos, 0x7fff, 1.0f, 50.0f, 8000);
+    TraversalAudioPush p = traversalAudioVoiceTick(v, L);   // sentinel
+    CHECK(!p.vol && !p.pan && !p.freq);
+    p = traversalAudioVoiceTick(v, L);                      // push once
+    CHECK(p.vol && p.pan && !p.freq);       // 0x6 = vol+pan, no doppler
+    CHECK(!traversalAudioVoiceActive(v));   // updater bits stripped
+    const int frozen = v.effVol;
+    v.pos[2] = -30.f;                       // move — must NOT recompute
+    p = traversalAudioVoiceTick(v, L);
+    CHECK(!p.vol && !p.pan && !p.freq);
+    CHECK(v.effVol == frozen);
+  }
+
+  // -- 3D updater (sniper scope, mode3d): cone + axial ----------------
+  {
+    L.mode3d = true;
+    TraversalAudioVoice v;
+    const float front[3] = {0.f, 0.f, -100.f};
+    traversalAudioVoiceInit(v, 0x1000e, front, 10000, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v, L);
+    // lat=0 (inside core) -> lat'=0; axial=min(1, 300/(1*100))=1;
+    // cone=1.3 -> vol = trunc(10000*1.3*1) = 13000 (boost over base —
+    // the OBSERVED in-cone gain).
+    CHECK(v.effVol == 13000);
+
+    // Behind the listener plane -> silent.
+    v.pos[2] = 50.f;
+    traversalAudioVoiceTick(v, L);
+    CHECK(v.effVol == 0);
+
+    // Cone edge: lat/|z| = 1.3 -> vol 0. lat=130, z=-100.
+    TraversalAudioVoice v2;
+    const float edge[3] = {130.f, 0.f, -100.f};
+    traversalAudioVoiceInit(v2, 0x1000e, edge, 10000, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v2, L);
+    // lat=130 > 2 -> excess = 1-2/130; latx' = 130*excess*(2/1) = 256;
+    // laty' = 0; cone = 1.3 - 256/100 = -1.26 -> clamped 0.
+    CHECK(v2.effVol == 0);
+
+    // Axial falloff: z=-600 -> axial = 300/600 = 0.5; lat=0 -> cone 1.3
+    // -> vol = trunc(10000*1.3*0.5) = 6500.
+    TraversalAudioVoice v3;
+    const float deep[3] = {0.f, 0.f, -600.f};
+    traversalAudioVoiceInit(v3, 0x1000e, deep, 10000, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v3, L);
+    CHECK(v3.effVol == 6500);
+    L.mode3d = false;
+  }
+
+  // -- live-pos select (0x2000e): caller-refreshed pos reads ----------
+  {
+    TraversalAudioVoice v;
+    const float p1[3] = {0.f, 0.f, -100.f};
+    traversalAudioVoiceInit(v, 0x2000e, p1, 0x7fff, 1.0f, 50.0f, 8000);
+    traversalAudioVoiceTick(v, L);
+    CHECK(near(v.prevDist, 100.0));
+    v.pos[2] = -50.f;                       // owner moved (caller refresh)
+    traversalAudioVoiceTick(v, L);
+    CHECK(near(v.prevDist, 50.0));
+    // mode&8 -> doppler ran on the closing move.
+    CHECK(v.freqHz == static_cast<int>(8000.0 * (1.0 + 50.0*30.0/1100.0)));
+  }
+
+  // -- conversions -----------------------------------------------------
+  {
+    CHECK(traversalAudioScaledVol(32767, 100) == 32767);
+    CHECK(traversalAudioScaledVol(32767, 70) == 22936);   // 32767*70/100
+    CHECK(traversalAudioScaledVol(100, 70) == 70);
+    // mB = trunc(vol*2500/32767) - 2500; full-scale lands at ~0 dB
+    // (the trunc can sit one ulp below 2500 -> mB 0 or -1).
+    CHECK(traversalAudioMilliBel(32767) <= 0 &&
+          traversalAudioMilliBel(32767) >= -1);
+    CHECK(traversalAudioMilliBel(0) == -2500);
+    CHECK(traversalAudioMilliBel(22936) ==
+          static_cast<int>(22936.0 * (2500.0/32767.0)) - 2500);
+    CHECK(near(traversalAudioVolDb(0), -25.0f));
+    // DS pan = (pan*10000)>>15 (arithmetic).
+    CHECK(traversalAudioDsPan(32767) == 9999);
+    CHECK(traversalAudioDsPan(-32768) == -10000);
+    CHECK(near(traversalAudioPanUnit(32767), 0.9999f));
+    CHECK(near(traversalAudioPanUnit(-32768), -1.0f));
+  }
+}
+
+// -- Phase 17C.2 voice pool: name scoping, owner lifecycle, cap -------
+
+namespace {
+
+mdk::TraversalAudioEvent mkEv(mdk::TraversalAudioOp op,
+                              const char* name) {
+  mdk::TraversalAudioEvent e;
+  e.op = op;
+  e.name = name;
+  return e;
+}
+
+// A standing record: 8000 Hz, 800 frames (100ms), non-loop.
+const mdk::TraversalAudioMixer::ResolveFn kFakeRes =
+    [](const std::string& name, mdk::TraversalAudioSoundDef& d) {
+      if (name == "MISSING") return false;
+      d.volume = 0x7fff;
+      d.rateHz = 8000;
+      d.frames = 800;
+      d.loop = (name == "LOOPED");
+      return true;
+    };
+
+const mdk::TraversalAudioMixer::OwnerPosFn kNoOwner =
+    [](int, const void*, float[3]) { return false; };
+
+std::vector<mdk::TraversalAudioCmd> drained(mdk::TraversalAudioMixer& m) {
+  std::vector<mdk::TraversalAudioCmd> out;
+  m.drain(out);
+  return out;
+}
+
+int countCmd(const std::vector<mdk::TraversalAudioCmd>& v,
+             mdk::TraversalAudioCmdOp op) {
+  int n = 0;
+  for (const auto& c : v) n += (c.op == op) ? 1 : 0;
+  return n;
+}
+
+} // namespace
+
+void test_traversal_audio_mixer() {
+  using mdk::TraversalAudioCmdOp;
+  using mdk::TraversalAudioEvent;
+  using mdk::TraversalAudioMixer;
+  using mdk::TraversalAudioOp;
+  using mdk::TraversalAudioOwner;
+
+  // -- kPlayOnce: one event -> one start; second event -> second voice
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "LAND"), kFakeRes);
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "LAND"), kFakeRes);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStart) == 2);
+    CHECK(m.activeCount() == 2);       // two instances of same record
+    // The pool must not replay when drained again.
+    CHECK(drained(m).empty());
+  }
+
+  // -- missing record: no voice, counted ------------------------------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "MISSING"), kFakeRes);
+    CHECK(m.activeCount() == 0 && m.missingCount() == 1);
+    CHECK(drained(m).empty());
+  }
+
+  // -- kEnsurePlaying: second ensure while alive is a no-op -----------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "CHUTEON"),
+                 kFakeRes);
+    CHECK(m.activeCount() == 1);
+    const auto c1 = drained(m);
+    CHECK(countCmd(c1, TraversalAudioCmdOp::kStart) == 1);
+    // Ensure again — the original's FUN_00402658 sees it active.
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "CHUTEON"),
+                 kFakeRes);
+    CHECK(m.activeCount() == 1 && drained(m).empty());
+    // A DIFFERENT name still spawns.
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "OTHER"),
+                 kFakeRes);
+    CHECK(m.activeCount() == 2);
+  }
+
+  // -- ensure respawns after the voice finishes ------------------------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "SHORT"),
+                 kFakeRes);
+    drained(m);
+    // 800 frames @ 8000 Hz = 0.1s; tick past it -> auto-stop.
+    m.tick(0.2, kNoOwner);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStop) == 1);
+    CHECK(m.activeCount() == 0);
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "SHORT"),
+                 kFakeRes);
+    CHECK(m.activeCount() == 1);       // respawned — ensure saw it gone
+  }
+
+  // -- kRestart: stop-all-by-name + fresh start ------------------------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "ZOOM"), kFakeRes);
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "ZOOM"), kFakeRes);
+    drained(m);
+    m.applyEvent(mkEv(TraversalAudioOp::kRestart, "ZOOM"), kFakeRes);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStop) == 2);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStart) == 1);
+    CHECK(m.activeCount() == 1);
+  }
+
+  // -- kStop: releases every instance of the record --------------------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "BREATH"), kFakeRes);
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "BREATH"), kFakeRes);
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "OTHER"), kFakeRes);
+    drained(m);
+    m.applyEvent(mkEv(TraversalAudioOp::kStop, "BREATH"), kFakeRes);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStop) == 2);
+    CHECK(m.activeCount() == 1);       // OTHER survives (name-scoped)
+  }
+
+  // -- positional spawn binds the owner; release frees exactly it -----
+  {
+    TraversalAudioMixer m;
+    int objA = 0, objB = 0;
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kSpawnPositional,
+                                 "ALERT");
+    e.owner = TraversalAudioOwner::kObject;
+    e.ownerKey = &objA;
+    e.hasPos = true;
+    e.pos[2] = -30.f;
+    e.mode = 0x1000e;
+    m.applyEvent(e, kFakeRes);
+    e.ownerKey = &objB;
+    m.applyEvent(e, kFakeRes);
+    CHECK(m.activeCount() == 2);
+    CHECK(m.ownerHasVoice(static_cast<int>(TraversalAudioOwner::kObject),
+                          &objA));
+    drained(m);
+    // Release objA -> its voice dies; objB's survives.
+    TraversalAudioEvent rel = mkEv(TraversalAudioOp::kRelease, "");
+    rel.owner = TraversalAudioOwner::kObject;
+    rel.ownerKey = &objA;
+    m.applyEvent(rel, kFakeRes);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStop) == 1);
+    CHECK(m.activeCount() == 1);
+    CHECK(!m.ownerHasVoice(static_cast<int>(TraversalAudioOwner::kObject),
+                           &objA));
+    CHECK(m.ownerHasVoice(static_cast<int>(TraversalAudioOwner::kObject),
+                          &objB));
+  }
+
+  // -- owner overwrite orphans the old voice (OBSERVED *slot=inst) ----
+  {
+    TraversalAudioMixer m;
+    int obj = 0;
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kSpawnPositional,
+                                 "VOICE");
+    e.owner = TraversalAudioOwner::kObject;
+    e.ownerKey = &obj;
+    e.mode = 0x2000e;
+    m.applyEvent(e, kFakeRes);
+    m.applyEvent(e, kFakeRes);           // same owner, second spawn
+    CHECK(m.activeCount() == 2);         // orphan still lives
+    drained(m);
+    // Release hits only the CURRENT binding — the orphan survives
+    // (the original loses the slot handle the same way).
+    TraversalAudioEvent rel = mkEv(TraversalAudioOp::kRelease, "");
+    rel.owner = TraversalAudioOwner::kObject;
+    rel.ownerKey = &obj;
+    m.applyEvent(rel, kFakeRes);
+    CHECK(m.activeCount() == 1);
+    // ...but a name-scoped stop still hits the orphan.
+    m.applyEvent(mkEv(TraversalAudioOp::kStop, "VOICE"), kFakeRes);
+    CHECK(m.activeCount() == 0);
+  }
+
+  // -- orphan's own death must not detach the NEW owner binding -----
+  // Regression: stopVoice used to erase ownerVoices_[key] even when
+  // the slot had been overwritten by a respawn — killing the orphan
+  // (by name or natural finish) then orphaned the LIVE binding.
+  {
+    TraversalAudioMixer m;
+    int obj = 0;
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kSpawnPositional,
+                                 "VOICE");
+    e.owner = TraversalAudioOwner::kObject;
+    e.ownerKey = &obj;
+    e.mode = 0x2000e;
+    m.applyEvent(e, kFakeRes);
+    // Second spawn under a DIFFERENT name — the orphan stays live
+    // and name-scoped stops can't reach it through "VOICE2".
+    TraversalAudioEvent e2 = mkEv(TraversalAudioOp::kSpawnPositional,
+                                  "VOICE2");
+    e2.owner = TraversalAudioOwner::kObject;
+    e2.ownerKey = &obj;
+    e2.mode = 0x2000e;
+    m.applyEvent(e2, kFakeRes);
+    drained(m);
+    CHECK(m.activeCount() == 2);
+    CHECK(m.ownerHasVoice(static_cast<int>(TraversalAudioOwner::kObject),
+                          &obj));
+    // Kill the orphan by ITS name — the VOICE2 binding must survive.
+    m.applyEvent(mkEv(TraversalAudioOp::kStop, "VOICE"), kFakeRes);
+    CHECK(m.activeCount() == 1);
+    CHECK(m.ownerHasVoice(static_cast<int>(TraversalAudioOwner::kObject),
+                          &obj));
+    // And the live binding still releases through the owner slot.
+    TraversalAudioEvent rel = mkEv(TraversalAudioOp::kRelease, "");
+    rel.owner = TraversalAudioOwner::kObject;
+    rel.ownerKey = &obj;
+    m.applyEvent(rel, kFakeRes);
+    CHECK(m.activeCount() == 0);
+  }
+
+  // -- kRestartPositional = stop-by-name + positional spawn ------------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kPlayOnce, "RICO1"), kFakeRes);
+    drained(m);
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kRestartPositional,
+                                 "RICO1");
+    e.owner = TraversalAudioOwner::kNone;
+    e.mode = 0x10106;
+    e.hasPos = true;
+    m.applyEvent(e, kFakeRes);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStop) == 1);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStart) == 1);
+    CHECK(m.activeCount() == 1);
+  }
+
+  // -- live-pos voices track the owner through tick --------------------
+  {
+    TraversalAudioMixer m;
+    int obj = 0;
+    float objPos[3] = {0.f, 0.f, -100.f};
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kSpawnPositional,
+                                 "VOICE");
+    e.owner = TraversalAudioOwner::kObject;
+    e.ownerKey = &obj;
+    e.mode = 0x2000e;
+    m.applyEvent(e, kFakeRes);
+    mdk::TraversalAudioListener L;
+    L.m[0][0] = L.m[1][1] = L.m[2][2] = 1.f;
+    L.zoom = L.frame = 1.0f;
+    m.setListener(L);
+    m.tick(0.001, [&](int, const void* key, float p[3]) {
+      if (key == &obj) {
+        p[0] = objPos[0]; p[1] = objPos[1]; p[2] = objPos[2];
+        return true;
+      }
+      return false;
+    });
+    drained(m);
+    // Move the owner closer — the baked-pos read must follow it.
+    objPos[2] = -50.f;
+    m.tick(0.001, [&](int, const void* key, float p[3]) {
+      p[0] = objPos[0]; p[1] = objPos[1]; p[2] = objPos[2];
+      return key == &obj;
+    });
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kParams) == 1);
+    // 50 < 20? no: vol = 32767*(250-50)/230 = 28493; pushed via params.
+    CHECK(c.back().vol == 28493);
+  }
+
+  // -- 63-cap: first-free, no stealing, exhaustion counted -------------
+  {
+    TraversalAudioMixer m;
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kPlayOnce, "BUSY");
+    for (int i = 0; i < TraversalAudioMixer::kMaxVoices; ++i)
+      m.applyEvent(e, kFakeRes);
+    CHECK(m.activeCount() == 63);
+    m.applyEvent(e, kFakeRes);           // 64th — pool exhausted
+    CHECK(m.activeCount() == 63);
+    CHECK(m.poolExhaustedCount() == 1);
+    // Resolve ran but no voice — and no steal happened.
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kStart) == 63);
+  }
+
+  // -- loop records never auto-finish; non-loop finishes ---------------
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "LOOPED"),
+                 kFakeRes);
+    drained(m);
+    m.tick(10.0, kNoOwner);              // way past 0.1s of audio
+    CHECK(m.activeCount() == 1);         // loop keeps playing
+    CHECK(drained(m).empty());
+  }
+
+  // -- reset: clears voices, owners, counters ---------------------------
+  {
+    TraversalAudioMixer m;
+    int obj = 0;
+    TraversalAudioEvent e = mkEv(TraversalAudioOp::kSpawnPositional,
+                                 "VOICE");
+    e.owner = TraversalAudioOwner::kObject;
+    e.ownerKey = &obj;
+    e.mode = 0x2000e;
+    m.applyEvent(e, kFakeRes);
+    m.reset();
+    CHECK(m.activeCount() == 0);
+    CHECK(!m.ownerHasVoice(static_cast<int>(TraversalAudioOwner::kObject),
+                           &obj));
+    CHECK(drained(m).empty());           // pending cmds cleared too
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -22784,6 +23502,9 @@ int main() {
   test_save_full_write();
   test_traversal_hud();
   test_traversal_audio();
+  test_sni_wave();
+  test_traversal_audio_dsp();
+  test_traversal_audio_mixer();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

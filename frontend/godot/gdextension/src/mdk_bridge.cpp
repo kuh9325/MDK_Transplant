@@ -142,6 +142,11 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::get_active_palette);
   ClassDB::bind_method(D_METHOD("fx_stab", "from", "to", "arena_index"),
                        &MdkBridge::fx_stab);
+  // Phase 17C.2 — traversal audio.
+  ClassDB::bind_method(D_METHOD("drain_audio_fx"),
+                       &MdkBridge::drain_audio_fx);
+  ClassDB::bind_method(D_METHOD("get_audio_stats"),
+                       &MdkBridge::get_audio_stats);
   // Phase 17B.2 — traversal HUD / view presentation.
   ClassDB::bind_method(D_METHOD("get_hud_snapshot"),
                        &MdkBridge::get_hud_snapshot);
@@ -301,7 +306,232 @@ bool MdkBridge::presentTraversalLevel_(const std::string& stem,
   kurtPalKey_ = 0;
   kurtTex_.clear();
   decodeKurtTables_();
+  // Phase 17C.2 — the SNI sound bank set for this level (level bank
+  // first — the observed record-list order; global banks after).
+  loadSoundBanks_();
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17C.2 — traversal audio: SNI banks, WAVE cache, voice pool
+// ---------------------------------------------------------------------------
+
+// The sound-bank set is rebuilt on every level presentation (load,
+// restore, freefall->traversal handoff): voices die with the session,
+// stream/lookup caches are level-scoped, and the byte buffers the SNI
+// directories index stay alive until the next boundary.
+void MdkBridge::loadSoundBanks_() {
+  audioBanks_.clear();
+  audioBankStore_.clear();
+  audioEntries_.clear();
+  audioMixer_.reset();
+  if (!rt_) return;
+  // OBSERVED record-list order: the level bank, then the traversal
+  // bank (FUN_0041b7b4's load pair), then the global MDKSOUND bank
+  // (FUN_0042322c). FUN_00402fe8's first-match walk makes list order
+  // the shadow order — the corpus carries zero cross-bank name
+  // collisions, so the order is belt-and-suspenders either way.
+  if (!rt_->level.sniBytes.empty()) {
+    AudioBank_ b;
+    b.bytes = std::span<const std::byte>(rt_->level.sniBytes);
+    b.dir = mdk::inspectSniDirectory(b.bytes);
+    audioBanks_.push_back(b);
+  }
+  for (const char* rel : {"TRAVERSE/TRAVERSE.SNI",
+                         "MISC/MDKSOUND.SNI"}) {
+    std::string err;
+    auto bytes = root_->readFile(rel, 1 << 28, &err);
+    if (!bytes) continue;   // absent bank -> resolves report missing
+    audioBankStore_.push_back(std::move(*bytes));
+    AudioBank_ b;
+    b.bytes = std::span<const std::byte>(audioBankStore_.back());
+    b.dir = mdk::inspectSniDirectory(b.bytes);
+    audioBanks_.push_back(b);
+  }
+}
+
+// Resolve + decode a record (memoized). Sentinel records and the
+// flags-bit1 music class never enter the SFX pool (OBSERVED: those
+// records drive the FUN_0041d774 song path). Returns the stable map
+// entry — nullptr only for a truly absent name.
+const MdkBridge::AudioEntry_* MdkBridge::audioEntry_(
+    const std::string& name) {
+  if (const auto it = audioEntries_.find(name);
+      it != audioEntries_.end()) {
+    return &it->second;
+  }
+  AudioEntry_ e;
+  for (const AudioBank_& b : audioBanks_) {
+    if (b.dir.status != mdk::SniDirectoryStatus::kOk) continue;
+    const mdk::SniEntry* rec = nullptr;
+    for (const mdk::SniEntry& en : b.dir.entries) {
+      if (!en.isSentinel() && en.name() == name) {
+        rec = &en;
+        break;
+      }
+    }
+    if (!rec) continue;
+    const std::uint32_t fld = rec->fieldAt0x0C;
+    const int flags = static_cast<int>(fld & 0xffffu);
+    if (flags & 0x2) break;    // music-class — out of SFX scope
+    const std::uint64_t off = rec->payloadFileOffset();
+    const std::uint64_t end = rec->payloadFileEnd();
+    if (off >= end || end > b.bytes.size()) break;
+    mdk::SniWave wv;
+    std::string derr;
+    const mdk::SniWaveStatus st = mdk::decodeSniWave(
+        b.bytes.subspan(static_cast<std::size_t>(off),
+                        static_cast<std::size_t>(end - off)),
+        &wv, &derr);
+    if (st != mdk::SniWaveStatus::kOk) {
+      UtilityFunctions::printerr(
+          "MdkBridge: SNI wave '", String(name.c_str()),
+          "' decode failed: ", mdk::sniWaveStatusName(st).data(),
+          " — ", derr.c_str());
+      break;
+    }
+    e.def.volume = static_cast<int>((fld >> 16) & 0xffffu);
+    e.def.rateHz = wv.rateHz;
+    e.def.frames = static_cast<std::uint32_t>(wv.frames);
+    e.def.loop = (flags & 0x1) != 0;
+    Ref<AudioStreamWAV> wav;
+    wav.instantiate();
+    wav->set_format(wv.bitsPerSample == 8
+                        ? AudioStreamWAV::FORMAT_8_BITS
+                        : AudioStreamWAV::FORMAT_16_BITS);
+    wav->set_stereo(false);
+    wav->set_mix_rate(wv.rateHz);   // verbatim — no resampling
+    PackedByteArray data;
+    data.resize(static_cast<int64_t>(wv.pcm.size()));
+    std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+    wav->set_data(data);
+    if (e.def.loop) {
+      wav->set_loop_mode(AudioStreamWAV::LOOP_FORWARD);
+      wav->set_loop_begin(0);
+      wav->set_loop_end(static_cast<int64_t>(wv.frames));
+    }
+    e.stream = wav;
+    e.resolved = true;
+    break;
+  }
+  const auto [it, inserted] =
+      audioEntries_.emplace(name, std::move(e));
+  return &it->second;
+}
+
+bool MdkBridge::audioResolve_(const std::string& name,
+                              mdk::TraversalAudioSoundDef& def) {
+  const AudioEntry_* e = audioEntry_(name);
+  if (!e || !e->resolved) return false;
+  def = e->def;
+  return true;
+}
+
+// 0x20000 live-pos refresh — the original dereferences inst+0x10 (the
+// owner position pointer). ownerKey IS that pointer in this process:
+// DynamicObject storage is stable (std::list + retained records), so
+// scanning finds it; a miss freezes the source at its last position.
+bool MdkBridge::audioOwnerPos_(int cat, const void* key,
+                               float pos[3]) {
+  if (!rt_ || !key) return false;
+  if (cat == static_cast<int>(mdk::TraversalAudioOwner::kPlayer)) {
+    pos[0] = rt_->cs.pos[0];
+    pos[1] = rt_->cs.pos[1];
+    pos[2] = rt_->cs.pos[2];
+    return true;
+  }
+  for (const auto& a : rt_->arenas) {
+    if (!a) continue;
+    for (const auto& up : a->dyn.storage) {
+      if (up.get() == key) {
+        pos[0] = up->pos[0];
+        pos[1] = up->pos[1];
+        pos[2] = up->pos[2];
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Drain rt_->audioFx once per presented frame: apply the batch, run
+// one mixer pass (FUN_004026f8 cadence) over the voice pool, then emit
+// the player commands. The conversions to Godot units happen here —
+// dB via the DS millibel table (FUN_0046c27c + the FUN_0040202c master
+// scale), pan to the +-1 panner domain, pitch as freqHz/recRate.
+Array MdkBridge::drain_audio_fx() {
+  Array out;
+  if (!rt_ || mode_ != 3) return out;
+  // Listener — the mixer copies the 0x540bb0 view snapshot
+  // (rt.camera.pose.basis), reads 0x540b58 (zoom), 0x49b6f0
+  // (smoothed frame scalar), and the global mode select (byte1 of
+  // 0x49ff58 — the scope paths write 2; 0x540ca0's nonzero phases
+  // are exactly those paths' mirror).
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c)
+      audioListener_.m[r][c] = rt_->camera.pose.basis[r][c];
+  audioListener_.zoom = rt_->camera.zoom;
+  audioListener_.frame = timing_.smoothed;
+  audioListener_.mode3d = (rt_->transitionPhase != 0);
+  audioMixer_.setListener(audioListener_);
+
+  const auto res = [this](const std::string& n,
+                          mdk::TraversalAudioSoundDef& d) {
+    return audioResolve_(n, d);
+  };
+  const auto posFn = [this](int cat, const void* key, float p[3]) {
+    return audioOwnerPos_(cat, key, p);
+  };
+  for (const auto& ev : rt_->audioFx) audioMixer_.applyEvent(ev, res);
+  rt_->audioFx.clear();
+  audioMixer_.tick(lastDtSec_, posFn);
+
+  std::vector<mdk::TraversalAudioCmd> cmds;
+  audioMixer_.drain(cmds);
+  for (const mdk::TraversalAudioCmd& c : cmds) {
+    Dictionary d;
+    d["id"] = int64_t(c.handle);
+    d["name"] = String(c.name.c_str());
+    switch (c.op) {
+      case mdk::TraversalAudioCmdOp::kStart: {
+        d["op"] = "start";
+        const AudioEntry_* e = audioEntry_(c.name);
+        if (e && e->stream.is_valid()) {
+          d["stream"] = e->stream;
+        }
+        d["loop"] = c.loop;
+        break;
+      }
+      case mdk::TraversalAudioCmdOp::kParams:
+        d["op"] = "params";
+        break;
+      case mdk::TraversalAudioCmdOp::kStop:
+        d["op"] = "stop";
+        break;
+    }
+    if (c.op != mdk::TraversalAudioCmdOp::kStop) {
+      // vol domain -> FUN_0040202c master scale -> mB -> dB.
+      d["db"] = double(mdk::traversalAudioVolDb(
+          mdk::traversalAudioScaledVol(c.vol, audioSfxPct_)));
+      d["pan"] = double(mdk::traversalAudioPanUnit(c.pan));
+      d["pitch"] = c.rateHz > 0
+                       ? double(c.freqHz) / double(c.rateHz)
+                       : 1.0;
+    }
+    out.push_back(d);
+  }
+  return out;
+}
+
+Dictionary MdkBridge::get_audio_stats() const {
+  Dictionary d;
+  d["active"] = int64_t(audioMixer_.activeCount());
+  d["resolved"] = int64_t(audioMixer_.resolvedCount());
+  d["missing"] = int64_t(audioMixer_.missingCount());
+  d["pool_exhausted"] = int64_t(audioMixer_.poolExhaustedCount());
+  d["cache"] = int64_t(audioEntries_.size());
+  d["banks"] = int64_t(audioBanks_.size());
+  return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +1101,7 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
     return out;
   }
   mdk::frontendTimingUpdate(timing_, dt_ms);
+  lastDtSec_ = dt_ms / 1000.0;   // mixer playhead cadence
   const mdk::RawGameplayInput raw =
       buildRawInput_(action_mask, input);
 
@@ -2421,6 +2652,13 @@ void MdkBridge::shutdown() {
   ftiBytes_.clear();
   sysPalHead_ = {};
   prevKeyLevel_ = {};
+  // Phase 17C.2 — the voice pool, banks, and stream cache all die
+  // with the session (same boundary as the Kurt/HUD caches).
+  audioBanks_.clear();
+  audioBankStore_.clear();
+  audioEntries_.clear();
+  audioMixer_.reset();
+  lastDtSec_ = 0.0;
   rt_.reset();
   ff_.reset();
   ffScene_.reset();

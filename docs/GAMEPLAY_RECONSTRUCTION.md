@@ -6930,3 +6930,107 @@ pointer, so `owner` stays `kNone` there. Owner identity only exists
 where the original binds an instance through an owner slot —
 positional spawns (`FUN_00402160`) and releases (`FUN_004020b4`) —
 expressed as the bound `DynamicObject*` identity token.
+
+## 232. Phase 17C.2 — playback: decoder + updater + voice pool (IMPLEMENTED)
+
+`core/sni_wave.cpp` — the SNI record payload IS a RIFF/WAVE stream at
+`payloadFileOffset` (no extra prefix — OBSERVED on the full reachable
+corpus). The decoder walks bounded chunks (RIFF word alignment,
+`fmt ` 18-byte PCM tag 1 only, mono only, 8/16-bit only), preserves
+the authored rate + PCM bytes verbatim (no resample/normalize), and
+reports structured statuses (`kNotWave`, `kTruncated`, `kBadFormat`,
+`kUnsupportedChannels`, `kUnsupportedBits`, `kBadData`) — synthetic
+fixtures only, no proprietary waveform data anywhere.
+
+`core/traversal_audio_dsp.cpp` — the per-instance updater port. The
+mixer tick `FUN_004026f8` copies the 0x540bb0 listener matrix to
+`0x49ff5c` once per frame, then dispatches per-instance on the GLOBAL
+mode `0x49ff58 & 0x300` (0x100 = 2D `FUN_0040282c`, 0x200 = 3D
+`FUN_00402b00`; the sniper-enter seam `FUN_00401ffc` writes byte1=2,
+scope teardown `FUN_00402014` writes byte1=1 — `rt.transitionPhase`'s
+nonzero writes are exactly the scope-enter edge). Per-instance mode
+bits select the position source (`inst+0xa`: 0x10000 baked, 0x20000
+live owner ptr, 0x40000 matrix path — unemitted seam) and the +0x9
+latch (`0x10106`/`0x10006` — the latch runs exactly one pushed update
+then strips the updater bits). `inst+0x24 = -1.0f` is the first-tick
+sentinel: fields compute, no DS push, doppler skipped.
+
+2D updater (`FUN_0040282c`, OBSERVED instruction-exact): `rel =
+listenerM * pos`, `dist = |rel|` (1.0 at zero), volume
+`dist<20 -> base`, `dist>250 -> 0`, else `trunc(base*(250-dist)/230)`
+in doubles; pan `trunc((nz*m20 - nx*m21) * 32767)`; doppler
+`shift = 1 + (prevDist-dist)*30/(frame*1100)` clamped [0.25, 3.0],
+`freq = trunc(recRate*shift*rate)`; pushes gated on pre-tick
+`prevDist >= 0`.
+
+3D updater (`FUN_00402b00`, OBSERVED instruction-exact): the sniper
+scope's cone model — `relz > 0` (behind listener plane) silences;
+axial `min(1, (400/zoom*0.75)/|relz|)`; lateral core radius 2 in
+screen units scaled by zoom/aperture (`latx' = relx*(1-2/lat)*(2/zoom)`,
+`laty' = rely*(1-2/lat)*(768/(280*zoom))` — the 384x280 aperture);
+cone `1.3 - |lat'|/|relz|`; `vol = clamp(base*cone*axial, 0, 32767)`
+(the 1.3 center boost CAN exceed baseVol — OBSERVED quirk kept). No
+pan path exists in this updater.
+
+Conversions (OBSERVED): `FUN_0040202c` master scale `vol*pct/100`
+(SFX channel 0x541308, factory 70 per MDK.CFG "SoundFX");
+`FUN_0046c27c` millibels `trunc(vol*2500/32767) - 2500` → Godot
+dB = mB/100; `FUN_0046c2ec` pan `(p*10000)>>15` → panner -1..1 by
+/32767; `FUN_0046c2c4` frequency verbatim → pitch = freqHz/rateHz.
+
+`core/traversal_audio_mixer.cpp` — the 63-slot voice pool.
+FUN_00402604's free-list pop is `first-free`, hard cap, no stealing
+(exhaustion → silent no-spawn, counted). FUN_0040210c/0x402658's
+record-name scoping: stop/ensure/restart match EVERY instance of the
+record regardless of owner. Owner slots (`FUN_00402160`'s
+`*ownerSlot = inst`) model replacement/orphan semantics: respawn
+overwrites the binding, the old voice survives as an orphan until a
+name-scoped stop or natural finish; release kills only the bound
+voice. Natural finish models the DS non-loop playhead
+(`playhead += freqHz*dt` vs PCM frames); loop-flagged records never
+finish. Commands (kStart/kParams/kStop) drain once per frame.
+
+## 233. Bridge + presenter (IMPLEMENTED)
+
+`mdk_bridge` loads three banks per level presentation — level
+`LEVELnS.SNI`, `TRAVERSE/TRAVERSE.SNI`, `MISC/MDKSOUND.SNI` — matching
+FUN_0041b7b4's traversal pair + FUN_0042322c's global bank; name
+lookup is level → traverse → global (the corpus has zero cross-bank
+collisions, so shadowing order is immaterial on real data).
+Music-class records (flags bit1) are excluded from the SFX pool.
+`drain_audio_fx()` — per presented frame: installs the listener from
+`rt.camera.pose.basis`/`camera.zoom`/`timing.smoothed`/
+`transitionPhase`, applies `rt.audioFx` in emission order, ticks once
+(FUN_004026f8 cadence), and returns command dicts
+{id, name, op, stream, loop, db, pan, pitch}. `get_audio_stats()`
+exposes {banks, resolved, missing, cache, active, pool_exhausted}.
+Owner positions resolve through the live `DynamicObject` storage
+(`ownerKey` IS the object pointer — `objIds_`-verified), player-owned
+events read `rt.cs.pos`.
+
+`main.gd` — 63 `AudioStreamPlayer` slots under `AudioRoot`, each on
+its own `mdkfx<i>` bus carrying one `AudioEffectPanner` (Godot 4 has
+no flat-player pan). `db`/`pitch`/`pan` apply verbatim — the core
+already computed the DirectSound-domain math, so no Godot distance
+model is used. `_step_n` and `_process` both drain (smoke paths never
+run `_process`); `_reset_audio` clears players on save-restore,
+level reload, mode flips and `_exit_tree`. No player state is
+serialized.
+
+Validation (headless `--smoke`, Dummy audio driver): LEVEL3 canonical
+smoke — `banks=3 resolved=27 missing=0 cache=8 active=12
+exhausted=0`, names `{FOOT3,FOOT4,LAND,SNIPERON,SNIPEROFF,GRUNTFIRE,
+SNIPERSHOT,RICO2}` all became playback; L6/L8 combat exercises decode
++ play (SNIPERON/SNIPERSHOT/SNIPEROFF/RICO2); the save->restore
+golden clears the pool across the boundary; freefall c0's mode-3
+handoff carries no traversal voices. `mdk_tests` 5962/0 (decoder +
+updater + pool semantics); CTest 1/1; pytest 25/25; all six 60f
+traversal digests + five freefall digests EXACT. Deferred: the
+Dummy-driver exit teardown leaves ~20 finished-playback objects in
+AudioServer's list (engine artifact — the real CoreAudio driver reaps
+them; verified clean on `--frames`); zone-ambient crossfade
+(`FUN_00431cf4`), `ambientFades`/`ambientChan` behavior, and all
+music-class/frontend audio remain for a later ambience/music phase —
+never reachable from traversal SFX playback.
+
+**TRAVERSAL SFX PLAYBACK: CLOSED FOR BUILD_A**
