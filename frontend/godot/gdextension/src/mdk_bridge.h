@@ -54,6 +54,7 @@
 #include "core/freefall_scene.h"
 #include "core/frontend_host.h"
 #include "core/frontend_machines.h"
+#include "core/frontend_resources.h"
 #include "core/frontend_shell.h"
 #include "core/fti_sprite.h"
 #include "core/gameplay_input.h"
@@ -64,6 +65,7 @@
 #include "core/traversal_runtime.h"
 #include "core/player_projectiles.h"
 
+#include "frontend_presenter.h"
 #include "mdk_objid.h"
 
 namespace godot {
@@ -259,6 +261,28 @@ class MdkBridge : public RefCounted {
   // requests (Quit, CycleBrightness, CaptureUtility,
   // OpenLegacyScreen) report handled=false with the owner tag.
   Array frontend_dispatch_requests();
+  // --- Phase 18B.2A — frontend presentation ----------------------
+  // Composes the authoritative shell state into the shared core
+  // renderers (mdkbridge::FrontendPresenter) and returns the frame:
+  //   "w"/"h"     — 600x360
+  //   "rgba"      — PackedByteArray RGBA8 (600*360*4)
+  //   "thmb"      — {"x","y","w","h","rgba"} existing-save THMB
+  //                 overlay, only when the selected slot carries the
+  //                 3648-byte record (decode-only; no new capture)
+  //   "screen"    — diagnostic tag for the composed surface
+  // Requires frontend_boot() (which loads FrontendResources).
+  Dictionary frontend_frame();
+  // Progression pump for the modes that have no runtime of their own
+  // (5 intermission / 6 loader / 7 traversal-only entry / 8
+  // cinematic). `input` carries the presentation seam:
+  //   "stage_done" / "confirm" — the tally/briefing/cinematic
+  //   finished this frame (the original's stage-complete input).
+  // Returns {"pumped","error","mode","sess_mode","level_id","ok"} —
+  // on a kOk transition the bridge installs the next runtime itself
+  // (freefall scene+init for mode 2, the traversal load for mode 3,
+  // frontend re-entry for mode 0) so the caller just keeps pumping
+  // until mode_ lands on a presented mode.
+  Dictionary frontend_progression_step(const Dictionary& input);
 
   // --- Phase 17A — traversal combat presentation ----------------
   // All of this is copy-out presentation state produced by the core
@@ -620,6 +644,11 @@ class MdkBridge : public RefCounted {
   // --- Phase 18B.1 — frontend host ----------------------------------
   std::unique_ptr<mdk::FrontendHostServices> feHost_;
   std::unique_ptr<mdk::FrontendShell> feShell_;
+  // Phase 18B.2A — the shared decoded frontend resources + the
+  // presentation composer (loaded inside frontend_boot).
+  mdk::FrontendResources feRes_;
+  bool feResLoaded_ = false;
+  mdkbridge::FrontendPresenter fePresenter_;
   // The write seam's content source — the original's writers read
   // live globals at commit time; this snapshots sess_/rt_.
   std::optional<mdk::FrontendSaveData> produceFrontendSave_();
@@ -636,6 +665,12 @@ class MdkBridge : public RefCounted {
   // structure survives into mode 0.
   void frontendTeardown_();
   Dictionary frontendSnapshot_() const;
+  // Campaign runtime installs for frontend_progression_step's
+  // kOk edges — mode 2 freefall entry (scene load + init carrying
+  // the session's rng/skill) and mode 3 traversal entry (the same
+  // load+present tail frontendLoadSaveFile_ runs).
+  bool campaignFreefallEnter_(std::string& detail);
+  bool campaignTraversalEnter_(std::string& detail);
   // FUN_0040202c's SFX master (0x541308) — the SoundFX menu scalar;
   // the frontend never parses the user's MDK.CFG, so the OBSERVED
   // factory default (70 — frontend_settings' @0x49b0fc table).

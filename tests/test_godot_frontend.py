@@ -100,6 +100,61 @@ class GodotFrontendSmoke(unittest.TestCase):
         self.assertIn(GOLDEN_ORDER, proc.stdout)
 
 
+@unittest.skipUnless(*have_prereqs())
+class GodotFrontendMenu(unittest.TestCase):
+    """Phase 18B.2A — Godot frontend menu presentation smoke.
+
+    Drives the canonical launcher with --frontend: the authoritative
+    FrontendShell runs under the bridge while GDScript only presents
+    and routes. The A-O scenario set covers root nav, save list,
+    options/skill, help/abort (incl. the OBSERVED same-frame Esc
+    self-cancel), transition ack, mode visibility, and the
+    LASTGAME/Continue route — all under a dedicated user:// save
+    root, never the original tree.
+
+    --smoke-real-saves additionally points the store at the
+    installed SAVES dir for the §24 read-only corpus check
+    (full 1.SAV + header-only 2.SAV, fingerprint-verified).
+    """
+
+    def run_smoke(self, *extra):
+        return subprocess.run(
+            [str(RUN_SH), "--smoke", "--frontend", *extra],
+            capture_output=True, text=True, timeout=300)
+
+    def check_smoke(self, verdict, pats, *extra):
+        proc = self.run_smoke(*extra)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("SCRIPT ERROR", out)
+        m = re.search(verdict + r": (\d+) failure", out)
+        self.assertIsNotNone(m, f"no verdict in output:\n{out}")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"godot exited {proc.returncode}:\n{out}")
+        self.assertEqual(m.group(1), "0", f"failures:\n{out}")
+        for pat in pats:
+            self.assertIn(pat, out)
+
+    def test_frontend_smoke(self):
+        self.check_smoke(
+            r"smoke\(frontend\)",
+            ("smoke: frontend",
+             "O: F10 in gameplay arms abort",
+             "D: progression reached freefall (mode 2)",
+             "temp: no writes into the data root"))
+
+    def test_real_saves_readonly(self):
+        data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
+        if not (Path(data) / "SAVES" / "1.SAV").exists():
+            self.skipTest("no installed SAVES corpus")
+        self.check_smoke(
+            r"smoke\(real-saves\)",
+            ("R: full-save classification",
+             "R: header-only classification",
+             "R: SAVES dir untouched"),
+            "--smoke-real-saves")
+
+
 def have_freefall_data():
     data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
     return (Path(data) / "FALL3D" / "FALL3D.BNI").exists()

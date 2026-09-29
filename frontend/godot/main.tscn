@@ -113,3 +113,23 @@ grow_horizontal = 2
 grow_vertical = 2
 mouse_filter = 2
 color = Color(0, 0, 0, 0)
+
+[node name="FrontendLayer" type="CanvasLayer" parent="."]
+layer = 7
+
+[node name="FrontendRect" type="TextureRect" parent="FrontendLayer"]
+visible = false
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 0
+
+[node name="FrontendThmb" type="TextureRect" parent="FrontendLayer"]
+visible = false
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 0

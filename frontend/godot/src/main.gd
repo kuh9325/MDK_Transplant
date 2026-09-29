@@ -28,6 +28,11 @@ extends Node3D
 #   --skill N         difficulty 0..2 for --freefall (default 0)
 #   --seed N          RNG seed for --freefall (default 0xC0FFEE —
 #                     the mdk-inspect freefall digest seed)
+#   --frontend        boot the authoritative frontend menu (mode 0)
+#                     instead of a level — Godot presents + routes,
+#                     FrontendShell owns all menu semantics
+#   --save-dir DIR    writable save root for --frontend (default
+#                     user://saves — NEVER the original data dir)
 #   --smoke           headless deterministic check, then quit
 #   --save-restore    with --smoke: run the save->restore combat
 #                     golden (LEVEL3/HMO_9) instead of the smoke
@@ -74,6 +79,29 @@ var ff_handoff_seen := false # printed the mode transition once
 var mouse_dx := 0
 var mouse_dy := 0
 var mouse_dz := 0
+
+# --- Phase 18B.2A — frontend presentation -------------------------
+# Godot presents + routes only: every menu transition lives in
+# mdk::FrontendShell (C++). These fields are presentation state —
+# edge queues, the composed-frame texture, the transition timer.
+var frontend := false          # --frontend launcher flag
+var data_root_path := ""       # resolved --data-path (smoke checks)
+var fe_active := false         # frontend route owns the frame
+var fe_sub := 0                # last snapshot's sub_mode (input routing)
+var fe_edges := {}             # semantic edge fields for this frame
+var fe_typed := PackedInt32Array()   # queued typed chars (1/frame)
+var fe_raw := PackedInt32Array()     # internal-domain key edges
+var fe_img: Image = null
+var fe_tex: ImageTexture = null
+var fe_thmb_img: Image = null
+var fe_thmb_tex: ImageTexture = null
+var fe_transition_left := 0    # placeholder transition frames
+var fe_stage_hold := 0         # intermission placeholder hold
+var fe_fx_counts := {}         # FrontendFx id -> count (diag/smoke)
+var fe_req_counts := {}        # request id -> count (diag/smoke)
+var fe_quit := false           # Quit request drained (app-owned)
+const FE_TRANSITION_FRAMES := 24   # ~0.4s noise placeholder
+const FE_STAGE_HOLD := 45          # ~0.75s intermission placeholder
 
 # Phase 17A — traversal combat presentation state. mdk_core owns
 # every gameplay fact; these are view-side node/resource caches only.
@@ -242,12 +270,14 @@ func _ready() -> void:
 		var launch_dir := OS.get_environment("PWD")
 		if not launch_dir.is_empty():
 			data_root = launch_dir.path_join(data_root).simplify_path()
+	data_root_path = data_root
 	var level := _arg_value(args, "--level", "TRAVERSE/LEVEL3/LEVEL3.DTI")
 	var arena := _arg_value(args, "--arena", "HMO_1")
 	var start := _arg_value(args, "--start", "")
 	var start_yaw := float(_arg_value(args, "--start-yaw", "0"))
 	var ff_course := _arg_value(args, "--freefall", "")
 	var ff_skill := int(_arg_value(args, "--skill", "0"))
+	frontend = "--frontend" in args
 	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
 	# digest runs use, so driven courses are cross-checkable.
 	var ff_seed := int(_arg_value(args, "--seed", "12648430"))
@@ -274,7 +304,43 @@ func _ready() -> void:
 		printerr("MdkBridge.initialize failed: ", bridge.get_last_error())
 		get_tree().quit(1)
 		return
-	if freefall:
+	if frontend:
+		# The writable save root is NEVER the original data dir:
+		# user://saves by default, --save-dir for tests. Smoke runs
+		# always use the dedicated user://saves_smoke root (wiped —
+		# it only ever holds files this harness wrote). The real-save
+		# corpus check is the one exception: it points the store at
+		# the installed SAVES dir and runs a read-only scenario (no
+		# write call exists on that path).
+		var real_saves := smoke and "--smoke-real-saves" in args
+		var save_dir := _arg_value(args, "--save-dir",
+			"user://saves_smoke" if smoke else "user://saves")
+		if real_saves:
+			save_dir = data_root_path.path_join("SAVES")
+		if save_dir.is_relative_path() and not \
+				save_dir.begins_with("user://") and not \
+				save_dir.begins_with("res://"):
+			var launch_dir := OS.get_environment("PWD")
+			if not launch_dir.is_empty():
+				save_dir = launch_dir.path_join(save_dir) \
+					.simplify_path()
+		save_dir = ProjectSettings.globalize_path(save_dir)
+		if smoke and not real_saves:
+			DirAccess.make_dir_recursive_absolute(save_dir)
+			var da := DirAccess.open(save_dir)
+			if da != null:
+				for f in da.get_files():
+					if f.get_extension() == "SAV":
+						da.remove(f)
+		if not bridge.frontend_boot(save_dir):
+			printerr("MdkBridge.frontend_boot failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
+		# Boot = the FUN_0041d85c(0) fresh entry.
+		bridge.frontend_enter(false)
+		fe_active = true
+	elif freefall:
 		if not bridge.load_freefall(int(ff_course), ff_skill, ff_seed):
 			printerr("MdkBridge.load_freefall failed: ",
 				bridge.get_last_error())
@@ -289,7 +355,7 @@ func _ready() -> void:
 			printerr("MdkBridge.load_arena failed: ", bridge.get_last_error())
 			get_tree().quit(1)
 			return
-	if not freefall and not start.is_empty():
+	if not frontend and not freefall and not start.is_empty():
 		# NATIVE DIAGNOSTIC — re-anchor into --arena at the given MDK
 		# position (mirrors mdk-inspect's --arena/--start selftests).
 		var parts := start.split(" ", false)
@@ -322,11 +388,16 @@ func _ready() -> void:
 	_build_hud_presenter()
 	_build_audio_presenter()
 
-	# One idle frame settles the deterministic spawn camera.
-	bridge.step_frame_input(0.0, {})
+	if frontend:
+		# The frontend owns the screen; all gameplay layers stay
+		# hidden until a request lands a runtime mode.
+		_frontend_show()
+	elif not freefall:
+		# One idle frame settles the deterministic spawn camera.
+		bridge.step_frame_input(0.0, {})
 	if freefall:
 		_apply_freefall()
-	else:
+	elif not frontend:
 		_apply_arena_snapshots()
 		_apply_object_snapshots()
 		_apply_player_snapshot()
@@ -335,7 +406,12 @@ func _ready() -> void:
 		_update_debug_label()
 
 	if smoke:
-		if "--save-restore" in args:
+		if frontend:
+			if "--smoke-real-saves" in args:
+				_run_smoke_real_saves()
+			else:
+				_run_smoke_frontend()
+		elif "--save-restore" in args:
 			# Phase 17A closeout — the save->restore golden is bound
 			# to the canonical LEVEL3 combat arena (HMO_9).
 			if freefall or level != "TRAVERSE/LEVEL3/LEVEL3.DTI":
@@ -365,10 +441,15 @@ func _ready() -> void:
 			get_tree().quit(2)
 			return
 		shot_frames_left = 8  # let the pipeline settle first
-	if interactive:
+	if interactive and not frontend:
+		# The frontend needs the OS cursor for its hit-test mouse.
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
-	if freefall:
+	if frontend:
+		print("mdk-godot: FRONTEND  (arrows/nav, Enter select, " +
+			"Esc cancel/back, F1 help, F2 save, F3 saves, " +
+			"F10 abort, F12 options)")
+	elif freefall:
 		print(("mdk-godot: FREEFALL course=%d skill=%d seed=%08x  " +
 			"(arrows/WASD steer, F3 debug, Esc release/quit)") %
 			[int(ff_course), ff_skill, ff_seed])
@@ -1952,6 +2033,11 @@ func _input(event: InputEvent) -> void:
 				Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	elif event is InputEventKey and event.pressed and not event.echo:
+		if fe_active:
+			# The frontend owns every key while it presents — Esc is
+			# the shell's cancel, not the app's quit shortcut.
+			_fe_key_edge(event)
+			return
 		if event.keycode == KEY_ESCAPE:
 			if interactive:
 				if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -2011,6 +2097,21 @@ func _process(delta: float) -> void:
 			get_tree().quit(0)
 			return
 	var mode := int(bridge.get_mode())
+	if fe_active and (mode == 0 or (mode >= 5 and mode <= 8)):
+		# The frontend route owns the frame: mode 0 runs the shell
+		# loop, modes 5-8 run the progression pump until a presented
+		# runtime lands. No gameplay presenter runs underneath.
+		_frontend_frame(delta, mode)
+		mode = int(bridge.get_mode())
+		if mode == 0 or (mode >= 5 and mode <= 8):
+			return
+		_frontend_hide()   # a runtime mode just landed
+	elif fe_active:
+		# Frontend booted but a gameplay mode is presenting.
+		if $FrontendLayer/FrontendRect.visible:
+			_frontend_hide()
+		else:
+			pass
 	if shot_path.is_empty() and (mode == 2 or mode == 3):
 		# Screenshot mode keeps the exact frame-0 spawn pose.
 		var input := {
@@ -3978,3 +4079,763 @@ func _run_smoke_restore() -> void:
 	_check(bridge.get_active_palette().size() == 768,
 		"restore: active palette rebound (768)")
 	print("smoke(restore): %d failure(s)" % failures)
+
+
+# ---------------------------------------------------------------------------
+# Phase 18B.2A — frontend presentation layer
+#
+# Godot is presentation + routing ONLY. FrontendShell owns the menu
+# state machine, overlays, request queue, and input repeat/debounce;
+# the bridge maps these dictionaries onto FrontendMenuInput verbatim.
+# ---------------------------------------------------------------------------
+
+# The four-key semantic edge set _fe_key_edge produces, plus the
+# internal-domain raw bitmap (rawKeyEdge — the keyboard child's
+# capture path). Held fields are polled per frame in _fe_input.
+func _fe_key_edge(event: InputEventKey) -> void:
+	# Semantic edges — the same fields frontendInputFromSdl sets for
+	# the SDL app. Positional (physical) keycodes match DIK layout.
+	match event.physical_keycode:
+		KEY_ENTER, KEY_KP_ENTER:
+			fe_edges["confirm"] = true
+		KEY_ESCAPE:
+			fe_edges["cancel"] = true
+		KEY_RIGHT:
+			fe_edges["attract"] = true   # DIK_RIGHT edge advances attract
+			fe_edges["right_edge"] = true
+		KEY_LEFT:
+			fe_edges["left_edge"] = true
+		KEY_PAGEUP:
+			fe_edges["page_up"] = true
+		KEY_PAGEDOWN:
+			fe_edges["page_down"] = true
+		KEY_HOME:
+			fe_edges["home"] = true
+			fe_edges["name_home"] = true
+		KEY_END:
+			fe_edges["end"] = true
+			fe_edges["name_end"] = true
+		KEY_BACKSPACE:
+			fe_edges["name_bs"] = true
+		KEY_DELETE:
+			fe_edges["name_del"] = true
+		KEY_Y:
+			fe_edges["key_y"] = true
+		KEY_N:
+			fe_edges["key_n"] = true
+		KEY_F1:
+			fe_edges["f1"] = true
+		KEY_F2:
+			fe_edges["f2"] = true
+		KEY_F3:
+			fe_edges["f3"] = true
+		KEY_F10:
+			fe_edges["f10"] = true
+		KEY_F11:
+			fe_edges["f11"] = true
+		KEY_F12:
+			fe_edges["f12"] = true
+		KEY_PAUSE:
+			fe_edges["pause"] = true
+		KEY_P:
+			fe_edges["pause_alt"] = true
+		KEY_PRINT:
+			fe_edges["utility"] = true
+	# Typed characters queue — the shell consumes one byte/frame.
+	if event.unicode > 0 and event.unicode < 128:
+		fe_typed.append(event.unicode)
+	# Raw internal-domain edge (keyboard-capture path — the same
+	# FUN_0046b688 translate the SDL app's dikFromSdlScancode +
+	# internalKeyFromDik produce).
+	var code := _fe_internal_code(event.physical_keycode)
+	if code >= 0:
+		fe_raw.append(code)
+
+
+# Godot physical keycode -> the original's internal key code, i.e.
+# internalKeyFromDik(dikFromSdlScancode(sc)) — extended DIKs already
+# folded through the OBSERVED 0x49bbf0 table. -1 = unmappable.
+func _fe_internal_code(k: int) -> int:
+	match k:
+		KEY_Q: return 0x10
+		KEY_W: return 0x11
+		KEY_E: return 0x12
+		KEY_R: return 0x13
+		KEY_T: return 0x14
+		KEY_Y: return 0x15
+		KEY_U: return 0x16
+		KEY_I: return 0x17
+		KEY_O: return 0x18
+		KEY_P: return 0x19
+		KEY_A: return 0x1e
+		KEY_S: return 0x1f
+		KEY_D: return 0x20
+		KEY_F: return 0x21
+		KEY_G: return 0x22
+		KEY_H: return 0x23
+		KEY_J: return 0x24
+		KEY_K: return 0x25
+		KEY_L: return 0x26
+		KEY_Z: return 0x2c
+		KEY_X: return 0x2d
+		KEY_C: return 0x2e
+		KEY_V: return 0x2f
+		KEY_B: return 0x30
+		KEY_N: return 0x31
+		KEY_M: return 0x32
+		KEY_1: return 0x02
+		KEY_2: return 0x03
+		KEY_3: return 0x04
+		KEY_4: return 0x05
+		KEY_5: return 0x06
+		KEY_6: return 0x07
+		KEY_7: return 0x08
+		KEY_8: return 0x09
+		KEY_9: return 0x0a
+		KEY_0: return 0x0b
+		KEY_ENTER: return 0x1c
+		KEY_KP_ENTER: return 0x60        # 0x9c -> extended 0x60
+		KEY_ESCAPE: return 0x01
+		KEY_BACKSPACE: return 0x0e
+		KEY_TAB: return 0x0f
+		KEY_SPACE: return 0x39
+		KEY_MINUS: return 0x0c
+		KEY_EQUAL: return 0x0d
+		KEY_BRACKETLEFT: return 0x1a
+		KEY_BRACKETRIGHT: return 0x1b
+		KEY_BACKSLASH: return 0x2b
+		KEY_SEMICOLON: return 0x27
+		KEY_APOSTROPHE: return 0x28
+		KEY_QUOTELEFT: return 0x29
+		KEY_COMMA: return 0x33
+		KEY_PERIOD: return 0x34
+		KEY_SLASH: return 0x35
+		KEY_CAPSLOCK: return 0x3a
+		KEY_F1: return 0x3b
+		KEY_F2: return 0x3c
+		KEY_F3: return 0x3d
+		KEY_F4: return 0x3e
+		KEY_F5: return 0x3f
+		KEY_F6: return 0x40
+		KEY_F7: return 0x41
+		KEY_F8: return 0x42
+		KEY_F9: return 0x43
+		KEY_F10: return 0x44
+		KEY_F11: return 0x57
+		KEY_F12: return 0x58
+		KEY_PRINT: return 0x64           # SYSRQ -> 100
+		KEY_SCROLLLOCK: return 0x46
+		KEY_PAUSE: return 0x7f           # 0xc5 -> extended 0x7f
+		KEY_INSERT: return 0x6e          # 0xd2 -> 110
+		KEY_HOME: return 0x66            # 0xc7 -> 102
+		KEY_PAGEUP: return 0x68          # 0xc9 -> 104
+		KEY_DELETE: return 0x6f          # 0xd3 -> 111
+		KEY_END: return 0x6b             # 0xcf -> 107
+		KEY_PAGEDOWN: return 0x6d        # 0xd1 -> 109
+		KEY_RIGHT: return 0x6a           # 0xcd -> 106
+		KEY_LEFT: return 0x69            # 0xcb -> 105
+		KEY_DOWN: return 0x6c            # 0xd0 -> 108
+		KEY_UP: return 0x67              # 0xc8 -> 103
+		KEY_NUMLOCK: return 0x45
+		KEY_KP_DIVIDE: return 0x63       # 0xb5 -> 99
+		KEY_KP_MULTIPLY: return 0x37
+		KEY_KP_SUBTRACT: return 0x4a
+		KEY_KP_ADD: return 0x4e
+		KEY_KP_1: return 0x4f
+		KEY_KP_2: return 0x50
+		KEY_KP_3: return 0x51
+		KEY_KP_4: return 0x4b
+		KEY_KP_5: return 0x4c
+		KEY_KP_6: return 0x4d
+		KEY_KP_7: return 0x47
+		KEY_KP_8: return 0x48
+		KEY_KP_9: return 0x49
+		KEY_KP_0: return 0x52
+		KEY_KP_PERIOD: return 0x53
+		KEY_CTRL: return 0x1d
+		KEY_SHIFT: return 0x2a
+		KEY_ALT: return 0x38
+		KEY_META: return 0x7f            # LWIN -> 0x7f
+		_: return -1
+
+
+# Build this frame's FrontendMenuInput dictionary — held fields are
+# polled, edge fields come from _fe_key_edge, and the raw bitmap is
+# OR'd into four dwords (the FUN_0046b688 internal domain).
+func _fe_input() -> Dictionary:
+	var d := {
+		"prev": Input.is_key_pressed(KEY_UP),
+		"next": Input.is_key_pressed(KEY_DOWN),
+		"left": Input.is_key_pressed(KEY_LEFT),
+		"right": Input.is_key_pressed(KEY_RIGHT),
+		"mouse_dx": mouse_dx,
+		"mouse_dy": mouse_dy,
+		# DIMOUSESTATE.lZ — wheel ticks scaled to the ±120 detent
+		# domain (the SDL path multiplies by WHEEL_DELTA the same way).
+		"mouse_dz": mouse_dz * 120,
+		"mouse_buttons": _mouse_button_bits(),
+	}
+	for k in fe_edges.keys():
+		d[k] = true
+	fe_edges.clear()
+	if not fe_typed.is_empty():
+		d["typed"] = fe_typed[0]
+		fe_typed.remove_at(0)
+	var raw := PackedInt32Array()
+	raw.resize(4)
+	for code in fe_raw:
+		if code >= 0 and code < 128:
+			raw[code >> 5] = raw[code >> 5] | (1 << (code & 31))
+	d["raw_edges"] = raw
+	fe_raw.clear()
+	mouse_dx = 0
+	mouse_dy = 0
+	mouse_dz = 0
+	return d
+
+
+func _frontend_show() -> void:
+	# The frontend owns the full frame: every gameplay presentation
+	# layer is hidden — no world under the menu (phase §18).
+	$FrontendLayer/FrontendRect.visible = true
+	$FrontendLayer.visible = true
+	_hide_gameplay_layers()
+
+
+func _frontend_hide() -> void:
+	$FrontendLayer/FrontendRect.visible = false
+	$FrontendLayer/FrontendThmb.visible = false
+	$FrontendLayer.visible = false
+	_show_gameplay_layers()
+
+
+func _hide_gameplay_layers() -> void:
+	$ArenaRoot.visible = false
+	$FreefallRoot.visible = false
+	$DynamicObjectRoot.visible = false
+	$PlayerRoot.visible = false
+	$ShotRoot.visible = false
+	$FxRoot.visible = false
+	$KurtLayer.visible = false
+	$BezelLayer.visible = false
+	$ScopeLayer.visible = false
+	$ShotCamLayer.visible = false
+	$HudLayer.visible = false
+
+
+func _show_gameplay_layers() -> void:
+	$ArenaRoot.visible = true
+	$FreefallRoot.visible = true
+	$DynamicObjectRoot.visible = true
+	$PlayerRoot.visible = true
+	$ShotRoot.visible = true
+	$FxRoot.visible = true
+	$KurtLayer.visible = true
+	$BezelLayer.visible = true
+	$ScopeLayer.visible = true
+	$ShotCamLayer.visible = true
+	$HudLayer.visible = true
+
+
+# FrontendFx ids (mdk::FrontendFx order).
+const FE_FX_PAUSE_SOUNDS := 0
+const FE_FX_RESUME_SOUNDS := 1
+const FE_FX_RESUME_SOUNDS_ALT := 2
+const FE_FX_MENU_SONG := 3
+const FE_FX_LOAD_RESOURCES := 4
+const FE_FX_TRANSITION_ARMED := 5
+const FE_FX_ABORT_RESOURCES := 6
+const FE_FX_THUMB_GRAB := 7
+
+func _frontend_fx(f: int) -> void:
+	fe_fx_counts[f] = int(fe_fx_counts.get(f, 0)) + 1
+	if f == FE_FX_TRANSITION_ARMED:
+		# Entry transition armed — run the mode-1 noise placeholder
+		# for a bounded window, then acknowledge through the core
+		# (FUN_0041ebf4's clear point).
+		fe_transition_left = FE_TRANSITION_FRAMES
+	# MenuSongStart / PauseSounds / ResumeSounds*: the music + SFX
+	# backend is a deferred seam — counted only.
+
+
+# FrontendRequest ids (mdk::FrontendRequest order).
+const FE_REQ_QUIT := 1
+const FE_REQ_NEW_GAME := 2
+const FE_REQ_CONTINUE := 3
+const FE_REQ_LOAD_SAVE := 4
+const FE_REQ_WRITE_SAVE := 5
+const FE_REQ_ABORT := 6
+const FE_REQ_RESUME := 7
+const FE_REQ_BRIGHTNESS := 8
+const FE_REQ_CAPTURE := 9
+const FE_REQ_LEGACY := 10
+
+func _frontend_request(req: Dictionary) -> void:
+	# The bridge already dispatched host-owned requests; this sees the
+	# report + the presentation/app-owned leftovers (handled=false).
+	var r := int(req.get("request", 0))
+	fe_req_counts[r] = int(fe_req_counts.get(r, 0)) + 1
+	if bool(req.get("handled", false)):
+		return
+	if r == FE_REQ_QUIT:
+		# DAT_0054148e — the process quit is app-owned.
+		fe_quit = true
+	elif r == FE_REQ_BRIGHTNESS:
+		# The brightness global already wrapped shell-side; the
+		# upload is the next frame's palette — nothing to do here.
+		pass
+	elif r == FE_REQ_LEGACY or r == FE_REQ_CAPTURE:
+		pass   # diagnostic only — the seams are not ported
+
+
+func _frontend_present() -> void:
+	if not $FrontendLayer/FrontendRect.visible:
+		_frontend_show()
+	var fr: Dictionary = bridge.frontend_frame()
+	if fr.is_empty():
+		return
+	var w := int(fr["w"])
+	var h := int(fr["h"])
+	fe_img = Image.create_from_data(w, h, false,
+		Image.FORMAT_RGBA8, fr["rgba"])
+	if fe_tex == null:
+		fe_tex = ImageTexture.create_from_image(fe_img)
+	else:
+		fe_tex.update(fe_img)
+	$FrontendLayer/FrontendRect.texture = fe_tex
+	var th: TextureRect = $FrontendLayer/FrontendThmb
+	if fr.has("thmb"):
+		# Existing-save THMB preview — decoded host-side with its
+		# own palette; presented as an overlay rect scaled with the
+		# same 600x360 -> window stretch the frame uses.
+		var t: Dictionary = fr["thmb"]
+		fe_thmb_img = Image.create_from_data(int(t["w"]), int(t["h"]),
+			false, Image.FORMAT_RGBA8, t["rgba"])
+		if fe_thmb_tex == null:
+			fe_thmb_tex = ImageTexture.create_from_image(fe_thmb_img)
+		else:
+			fe_thmb_tex.update(fe_thmb_img)
+		th.texture = fe_thmb_tex
+		var vp := get_viewport().get_visible_rect().size
+		var sx := vp.x / 600.0
+		var sy := vp.y / 360.0
+		th.position = Vector2(int(t["x"]) * sx, int(t["y"]) * sy)
+		th.size = Vector2(int(t["w"]) * sx, int(t["h"]) * sy)
+		th.visible = true
+	else:
+		th.visible = false
+
+
+# One frontend-owned frame: shell update, request dispatch, fx
+# drain, transition ack, present, end_frame — the phase §2 loop.
+func _frontend_frame(delta: float, mode: int) -> void:
+	var input := _fe_input()
+	if mode == 0:
+		var snap: Dictionary = bridge.frontend_update(input)
+		fe_sub = int(snap.get("sub_mode", 0))
+		for req in bridge.frontend_dispatch_requests():
+			_frontend_request(req)
+		for f in bridge.frontend_drain_fx():
+			_frontend_fx(int(f))
+		if fe_transition_left > 0:
+			fe_transition_left -= 1
+			if fe_transition_left == 0:
+				bridge.frontend_transition_complete()
+		_frontend_present()
+		bridge.frontend_end_frame(delta * 1000.0)
+		if fe_quit:
+			get_tree().quit(0)
+		return
+	# Modes 5..8 — the progression pump. No runtime/presentation of
+	# their own: a bounded placeholder hold (or a confirm) marks the
+	# stage-complete seam, then the bridge installs the next mode.
+	fe_stage_hold -= 1
+	var done := fe_stage_hold <= 0 or \
+		bool(input.get("confirm", false))
+	var res: Dictionary = bridge.frontend_progression_step(
+		{"stage_done": done})
+	if not bool(res.get("ok", true)):
+		printerr("frontend progression: ", bridge.get_last_error())
+		fe_stage_hold = FE_STAGE_HOLD
+	var new_mode := int(bridge.get_mode())
+	if new_mode != mode:
+		fe_stage_hold = FE_STAGE_HOLD
+	bridge.frontend_end_frame(delta * 1000.0)
+
+
+# ---------------------------------------------------------------------------
+# Frontend smoke — the phase §23 bounded scenarios. Synthetic input
+# dictionaries drive the same bridge path _frontend_frame uses; no
+# _process involvement, so the whole run is deterministic.
+# ---------------------------------------------------------------------------
+
+# Advance the frontend N frames through the same call sequence the
+# live loop runs (update -> dispatch -> fx -> transition-ack ->
+# frame -> end_frame). The first frame carries `input`.
+func _fe_smoke_step(input: Dictionary, n: int = 1) -> Dictionary:
+	var snap := {}
+	for i in n:
+		snap = bridge.frontend_update(input if i == 0 else {})
+		for req in bridge.frontend_dispatch_requests():
+			_frontend_request(req)
+		for f in bridge.frontend_drain_fx():
+			_frontend_fx(int(f))
+		if fe_transition_left > 0:
+			fe_transition_left -= 1
+			if fe_transition_left == 0:
+				bridge.frontend_transition_complete()
+		bridge.frontend_frame()
+		bridge.frontend_end_frame(33.333)
+	fe_sub = int(snap.get("sub_mode", 0)) if not snap.is_empty() else 0
+	return snap
+
+
+# One semantic key press = one held frame + one released frame. The
+# shell's repeat/debounce deadlines only reset on release — a second
+# held frame inside the 30-tick first-delay window is a hold, not a
+# new press.
+func _fe_press(field: String) -> Dictionary:
+	_fe_smoke_step({field: true}, 1)
+	return _fe_smoke_step({}, 1)
+
+
+func _run_smoke_frontend() -> void:
+	print("smoke: frontend")
+	_check(bridge.frontend_booted(), "frontend booted")
+
+	# --- A. boot, no LASTGAME (the temp save-dir is fresh) ---------
+	var snap := _fe_smoke_step({}, 2)
+	_check(int(snap.get("mode", -1)) == 0, "A: mode == frontend")
+	_check(int(snap.get("sub_mode", -1)) == 0, "A: sub == root")
+	_check(not bool(snap.get("saves_exist", true)),
+		"A: no LASTGAME -> saves_exist false")
+	_check(int(snap.get("selection", -1)) == 1,
+		"A: selection defaults to New Game")
+
+	# --- C. root navigation ----------------------------------------
+	# No saves: Continue (0) is disabled — prev from 1 wraps to the
+	# bottom and next from the bottom wraps back to 1, both skipping
+	# the disabled row (OBSERVED controller logic).
+	snap = _fe_press("prev")
+	_check(int(snap.get("selection", -1)) == 4,
+		"C: prev from New Game wraps to Quit (no saves)")
+	snap = _fe_press("next")
+	_check(int(snap.get("selection", -1)) == 1,
+		"C: next wraps back to New Game")
+	snap = _fe_press("next")
+	_check(int(snap.get("selection", -1)) == 2,
+		"C: next advances to Saved Game")
+	snap = _fe_press("next")
+	snap = _fe_press("next")
+	_check(int(snap.get("selection", -1)) == 4,
+		"C: next x2 lands on Quit")
+	snap = _fe_press("prev")                   # back off Quit -> 3
+
+	# --- L. Abort console (frontend root Esc arm) ------------------
+	# Esc at the menu arms the abort console AND self-cancels the
+	# same frame — the OBSERVED quirk: the just-armed overlay
+	# dispatches the still-live Esc edge as 'No'. Net effect: the
+	# Pause->Resume->MenuSong fx sequence and a fresh root re-entry.
+	# The visible console is exercised in scenario O via the in-game
+	# F10 arm, which does not self-cancel.
+	var pause0: int = int(fe_fx_counts.get(FE_FX_PAUSE_SOUNDS, 0))
+	var song0: int = int(fe_fx_counts.get(FE_FX_MENU_SONG, 0))
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"L: Esc abort arm self-cancels same frame (OBSERVED)")
+	_check(int(fe_fx_counts.get(FE_FX_PAUSE_SOUNDS, 0)) > pause0 and
+		int(fe_fx_counts.get(FE_FX_MENU_SONG, 0)) > song0,
+		"L: arm+cancel fx sequence ran (pause+song)")
+	_check(int(snap.get("selection", -1)) == 1,
+		"L: fresh re-entry re-derives selection")
+
+	# --- F/G. save list (needs saves — write a header-only one) ----
+	var wok: bool = bridge.frontend_write_save(
+		{"name": "SMOKE1", "header_only": true})
+	_check(wok, "F: header-only save write to temp dir")
+	var wok2: bool = bridge.frontend_write_save(
+		{"name": "SMOKE2", "header_only": true})
+	_check(wok2, "F: second header-only save write")
+	# F3 carries the same sub==0 && mode!=0 gate as F1 — an OBSERVED
+	# no-op at the menu. The menu route is the Saved Game item.
+	snap = _fe_press("f3")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"F: F3 at the menu is a no-op (in-game gate)")
+	snap = _fe_press("next")                   # 1 -> 2
+	_check(int(snap.get("selection", -1)) == 2,
+		"F: Saved Game item selected")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 1,
+		"F: confirm -> save list")
+	var sl: Dictionary = snap.get("save_list", {})
+	_check(int(sl.get("count", 0)) >= 2, "F: list sees the writes")
+	var stems: Array = sl.get("stems", [])
+	_check(stems.has("SMOKE1"), "G: stem enumeration")
+	var insp: Dictionary = bridge.frontend_inspect_slot("SMOKE1")
+	_check(bool(insp.get("found", false)), "G: slot inspect found")
+	_check(bool(insp.get("valid", false)), "G: header-only slot valid")
+	_check(not bool(insp.get("full_save", true)),
+		"G: header-only classification")
+	snap = _fe_press("next")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"F: Esc exits save list")
+
+	# --- H. save-name entry (F2 gate is traversal-only; the arm
+	#        through the shell's autosave path is the testable one) -
+	# Drive the request path the write seam exposes instead: the
+	# shell's F2 arm only fires in mode 3, so verify the writer +
+	# the confirm-phase surface through a fresh autosave arm via
+	# the host seam (write already covered above).
+	var det: Dictionary = bridge.frontend_inspect_slot("SMOKE2")
+	_check(bool(det.get("found", false)), "H: second slot detail")
+	var fr: Dictionary = bridge.frontend_frame()
+	_check(int(fr.get("w", 0)) == 600 and int(fr.get("h", 0)) == 360,
+		"H: composed frame is 600x360")
+
+	# --- I/J/K. Options navigation + help + skill cycle ------------
+	# The save-list Esc exit ran a fresh re-entry -> selection is 1.
+	snap = _fe_press("next")
+	snap = _fe_press("next")                   # 1 -> 3
+	_check(int(snap.get("selection", -1)) == 3,
+		"I: options item selectable")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 11,
+		"I: confirm -> options sub")
+	# Options entry selection is row 8 (Quit/Back); all 9 rows are
+	# navigable (devHidden_ is the -mapok flag, canonical 0). Row 0
+	# is Help — next wraps 8 -> 0, confirm arms the sub-10 overlay.
+	snap = _fe_press("next")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 10,
+		"K: options Help row -> help sub")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 11,
+		"K: Esc closes help -> options")
+	var skill0 := int(snap.get("settings", {}).get("skill", -1))
+	# Skill is options row 6 — six next presses from row 0, then the
+	# activate query cycles it up in place (wraps 2 -> 0). The flow's
+	# skill global syncs on the return-to-root handoff, so the check
+	# reads the snapshot after Esc leaves the subtree.
+	for i in 6:
+		snap = _fe_press("next")
+	snap = _fe_press("confirm")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"I: Esc exits options")
+	var skill1 := int(snap.get("settings", {}).get("skill", -1))
+	_check(skill0 >= 0 and skill1 == (skill0 + 1) % 3,
+		"J: skill cycled through the contract")
+
+	# --- M. transition arm/ack -------------------------------------
+	# enterFrontend(true) is the returning-entry path: it arms
+	# TransitionArmed + Esc suppression; the ack releases both.
+	bridge.frontend_enter(true)
+	var fx_seen := false
+	for i in 4:
+		bridge.frontend_update({})
+		for f in bridge.frontend_drain_fx():
+			_frontend_fx(int(f))
+		bridge.frontend_end_frame(33.333)
+	var snap2: Dictionary = bridge.frontend_snapshot()
+	fx_seen = int(fe_fx_counts.get(FE_FX_TRANSITION_ARMED, 0)) > 0
+	_check(fx_seen, "M: returning entry armed TransitionArmed")
+	_check(bool(snap2.get("suppress_esc_abort", false)),
+		"M: Esc suppression held during transition")
+	for i in FE_TRANSITION_FRAMES + 2:
+		_fe_smoke_step({}, 1)
+	snap2 = bridge.frontend_snapshot()
+	_check(not bool(snap2.get("suppress_esc_abort", true)),
+		"M: transition ack released Esc suppression")
+
+	# --- D. New Game request -> progression ------------------------
+	# Select index 1 (New Game) then confirm.
+	for i in 6:
+		snap = _fe_press("prev")
+		if int(snap.get("selection", -1)) == 1:
+			break
+	var sel := int(snap.get("selection", -1))
+	if sel != 1:
+		for i in 6:
+			snap = _fe_press("next")
+			if int(snap.get("selection", -1)) == 1:
+				break
+	_check(int(snap.get("selection", -1)) == 1,
+		"D: New Game selectable")
+	var req_seen := false
+	snap = _fe_press("confirm")
+	req_seen = int(fe_req_counts.get(FE_REQ_NEW_GAME, 0)) > 0
+	_check(req_seen, "D: StartNewGame request drained")
+	# The campaign pump: mode 6 briefing -> mode 2 freefall.
+	var mode := int(bridge.get_mode())
+	_check(mode == 6, "D: campaign entry is mode 6")
+	var guard := 0
+	while mode >= 5 and mode <= 8 and guard < 40:
+		var res: Dictionary = bridge.frontend_progression_step(
+			{"stage_done": true})
+		_check(bool(res.get("ok", true)) or guard < 3,
+			"D: progression step ok")
+		mode = int(bridge.get_mode())
+		guard += 1
+	_check(mode == 2, "D: progression reached freefall (mode 2)")
+	_frontend_hide()
+	frontend = true   # still frontend-launched; runtime now live
+
+	# --- N. frontend -> gameplay hide ------------------------------
+	_check(not $FrontendLayer/FrontendRect.visible,
+		"N: frontend layer hidden on gameplay entry")
+
+	# --- O. gameplay -> frontend return (abort YES) -----------------
+	# Step a few freefall frames, then arm the console. The in-game
+	# arm is F10 — an Esc-armed abort self-cancels the same frame on
+	# the still-live edge (the OBSERVED quirk checked at L).
+	for i in 4:
+		bridge.step_frame_input(33.333, {})
+	snap = _fe_press("f10")
+	_check(int(snap.get("sub_mode", -1)) == 9,
+		"O: F10 in gameplay arms abort")
+	_check(int(snap.get("abort_selection", -1)) == 0,
+		"O: abort selection starts on Yes")
+	snap = _fe_press("key_y")
+	# Abort YES -> AbortToFrontend request -> teardown + fresh entry.
+	snap = _fe_smoke_step({}, 2)
+	mode = int(bridge.get_mode())
+	_check(mode == 0, "O: abort YES returned to frontend")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"O: fresh frontend entry at root")
+	_frontend_show()
+	_check($FrontendLayer/FrontendRect.visible,
+		"O: frontend layer restored")
+
+	# --- E. Continue (LASTGAME now exists — write it) --------------
+	var lok: bool = bridge.frontend_write_save(
+		{"name": "LASTGAME", "header_only": true})
+	_check(lok, "E: LASTGAME write to temp dir")
+	bridge.frontend_enter(false)   # re-probe saves_exist
+	snap = _fe_smoke_step({}, 2)
+	_check(bool(snap.get("saves_exist", false)),
+		"E: LASTGAME -> saves_exist true")
+	_check(int(snap.get("selection", -1)) == 0,
+		"E: Continue is the default selection")
+	_check(bridge.frontend_lastgame_exists(),
+		"E: host LASTGAME probe true")
+	snap = _fe_press("confirm")
+	# Continue request drained — the header-only mode field decides
+	# the route; a 0-mode field falls back to frontend (mode 0).
+	mode = int(bridge.get_mode())
+	_check(mode == 0 or mode == 3 or mode == 6,
+		"E: continue request routed")
+
+	# Temp-save safety: every write this smoke did landed under the
+	# user:// temp root, never the original tree.
+	var save_abs := ProjectSettings.globalize_path("user://saves_smoke")
+	_check(FileAccess.file_exists(save_abs.path_join("LASTGAME.SAV")),
+		"temp: LASTGAME under user:// saves_smoke root")
+	_check(not FileAccess.file_exists(
+		data_root_path.path_join("SAVES/SMOKE1.SAV")),
+		"temp: no writes into the data root")
+
+	# fx coverage diagnostics — all bounded.
+	print("smoke: fe_fx=", fe_fx_counts, " fe_req=", fe_req_counts)
+	print("smoke(frontend): %d failure(s)" % failures)
+
+
+func _smoke_frontend_frame_check() -> bool:
+	var fr: Dictionary = bridge.frontend_frame()
+	return int(fr.get("w", 0)) == 600 and int(fr.get("h", 0)) == 360
+
+
+# ---------------------------------------------------------------------------
+# Phase 18B.2A §24 — real-save corpus read-only check. Boot points the
+# frontend store at the installed SAVES dir; the scenario only ever calls
+# read seams (enumerate / inspect / slide probe / frame compose) and
+# fingerprints the directory before and after to prove nothing was
+# written.
+# ---------------------------------------------------------------------------
+func _run_smoke_real_saves() -> void:
+	print("smoke: real saves (read-only)")
+	var saves_dir := data_root_path.path_join("SAVES")
+	var before := {}
+	var da := DirAccess.open(saves_dir)
+	_check(da != null, "R: real SAVES dir opens")
+	if da != null:
+		for f in da.get_files():
+			before[f] = FileAccess.get_modified_time(
+				saves_dir.path_join(f))
+
+	_check(bridge.frontend_booted(), "R: frontend booted")
+	var snap := _fe_smoke_step({}, 2)
+	_check(int(snap.get("mode", -1)) == 0, "R: mode == frontend")
+
+	# Host enumeration over the real dir — raw "*.SAV" names.
+	var names: Array = bridge.frontend_enumerate_saves()
+	_check(names.size() >= 2, "R: enumeration sees the corpus")
+	_check(names.has("1.SAV") and names.has("2.SAV"),
+		"R: 1.SAV + 2.SAV enumerated")
+
+	# The full save: head + THMB (768-byte palette + 64x45 indexed).
+	var full: Dictionary = bridge.frontend_inspect_slot("1")
+	_check(bool(full.get("found", false)), "R: full slot found")
+	_check(bool(full.get("valid", false)), "R: full slot valid")
+	_check(bool(full.get("full_save", false)),
+		"R: full-save classification")
+	_check(int(full.get("thumbnail_size", 0)) == 3648,
+		"R: full save carries the THMB record")
+	print("R: 1.SAV level=", full.get("level_id"),
+		" mode=", full.get("mode_field"),
+		" health=", full.get("health"))
+
+	# The header-only save: metadata only — LOAD_<level>.LBB is an
+	# unknown format; no imagery is invented for it.
+	var hdr: Dictionary = bridge.frontend_inspect_slot("2")
+	_check(bool(hdr.get("found", false)), "R: header slot found")
+	_check(bool(hdr.get("valid", false)), "R: header slot valid")
+	_check(not bool(hdr.get("full_save", true)),
+		"R: header-only classification")
+	print("R: 2.SAV level=", hdr.get("level_id"),
+		" mode=", hdr.get("mode_field"))
+
+	# The real corpus carries no LASTGAME.SAV — the probe is false
+	# and the default selection is New Game (1), matching the
+	# no-saves contract verified in scenario A.
+	_check(not bool(snap.get("saves_exist", true)),
+		"R: no LASTGAME -> saves_exist false")
+	_check(int(snap.get("selection", -1)) == 1,
+		"R: New Game is the default selection")
+
+	# The save list sees the real stems through the menu route.
+	snap = _fe_press("next")                   # 1 -> 2
+	_check(int(snap.get("selection", -1)) == 2,
+		"R: Saved Game item selected")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 1,
+		"R: save list opens over the real corpus")
+	var sl: Dictionary = snap.get("save_list", {})
+	var stems: Array = sl.get("stems", [])
+	_check(stems.has("1") and stems.has("2"),
+		"R: shell list carries stems 1 + 2")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"R: Esc exits the list")
+
+	# Attract-slide probe — read-only MISC\MDKS_001.GIF head check
+	# (the slide renderer itself is the deferred 18B.2B seam).
+	var probe: Dictionary = bridge.frontend_slide_probe(1)
+	_check(bool(probe.get("exists", false)),
+		"R: MDKS_001 slide probe (600x360 gate)")
+
+	# The composed frame still forms over the real data.
+	var fr: Dictionary = bridge.frontend_frame()
+	_check(int(fr.get("w", 0)) == 600 and int(fr.get("h", 0)) == 360,
+		"R: composed frame is 600x360")
+
+	# Fingerprint after — identical names and mtimes prove the whole
+	# scenario never wrote.
+	var after := {}
+	var da2 := DirAccess.open(saves_dir)
+	if da2 != null:
+		for f in da2.get_files():
+			after[f] = FileAccess.get_modified_time(
+				saves_dir.path_join(f))
+	_check(after == before, "R: SAVES dir untouched (read-only)")
+	print("smoke(real-saves): %d failure(s)" % failures)

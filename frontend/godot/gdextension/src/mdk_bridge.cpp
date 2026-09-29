@@ -199,6 +199,11 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::frontend_notify_load_result);
   ClassDB::bind_method(D_METHOD("frontend_dispatch_requests"),
                        &MdkBridge::frontend_dispatch_requests);
+  // Phase 18B.2A — frontend presentation.
+  ClassDB::bind_method(D_METHOD("frontend_frame"),
+                       &MdkBridge::frontend_frame);
+  ClassDB::bind_method(D_METHOD("frontend_progression_step", "input"),
+                       &MdkBridge::frontend_progression_step);
 }
 
 void MdkBridge::setError_(const std::string& msg) {
@@ -2730,6 +2735,15 @@ bool MdkBridge::frontend_boot(const String& save_dir) {
   feShell_->setPrimaryMode(mode_);
   feShell_->setRunning(true);
   feShell_->setLevelIndex(sess_.levelId);
+  // Phase 18B.2A: decode the shared frontend resources once — the
+  // same loader the SDL app runs (core/frontend_resources.h).
+  std::string err;
+  if (!mdk::loadFrontendResources(*root_, feRes_, &err)) {
+    setError_("frontend_boot: " + err);
+    feResLoaded_ = false;
+    return false;
+  }
+  feResLoaded_ = true;
   return true;
 }
 
@@ -3277,5 +3291,219 @@ Array MdkBridge::frontend_dispatch_requests() {
     }
     out.push_back(r);
   }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18B.2A — frontend presentation
+// ---------------------------------------------------------------------------
+
+Dictionary MdkBridge::frontend_frame() {
+  Dictionary out;
+  if (!feShell_ || !feResLoaded_) {
+    setError_("frontend_frame: frontend_boot() first");
+    return out;
+  }
+  std::string err;
+  // suppressEscAbort is set on the returning-entry transition arm and
+  // cleared exactly by frontend_transition_complete — the same
+  // lifecycle as the transition presentation window.
+  if (!fePresenter_.compose(*feShell_, feRes_, feHost_.get(),
+                            feShell_->suppressEscAbort(), &err)) {
+    setError_("frontend_frame: " + err);
+    return out;
+  }
+  const mdkbridge::FrontendComposedFrame& f = fePresenter_.frame();
+  out["w"] = f.fb.width();
+  out["h"] = f.fb.height();
+  PackedByteArray rgba;
+  rgba.resize(int64_t(f.fb.pixelCount()) * 4);
+  std::uint8_t* dst = rgba.ptrw();
+  for (std::size_t i = 0; i < f.fb.pixelCount(); ++i) {
+    const mdk::Palette::Color c = f.palette.get(f.fb.pixels()[i]);
+    dst[i * 4 + 0] = c.r;
+    dst[i * 4 + 1] = c.g;
+    dst[i * 4 + 2] = c.b;
+    dst[i * 4 + 3] = c.a;
+  }
+  out["rgba"] = rgba;
+  if (f.hasThmb) {
+    // Existing-save THMB overlay: decoded with its own 768-byte
+    // palette (OBSERVED record head) — decode-only presentation.
+    PackedByteArray t;
+    t.resize(mdkbridge::kFrontendThmbWidth *
+             mdkbridge::kFrontendThmbHeight * 4);
+    std::uint8_t* td = t.ptrw();
+    for (int i = 0;
+         i < mdkbridge::kFrontendThmbWidth *
+                 mdkbridge::kFrontendThmbHeight;
+         ++i) {
+      const int idx = f.thmbPixels[static_cast<std::size_t>(i)];
+      td[i * 4 + 0] = f.thmbPalette[idx * 3 + 0];
+      td[i * 4 + 1] = f.thmbPalette[idx * 3 + 1];
+      td[i * 4 + 2] = f.thmbPalette[idx * 3 + 2];
+      td[i * 4 + 3] = 255;
+    }
+    Dictionary th;
+    th["x"] = f.thmbX;
+    th["y"] = f.thmbY;
+    th["w"] = mdkbridge::kFrontendThmbWidth;
+    th["h"] = mdkbridge::kFrontendThmbHeight;
+    th["rgba"] = t;
+    out["thmb"] = th;
+  }
+  return out;
+}
+
+bool MdkBridge::campaignFreefallEnter_(std::string& detail) {
+  // The mode-6 exit's FALL3D_<levelId> entry — the same loads
+  // load_freefall runs, but the session carries through (health/
+  // rng/skill are the campaign globals, not a fresh reset).
+  ffScene_ = std::make_unique<mdk::FreefallScene>();
+  const auto se = mdk::freefallSceneLoad(*root_, sess_.levelId,
+                                         ffScene_.get(), &detail);
+  if (se != mdk::FreefallSceneError::kOk) {
+    detail = std::string("freefall scene load: ") +
+             mdk::freefallSceneErrorName(se) + " — " + detail;
+    ffScene_.reset();
+    return false;
+  }
+  ff_ = std::make_unique<mdk::FreefallRuntime>();
+  mdk::FreefallCourseData data;
+  data.course = sess_.levelId;
+  data.skill = sess_.skill;
+  data.pickups = ffScene_->pickups;
+  mdk::freefallInit(*ff_, data, sess_.rng);
+  timing_ = mdk::FrontendTimingState{};
+  prevKeyLevel_ = {};
+  ffHandoffDone_ = false;
+  ffHandoffRoute_ = -1;
+  ffHandoffDetail_.clear();
+  ffTex_.clear();
+  mode_ = 2;
+  hasFrame_ = false;
+  return true;
+}
+
+bool MdkBridge::campaignTraversalEnter_(std::string& detail) {
+  // The mode-6-exit (levelId >= 5) / mode-7 traversal entry — the
+  // same load+present tail frontendLoadSaveFile_ runs.
+  auto trav = std::make_unique<mdk::TraversalRuntime>();
+  const mdk::ProgressionError e =
+      mdk::progressionLoadTraversalForCurrentLevel(*root_, sess_,
+                                                 *trav, &detail);
+  if (e != mdk::ProgressionError::kOk) {
+    detail = std::string("load: ") +
+             mdk::progressionErrorName(e) + " — " + detail;
+    return false;
+  }
+  rt_ = std::move(trav);
+  mode_ = 3;
+  hasFrame_ = false;
+  timing_ = mdk::FrontendTimingState{};
+  last_ = mdk::TraversalFrameResult{};
+  prevKeyLevel_ = {};
+  ff_.reset();
+  ffScene_.reset();
+  ffTex_.clear();
+  ffHandoffDone_ = false;
+  ffHandoffRoute_ = -1;
+  ffHandoffDetail_.clear();
+  objIds_ = mdkfront::MdkObjectIds{};
+  arenaSets_.clear();
+  arenaSetFailed_.clear();
+  displaySet_.clear();
+  arenaIndex_ = -1;
+  arenaName_.clear();
+  arenaLoaded_ = false;
+  const int dir = mdk::progressionLevelDir(sess_.levelId);
+  char stemBuf[16], dirBuf[32];
+  std::snprintf(stemBuf, sizeof(stemBuf), "LEVEL%d", dir);
+  std::snprintf(dirBuf, sizeof(dirBuf), "TRAVERSE/LEVEL%d/", dir);
+  if (!presentTraversalLevel_(stemBuf, dirBuf)) {
+    detail = lastError_;
+    return false;
+  }
+  updateDisplaySet_();
+  refreshOrders_();
+  return true;
+}
+
+Dictionary MdkBridge::frontend_progression_step(const Dictionary& input) {
+  Dictionary out;
+  out["pumped"] = false;
+  out["ok"] = true;
+  out["mode"] = mode_;
+  out["sess_mode"] = sess_.mode;
+  out["level_id"] = sess_.levelId;
+  if (!feShell_ || !root_) {
+    setError_("frontend_progression_step: frontend_boot() first");
+    out["ok"] = false;
+    return out;
+  }
+  // The presentation seam: the original's stage-complete input (the
+  // tally fade / briefing input / cinematic end). Godot marks the
+  // placeholder intermission done with "stage_done" or a confirm.
+  const bool stageDone = bool(input.get("stage_done", false)) ||
+                        bool(input.get("confirm", false));
+  mdk::ProgressionError e = mdk::ProgressionError::kOk;
+  const int prevMode = sess_.mode;
+  switch (prevMode) {
+  case 5:
+    e = mdk::progressionStepIntermission(sess_, stageDone);
+    break;
+  case 6:
+    e = mdk::progressionStepLoader(sess_, stageDone);
+    break;
+  case 7:
+    e = mdk::progressionStepMode7(sess_);
+    break;
+  case 8:
+    e = mdk::progressionStepCinematic(sess_, stageDone);
+    break;
+  default:
+    return out;   // no pump for runtime-presented modes
+  }
+  out["pumped"] = true;
+  out["error"] = String(mdk::progressionErrorName(e));
+  if (e == mdk::ProgressionError::kStageRunning) {
+    out["sess_mode"] = sess_.mode;
+    return out;
+  }
+  if (e != mdk::ProgressionError::kOk) {
+    setError_(std::string("progression step: ") +
+              mdk::progressionErrorName(e));
+    out["ok"] = false;
+    return out;
+  }
+  // The transition completed — install whichever runtime the new
+  // mode needs (the dispatcher's tail is data-load, not state).
+  std::string detail;
+  if (sess_.mode == 2 && !ff_) {
+    if (!campaignFreefallEnter_(detail)) {
+      setError_("campaign freefall: " + detail);
+      out["ok"] = false;
+      out["detail"] = String(detail.c_str());
+      return out;
+    }
+  } else if (sess_.mode == 3 && !rt_) {
+    if (!campaignTraversalEnter_(detail)) {
+      setError_("campaign traversal: " + detail);
+      out["ok"] = false;
+      out["detail"] = String(detail.c_str());
+      return out;
+    }
+  } else if (sess_.mode == 0) {
+    // The campaign's frontend exit. The mode-8 tail calls
+    // FUN_0041d85c(nonzero) — the returning-entry arm that runs the
+    // entry transition + Esc suppression (OBSERVED); every other
+    // mode-0 route is the fresh entry.
+    mode_ = 0;
+    feShell_->enterFrontend(prevMode == 8);
+  }
+  mode_ = sess_.mode;
+  out["mode"] = mode_;
+  out["sess_mode"] = sess_.mode;
+  out["level_id"] = sess_.levelId;
   return out;
 }
