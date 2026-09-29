@@ -203,6 +203,26 @@ public:
   // DAT_00541486 — the shared settings-dirty flag (see returnToRoot).
   bool settingsDirty() const { return settingsDirty_; }
 
+  // Phase 18A — FUN_0041d85c re-entry on a live flow: any open child
+  // screen is torn down, the screen returns to Root, and the root
+  // controller re-derives its entry state from `savesExist`
+  // (DAT_0054bc98 -> DAT_0049aa78). The shared machine block and all
+  // settings globals (skill_/brightness_/etc.) persist — the original
+  // does not touch them here either.
+  void enterFrontend(bool savesExist);
+
+  // Phase 18A — FUN_00420cf0 reached through the F12 overlay chain
+  // (the in-game options entry) instead of the root-menu dispatch:
+  // same sub-mode-11 entry, but the shared machine block comes from
+  // the caller (the shell's process-global mirror), not from the
+  // root controller which is not the visible screen.
+  void enterOptionsSubtree(const FrontendMachineState& s);
+  // The live screen's shared-machine block (for the shell's mirror).
+  FrontendMachineState activeMachineState() const;
+  // The loop-tail timing update (FUN_0042fe78 / FUN_0042fcd0) routed
+  // to the live screen — every screen ends its frame with it.
+  void endFrame(double dtMs);
+
   // Phase 4I semantic audio events — the flow-level queue for the
   // proven OPTSONG/OPTBUTT/ambient-song triggers. The sound
   // controller's per-frame events move here (the original's audio

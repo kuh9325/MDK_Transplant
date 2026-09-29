@@ -1,6 +1,7 @@
 // Phase 3A unit tests for platform-neutral logic. No SDL, no Metal —
 // those paths are exercised by the runtime smoke test instead.
 
+#include "core/abort_console.h"
 #include "core/arena_mesh.h"
 #include "core/arena_render.h"
 #include "core/binary_reader.h"
@@ -22,6 +23,7 @@
 #include "core/frontend_flow.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
+#include "core/frontend_shell.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
@@ -44,6 +46,8 @@
 #include "core/save_full_restore.h"
 #include "core/save_full_write.h"
 #include "core/save_game.h"
+#include "core/save_name_entry.h"
+#include "core/save_slot_list.h"
 #include "core/sni_directory.h"
 #include "core/sni_wave.h"
 #include "core/sound_menu.h"
@@ -7630,6 +7634,839 @@ void test_frontend_flow() {
       CHECK(flowB.options().skill() == want);
     }
     std::filesystem::remove(cfg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18A — the frontend shell (DAT_00541492/93 mode+sub-mode machine)
+// plus the overlay controllers (save list, save name entry, abort).
+
+void test_save_slot_list() {
+  // saveListStem (FUN_004202cc copy loop): stop at ' '/'.', cap 8.
+  {
+    CHECK(mdk::saveListStem("1.SAV") == "1");
+    CHECK(mdk::saveListStem("BOSS FIGHT.SAV") == "BOSS");
+    CHECK(mdk::saveListStem("VERYLONGNAME.SAV") == "VERYLONG");
+    CHECK(mdk::saveListStem("") == "");
+  }
+
+  // Navigation: prev/next clamp (no wrap), Home/End, PgUp/PgDn by 13,
+  // the window follows the selection (sel inside [top, top+12]).
+  {
+    std::vector<std::string> stems;
+    for (int i = 0; i < 20; ++i) stems.push_back(std::to_string(i));
+    mdk::SaveSlotListController list(std::move(stems), {}, 0);
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    CHECK(list.count() == 20 && list.selection() == 0);
+    // End -> 19; top follows so sel stays inside the 13-row window.
+    in.endEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 19 && list.topRow() == 7);
+    // Home -> 0.
+    in = {}; in.homeEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 0 && list.topRow() == 0);
+    // PgDn -> +13.
+    in = {}; in.pageDownEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 13);
+    // PgUp -> back to 0.
+    in = {}; in.pageUpEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 0);
+    // Next repeat at the bottom clamps at 19 (no wrap) — the first
+    // repeat fires after the 30-tick press delay, then every 3.
+    in = {}; in.nextHeld = true;
+    for (int i = 0; i < 140; ++i) { ++sh.tick; list.update(sh, in); }
+    CHECK(list.selection() == 19);
+    // Prev clamps at 0.
+    in = {}; in.prevHeld = true;
+    for (int i = 0; i < 140; ++i) { ++sh.tick; list.update(sh, in); }
+    CHECK(list.selection() == 0);
+  }
+
+  // Mouse hit band: (y-0x67)>>4 + topRow, gated on 0x66 < y < 0x137,
+  // only when mouse input arrived this frame.
+  {
+    std::vector<std::string> stems;
+    for (int i = 0; i < 20; ++i) stems.push_back(std::to_string(i));
+    mdk::SaveSlotListController list(std::move(stems), {}, 0);
+    mdk::FrontendMachineState sh;
+    sh.mouseX = 300;
+    sh.mouseY = 0x67 + 16 * 5;  // row 5
+    mdk::FrontendMenuInput in;
+    in.mouseDy = 1;             // any activity gates the hit test
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 5);
+    // Below the band: no row hit, but the tracker arms the edge
+    // scroll — y >= 0x137 scrolls down.
+    sh.mouseY = 0x137;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 6);
+    // At/above the top edge scrolls back up.
+    sh.mouseY = 0x66;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 5);
+  }
+
+  // Confirm on a valid entry -> Load + stem; on an invalid entry ->
+  // Exit (the OBSERVED quirk). Esc -> Exit.
+  {
+    std::vector<std::string> stems = {"aa", "bb", "cc"};
+    mdk::SaveSlotListController list(
+        stems, [](std::string_view s) -> std::optional<mdk::SaveSlotSummary> {
+          if (s == "bb") {
+            mdk::SaveSlotSummary sum;
+            sum.valid = true;
+            sum.fullSave = true;
+            sum.levelId = 3;
+            sum.modeField = 1000;
+            sum.health = 95;
+            sum.deathCount = 2;
+            return sum;
+          }
+          return std::nullopt;  // unreadable -> invalid
+        }, 0);
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    // Select bb (index 1) with a down press.
+    in.nextHeld = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 1);
+    CHECK(list.selected() && list.selected()->valid &&
+          list.selected()->fullSave && list.selected()->levelId == 3);
+    // Confirm -> Load "bb".
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.pendingAction() == mdk::SaveListAction::Load);
+    CHECK(list.actionStem() == "bb");
+    CHECK(list.consumeAction() == mdk::SaveListAction::Load);
+    CHECK(list.consumeAction() == mdk::SaveListAction::None);
+  }
+  {
+    // Confirm on an INVALID entry exits rather than staying.
+    mdk::SaveSlotListController list({"bad"}, {}, 0);
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.pendingAction() == mdk::SaveListAction::Exit);
+    // Esc exits too.
+    mdk::SaveSlotListController list2({"aa"}, {}, 0);
+    in = {}; in.cancelEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list2.update(sh, in);
+    CHECK(list2.pendingAction() == mdk::SaveListAction::Exit);
+  }
+
+  // Typed-character jump: first entry whose first byte >= typed
+  // (walks entries 0..count-2).
+  {
+    std::vector<std::string> stems = {"aa", "bb", "cc", "dd"};
+    mdk::SaveSlotListController list(std::move(stems), {}, 0);
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    in.typedChar = 'c';
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 2);
+    in = {}; in.typedChar = 'z';   // nothing >= 'z' -> lands on last
+    ++sh.tick;  // the loop head advances DAT_00541518
+    list.update(sh, in);
+    CHECK(list.selection() == 3);
+  }
+}
+
+void test_save_name_entry() {
+  // Manual (F2) arm shape: empty buffer, typing phase straight away
+  // (DAT_0054bd9c = arg==0 -> 1 -> no confirm phase).
+  {
+    mdk::SaveNameEntryController e("", /*confirmPhase=*/false,
+                                   /*headerOnly=*/false, {});
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    // Enter with cursor 0 does nothing (OBSERVED: the gate is on the
+    // cursor, not the name length — but here both are empty anyway).
+    in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.pendingAction() == mdk::SaveNameAction::None);
+    // Type "MDK_95" — alnum + '_' pass the charset.
+    const char* s = "MDK_95";
+    for (const char* p = s; *p; ++p) {
+      in = {}; in.typedChar = *p;
+      ++sh.tick;  // the loop head advances DAT_00541518
+      e.update(sh, in, 0);
+    }
+    CHECK(e.name() == "MDK_95" && e.cursor() == 6);
+    // Rejected chars: '!' and ' ' are not alnum/_/$.
+    in = {}; in.typedChar = '!';
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.name() == "MDK_95" && e.cursor() == 6);
+    // Fill to the 8-char cap — overwrite semantics (no insert).
+    in = {}; in.typedChar = 'X';
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    in = {}; in.typedChar = 'Y';
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.name() == "MDK_95XY" && e.cursor() == 8);
+    in = {}; in.typedChar = 'Z';   // cap reached — no write
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.name() == "MDK_95XY");
+    // Enter commits.
+    int writes = 0;
+    std::string written;
+    mdk::SaveNameEntryController e2("", false, false,
+        [&](std::string_view n, bool headerOnly) {
+          ++writes; written = std::string(n);
+          CHECK(!headerOnly);
+          return true;
+        });
+    in = {}; in.typedChar = 'Q';
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e2.update(sh, in, 0);
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e2.update(sh, in, 0);
+    CHECK(writes == 1 && written == "Q");
+    CHECK(e2.pendingAction() == mdk::SaveNameAction::Commit);
+  }
+
+  // Cursor editing: left/right clamp, Home/End, backspace shift,
+  // delete-at-cursor, and the overwrite-at-cursor quirk.
+  {
+    mdk::SaveNameEntryController e("ABCD", false, false, {});
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    CHECK(e.cursor() == 4);   // arm puts the cursor at strlen
+    in.nameHomeEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.cursor() == 0);
+    // leftEdge at 0 clamps; typing at cursor 0 overwrites 'A'.
+    in = {}; in.leftEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.cursor() == 0);
+    in = {}; in.typedChar = 'Z';
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.name() == "ZBCD" && e.cursor() == 1);
+    // rightEdge to end.
+    in = {}; in.nameEndEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.cursor() == 4);
+    // backspace deletes before the cursor.
+    in = {}; in.nameBackspaceEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.name() == "ZBC" && e.cursor() == 3);
+    // delete at cursor.
+    in = {}; in.nameHomeEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    in = {}; in.nameDeleteEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.name() == "BC" && e.cursor() == 0);
+    // Esc cancels.
+    in = {}; in.cancelEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.pendingAction() == mdk::SaveNameAction::Cancel);
+  }
+
+  // The OBSERVED quirk: Enter gates on cursor >= 1, not the name.
+  // Backspacing the only char leaves name="" cursor=0 -> Enter dead.
+  {
+    mdk::SaveNameEntryController e("A", false, false, {});
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    in.nameHomeEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.cursor() == 0);
+    // Name still "A" but cursor 0: Enter does NOT commit (cursor<1).
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.pendingAction() == mdk::SaveNameAction::None);
+    // rightEdge -> cursor 1: now Enter commits even mid-string.
+    in = {}; in.rightEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.pendingAction() == mdk::SaveNameAction::Commit);
+    CHECK(e.name() == "A");
+  }
+
+  // Autosave arm shape: prefilled "n", confirm phase first (item 0
+  // proceeds to typing, item 1 cancels).
+  {
+    mdk::SaveNameEntryController e("3", /*confirmPhase=*/true,
+                                   /*headerOnly=*/true, {});
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    CHECK(e.confirmPhase() && e.name() == "3" && e.cursor() == 1);
+    // Navigate the 2-item confirm list and pick item 0 (proceed).
+    in.nextHeld = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.confirmSelection() == 1);
+    in = {};                       // release — resets the repeat state
+    ++sh.tick;
+    e.update(sh, in, 0);
+    in.nextHeld = true;            // second press wraps 1 -> 0
+    ++sh.tick;
+    e.update(sh, in, 0);
+    CHECK(e.confirmSelection() == 0);
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(!e.confirmPhase());      // -> typing phase
+    // Enter commits the prefilled name.
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.pendingAction() == mdk::SaveNameAction::Commit);
+    CHECK(e.headerOnly());
+  }
+  {
+    // Confirm-phase item 1 cancels; a failed write keeps the dialog.
+    mdk::SaveNameEntryController e("x", true, true, {});
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    in.nextHeld = true;             // -> item 1
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e.update(sh, in, 0);
+    CHECK(e.pendingAction() == mdk::SaveNameAction::Cancel);
+
+    int calls = 0;
+    mdk::SaveNameEntryController e2("x", false, false,
+                                    [&](std::string_view, bool) {
+                                      ++calls;
+                                      return false;  // write fails
+                                    });
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    e2.update(sh, in, 0);
+    CHECK(calls == 1);
+    CHECK(e2.pendingAction() == mdk::SaveNameAction::None);
+    CHECK(e2.writeFailed());        // dialog stays open
+  }
+}
+
+void test_abort_console() {
+  // Selection wraps 0<->1; Y edge -> yes; N edge or Esc -> no; the
+  // latched confirm dispatches on the selected item.
+  {
+    mdk::AbortConsoleController c;
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    CHECK(c.selection() == 0);
+    in.nextHeld = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    c.update(sh, in);
+    CHECK(c.selection() == 1);
+    in = {};                       // release — resets the repeat state
+    ++sh.tick;
+    c.update(sh, in);
+    in.nextHeld = true;            // second press wraps back to 0
+    ++sh.tick;
+    c.update(sh, in);
+    CHECK(c.selection() == 0);
+    in = {}; in.keyYEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    c.update(sh, in);
+    CHECK(c.pendingAction() == mdk::AbortAction::Yes);
+  }
+  {
+    mdk::AbortConsoleController c;
+    mdk::FrontendMachineState sh;
+    mdk::FrontendMenuInput in;
+    in.keyNEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    c.update(sh, in);
+    CHECK(c.pendingAction() == mdk::AbortAction::No);
+    mdk::AbortConsoleController c2;
+    in = {}; in.cancelEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    c2.update(sh, in);
+    CHECK(c2.pendingAction() == mdk::AbortAction::No);
+    // Confirm on item 1 -> No.
+    mdk::AbortConsoleController c3;
+    in = {}; in.nextHeld = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    c3.update(sh, in);
+    in = {}; in.confirmEdge = true;
+    ++sh.tick;  // the loop head advances DAT_00541518
+    c3.update(sh, in);
+    CHECK(c3.pendingAction() == mdk::AbortAction::No);
+  }
+}
+
+void test_frontend_shell() {
+  // Boot: fresh frontend entry — mode 0, sub 0, MenuSongStart +
+  // LoadFrontendResources queued; no saves -> root selection 1.
+  {
+    mdk::FrontendShell sh(false);
+    CHECK(sh.primaryMode() == mdk::mode::observed::frontend);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.flow().root().selection() == 1);
+    const auto fx = sh.drainFx();
+    CHECK(fx.size() == 2 &&
+          fx[0] == mdk::FrontendFx::MenuSongStart &&
+          fx[1] == mdk::FrontendFx::LoadFrontendResources);
+    CHECK(sh.drainFx().empty());
+  }
+
+  // New Game: no saves -> sel 1 -> confirm -> StartNewGame request.
+  {
+    mdk::FrontendShell sh(false);
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::StartNewGame);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::StartNewGame);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::None);
+  }
+
+  // Continue + Quit routing with saves present.
+  {
+    mdk::FrontendShell sh(true);
+    CHECK(sh.flow().root().selection() == 0);
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    sh.update(in);   // sel 0 -> Continue
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::ContinueLastGame);
+    // Walk to Quit (sel 4) and confirm.
+    for (int i = 0; i < 4; ++i) {
+      in = {}; in.nextHeld = true;
+      sh.update(in);
+      in = {};
+      sh.update(in);
+    }
+    CHECK(sh.flow().root().selection() == 4);
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::Quit);
+    CHECK(sh.quitRequested());
+  }
+
+  // Saved Game (sel 2): arms the save-list overlay (sub 1); the list
+  // does NOT dispatch on the arming frame (the dispatch switch already
+  // passed). Esc on the next frame cancels -> FUN_0042056c(1) ->
+  // mode 0 -> FUN_0041d85c fresh re-entry.
+  {
+    mdk::FrontendShellSeams seams;
+    seams.lastGameExists = [] { return true; };
+    seams.enumerateSaves = [] {
+      return std::vector<std::string>{"1.SAV", "2.SAV"};
+    };
+    mdk::FrontendShell sh(seams);
+    sh.drainFx();
+    mdk::FrontendMenuInput in;
+    in.nextHeld = true;
+    sh.update(in);
+    in = {};
+    sh.update(in);   // release
+    in.nextHeld = true;
+    sh.update(in);   // sel 2
+    CHECK(sh.flow().root().selection() == 2);
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveList);
+    CHECK(sh.saveList() && sh.saveList()->count() == 2);
+    // Esc cancels: teardown(1) at mode 0 -> fresh frontend re-entry.
+    in = {}; in.cancelEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.primaryMode() == mdk::mode::observed::frontend);
+    const auto fx = sh.drainFx();
+    bool sawSong = false;
+    for (const auto& f : fx) {
+      if (f == mdk::FrontendFx::MenuSongStart) sawSong = true;
+    }
+    CHECK(sawSong);
+  }
+
+  // Load path: confirm on a valid entry -> LoadSave + stem; the sub
+  // stays 1 until notifyLoadResult. Success -> sub 0; failure ->
+  // fresh re-entry.
+  {
+    mdk::FrontendShellSeams seams;
+    seams.lastGameExists = [] { return true; };
+    seams.enumerateSaves = [] {
+      return std::vector<std::string>{"AA.SAV"};
+    };
+    seams.inspectSlot =
+        [](std::string_view s) -> std::optional<mdk::SaveSlotSummary> {
+          mdk::SaveSlotSummary sum;
+          sum.valid = (s == "AA");
+          return sum;
+        };
+    mdk::FrontendShell sh(seams);
+    mdk::FrontendMenuInput in;
+    // sel 0 -> 2 (Saved Game): two down presses.
+    for (int i = 0; i < 2; ++i) {
+      in = {}; in.nextHeld = true;
+      sh.update(in);
+      in = {};
+      sh.update(in);
+    }
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveList);
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::LoadSave);
+    CHECK(sh.requestName() == "AA");
+    CHECK(sh.subMode() == mdk::kSubSaveList);   // resolves on notify
+    sh.notifyLoadResult(true);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::LoadSave);
+    // Re-arm + failure -> fresh re-entry. The root selection is still
+    // 2 (the root screen was never re-entered), so a bare confirm
+    // re-arms the list.
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveList);
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::LoadSave);
+    sh.notifyLoadResult(false);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.flow().root().selection() == 0);  // fresh re-entry re-derives
+  }
+
+  // Esc at the frontend arms the abort console AND self-cancels the
+  // same frame (the Esc edge is still live when the just-armed
+  // overlay dispatches — OBSERVED): net effect is FUN_0041d85c.
+  {
+    mdk::FrontendShell sh(false);
+    sh.drainFx();
+    mdk::FrontendMenuInput in;
+    in.cancelEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    const auto fx = sh.drainFx();
+    bool sawSong = false, sawPause = false, sawResume = false;
+    for (const auto& f : fx) {
+      sawSong |= f == mdk::FrontendFx::MenuSongStart;
+      sawPause |= f == mdk::FrontendFx::PauseSounds;
+      sawResume |= f == mdk::FrontendFx::ResumeSounds;
+    }
+    CHECK(sawSong && sawPause && sawResume);
+  }
+
+  // In-game abort: F10 arms the console (sub 9) under mode 3; the Y
+  // edge confirms -> AbortToFrontend for the host.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.f10Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubAbort);
+    CHECK(sh.abortConsole() != nullptr);
+    in = {}; in.keyYEdge = true;
+    sh.update(in);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::AbortToFrontend);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+  }
+
+  // In-game N/Esc paths resume traversal (FUN_004348d4), Esc-armed
+  // abort self-cancels the same frame into it.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.cancelEdge = true;   // Esc -> arm + same-frame cancel
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::ResumeTraversal);
+    const auto fx = sh.drainFx();
+    bool sawPause = false, sawResume = false;
+    for (const auto& f : fx) {
+      sawPause |= f == mdk::FrontendFx::PauseSounds;
+      sawResume |= f == mdk::FrontendFx::ResumeSounds;
+    }
+    CHECK(sawPause && sawResume);
+  }
+
+  // F2 save gate (FUN_00422bc0 arg==0): needs traversal + sub 0 +
+  // both block flags clear + no X_STRIKE. A gated arm is a silent
+  // no-op.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.f2Edge = true;
+    sh.update(in);   // mode 0 — not in the arm chain at all
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setSaveBlockFlags(false, false, /*xStrike=*/true);
+    sh.update(in);   // X_STRIKE blocks the arm
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    sh.setSaveBlockFlags(false, false, false);
+    sh.update(in);   // gate passes -> sub 8 typing phase
+    CHECK(sh.subMode() == mdk::kSubSaveName);
+    CHECK(sh.saveName() && !sh.saveName()->confirmPhase());
+    // Type a name and commit -> WriteSaveDone.
+    in = {}; in.typedChar = 'K';
+    sh.update(in);
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::WriteSaveDone);
+    CHECK(sh.requestName() == "K");
+    CHECK(!sh.requestHeaderOnly());
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::WriteSaveDone);
+    CHECK(sh.subMode() == mdk::kSubPrimary);   // teardown -> saved sub
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::ResumeTraversal);
+  }
+
+  // Autosave arm (mode-5 completion path): confirm phase first,
+  // header-only write, "<level+1>" prefill.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::stats);
+    sh.setRunning(true);
+    sh.setLevelIndex(2);
+    sh.armAutosave();
+    CHECK(sh.subMode() == mdk::kSubSaveName);
+    CHECK(sh.saveName() && sh.saveName()->confirmPhase() &&
+          sh.saveName()->name() == "3");
+    // Confirm phase item 0 -> typing.
+    mdk::FrontendMenuInput in;
+    in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.saveName() && !sh.saveName()->confirmPhase());
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::WriteSaveDone);
+    CHECK(sh.requestName() == "3" && sh.requestHeaderOnly());
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::WriteSaveDone);
+  }
+
+  // F3 load list in-game (sub 1); cancel resumes traversal.
+  {
+    mdk::FrontendShellSeams seams;
+    seams.enumerateSaves = [] { return std::vector<std::string>{}; };
+    mdk::FrontendShell sh(seams);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.f3Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveList);
+    in = {}; in.cancelEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::ResumeTraversal);
+  }
+
+  // F1 help (sub 10) in-game; any nav query tears it down and
+  // restores the saved byte.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.f1Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubHelp && sh.helpOpen());
+    in = {}; in.nextHeld = true;   // a nav query exits help
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::ResumeTraversal);
+  }
+
+  // F12 options over traversal: sub 11, options screens work, and
+  // Back -> sub 0 resumes traversal with the resume chain.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.f12Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubOptions);
+    CHECK(sh.flow().inOptions());
+    in = {}; in.cancelEdge = true;  // Esc -> Back -> teardown
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::ResumeTraversal);
+  }
+
+  // F11 brightness cycles through a request; the utility hotkey is
+  // gated on running + the enable flag.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.f11Edge = true;
+    sh.update(in);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::CycleBrightness);
+    in = {}; in.utilityEdge = true;
+    sh.update(in);   // DAT_005414f0 clear -> no request
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::None);
+    sh.setUtilityKeyEnabled(true);
+    sh.update(in);
+    CHECK(sh.consumeRequest() == mdk::FrontendRequest::CaptureUtility);
+  }
+
+  // Pause: arms only in non-frontend/non-cinematic modes with sub 0
+  // and running; while paused nothing dispatches; the unpause key
+  // resumes and consumes the Esc edge.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.pauseEdge = true;
+    sh.update(in);
+    CHECK(sh.paused());
+    // While paused a frame with no input just renders the pause
+    // screen — no dispatch, but the tick keeps accumulating.
+    const int t0 = sh.sharedMachine().tick;
+    in = {};
+    sh.update(in);
+    CHECK(sh.paused());
+    CHECK(sh.sharedMachine().tick == t0 + 1);
+    // Esc while paused unpauses and swallows the edge — no abort.
+    in = {}; in.cancelEdge = true;
+    sh.update(in);
+    CHECK(!sh.paused());
+    CHECK(sh.subMode() == mdk::kSubPrimary);   // abort never armed
+    // Pause does not arm at the frontend.
+    mdk::FrontendShell sh2(false);
+    sh2.setRunning(true);
+    in = {}; in.pauseEdge = true;
+    sh2.update(in);
+    CHECK(!sh2.paused());
+  }
+
+  // Ending return: enterFrontend(true) is the arg != 0 path — the
+  // transition flag arms and the Esc-abort arm is suppressed.
+  {
+    mdk::FrontendShell sh(true);
+    sh.drainFx();              // drop the boot fx
+    sh.enterFrontend(true);
+    CHECK(sh.suppressEscAbort());
+    const auto fx = sh.drainFx();
+    bool sawTransition = false, sawFresh = false;
+    for (const auto& f : fx) {
+      sawTransition |= f == mdk::FrontendFx::TransitionArmed;
+      sawFresh |= f == mdk::FrontendFx::LoadFrontendResources;
+    }
+    CHECK(sawTransition && !sawFresh);
+    mdk::FrontendMenuInput in;
+    in.cancelEdge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);   // no abort arm
+  }
+
+  // Mode 1 dispatches the noise-transition frame (FUN_00418e04);
+  // gameplay modes dispatch nothing through the shell.
+  {
+    mdk::FrontendShell sh(false);
+    sh.setPrimaryMode(mdk::mode::observed::noiseTransition);
+    mdk::FrontendMenuInput in;
+    sh.update(in);
+    CHECK(sh.noiseFrameRan());
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.update(in);
+    CHECK(!sh.noiseFrameRan());
+  }
+
+  // Attract: the default probe reports no slides -> the 5-second
+  // threshold fires the EnterAttract advance and lands the state at
+  // -1, which survives enterFrontend (only positive states reset).
+  {
+    mdk::FrontendShell sh(false);
+    mdk::FrontendMenuInput in;
+    // Idle 5+ seconds at ~30fps deltas -> advance attempt -> the
+    // missing MDKS_001 fails -> state -1.
+    for (int i = 0; i < 170; ++i) {
+      in = {};
+      sh.update(in);
+      sh.endFrame(33.3);
+    }
+    CHECK(sh.flow().root().attractState() == -1);
+    // -1 persists across re-entry.
+    sh.enterFrontend(false);
+    CHECK(sh.flow().root().attractState() == -1);
+  }
+
+  // Attract with a working probe: state advances 0 -> 1 -> 2, the
+  // right edge advances manually, and a slide failure at state > 1
+  // wraps back to 0 (menu) rather than -1.
+  {
+    mdk::FrontendShellSeams seams;
+    seams.slideProbe = [](int slide) { return slide <= 2; };
+    mdk::FrontendShell sh(seams);
+    mdk::FrontendMenuInput in;
+    in.attractEdge = true;   // manual right-edge advance
+    sh.update(in);
+    sh.flow().consumeRootAction();
+    CHECK(sh.flow().root().attractState() == 1);
+    CHECK(sh.flow().root().menuStringsHidden());  // state 1 hides strings
+    in = {}; in.attractEdge = true;
+    sh.update(in);
+    sh.flow().consumeRootAction();
+    CHECK(sh.flow().root().attractState() == 2);
+    CHECK(!sh.flow().root().menuStringsHidden());
+    in = {}; in.attractEdge = true;   // slide 3 missing -> wrap to 0
+    sh.update(in);
+    sh.flow().consumeRootAction();
+    CHECK(sh.flow().root().attractState() == 0);
+    CHECK(!sh.flow().root().attractSlideActive());
+    // Re-entry resets a positive/zero attract state.
+    sh.enterFrontend(false);
+    CHECK(sh.flow().root().attractState() == 0);
+  }
+
+  // Shared-machine-state preservation: the tick/mouse accumulated
+  // while an overlay ran carry into the resumed root screen.
+  {
+    mdk::FrontendShellSeams seams;
+    seams.enumerateSaves = [] { return std::vector<std::string>{}; };
+    mdk::FrontendShell sh(seams);
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setRunning(true);
+    mdk::FrontendMenuInput in;
+    in.mouseDx = 50;   // shared mouse moves during gameplay frames
+    sh.update(in);
+    const int mx = sh.sharedMachine().mouseX;
+    CHECK(mx == 300 + 50 + 0);   // 300 boot + 50 (loop-head apply)
+    in = {}; in.f1Edge = true;
+    sh.update(in);
+    in = {}; in.nextHeld = true;
+    sh.update(in);   // help exits -> sub 0
+    CHECK(sh.sharedMachine().mouseX == mx);
   }
 }
 
@@ -23446,6 +24283,10 @@ int main() {
   test_frontend_settings();
   test_frontend_flow();
   test_options_render();
+  test_save_slot_list();
+  test_save_name_entry();
+  test_abort_console();
+  test_frontend_shell();
   test_display_render();
   test_sound_render();
   test_mouse_render();

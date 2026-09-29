@@ -25,6 +25,7 @@ find_package(SDL3 REQUIRED CONFIG)
 
 # --- core library: platform-neutral, unit-testable, no SDL/Metal headers ----
 add_library(mdk_core STATIC
+  src/core/abort_console.cpp
   src/core/arena_mesh.cpp
   src/core/arena_render.cpp
   src/core/bni_directory.cpp
@@ -45,6 +46,7 @@ add_library(mdk_core STATIC
   src/core/frontend_flow.cpp
   src/core/frontend_menu.cpp
   src/core/frontend_settings.cpp
+  src/core/frontend_shell.cpp
   src/core/fti_directory.cpp
   src/core/fti_font.cpp
   src/core/fti_sprite.cpp
@@ -72,6 +74,8 @@ add_library(mdk_core STATIC
   src/core/save_full_restore.cpp
   src/core/save_full_write.cpp
   src/core/save_game.cpp
+  src/core/save_name_entry.cpp
+  src/core/save_slot_list.cpp
   src/core/sni_directory.cpp
   src/core/sni_wave.cpp
   src/core/sound_menu.cpp

@@ -55,6 +55,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -79,6 +80,11 @@ inline constexpr int kFrontendMouseResetY = 180;
 // OBSERVED hit-test constants (FUN_0041dc90: band = trunc((y-5)/36)).
 inline constexpr int kFrontendHitBandBase = 5;
 inline constexpr int kFrontendHitBandSize = 36;    // 0x24
+// OBSERVED attract idle thresholds (FUN_0041dc90 tail; doubles at
+// 0x495a20/0x495a28/0x495a30, seconds on DAT_0049aaa4).
+inline constexpr float kAttractDelayMenu = 5.0f;   // state 0 -> slide 1
+inline constexpr float kAttractDelayFirst = 4.0f;  // state 1 -> slide 2
+inline constexpr float kAttractDelaySlide = 2.0f;  // state n -> slide n+1
 
 struct FrontendMenuItem {
   int optIndex = 0;   // which OPT record (0..4)
@@ -137,8 +143,11 @@ enum class FrontendAction {
   SavedGame,     // sel 2: FUN_0041dbd4 + FUN_004202cc
   OpenOptions,   // sel 3: FUN_00420cf0 (sub-menu itself is Phase 4F)
   Quit,          // sel 4 (or sel 0 without saves): DAT_0054148e=1
-  EnterAttract,  // DIK_RIGHT edge (DAT_0054b554): attract/slideshow
-                 // trigger FUN_0041ef74 — deferred, emitted only
+  EnterAttract,  // attract/slideshow advance fired this frame
+                 // (FUN_0041ef74): DIK_RIGHT edge (DAT_0054b554)
+                 // while state >= 0, or the idle timers hitting the
+                 // 5.0/4.0/2.0 s thresholds (0x495a20/28/30). Query
+                 // attractState() for the resulting slide index.
 };
 
 // Platform-neutral per-frame input for the controller. The platform layer
@@ -171,6 +180,40 @@ enum class FrontendAction {
 //                         `edge = latch & ~prev`). Only the keyboard
 //                         child's capture poll (FUN_0041925c) reads
 //                         it; every other screen ignores it.
+//
+// Phase 18A adds the modal-overlay inputs (the original polls the same
+// global arrays for every screen — these fields are simply the edge
+// dwords the overlay frames read). Root/options ignore them all.
+//   pageUp/pageDown     : DAT_0054b5b4/0x54b5b8 gated queries (PgUp/
+//                         PgDn — save list page steps of 13).
+//   homeEdge/endEdge    : DAT_0054b5bc/0x54b5c0 (list Home/End).
+//   keyYEdge/keyNEdge   : DAT_0054b5ac/0x54b594 (abort-console Y/N).
+//   f1..f12 edges       : the overlay-arm chain globals
+//                         (0x54b5d4 F1 help, 0x54b5d8 F2 save,
+//                         0x54b5dc F3 load, 0x54b5f8 F10 abort,
+//                         0x54b5fc F11 brightness, 0x54b600 F12
+//                         options) — armed only while a non-frontend
+//                         primary mode runs with sub-mode 0.
+//   pauseEdge           : DAT_0054b630 — the in-game pause toggle.
+//   pauseAltEdge        : DAT_0054b598 — the second pause key the main
+//                         loop ORs with pauseEdge.
+//   utilityEdge         : DAT_0054b584 — the capture-utility binding
+//                         edge (the DAT_005414f0 gate is shell-side).
+//   typedChar           : the keycharmap-translated character the
+//                         overlay frames consume (FUN_0041925c ->
+//                         FUN_00419294); 0 = none this frame.
+//   leftEdge/rightEdge  : DIK_LEFT/RIGHT press edges
+//                         (DAT_0054b550/0x54b554) — cursor motion in
+//                         the save name entry; rightEdge is the same
+//                         global as attractEdge (the root menu reads
+//                         it for the attract advance).
+//   nameBackspaceEdge   : internal key 0x0e — delete char before the
+//                         cursor (block shift).
+//   nameDeleteEdge      : internal key 0x6f — delete char at cursor.
+//   nameHomeEdge        : internal key 0x66 — cursor to start
+//                         (0x54bda0 = 0).
+//   nameEndEdge         : internal key 0x6b — cursor to end
+//                         (0x54bda0 = strlen).
 struct FrontendMenuInput {
   bool prevHeld = false;
   bool nextHeld = false;
@@ -184,6 +227,28 @@ struct FrontendMenuInput {
   int mouseDz = 0;
   std::uint8_t mouseButtons = 0;
   std::array<std::uint32_t, 4> rawKeyEdge{};
+  bool pageUpEdge = false;
+  bool pageDownEdge = false;
+  bool homeEdge = false;
+  bool endEdge = false;
+  bool keyYEdge = false;
+  bool keyNEdge = false;
+  bool f1Edge = false;
+  bool f2Edge = false;
+  bool f3Edge = false;
+  bool f10Edge = false;
+  bool f11Edge = false;
+  bool f12Edge = false;
+  bool pauseEdge = false;
+  bool pauseAltEdge = false;
+  bool utilityEdge = false;
+  char typedChar = 0;
+  bool leftEdge = false;
+  bool rightEdge = false;
+  bool nameBackspaceEdge = false;
+  bool nameDeleteEdge = false;
+  bool nameHomeEdge = false;
+  bool nameEndEdge = false;
 };
 
 // The reconstructed controller. Frame protocol mirrors the original
@@ -209,7 +274,19 @@ public:
   int mouseY() const { return mouseY_; }               // DAT_0054b638
   int tick() const { return tick_; }                   // DAT_00541518
   float idleSeconds() const { return idleSeconds_; }   // DAT_0049aaa4
-  int listState() const { return 0; }                  // DAT_0049aa98
+  // DAT_0049aa98 — the attract/slideshow state: -1 = disabled (the
+  // first slide, MDKS_001.GIF, failed to load and the state stays -1
+  // even across FUN_0041d85c re-init, which only resets values > 0);
+  // 0 = menu idle; 1 = MDKS_001 on screen (menu strings hidden);
+  // n >= 2 = MDKS_<n> on screen (menu strings drawn over it).
+  int listState() const { return attractState_; }
+  int attractState() const { return attractState_; }
+  // The slide pixel payload (DAT_0049aaa0) is bound when the provider
+  // reported a loadable 600x360 MDKS_<state>.GIF; cleared on failure.
+  bool attractSlideActive() const { return slideActive_; }
+  // DAT_0049aa98 == 1 hides the menu item strings (the FUN_0041dc90
+  // draw block draws strings only when the state is not 1).
+  bool menuStringsHidden() const { return attractState_ == 1; }
   float rampAccumulator() const { return ramp_.acc; }  // DAT_0054bdd8
   float smoothedDelta() const { return timing_.smoothed; }  // DAT_0049b6f0
   float deltaSeconds() const { return timing_.deltaSec; }   // DAT_0049b6f4
@@ -253,13 +330,43 @@ public:
   // activation branch.
   bool frameEndedEarly() const { return endedEarly_; }
 
+  // Slide provider seam (Phase 18A): the host supplies
+  //   bool probe(int slideNo)
+  // answering "MISC\MDKS_<slideNo:03>.GIF exists and decodes to a
+  // 600x360 image" — the FUN_0041b004 + FUN_00416e98 chain inside
+  // FUN_0041ef74. The provider may also preload the slide pixels for
+  // the renderer; the core only consumes the yes/no (and keeps
+  // `slideActive_` for the draw override). Default provider reports
+  // no slides: the first advance goes straight to state -1.
+  using AttractSlideProbe = std::function<bool(int slideNo)>;
+  void setAttractSlideProbe(AttractSlideProbe p);
+  // FUN_0041d85c resets DAT_0049aa98 only when it is > 0 — a -1
+  // (first slide missing) survives every frontend re-entry.
+  void resetAttractIfPositive();
+  // FUN_0041d85c re-entry on an existing controller: selection and
+  // the savesExist gate re-derive, pending actions clear, and the
+  // attract state resets only when > 0. The shared machine block
+  // (mouse/tick/deadlines/latch/ramp/timing) and the slide provider
+  // persist — the original does not touch them here.
+  void resetForEntry(bool savesExist);
+  // The FUN_004140f4 blend gate inside the attract check: while a
+  // screen blend/transition resource (DAT_0049aa8c) is active and not
+  // finished, the idle timer is held at 0 and the advance suppressed.
+  // The shell/host raises this while an entry transition runs.
+  void setAttractBlendActive(bool b) { attractBlend_ = b; }
+
 private:
+  void attractAdvance();  // FUN_0041ef74 state advance + load attempt
   bool savesExist_;
   int selection_;        // DAT_0049aa78
   int mouseX_;           // DAT_0054b634
   int mouseY_;           // DAT_0054b638
   int tick_ = 0;         // DAT_00541518
   float idleSeconds_ = 0.0f; // DAT_0049aaa4
+  int attractState_ = 0;     // DAT_0049aa98
+  bool slideActive_ = false; // DAT_0049aaa0 bound (slide pixels valid)
+  bool attractBlend_ = false; // DAT_0049aa8c blend gate
+  AttractSlideProbe slideProbe_; // MISC\MDKS_%03d.GIF load probe
   // Repeat deadlines (DAT_0049ac84 up, DAT_0049ac88 down).
   int prevDeadline_ = 0;
   int nextDeadline_ = 0;

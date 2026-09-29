@@ -36,6 +36,12 @@ namespace mode {
 // for provenance only — do not implement semantics from these yet.
 namespace observed {
 inline constexpr PrimaryModeId frontend = 0;   // STRONG evidence
+// Phase 18A (OBSERVED): the dispatch-tail `CMP DL,AL` at 0x40153e
+// compares against EDX=1 (the loop's sentinel, set at 0x4010a1) —
+// primary mode 1 runs FUN_00418e04, the static-noise transition
+// frame (intro -> frontend dissolve etc.). Mode 4 and any other
+// unlisted value fall through to FUN_0041dc90 (the frontend menu).
+inline constexpr PrimaryModeId noiseTransition = 1; // STRONG evidence
 inline constexpr PrimaryModeId transition = 2; // STRONG evidence
 inline constexpr PrimaryModeId traversal = 3;  // STRONG evidence
 inline constexpr PrimaryModeId stats = 5;      // STRONG evidence

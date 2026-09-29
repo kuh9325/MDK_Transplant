@@ -40,6 +40,8 @@
 #ifndef MDK_CORE_FRONTEND_MACHINES_H
 #define MDK_CORE_FRONTEND_MACHINES_H
 
+#include <cstdint>
+
 namespace mdk {
 
 // OBSERVED coordinate clamps (FUN_004187e0 accumulate / FUN_0041dc90 +
@@ -216,6 +218,27 @@ struct FrontendMachineState {
   // that uses flagged draws.
   int markerAcc = 0;
 };
+
+// FUN_00423764 — the shared activate query: DIK_RETURN edge
+// (DAT_0054b574) OR an any-button down-edge while the DAT_0049ac80
+// latch is armed. The latch re-arms when all buttons are released and
+// is consumed on fire. Used by the root menu, the saved-games list,
+// and the abort console — identical helper, identical global.
+inline bool frontendConfirmQuery(FrontendMachineState& s,
+                                 bool confirmEdge,
+                                 std::uint8_t mouseButtons) {
+  if (mouseButtons == 0) {
+    s.buttonLatch = true;
+  }
+  bool fire = confirmEdge;
+  if (!fire && s.buttonLatch && mouseButtons != 0) {
+    fire = true;
+  }
+  if (fire) {
+    s.buttonLatch = false;
+  }
+  return fire;
+}
 
 } // namespace mdk
 

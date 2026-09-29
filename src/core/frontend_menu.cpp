@@ -248,14 +248,75 @@ void FrontendMenuController::update(const FrontendMenuInput& in) {
   // 5. Idle/attract timer: DAT_0049aaa4 += DAT_0049b6f4 each frame.
   idleSeconds_ += timing_.deltaSec;
 
-  // 6. DIK_RIGHT press edge (DAT_0054b554) with list state >= 0 forces
-  // the attract trigger (FUN_0041ef74 path) — emitted as a semantic
-  // event; the slideshow itself is deferred. An activation dispatched
-  // earlier in the same frame already leaves the menu, so it wins.
-  if (in.attractEdge && listState() >= 0 &&
-      action_ == FrontendAction::None) {
-    action_ = FrontendAction::EnterAttract;
+  // 6. Attract advance (OBSERVED, FUN_0041dc90 tail + FUN_0041ef74):
+  //    advance = (DIK_RIGHT edge && state >= 0)
+  //              || (state == 0 && idle >= 5.0f)   // 0x495a20 double
+  //              || (state == 1 && idle >= 4.0f)   // 0x495a28 double
+  //              || (state  > 1 && idle >= 2.0f);  // 0x495a30 double
+  //    While the blend buffer (DAT_0049aa8c) is mid-transition the
+  //    timer is held at 0 instead. An activation dispatched earlier
+  //    in the same frame already RET'd, so it wins. On fire: the idle
+  //    timer resets to 0 and FUN_0041ef74 advances the state and loads
+  //    MDKS_<state:03>.GIF — load failure sends state > 1 back to 0
+  //    (wrap to menu) or state <= 1 to -1 (attract disabled).
+  if (action_ == FrontendAction::None) {
+    if (attractBlend_) {
+      idleSeconds_ = 0.0f;
+    } else {
+      bool advance = in.attractEdge && attractState_ >= 0;
+      if (attractState_ == 0 && idleSeconds_ >= kAttractDelayMenu) {
+        advance = true;
+      } else if (attractState_ == 1 &&
+                 idleSeconds_ >= kAttractDelayFirst) {
+        advance = true;
+      } else if (attractState_ > 1 &&
+                 idleSeconds_ >= kAttractDelaySlide) {
+        advance = true;
+      }
+      if (advance) {
+        idleSeconds_ = 0.0f;
+        attractAdvance();
+        action_ = FrontendAction::EnterAttract;
+      }
+    }
   }
+}
+
+// FUN_0041ef74 (OBSERVED): FUN_0041ef10 teardown first (frees the old
+// slide + blend buffers — provider-side), then ++DAT_0049aa98, then
+// sprintf "MISC\MDKS_%3.3d.GIF" + FUN_0041b004 open + FUN_00416e98
+// GIF decode gated on 600x360. On failure: state > 1 wraps to 0,
+// state <= 1 goes to -1 (attract permanently disabled for the
+// session — FUN_0041d85c only resets positive states).
+void FrontendMenuController::attractAdvance() {
+  ++attractState_;
+  slideActive_ = slideProbe_ ? slideProbe_(attractState_) : false;
+  if (!slideActive_) {
+    attractState_ = (attractState_ > 1) ? 0 : -1;
+  }
+}
+
+void FrontendMenuController::setAttractSlideProbe(AttractSlideProbe p) {
+  slideProbe_ = std::move(p);
+}
+
+void FrontendMenuController::resetAttractIfPositive() {
+  // FUN_0041d85c: `if (DAT_0049aa98 > 0) DAT_0049aa98 = 0` — a -1
+  // (first slide missing) is deliberately left in place.
+  if (attractState_ > 0) {
+    attractState_ = 0;
+    slideActive_ = false;
+  }
+}
+
+void FrontendMenuController::resetForEntry(bool savesExist) {
+  savesExist_ = savesExist;
+  selection_ = savesExist ? 0 : 1;   // DAT_0049aa78 = !DAT_0054bc98
+  action_ = FrontendAction::None;
+  endedEarly_ = false;
+  resetAttractIfPositive();
+  // DAT_0049aaa4 (idle timer) is not written here — it survives
+  // re-entry like the rest of the shared globals.
 }
 
 float FrontendMenuController::itemScale(int centerX, int itemY,

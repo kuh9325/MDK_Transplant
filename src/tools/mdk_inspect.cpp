@@ -28,6 +28,7 @@
 #include "core/file_family.h"
 #include "core/freefall_runtime.h"
 #include "core/frontend_machines.h"
+#include "core/frontend_shell.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
@@ -47,13 +48,16 @@
 #include "core/stream_context.h"
 #include "core/traversal_runtime.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -139,6 +143,14 @@ int usage() {
                "                            frame steps (deterministic under\n"
                "                            --seed), re-parses and re-restores it,\n"
                "                            and reports equivalence)\n"
+               "       mdk-inspect [--data-path DIR] --frontend-script\n"
+               "                            (Phase 18A: deterministic\n"
+               "                            scripted-input run over the\n"
+               "                            frontend shell — mode/sub-mode,\n"
+               "                            overlay arms, save slots, requests.\n"
+               "                            With --data-path the SAVES dir is\n"
+               "                            enumerated for real; writes are\n"
+               "                            reported but never performed)\n"
                "       mdk-inspect --selftest\n"
                "       mdk-inspect --selftest-player-surface\n"
                "       mdk-inspect --selftest-camera-pose\n"
@@ -1536,6 +1548,285 @@ void fireCombatHits(mdk::TraversalRuntime& rt,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 18A — deterministic frontend scripted-input diagnostic.
+// Drives the Phase-18A FrontendShell (mode/sub-mode machine, overlay
+// arms, save list, name entry, abort console) with synthetic seams
+// and prints the resulting state each frame. With --data-path the
+// SAVES directory is enumerated for real; without it a synthetic
+// fixture set is used. The tool never writes save files — the
+// write seam is reported as a stub.
+
+const char* frontendRequestName(mdk::FrontendRequest r) {
+  switch (r) {
+  case mdk::FrontendRequest::None: return "none";
+  case mdk::FrontendRequest::Quit: return "Quit";
+  case mdk::FrontendRequest::StartNewGame: return "StartNewGame";
+  case mdk::FrontendRequest::ContinueLastGame: return "ContinueLastGame";
+  case mdk::FrontendRequest::LoadSave: return "LoadSave";
+  case mdk::FrontendRequest::WriteSaveDone: return "WriteSaveDone";
+  case mdk::FrontendRequest::AbortToFrontend: return "AbortToFrontend";
+  case mdk::FrontendRequest::ResumeTraversal: return "ResumeTraversal";
+  case mdk::FrontendRequest::CycleBrightness: return "CycleBrightness";
+  case mdk::FrontendRequest::CaptureUtility: return "CaptureUtility";
+  case mdk::FrontendRequest::OpenLegacyScreen: return "OpenLegacyScreen";
+  }
+  return "?";
+}
+
+const char* frontendFxName(mdk::FrontendFx f) {
+  switch (f) {
+  case mdk::FrontendFx::PauseSounds: return "PauseSounds";
+  case mdk::FrontendFx::ResumeSounds: return "ResumeSounds";
+  case mdk::FrontendFx::ResumeSoundsAlt: return "ResumeSoundsAlt";
+  case mdk::FrontendFx::MenuSongStart: return "MenuSongStart";
+  case mdk::FrontendFx::LoadFrontendResources:
+    return "LoadFrontendResources";
+  case mdk::FrontendFx::TransitionArmed: return "TransitionArmed";
+  case mdk::FrontendFx::AbortDialogResources:
+    return "AbortDialogResources";
+  case mdk::FrontendFx::SaveNameThumbnailGrab:
+    return "SaveNameThumbnailGrab";
+  }
+  return "?";
+}
+
+const char* frontendScreenName(mdk::FrontendScreen s) {
+  switch (s) {
+  case mdk::FrontendScreen::Root: return "root";
+  case mdk::FrontendScreen::Options: return "options";
+  case mdk::FrontendScreen::Display: return "display";
+  case mdk::FrontendScreen::Sound: return "sound";
+  case mdk::FrontendScreen::Mouse: return "mouse";
+  case mdk::FrontendScreen::Keyboard: return "keyboard";
+  }
+  return "?";
+}
+
+void printFrontendState(const char* tag, mdk::FrontendShell& sh) {
+  // Drain the per-frame outputs for printing.
+  std::string reqs;
+  while (sh.pendingRequest() != mdk::FrontendRequest::None) {
+    if (!reqs.empty()) reqs += ',';
+    reqs += frontendRequestName(sh.pendingRequest());
+    if (!sh.requestName().empty()) {
+      reqs += '(';
+      reqs += sh.requestName();
+      reqs += ')';
+    }
+    sh.consumeRequest();
+  }
+  std::string fx;
+  for (const auto f : sh.drainFx()) {
+    if (!fx.empty()) fx += ',';
+    fx += frontendFxName(f);
+  }
+  const int sel = sh.flow().screen() == mdk::FrontendScreen::Root
+                      ? sh.flow().root().selection()
+                      : -1;
+  std::printf("  %-26s mode=%d sub=%2d screen=%-8s sel=%2d "
+              "saves=%d paused=%d idle=%d quit=%d reqs=[%s] fx=[%s]\n",
+              tag, sh.primaryMode(), sh.subMode(),
+              frontendScreenName(sh.flow().screen()), sel,
+              sh.flow().root().savesExist() ? 1 : 0,
+              sh.paused() ? 1 : 0, sh.idleTicks(),
+              sh.quitRequested() ? 1 : 0,
+              reqs.empty() ? "-" : reqs.c_str(),
+              fx.empty() ? "-" : fx.c_str());
+}
+
+int frontendScript(const std::optional<std::string>& dataPath) {
+  namespace fs = std::filesystem;
+  mdk::FrontendShellSeams seams;
+  std::vector<std::string> saveFiles;
+  fs::path savesDir;
+  const bool realData =
+      dataPath && fs::is_directory(fs::path(*dataPath) / "SAVES");
+
+  if (realData) {
+    savesDir = fs::path(*dataPath) / "SAVES";
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(savesDir, ec)) {
+      if (!e.is_regular_file(ec)) continue;
+      const auto name = e.path().filename().string();
+      const auto ext = e.path().extension().string();
+      if (ext == ".SAV" || ext == ".sav") {
+        saveFiles.push_back(name);
+      }
+    }
+    std::sort(saveFiles.begin(), saveFiles.end());
+    seams.lastGameExists = [savesDir] {
+      std::error_code ec;
+      return fs::exists(savesDir / "LASTGAME.SAV", ec) ||
+             fs::exists(savesDir / "lastgame.sav", ec);
+    };
+    seams.enumerateSaves = [&saveFiles] { return saveFiles; };
+    seams.inspectSlot =
+        [savesDir](std::string_view stem)
+        -> std::optional<mdk::SaveSlotSummary> {
+      mdk::SaveGame sg;
+      if (mdk::saveGameLoadFile(savesDir / (std::string(stem) + ".SAV"),
+                                sg, /*strictPackets=*/false) !=
+          mdk::SaveError::kOk) {
+        return std::nullopt;
+      }
+      mdk::SaveSlotSummary s;
+      s.valid = true;
+      s.fullSave = sg.game.full();
+      s.levelId = sg.game.levelId;
+      s.modeField = sg.game.modeField;
+      s.health = sg.game.health;
+      s.deathCount = sg.game.deathCount;
+      return s;
+    };
+    std::printf("frontend-script: real SAVES enumeration (%zu files)\n",
+                saveFiles.size());
+  } else {
+    // Synthetic fixtures: a full save, a header-only inter-level
+    // save, and an unreadable entry.
+    saveFiles = {"1.SAV", "BOSS2.SAV", "HDRONLY.SAV", "BAD.SAV"};
+    seams.lastGameExists = [] { return true; };
+    seams.enumerateSaves = [&saveFiles] { return saveFiles; };
+    seams.inspectSlot =
+        [](std::string_view stem)
+        -> std::optional<mdk::SaveSlotSummary> {
+      if (stem == "BAD") return std::nullopt;  // unreadable -> invalid
+      mdk::SaveSlotSummary s;
+      s.name = std::string(stem);
+      s.valid = true;
+      if (stem == "HDRONLY") {           // inter-level autosave shape
+        s.fullSave = false;
+        s.modeField = 6;
+        s.levelId = 2;
+        s.health = 100;
+      } else {
+        s.fullSave = true;               // modeField >= 1000
+        s.modeField = 1003;
+        s.levelId = stem == "1" ? 0 : 3;
+        s.health = stem == "1" ? 100 : 62;
+        s.deathCount = stem == "1" ? 0 : 4;
+      }
+      return s;
+    };
+    std::printf("frontend-script: synthetic SAVES fixtures "
+                "(%zu files)\n", saveFiles.size());
+  }
+  // The diagnostic never writes save files — report the would-be
+  // write and let the shell believe it succeeded.
+  seams.writeSave = [](std::string_view name, bool headerOnly) {
+    std::printf("      [write-stub] SAVES\\%s.SAV headerOnly=%d\n",
+                std::string(name).c_str(), headerOnly ? 1 : 0);
+    return true;
+  };
+
+  mdk::FrontendShell sh(std::move(seams));
+  mdk::FrontendMenuInput in;
+  auto step = [&](const char* tag) {
+    sh.update(in);
+    sh.endFrame(33.3);
+    printFrontendState(tag, sh);
+    in = {};
+  };
+  auto press = [&](const char* tag, bool mdk::FrontendMenuInput::*f) {
+    in.*f = true;
+    step(tag);
+    step("  (release)");
+  };
+
+  std::printf("== frontend script ==\n");
+  std::printf("[boot] fresh entry (FUN_0041d85c arg=0)\n");
+  step("boot");
+
+  std::printf("[nav] selection moves down through the 5 items\n");
+  press("down -> sel+1", &mdk::FrontendMenuInput::nextHeld);
+  press("down -> sel+1", &mdk::FrontendMenuInput::nextHeld);
+
+  std::printf("[saves] sel2 Saved Game -> sub 1 list\n");
+  in.confirmEdge = true;
+  step("confirm -> arm list");
+  {
+    const auto* l = sh.saveList();
+    if (l) {
+      std::printf("      slots (%d):", l->count());
+      for (const auto& s : l->stems()) std::printf(" %s", s.c_str());
+      std::printf("\n");
+      // Inspect each row by navigating down and reading the summary.
+      for (int i = 0; i < l->count(); ++i) {
+        if (i > 0) {
+          press("  list down", &mdk::FrontendMenuInput::nextHeld);
+        }
+        if (const auto* s = sh.saveList()->selected()) {
+          std::printf("        slot %d: name=%-8s valid=%d full=%d "
+                      "modeField=%d level=%d health=%d deaths=%d\n",
+                      i, s->name.c_str(), s->valid ? 1 : 0,
+                      s->fullSave ? 1 : 0, s->modeField, s->levelId,
+                      s->health, s->deathCount);
+        }
+      }
+    }
+  }
+  in.cancelEdge = true;
+  step("Esc -> list exit");
+
+  std::printf("[continue] sel0 Continue -> ContinueLastGame\n");
+  // Fresh re-entry left sel at 0.
+  in.confirmEdge = true;
+  step("confirm -> continue");
+  std::printf("      (host reports load failure -> fresh re-entry)\n");
+  sh.notifyLoadResult(false);
+  printFrontendState("load-failed", sh);
+
+  std::printf("[new game] sel1 New Game -> StartNewGame\n");
+  press("down", &mdk::FrontendMenuInput::nextHeld);
+  in.confirmEdge = true;
+  step("confirm -> new game");
+
+  std::printf("[options] sel3 Options -> sub 11, Esc backs out\n");
+  press("down", &mdk::FrontendMenuInput::nextHeld);
+  press("down", &mdk::FrontendMenuInput::nextHeld);
+  in.confirmEdge = true;
+  step("confirm -> options");
+  in.cancelEdge = true;
+  step("Esc -> back");
+
+  std::printf("[ingame] host sets mode=3 running -> F2 save gate\n");
+  sh.setPrimaryMode(mdk::mode::observed::traversal);
+  sh.setRunning(true);
+  sh.setSaveBlockFlags(false, false, /*xStrike=*/true);
+  in.f2Edge = true;
+  step("F2 (X_STRIKE live)");
+  sh.setSaveBlockFlags(false, false, false);
+  in.f2Edge = true;
+  step("F2 (gate open)");
+  for (const char c : std::string_view("MDK")) {
+    in.typedChar = c;
+    step("  type");
+  }
+  in.confirmEdge = true;
+  step("Enter -> commit");
+
+  std::printf("[ingame] Esc arms the abort console and the same-frame\n");
+  std::printf("         dispatch self-cancels it (OBSERVED quirk)\n");
+  in.cancelEdge = true;
+  step("Esc");
+
+  std::printf("[ingame] F10 abort -> Y -> AbortToFrontend\n");
+  in.f10Edge = true;
+  step("F10 -> abort arm");
+  in.keyYEdge = true;
+  step("Y -> yes");
+
+  std::printf("[returning] enterFrontend(arg!=0): transition armed, "
+              "Esc arm suppressed\n");
+  sh.enterFrontend(true);
+  printFrontendState("enterFrontend(1)", sh);
+  in.cancelEdge = true;
+  step("Esc (suppressed)");
+
+  std::printf("[done]\n");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1554,6 +1845,7 @@ int main(int argc, char** argv) {
   bool freefallRuntime = false;
   bool campaignHandoff = false;
   bool campaignSequence = false;
+  bool frontendScriptMode = false;
   std::optional<std::string> saveInfoPath;
   std::optional<std::string> saveRoundtripPath;
   std::optional<std::string> saveRestorePath;
@@ -1743,6 +2035,8 @@ int main(int argc, char** argv) {
       campaignHandoff = true;
     } else if (!std::strcmp(a, "--campaign-sequence")) {
       campaignSequence = true;
+    } else if (!std::strcmp(a, "--frontend-script")) {
+      frontendScriptMode = true;
     } else if (!std::strcmp(a, "--save-info")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -1868,6 +2162,13 @@ int main(int argc, char** argv) {
     } else {
       target = a;
     }
+  }
+
+  // --frontend-script: Phase 18A deterministic scripted-input
+  // diagnostic over the frontend shell. --data-path is optional:
+  // without it the SAVES fixtures are synthetic.
+  if (frontendScriptMode) {
+    return frontendScript(dataPath);
   }
 
   // --campaign-sequence: Phase 14A diagnostic. No <relative-path>

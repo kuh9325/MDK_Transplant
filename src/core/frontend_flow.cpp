@@ -196,6 +196,65 @@ void FrontendFlowController::returnToRoot() {
   screen_ = FrontendScreen::Root;
 }
 
+// Phase 18A — FUN_0041d85c on a live flow (abort-to-frontend,
+// ending-return, load-failure). The original tears the active mode
+// down OUTSIDE this call; here we close any open child screen and
+// re-seat the root controller. The shared machine block and the
+// settings globals persist (the original writes none of them).
+void FrontendFlowController::enterOptionsSubtree(
+    const FrontendMachineState& s) {
+  // Same body as enterOptions() with the shared block supplied by the
+  // caller — FUN_00420cf0 does not care which screen was visible.
+  options_.emplace(s, devHidden_, skill_, settingsDirty_);
+  screen_ = FrontendScreen::Options;
+}
+
+FrontendMachineState FrontendFlowController::activeMachineState()
+    const {
+  switch (screen_) {
+  case FrontendScreen::Options:  return options_->machineState();
+  case FrontendScreen::Display:  return display_->machineState();
+  case FrontendScreen::Sound:    return sound_->machineState();
+  case FrontendScreen::Mouse:    return mouse_->machineState();
+  case FrontendScreen::Keyboard: return keyboard_->machineState();
+  case FrontendScreen::Root:
+  default:                       return root_.machineState();
+  }
+}
+
+void FrontendFlowController::endFrame(double dtMs) {
+  switch (screen_) {
+  case FrontendScreen::Options:  options_->endFrame(dtMs);  break;
+  case FrontendScreen::Display:  display_->endFrame(dtMs);  break;
+  case FrontendScreen::Sound:    sound_->endFrame(dtMs);    break;
+  case FrontendScreen::Mouse:    mouse_->endFrame(dtMs);    break;
+  case FrontendScreen::Keyboard: keyboard_->endFrame(dtMs); break;
+  case FrontendScreen::Root:
+  default:                       root_.endFrame(dtMs);      break;
+  }
+}
+
+void FrontendFlowController::enterFrontend(bool savesExist) {
+  if (options_) {
+    root_.setMachineState(options_->machineState());
+  } else if (display_) {
+    root_.setMachineState(display_->machineState());
+  } else if (sound_) {
+    root_.setMachineState(sound_->machineState());
+  } else if (mouse_) {
+    root_.setMachineState(mouse_->machineState());
+  } else if (keyboard_) {
+    root_.setMachineState(keyboard_->machineState());
+  }
+  options_.reset();
+  display_.reset();
+  sound_.reset();
+  mouse_.reset();
+  keyboard_.reset();
+  root_.resetForEntry(savesExist);
+  screen_ = FrontendScreen::Root;
+}
+
 // FUN_0041d020 (OBSERVED, disasm_41d020.txt / phase4h_funcs.txt):
 // DAT_00541493 = 7, DAT_0054b834 = 2 — plus the palette work (dlut
 // saves the active palette, slut = SYS_PAL head + 4x48 ramps

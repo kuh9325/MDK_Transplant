@@ -7034,3 +7034,106 @@ music-class/frontend audio remain for a later ambience/music phase —
 never reachable from traversal SFX playback.
 
 **TRAVERSAL SFX PLAYBACK: CLOSED FOR BUILD_A**
+
+# Phase 18A — Frontend / Menu RE + Core Contract
+
+## 234. Frontend root and the mode/sub-mode machine (OBSERVED — BUILD_A disasm)
+
+The frontend is not a separate state machine — it is two globals read
+by the main loop `FUN_0040103c` every frame: `DAT_00541492` (primary
+mode) and `DAT_00541493` (sub-mode). Per frame the loop head runs
+`FUN_0046ceac` (device fold into the `0x54b5xx` edge globals) +
+`FUN_004187e0` (logical-mouse accumulate, clamp 599x359) +
+`DAT_00541518 += DAT_0049b6e8` (tick), then the pause block
+(`DAT_00499a08`/`DAT_0054151c`), the `0x40112c` utility check
+(`FUN_00428340`), the `DAT_005414fc` idle counter, the Esc-abort arm
+(`FUN_004030a8`, not mode-gated — `DAT_0054152c` suppresses it on
+returning entries), the F1>F2>F3>F10>F11>F12 overlay chain
+(`sub==0 && mode!=0`, first match wins), `FUN_00406ef4`, and only
+THEN re-reads `DAT_00541493` for the jump-table dispatch at
+`0x401010` — a just-armed overlay runs its first frame in the SAME
+iteration (the OBSERVED Esc quirk: Esc arms the abort console and the
+console's own Esc-cancel consumes the live edge immediately).
+
+Sub-mode map (jump table, OBSERVED): 1 saved-games list
+(`FUN_004206d0`), 2 sound, 3 joystick (LEGACY, not ported), 4 mouse,
+5 keyboard, 6 performance (LEGACY, not ported), 7 display, 8 save
+name entry (`FUN_00422dec`), 9 abort console (`FUN_00403264`), 10
+help (`FUN_0041d630`), 11 options (`FUN_00420eac`); `sub==0` falls
+through to the primary-mode dispatch (mode 1 = `FUN_00418e04` static
+noise, gameplay modes 2/3/5/6/7/8 host-side, everything else
+`FUN_0041dc90` the root menu). Sub-modes > 11 and the two legacy
+subs dispatch nothing.
+
+Root menu (`FUN_0041dc90`): five items Continue/New Game/Saved
+Game/Options/Quit (`OPT0..OPT4`); Continue hidden-but-indexed when
+`FUN_00428290` says no `SAVES\LASTGAME.SAV` (selection starts at
+`!exists`). Attract: `DAT_0049aa98` — `>0` reset by re-entry, `-1`
+sticky; idle thresholds 5.0/4.0/2.0 s (`0x495a20/28/30`) +
+DIK_RIGHT edge advance `FUN_0041ef74` probing `MISC\MDKS_%03d.GIF`
+(600x360 gate); blend buffer `DAT_0049aa8c` suppresses the timer.
+
+Save list (`FUN_004202cc`/`FUN_004206d0`): stems truncated at first
+' '/'.', <=8 chars; selection clamps (no wrap); PgUp/PgDn = 13;
+window 13 rows; typed-char first-byte jump; mouse band
+`0x66 < y < 0x137` rows of 16 px with edge scroll;
+`FUN_00428144` lazy inspect — confirm on an INVALID entry EXITS
+(OBSERVED quirk); teardown `FUN_0042056c(arg)`: arg=0 cleanup only
+(load path — `FUN_00427f94` decides sub on completion), arg=1
+cancel (mode 0 -> `FUN_0041d85c` fresh entry; mode!=0 -> resume
+chain `FUN_00402590` + mode-3 `FUN_004348d4`).
+
+Save name entry (`FUN_00422bc0` arm / `FUN_00422dec` frame): the
+manual gate (arg==0, the F2 arm) requires mode 3 + sub 0 +
+`DAT_00540e9c`/`DAT_00540d9c` clear + NO live `X_STRIKE` object —
+**retail CANNOT save mid-fight during the L8 gun-strike** (the
+entity scan rejects the arm silently). Autosave arms (arg!=0, the
+mode-5 tally-complete path) bypass the gate, run the "SAVE CURRENT
+POSITION?" confirm phase first (`DAT_0054bd9c = (arg==0)` — the
+flag runs the confirm while ZERO), prefill `"<levelIndex+1>"`, and
+write header-only (`DAT_0054bdb4`). Editing: 8-char cap, charset
+alnum+`_`+`$`, overwrite-at-cursor (no insert), distinct
+Backspace (shift-delete before cursor) / Delete (at cursor),
+Home/End, Enter gated on `cursor >= 1` (NOT the name length —
+OBSERVED quirk), Esc cancels from either phase, write failure keeps
+the dialog.
+
+Abort console (`FUN_004030a8` arm / `FUN_00403264` frame):
+`DAT_004a1e28` sel wraps 0<->1 (0=yes); Y edge -> yes
+(`FUN_004031b8`: `FUN_004025d0` + mode 0 -> `DAT_0054148e=1` quit,
+mode!=0 -> per-mode teardown then `FUN_0041d85c`); N/Esc -> no
+(`FUN_0040316c`: `FUN_00402590` unconditionally, mode 0 -> fresh
+`FUN_0041d85c`, mode 3 -> `FUN_004348d4`).
+
+## 235. Native contract (IMPLEMENTED)
+
+`core/frontend_shell.{h,cpp}` — `FrontendShell` owns
+`primaryMode_`/`subMode_`/`transitionByte_`/`savedByte_`, the pause
+pair, the idle counter, the overlay controllers
+(`SaveSlotListController`, `SaveNameEntryController`,
+`AbortConsoleController`), the shared `FrontendMachineState` mirror
+transferred between screens (the original's process globals), a
+request QUEUE (`Quit`/`StartNewGame`/`ContinueLastGame`/`LoadSave`/
+`WriteSaveDone`/`AbortToFrontend`/`ResumeTraversal`/
+`CycleBrightness`/`CaptureUtility`/`OpenLegacyScreen` — a commit
+frame emits both `WriteSaveDone` and the teardown's resume), and
+`FrontendFx` host events (sound pause/resume, MAINSONG, resource
+reload, transition arm, thumbnail grab). `FrontendShellSeams`:
+`lastGameExists`/`enumerateSaves`/`inspectSlot`/`writeSave`/
+`slideProbe` — the shell never touches the filesystem itself.
+`SaveSlotSummary` = the slot metadata API (valid/fullSave/levelId/
+modeField/health/deathCount — no invented fields).
+
+`mdk-inspect --frontend-script [--data-path DIR]` — deterministic
+scripted-input diagnostic: boot/nav/save-slot enumeration + per-slot
+metadata/Continue/New Game/options/in-game F2 gate/X_STRIKE block/
+autosave shape/Esc self-cancel/F10 abort/returning entry; never
+writes saves.
+
+Regression: `mdk_tests` 6117/0 (+150 checks), CTest 1/1, pytest
+17+8skip, selftests 4/4, traversal L3-L8 60f digests EXACT
+(`25766a67ce50ea46 950219ddeae8b679 2379f7e90204e671
+5686edbf38de3fda 57bdd179a944a4c9 2edeb4aa6c7ef486`), freefall
+c0-c4 digests EXACT. Godot presentation NOT implemented — Phase 18B.
+
+**FRONTEND / MENU CORE: CLOSED FOR BUILD_A**
