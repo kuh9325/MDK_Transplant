@@ -20,6 +20,7 @@
 #include "core/dti_structure.h"
 #include "core/enemy_runtime.h"
 #include "core/fti_directory.h"
+#include "core/indexed_image.h"
 #include "core/keyboard_menu.h"
 #include "core/mto_directory.h"
 #include "core/save_full_restore.h"
@@ -141,6 +142,9 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::get_active_palette);
   ClassDB::bind_method(D_METHOD("fx_stab", "from", "to", "arena_index"),
                        &MdkBridge::fx_stab);
+  // Phase 17B.2 — traversal HUD / view presentation.
+  ClassDB::bind_method(D_METHOD("get_hud_snapshot"),
+                       &MdkBridge::get_hud_snapshot);
   // Phase 16C — freefall (mode 2).
   ClassDB::bind_method(
       D_METHOD("load_freefall", "course", "skill", "seed"),
@@ -373,7 +377,10 @@ void MdkBridge::decodeKurtTables_() {
   }
 }
 
-void MdkBridge::refreshKurtPalette_() {
+const std::uint8_t* MdkBridge::activePalette_() const {
+  // The displayed arena's composed palette, else the level fallback
+  // (SYS_PAL head + region-B + DTI-s3 compose). Shared by the Kurt
+  // sprite path, get_active_palette(), and the HUD expand.
   const std::uint8_t* pal = levelPalette_.data();
   if (arenaIndex_ >= 0) {
     if (auto it = arenaSets_.find(arenaIndex_);
@@ -381,6 +388,11 @@ void MdkBridge::refreshKurtPalette_() {
       pal = it->second->palette.data();
     }
   }
+  return pal;
+}
+
+void MdkBridge::refreshKurtPalette_() {
+  const std::uint8_t* pal = activePalette_();
   if (std::memcmp(pal, kurtPalette_.data(), 768) != 0) {
     std::memcpy(kurtPalette_.data(), pal, 768);
     kurtPalKey_ = fnvAppend(0xcbf29ce484222325ull, pal, 768);
@@ -1700,14 +1712,7 @@ PackedByteArray MdkBridge::get_active_palette() {
   // composed palette, else the level fallback (SYS_PAL head +
   // region-B + DTI-s3 compose). The FUN_00437444 shard pens and the
   // HUD rectfill both index this active display palette.
-  const std::uint8_t* pal = levelPalette_.data();
-  if (arenaIndex_ >= 0) {
-    if (auto it = arenaSets_.find(arenaIndex_);
-        it != arenaSets_.end()) {
-      pal = it->second->palette.data();
-    }
-  }
-  std::memcpy(out.ptrw(), pal, 768);
+  std::memcpy(out.ptrw(), activePalette_(), 768);
   return out;
 }
 
@@ -1754,6 +1759,183 @@ Array MdkBridge::get_arena_names() const {
   for (const auto& a : rt_->arenas) {
     out.push_back(String(a->name.c_str()));
   }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17B.2 — traversal HUD / view presentation
+// ---------------------------------------------------------------------------
+// The composed 600x360 pen buffer + the SNIPERS1 bezel, copied out
+// verbatim. All composition is mdk_core's (traversalHudCompose runs
+// inside the stepped frame); this function only folds state into
+// copy-safe values and owns the two persistent expand textures.
+
+Dictionary MdkBridge::get_hud_snapshot() {
+  Dictionary out;
+  if (mode_ != 3 || !rt_ || !hasFrame_ || !rt_->hud.bound) {
+    return out;
+  }
+  const mdk::TraversalHudState& hud = rt_->hud;
+  const mdk::IndexedFramebuffer& fb = hud.fb;
+  const std::size_t npix = fb.pixelCount();
+  const std::uint8_t* pal = activePalette_();
+  const std::uint64_t palKey =
+      fnvAppend(0xcbf29ce484222325ull, pal, 768);
+
+  // Copy-out the pen buffer verbatim — the frontend never aliases
+  // runtime memory.
+  PackedByteArray pens;
+  pens.resize(static_cast<int64_t>(npix));
+  std::memcpy(pens.ptrw(), fb.pixels(), npix);
+  out["fb"] = pens;
+  out["w"] = int64_t(fb.width());
+  out["h"] = int64_t(fb.height());
+  int nz = 0;
+  for (std::size_t i = 0; i < npix; ++i) nz += fb.pixels()[i] != 0;
+  out["nz"] = int64_t(nz);
+  // The identical fold mdk-inspect's `hud: dg=` prints — a given
+  // runtime state cross-checks against the native diagnostic.
+  const std::uint64_t dg = mdk::fnv1a64(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(fb.pixels()), npix));
+  out["digest"] = static_cast<int64_t>(dg);
+  out["pal_key"] = static_cast<int64_t>(palKey);
+
+  // Palette-expanded overlay texture — pen 0 -> alpha 0 (the
+  // overlay's transparency is the indexed contract). One Image +
+  // one ImageTexture persist across calls; re-upload only when the
+  // (content, palette) pair actually changed.
+  const std::uint64_t texKey = dg ^ (palKey * 0x9e3779b97f4a7c15ull);
+  if (texKey != hudTexKey_ || hudTex_.is_null()) {
+    PackedByteArray px;
+    px.resize(static_cast<int64_t>(npix) * 4);
+    std::uint8_t* dst = px.ptrw();
+    for (std::size_t i = 0; i < npix; ++i) {
+      const std::uint8_t v = fb.pixels()[i];
+      if (v == 0) continue;              // RGBA stays 0 -> alpha 0
+      dst[i * 4 + 0] = pal[v * 3 + 0];
+      dst[i * 4 + 1] = pal[v * 3 + 1];
+      dst[i * 4 + 2] = pal[v * 3 + 2];
+      dst[i * 4 + 3] = 255;
+    }
+    if (hudImage_.is_null()) {
+      hudImage_ = Image::create_from_data(fb.width(), fb.height(),
+                                          false, Image::FORMAT_RGBA8,
+                                          px);
+    } else {
+      hudImage_->set_data(fb.width(), fb.height(), false,
+                          Image::FORMAT_RGBA8, px);
+    }
+    if (hudTex_.is_null()) {
+      hudTex_ = ImageTexture::create_from_image(hudImage_);
+    } else {
+      hudTex_->update(hudImage_);
+    }
+    hudTexKey_ = texKey;
+    ++hudTexUploads_;
+  }
+  out["tex"] = hudTex_;
+  // Boundedness counters — the texture object persists across
+  // uploads; this serial only advances on a real re-upload, never
+  // on a snapshot call with unchanged content.
+  out["tex_uploads"] = hudTexUploads_;
+
+  // View/scope gates — verbatim core state, no derived logic.
+  out["scoped"] = mdk::playerShotRenderGate(*rt_);
+  out["sniper_view"] =
+      rt_->flagC9c != 0 && rt_->transitionPhase != 0;
+  out["hud_active"] = rt_->hudActive != 0;
+  const mdk::PlayerCameraPose& pose =
+      hasFrame_ ? last_.camera : rt_->camera.pose;
+  out["view_rect"] =
+      Rect2i(pose.viewOX, pose.viewOY, pose.viewW, pose.viewH);
+  out["scope_rect"] = Rect2i(mdk::kHudScopeX, mdk::kHudScopeY,
+                             mdk::kHudScopeW, mdk::kHudScopeH);
+  // shotWinFill — FUN_0045ee7c's mode-1 per-slot indicator select
+  // (the window pen fills are a documented deferred seam; the
+  // frontend draws them from this channel).
+  {
+    PackedInt32Array wf;
+    wf.resize(3);
+    const auto vis = mdk::playerShotVisuals(*rt_);
+    for (int i = 0; i < 3; ++i) {
+      wf[i] = static_cast<int32_t>(vis[std::size_t(i)].hudFrame);
+    }
+    out["win_fill"] = wf;
+  }
+
+  // SNIPERS1 — the 640x480 scope bezel verbatim (raw indexed buffer
+  // at payload+0, the FUN_004039c8 bind). Presented beneath the fb
+  // content; opaque — the fb-space layers above own the apertures.
+  if (!hud.bezelPx.empty()) {
+    Dictionary bz;
+    bz["w"] = int64_t(mdk::kHudBezelW);
+    bz["h"] = int64_t(mdk::kHudBezelH);
+    PackedByteArray bpx;
+    bpx.resize(static_cast<int64_t>(hud.bezelPx.size()));
+    std::memcpy(bpx.ptrw(), hud.bezelPx.data(), hud.bezelPx.size());
+    bz["px"] = bpx;
+    const std::uint64_t bk = mdk::fnv1a64(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(hud.bezelPx.data()),
+        hud.bezelPx.size()));
+    bz["key"] = static_cast<int64_t>(bk);
+    bz["fb_ofs"] = Vector2i(mdk::kHudBezelFbOfsX, mdk::kHudBezelFbOfsY);
+    const std::uint64_t bkey = bk ^ (palKey * 0x9e3779b97f4a7c15ull);
+    if (bkey != bezelTexKey_ || bezelTex_.is_null()) {
+      const std::size_t bnp = hud.bezelPx.size();
+      PackedByteArray px;
+      px.resize(static_cast<int64_t>(bnp) * 4);
+      std::uint8_t* dst = px.ptrw();
+      for (std::size_t i = 0; i < bnp; ++i) {
+        const std::uint8_t v = hud.bezelPx[i];
+        dst[i * 4 + 0] = pal[v * 3 + 0];
+        dst[i * 4 + 1] = pal[v * 3 + 1];
+        dst[i * 4 + 2] = pal[v * 3 + 2];
+        dst[i * 4 + 3] = 255;
+      }
+      if (bezelImage_.is_null()) {
+        bezelImage_ = Image::create_from_data(
+            mdk::kHudBezelW, mdk::kHudBezelH, false,
+            Image::FORMAT_RGBA8, px);
+      } else {
+        bezelImage_->set_data(mdk::kHudBezelW, mdk::kHudBezelH, false,
+                              Image::FORMAT_RGBA8, px);
+      }
+      if (bezelTex_.is_null()) {
+        bezelTex_ = ImageTexture::create_from_image(bezelImage_);
+      } else {
+        bezelTex_->update(bezelImage_);
+      }
+      bezelTexKey_ = bkey;
+      ++bezelTexUploads_;
+    }
+    bz["tex"] = bezelTex_;
+    bz["tex_uploads"] = bezelTexUploads_;
+    out["bezel"] = bz;
+  }
+
+  // Verbatim scalar echoes — diagnostics/tests read these to prove
+  // the presented pixels move with core state; presentation draws
+  // only the composed fb.
+  out["health"] = int64_t(rt_->fieldHealth);
+  out["field_dac"] = int64_t(rt_->fieldDac);
+  out["field_eb8"] = int64_t(rt_->fieldEb8);
+  out["loco_state"] = int64_t(rt_->locoState);
+  out["wpn0"] = int64_t(rt_->wpnSel0);
+  out["wpn1"] = int64_t(rt_->wpnSel1);
+  {
+    PackedInt32Array am;
+    am.resize(6);
+    for (int i = 0; i < 6; ++i)
+      am[i] = static_cast<int32_t>(rt_->ammo[std::size_t(i)]);
+    out["ammo"] = am;
+  }
+  out["inv_count"] = int64_t(rt_->inventoryCount);
+  out["inv_sel"] = int64_t(rt_->inventorySel);
+  out["inv_timer"] = int64_t(rt_->invHudTimer);
+  out["timer"] = static_cast<double>(rt_->fadeTimer5414a0);
+  out["timer_max"] = static_cast<double>(rt_->fadeTimer5414a4);
+  out["timer_latch"] = static_cast<double>(rt_->fadeTimer5414a8);
+  out["level_id"] = int64_t(rt_->field541498);
   return out;
 }
 
@@ -2225,6 +2407,16 @@ void MdkBridge::shutdown() {
   kurtPalette_ = {};
   levelPalette_ = {};
   kurtPalKey_ = 0;
+  // Phase 17B.2 — HUD/bezel expand cache: the textures keyed on the
+  // old runtime's content die with the level/session.
+  hudImage_.unref();
+  hudTex_.unref();
+  hudTexKey_ = 0;
+  hudTexUploads_ = 0;
+  bezelImage_.unref();
+  bezelTex_.unref();
+  bezelTexKey_ = 0;
+  bezelTexUploads_ = 0;
   sharedMtiBytes_.clear();
   ftiBytes_.clear();
   sysPalHead_ = {};

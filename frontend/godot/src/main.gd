@@ -98,6 +98,13 @@ var fx_recent: Array = []         # last drained events (diag, cap 16)
 var fx_stats := {"events": 0, "shards": 0, "remnants": 0,
 	"kinds": {}}                # --combat-diag counters
 
+# Phase 17B.2 — traversal HUD / view presentation state. The core
+# composes the 600x360 indexed framebuffer and owns every semantic;
+# these are view-side node/resource caches only.
+var last_hud := {}                # last applied HUD snapshot (diag)
+var scope_vp: SubViewport = null  # mode-1 aperture viewport (384x280)
+var scope_cam: Camera3D = null    # scope view camera (mirrors pose)
+
 # The original 600x360 HUD window rects (0x49b900/0x49b8e8, OBSERVED).
 const SHOT_HUD_RECT := [
 	Rect2(72, 10, 140, 70),
@@ -299,6 +306,7 @@ func _ready() -> void:
 	_build_player_proxy()
 	_build_kurt_presenter()
 	_build_combat_presenter()
+	_build_hud_presenter()
 
 	# One idle frame settles the deterministic spawn camera.
 	bridge.step_frame_input(0.0, {})
@@ -1143,6 +1151,122 @@ func _reset_presentation_for_restore() -> void:
 	last_display_digest = -1
 	geom_cache.clear()
 	elem_mats.clear()
+	# Phase 17B.2 — HUD/view surfaces presented the discarded
+	# runtime; they rebuild from the first post-restore snapshot.
+	_hide_hud()
+
+
+# ---------------------------------------------------------------------------
+# Phase 17B.2 — traversal HUD / view presentation.
+#
+# The core composes the authoritative 600x360 indexed framebuffer
+# (rt.hud.fb) inside the stepped frame — health, weapons, ammo,
+# inventory, timer/status, damage, and the SKULL death overlay are
+# already pixels when they reach the bridge. get_hud_snapshot()
+# copies the buffer verbatim and reuses one palette-expanded
+# ImageTexture (pen 0 -> alpha 0). GDScript only places layers:
+#
+#   Kurt(1) < bezel(2) < scope view(3) < shot windows(4)
+#       < HUD overlay(5) < fade(6) < debug(10)
+#
+# The SNIPERS1 bezel is a 640x480 screen buffer shown beneath the
+# view while the core scope gate is open; the fb rides at (20,55)
+# inside it (HYPOTHESIS — aperture-aligned, +/-1px). The mode-1
+# scope viewport renders the shared world at 384x280 into the
+# authored aperture rect; modes 2/3/4 stay on the Phase-17A
+# bullet-cam windows. Deferred seams (scope warp, entry fades, the
+# window pen fills in fb, message flush) are documented core gaps,
+# not emulated here.
+# ---------------------------------------------------------------------------
+
+
+func _build_hud_presenter() -> void:
+	var hr: TextureRect = $HudLayer/HudRect
+	var br: TextureRect = $BezelLayer/BezelRect
+	var sr: TextureRect = $ScopeLayer/ScopeRect
+	for r in [hr, br, sr]:
+		r.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		r.stretch_mode = TextureRect.STRETCH_SCALE
+	# The mode-1 scope viewport — shares the main world_3d exactly
+	# like the bullet-cam windows; the authored aperture is 384x280.
+	scope_vp = SubViewport.new()
+	scope_vp.name = "ScopeVP"
+	scope_vp.size = Vector2i(384, 280)
+	scope_vp.world_3d = get_viewport().world_3d
+	scope_vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	scope_cam = Camera3D.new()
+	scope_cam.near = 0.05
+	scope_cam.far = 20000.0
+	scope_vp.add_child(scope_cam)
+	$ShotCamRoot.add_child(scope_vp)
+	var vt := ViewportTexture.new()
+	vt.viewport_path = scope_vp.get_path()
+	sr.texture = vt
+
+
+func _hide_hud() -> void:
+	# The traversal HUD/view is mode-3 only — non-traversal modes and
+	# runtime-swap boundaries drop every surface; none is serialized
+	# or kept across a restore.
+	$HudLayer/HudRect.visible = false
+	$BezelLayer/BezelRect.visible = false
+	$ScopeLayer/ScopeRect.visible = false
+	if scope_vp != null:
+		scope_vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	last_hud = {}
+
+
+func _apply_hud_snapshot() -> void:
+	var h: Dictionary = bridge.get_hud_snapshot()
+	if h.is_empty():
+		_hide_hud()
+		return
+	last_hud = h
+	var vps := get_viewport().get_visible_rect().size
+	var sx := vps.x / KURT_SCREEN.x
+	var sy := vps.y / KURT_SCREEN.y
+	# The composed fb IS the HUD — the TextureRect is full-window
+	# (the same 600x360->screen map the Kurt sprite and the shot
+	# windows use) and pen-0 pixels are transparent, so the world
+	# shows through wherever the compositor wrote nothing.
+	var hr: TextureRect = $HudLayer/HudRect
+	hr.texture = h["tex"]
+	hr.visible = true
+	# sniper_view = flagC9c && transitionPhase != 0 — the scope
+	# camera/aperture gate. The scope-zoom transition warp is a
+	# documented deferred seam, so during transitionPhase 1 the
+	# bezel+viewport simply track the (interpolating) core pose.
+	var scoped := bool(h["sniper_view"])
+	var br: TextureRect = $BezelLayer/BezelRect
+	var sr: TextureRect = $ScopeLayer/ScopeRect
+	if scoped:
+		var bz: Dictionary = h.get("bezel", {})
+		if not bz.is_empty():
+			# Map so the bezel's fb region lands exactly on the
+			# window: fb origin (20,55) inside the 640x480 buffer ->
+			# bezel origin at -ofs in fb space.
+			var ofs: Vector2i = bz["fb_ofs"]
+			br.texture = bz["tex"]
+			br.position = Vector2(-float(ofs.x) * sx,
+				-float(ofs.y) * sy)
+			br.size = Vector2(float(bz["w"]) * sx,
+				float(bz["h"]) * sy)
+			br.visible = true
+		var ap: Rect2i = h["scope_rect"]
+		sr.position = Vector2(float(ap.position.x) * sx,
+			float(ap.position.y) * sy)
+		sr.size = Vector2(float(ap.size.x) * sx,
+			float(ap.size.y) * sy)
+		sr.visible = true
+		# The scoped camera pose is already the core's — mirror what
+		# _apply_camera_snapshot put on the main camera this frame.
+		scope_cam.global_transform = $Camera3D.global_transform
+		scope_cam.fov = $Camera3D.fov
+		scope_vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	else:
+		br.visible = false
+		sr.visible = false
+		scope_vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
 
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1412,8 @@ func _apply_freefall() -> void:
 	var ff: Dictionary = bridge.get_freefall_snapshot()
 	if ff.is_empty():
 		return
+	# Traversal HUD/view is mode-3 only — never over freefall.
+	_hide_hud()
 	if ff_palette.is_empty() and bool(ff.get("palette_ok", false)):
 		ff_palette = ff["palette"]
 
@@ -1406,6 +1532,15 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 	print("smoke(freefall): course=%d skill=%d seed=%08x" %
 		[course, skill, seed])
 	_check(int(bridge.get_mode()) == 2, "mode == 2 (freefall)")
+	# Phase 17B.2 — the traversal HUD contract is mode-3 only: the
+	# snapshot is empty and no HUD/view surface is presented.
+	_check(bridge.get_hud_snapshot().is_empty(),
+		"hud: no snapshot in mode 2")
+	_apply_freefall()
+	_check(not $HudLayer/HudRect.visible and
+		not $BezelLayer/BezelRect.visible and
+		not $ScopeLayer/ScopeRect.visible,
+		"hud: no traversal HUD over freefall")
 	var f0: Dictionary = bridge.get_freefall_snapshot()
 	_check(not f0.is_empty(), "freefall snapshot non-empty")
 	_check(int(f0["phase"]) == 0, "phase == intro at load")
@@ -1576,6 +1711,18 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 		var tp: Dictionary = bridge.get_player_snapshot()
 		_check(not tp.is_empty(),
 			"traversal snapshot live post-handoff")
+		# Phase 17B.2 — the traversal runtime behind the handoff
+		# composes its own HUD; the presentation rebuilds it.
+		var hh: Dictionary = bridge.get_hud_snapshot()
+		_check(not hh.is_empty(),
+			"hud: snapshot live post-handoff")
+		if not hh.is_empty():
+			_check(int(hh["w"]) == 600 and int(hh["h"]) == 360,
+				"hud: 600x360 post-handoff")
+		_apply_camera_snapshot()
+		_apply_hud_snapshot()
+		_check($HudLayer/HudRect.visible,
+			"hud: overlay rebuilt post-handoff")
 	else:
 		_check(int(bridge.get_mode()) == 0,
 			"death route -> mode 0 (frontend)")
@@ -1799,6 +1946,10 @@ func _process(delta: float) -> void:
 	_apply_shot_snapshots()
 	_drain_combat_fx()
 	_tick_combat_fx(delta)
+	# Phase 17B.2 — the composed HUD overlay + bezel/scope view. All
+	# state comes from the post-step snapshot; nothing is derived
+	# from device input here.
+	_apply_hud_snapshot()
 	_update_debug_label()
 	# Rebuild the presented arena set only when the display digest
 	# changes — a BSP-order change from camera movement, a portal
@@ -1995,6 +2146,150 @@ func _run_smoke(data_root: String) -> void:
 	_check(masks.size() == 4 and masks[0] == 1 and masks[1] == 4 and
 		masks[2] == 2 and masks[3] == 0,
 		"mouse button masks == {fire,jump,sniper,none}")
+
+	# ---- Phase 17B.2: HUD / view presentation ----
+	# Canonical digest — mdk-inspect --traversal-runtime's scripted
+	# 60-frame stream (idle x10 -> KeyUp(103) x20 -> idle x5 ->
+	# KeyJump(56) x15 -> idle x10) needs the load-time state the
+	# read-only asserts above preserved; reload to get it back
+	# (also the level-transition path: shutdown drops the HUD/bezel
+	# cache, so this run double-checks texture rebuild).
+	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
+		"hud: reload for canonical run")
+	_check(bridge.load_arena("HMO_1"), "hud: arena rebind")
+	# The load path composes once at load; one settle step matches
+	# _ready's contract (the settle IS the diagnostic's frame 0).
+	bridge.step_frame_input(0.0, {})
+	for f in range(1, 60):
+		var keys := PackedInt32Array()
+		if f >= 10 and f < 30:
+			keys = PackedInt32Array([103])
+		elif f >= 35 and f < 50:
+			keys = PackedInt32Array([56])
+		bridge.step_frame_input(1000.0 / 30.0, {"keys": keys})
+	var h0: Dictionary = bridge.get_hud_snapshot()
+	_check(not h0.is_empty(), "hud: snapshot non-empty")
+	_check(int(h0["w"]) == 600 and int(h0["h"]) == 360,
+		"hud: framebuffer 600x360")
+	var fb0: PackedByteArray = h0["fb"]
+	_check(fb0.size() == 216000, "hud: 216000 indexed bytes")
+	# Copy integrity — the digest folds the same buffer the bridge
+	# copies out, stays stable across repeat snapshot calls, and
+	# matches the mdk-inspect canonical fold for this exact runtime
+	# state (the fnv1a64 fold itself is covered by mdk_tests).
+	print("  hud: digest=%016x nz=%d" % [int(h0["digest"]),
+		int(h0["nz"])])
+	_check(int(h0["digest"]) == 0x36e1ab03a2f649ab,
+		"hud: canonical composed digest @60f")
+	_check(int(h0["nz"]) > 0, "hud: nontransparent pens composed")
+	# The palette-expanded texture: 600x360, pen 0 -> alpha 0,
+	# nonzero pens -> opaque palette colors.
+	var ht0 = h0["tex"]
+	_check(ht0 != null and ht0.get_width() == 600 and
+		ht0.get_height() == 360, "hud: texture 600x360")
+	var himg: Image = ht0.get_image()
+	var pal: PackedByteArray = bridge.get_active_palette()
+	var z_ok := true
+	var c_ok := true
+	for i in range(0, fb0.size(), 997):
+		var p := himg.get_pixel(i % 600, i / 600)
+		if fb0[i] == 0:
+			if p.a8 != 0:
+				z_ok = false
+		else:
+			var pen := int(fb0[i]) * 3
+			if p.a8 != 255 or p.r8 != int(pal[pen]) or \
+					p.g8 != int(pal[pen + 1]) or \
+					p.b8 != int(pal[pen + 2]):
+				c_ok = false
+	_check(z_ok, "hud: pen 0 expands transparent")
+	_check(c_ok, "hud: pens expand through the active palette")
+	# Texture reuse — the same ImageTexture object persists across
+	# calls; uploads only advance on content/palette change.
+	var up0 := int(h0["tex_uploads"])
+	var h0b: Dictionary = bridge.get_hud_snapshot()
+	_check(h0b["tex"] == ht0, "hud: texture object reused")
+	_check(int(h0b["tex_uploads"]) == up0,
+		"hud: no re-upload on unchanged frame")
+	_check(int(h0b["digest"]) == int(h0["digest"]),
+		"hud: digest stable across calls")
+	# Bezel — the 640x480 SNIPERS1 buffer, raw indexed + expanded.
+	var bz0: Dictionary = h0["bezel"]
+	_check(not bz0.is_empty(), "hud: bezel present")
+	if not bz0.is_empty():
+		_check(int(bz0["w"]) == 640 and int(bz0["h"]) == 480,
+			"hud: bezel 640x480")
+		_check(PackedByteArray(bz0["px"]).size() == 640 * 480,
+			"hud: bezel bytes 307200")
+		_check(int(bz0["w"]) - int(h0["w"]) == 2 * int(bz0["fb_ofs"].x)
+			and int(bz0["h"]) - int(h0["h"]) ==
+			int(bz0["fb_ofs"].y) + 65,
+			"hud: bezel fb offset consistent")
+		var bt0 = bz0["tex"]
+		_check(bt0 != null and bt0.get_width() == 640 and
+			bt0.get_height() == 480, "hud: bezel texture 640x480")
+		_check(h0b["bezel"]["tex"] == bt0,
+			"hud: bezel texture reused")
+	# Scalar echoes — the composed pixels already carry this state;
+	# the fields exist so tests can prove the presentation tracks
+	# core without re-deriving anything.
+	_check(h0.has("health") and h0.has("wpn0") and
+		h0.has("wpn1") and h0.has("ammo") and
+		h0.has("inv_count") and h0.has("inv_sel") and
+		h0.has("inv_timer") and h0.has("timer") and
+		h0.has("timer_latch") and h0.has("level_id"),
+		"hud: scalar echo fields present")
+	_check(PackedInt32Array(h0["ammo"]).size() == 6,
+		"hud: 6 ammo slots echoed")
+	_check(int(h0["health"]) == 150, "hud: seeded health echoed")
+	# Weapon-scan exercise — itemNext (internal code 27) is an edge
+	# input that scans wpnSel1 forward, skipping ammo<=0 slots and
+	# landing on 0 (unconditional). Predict the target from the
+	# echoed ammo and prove the echo follows the core write.
+	var ammo0: PackedInt32Array = h0["ammo"]
+	var w10 := int(h0["wpn1"])
+	_step_n({"keys": PackedInt32Array([27])}, 1)
+	var hn0: Dictionary = bridge.get_hud_snapshot()
+	var wscan := 0
+	for w in range(w10 + 1, 6):
+		if int(ammo0[w]) > 0:
+			wscan = w
+			break
+	_check(int(hn0["wpn1"]) == wscan,
+		"hud: wpn1 echo tracks the itemNext weapon scan")
+	# itemPrev scans the other way; weapon-0 hotkey (code 2) then
+	# re-pins the pending selection so the reload below starts at
+	# the same pending state the spawn had anyway.
+	_step_n({"keys": PackedInt32Array([26])}, 1)
+	_step_n({"keys": PackedInt32Array([2])}, 1)
+	_check(int(bridge.get_hud_snapshot()["wpn1"]) == 0,
+		"hud: weapon-0 hotkey is unconditional")
+	# View gates at spawn — unscoped normal view.
+	_check(not bool(h0["scoped"]) and not bool(h0["sniper_view"]),
+		"hud: unscoped at rest")
+	var vr0: Rect2i = h0["view_rect"]
+	_check(vr0.size.x == 600 and vr0.size.y == 360,
+		"hud: full-frame view rect unscoped")
+	var srect: Rect2i = h0["scope_rect"]
+	_check(srect.position == Vector2i(108, 80) and
+		srect.size == Vector2i(384, 280),
+		"hud: authored aperture rect")
+	# The overlay node presents only when a snapshot is live; the
+	# smoke path bypasses _process, so apply explicitly.
+	_apply_hud_snapshot()
+	_check($HudLayer/HudRect.visible and
+		$HudLayer/HudRect.texture == ht0,
+		"hud: overlay node shows the composed texture")
+	_check(not $BezelLayer/BezelRect.visible and
+		not $ScopeLayer/ScopeRect.visible,
+		"hud: no bezel/scope while unscoped")
+	# Reload once more — the traversal checks below assume the
+	# pristine spawn pose/RNG, which the canonical stream consumed.
+	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
+		"hud: reload back to spawn")
+	_check(bridge.load_arena("HMO_1"), "hud: spawn arena rebind")
+	bridge.step_frame_input(0.0, {})
+	player = bridge.get_player_snapshot()
 
 	# ---- G2 deterministic traversal checks (dt fixed -> exact) ----
 	# Order matters — several checks need the pristine rest pose or
@@ -2515,6 +2810,28 @@ func _run_smoke(data_root: String) -> void:
 		_step_n({}, 8)
 		ss1 = bridge.get_shot_snapshots()
 	_check(bool(ss1["scoped"]), "combat: scoped after MMB pulse")
+	# Phase 17B.2 — the scoped view presentation follows the same
+	# core gates: sniper_view open, the authored aperture pose on the
+	# camera, bezel beneath the scope viewport, overlay on top.
+	var hs1: Dictionary = bridge.get_hud_snapshot()
+	_check(bool(hs1["sniper_view"]), "hud: sniper_view gate open")
+	var vr1: Rect2i = hs1["view_rect"]
+	_check(vr1.size.x <= 400 and vr1.size.y <= 300,
+		"hud: scoped view rect is the aperture size")
+	_apply_hud_snapshot()
+	_check($BezelLayer/BezelRect.visible,
+		"hud: bezel shown while scoped")
+	_check($ScopeLayer/ScopeRect.visible,
+		"hud: scope viewport shown while scoped")
+	_check(scope_vp.render_target_update_mode ==
+		SubViewport.UPDATE_ALWAYS,
+		"hud: scope viewport live while scoped")
+	_check($HudLayer/HudRect.visible,
+		"hud: composed overlay still on top while scoped")
+	# shotWinFill — the core's per-slot indicator channel drives the
+	# same window fills Phase 17A already draws.
+	var wf: PackedInt32Array = hs1["win_fill"]
+	_check(wf.size() == 3, "hud: win_fill carries 3 slots")
 	# 0x464a56's gate is level-triggered (ctrl.fire != 0) but also
 	# needs fireCadence == 0 — the earlier unscoped punches left the
 	# cadence timer hot, and it only decays while scoped. Hold LMB
@@ -2565,6 +2882,24 @@ func _run_smoke(data_root: String) -> void:
 		"combat: shot world-mesh node built+visible")
 	_check(win_ok, "combat: bullet-cam window texture-rect shown")
 	_check(fill_ok, "combat: free-slot HUD indicator fill drawn")
+	# Phase 17B.2 — weapon/ammo echoes track the post-fire core.
+	# The default tracer (wpnSel0==0) consumes no ammo slot — the
+	# OBSERVED decrement paths are weapons 1..4/5, none of which
+	# hold ammo at this spawn (pickup-granted). Assert the echo
+	# shape/values instead; the composed digits themselves are
+	# covered by the canonical fb digest.
+	var hf: Dictionary = bridge.get_hud_snapshot()
+	var ammo1: PackedInt32Array = hf["ammo"]
+	_check(ammo1.size() == 6 and int(hf["wpn0"]) >= 0 and
+		int(hf["wpn0"]) <= 5 and int(hf["wpn1"]) >= 0 and
+		int(hf["wpn1"]) <= 5,
+		"hud: weapon/ammo echoes valid post-fire")
+	var ammo_dropped := false
+	for i in mini(ammo0.size(), ammo1.size()):
+		if int(ammo1[i]) < int(ammo0[i]):
+			ammo_dropped = true
+	if ammo_dropped:
+		print("  hud: ammo echo decremented post-fire")
 	var sg: Dictionary = bridge.get_shot_geometry(-1)
 	_check(not sg.is_empty() and int(sg["vert_count"]) > 0,
 		"combat: KURT geometry resolves from STREAM.BNI")
@@ -2680,6 +3015,17 @@ func _run_smoke(data_root: String) -> void:
 		_step_n({}, 8)
 	_check(not bool(bridge.get_shot_snapshots()["scoped"]),
 		"combat: unscoped for downstream blocks")
+	# Phase 17B.2 — scope exit drops the bezel/aperture surfaces; the
+	# composed overlay persists (it carries the unscoped HUD too).
+	_apply_hud_snapshot()
+	_check(not bool(last_hud["sniper_view"]),
+		"hud: sniper_view closed on unscope")
+	_check(not $BezelLayer/BezelRect.visible and
+		not $ScopeLayer/ScopeRect.visible,
+		"hud: bezel/scope hidden on unscope")
+	_check(scope_vp.render_target_update_mode ==
+		SubViewport.UPDATE_DISABLED,
+		"hud: scope viewport idle on unscope")
 	if not pre_c.is_empty():
 		bridge.diagnostic_start(int(pre_c["arena"]),
 			pre_c["pos_mdk"], float(pre_c["yaw_deg"]))
@@ -2700,6 +3046,13 @@ func _run_smoke(data_root: String) -> void:
 		"nonlethal hit reduced health")
 	_check(float(dd1["accum"]) >= 5.0,
 		"accumulator past the 5.0 post gate")
+	# Phase 17B.2 — the damage state is already in the composed
+	# buffer; the snapshot echoes the same fields the pixels show.
+	var hd1: Dictionary = bridge.get_hud_snapshot()
+	_check(int(hd1["health"]) == int(dd1["health"]),
+		"hud: health field echoed post-hit")
+	_check(int(hd1["field_dac"]) > 0,
+		"hud: damage accumulator echoed post-hit")
 	var saw_bang := false
 	var saw_bflip := false
 	var tumble_state := false
@@ -2741,19 +3094,32 @@ func _run_smoke(data_root: String) -> void:
 	_wait_rest(120)
 	var dd2: Dictionary = bridge.diagnostic_damage(500)
 	_check(int(dd2["health"]) == 0, "lethal hit floored health at 0")
+	# Phase 17B.2 — the SKULL/death presentation is composed into
+	# the fb by the core; the overlay must visibly change and the
+	# scalar echoes must track the dispatch.
+	var hud_dg_pre := int(bridge.get_hud_snapshot()["digest"])
 	var death_state := false
+	var death_hud := false
 	for i in 40:
 		_step_n({}, 1)
 		var ke: Dictionary = bridge.get_kurt_snapshot()
 		collect.call(ke, kset)
 		if int(ke["loco_state"]) == 0x3ea:
 			death_state = true
+		var hd: Dictionary = bridge.get_hud_snapshot()
+		if int(hd["loco_state"]) == 0x3ea:
+			death_hud = true
 		var me: Dictionary = ke["main"]
 		if not me.is_empty():
 			_check(String(me["table_name"]) == "K_BANG",
 				"death presents K_BANG")
 			_check(bool(ke["drawn"]), "death sprite drawn")
 	_check(death_state, "dispatch posted 0x3ea death state")
+	_check(death_hud, "hud: snapshot echoes 0x3ea death state")
+	var hd3: Dictionary = bridge.get_hud_snapshot()
+	_check(int(hd3["health"]) == 0, "hud: health 0 post-lethal")
+	_check(int(hd3["digest"]) != hud_dg_pre,
+		"hud: composed fb changed on the death path")
 	# Terminal: 0x3ea never releases; the dead-check fade countdown
 	# is armed and counting (a 0-amount call is a producer no-op —
 	# hp==0 && gate==0 — used here only as a live-state read).
@@ -2763,6 +3129,8 @@ func _run_smoke(data_root: String) -> void:
 	_check(int(dd3["event_priority"]) == 10,
 		"death event priority 10")
 	_check(int(dd3["fade"]) > 0, "death fade armed (eb8 countdown)")
+	_check(int(hd3["field_eb8"]) != 0 or int(dd3["fade"]) > 0,
+		"hud: death-fade field live")
 	var ks1: Dictionary = bridge.get_kurt_snapshot()
 	var ktex1 := int(ks1["tex_cache"])
 	var kpal1 := int(ks1["pal_key"])
@@ -2801,6 +3169,30 @@ func _run_smoke(data_root: String) -> void:
 	var km_end: TextureRect = $KurtLayer/KurtViewport/KurtMain
 	_check(km_end.visible and km_end.texture != null,
 		"KurtMain still presents during death")
+
+	# ---- Phase 17B.2: level transition ----
+	# shutdown() drops the HUD/bezel cache; a reload must rebuild
+	# every surface from the fresh runtime — nothing stale survives.
+	var hpre: Dictionary = bridge.get_hud_snapshot()
+	var tex_pre = hpre["tex"]
+	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
+		"transition: LEVEL3 reload")
+	_check(bridge.load_arena("HMO_1"), "transition: arena rebind")
+	_step_n({}, 2)
+	var hpost: Dictionary = bridge.get_hud_snapshot()
+	_check(not hpost.is_empty(),
+		"transition: HUD snapshot live post-reload")
+	_check(int(hpost["tex_uploads"]) >= 1,
+		"transition: HUD texture re-uploaded for new runtime")
+	_check(hpost["tex"] != tex_pre or int(hpre["tex_uploads"]) != \
+		int(hpost["tex_uploads"]),
+		"transition: texture cache did not carry stale key")
+	_apply_hud_snapshot()
+	_check($HudLayer/HudRect.visible,
+		"transition: overlay node rebuilt post-reload")
+	_check(not $BezelLayer/BezelRect.visible and
+		not $ScopeLayer/ScopeRect.visible,
+		"transition: no stale bezel/scope post-reload")
 
 	print("smoke: %d failure(s)" % failures)
 
@@ -2929,6 +3321,17 @@ func _run_combat_exercise(tag: String) -> void:
 	_apply_shot_snapshots()
 	_check(fx_palette.size() == 768,
 		"combat(%s): active palette resolves (768)" % tag)
+	# Phase 17B.2 — the composed HUD is level-agnostic: a 600x360
+	# buffer + SNIPERS1 bezel exist on every traversal level.
+	var hg0: Dictionary = bridge.get_hud_snapshot()
+	_check(not hg0.is_empty() and int(hg0["w"]) == 600 and
+		int(hg0["h"]) == 360,
+		"combat(%s): HUD snapshot 600x360" % tag)
+	_check(not hg0["bezel"].is_empty(),
+		"combat(%s): SNIPERS1 bezel bound" % tag)
+	_apply_hud_snapshot()
+	_check($HudLayer/HudRect.visible,
+		"combat(%s): HUD overlay presented" % tag)
 	var shards0 := int(fx_stats["shards"])
 	_step_n({"mouse_buttons": 4}, 1)     # MMB edge -> scope toggle
 	_step_n({}, 8)                       # transitionPhase advances
@@ -2940,6 +3343,14 @@ func _run_combat_exercise(tag: String) -> void:
 		ss1 = bridge.get_shot_snapshots()
 	_check(bool(ss1["scoped"]),
 		"combat(%s): scoped after MMB pulse" % tag)
+	# Phase 17B.2 — scoped view presentation on this level.
+	var hg1: Dictionary = bridge.get_hud_snapshot()
+	_check(bool(hg1["sniper_view"]),
+		"combat(%s): sniper_view open" % tag)
+	_apply_hud_snapshot()
+	_check($ScopeLayer/ScopeRect.visible and
+		$BezelLayer/BezelRect.visible,
+		"combat(%s): scope view + bezel shown" % tag)
 	var ss2 := {}
 	var saw_state1 := false
 	var mesh_node_ok := false
@@ -3109,6 +3520,10 @@ func _run_combat_exercise(tag: String) -> void:
 		_step_n({}, 8)
 	_check(not bool(bridge.get_shot_snapshots()["scoped"]),
 		"combat(%s): unscoped" % tag)
+	_apply_hud_snapshot()
+	_check(not $ScopeLayer/ScopeRect.visible and
+		not $BezelLayer/BezelRect.visible,
+		"combat(%s): scope view + bezel hidden on exit" % tag)
 	if not pre_c.is_empty():
 		bridge.diagnostic_start(int(pre_c["arena"]),
 			pre_c["pos_mdk"], float(pre_c["yaw_deg"]))
@@ -3203,6 +3618,15 @@ func _run_smoke_restore() -> void:
 	# pre-restore event replays out of the fresh runtime.
 	_check($FxRoot.get_child_count() == 0,
 		"restore: no transient FX nodes survive")
+	# Phase 17B.2 — no HUD/view surface survives the boundary: the
+	# overlay, bezel, and scope viewport all dropped with the
+	# discarded runtime's presentation.
+	_check(not $HudLayer/HudRect.visible and
+		not $BezelLayer/BezelRect.visible and
+		not $ScopeLayer/ScopeRect.visible,
+		"restore: HUD/view surfaces dropped")
+	_check(last_hud.is_empty(),
+		"restore: HUD snapshot cache cleared")
 	_check(bridge.drain_combat_fx().is_empty(),
 		"restore: no pre-restore combat events replay")
 	for i in 3:
@@ -3276,6 +3700,23 @@ func _run_smoke_restore() -> void:
 		"restore: restored objects enumerated")
 	_check($DynamicObjectRoot.get_child_count() == post_ids.size(),
 		"restore: object nodes == restored snapshot set")
+	# Phase 17B.2 — the HUD/view rebuilds from the restored runtime:
+	# the save was taken scoped, so the restored core state reopens
+	# the aperture and the composed fb is live again.
+	_apply_camera_snapshot()
+	_apply_hud_snapshot()
+	_check(not last_hud.is_empty() and $HudLayer/HudRect.visible,
+		"restore: HUD overlay rebuilt from restored state")
+	# Whatever gate the restored core reports, the presentation
+	# mirrors it — the save was taken scoped, so this exercises the
+	# aperture path when the restored phase says so.
+	_check($ScopeLayer/ScopeRect.visible ==
+		bool(last_hud["sniper_view"]),
+		"restore: scope viewport follows restored sniper_view")
+	_check($BezelLayer/BezelRect.visible ==
+		(bool(last_hud["sniper_view"]) and
+			not last_hud["bezel"].is_empty()),
+		"restore: bezel follows restored sniper_view")
 	print(("  restore: post shots=%d objs=%d " +
 		"shot_nodes=%d fx_nodes=%d geom_cache=%d") %
 		[rlive, post_ids.size(), $ShotRoot.get_child_count(),

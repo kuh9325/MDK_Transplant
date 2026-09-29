@@ -38,6 +38,7 @@ visible = false
 far = 20000.0
 
 [node name="KurtLayer" type="CanvasLayer" parent="."]
+layer = 1
 
 [node name="KurtViewport" type="Control" parent="KurtLayer"]
 anchors_preset = 15
@@ -57,10 +58,37 @@ mouse_filter = 2
 expand_mode = 1
 stretch_mode = 0
 
-[node name="ShotCamLayer" type="CanvasLayer" parent="."]
+[node name="BezelLayer" type="CanvasLayer" parent="."]
 layer = 2
 
+[node name="BezelRect" type="TextureRect" parent="BezelLayer"]
+visible = false
+mouse_filter = 2
+
+[node name="ScopeLayer" type="CanvasLayer" parent="."]
+layer = 3
+
+[node name="ScopeRect" type="TextureRect" parent="ScopeLayer"]
+visible = false
+mouse_filter = 2
+
+[node name="ShotCamLayer" type="CanvasLayer" parent="."]
+layer = 4
+
+[node name="HudLayer" type="CanvasLayer" parent="."]
+layer = 5
+
+[node name="HudRect" type="TextureRect" parent="HudLayer"]
+visible = false
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+
 [node name="DebugUI" type="CanvasLayer" parent="."]
+layer = 10
 
 [node name="DebugLabel" type="Label" parent="DebugUI"]
 offset_left = 8.0
@@ -72,7 +100,7 @@ theme_override_constants/shadow_offset_y = 1
 theme_override_font_sizes/font_size = 13
 
 [node name="FadeLayer" type="CanvasLayer" parent="."]
-layer = 3
+layer = 6
 
 [node name="FadeRect" type="ColorRect" parent="FadeLayer"]
 visible = false

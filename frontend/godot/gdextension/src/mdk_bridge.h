@@ -240,6 +240,53 @@ class MdkBridge : public RefCounted {
   Dictionary fx_stab(const Vector3& from, const Vector3& to,
                      int64_t arena_index);
 
+  // --- Phase 17B.2 — traversal HUD / view presentation ----------
+  // The already-composed core HUD (FUN_00436d60's tail, run per
+  // frame inside stepTraversalRuntime — see core/traversal_hud.h)
+  // copied out for the frontend: pen indices + palette-mapped
+  // ImageTextures + the view/scope gates. Nothing here mutates the
+  // runtime; no HUD semantics exist on the GDScript side.
+  //
+  // Returns {} unless mode_ == 3, a frame has been stepped, and the
+  // HUD bound (traversalHudBind ran). Fields:
+  //   "w"/"h"        — 600x360 (fb dims)
+  //   "fb"           — PackedByteArray, the composed pen indices
+  //                    (216000 bytes; pen 0 = transparent)
+  //   "nz"           — nonzero pen count (diagnostic)
+  //   "digest"       — fnv1a64 over the pen bytes — the SAME fold
+  //                    mdk-inspect's `hud: ... dg=` prints, so a
+  //                    given runtime state cross-checks directly
+  //   "pal_key"      — fnv over the active display palette (the
+  //                    768-byte pick get_active_palette returns)
+  //   "tex"          — persistent palette-expanded RGBA8
+  //                    ImageTexture; pen 0 -> alpha 0. Re-created
+  //                    only on (content|palette) change — the same
+  //                    object identity is returned every call.
+  //   "scoped"       — playerShotRenderGate (c9c && ca0>1): the
+  //                    scope gate that also runs the shot windows
+  //   "sniper_view"  — c9c && ca0!=0: the camera's alt-rect gate
+  //                    (ce.sniperViewport — transition phase 1
+  //                    already adopts the aperture pose)
+  //   "hud_active"   — 0x5414d4
+  //   "view_rect"    — the camera pose's authored rect
+  //                    (0,0,600,360 / 107,79,384,280 — the
+  //                    viewport-register form)
+  //   "scope_rect"   — the fb-space scope aperture constants
+  //                    (108,80,384,280 — kHudScope*)
+  //   "win_fill"     — PackedInt32Array[3]: per-slot hudFrame
+  //                    (the FUN_0045ee7c mode-1 shotWinFill channel)
+  //   "bezel"        — SNIPERS1 dict: "w","h" (640x480), "px" (the
+  //                    raw indexed buffer), "key" (fnv of px),
+  //                    "tex" (persistent opaque RGBA texture),
+  //                    "fb_ofs" (Vector2i — the (20,55) fb-in-bezel
+  //                    HYPOTHESIS offset, see traversal_hud.h)
+  //   Scalar echoes for diagnostics/tests only (verbatim fields —
+  //   the composed fb above remains the authoritative visual):
+  //   "health" "field_dac" "field_eb8" "loco_state" "wpn0" "wpn1"
+  //   "ammo" (PInt32[6]) "inv_count" "inv_sel" "inv_timer"
+  //   "timer" "timer_max" "timer_latch" "level_id"
+  Dictionary get_hud_snapshot();
+
   // --- Phase 16C — freefall (mode 2) ------------------------------
   // FUN_0040ef28's domain: loads the FALL3D course bundle (BNI +
   // FALL3D_<course+1>.MTI + FALLP_<course+1> palette + FALLPU pickups)
@@ -372,6 +419,23 @@ class MdkBridge : public RefCounted {
   std::array<std::uint8_t, 768> kurtPalette_{};
   std::array<std::uint8_t, 768> levelPalette_{};
   std::uint64_t kurtPalKey_ = 0;   // FNV-64 of kurtPalette_
+
+  // --- Phase 17B.2 — HUD/bezel texture cache --------------------
+  // The displayed palette pick — the primary displayed arena's
+  // composed palette, else the level fallback (the same rule
+  // refreshKurtPalette_ and get_active_palette use).
+  const std::uint8_t* activePalette_() const;
+  // Persistent expand targets — one Image + one ImageTexture each
+  // for the HUD overlay and the SNIPERS1 bezel, re-uploaded only
+  // when (contentDigest, paletteKey) changes. Bounded: 2 textures.
+  Ref<Image> hudImage_;
+  Ref<ImageTexture> hudTex_;
+  std::uint64_t hudTexKey_ = 0;    // mix(fb digest, pal key) uploaded
+  int64_t hudTexUploads_ = 0;      // real re-uploads only (boundedness)
+  Ref<Image> bezelImage_;
+  Ref<ImageTexture> bezelTex_;
+  std::uint64_t bezelTexKey_ = 0;  // mix(bezel key, pal key)
+  int64_t bezelTexUploads_ = 0;
 
   // --- Phase 16C — freefall (mode 2) ------------------------------
   // The presentation tail load_level and the freefall handoff share:
