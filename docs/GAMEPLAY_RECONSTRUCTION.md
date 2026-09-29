@@ -6532,16 +6532,16 @@ a shooter is reachable (not in the L6/L8 spawn view sets).
 
 # Phase 17B — Traversal HUD + Scope Presentation (RE CHECKPOINT)
 
-IMPLEMENTATION STATUS: **NOT STARTED.** This checkpoint records only
-the reverse-engineered BUILD_A contract; `src/core/traversal_hud.h`
-declares the planned API surface and has no implementation file, no
-includers, and no callers. No runtime/gameplay behaviour changed.
+IMPLEMENTATION STATUS: **HUD CORE IMPLEMENTED (Phase 17B.1).**
+`src/core/traversal_hud.cpp` composes the observed tail into the
+600x360 indexed overlay; runtime wiring lives in
+`traversal_runtime.cpp`. Godot HUD presentation (Phase 17B.2) is
+**NOT STARTED** — see the closeout record in §227.
 
-GODOT VALIDATION STATUS: **NOT PERFORMED.** One direct
-`Godot --headless --smoke` process started at baseline was found hung
-(3h52m elapsed vs ~1m CPU) and was terminated; a bounded baseline
-smoke must be verified before any Phase 17B Godot-side validation
-claims are made.
+GODOT VALIDATION STATUS: **BASELINE HEALTHY.** The pre-change and
+post-change bounded smoke runs (`frontend/godot/run.sh --smoke`)
+terminated normally 3/3 with `0 failures` and no surviving
+processes. No Phase 17B Godot-side content exists yet.
 
 All findings below are OBSERVED at instruction level in BUILD_A's
 MDK95.EXE unless marked otherwise (constants re-dumped with the
@@ -6706,6 +6706,17 @@ counted as a seam. This does **not** block the Phase 17B core HUD.
   (`remnantIdx(+0xf4)>>1`, counter +=1/frame capped `2*count-1`) in
   the window rect — not the pen-3 fill the Phase 17A frontend uses.
   Non-type-4 expired slots keep the pen fill (3/0x3c/0xf4).
+- `FUN_00433d40`'s mission-timer init constants are
+  **81000/54000/36000** for difficulty 0/1/2 (0x479e3400 =
+  81000.0f — the earlier 40000 note was a misread).
+- Expiry flag byte `0x540d9b` selects `|= 0x20` vs `|= 0x40` on the
+  byte's own bit7 (scriptGFlags dword bit31) — the unconditional
+  `|= 0x20` shorthand in §222 is the bit7-clear case.
+- Angle compares in the wedge path are float compares (0x40490fdb =
+  float pi) — implemented with float-precision constants so the
+  a==pi boundary does not flip the hemisphere mirror.
+- Damage-window digit suppression fires on **even** `0x5414d8`
+  frames (the disasm branch passes odd) — §220's "odd" is inverted.
 
 ## 226. Bounded implementation contract (when resumed)
 
@@ -6718,3 +6729,81 @@ Bezel under the fb. Existing decoders only: `decodeSpriteTable` /
 `blitFtiSpriteFrame` (K_ tables), the `{w16,h16,px}` image form,
 `drawFtiText`/`measureFtiText` (FONTBIG), active palette via
 `get_active_palette`. No new decoders, no embedded original data.
+
+## 227. Phase 17B.1 closeout — TRAVERSAL HUD CORE
+
+IMPLEMENTED per the §226 contract, in `src/core/traversal_hud.cpp`
+with runtime wiring in `traversal_runtime.cpp`:
+
+- `traversalHudBind` — FUN_00418688's record table (SC_STAT/SC_BSTAT/
+  SNIP_RNG/SNIP_WEP/SNIP_TXT/SNIP_L1-6/SNIP_W1-6/SKULL images),
+  CROSS/BOMBTARG/SNIPERGA/PICKUPS K_-sprite tables, the SNIPERS2
+  u16-stream layer decoded once into a 600x360 overlay, SNIPERS1
+  bezel verbatim, FONTBIG from `MISC/MDKFONT.FTI`, and the
+  difficulty-keyed timer init (81000/54000/36000).
+- `traversalHudMissionTick` — FUN_0041b654 at the frame head under
+  `fieldE9c == 0`: fixed -1.0/call, level-5 + masterMove gates,
+  expiry (clamp, shake>=5.0 arm, OOT post seam, 0x540d9b |= 0x20/0x40
+  by its own bit7).
+- `traversalHudUpdate` — FUN_00469f7c: scope-pinned/rearmed 0x541558,
+  fixed 1/30 slide lerp with overshoot clamps, id-6 `ammo[0]` sync
+  in the draw path, `frameStep` decrement.
+- `traversalHudCompose` — the full tail in observed order: selection
+  box + icons + counts -> gate-B SNIPERGA gauges (+0xf4 remnant tick)
+  -> CROSS+SNIPERS2 (hudActive) -> mounted reticle (BOMBTARG/CROSS/
+  bomb-count FONTBIG) -> event bars -> pie wedge + health digits
+  (blink/damage-window gates) -> scoped tail (zoom%, SNIP_RNG latch,
+  SNIP_WEP, SNIP_W[i] ammo gating, SNIP_L[sel], ammo digits) ->
+  message-flush seam -> SKULL scaled overlay.
+- `field541498` is now populated as the level id (parsed from the
+  LEVEL%d DTI — the port's analog of the dispatch parameter); the
+  existing readers (medium-damp `==1`, weapon-5 latch `>3`) were
+  audited against the OBSERVED compares — code unchanged, comments
+  corrected.
+
+Diagnostic surface: `--traversal-runtime` prints a `hud:` line —
+level id, bound/missing record census (25 expected slots),
+viewport-mode counter, scope flags, health/blink, weapon select,
+ammo block, inventory FSM (count/sel/timer), mission timer + wedge
+latch, event-bar state, SKULL gate fields, HUD seam counters
+(msg posts/flush/LUT remap), fb dims, nonzero pen count, and a
+deterministic FNV-1a64 digest over the composed pen-index buffer.
+
+Real-data results (`--traversal-runtime LEVEL<n> --frames 60`,
+scripted input, unscoped):
+
+| level | bound | miss | vpm | timer | nz | hud digest |
+|---|---|---|---|---|---|---|
+| L3 | 25 | 0 | 60 | 53940/54000 | 4097 | `36e1ab03a2f649ab` |
+| L6 | 25 | 0 | 60 | 53940/54000 | 4097 | `36e1ab03a2f649ab` |
+| L8 | 25 | 0 | 60 | 53940/54000 | 4097 | `36e1ab03a2f649ab` |
+
+Identical digests across levels are correct: at frame 60 the
+composed overlay is level-independent (same health/timer/digit
+draws, nothing level-keyed enters the buffer). Repeated runs are
+byte-identical — deterministic under the harness's fixed input
+stream; the digest folds only overlay pen indices, never gameplay
+state (the traversal digest is untouched).
+
+Regression at closeout: `mdk_tests` 5790 checks / 0 failures
+(including synthetic HUD fixtures: BNI/table/image/stream decode,
+bind census, timer gates, inventory FSM, scope gates, wedge stamp,
+reticle, event bars, SKULL, malformed-stream rejection, off-screen
+clipping), CTest 1/1, Godot baseline smoke 3/3 healthy, and all six
+60f traversal canonicals EXACT with `diag=0`:
+
+`25766a67ce50ea46 950219ddeae8b679 2379f7e90204e671
+5686edbf38de3fda 57bdd179a944a4c9 2edeb4aa6c7ef486`
+
+Deferred seams preserved (counted, not composed): the 0x540b20
+selected-cell shade-LUT darken (§224), the FUN_0041cb44 message
+flush, the FUN_00437aa8 scope warp, scope-entry palette fades,
+FUN_0046ec60 viewport register writes, and FUN_0045ee7c's
+window pen fills (the shotWinFill channel remains the frontend
+contract).
+
+NOT implemented: Godot HUD presentation (Phase 17B.2), audio,
+frontend/menu work. `TRAVERSAL HUD / VIEW PRESENTATION` remains
+open.
+
+**TRAVERSAL HUD CORE: CLOSED FOR BUILD_A**

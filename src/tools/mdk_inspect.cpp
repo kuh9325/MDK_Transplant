@@ -32,6 +32,7 @@
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 #include "core/gameplay_input.h"
+#include "core/indexed_image.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
@@ -3271,6 +3272,61 @@ int main(int argc, char** argv) {
                 static_cast<int>(rt.scriptDiag.size()));
     for (const std::string& m : rt.scriptDiag)
       std::printf("           ! %s\n", m.c_str());
+    // Phase 17B.1 — traversal HUD core diagnostic: the bound-record
+    // census (25 expected slots: 18 images, 4 sprite tables, SNIPERS2
+    // stream layer, SNIPERS1 bezel, FONTBIG), the latches/gates the
+    // compositor reads, and a deterministic FNV-1a64 digest over the
+    // composed 600x360 overlay's pen indices (reconstructed output —
+    // no proprietary bytes). Pixels only ever carry index values; the
+    // digest is a content checksum, not a dump.
+    {
+      const mdk::TraversalHudState& h = rt.hud;
+      int hudBound = 0, hudMiss = 0;
+      const auto imgSlot = [&](const mdk::TraversalHudImage& im) {
+        (im.px != nullptr && im.w > 0 && im.h > 0) ? ++hudBound
+                                                 : ++hudMiss;
+      };
+      imgSlot(h.scStat); imgSlot(h.scBstat);
+      imgSlot(h.snipRng); imgSlot(h.snipWep); imgSlot(h.snipTxt);
+      imgSlot(h.skull);
+      for (const auto& im : h.snipL) imgSlot(im);
+      for (const auto& im : h.snipW) imgSlot(im);
+      const auto sprSlot = [&](const mdk::FtiSprite& sp) {
+        sp.frames.empty() ? ++hudMiss : ++hudBound;
+      };
+      sprSlot(h.cross); sprSlot(h.bombtarg);
+      sprSlot(h.sniperga); sprSlot(h.pickups);
+      h.overlayPx.empty() ? ++hudMiss : ++hudBound;   // SNIPERS2
+      h.bezelPx.empty() ? ++hudMiss : ++hudBound;     // SNIPERS1
+      h.fontBigOk ? ++hudBound : ++hudMiss;           // FONTBIG
+      const std::uint64_t hudDg = mdk::fnv1a64(
+          std::span<const std::byte>(
+              reinterpret_cast<const std::byte*>(h.fb.pixels()),
+              h.fb.pixelCount()));
+      int hudNz = 0;
+      for (std::size_t i = 0; i < h.fb.pixelCount(); ++i)
+        hudNz += h.fb.pixels()[i] != 0 ? 1 : 0;
+      std::printf(
+          "hud:       lvl=%d bound=%d miss=%d vpm=%d scope=%d/%d "
+          "hp=%d blink=%d wpn=%d/%d ammo=[%d,%d,%d,%d,%d,%d] "
+          "inv=%d/%d/%d timer=%.0f/%.0f latch=%.0f ev=%.2f/%d "
+          "skull=%d/%d/%03x seams=msg%d/flush%d/lut%d "
+          "fb=%dx%d nz=%d dg=%016llx%s\n",
+          rt.field541498, hudBound, hudMiss, s.hudViewportModes,
+          rt.flagC9c, rt.transitionPhase, rt.fieldHealth,
+          h.blinkPhase, rt.wpnSel0, rt.wpnSel1,
+          rt.ammo[0], rt.ammo[1], rt.ammo[2], rt.ammo[3],
+          rt.ammo[4], rt.ammo[5],
+          rt.inventoryCount, rt.inventorySel, rt.invHudTimer,
+          (double)rt.fadeTimer5414a0, (double)rt.fadeTimer5414a4,
+          (double)rt.fadeTimer5414a8,
+          (double)rt.eventTimer, rt.eventTimerObj ? 1 : 0,
+          rt.fieldHealth == 0 ? 1 : 0, rt.fieldDac,
+          (unsigned)rt.locoState,
+          s.hudMsgPosts, s.hudMsgFlush, s.hudLutRemaps,
+          h.fb.width(), h.fb.height(), hudNz,
+          (unsigned long long)hudDg, h.bound ? "" : " (UNBOUND)");
+    }
     // Phase 15A — boss-runtime summary: end-state of each watched
     // object plus the completion-latch edges observed this run.
     if (!bossNames.empty() || !hitSpecs.empty() || sawEndLevel ||

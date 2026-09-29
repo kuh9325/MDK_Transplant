@@ -22302,6 +22302,52 @@ void test_traversal_hud() {
     mdk::traversalHudCompose(rt);
     CHECK(rt.hud.fb.at(10, 10) == 0);
   }
+
+  // ---- bounds / malformed-input hardening -------------------------
+  {
+    // Truncated sprite stream (no 0xff): the table decode fails, the
+    // slot stays empty and `bound` drops — no partial frame leaks in.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> recs;
+    recs.push_back({"CROSS", hudTestSpriteTable({{0x01, 9, 9}})});
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestBni(recs);
+    mdk::traversalHudBind(rt);
+    CHECK(rt.hud.cross.frames.empty());
+    CHECK(!rt.hud.bound);
+    // Composing the unbound runtime is still safe (empty overlay).
+    mdk::traversalHudCompose(rt);
+    int nonzero = 0;
+    for (std::size_t i = 0; i < rt.hud.fb.pixelCount(); ++i)
+      nonzero += rt.hud.fb.pixels()[i] != 0;
+    CHECK(nonzero == 0);
+
+    // Off-screen sprite writes never reach the buffer: mount the
+    // reticle and push the CROSS draw fully left/above the fb —
+    // hardened bounds drop every pixel (no OOB writes).
+    mdk::TraversalRuntime rt2;
+    rt2.level.travsprtBytes = hudTestTravsprt();
+    mdk::traversalHudBind(rt2);
+    mdk::CollisionObject mo{};
+    rt2.cs.excludeObj = &mo;
+    rt2.mountClass = 0x40000u;
+    rt2.motion.moveVel = -50.0f;      // (-50,-80): 2x2 fully OOB
+    rt2.motion.strafeVel = -80.0f;
+    rt2.hud.frameStep = 1;
+    mdk::traversalHudCompose(rt2);
+    nonzero = 0;
+    for (std::size_t i = 0; i < rt2.hud.fb.pixelCount(); ++i)
+      nonzero += rt2.hud.fb.pixels()[i] == 9;   // CROSS pen only
+    CHECK(nonzero == 0);
+    // Partial clip: strafe -1 -> only the right column survives.
+    rt2.motion.moveVel = 50.0f;
+    rt2.motion.strafeVel = -1.0f;
+    mdk::traversalHudCompose(rt2);
+    CHECK(rt2.hud.fb.at(51, 0) == 9);
+    nonzero = 0;
+    for (std::size_t i = 0; i < rt2.hud.fb.pixelCount(); ++i)
+      nonzero += rt2.hud.fb.pixels()[i] == 9;
+    CHECK(nonzero == 2);              // right column of the 2x2
+  }
 }
 
 int main() {
