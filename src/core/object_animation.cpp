@@ -321,7 +321,8 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
     // one-shot (owner slot EAX=0; +0x10 is the ECX position pointer).
     if (rt != nullptr)
       traversalAudioEmitPositional(*rt, TraversalAudioOp::kSpawnPositional,
-                                   o.animSoundName, o.pos);
+                                   o.animSoundName, o.pos, nullptr,
+                                   0x1000e);
     o.animSoundName.clear();
   }
 

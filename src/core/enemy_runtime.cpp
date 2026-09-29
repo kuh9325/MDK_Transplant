@@ -867,7 +867,7 @@ void objectArenaActivate(TraversalRuntime& rt, DynamicObject& o) {
   if (o.field158 == nullptr && !o.field15c.empty()) {
     rt.seams.fireSoundCalls++;
     traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
-                                 o.field15c, o.pos, &o);
+                                 o.field15c, o.pos, &o, 0x2000e);
   }
 }
 
@@ -934,7 +934,7 @@ DynamicObject* fxChildSpawn(TraversalRuntime& rt, DynamicObject& o) {
   rt.seams.reticleSpawnCalls++;    // same FUN_00402160 seam family
   if (!o.field15c.empty())
     traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
-                                 o.field15c, o.pos, &o);
+                                 o.field15c, o.pos, &o, 0x2000e);
   return nullptr;                  // the FX child is presentation-only
 }
 
@@ -1531,7 +1531,8 @@ void objectSubtypeUpdate(TraversalRuntime& rt, DynamicObject& o,
       if ((rt.frameCounter & 0x1f) == 0) {
         rt.seams.fireSoundCalls++;             // FUN_00402160 seam
         traversalAudioEmitPositional(
-            rt, TraversalAudioOp::kSpawnPositional, "ALERT", o.pos);
+            rt, TraversalAudioOp::kSpawnPositional, "ALERT", o.pos,
+            nullptr, 0x1000e);
       }
       rt.fieldD2c = 10;                        // DAT_00540d28
       return;

@@ -22587,7 +22587,8 @@ void test_traversal_audio() {
     CHECK(ev.op == TraversalAudioOp::kSpawnPositional &&
           ev.name == "BONES" && ev.hasPos &&
           ev.pos[0] == 9.0f && ev.pos[2] == 7.0f);
-    CHECK(ev.owner == TraversalAudioOwner::kNone); // unowned (0x1000e)
+    CHECK(ev.owner == TraversalAudioOwner::kNone); // unowned (EAX=0)
+    CHECK(ev.mode == 0x1000e);   // FUN_004555bc EBX word
 
     // Freefall form: null runtime — still consumed, no event.
     mdk::DynamicObject& o2 = animObject(da, rec);
@@ -22671,7 +22672,8 @@ void test_traversal_audio() {
           f.rt.audioFx[0].ownerKey == &o);
     CHECK(f.rt.audioFx[1].op == TraversalAudioOp::kSpawnPositional &&
           f.rt.audioFx[1].name == "SHOOT" &&
-          f.rt.audioFx[1].owner == TraversalAudioOwner::kObject);
+          f.rt.audioFx[1].owner == TraversalAudioOwner::kObject &&
+          f.rt.audioFx[1].mode == 0x2000e);   // 0x443902 EBX word
     // Rebind with empty prior name: spawn only, no release.
     mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
     o2.field108 = f.image.data() + 4 + C;

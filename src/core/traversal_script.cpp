@@ -4405,7 +4405,7 @@ void objScriptInsn(ObjScriptPass& v) {
         ++env.rt->seams.fireSoundCalls;              // FUN_00402160
         traversalAudioEmitPositional(*env.rt,
                                      TraversalAudioOp::kSpawnPositional,
-                                     sfx, obj.pos, &obj);
+                                     sfx, obj.pos, &obj, 0x2000e);
       }
       return;
     }

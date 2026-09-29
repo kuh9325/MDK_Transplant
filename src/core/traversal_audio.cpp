@@ -30,10 +30,11 @@ TraversalAudioEvent& traversalAudioEmit(TraversalRuntime& rt,
 
 TraversalAudioEvent& traversalAudioEmitPositional(
     TraversalRuntime& rt, TraversalAudioOp op, const char* name,
-    const float pos[3], const void* ownerKey) {
+    const float pos[3], const void* ownerKey, std::uint32_t mode) {
   TraversalAudioEvent& ev = traversalAudioEmit(rt, op, name);
   ev.hasPos = true;
   for (int i = 0; i < 3; ++i) ev.pos[i] = pos[i];
+  ev.mode = mode;
   if (ownerKey != nullptr) {
     ev.owner = TraversalAudioOwner::kObject;
     ev.ownerKey = ownerKey;
@@ -43,8 +44,9 @@ TraversalAudioEvent& traversalAudioEmitPositional(
 
 TraversalAudioEvent& traversalAudioEmitPositional(
     TraversalRuntime& rt, TraversalAudioOp op, const std::string& name,
-    const float pos[3], const void* ownerKey) {
-  return traversalAudioEmitPositional(rt, op, name.c_str(), pos, ownerKey);
+    const float pos[3], const void* ownerKey, std::uint32_t mode) {
+  return traversalAudioEmitPositional(rt, op, name.c_str(), pos, ownerKey,
+                                      mode);
 }
 
 std::string traversalAudioCmiName(const TraversalRuntime& rt,

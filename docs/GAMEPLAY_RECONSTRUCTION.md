@@ -6822,7 +6822,7 @@ decompiler's.
 | `FUN_004022b8` | play | one-shot spawn (no owner, no position) |
 | `FUN_00402388` | ensure/restart | mode 0: `FUN_00402658` query — if an instance is active, no-op; else `FUN_004022b8`. mode != 0: `FUN_0040210c` stop then `FUN_004022b8` |
 | `FUN_0040210c` | stop | name-scoped: scans the instance list matching `node+0x28 == snd`, releases every match via `FUN_004020b4` |
-| `FUN_00402160` | spawn positional | `(ownerSlot*, snd, mode, posPtr, a5, a6, vol, rate, range)` — `inst+0xc = ownerSlot`, `*ownerSlot = inst` (back-pointer binding); posPtr optionally copies 12 bytes to `inst+0x18`. mode `0x1000e` = ordinary positional/anim, `0x10106` = impact-style; observed vol `0x7fff`, rate `1.0`, range `50.0` |
+| `FUN_00402160` | spawn positional | `(ownerSlot*, snd, mode, posPtr, a5, a6, vol, rate, range)` — `inst+0xc = ownerSlot`, `*ownerSlot = inst` (back-pointer binding); posPtr optionally copies 12 bytes to `inst+0x18`. OBSERVED mode words: `0x1000e` anim/`ALERT`, `0x2000e` voice (`+0x158` slot), `0x10106` impacts, `0x10006` `EXPLODE` remnant; observed vol `0x7fff`, rate `1.0`, range `50.0` |
 | `FUN_00402288` | restart positional | stop the owner's current instance, respawn positionally |
 | `FUN_00402068` | release | return instance to pool + clear the owner slot |
 | `FUN_00402658` | query | name-scoped: returns a node iff some instance has `node+0x28 == snd` and `flags&0xc0 == 0` (still playing) |
@@ -6875,8 +6875,11 @@ TRANSIENT/RESET, sample parity only), `LAND` (fall and jump
 -> grounded, shared endpoint), `CHUTEOUT` (chute enter), `CHUTEON`
 (sustain ensure-playing; mantle stops + clears the latch), `CHUTEIN`
 (release — only when the query proves CHUTEON active), `SNIPERON`
-(scope enter, restart), `SNIPEROFF` + `BREATH` stop (unscope), `BREATH`
-stop (tumble/death), `ZOOM` + `BREATH` stop (death enter).
+(scope enter, restart), `SNIPEROFF` + `BREATH` stop (unscope),
+`BREATH` stop (tumble/death enter), `ZOOM` ramp loop — ensure-playing
+while `sniperZoomUpdate` moves the zoom, stop at clamp/idle
+(`FUN_00464b50`), `ZOOM` + `BREATH` stops on scope teardown
+(`FUN_00461878`, `sniperReset`).
 
 WEAPON: `SNIPERSHOT` (fire — after a free slot in the 3-slot shot
 pool; silent all-busy return preserved), `RASPBER` (weapon-5 deny,

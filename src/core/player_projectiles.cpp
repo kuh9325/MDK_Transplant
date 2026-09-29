@@ -520,7 +520,7 @@ void wallImpactDispatch(TraversalRuntime& rt, TraversalArena& arena,
     static const char* const kRico[3] = {"RICO1", "RICO2", "RICO3"};
     const std::string pick = kRico[enemyRandBelow(rt.rngState, 3)];
     traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
-                                 pick, hitPt);
+                                 pick, hitPt, nullptr, 0x10106);
   }
   CombatFxEvent ev;
   ev.kind = CombatFxKind::kShotWallImpact;
@@ -557,7 +557,7 @@ void detonateShot(TraversalRuntime& rt, PlayerShot& s, int dmg,
   // FUN_004575fc also plays EXPLODE (0x54c61c read at 0x45771f)
   // positionally at the remnant point.
   traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
-                               "EXPLODE", s.pos);
+                               "EXPLODE", s.pos, nullptr, 0x10006);
   CombatFxEvent fx;
   fx.kind = CombatFxKind::kDetonation;
   fx.pos[0] = s.pos[0]; fx.pos[1] = s.pos[1]; fx.pos[2] = s.pos[2];
@@ -1324,7 +1324,7 @@ void updateShot(TraversalRuntime& rt, PlayerShot& s, int frameStep,
         if (!iname.empty()) {
           traversalAudioEmitPositional(
               rt, TraversalAudioOp::kRestartPositional, iname,
-              hitObj->field210);
+              hitObj->field210, nullptr, 0x10106);
         } else {
           static const char* const kRico[3] = {"RICO1", "RICO2",
                                                "RICO3"};
@@ -1332,7 +1332,7 @@ void updateShot(TraversalRuntime& rt, PlayerShot& s, int frameStep,
               kRico[enemyRandBelow(rt.rngState, 3)];
           traversalAudioEmitPositional(
               rt, TraversalAudioOp::kSpawnPositional, pick,
-              hitObj->field210);
+              hitObj->field210, nullptr, 0x10106);
         }
       }
       CombatFxEvent fx;

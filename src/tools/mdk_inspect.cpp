@@ -2949,6 +2949,10 @@ int main(int argc, char** argv) {
           }
           audioDg ^= std::uint64_t(ev.hasPos) & 0xff;
           audioDg *= 1099511628211ull;
+          for (int i = 0; i < 4; ++i) {
+            audioDg ^= (ev.mode >> (i * 8)) & 0xff;
+            audioDg *= 1099511628211ull;
+          }
           if (audioLog.size() < 16) audioLog.push_back(ev);
         }
         rt.audioFx.clear();
@@ -3388,6 +3392,7 @@ int main(int argc, char** argv) {
                                   ? " owner=zone"
                                   : "",
                   ev.hasPos ? " pos=" : "");
+      if (ev.mode != 0) std::printf(" mode=%x", ev.mode);
       if (ev.hasPos)
         std::printf("(%.1f,%.1f,%.1f)", (double)ev.pos[0],
                     (double)ev.pos[1], (double)ev.pos[2]);

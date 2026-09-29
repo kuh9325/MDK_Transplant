@@ -67,6 +67,12 @@ struct TraversalAudioEvent {
                                   // matches combatFx's obj convention)
   float pos[3] = {0.f, 0.f, 0.f}; // world position (hasPos)
   bool hasPos = false;            // positional spawn/update flag
+  // FUN_00402160's mode word (inst+0x8), OBSERVED per callsite:
+  //   0x1000e object anim sounds / ALERT heartbeat
+  //   0x2000e object voice spawn (+0x158 owner slot)
+  //   0x10106 shot impacts (RICO/CMI-named)
+  //   0x10006 EXPLODE remnant (FUN_004575fc)
+  std::uint32_t mode = 0;
   int volume = 0x7fff;            // original 0..0x7fff volume domain
   float rate = 1.0f;              // rate scale (1.0 = record sample rate)
   float range = 50.0f;            // FUN_00402160 range arg (50.0 default)
@@ -85,10 +91,12 @@ TraversalAudioEvent& traversalAudioEmit(TraversalRuntime& rt,
 // Convenience: positional spawn/restart with a world position.
 TraversalAudioEvent& traversalAudioEmitPositional(
     TraversalRuntime& rt, TraversalAudioOp op, const char* name,
-    const float pos[3], const void* ownerKey = nullptr);
+    const float pos[3], const void* ownerKey = nullptr,
+    std::uint32_t mode = 0);
 TraversalAudioEvent& traversalAudioEmitPositional(
     TraversalRuntime& rt, TraversalAudioOp op, const std::string& name,
-    const float pos[3], const void* ownerKey = nullptr);
+    const float pos[3], const void* ownerKey = nullptr,
+    std::uint32_t mode = 0);
 
 // Resolve a CMI-offset string marker (field150 / field154 form:
 // offset of a length-prefixed string's data, or 0/-1 when unbound).
