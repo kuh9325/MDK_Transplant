@@ -19,12 +19,14 @@
 
 #include "core/dti_structure.h"
 #include "core/enemy_runtime.h"
+#include "core/frontend_transition.h"
 #include "core/fti_directory.h"
 #include "core/indexed_image.h"
 #include "core/keyboard_menu.h"
 #include "core/mto_directory.h"
 #include "core/save_full_restore.h"
 #include "core/save_full_write.h"
+#include "core/thmb_capture.h"
 
 #include "arena_presenter.h"
 #include "mdk_convert.h"
@@ -195,13 +197,17 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::frontend_slide_data);
   ClassDB::bind_method(D_METHOD("frontend_transition_complete"),
                        &MdkBridge::frontend_transition_complete);
+  ClassDB::bind_method(D_METHOD("frontend_transition_seconds"),
+                       &MdkBridge::frontend_transition_seconds);
+  ClassDB::bind_method(D_METHOD("frontend_capture_thumbnail"),
+                       &MdkBridge::frontend_capture_thumbnail);
   ClassDB::bind_method(D_METHOD("frontend_notify_load_result", "ok"),
                        &MdkBridge::frontend_notify_load_result);
   ClassDB::bind_method(D_METHOD("frontend_dispatch_requests"),
                        &MdkBridge::frontend_dispatch_requests);
   // Phase 18B.2A — frontend presentation.
-  ClassDB::bind_method(D_METHOD("frontend_frame"),
-                       &MdkBridge::frontend_frame);
+  ClassDB::bind_method(D_METHOD("frontend_frame", "transition_ms"),
+                       &MdkBridge::frontend_frame, DEFVAL(-1.0));
   ClassDB::bind_method(D_METHOD("frontend_progression_step", "input"),
                        &MdkBridge::frontend_progression_step);
 }
@@ -2764,8 +2770,8 @@ std::optional<mdk::FrontendSaveData> MdkBridge::produceFrontendSave_() {
   // FUN_00427ed4's writers read the live 0x541xxx globals at commit
   // time — this source snapshots them (the session is the canonical
   // store; the traversal runtime carries the live health while mode
-  // 3 runs). THMB capture is DEFERRED TO PRESENTATION — an empty
-  // thumbnail span emits the writer's zeroed 3648-byte record.
+  // 3 runs). The THMB is the arm-time capture staged by
+  // frontend_capture_thumbnail (FUN_00427e8c -> 0x49f010).
   mdk::FrontendSaveData d;
   d.headerOnly.modeField = mode_ != 0 ? mode_ : sess_.mode;
   d.headerOnly.levelId = sess_.levelId;
@@ -2773,8 +2779,18 @@ std::optional<mdk::FrontendSaveData> MdkBridge::produceFrontendSave_() {
                                           : sess_.health;
   d.headerOnly.deathCount = sess_.deathCount;
   d.headerOnly.field54163b = sess_.field54163b;
+  // The staged FUN_00427e8c capture (armed by the SaveNameThumbnailGrab
+  // fx) is embedded verbatim — FUN_00422d84 writes whatever the
+  // staging buffer holds; an absent grab emits the writer's zeroed
+  // record exactly like an original arm that never captured.
+  if (armedThmb_.size() == mdk::kThmbRecordBytes) {
+    d.headerOnly.thumbnail = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(armedThmb_.data()),
+        armedThmb_.size());
+  }
   if (mode_ == 3 && rt_) {
-    mdk::SaveWriteFullInput in;  // seed 0, no thumbnail yet
+    mdk::SaveWriteFullInput in;
+    in.thumbnail = d.headerOnly.thumbnail;
     mdk::FullWriteReport rep;
     std::string detail;
     d.full = mdk::saveGameWriteFull(*rt_, sess_, in, &rep, &detail);
@@ -2897,8 +2913,16 @@ Array MdkBridge::frontend_drain_requests() {
 Array MdkBridge::frontend_drain_fx() {
   Array out;
   if (!feShell_) return out;
-  for (const mdk::FrontendFx f : feShell_->drainFx())
+  for (const mdk::FrontendFx f : feShell_->drainFx()) {
+    // The host-side half of the arm: DAT_0049aa8c's blend gate holds
+    // the attract idle timer while the transition plays (the shell
+    // surfaced the fx; the host applies the gate here so the timing
+    // is observable in the drained event).
+    if (f == mdk::FrontendFx::TransitionArmed) {
+      mdk::frontendHostTransitionArmed(*feShell_);
+    }
     out.push_back(int64_t(f));
+  }
   return out;
 }
 
@@ -3086,6 +3110,49 @@ void MdkBridge::frontend_transition_complete() {
   // finished; the Esc-abort suppression + the attract blend gate
   // release together.
   mdk::frontendHostTransitionComplete(*feShell_);
+}
+
+double MdkBridge::frontend_transition_seconds() const {
+  // FUN_0041e554's nominal timeline — 300 ticks of 1/30. A missing
+  // INTRO1A record reports 0 so the caller completes at once rather
+  // than reproducing the original's unbound-record crash.
+  return feRes_.transition ? mdk::kFrontendTransitionSeconds : 0.0;
+}
+
+bool MdkBridge::frontend_capture_thumbnail() {
+  // FUN_00427e8c (OBSERVED): at save-name arm the original samples
+  // the presented 600x360 indexed frame (fb[(r*8)*600 + 44 + c*8])
+  // and snapshots the staged DAC palette (FUN_0046d614). In the
+  // original every screen shares the one indexed work buffer; in
+  // this port the closest authoritative source is:
+  //   * traversal arm (F2): rt_.hud.fb — the core's 600x360 indexed
+  //     overlay — under the active level palette. PARTIAL SEAM:
+  //     the Godot port has no indexed world buffer, so the world
+  //     scene beneath the HUD cannot appear in the thumbnail; the
+  //     sample layout/palette semantics are exact.
+  //   * frontend arm (autosave/briefing paths): the last composed
+  //     frontend frame.
+  armedThmb_.assign(mdk::kThmbRecordBytes, 0);
+  if (mode_ == 3 && rt_) {
+    mdk::captureThumbnail(rt_->hud.fb,
+                          {activePalette_(), 768},
+                          armedThmb_.data());
+    return true;
+  }
+  if (feShell_ && feResLoaded_) {
+    const mdkbridge::FrontendComposedFrame& f = fePresenter_.frame();
+    std::uint8_t pal[768];
+    for (int i = 0; i < mdk::Palette::size(); ++i) {
+      const mdk::Palette::Color c = f.palette.get(i);
+      pal[i * 3 + 0] = c.r;
+      pal[i * 3 + 1] = c.g;
+      pal[i * 3 + 2] = c.b;
+    }
+    mdk::captureThumbnail(f.fb, pal, armedThmb_.data());
+    return true;
+  }
+  return false;   // no indexed source armed — the staged buffer
+                  // keeps the zeroed 3648 bytes the writer emits.
 }
 
 void MdkBridge::frontend_notify_load_result(bool ok) {
@@ -3298,7 +3365,7 @@ Array MdkBridge::frontend_dispatch_requests() {
 // Phase 18B.2A — frontend presentation
 // ---------------------------------------------------------------------------
 
-Dictionary MdkBridge::frontend_frame() {
+Dictionary MdkBridge::frontend_frame(double transition_ms) {
   Dictionary out;
   if (!feShell_ || !feResLoaded_) {
     setError_("frontend_frame: frontend_boot() first");
@@ -3307,9 +3374,14 @@ Dictionary MdkBridge::frontend_frame() {
   std::string err;
   // suppressEscAbort is set on the returning-entry transition arm and
   // cleared exactly by frontend_transition_complete — the same
-  // lifecycle as the transition presentation window.
+  // lifecycle as the transition presentation window. The elapsed
+  // time drives the INTRO1A palette timeline (FUN_0041e554); a caller
+  // that keeps reporting ms after the ack gets the normal frame.
+  const double transitionSec = feShell_->suppressEscAbort()
+                                   ? transition_ms / 1000.0
+                                   : -1.0;
   if (!fePresenter_.compose(*feShell_, feRes_, feHost_.get(),
-                            feShell_->suppressEscAbort(), &err)) {
+                            transitionSec, &err)) {
     setError_("frontend_frame: " + err);
     return out;
   }
@@ -3327,31 +3399,6 @@ Dictionary MdkBridge::frontend_frame() {
     dst[i * 4 + 3] = c.a;
   }
   out["rgba"] = rgba;
-  if (f.hasThmb) {
-    // Existing-save THMB overlay: decoded with its own 768-byte
-    // palette (OBSERVED record head) — decode-only presentation.
-    PackedByteArray t;
-    t.resize(mdkbridge::kFrontendThmbWidth *
-             mdkbridge::kFrontendThmbHeight * 4);
-    std::uint8_t* td = t.ptrw();
-    for (int i = 0;
-         i < mdkbridge::kFrontendThmbWidth *
-                 mdkbridge::kFrontendThmbHeight;
-         ++i) {
-      const int idx = f.thmbPixels[static_cast<std::size_t>(i)];
-      td[i * 4 + 0] = f.thmbPalette[idx * 3 + 0];
-      td[i * 4 + 1] = f.thmbPalette[idx * 3 + 1];
-      td[i * 4 + 2] = f.thmbPalette[idx * 3 + 2];
-      td[i * 4 + 3] = 255;
-    }
-    Dictionary th;
-    th["x"] = f.thmbX;
-    th["y"] = f.thmbY;
-    th["w"] = mdkbridge::kFrontendThmbWidth;
-    th["h"] = mdkbridge::kFrontendThmbHeight;
-    th["rgba"] = t;
-    out["thmb"] = th;
-  }
   return out;
 }
 

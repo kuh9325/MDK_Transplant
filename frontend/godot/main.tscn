@@ -127,9 +127,3 @@ grow_vertical = 2
 mouse_filter = 2
 expand_mode = 1
 stretch_mode = 0
-
-[node name="FrontendThmb" type="TextureRect" parent="FrontendLayer"]
-visible = false
-mouse_filter = 2
-expand_mode = 1
-stretch_mode = 0

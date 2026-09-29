@@ -3,6 +3,8 @@
 
 #include "core/frontend_host.h"
 
+#include "core/lbb_image.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -165,6 +167,21 @@ std::optional<std::vector<std::byte>> FrontendHostServices::slideData(
   char rel[24];
   std::snprintf(rel, sizeof(rel), "MISC/MDKS_%03d.GIF", slide);
   return data_->readFile(rel, 8 << 20, nullptr);
+}
+
+const IndexedImage* FrontendHostServices::saveListLbbImage(
+    int levelId) const {
+  if (data_ == nullptr || levelId < 0 ||
+      levelId >= kSaveListLbbCount) {
+    return nullptr;
+  }
+  auto& slot = lbbCache_[static_cast<std::size_t>(levelId)];
+  if (!slot.has_value()) {
+    // Engaged-but-empty sentinel caches a miss — the file set is
+    // static for the session, so we do not re-probe every frame.
+    slot = loadSaveListLbb(*data_, levelId).value_or(IndexedImage{});
+  }
+  return slot->width > 0 ? &*slot : nullptr;
 }
 
 FrontendShellSeams FrontendHostServices::makeSeams(

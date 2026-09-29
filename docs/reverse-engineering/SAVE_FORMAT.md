@@ -67,6 +67,19 @@ LCG; save bytes are nondeterministic across identical writes).
 | `FAND` | 72 | `0x48` fan/volume record | C |
 | `BULL` | 252 | `0x540ed4` shot-pool slot (×3) | E |
 
+THMB capture (OBSERVED, `FUN_00427e8c` + `FUN_0046d614`): at save-name
+arm time — before the dialog draws — the original samples the live
+600×360 indexed work framebuffer into the record's pixel half:
+`out[768 + r*64 + c] = fb[(r*8)*600 + 44 + c*8]` (source x offset
+0x2c=44, pitch 8 in both axes), then snapshots the staged 256-entry
+DAC palette verbatim into `out[0..767]`. The record is written into
+the save on confirm (`FUN_00422d84`) and is what the save list blits
+at (418,103) for full saves (`FUN_004206d0`). Ported as
+`mdk::captureThumbnail` (`src/core/thmb_capture.*`); the Godot
+frontend stages the grab on the `SaveNameThumbnailGrab` fx and
+supplies it through `SaveWriteInput::thumbnail` /
+`SaveWriteFullInput::thumbnail`.
+
 ### Observed packet orders
 
 ```

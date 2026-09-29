@@ -370,40 +370,8 @@ struct KbBlink {
   KeyboardMenuController* ctl;  // non-null -> advanceBlink() path
 };
 
-// FUN_00416a20 (OBSERVED): inclusive hollow rectangle outline.
-void kbRectOutline(IndexedFramebuffer& fb, int x0, int y0, int x1,
-                   int y1, std::uint8_t color) {
-  for (int x = x0; x <= x1; ++x) {
-    fb.put(x, y0, color);
-    fb.put(x, y1, color);
-  }
-  for (int y = y0; y <= y1; ++y) {
-    fb.put(x0, y, color);
-    fb.put(x1, y, color);
-  }
-}
-
-// FUN_00414b28 (OBSERVED): the blinking double-outline bracket —
-  // clamps x0>=2, x1<=597, y0>=0, y1<=357; acc advances
-// floor(acc+smoothed) per call; bit 3 picks which color leads.
-void kbBlinkBracket(IndexedFramebuffer& fb, int x0, int y0, int x1,
-                    int y1, KbBlink& blink) {
-  if (x0 < kKeyboardBlinkMinX) x0 = kKeyboardBlinkMinX;
-  if (x1 > kKeyboardBlinkMaxX) x1 = kKeyboardBlinkMaxX;
-  if (y0 < 0) y0 = 0;
-  if (y1 > kKeyboardBlinkMaxY) y1 = kKeyboardBlinkMaxY;
-  bool phase;
-  if (blink.ctl) {
-    phase = blink.ctl->advanceBlink();
-  } else {
-    blink.acc = static_cast<int>(std::floor(blink.acc + blink.smoothed));
-    phase = (blink.acc & 0x8) != 0;
-  }
-  const std::uint8_t c1 = phase ? kKeyboardBlinkA : kKeyboardBlinkB;
-  const std::uint8_t c2 = phase ? kKeyboardBlinkB : kKeyboardBlinkA;
-  kbRectOutline(fb, x0 - 1, y0 + 1, x1 + 1, y1 + 1, c1);
-  kbRectOutline(fb, x0 - 2, y0, x1 + 2, y1 + 2, c2);
-}
+// FUN_00416a20 lives in fti_font as drawFtiRectOutline (shared with
+// the mouse menu and the save list).
 
 // FUN_00414dd4 (OBSERVED): FONTSML draw; flag=1 runs the
 // FUN_00414b28 marker around (penStart, penY-top)-(penEnd,
@@ -412,18 +380,19 @@ void kbBlinkBracket(IndexedFramebuffer& fb, int x0, int y0, int x1,
 void kbDrawFlagged(const FtiFont& font, std::string_view text,
                    IndexedFramebuffer& fb, int x, int penY,
                    bool flagged, KbBlink& blink) {
-  const int end =
-      drawFtiText(font, text, fb, x, penY, kFtiFontSmlMissingAdvance);
-  if (!flagged) return;
-  int top = kKeyboardTextTop, bottom = kKeyboardTextBottom;
-  if (text.size() == 1) {
-    if (const auto* g = font.glyphFor(
-            static_cast<std::uint8_t>(text[0]))) {
-      top = g->top;
-      bottom = g->bottom;
+  // The accumulator advance stays local (controller vs frozen
+  // static); geometry + the glyph top/bottom rule are the shared
+  // drawFtiTextFlagged.
+  bool phase = false;
+  if (flagged) {
+    if (blink.ctl) {
+      phase = blink.ctl->advanceBlink();
+    } else {
+      blink.acc = static_cast<int>(std::floor(blink.acc + blink.smoothed));
+      phase = (blink.acc & 0x8) != 0;
     }
   }
-  kbBlinkBracket(fb, x, penY - top, end, penY + bottom, blink);
+  drawFtiTextFlagged(font, text, fb, x, penY, flagged, phase);
 }
 
 // FUN_00414f1c (OBSERVED): centered text at x = trunc((600-w)/2) —

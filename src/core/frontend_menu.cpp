@@ -351,9 +351,6 @@ bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
       backdrop.stride != backdrop.width) {
     return fail("frontend menu: backdrop is not the 600x360 work size");
   }
-  if (optStrings.size() < kFrontendOptCount) {
-    return fail("frontend menu: OPT0..OPT4 strings not resolved");
-  }
 
   // Same composition as renderFrontendMenuFrame: backdrop memcpy,
   // palette upload, then items in draw order.
@@ -367,6 +364,30 @@ bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
   }
   // Same FUN_0046d208 upload lift as the static path (DAT_0054147e).
   applyFrontendBrightness(palette, brightness);
+
+  if (!drawFrontendMenuItems(fb, fontBig, optStrings, ctl, err)) {
+    return false;
+  }
+
+  // ARROW at the logical mouse position (FUN_004236c0).
+  blitFtiSpriteFrame(arrow, fb, ctl.mouseX(), ctl.mouseY());
+  return true;
+}
+
+bool drawFrontendMenuItems(IndexedFramebuffer& fb,
+                           const FtiFont& fontBig,
+                           std::span<const std::string_view> optStrings,
+                           FrontendMenuController& ctl,
+                           std::string* err) {
+  auto fail = [&](const char* msg) {
+    if (err) {
+      *err = msg;
+    }
+    return false;
+  };
+  if (optStrings.size() < kFrontendOptCount) {
+    return fail("frontend menu: OPT0..OPT4 strings not resolved");
+  }
 
   // Item layout (OBSERVED): saves -> indices 0..4 at y=31+36i;
   // no saves -> indices 1..4 at y=31+36(i-1) (global indices preserved).
@@ -398,9 +419,6 @@ bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
     drawFtiTextScaled(fontBig, text, fb, x, y, scale,
                       kFtiFontBigMissingAdvance);
   }
-
-  // ARROW at the logical mouse position (FUN_004236c0).
-  blitFtiSpriteFrame(arrow, fb, ctl.mouseX(), ctl.mouseY());
   return true;
 }
 

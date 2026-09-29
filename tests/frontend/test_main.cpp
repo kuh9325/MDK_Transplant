@@ -7,11 +7,15 @@
 // Canonical mapping (docs/GODOT_INTEGRATION_AUDIT.md):
 //   godot = (-mdk.y, mdk.z, -mdk.x)   — proper rotation, det +1.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <vector>
 
 #include "core/dynamic_objects.h"
+#include "gif_decode.h"
 #include "mdk_math.h"
 #include "mdk_objid.h"
 
@@ -430,6 +434,220 @@ int main() {
     CHECK(ids.idFor(&p, 0xB2) == pid);
     ids.endPass();
     CHECK(ids.find(oid) == &o && ids.find(pid) == &p);
+  }
+
+  // ================================================================
+  // Phase 18B.2B — attract-slide GIF decode (corpus shape: GIF87a/89a,
+  // one image, GCT only, non-interlaced, exactly 600x360)
+  // ================================================================
+  {
+    // Minimal GIF builder: header + LSD + 256-entry GCT + one image
+    // descriptor + LZW(min 8) sub-blocks + trailer. `codes` are the
+    // LZW code stream; packing mirrors the decoder's width growth
+    // (add one dict entry per code after the epoch's first; bump
+    // width when next == 1<<width).
+    auto packLzw = [](const std::vector<int>& codes) {
+      std::vector<std::uint8_t> out;
+      std::uint32_t acc = 0;
+      int accBits = 0;
+      int codeSize = 9, next = 258;
+      bool havePrev = false;
+      auto emit = [&](int c) {
+        acc |= std::uint32_t(c) << accBits;
+        accBits += codeSize;
+        while (accBits >= 8) {
+          out.push_back(std::uint8_t(acc & 0xff));
+          acc >>= 8;
+          accBits -= 8;
+        }
+        if (c == 256) {   // clear
+          next = 258; codeSize = 9; havePrev = false;
+        } else if (!havePrev) {
+          havePrev = true;
+        } else if (++next == (1 << codeSize) && codeSize < 12) {
+          ++codeSize;
+        }
+      };
+      for (int c : codes) emit(c);
+      if (accBits > 0) out.push_back(std::uint8_t(acc & 0xff));
+      return out;
+    };
+    auto buildGif = [&](const std::vector<int>& codes, int w, int h,
+                        int ipacked, bool trailer, bool gct) {
+      std::vector<std::uint8_t> g;
+      auto put = [&](std::initializer_list<int> bs) {
+        for (int v : bs) g.push_back(std::uint8_t(v));
+      };
+      put({'G', 'I', 'F', '8', '9', 'a'});
+      put({w & 0xff, w >> 8, h & 0xff, h >> 8,
+           gct ? 0xf7 : 0x00, 0, 0});
+      if (gct) {
+        for (int i = 0; i < 768; ++i) g.push_back(std::uint8_t(i));
+      }
+      put({0x2c, 0, 0, 0, 0, w & 0xff, w >> 8, h & 0xff, h >> 8,
+           ipacked});
+      g.push_back(8);   // LZW min code size
+      const auto stream = packLzw(codes);
+      for (std::size_t p = 0; p < stream.size(); p += 255) {
+        const int n = int(std::min<std::size_t>(255,
+                                                stream.size() - p));
+        g.push_back(std::uint8_t(n));
+        g.insert(g.end(), stream.begin() + p, stream.begin() + p + n);
+      }
+      g.push_back(0);   // block terminator
+      if (trailer) g.push_back(0x3b);
+      return g;
+    };
+    // Literal-only code stream: clear + k literals, repeated.
+    auto literalStream = [](int pixels, int litBase,
+                            std::vector<std::uint8_t>* expected) {
+      std::vector<int> codes;
+      expected->clear();
+      int emitted = 0;
+      while (emitted < pixels) {
+        codes.push_back(256);                    // clear
+        const int n = std::min(200, pixels - emitted);
+        for (int i = 0; i < n; ++i) {
+          const int lit = (litBase + emitted + i) & 0xff;
+          codes.push_back(lit);
+          expected->push_back(std::uint8_t(lit));
+        }
+        emitted += n;
+      }
+      codes.push_back(257);                      // eoi
+      return codes;
+    };
+
+    // Valid still: literals-only 600x360, palette echo.
+    {
+      std::vector<std::uint8_t> expected;
+      const auto g = buildGif(literalStream(600 * 360, 3, &expected),
+                              600, 360, 0, true, true);
+      const auto img = mdkbridge::decodeGifImage(g);
+      CHECK(img && img->hasPalette);
+      CHECK(img->width == 600 && img->height == 360);
+      CHECK(img->pixels == expected);
+      CHECK(img->palette[0].r == 0 && img->palette[0].g == 1 &&
+            img->palette[0].b == 2);
+      CHECK(img->palette[255].r == 765 % 256);
+    }
+
+    // Dictionary + KwKwK codes: epoch = clear, lits 0..255 (dict
+    // [258+k] = (k,k+1)), then dict codes 258..511 (emit pairs),
+    // then 513 == next (KwKwK -> prev string + its first char),
+    // then literals to fill.
+    {
+      std::vector<int> codes = {256};
+      std::vector<std::uint8_t> expected;
+      for (int i = 0; i <= 255; ++i) {
+        codes.push_back(i);
+        expected.push_back(std::uint8_t(i));
+      }
+      for (int k = 0; k <= 253; ++k) {          // codes 258..511
+        codes.push_back(258 + k);
+        expected.push_back(std::uint8_t(k));
+        expected.push_back(std::uint8_t(k + 1));
+      }
+      // next is now 767 -> emitting 767 is the KwKwK case:
+      // prev string [253,254] + its first char.
+      codes.push_back(767);
+      expected.push_back(253);
+      expected.push_back(254);
+      expected.push_back(253);
+      // Fill to 216000 with literals (fresh epoch each 200 codes).
+      while (expected.size() < 600 * 360) {
+        codes.push_back(256);
+        const int n =
+            std::min<int>(200, int(600 * 360 - expected.size()));
+        for (int i = 0; i < n; ++i) {
+          codes.push_back(7);
+          expected.push_back(7);
+        }
+      }
+      codes.push_back(257);
+      const auto g = buildGif(codes, 600, 360, 0, true, true);
+      const auto img = mdkbridge::decodeGifImage(g);
+      CHECK(img && img->pixels == expected);
+    }
+
+    // Rejects — every non-corpus shape.
+    {
+      std::vector<std::uint8_t> expected;
+      const auto ok = buildGif(literalStream(600 * 360, 0, &expected),
+                               600, 360, 0, true, true);
+      auto bad = ok; bad[0] = 'X';
+      CHECK(!mdkbridge::decodeGifImage(bad));          // bad sig
+      CHECK(!mdkbridge::decodeGifImage(
+          {ok.data(), ok.size() - 1}));                // truncated tail
+      CHECK(!mdkbridge::decodeGifImage({}));
+      // Wrong logical dims.
+      CHECK(!mdkbridge::decodeGifImage(
+          buildGif(literalStream(320 * 200, 0, &expected),
+                   320, 200, 0, true, true)));
+      // Interlaced / local-CT image descriptors.
+      CHECK(!mdkbridge::decodeGifImage(
+          buildGif(literalStream(600 * 360, 0, &expected),
+                   600, 360, 0x40, true, true)));
+      CHECK(!mdkbridge::decodeGifImage(
+          buildGif(literalStream(600 * 360, 0, &expected),
+                   600, 360, 0x80, true, true)));
+      // No color table at all.
+      CHECK(!mdkbridge::decodeGifImage(
+          buildGif(literalStream(600 * 360, 0, &expected),
+                   600, 360, 0, true, false)));
+      // Missing trailer.
+      CHECK(!mdkbridge::decodeGifImage(
+          buildGif(literalStream(600 * 360, 0, &expected),
+                   600, 360, 0, false, true)));
+      // A second image descriptor after the first (animation).
+      {
+        std::vector<std::uint8_t> multi;
+        const std::size_t hdrEnd = 13 + 768;   // header+LSD+GCT
+        multi.insert(multi.end(), ok.begin(), ok.begin() + hdrEnd);
+        // image 1 = ok's descriptor+data .. up to (not incl.) trailer
+        multi.insert(multi.end(), ok.begin() + hdrEnd,
+                     ok.end() - 1);
+        // image 2 = another descriptor (just the descriptor bytes is
+        // enough to trip the multi-image reject — decode fails on
+        // the second 0x2c before reading its data)
+        multi.insert(multi.end(), {0x2c, 0, 0, 0, 0,
+                                   600 & 0xff, 600 >> 8,
+                                   360 & 0xff, 360 >> 8, 0, 8});
+        multi.push_back(0);
+        multi.push_back(0x3b);
+        CHECK(!mdkbridge::decodeGifImage(multi));
+      }
+      // Truncated image data (stream ends mid-LZW).
+      {
+        auto shorty = buildGif(literalStream(600 * 360, 0, &expected),
+                               600, 360, 0, true, true);
+        shorty.resize(shorty.size() / 2);
+        CHECK(!mdkbridge::decodeGifImage(shorty));
+      }
+      // Sub-rect descriptor (offset origin) — not the corpus shape.
+      {
+        std::vector<std::uint8_t> g;
+        auto put = [&](std::initializer_list<int> bs) {
+          for (int v : bs) g.push_back(std::uint8_t(v));
+        };
+        put({'G', 'I', 'F', '8', '7', 'a'});
+        put({600 & 0xff, 600 >> 8, 360 & 0xff, 360 >> 8, 0xf7, 0, 0});
+        for (int i = 0; i < 768; ++i) g.push_back(std::uint8_t(i));
+        // image at offset (4,4) — legal GIF, outside the corpus.
+        put({0x2c, 4, 0, 4, 0, 592 & 0xff, 592 >> 8,
+             352 & 0xff, 352 >> 8, 0});
+        g.push_back(8);
+        const auto s = packLzw(literalStream(592 * 352, 0, &expected));
+        for (std::size_t p = 0; p < s.size(); p += 255) {
+          const int n = int(std::min<std::size_t>(255, s.size() - p));
+          g.push_back(std::uint8_t(n));
+          g.insert(g.end(), s.begin() + p, s.begin() + p + n);
+        }
+        g.push_back(0);
+        g.push_back(0x3b);
+        CHECK(!mdkbridge::decodeGifImage(g));
+      }
+    }
   }
 
   if (gFailures == 0) {

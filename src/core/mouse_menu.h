@@ -207,15 +207,9 @@ inline constexpr std::uint8_t kMouseCursorHollow = 6;
 inline constexpr std::uint8_t kMouseCursorFilled = 14;
 inline constexpr std::uint8_t kMouseBarOutline = 14;
 inline constexpr std::uint8_t kMouseMarkerFill = 6;
-inline constexpr std::uint8_t kMouseBlinkA = 1;
-inline constexpr std::uint8_t kMouseBlinkB = 2;
-// Blink-bracket clamps (FUN_00414b28) and default text extents
-// (FUN_00414dd4 multi-char path: top=14, bottom=2).
-inline constexpr int kMouseBlinkMaxX = 597;   // 0x255
-inline constexpr int kMouseBlinkMaxY = 357;   // 0x165
-inline constexpr int kMouseBlinkMinX = 2;
-inline constexpr int kMouseTextTop = 14;
-inline constexpr int kMouseTextBottom = 2;
+// Blink-bracket clamps/pens (FUN_00414b28) and the FUN_00414dd4
+// default text extents live in fti_font.h (kFtiBlink*/kFtiText*) —
+// shared with the keyboard screen and the save list.
 // Axis letter domain (FUN_004216a0): '0' ("Off") + 'A'..'H'.
 inline constexpr char kMouseAxisOff = '0';
 inline constexpr char kMouseAxisLetterMin = 'A';

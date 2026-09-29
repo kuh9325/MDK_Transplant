@@ -46,8 +46,8 @@
 //   documented format — file_family.h kStandardExternalFormat); the
 //   probe reads the GIF logical-screen descriptor for the 600x360
 //   gate and slideData() hands the raw bytes to whatever decoder the
-//   presentation host owns (Godot's Image.load_gif_from_buffer
-//   covers the 18B.2 frontend).
+//   presentation host owns (the GDExtension's gif_decode.cpp covers
+//   the corpus-proven GIF87a/89a single-image shape).
 //
 //   Transition seam: FUN_0041d85c(arg!=0) sets DAT_0049aa7c=1
 //   (transition armed — emitted as FrontendFx::TransitionArmed) and
@@ -57,22 +57,26 @@
 //   is active. Presentation plays the transition; the host calls
 //   frontendHostTransitionComplete() to clear both.
 //
-// THMB CAPTURE: DEFERRED TO PRESENTATION — FUN_00427e8c grabs the
-// thumbnail into 0x49f010 at save-name arm time from the live
-// framebuffer; no proven indexed-capture path exists in the host yet.
-// Writers already emit a zeroed THMB when the source thumbnail is
-// empty (the load path only previews it). A presentation that can
-// produce the exact 3648-byte record supplies it through
-// FrontendSaveData::headerOnly.thumbnail / the full-write input.
+// THMB CAPTURE (thmb_capture.h, OBSERVED FUN_00427e8c/FUN_0046d614):
+// the save-name dialog grabs a 64x45 nearest-sample of the live
+// 600x360 indexed framebuffer (x offset 44, pitch 8) plus the staged
+// 768-byte palette at arm time, staged into the record the writer
+// embeds on confirm. Writers emit a zeroed THMB when the source
+// thumbnail is empty (the load path only previews it). A
+// presentation that can produce the exact 3648-byte record supplies
+// it through FrontendSaveData::headerOnly.thumbnail / the
+// full-write input.
 
 #ifndef MDK_CORE_FRONTEND_HOST_H
 #define MDK_CORE_FRONTEND_HOST_H
 
 #include "core/data_root.h"
 #include "core/frontend_shell.h"
+#include "core/indexed_image.h"
 #include "core/save_game.h"
 #include "core/save_slot_list.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -173,6 +177,14 @@ public:
   // deliberately has no GIF decoder — kStandardExternalFormat).
   std::optional<std::vector<std::byte>> slideData(int slide) const;
 
+  // Phase 18B.2B — the save-list detail pane's level fallback
+  // image: FUN_004202cc preloads LOAD_<id>.LBB for the six level
+  // ids {7,6,3,4,8,5} (rodata 0x4999e8), pixel slots indexed by the
+  // save's level field. Returns the decoded image (palette
+  // embedded), lazily cached — bounded at six entries. Null when
+  // levelId is out of range or the file is absent/malformed.
+  const IndexedImage* saveListLbbImage(int levelId) const;
+
   // Bind all five shell seams to this host. `saveSource` supplies the
   // serialized content at write-commit time (the SaveNameWriter seam
   // only carries name + headerOnly — the original pulls the rest
@@ -186,6 +198,8 @@ public:
 private:
   SaveStore store_;          // saveRoot() — the <name>.SAV path model
   const DataRoot* data_ = nullptr;   // MISC\MDKS_* read-only access
+  // Bounded lazy cache for saveListLbbImage (six level slots).
+  mutable std::array<std::optional<IndexedImage>, 6> lbbCache_{};
 };
 
 // --- transition acknowledgement (the FUN_0041ebf4 clear point) ----

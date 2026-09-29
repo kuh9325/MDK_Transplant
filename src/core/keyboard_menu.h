@@ -225,16 +225,9 @@ inline constexpr int kKeyboardHitSplitX = 320;       // 0x140
 inline constexpr int kKeyboardHitResetLo = 2;
 inline constexpr int kKeyboardHitResetHi = 18;       // 0x12
 inline constexpr int kKeyboardHitQuitHi = 34;        // 0x22
-// Blink-bracket clamps (FUN_00414b28) and default text extents
-// (FUN_00414dd4 multi-char path: top=14, bottom=2) — same helpers
-// as the mouse screen.
-inline constexpr int kKeyboardBlinkMaxX = 597;   // 0x255
-inline constexpr int kKeyboardBlinkMaxY = 357;   // 0x165
-inline constexpr int kKeyboardBlinkMinX = 2;
-inline constexpr int kKeyboardTextTop = 14;
-inline constexpr int kKeyboardTextBottom = 2;
-inline constexpr std::uint8_t kKeyboardBlinkA = 1;
-inline constexpr std::uint8_t kKeyboardBlinkB = 2;
+// Blink-bracket clamps/pens (FUN_00414b28) and the FUN_00414dd4
+// default text extents live in fti_font.h (kFtiBlink*/kFtiText*) —
+// shared with the mouse screen and the save list.
 
 // ---------------------------------------------------------------------------
 // Internal key-code domain helpers (the four-dword bitfield domain —

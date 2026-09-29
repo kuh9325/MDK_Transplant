@@ -172,6 +172,72 @@ writer. `0x54148e` (the main-loop quit flag) is written here — an
 in-course quit surfaces through the frontend frame, not as a third
 freefall-exit branch.
 
+### Phase 18B.2B presentation detail (OBSERVED, instruction-level)
+
+The frontend seams the Godot port presents — all verified against the
+BUILD_A disassembly, not assumed:
+
+- **Attract slides** (`FUN_0041ef74` advance + `FUN_00416e98`
+  decode): `MISC\MDKS_%03d.GIF` gated on the decoder's own 600x360
+  logical-screen check; the decode writes the pixel-buffer pointer to
+  `0x49aaa0` and the palette pointer to `0x49aa9c`. Draw block in
+  `FUN_0041dc90`: the slide pixels replace the framebuffer and the
+  slide palette uploads (through the `0x54147e`-gated brightness
+  path `FUN_0046d208`); menu item strings draw over the slide for
+  `attractState != 1` and are hidden at state 1; the ARROW cursor
+  draws in all states. Corpus shape (all 10 MDKS files): GIF87a,
+  single full-frame image at origin, global color table only,
+  non-interlaced.
+- **Returning-entry transition** (`FUN_0041e554`, armed by
+  `FUN_0041d85c` writing `0x49aa7c=1` + `0x54152c=1` Esc
+  suppression): `OPTIONS.BNI` record `INTRO1A` = `{palA[768],
+  palB[768], RLE @+0x600}` — the corpus record is 83976 bytes and
+  decodes to exactly 216000 pixels, `0x00`-terminated. `FUN_0041e500`
+  RLE: control `c==0` ends the stream, `1..127` runs the next byte
+  `c` times, `128..255` copies `256-c` literal bytes. Six-phase
+  palette timeline over the decoded still (accumulator `+=1/30` per
+  tick): phase 1 decode+draw; phase 2 fade-in `black→palA` to frac
+  1.0; phase 3 hold until accum > 3.0; phase 4 crossfade `palA→palB`
+  at `+=1/60` (the step is `1/30 * 0.5`, constant `0x495a38`) to frac
+  1.0; phase 5 is the same hold body (jump-table alias); phase 6
+  fade-out `palB→black` then phase 0 → finish (black upload,
+  `FUN_0041d7b4` resource reload, `0x54152c=0`). Blend math
+  (`FUN_004164d0`/`FUN_0041657c`): `k = rint(frac*256)`,
+  `out = (src*k + base*(256-k)) >> 8` / `(a*(256-k) + b*k) >> 8`.
+  Skip: `0x54b57c` = any key edge in codes 0..127 — with `0x54bca4`
+  armed the finish body runs mid-transition. The INTRO2 nine-phase
+  variant `FUN_0041e838` exists but its record is absent from
+  BUILD_A's OPTIONS.BNI (never reachable); the mode-1 fire
+  transition `FUN_00418d80`/`FUN_00418e04` is dead code — its sole
+  writer of `0x541492=1` is itself caller-less.
+- **Save-list detail pane** (`FUN_004206d0` draw block): rows are
+  FONTSML stems at `x=0x62`, pen rows `y=0x67+16·r`, 13-row window
+  (mouse hit band `0x66 < y < 0x137`); title `SVOPT1` centered at
+  `y=0x1f` via `FUN_004239c4` (literal `"\\n"` escape split, 36px
+  step, per-line `FUN_00414d2c` = FONTBIG with FONTSML fallback when
+  the big measure hits 600px); empty list draws `SVOPT3` at `y=0x64`;
+  invalid slot draws `SVBAD` at `(0xa,0x162)`. Selected row: the
+  `FUN_00414b28` double hollow bracket via `FUN_00414dd4`'s flag —
+  pens 1/2 swap on `(markerAcc & 8)`, x clamped [2,597], y clamped
+  [0,357]. Detail pane (selected slot only): full save
+  (`GAME+0` ≥ 1000) → THMB 64×45 at `(0x1a2,0x67)`; header-only →
+  `LOAD_<lvl>.LBB` centered at `(0x1c2 − w/2, 0x67)`; inspect
+  failure → SVBAD. On selection change `FUN_00428144` inspects and
+  `FUN_00413b40` merges palettes: entries 0..63 keep the resident
+  SYS_PAL head (DAC snapshot slot), entries 64..255 take the THMB/LBB
+  palette.
+- **LOAD_<n>.LBB** (`FUN_004258a0` loader): `{768B palette, u16le w,
+  u16le h, w*h indexed}` — all six corpus files are 40772 =
+  768+4+200·200. `FUN_004202cc` preloads all six at save-list arm for
+  the level table `0x4999e8 = {7,6,3,4,8,5}`, pixel slots indexed by
+  the save's level field, palette slots at levelId+1 (slot 0 is the
+  DAC snapshot). The save-load path `FUN_004090fc` loads one for the
+  destination level. Ported as `mdk::decodeLbbImage` /
+  `mdk::loadSaveListLbb` (`src/core/lbb_image.*`).
+- **THMB capture** (`FUN_00427e8c` + `FUN_0046d614`): see
+  `SAVE_FORMAT.md` — arm-time 64×45 nearest-sample of the work
+  framebuffer (`fb[(r*8)*600 + 44 + c*8]`) + staged DAC palette.
+
 ## Subsystem map (BUILD_A)
 
 | Subsystem | Address(es) | Confidence | Key evidence |

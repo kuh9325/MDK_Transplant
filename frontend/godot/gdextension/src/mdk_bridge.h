@@ -246,10 +246,20 @@ class MdkBridge : public RefCounted {
   Dictionary frontend_slide_probe(int64_t index);
   PackedByteArray frontend_slide_data(int64_t index);
   // The transition seam: presentation calls this when the transition
-  // the TransitionArmed fx requested has played — clears the
+  // the TransitionArmed fx requested has played (elapsed the
+  // FUN_0041e554 timeline OR skipped by a key edge) — clears the
   // Esc-abort suppression + the idle/attract blend gate
   // (FUN_0041ebf4's clear point).
   void frontend_transition_complete();
+  // Nominal duration of the armed entry transition in seconds —
+  // the six-phase FUN_0041e554 timeline when INTRO1A decoded, 0 when
+  // the record is absent (the caller completes immediately then).
+  double frontend_transition_seconds() const;
+  // FUN_00427e8c's arm-time capture: samples the live indexed source
+  // (traversal -> rt_.hud.fb under the active palette; frontend
+  // arm -> the last composed frame) into the staged 3648-byte THMB
+  // record the next save write embeds.
+  bool frontend_capture_thumbnail();
   void frontend_notify_load_result(bool ok);
   // Executes every drained request the host owns — LoadSave /
   // ContinueLastGame (envelope parse + restore),
@@ -266,12 +276,10 @@ class MdkBridge : public RefCounted {
   // renderers (mdkbridge::FrontendPresenter) and returns the frame:
   //   "w"/"h"     — 600x360
   //   "rgba"      — PackedByteArray RGBA8 (600*360*4)
-  //   "thmb"      — {"x","y","w","h","rgba"} existing-save THMB
-  //                 overlay, only when the selected slot carries the
-  //                 3648-byte record (decode-only; no new capture)
-  //   "screen"    — diagnostic tag for the composed surface
+  // `transition_ms` is the elapsed milliseconds of the armed entry
+  // transition; < 0 (the default) when none is playing.
   // Requires frontend_boot() (which loads FrontendResources).
-  Dictionary frontend_frame();
+  Dictionary frontend_frame(double transition_ms = -1.0);
   // Progression pump for the modes that have no runtime of their own
   // (5 intermission / 6 loader / 7 traversal-only entry / 8
   // cinematic). `input` carries the presentation seam:
@@ -650,8 +658,12 @@ class MdkBridge : public RefCounted {
   bool feResLoaded_ = false;
   mdkbridge::FrontendPresenter fePresenter_;
   // The write seam's content source — the original's writers read
-  // live globals at commit time; this snapshots sess_/rt_.
+  // live globals at commit time; this snapshots sess_/rt_ plus the
+  // armed THMB capture (frontend_capture_thumbnail's staging).
   std::optional<mdk::FrontendSaveData> produceFrontendSave_();
+  // The staged FUN_00427e8c capture (0x49f010) — armed by the
+  // SaveNameThumbnailGrab fx, embedded verbatim by the writers.
+  std::vector<std::uint8_t> armedThmb_;
   // Dictionary -> FrontendMenuInput (see frontend_update's doc).
   mdk::FrontendMenuInput frontendInput_(const Dictionary& input) const;
   // FUN_00427f94 route for LoadSave/ContinueLastGame: parse, then

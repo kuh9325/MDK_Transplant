@@ -190,6 +190,36 @@ int drawFtiTextScaled(const FtiFont& font, std::string_view text,
                       IndexedFramebuffer& fb, int penX, int penY,
                       float scale, int missingAdvance);
 
+// --- Selection marker (FUN_00414b28 + FUN_00416a20) ---------------
+// Shared by the mouse screen, the keyboard screen, and the save
+// list (FUN_004206d0 rows pass flag=selection to FUN_00414dd4).
+inline constexpr int kFtiBlinkMinX = 2;
+inline constexpr int kFtiBlinkMaxX = 597;    // 0x255
+inline constexpr int kFtiBlinkMaxY = 357;    // 0x165
+inline constexpr std::uint8_t kFtiBlinkA = 1;
+inline constexpr std::uint8_t kFtiBlinkB = 2;
+inline constexpr int kFtiTextDefaultTop = 14;
+inline constexpr int kFtiTextDefaultBottom = 2;
+
+// FUN_00416a20 (OBSERVED): inclusive hollow rectangle outline.
+void drawFtiRectOutline(IndexedFramebuffer& fb, int x0, int y0,
+                        int x1, int y1, std::uint8_t color);
+
+// FUN_00414b28 (OBSERVED): the blinking double-outline bracket —
+// clamps x0>=2, x1<=597, y0>=0, y1<=357; outline A inset
+// (-1,+1,+1,+1), outline B inset (-2,0,+2,+2); `phase` (bit 3 of
+// the caller's blink accumulator) picks which color leads.
+void drawFtiBlinkBracket(IndexedFramebuffer& fb, int x0, int y0,
+                         int x1, int y1, bool phase);
+
+// FUN_00414dd4 tail (OBSERVED): FONTSML draw; `flagged` runs the
+// bracket around (penStart, penY-top)-(penEnd, penY+bottom).
+// Multi-char defaults top=14 bottom=2; a single mapped char uses
+// its glyph's own top/bottom. Returns the pen x after the text.
+int drawFtiTextFlagged(const FtiFont& font, std::string_view text,
+                       IndexedFramebuffer& fb, int penX, int penY,
+                       bool flagged, bool phase);
+
 } // namespace mdk
 
 #endif // MDK_CORE_FTI_FONT_H

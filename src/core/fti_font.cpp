@@ -263,4 +263,46 @@ int drawFtiTextScaled(const FtiFont& font, std::string_view text,
   return static_cast<int>(penPos);
 }
 
+void drawFtiRectOutline(IndexedFramebuffer& fb, int x0, int y0,
+                        int x1, int y1, std::uint8_t color) {
+  for (int x = x0; x <= x1; ++x) {
+    fb.put(x, y0, color);
+    fb.put(x, y1, color);
+  }
+  for (int y = y0; y <= y1; ++y) {
+    fb.put(x0, y, color);
+    fb.put(x1, y, color);
+  }
+}
+
+void drawFtiBlinkBracket(IndexedFramebuffer& fb, int x0, int y0,
+                         int x1, int y1, bool phase) {
+  if (x0 < kFtiBlinkMinX) x0 = kFtiBlinkMinX;
+  if (x1 > kFtiBlinkMaxX) x1 = kFtiBlinkMaxX;
+  if (y0 < 0) y0 = 0;
+  if (y1 > kFtiBlinkMaxY) y1 = kFtiBlinkMaxY;
+  const std::uint8_t c1 = phase ? kFtiBlinkA : kFtiBlinkB;
+  const std::uint8_t c2 = phase ? kFtiBlinkB : kFtiBlinkA;
+  drawFtiRectOutline(fb, x0 - 1, y0 + 1, x1 + 1, y1 + 1, c1);
+  drawFtiRectOutline(fb, x0 - 2, y0, x1 + 2, y1 + 2, c2);
+}
+
+int drawFtiTextFlagged(const FtiFont& font, std::string_view text,
+                       IndexedFramebuffer& fb, int penX, int penY,
+                       bool flagged, bool phase) {
+  const int end =
+      drawFtiText(font, text, fb, penX, penY, kFtiFontSmlMissingAdvance);
+  if (!flagged) return end;
+  int top = kFtiTextDefaultTop, bottom = kFtiTextDefaultBottom;
+  if (text.size() == 1) {
+    if (const FtiGlyph* g =
+            font.glyphFor(static_cast<std::uint8_t>(text[0]))) {
+      top = g->top;
+      bottom = g->bottom;
+    }
+  }
+  drawFtiBlinkBracket(fb, penX, penY - top, end, penY + bottom, phase);
+  return end;
+}
+
 } // namespace mdk

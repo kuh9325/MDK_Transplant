@@ -313,18 +313,8 @@ MouseAction MouseMenuController::consumeAction() {
 
 namespace {
 
-// FUN_00416a20 (OBSERVED): inclusive hollow rectangle outline.
-void rectOutline(IndexedFramebuffer& fb, int x0, int y0, int x1,
-                 int y1, std::uint8_t color) {
-  for (int x = x0; x <= x1; ++x) {
-    fb.put(x, y0, color);
-    fb.put(x, y1, color);
-  }
-  for (int y = y0; y <= y1; ++y) {
-    fb.put(x0, y, color);
-    fb.put(x1, y, color);
-  }
-}
+// FUN_00416a20 lives in fti_font as drawFtiRectOutline (shared with
+// the keyboard menu and the save list).
 
 // FUN_00416aa8 (OBSERVED): inclusive solid rectangle fill.
 void rectFill(IndexedFramebuffer& fb, int x0, int y0, int x1,
@@ -361,28 +351,6 @@ struct BlinkState {
   MouseMenuController* ctl;  // non-null -> advanceBlink() path
 };
 
-// FUN_00414b28 (OBSERVED): the blinking double-outline bracket.
-// Clamps x0>=2, x1<=597, y0>=0, y1<=357; acc advances
-// floor(acc+smoothed) per call; bit 3 picks which color leads.
-void blinkBracket(IndexedFramebuffer& fb, int x0, int y0, int x1,
-                  int y1, BlinkState& blink) {
-  if (x0 < kMouseBlinkMinX) x0 = kMouseBlinkMinX;
-  if (x1 > kMouseBlinkMaxX) x1 = kMouseBlinkMaxX;
-  if (y0 < 0) y0 = 0;
-  if (y1 > kMouseBlinkMaxY) y1 = kMouseBlinkMaxY;
-  bool phase;
-  if (blink.ctl) {
-    phase = blink.ctl->advanceBlink();
-  } else {
-    blink.acc = static_cast<int>(std::floor(blink.acc + blink.smoothed));
-    phase = (blink.acc & 0x8) != 0;
-  }
-  const std::uint8_t c1 = phase ? kMouseBlinkA : kMouseBlinkB;
-  const std::uint8_t c2 = phase ? kMouseBlinkB : kMouseBlinkA;
-  rectOutline(fb, x0 - 1, y0 + 1, x1 + 1, y1 + 1, c1);
-  rectOutline(fb, x0 - 2, y0, x1 + 2, y1 + 2, c2);
-}
-
 // FUN_00414dd4 (OBSERVED): FONTSML draw; flag=1 runs the
 // FUN_00414b28 marker around (penStart, penY-top)-(penEnd,
 // penY+bottom). Multi-char default top=14 bottom=2; a single
@@ -390,18 +358,19 @@ void blinkBracket(IndexedFramebuffer& fb, int x0, int y0, int x1,
 void drawFlaggedText(const FtiFont& font, std::string_view text,
                      IndexedFramebuffer& fb, int x, int penY,
                      bool flagged, BlinkState& blink) {
-  const int end =
-      drawFtiText(font, text, fb, x, penY, kFtiFontSmlMissingAdvance);
-  if (!flagged) return;
-  int top = kMouseTextTop, bottom = kMouseTextBottom;
-  if (text.size() == 1) {
-    if (const auto* g = font.glyphFor(
-            static_cast<std::uint8_t>(text[0]))) {
-      top = g->top;
-      bottom = g->bottom;
+  // The accumulator advance stays local (controller vs frozen
+  // static); geometry + the glyph top/bottom rule are the shared
+  // drawFtiTextFlagged.
+  bool phase = false;
+  if (flagged) {
+    if (blink.ctl) {
+      phase = blink.ctl->advanceBlink();
+    } else {
+      blink.acc = static_cast<int>(std::floor(blink.acc + blink.smoothed));
+      phase = (blink.acc & 0x8) != 0;
     }
   }
-  blinkBracket(fb, x, penY - top, end, penY + bottom, blink);
+  drawFtiTextFlagged(font, text, fb, x, penY, flagged, phase);
 }
 
 // The display letter for axis i — same NUL semantics as the
@@ -456,11 +425,11 @@ void drawGridRow(const FtiFont& font, IndexedFramebuffer& fb,
     if (set) {
       rectFill(fb, cellX, y - 13, cellX + 13, y - 1, kMouseCellFill);
     } else {
-      rectOutline(fb, cellX + 1, y - 13, cellX + 13, y - 1,
+      drawFtiRectOutline(fb, cellX + 1, y - 13, cellX + 13, y - 1,
                   kMouseCellOutline);
     }
     if (activeCol == c) {
-      rectOutline(fb, cellX, y - 14, cellX + 14, y,
+      drawFtiRectOutline(fb, cellX, y - 14, cellX + 14, y,
                   set ? kMouseCursorFilled : kMouseCursorHollow);
     }
   }
@@ -480,7 +449,7 @@ void drawAxisRow(const FtiFont& font, IndexedFramebuffer& fb,
               kFtiFontSmlMissingAdvance);
   drawFlaggedText(font, action, fb, kMouseAxisActionX, y,
                   axisIndex + 4 == selection, blink);
-  rectOutline(fb, kMouseAxisBarX0, y - kMouseAxisBarTop,
+  drawFtiRectOutline(fb, kMouseAxisBarX0, y - kMouseAxisBarTop,
               kMouseAxisBarX1, y - kMouseAxisBarBottom,
               kMouseBarOutline);
   const int pos = static_cast<int>(std::floor(
@@ -494,12 +463,12 @@ void drawAxisRow(const FtiFont& font, IndexedFramebuffer& fb,
 // color 2 at (50,110)-(150,210); box outlines color 3 offset by
 // the clamped marker components.
 void drawTestIndicator(IndexedFramebuffer& fb, int mx, int my) {
-  rectOutline(fb, kMouseTestX0, kMouseTestY0, kMouseTestX1,
+  drawFtiRectOutline(fb, kMouseTestX0, kMouseTestY0, kMouseTestX1,
               kMouseTestY1, kMouseTestFrameColor);
-  rectOutline(fb, kMouseTestCenterX - 3 + mx, kMouseTestCenterY - 3 + my,
+  drawFtiRectOutline(fb, kMouseTestCenterX - 3 + mx, kMouseTestCenterY - 3 + my,
               kMouseTestCenterX + 3 + mx, kMouseTestCenterY + 3 + my,
               kMouseBoxColor);
-  rectOutline(fb, kMouseTestCenterX - 2 + mx, kMouseTestCenterY - 2 + my,
+  drawFtiRectOutline(fb, kMouseTestCenterX - 2 + mx, kMouseTestCenterY - 2 + my,
               kMouseTestCenterX + 2 + mx, kMouseTestCenterY + 2 + my,
               kMouseBoxColor);
 }

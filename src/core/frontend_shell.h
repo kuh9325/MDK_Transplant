@@ -249,6 +249,13 @@ public:
   }
   bool helpOpen() const { return subMode_ == kSubHelp; }
   const FrontendMachineState& sharedMachine() const { return shared_; }
+  // DAT_0049a770 — the shared flagged-draw blink accumulator
+  // (FUN_00414b28): advances floor(acc + timing.smoothed) per call,
+  // bit 3 is the phase. The menu controllers advance it through
+  // their own machine blocks; screens whose flagged draws run in
+  // presentation (the save list's selected row) advance it here so
+  // the global's cadence stays identical across screens.
+  bool advanceMarkerBlink();
 
   // Requests queue in emission order — a single frame can produce
   // more than one (e.g. the save-name commit raises WriteSaveDone

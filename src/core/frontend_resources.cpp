@@ -323,6 +323,20 @@ bool loadFrontendResources(DataRoot& root, FrontendResources& res,
     }
   }
 
+  // Phase 18B.2B: INTRO1A — the returning-entry transition record.
+  // FUN_0041d85c resolves it unconditionally into the mode-1
+  // dispatcher's pointer (0x49aa84); a missing record would leave
+  // that null. The port treats it as optional and skips playback.
+  if (const BniRecord* intro = findBniRecord(bdir, "INTRO1A")) {
+    const std::span<const std::byte> introPayload(
+        bni->data() + intro->payloadFileOffset, intro->payloadSize());
+    res.transition = decodeFrontendTransitionRecord(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(
+                introPayload.data()),
+            introPayload.size()));
+  }
+
   res.backdrop = std::move(*backdrop);
   res.fontBig = std::move(*fontBig);
   res.fontSml = std::move(*fontSml);

@@ -49,12 +49,14 @@ add_library(mdk_core STATIC
   src/core/frontend_resources.cpp
   src/core/frontend_settings.cpp
   src/core/frontend_shell.cpp
+  src/core/frontend_transition.cpp
   src/core/fti_directory.cpp
   src/core/fti_font.cpp
   src/core/fti_sprite.cpp
   src/core/gameplay_input.cpp
   src/core/indexed_image.cpp
   src/core/keyboard_menu.cpp
+  src/core/lbb_image.cpp
   src/core/mode_dispatch.cpp
   src/core/mouse_menu.cpp
   src/core/mti_directory.cpp
@@ -82,6 +84,7 @@ add_library(mdk_core STATIC
   src/core/sni_wave.cpp
   src/core/sound_menu.cpp
   src/core/stream_context.cpp
+  src/core/thmb_capture.cpp
   src/core/traversal_audio.cpp
   src/core/traversal_audio_dsp.cpp
   src/core/traversal_audio_mixer.cpp

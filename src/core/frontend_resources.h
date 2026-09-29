@@ -16,6 +16,7 @@
 #ifndef MDK_CORE_FRONTEND_RESOURCES_H
 #define MDK_CORE_FRONTEND_RESOURCES_H
 
+#include "core/frontend_transition.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 #include "core/indexed_image.h"
@@ -100,6 +101,13 @@ struct FrontendResources {
   std::string helpBot;               // HELP_BOT "Items marked with * are remappable"
   std::array<std::string, 18> helpLines;  // HELP_01..HELP_18
   std::array<std::byte, 192> sysPalHead{};  // SYS_PAL record head
+  // Phase 18B.2B — OPTIONS.BNI record INTRO1A: the returning-entry
+  // transition record {palA, palB, RLE pixels} FUN_0041d85c binds
+  // for the FUN_0041e554 dispatcher. Optional: absent/malformed
+  // leaves this empty and the port skips transition playback (the
+  // original would dereference the unbound record pointer — the
+  // crash itself is not reproduced).
+  std::optional<FrontendTransitionImage> transition;
   bool savesExist = false;          // FUN_00428290 SAVES/*.SAV probe
 };
 

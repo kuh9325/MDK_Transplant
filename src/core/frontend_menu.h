@@ -404,6 +404,20 @@ bool renderFrontendMenuDynamic(IndexedFramebuffer& fb, Palette& palette,
                                int brightness,
                                std::string* err);
 
+// The strings block of renderFrontendMenuDynamic (the FUN_0041dc90
+// item loop, OBSERVED): OPT items at y = 31 + 36i, each scaled by the
+// controller's ramp machine in draw order — with NO backdrop copy and
+// NO palette upload. The attract path uses this when a slide is bound
+// and attractState != 1: the original draws the same strings over the
+// slide pixels (0x49aaa0 replaces the framebuffer before the block).
+// The ARROW cursor draw stays with the caller (it runs in both the
+// state==1 and state>=2 tails).
+bool drawFrontendMenuItems(IndexedFramebuffer& fb,
+                           const FtiFont& fontBig,
+                           std::span<const std::string_view> optStrings,
+                           FrontendMenuController& ctl,
+                           std::string* err);
+
 } // namespace mdk
 
 #endif // MDK_CORE_FRONTEND_MENU_H

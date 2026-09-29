@@ -93,14 +93,16 @@ var fe_typed := PackedInt32Array()   # queued typed chars (1/frame)
 var fe_raw := PackedInt32Array()     # internal-domain key edges
 var fe_img: Image = null
 var fe_tex: ImageTexture = null
-var fe_thmb_img: Image = null
-var fe_thmb_tex: ImageTexture = null
-var fe_transition_left := 0    # placeholder transition frames
+# Entry-transition playback window: fe_transition_ms < 0 = idle;
+# >= 0 counts the elapsed FUN_0041e554 timeline while fe_transition_
+# total_ms holds the record's nominal duration (0 when INTRO1A is
+# absent — the window then closes on the first tick).
+var fe_transition_ms := -1.0
+var fe_transition_total_ms := 0.0
 var fe_stage_hold := 0         # intermission placeholder hold
 var fe_fx_counts := {}         # FrontendFx id -> count (diag/smoke)
 var fe_req_counts := {}        # request id -> count (diag/smoke)
 var fe_quit := false           # Quit request drained (app-owned)
-const FE_TRANSITION_FRAMES := 24   # ~0.4s noise placeholder
 const FE_STAGE_HOLD := 45          # ~0.75s intermission placeholder
 
 # Phase 17A — traversal combat presentation state. mdk_core owns
@@ -4304,7 +4306,6 @@ func _frontend_show() -> void:
 
 func _frontend_hide() -> void:
 	$FrontendLayer/FrontendRect.visible = false
-	$FrontendLayer/FrontendThmb.visible = false
 	$FrontendLayer.visible = false
 	_show_gameplay_layers()
 
@@ -4350,12 +4351,68 @@ const FE_FX_THUMB_GRAB := 7
 func _frontend_fx(f: int) -> void:
 	fe_fx_counts[f] = int(fe_fx_counts.get(f, 0)) + 1
 	if f == FE_FX_TRANSITION_ARMED:
-		# Entry transition armed — run the mode-1 noise placeholder
-		# for a bounded window, then acknowledge through the core
-		# (FUN_0041ebf4's clear point).
-		fe_transition_left = FE_TRANSITION_FRAMES
+		# Returning-entry transition armed — run the INTRO1A still
+		# under the six-phase palette timeline (FUN_0041e554); the
+		# ack is FUN_0041ebf4's clear point.
+		fe_transition_ms = 0.0
+		fe_transition_total_ms = bridge.frontend_transition_seconds() * 1000.0
+	elif f == FE_FX_THUMB_GRAB:
+		# FUN_00427e8c's arm-time capture — the bridge samples the
+		# live indexed frame into the staged THMB record.
+		bridge.frontend_capture_thumbnail()
 	# MenuSongStart / PauseSounds / ResumeSounds*: the music + SFX
 	# backend is a deferred seam — counted only.
+
+
+# True when the input dictionary carries any key edge — the OBSERVED
+# transition skip flag 0x54b57c ("any key edge in codes 0..127").
+# raw_edges already covers every mappable physical key; the named
+# fields are edge-triggered entries (the smoke's injected dicts and
+# any unmapped semantic edge). Held levels (prev/next/left/right)
+# are NOT edges — a held key must not skip. Mouse buttons/motion are
+# not keys and do not skip.
+const FE_EDGE_KEYS := [
+	"confirm", "attract", "cancel",
+	"page_up", "page_down", "home", "end",
+	"key_y", "key_n", "f1", "f2", "f3", "f10", "f11", "f12",
+	"pause", "pause_alt", "utility",
+	"left_edge", "right_edge",
+	"name_bs", "name_del", "name_home", "name_end",
+]
+
+func _fe_any_edge(d: Dictionary) -> bool:
+	for k in FE_EDGE_KEYS:
+		if bool(d.get(k, false)):
+			return true
+	if int(d.get("typed", 0)) != 0:
+		return true
+	var raw = d.get("raw_edges", null)
+	if raw != null:
+		for v in raw:
+			if int(v) != 0:
+				return true
+	return false
+
+
+# Per-frame transition bookkeeping shared by the live loop and the
+# smoke. While the window is active the frame routes to the
+# transition machine, not the menu pump (0x49aa7c's dispatch) — so
+# the input the shell sees that frame is empty. A key edge skips
+# (0x54b57c); the window closes when the elapsed time reaches the
+# record's timeline duration. Returns the input dict to feed
+# frontend_update (empty while the transition owns the frame).
+func _fe_transition_input(input: Dictionary, dt_ms: float) -> Dictionary:
+	if fe_transition_ms < 0.0:
+		return input
+	if _fe_any_edge(input):
+		bridge.frontend_transition_complete()
+		fe_transition_ms = -1.0
+		return {}
+	fe_transition_ms += dt_ms
+	if fe_transition_ms >= fe_transition_total_ms:
+		bridge.frontend_transition_complete()
+		fe_transition_ms = -1.0
+	return {}
 
 
 # FrontendRequest ids (mdk::FrontendRequest order).
@@ -4391,7 +4448,10 @@ func _frontend_request(req: Dictionary) -> void:
 func _frontend_present() -> void:
 	if not $FrontendLayer/FrontendRect.visible:
 		_frontend_show()
-	var fr: Dictionary = bridge.frontend_frame()
+	# The armed-transition elapsed time drives the frame — the core
+	# shows the INTRO1A still under the blended palette when
+	# fe_transition_ms >= 0.
+	var fr: Dictionary = bridge.frontend_frame(fe_transition_ms)
 	if fr.is_empty():
 		return
 	var w := int(fr["w"])
@@ -4403,27 +4463,6 @@ func _frontend_present() -> void:
 	else:
 		fe_tex.update(fe_img)
 	$FrontendLayer/FrontendRect.texture = fe_tex
-	var th: TextureRect = $FrontendLayer/FrontendThmb
-	if fr.has("thmb"):
-		# Existing-save THMB preview — decoded host-side with its
-		# own palette; presented as an overlay rect scaled with the
-		# same 600x360 -> window stretch the frame uses.
-		var t: Dictionary = fr["thmb"]
-		fe_thmb_img = Image.create_from_data(int(t["w"]), int(t["h"]),
-			false, Image.FORMAT_RGBA8, t["rgba"])
-		if fe_thmb_tex == null:
-			fe_thmb_tex = ImageTexture.create_from_image(fe_thmb_img)
-		else:
-			fe_thmb_tex.update(fe_thmb_img)
-		th.texture = fe_thmb_tex
-		var vp := get_viewport().get_visible_rect().size
-		var sx := vp.x / 600.0
-		var sy := vp.y / 360.0
-		th.position = Vector2(int(t["x"]) * sx, int(t["y"]) * sy)
-		th.size = Vector2(int(t["w"]) * sx, int(t["h"]) * sy)
-		th.visible = true
-	else:
-		th.visible = false
 
 
 # One frontend-owned frame: shell update, request dispatch, fx
@@ -4431,16 +4470,13 @@ func _frontend_present() -> void:
 func _frontend_frame(delta: float, mode: int) -> void:
 	var input := _fe_input()
 	if mode == 0:
-		var snap: Dictionary = bridge.frontend_update(input)
+		var snap: Dictionary = bridge.frontend_update(
+			_fe_transition_input(input, delta * 1000.0))
 		fe_sub = int(snap.get("sub_mode", 0))
 		for req in bridge.frontend_dispatch_requests():
 			_frontend_request(req)
 		for f in bridge.frontend_drain_fx():
 			_frontend_fx(int(f))
-		if fe_transition_left > 0:
-			fe_transition_left -= 1
-			if fe_transition_left == 0:
-				bridge.frontend_transition_complete()
 		_frontend_present()
 		bridge.frontend_end_frame(delta * 1000.0)
 		if fe_quit:
@@ -4475,16 +4511,14 @@ func _frontend_frame(delta: float, mode: int) -> void:
 func _fe_smoke_step(input: Dictionary, n: int = 1) -> Dictionary:
 	var snap := {}
 	for i in n:
-		snap = bridge.frontend_update(input if i == 0 else {})
+		var frame_input: Dictionary = input if i == 0 else {}
+		snap = bridge.frontend_update(
+			_fe_transition_input(frame_input, 33.333))
 		for req in bridge.frontend_dispatch_requests():
 			_frontend_request(req)
 		for f in bridge.frontend_drain_fx():
 			_frontend_fx(int(f))
-		if fe_transition_left > 0:
-			fe_transition_left -= 1
-			if fe_transition_left == 0:
-				bridge.frontend_transition_complete()
-		bridge.frontend_frame()
+		bridge.frontend_frame(fe_transition_ms)
 		bridge.frontend_end_frame(33.333)
 	fe_sub = int(snap.get("sub_mode", 0)) if not snap.is_empty() else 0
 	return snap
@@ -4627,9 +4661,11 @@ func _run_smoke_frontend() -> void:
 	_check(skill0 >= 0 and skill1 == (skill0 + 1) % 3,
 		"J: skill cycled through the contract")
 
-	# --- M. transition arm/ack -------------------------------------
+	# --- M. transition arm/ack/skip --------------------------------
 	# enterFrontend(true) is the returning-entry path: it arms
-	# TransitionArmed + Esc suppression; the ack releases both.
+	# TransitionArmed + Esc suppression; the INTRO1A timeline is 10s
+	# (300 ticks of 1/30) and any key edge skips it (0x54b57c,
+	# OBSERVED). The ack is FUN_0041ebf4's clear point.
 	bridge.frontend_enter(true)
 	var fx_seen := false
 	for i in 4:
@@ -4642,11 +4678,19 @@ func _run_smoke_frontend() -> void:
 	_check(fx_seen, "M: returning entry armed TransitionArmed")
 	_check(bool(snap2.get("suppress_esc_abort", false)),
 		"M: Esc suppression held during transition")
-	for i in FE_TRANSITION_FRAMES + 2:
-		_fe_smoke_step({}, 1)
-	snap2 = bridge.frontend_snapshot()
+	_check(fe_transition_ms >= 0.0,
+		"M: transition presentation window armed")
+	# The armed frame is the INTRO1A record under the blended palette,
+	# not the menu — count the non-black pixels a few ticks in.
+	_fe_smoke_step({}, 3)
+	var tfr: Dictionary = bridge.frontend_frame(fe_transition_ms)
+	_check(int(tfr.get("w", 0)) == 600, "M: transition frame composed")
+	# A key edge skips (Y is inert at the root menu, so nothing else
+	# dispatches off this frame).
+	snap2 = _fe_smoke_step({"key_y": true}, 1)
 	_check(not bool(snap2.get("suppress_esc_abort", true)),
-		"M: transition ack released Esc suppression")
+		"M: key edge ack released Esc suppression")
+	_check(fe_transition_ms < 0.0, "M: transition window closed")
 
 	# --- D. New Game request -> progression ------------------------
 	# Select index 1 (New Game) then confirm.

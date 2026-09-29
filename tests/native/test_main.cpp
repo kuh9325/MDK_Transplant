@@ -25,12 +25,14 @@
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
 #include "core/frontend_shell.h"
+#include "core/frontend_transition.h"
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 #include "core/gameplay_input.h"
 #include "core/indexed_image.h"
 #include "core/keyboard_menu.h"
+#include "core/lbb_image.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
@@ -53,6 +55,7 @@
 #include "core/sni_wave.h"
 #include "core/sound_menu.h"
 #include "core/stream_context.h"
+#include "core/thmb_capture.h"
 #include "core/traversal_audio_dsp.h"
 #include "core/traversal_audio_mixer.h"
 #include "core/traversal_runtime.h"
@@ -24768,6 +24771,229 @@ void test_traversal_audio_mixer() {
   }
 }
 
+// ---- Phase 18B.2B — presentation-format decoders ------------------
+
+void test_lbb_image() {
+  // OBSERVED layout (FUN_004258a0): 768-byte palette, u16le w/h,
+  // w*h indexed pixels — nothing else.
+  {
+    std::vector<std::uint8_t> bytes(768 + 4 + 6);
+    for (int i = 0; i < 768; ++i) bytes[i] = std::uint8_t(i & 0xff);
+    bytes[768] = 2;  bytes[769] = 0;   // w = 2
+    bytes[770] = 3;  bytes[771] = 0;   // h = 3
+    for (int i = 0; i < 6; ++i) bytes[772 + i] = std::uint8_t(40 + i);
+    const auto img = mdk::decodeLbbImage(bytes);
+    CHECK(img && img->hasPalette);
+    CHECK(img->width == 2 && img->height == 3 && img->stride == 2);
+    CHECK(img->pixels.size() == 6 && img->pixels[0] == 40 &&
+          img->pixels[5] == 45);
+    CHECK(img->palette[0].r == 0 && img->palette[1].g == 4 &&
+          img->palette[255].b == std::uint8_t(767 & 0xff));
+  }
+  // Rejects: truncated, trailing byte, zero dims, oversized dims,
+  // size/dim mismatch.
+  CHECK(!mdk::decodeLbbImage({}));
+  {
+    std::vector<std::uint8_t> b(768 + 4 + 6, 0);
+    b[768] = 2; b[770] = 3;
+    CHECK(mdk::decodeLbbImage(b).has_value());
+    CHECK(!mdk::decodeLbbImage(
+        {b.data(), b.size() - 1}));            // short payload
+    b.push_back(0);
+    CHECK(!mdk::decodeLbbImage(b));            // trailing byte
+    b[768] = 0;
+    CHECK(!mdk::decodeLbbImage(b));            // w == 0
+    std::vector<std::uint8_t> big(768 + 4, 0);
+    big[768] = 601 & 0xff; big[769] = 601 >> 8;
+    big[770] = 10; big[771] = 0;
+    CHECK(!mdk::decodeLbbImage(big));          // w > 600
+  }
+  // loadSaveListLbb: levelId indexes the rodata table {7,6,3,4,8,5}.
+  {
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "mdk_test_lbb";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "MISC");
+    std::vector<std::uint8_t> lbb(768 + 4 + 200 * 200, 0);
+    lbb[0] = 0xAA;
+    lbb[768] = 200; lbb[770] = 200;
+    lbb[772] = 0x55;
+    std::ofstream(tmp / "MISC" / "LOAD_7.LBB", std::ios::binary)
+        .write(reinterpret_cast<const char*>(lbb.data()),
+               std::streamsize(lbb.size()));
+    // A malformed sibling (wrong size) must fail its own levelId.
+    std::ofstream(tmp / "MISC" / "LOAD_6.LBB", std::ios::binary)
+        .write("xx", 2);
+    std::string err;
+    auto root = mdk::DataRoot::open(tmp, &err);
+    CHECK(root.has_value());
+    const auto img = mdk::loadSaveListLbb(*root, 0);   // -> LOAD_7
+    CHECK(img && img->width == 200 && img->height == 200);
+    CHECK(img->pixels[0] == 0x55);
+    CHECK(img->palette[0].r == 0xAA);
+    CHECK(!mdk::loadSaveListLbb(*root, 1));            // LOAD_6 malformed
+    CHECK(!mdk::loadSaveListLbb(*root, 2));            // LOAD_3 absent
+    CHECK(!mdk::loadSaveListLbb(*root, -1));
+    CHECK(!mdk::loadSaveListLbb(*root, 6));
+    fs::remove_all(tmp);
+  }
+}
+
+void test_thmb_capture() {
+  // FUN_00427e8c (OBSERVED): out[768 + r*64 + c] =
+  // fb[(r*8)*600 + 44 + c*8]; FUN_0046d614 snapshots the staged
+  // 768-byte palette verbatim into out[0..767].
+  mdk::IndexedFramebuffer fb(600, 360);
+  for (int y = 0; y < 360; ++y)
+    for (int x = 0; x < 600; ++x)
+      fb.put(x, y, std::uint8_t((x * 3 + y * 5) & 0xff));
+  std::uint8_t pal[768];
+  for (int i = 0; i < 768; ++i) pal[i] = std::uint8_t(i * 7 & 0xff);
+
+  std::vector<std::uint8_t> rec(mdk::kThmbRecordBytes);
+  mdk::captureThumbnail(fb, pal, rec.data());
+  CHECK(rec.size() == 3648);
+  CHECK(std::memcmp(rec.data(), pal, 768) == 0);
+  bool px = true;
+  for (int r = 0; r < mdk::kThmbHeight; ++r)
+    for (int c = 0; c < mdk::kThmbWidth; ++c)
+      px &= rec[768 + r * mdk::kThmbWidth + c] ==
+            fb.at(mdk::kThmbSrcOffsetX + c * mdk::kThmbSamplePitch,
+                  r * mdk::kThmbSamplePitch);
+  CHECK(px);
+
+  // Round-trip: the captured record rides SaveWriteInput.thumbnail
+  // into the written save's THMB packet and inspects back verbatim.
+  mdk::SaveWriteInput in;
+  in.modeField = 3;
+  in.levelId = 1;
+  in.health = 120;
+  in.deathCount = 0;
+  in.field54163b = 0;
+  in.seed = 0x42;
+  in.thumbnail = std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(rec.data()), rec.size());
+  const auto file = mdk::saveGameWriteHeaderOnly(in);
+  CHECK(!file.empty());
+  mdk::SaveGamePacket g;
+  std::vector<std::byte> cap;
+  CHECK(mdk::saveGameInspectHead(file.data(), file.size(), &g, &cap) ==
+        mdk::SaveError::kOk);
+  CHECK(cap.size() == mdk::kThmbRecordBytes);
+  CHECK(std::memcmp(cap.data(), rec.data(), rec.size()) == 0);
+}
+
+void test_frontend_transition() {
+  // INTRO1A record: palA + palB + FUN_0041e500 RLE -> 600x360.
+  // RLE: c==0 end; 1..127 run of next byte; 128..255 literal 256-c.
+  std::vector<std::uint8_t> rec(768 * 2);
+  for (int i = 0; i < 768; ++i) {
+    rec[i] = std::uint8_t(i & 0xff);                // palette A
+    rec[768 + i] = std::uint8_t(255 - (i & 0xff));  // palette B
+  }
+  // Stream: run 127x of 9, literal 3 [10,11,12], run 1x 13, then
+  // enough zero-runs to fill 216000, then the terminator.
+  std::vector<std::uint8_t> rle = {127, 9, 0xFD, 10, 11, 12, 1, 13};
+  std::size_t filled = 127 + 3 + 1;
+  const std::size_t target = 600 * 360;
+  while (filled < target) {
+    const int n = static_cast<int>(
+        std::min<std::size_t>(127, target - filled));
+    rle.push_back(std::uint8_t(n));
+    rle.push_back(0);
+    filled += std::size_t(n);
+  }
+  rle.push_back(0);
+  rec.insert(rec.end(), rle.begin(), rle.end());
+
+  const auto img = mdk::decodeFrontendTransitionRecord(rec);
+  CHECK(img.has_value());
+  CHECK(img->image.width == 600 && img->image.height == 360);
+  CHECK(!img->image.hasPalette);
+  CHECK(img->image.pixels.size() == target);
+  CHECK(img->image.pixels[0] == 9 && img->image.pixels[126] == 9);
+  CHECK(img->image.pixels[127] == 10 && img->image.pixels[128] == 11 &&
+        img->image.pixels[129] == 12);
+  CHECK(img->image.pixels[130] == 13);
+  CHECK(img->image.pixels[131] == 0 &&
+        img->image.pixels[target - 1] == 0);
+  CHECK(img->paletteA[0] == 0 && img->paletteA[3] == 3);
+  CHECK(img->paletteB[0] == 255 && img->paletteB[3] == 252);
+
+  // Early terminator leaves the tail black (the original's buffer is
+  // cleared before decode).
+  {
+    std::vector<std::uint8_t> r2(768 * 2);
+    r2.insert(r2.end(), {5, 77, 0});
+    const auto img2 = mdk::decodeFrontendTransitionRecord(r2);
+    CHECK(img2.has_value());
+    CHECK(img2->image.pixels[4] == 77 &&
+          img2->image.pixels[5] == 0);
+  }
+  // Rejects: short record, truncated literal run, output overrun.
+  CHECK(!mdk::decodeFrontendTransitionRecord(
+      {rec.data(), 768 * 2}));                    // no RLE at all
+  {
+    std::vector<std::uint8_t> bad(768 * 2);
+    bad.insert(bad.end(), {200, 1, 2});           // literal wants 56
+    CHECK(!mdk::decodeFrontendTransitionRecord(bad));
+  }
+  {
+    std::vector<std::uint8_t> bad(768 * 2);
+    bad.insert(bad.end(), {127, 9});
+    std::size_t f = 127;
+    while (f <= target) {                         // overruns the cap
+      bad.push_back(127);
+      bad.push_back(9);
+      f += 127;
+    }
+    CHECK(!mdk::decodeFrontendTransitionRecord(bad));
+  }
+
+  // Palette timeline (FUN_0041e554 phases): black at 0, fade palA in
+  // to 1.0s, hold to 4.0s, crossfade to 6.0s, hold to 9.0s, fade to
+  // black by 10.0s.
+  std::uint8_t out[768];
+  mdk::frontendTransitionPalette(*img, 0.0, out);
+  CHECK(out[0] == 0 && out[100] == 0 && out[767] == 0);
+  mdk::frontendTransitionPalette(*img, 0.5, out);
+  // frac .5 -> k = rne(128): out = (a*128 + 0*128) >> 8.
+  CHECK(out[3] == std::uint8_t((3 * 128) >> 8));
+  CHECK(out[100] == std::uint8_t((100 * 128) >> 8));
+  mdk::frontendTransitionPalette(*img, 2.0, out);
+  CHECK(out[3] == 3 && out[767] == 255);          // full palA
+  mdk::frontendTransitionPalette(*img, 5.0, out);  // crossfade .5
+  CHECK(out[0] == std::uint8_t((0 * 128 + 255 * 128) >> 8));
+  CHECK(out[3] == std::uint8_t((3 * 128 + 252 * 128) >> 8));
+  mdk::frontendTransitionPalette(*img, 7.0, out);
+  CHECK(out[0] == 255 && out[3] == 252);          // full palB
+  mdk::frontendTransitionPalette(*img, 9.5, out);  // fade-out half
+  CHECK(out[0] == std::uint8_t((255 * 128) >> 8));
+  mdk::frontendTransitionPalette(*img, 10.0, out);
+  CHECK(out[0] == 0 && out[767] == 0);
+  CHECK(mdk::frontendTransitionDone(10.0));
+  CHECK(!mdk::frontendTransitionDone(9.999));
+
+  // The raw blend primitives: k = round-half-even(frac*256).
+  {
+    std::uint8_t src[768], a[768], b[768], dst[768];
+    for (int i = 0; i < 768; ++i) {
+      src[i] = std::uint8_t(i & 0xff);
+      a[i] = std::uint8_t(i & 0xff);
+      b[i] = std::uint8_t((i * 3) & 0xff);
+    }
+    const std::uint8_t black[3] = {0, 0, 0};
+    mdk::frontendPaletteFadeToBase(dst, src, black, 0.25);
+    // k = rne(64) = 64 -> (src*64) >> 8.
+    CHECK(dst[255] == std::uint8_t((255 * 64) >> 8));
+    mdk::frontendPaletteFadeToBase(dst, src, black, 0.1);
+    // k = rne(25.6) = 26.
+    CHECK(dst[100] == std::uint8_t((100 * 26) >> 8));
+    mdk::frontendPaletteCrossfade(dst, a, b, 0.25);
+    CHECK(dst[100] == std::uint8_t((100 * 192 + 44 * 64) >> 8));
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -24862,6 +25088,9 @@ int main() {
   test_sni_wave();
   test_traversal_audio_dsp();
   test_traversal_audio_mixer();
+  test_lbb_image();
+  test_thmb_capture();
+  test_frontend_transition();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

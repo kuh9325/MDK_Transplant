@@ -1,7 +1,7 @@
 // Godot frontend presenter — composes the authoritative FrontendShell
 // state into a 600x360 indexed frame + palette using the SAME core
-// renderers the native SDL app uses. GDScript receives RGBA bytes and
-// an optional THMB overlay; no menu semantics live here.
+// renderers the native SDL app uses. GDScript receives RGBA bytes;
+// no menu semantics live here.
 //
 // Evidence levels per layout element are marked at each draw site:
 // OBSERVED records/coords where the evidence doc pins them,
@@ -15,9 +15,10 @@
 #include "core/frontend_host.h"
 #include "core/frontend_resources.h"
 #include "core/frontend_shell.h"
+#include "core/indexed_image.h"
 
-#include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,31 +36,22 @@ inline constexpr int kFrontendThmbBytes =
 struct FrontendComposedFrame {
   mdk::IndexedFramebuffer fb{600, 360};
   mdk::Palette palette;
-  // Existing-save THMB preview. The thumbnail carries its OWN palette
-  // so it cannot be baked into the shared indexed frame — the caller
-  // expands and draws it as an overlay rect at (thmbX, thmbY).
-  bool hasThmb = false;
-  int thmbX = 0;
-  int thmbY = 0;
-  std::array<std::uint8_t,
-             kFrontendThmbWidth * kFrontendThmbHeight>
-      thmbPixels{};
-  std::array<std::uint8_t, kFrontendThmbPaletteBytes> thmbPalette{};
 };
 
 class FrontendPresenter {
 public:
   // Compose one frame for the shell's current state. `host` supplies
-  // the save-slot detail probe (THMB bytes); it may be null in tests —
-  // slot detail then degrades to summary-only text.
-  // `transitionPlaying` mirrors the host's armed-but-not-acknowledged
-  // entry transition (FrontendFx::TransitionArmed drained, awaiting
-  // frontend_transition_complete) — the frame shows the mode-1 noise
-  // placeholder then.
+  // the save-slot detail probe (THMB bytes), the LBB detail images
+  // and the MISC\MDKS_* slide bytes; it may be null in tests —
+  // host-sourced imagery then degrades to its absent-resource path.
+  //
+  // `transitionSec` is the elapsed time of the armed returning-entry
+  // transition (FUN_0041e554): >= 0 while it plays (the INTRO1A still
+  // under the blended palette timeline), < 0 otherwise.
   bool compose(mdk::FrontendShell& shell,
                const mdk::FrontendResources& res,
                const mdk::FrontendHostServices* host,
-               bool transitionPlaying,
+               double transitionSec,
                std::string* err);
 
   const FrontendComposedFrame& frame() const { return frame_; }
@@ -73,6 +65,11 @@ private:
   void drawCenteredBig(const mdk::FtiFont& font, std::string_view text,
                        int y, float scale = 1.0f);
 
+  // Returning-entry transition frame: INTRO1A pixels under the
+  // six-phase blended palette (FUN_0041e554).
+  void transitionFrame(const mdk::FrontendResources& res,
+                       double seconds, int brightness);
+
   void saveListScreen(mdk::FrontendShell& sh,
                       const mdk::FrontendResources& res,
                       const mdk::FrontendHostServices* host);
@@ -82,16 +79,29 @@ private:
                    const mdk::FrontendResources& res);
   void helpScreen(const mdk::FrontendResources& res);
   void pauseScreen(const mdk::FrontendResources& res);
-  void noiseFrame();
+
+  // Lazily decoded attract slide, keyed by the attract state (the
+  // slide number). nullopt = no decode attempted yet; an empty
+  // engaged value caches a failure so a broken slide is not
+  // re-decoded every frame (bounded).
+  const mdk::IndexedImage* slideImage(
+      const mdk::FrontendHostServices* host, int state);
+  // Lazily inspected save-slot detail, keyed by stem (DAT_0054bd2c's
+  // selection-change cadence — the file set is static mid-dialog).
+  const mdk::FrontendSlotInspection* slotDetail(
+      const mdk::FrontendHostServices* host, const std::string& stem);
 
   FrontendComposedFrame frame_;
-  // Presentation-only counters: cursor blink + noise fill. These are
-  // NOT gameplay/frontend state — they never reach the shell.
+  // Presentation-only counter: cursor blink phase.
   unsigned tick_ = 0;
-  unsigned noiseSeed_ = 0;
   std::vector<std::string_view> optViews_;
   // Borrowed during compose() for dialogPalette's SYS_PAL head.
   const mdk::FrontendResources* lastRes_ = nullptr;
+
+  int slideIndex_ = -1;
+  std::optional<mdk::IndexedImage> slideImg_;
+  std::string detailStem_;
+  std::optional<mdk::FrontendSlotInspection> detail_;
 };
 
 }  // namespace mdkbridge

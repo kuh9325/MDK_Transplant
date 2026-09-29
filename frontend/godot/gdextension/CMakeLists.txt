@@ -61,6 +61,7 @@ add_library(mdkbridge SHARED
     src/mdk_bridge.cpp
     src/arena_presenter.cpp
     src/frontend_presenter.cpp
+    src/gif_decode.cpp
     src/object_presenter.cpp
     src/register_types.cpp)
 target_include_directories(mdkbridge PRIVATE "${MDK_CORE_SRC}" src)
@@ -75,7 +76,8 @@ set_target_properties(mdkbridge PROPERTIES
 
 # ---------- native (non-Godot) frontend tests ----------
 add_executable(mdk_frontend_tests
-    "${MDK_REPO_ROOT}/tests/frontend/test_main.cpp")
+    "${MDK_REPO_ROOT}/tests/frontend/test_main.cpp"
+    src/gif_decode.cpp)
 target_include_directories(mdk_frontend_tests PRIVATE "${MDK_CORE_SRC}" src)
 target_link_libraries(mdk_frontend_tests PRIVATE mdk_core_frontend)
 target_compile_options(mdk_frontend_tests PRIVATE

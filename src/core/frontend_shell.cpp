@@ -1,5 +1,6 @@
 #include "core/frontend_shell.h"
 
+#include <cmath>
 #include <utility>
 
 namespace mdk {
@@ -61,6 +62,14 @@ std::vector<FrontendFx> FrontendShell::drainFx() {
   std::vector<FrontendFx> out;
   out.swap(fx_);
   return out;
+}
+
+bool FrontendShell::advanceMarkerBlink() {
+  // FUN_00414b28's accumulator step on the shared global
+  // (DAT_0049a770): floor(acc + smoothed), bit 3 is the phase.
+  shared_.markerAcc = static_cast<int>(
+      std::floor(shared_.markerAcc + shared_.timing.smoothed));
+  return (shared_.markerAcc & 0x8) != 0;
 }
 
 void FrontendShell::setSaveBlockFlags(bool a, bool b, bool xStrike) {
