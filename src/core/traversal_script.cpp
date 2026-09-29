@@ -4084,6 +4084,15 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       if ((mode & 0x80) != 0 && env.rt != nullptr) {
         ++env.rt->seams.fireSoundCalls;     // FUN_004022b8/402388 seam
+        // mode&3 sub-mode (OBSERVED dispatch at 0x43a1xx):
+        // 0 -> FUN_004022b8 one-shot, 1 -> FUN_00402388(h,1) restart,
+        // 2 -> FUN_00402388(h,0) ensure-playing.
+        static const TraversalAudioOp kSfxOps[3] = {
+            TraversalAudioOp::kPlayOnce, TraversalAudioOp::kRestart,
+            TraversalAudioOp::kEnsurePlaying};
+        const int sub = mode & 3;
+        if (sub <= 2 && !sfx.empty())
+          traversalAudioEmit(*env.rt, kSfxOps[sub], sfx);
       }
       return;
     }
@@ -4376,13 +4385,28 @@ void objScriptInsn(ObjScriptPass& v) {
       // presentation — counted in seams.fireSoundCalls, not resolved.
       const std::string sfx = r.str();
       if (!r.ok) { v.fail("voicebind"); return; }
+      const std::string oldVoice = obj.field15c;
       obj.field15c = sfx;                            // +0x15c
       if (obj.field158 != nullptr) {
         if (env.rt != nullptr) ++env.rt->seams.fireSoundCalls;
         obj.field158 = nullptr;
       }
-      if (!sfx.empty() && env.rt != nullptr)
+      // Audio contract: release the previous owned voice instance and
+      // respawn the new one positionally (owner = +0x158 slot). The
+      // port's field158 stays null, so the release keys on the prior
+      // bound name — the same object-voice identity.
+      if (env.rt != nullptr && !oldVoice.empty()) {
+        TraversalAudioEvent& rel = traversalAudioEmit(
+            *env.rt, TraversalAudioOp::kRelease, oldVoice);
+        rel.owner = TraversalAudioOwner::kObject;
+        rel.ownerKey = &obj;
+      }
+      if (!sfx.empty() && env.rt != nullptr) {
         ++env.rt->seams.fireSoundCalls;              // FUN_00402160
+        traversalAudioEmitPositional(*env.rt,
+                                     TraversalAudioOp::kSpawnPositional,
+                                     sfx, obj.pos, &obj);
+      }
       return;
     }
     case 0x6d: {                            // player damage (0x443c73)

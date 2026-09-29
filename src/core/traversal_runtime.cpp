@@ -558,8 +558,9 @@ void traversalConnectorUpdate(DynamicObject& o, TraversalRuntime& rt) {
 // latching +0x118 = 0xff00 on completion of a non-looping anim.
 // ---------------------------------------------------------------------------
 void traversalObjectAnimUpdate(DynamicObject& o,
-                               const std::uint8_t* recLimit) {
-  objectAnimTick(o, recLimit);
+                               const std::uint8_t* recLimit,
+                               TraversalRuntime* rt) {
+  objectAnimTick(o, recLimit, rt);
 }
 
 // ---------------------------------------------------------------------------
@@ -1748,7 +1749,7 @@ TraversalFrameResult stepTraversalRuntime(
         traversalObjectAnimUpdate(
             o, reinterpret_cast<const std::uint8_t*>(
                    rt.level.cmiBytes.data()) +
-                   rt.level.cmiBytes.size());        // FUN_004555bc
+                   rt.level.cmiBytes.size(), &rt);   // FUN_004555bc
         if (!o.col.named) continue;                  // 0x4573b1
         // Tail: roll ride (0x148&0x40) -> ridden-follow -> +0x18c
         // vel-cache + prev-state latch (inside latchObjectPrevState).

@@ -425,6 +425,7 @@ void playerFireDispatch(TraversalRuntime& rt) {
     // flag 0x540e14 and the fire latch 0x54163b.
     if (rt.fieldE14 == 0 || rt.field54163b != 0) {
       ++rt.seams.fireDenyCalls;   // FUN_00402388(1, 0x54c650)
+      traversalAudioEmit(rt, TraversalAudioOp::kRestart, "RASPBER");
       return;
     }
     if (rt.field541498 > 3) rt.field54163b = 1;   // level id >= 4
@@ -446,6 +447,7 @@ void playerFireDispatch(TraversalRuntime& rt) {
 
   rt.fieldD0c = 0;
   ++rt.seams.fireSoundCalls;      // FUN_004022b8(0x54c5d0)
+  traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "SNIPERSHOT");
   PlayerShot& s = rt.shots[slot];
   s = PlayerShot{};               // FUN_0047d20a — memset 0xfc
   s.state = 1;

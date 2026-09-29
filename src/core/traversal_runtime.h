@@ -90,6 +90,7 @@
 #include "core/player_motion.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
+#include "core/traversal_audio.h"
 #include "core/traversal_hud.h"
 
 namespace mdk {
@@ -709,6 +710,13 @@ struct TraversalRuntime {
   // Presentation-only — the frontend drains it; nothing consumes it
   // in-game. (std::move + clear to drain.)
   std::vector<CombatFxEvent> combatFx;
+  // Phase 17C.1 — traversal audio event log (traversal_audio.h).
+  // One TraversalAudioEvent per original FUN_00402xxx callsite,
+  // pushed alongside the seams.* counters. Drain-once like combatFx
+  // (std::move + clear) — nothing in the core consumes it; it is
+  // presentation output only and never feeds back into gameplay.
+  std::vector<TraversalAudioEvent> audioFx;
+  std::uint32_t audioSeq = 0;     // monotonic audio-event emission order
   // Animation machine (FUN_00461954) + slide vector + scripted gates:
   int animPrev = -1;              // 0x540cb0 — previous anim state (the
                                   // first-frame detect latch)
@@ -975,7 +983,8 @@ const RuntimeModel* traversalNamedModel(TraversalLevel& lv,
 // record walk — pass the containing image end (nullptr = unchecked,
 // test path). Full implementation: object_animation.cpp.
 void traversalObjectAnimUpdate(DynamicObject& o,
-                               const std::uint8_t* recLimit);
+                               const std::uint8_t* recLimit,
+                               TraversalRuntime* rt = nullptr);
 
 // FUN_00434b44 — type-1/3 trigger scan on the current arena.
 void traversalTriggerScan(TraversalRuntime& rt);

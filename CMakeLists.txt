@@ -75,6 +75,7 @@ add_library(mdk_core STATIC
   src/core/sni_directory.cpp
   src/core/sound_menu.cpp
   src/core/stream_context.cpp
+  src/core/traversal_audio.cpp
   src/core/traversal_hud.cpp
   src/core/traversal_runtime.cpp
   src/core/traversal_script.cpp

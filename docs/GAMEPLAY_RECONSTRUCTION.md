@@ -6807,3 +6807,123 @@ frontend/menu work. `TRAVERSAL HUD / VIEW PRESENTATION` remains
 open.
 
 **TRAVERSAL HUD CORE: CLOSED FOR BUILD_A**
+
+## 228. Traversal audio — the BUILD_A sound API (OBSERVED — disasm)
+
+The traversal sound system is a DirectSound-backed instance pool driven
+by a small API in `0x4020xx-0x402fxx`. All of the following was
+reconstructed from BUILD_A disassembly; names/addresses are the
+decompiler's.
+
+| address | role | semantics |
+|---|---|---|
+| `FUN_0046c198` | init | DirectSound init; fails on Resources-in-Use |
+| `FUN_00402fe8` | resolve | name -> sound-table record in the active list |
+| `FUN_004022b8` | play | one-shot spawn (no owner, no position) |
+| `FUN_00402388` | ensure/restart | mode 0: `FUN_00402658` query — if an instance is active, no-op; else `FUN_004022b8`. mode != 0: `FUN_0040210c` stop then `FUN_004022b8` |
+| `FUN_0040210c` | stop | name-scoped: scans the instance list matching `node+0x28 == snd`, releases every match via `FUN_004020b4` |
+| `FUN_00402160` | spawn positional | `(ownerSlot*, snd, mode, posPtr, a5, a6, vol, rate, range)` — `inst+0xc = ownerSlot`, `*ownerSlot = inst` (back-pointer binding); posPtr optionally copies 12 bytes to `inst+0x18`. mode `0x1000e` = ordinary positional/anim, `0x10106` = impact-style; observed vol `0x7fff`, rate `1.0`, range `50.0` |
+| `FUN_00402288` | restart positional | stop the owner's current instance, respawn positionally |
+| `FUN_00402068` | release | return instance to pool + clear the owner slot |
+| `FUN_00402658` | query | name-scoped: returns a node iff some instance has `node+0x28 == snd` and `flags&0xc0 == 0` (still playing) |
+| `FUN_00402698` | set volume | per-instance volume write (zone-crossfade fader) |
+| `FUN_0040247c` | set rate | per-instance pitch/rate (sled BUTSLIDE/BUTBRAKE path) |
+| `FUN_0040202c` | master scale | scale by master sfx/music volume |
+| `FUN_004026f8` | mixer tick | copies the 48-byte listener matrix to `0x49ff5c` (source `0x540bb0` = traversal camera basis, written per frame in `FUN_00436100`), then walks the instance list dispatching on mode: `0x100` -> 2D `FUN_0040282c`, `0x200` -> 3D `FUN_00402b00` |
+| `FUN_00402b00` | 3D update | distance attenuation (min 20, max 250), doppler rate, pan from the listener basis, DS scale ~0.0763/unit with -2500mB offset |
+| `FUN_0046c31c` | DS buffer ops | `IDirectSoundBuffer` vtbl: SetVolume(-2500mB bias), SetFrequency, SetCurrentPosition, Play(loop) |
+| `FUN_00402e2c` | buffer create | parses the embedded RIFF/WAVE in place (fmt size 0x12 check, 'fact' chunk, DS buffer from channels/dataSize/rate/blockAlign) |
+
+Instance pool: 63 entries x 0x48 bytes at `0x4a0020` — a hard cap with
+NO stealing (allocation failure returns null silently). Loops are
+ordinary instances with the DS LOOP flag; the keep-alive is the
+ensure-playing query, not a separate channel class.
+
+## 229. Sound data source + format (OBSERVED on real data)
+
+Traversal sounds live in the SNI resource directories (`*.SNI` beside
+the levels). Record: `{char name[12], u16 flags, u16 volume
+(0x7fff typical), u32 dataOffset, u32 dataLength}`; the payload is a
+4-byte-length-prefixed RIFF/WAVE. fmt chunk (18 bytes, 0x12) carries
+PCM format — mono, 8000Hz 8-bit for `SNIPERSHOT`; rate/bit depth vary
+per record. `flags` bit0 marks loop records (CHUTEON, BREATH, FAN,
+GRUNTFIRE, zone loops); `CORRIDOR`-class zone records show flags=3.
+`LEVELnS.SNI` carries the level-local `FOOT1`..`FOOT4`; the global
+table is loaded by `FUN_0043394c` inside `FUN_00433d40` (34 fixed
+names + slots `0x54c620/0x624` resolved per-level by `FUN_00431e50`
+zone records through `FUN_0045849c` CMI lookup).
+
+Verified name->slot map (excerpt): `0x54c5d0 SNIPERSHOT`,
+`0x54c5d4 SNIPERON`, `0x54c5d8 SNIPEROFF`, `0x54c5dc BREATH`,
+`0x54c5f4 ALERT`, `0x54c5fc CHUTEOUT`, `0x54c600 CHUTEIN`,
+`0x54c604 CHUTEON`, `0x54c608 LAND`, `0x54c630 GRUNTFIRE`,
+`0x54c634 APPLE`, `0x54c644 RUNNER`, `0x54c650 RASPBER`,
+`0x54c658 ZOOM`, plus `RICO1/2/3`, `FOOT1-4`, `EXPLODE`, `ALDIE`,
+`CHUTEOUT`, `MULTIFIRE`, `GATTFIRE`, `SNIPRELD`, `BONES`, `COLLECT`,
+`WMIB`, `FAN`, `TORNADO`, `COW`, `DUMMY`, `LOAD_MSG`.
+
+No original waveform data is committed; the port never parses the
+payload — it needs only the record names.
+
+## 230. Reachable traversal sound census (OBSERVED callsites)
+
+PLAYER: `FOOT1-4` (run/run-fire anim-frame crossings — first trigger
+plays `0x54c60c`/`0x54c614`, second `0x54c610`/`0x54c618`; latch
+`0x49b924` picks the pair (!=0 -> FOOT1/FOOT2, ==0 -> FOOT3/FOOT4)
+and toggles only on the second crossing — `animFootAlt` is
+TRANSIENT/RESET, sample parity only), `LAND` (fall and jump
+-> grounded, shared endpoint), `CHUTEOUT` (chute enter), `CHUTEON`
+(sustain ensure-playing; mantle stops + clears the latch), `CHUTEIN`
+(release — only when the query proves CHUTEON active), `SNIPERON`
+(scope enter, restart), `SNIPEROFF` + `BREATH` stop (unscope), `BREATH`
+stop (tumble/death), `ZOOM` + `BREATH` stop (death enter).
+
+WEAPON: `SNIPERSHOT` (fire — after a free slot in the 3-slot shot
+pool; silent all-busy return preserved), `RASPBER` (weapon-5 deny,
+restart), impact `RICO1/2/3` (positional spawn, `0x10106` mode) chosen
+by `FUN_00437444` via `FUN_00401ed4` — **the pick consumes the shared
+gameplay LCG** and is reproduced as `enemyRandBelow(rt.rngState,3)`
+(owner-none); wall impacts use the same pick gated by
+`mode>1 || (frameCounter&3)==0`; detonation spawns `EXPLODE`
+positionally; named object-impact sounds (`field150`-resolved CMI
+name) use `FUN_00402288` restart-positional. `MULTIFIRE`/`GATTFIRE`/
+`SNIPRELD` are weapon-table sounds wired through the same fire seam.
+
+ENEMY/OBJECT: `ALERT` heartbeat (positional, every 32 frames while the
+object is in the player's arena), object voice (`+0x15c` name,
+`+0x158` instance) release via `FUN_004020b4`/`FUN_00402068` and
+respawn via `FUN_00402160` — script op `0x6b` rebind does both;
+`RUNNER` ensure-playing; `FUN_0046603c` sled repitch (BUTSLIDE/
+BUTBRAKE) is a rate-update seam, presentation-only; anim-marker
+`+0x140` consume -> `FUN_00402160` unowned positional one-shot
+(`0x1000e`, range 50) in `FUN_004555bc`; object-sfx op `0x59`
+`mode&0x80` -> `FUN_004022b8`/`FUN_00402388` per `mode&3` (one-shot /
+restart / ensure), `mode&4` also binds `+0x15c`.
+
+Zone ambience: `FUN_00431e50` resolves the level's two zone names into
+`0x54c620/0x624`; `FUN_00431cf4` crossfades via per-instance volume
+(`FUN_00402698`); `FUN_00431fbc` cleans up on teardown. Port state:
+`ambientFades`/`ambientChan` are already persisted in full saves —
+ambient loops are PERSISTED/DERIVED state, event history is TRANSIENT.
+
+OUT OF SCOPE (classified, not implemented): frontend/menu sounds,
+music, OS driver emulation, broad unused-name catalog. Freefall keeps
+its own FreefallEvent family — `objectAnimTickDt` receives a null
+runtime there so its anim sounds stay out of the traversal stream.
+
+## 231. Core contract (IMPLEMENTED) — `core/traversal_audio.h`
+
+`TraversalAudioEvent` {seq, op, name, owner category, ownerKey,
+position} with `TraversalAudioOp` = `kPlayOnce | kRestart | kStop |
+kRelease | kEnsurePlaying | kSpawnPositional | kRestartPositional`.
+Emission helpers `traversalAudioEmit`/`traversalAudioEmitPositional`
+append to `rt.audioFx` under monotonic `rt.audioSeq`; consumers drain
+(`std::move` + clear) like `combatFx` — one-shot-once, no duplicate
+playback across snapshots. Events carry names not waveforms; no
+DirectSound/Godot dependency. Name-keyed ops (play-once, ensure,
+restart, stop) are NAME-scoped in the original — `FUN_00402658` /
+`FUN_0040210c` walk the instance list matching the sound-record
+pointer, so `owner` stays `kNone` there. Owner identity only exists
+where the original binds an instance through an owner slot —
+positional spawns (`FUN_00402160`) and releases (`FUN_004020b4`) —
+expressed as the bound `DynamicObject*` identity token.

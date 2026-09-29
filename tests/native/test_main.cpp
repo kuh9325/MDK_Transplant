@@ -22350,6 +22350,352 @@ void test_traversal_hud() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 17C.1 — traversal audio event contract (core/traversal_audio.h).
+// Presentation-neutral records only: ordering, identity, owner, position,
+// drain-once delivery, and the emitter sites' original call semantics.
+// ---------------------------------------------------------------------------
+void test_traversal_audio() {
+  using namespace mdk;
+
+  // Minimal player-anim table bank (same shape as test_player_animation).
+  // Reserve up front: rec() must never reallocate, or pointers already
+  // stored into rt.animTables.* dangle.
+  struct Abank {
+    std::vector<std::byte> buf;
+    Abank() { buf.reserve(1 << 16); }
+    const std::byte* rec(int n) {
+      const std::size_t base = buf.size();
+      const std::size_t data = base + 4 + n * 4;
+      buf.resize(data + n * 8, std::byte{0});
+      buf[base] = (std::byte)(n & 0xff);
+      buf[base + 1] = (std::byte)((n >> 8) & 0xff);
+      for (int i = 0; i < n; ++i) {
+        const std::uint32_t ofs =
+            static_cast<std::uint32_t>(data - base + i * 8);
+        for (int k = 0; k < 4; ++k)
+          buf[base + 4 + i * 4 + k] =
+              (std::byte)((ofs >> (k * 8)) & 0xff);
+      }
+      return buf.data() + base;
+    }
+  };
+
+  // -- emit: seq is monotonic, frame stamped, drain-once ---------------
+  {
+    TraversalRuntime rt;
+    rt.frameCounter = 7;
+    traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "FOO");
+    traversalAudioEmit(rt, TraversalAudioOp::kStop, "BAR");
+    CHECK(rt.audioFx.size() == 2);
+    CHECK(rt.audioFx[0].seq == 0 && rt.audioFx[1].seq == 1);
+    CHECK(rt.audioFx[0].frame == 7 && rt.audioFx[0].name == "FOO");
+    CHECK(rt.audioFx[1].op == TraversalAudioOp::kStop);
+    CHECK(rt.audioSeq == 2);
+    std::vector<TraversalAudioEvent> drained = std::move(rt.audioFx);
+    rt.audioFx.clear();                            // drain-once
+    CHECK(rt.audioFx.empty() && drained.size() == 2);
+    rt.frameCounter = 8;
+    traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "BAZ");
+    CHECK(rt.audioFx[0].seq == 2);                 // seq survives drain
+  }
+
+  // -- positional emit: pos copy + owner classification ----------------
+  {
+    TraversalRuntime rt;
+    const float p[3] = {1.f, -2.f, 3.5f};
+    mdk::DynamicObject ownerObj;
+    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                                 "ALERT", p, &ownerObj);
+    const TraversalAudioEvent& ev = rt.audioFx.back();
+    CHECK(ev.hasPos && ev.pos[0] == 1.f && ev.pos[2] == 3.5f);
+    CHECK(ev.owner == TraversalAudioOwner::kObject &&
+          ev.ownerKey == &ownerObj);
+    CHECK(ev.volume == 0x7fff && ev.rate == 1.0f && ev.range == 50.0f);
+    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                                 "RICO1", p);      // no owner -> unowned
+    CHECK(rt.audioFx.back().owner == TraversalAudioOwner::kNone &&
+          rt.audioFx.back().ownerKey == nullptr);
+  }
+
+  // -- traversalAudioCmiName bounds ------------------------------------
+  {
+    TraversalRuntime rt;
+    // CMI string record: u8 len (incl NUL) + bytes.
+    rt.level.cmiBytes = {std::byte{5}, std::byte{'B'}, std::byte{'O'},
+                         std::byte{'N'}, std::byte{'E'}, std::byte{'S'},
+                         std::byte{0}};
+    CHECK(traversalAudioCmiName(rt, 1) == "BONES");
+    CHECK(traversalAudioCmiName(rt, 0).empty());
+    CHECK(traversalAudioCmiName(rt, -1).empty());
+    CHECK(traversalAudioCmiName(rt, 0x7fffffff).empty());
+    // Unterminated tail clamps at the buffer end (no runaway read).
+    rt.level.cmiBytes = {std::byte{0}, std::byte{'A'}, std::byte{'B'}};
+    CHECK(traversalAudioCmiName(rt, 1) == "AB");
+  }
+
+  // -- footsteps: 0x259 run-fire crossings emit FOOT1/FOOT2 + alt ------
+  {
+    TraversalRuntime rt;
+    Abank bank;
+    rt.animPrev = -1;
+    rt.locoState = 0x259;
+    rt.animTables.runFir = bank.rec(0x14);         // 20 frames
+    rt.motion.moveDirLatch = 1;
+    PlayerAnimEnvironment e;
+    const int snd = rt.seams.animSoundCalls;
+    for (int i = 0; i < 5; ++i) playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 4);                      // crossed trig 4
+    CHECK(rt.audioFx.size() == 1 &&
+          rt.audioFx[0].op == TraversalAudioOp::kPlayOnce &&
+          rt.audioFx[0].name == "FOOT3");   // latch 0x49b924==0 -> FOOT3
+    CHECK(rt.audioFx[0].owner == TraversalAudioOwner::kNone);
+    for (int i = 0; i < 13; ++i) playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 17);                     // crossed trig 0x11
+    CHECK(rt.audioFx.size() == 2 &&
+          rt.audioFx[1].name == "FOOT4" &&  // latch==0 -> FOOT4
+          rt.audioFx[1].seq == 1);
+    CHECK(rt.animFootAlt == 1);
+    CHECK(rt.seams.animSoundCalls == snd + 2);     // seam count parity
+  }
+
+  // -- land: 0x2bc fall -> grounded emits LAND once ---------------------
+  {
+    TraversalRuntime rt;
+    Abank bank;
+    rt.animPrev = -1;
+    rt.locoState = 0x2bc;
+    rt.animTables.fall = bank.rec(8);
+    rt.animTables.land = bank.rec(3);
+    PlayerAnimEnvironment e;
+    playerAnimTick(rt, e);                         // enter: no LAND yet
+    CHECK(rt.audioFx.empty());
+    rt.animPrev = 0x2bc;
+    rt.vert.vertVel = 0.0f;
+    rt.vert.contactFlags |= 1;                     // grounded
+    playerAnimTick(rt, e);
+    CHECK(rt.locoState == 0xc8);
+    CHECK(rt.audioFx.size() == 1 &&
+          rt.audioFx[0].name == "LAND" &&
+          rt.audioFx[0].op == TraversalAudioOp::kPlayOnce);
+  }
+
+  // -- chute: CHUTEOUT enter / CHUTEON sustain / CHUTEIN release --------
+  {
+    TraversalRuntime rt;
+    Abank bank;
+    rt.animPrev = -1;
+    rt.locoState = 0x2bd;
+    rt.animTables.chute = bank.rec(6);
+    rt.animTables.chuteC = bank.rec(4);
+    rt.vert.vertVel = -1.0f;                       // falling
+    rt.vert.contactFlags = 0;
+    rt.vert.jumpSustain = 0;
+    PlayerAnimEnvironment e;
+    playerAnimTick(rt, e);                         // enter -> CHUTEOUT
+    CHECK(rt.audioFx.size() == 1 &&
+          rt.audioFx[0].name == "CHUTEOUT" &&
+          rt.audioFx[0].op == TraversalAudioOp::kPlayOnce);
+    for (int i = 0; i < 4; ++i) playerAnimTick(rt, e);
+    CHECK(rt.animFrame == 4);
+    // Sustain frame: jumpSustain != 0 -> CHUTEON ensure + latch.
+    rt.vert.jumpSustain = 1;
+    playerAnimTick(rt, e);
+    CHECK(rt.animChuteLoop == 1);
+    const TraversalAudioEvent& on = rt.audioFx.back();
+    CHECK(on.name == "CHUTEON" &&
+          on.op == TraversalAudioOp::kEnsurePlaying &&
+          on.owner == TraversalAudioOwner::kNone);   // name-scoped op
+    // Release: query-active -> stop CHUTEON + play CHUTEIN, once.
+    rt.vert.jumpSustain = 0;
+    playerAnimTick(rt, e);
+    CHECK(rt.animChuteLoop == 0);
+    const std::size_t n = rt.audioFx.size();
+    CHECK(rt.audioFx[n - 2].name == "CHUTEON" &&
+          rt.audioFx[n - 2].op == TraversalAudioOp::kStop &&
+          rt.audioFx[n - 2].owner == TraversalAudioOwner::kNone);
+    CHECK(rt.audioFx[n - 1].name == "CHUTEIN" &&
+          rt.audioFx[n - 1].op == TraversalAudioOp::kPlayOnce);
+    // Held release: refire latch -> no further CHUTEIN.
+    const std::size_t held = rt.audioFx.size();
+    playerAnimTick(rt, e);
+    playerAnimTick(rt, e);
+    CHECK(rt.audioFx.size() == held);
+  }
+
+  // -- chute release without a sustain frame: no CHUTEIN ---------------
+  {
+    TraversalRuntime rt;
+    Abank bank;
+    rt.animPrev = -1;
+    rt.locoState = 0x2bd;
+    rt.animTables.chute = bank.rec(6);
+    rt.animTables.chuteC = bank.rec(4);
+    rt.vert.vertVel = -1.0f;
+    rt.vert.jumpSustain = 0;
+    PlayerAnimEnvironment e;
+    playerAnimTick(rt, e);                          // enter
+    for (int i = 0; i < 5; ++i) playerAnimTick(rt, e); // deploy done
+    playerAnimTick(rt, e);                          // release, no sustain
+    for (const auto& ev : rt.audioFx)
+      CHECK(ev.name != "CHUTEIN");
+    CHECK(rt.audioFx.size() == 1);                  // CHUTEOUT only
+  }
+
+  // -- mantle entry cancels CHUTEON ------------------------------------
+  {
+    TraversalRuntime rt;
+    Abank bank;
+    rt.animPrev = -1;
+    rt.locoState = 0x320;
+    rt.animTables.hang = bank.rec(4);
+    rt.animChuteLoop = 1;
+    PlayerAnimEnvironment e;
+    playerAnimTick(rt, e);                          // enter
+    CHECK(rt.animChuteLoop == 0);
+    CHECK(rt.audioFx.size() == 1 &&
+          rt.audioFx[0].name == "CHUTEON" &&
+          rt.audioFx[0].op == TraversalAudioOp::kStop);
+  }
+
+  // -- object anim-sound consume: traversal emits, freefall silent -----
+  {
+    // Same synthetic anim record shape as test_object_animation.
+    std::vector<std::uint8_t> rec;
+    aF(rec, 1.0f); aW(rec, 1); aW(rec, 2);          // rate, chans, frames
+    const std::size_t offPos = rec.size();
+    aW(rec, 0);                                    // chanOff (patched)
+    for (int f = 0; f < 2; ++f) aV3(rec, 0, 0, 0); // rootKeys
+    aW(rec, 0);                                    // refCount
+    const std::size_t chanAt = rec.size();
+    rec[offPos + 0] = static_cast<std::uint8_t>(chanAt - 4);
+    aName(rec, "ELEM"); aW(rec, 1); aF(rec, 1.0f); // name, verts, scale
+    aV3(rec, 0, 0, 0);                             // basePose
+    aH(rec, -1);                                   // terminator
+    const std::uint8_t* lim = rec.data() + rec.size();
+
+    TraversalRuntime rt;
+    DynamicArena da;
+    mdk::DynamicObject& o = animObject(da, rec);
+    o.pos[0] = 9.0f; o.pos[1] = 8.0f; o.pos[2] = 7.0f;
+    o.animSoundName = "BONES";
+    o.animSoundMark = 0;                           // trigger at frame 1
+    objectAnimTick(o, lim, &rt);
+    CHECK(o.animSoundName.empty());                // consume-on-cross
+    CHECK(rt.audioFx.size() == 1);
+    const TraversalAudioEvent& ev = rt.audioFx[0];
+    CHECK(ev.op == TraversalAudioOp::kSpawnPositional &&
+          ev.name == "BONES" && ev.hasPos &&
+          ev.pos[0] == 9.0f && ev.pos[2] == 7.0f);
+    CHECK(ev.owner == TraversalAudioOwner::kNone); // unowned (0x1000e)
+
+    // Freefall form: null runtime — still consumed, no event.
+    mdk::DynamicObject& o2 = animObject(da, rec);
+    o2.animSoundName = "BONES";
+    o2.animSoundMark = 0;
+    objectAnimTick(o2, lim);
+    CHECK(o2.animSoundName.empty());
+    CHECK(rt.audioFx.size() == 1);                 // unchanged
+  }
+
+  // -- script op 0x59: mode&0x80 sub-modes map onto the audio ops ------
+  {
+    const std::uint32_t C = 0x200;
+    {
+      ScriptFixture f;
+      f.write(C, {0x59, 0x80});                    // one-shot
+      f.writeStr(C + 2, "PING");
+      f.write(C + 8, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.field108 = f.image.data() + 4 + C;
+      auto r = traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.audioFx.size() == 1 &&
+            f.rt.audioFx[0].op == TraversalAudioOp::kPlayOnce &&
+            f.rt.audioFx[0].name == "PING");
+    }
+    {
+      ScriptFixture f;
+      f.write(C, {0x59, 0x81});                    // restart
+      f.writeStr(C + 2, "LOOPA");
+      f.write(C + 9, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.field108 = f.image.data() + 4 + C;
+      auto r = traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.audioFx.size() == 1 &&
+            f.rt.audioFx[0].op == TraversalAudioOp::kRestart);
+    }
+    {
+      ScriptFixture f;
+      f.write(C, {0x59, 0x82});                    // ensure-playing
+      f.writeStr(C + 2, "LOOPB");
+      f.write(C + 9, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.field108 = f.image.data() + 4 + C;
+      auto r = traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.audioFx.size() == 1 &&
+            f.rt.audioFx[0].op == TraversalAudioOp::kEnsurePlaying);
+    }
+    {
+      ScriptFixture f;                             // mode&4: bind only
+      f.write(C, {0x59, 0x04});
+      f.writeStr(C + 2, "VOX");
+      f.write(C + 7, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.field108 = f.image.data() + 4 + C;
+      auto r = traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(o.field15c == "VOX" && f.rt.audioFx.empty());
+    }
+  }
+
+  // -- script op 0x6b: voice rebind releases old + respawns new --------
+  {
+    const std::uint32_t C = 0x200;
+    ScriptFixture f;
+    f.write(C, {0x6b});
+    f.writeStr(C + 1, "SHOOT");
+    f.write(C + 8, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    o.field15c = "OLDVOX";                         // previously bound
+    auto r = traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field15c == "SHOOT");
+    CHECK(f.rt.audioFx.size() == 2);
+    CHECK(f.rt.audioFx[0].op == TraversalAudioOp::kRelease &&
+          f.rt.audioFx[0].name == "OLDVOX" &&
+          f.rt.audioFx[0].owner == TraversalAudioOwner::kObject &&
+          f.rt.audioFx[0].ownerKey == &o);
+    CHECK(f.rt.audioFx[1].op == TraversalAudioOp::kSpawnPositional &&
+          f.rt.audioFx[1].name == "SHOOT" &&
+          f.rt.audioFx[1].owner == TraversalAudioOwner::kObject);
+    // Rebind with empty prior name: spawn only, no release.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    traversalObjectScriptTick(f.env, o2);
+    CHECK(f.rt.audioFx.size() == 3 &&
+          f.rt.audioFx[2].op == TraversalAudioOp::kSpawnPositional);
+  }
+
+  // -- RICO pick consumes exactly one shared-LCG draw -------------------
+  {
+    // The impact pick is FUN_00401ed4(rng,3) — one LCG step on the
+    // shared gameplay stream (0x43753f). Verify the mapping + that a
+    // single draw is consumed.
+    std::uint32_t st = 0x12345678;
+    const std::uint32_t before = st;
+    const int pick = mdk::enemyRandBelow(st, 3);
+    CHECK(pick >= 0 && pick < 3);
+    CHECK(st != before);                           // consumed
+    std::uint32_t st2 = before;
+    st2 = st2 * 0x41c64e6d + 0x3039;               // one LCG step
+    CHECK(st == st2);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -22435,6 +22781,7 @@ int main() {
   test_save_full_restore();
   test_save_full_write();
   test_traversal_hud();
+  test_traversal_audio();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

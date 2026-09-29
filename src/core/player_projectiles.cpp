@@ -28,6 +28,8 @@ void objectTeardownNow(TraversalRuntime& rt, DynamicObject& o);
 float remnantFacingYaw(const TraversalRuntime& rt, const float pos[3]);
 float remnantBankDeg(const TraversalRuntime& rt, const float pos[3],
                      float zLift, float horizGate);
+int enemyRandBelow(std::uint32_t& state, int n);  // FUN_00401ed4 — the
+                                                  // shared-LCG pick
 
 namespace {
 
@@ -508,9 +510,21 @@ void wallImpactDispatch(TraversalRuntime& rt, TraversalArena& arena,
   // -> {mode 1, variant 2}, else {mode 3, variant 1} (0x4601a8/0x4601c3,
   // OBSERVED). The EBX aux is 0 on the wall path.
   ++rt.seams.shotImpactFxCalls;
+  // FUN_00437444's positional sound: name==0 -> RICO1/2/3 picked by
+  // FUN_00401ed4 (shared-LCG draw, OBSERVED). The emit is throttled by
+  // the original's OR-gate — mode>1 always passes; mode==1 only on
+  // (0x540ce0 & 3) == 0 frames (CORROBORATED — the first clause reads
+  // an arena field the port doesn't model).
+  const int fxMode = (res & 1) ? 1 : 3;
+  if (fxMode > 1 || (rt.frameCounter & 3) == 0) {
+    static const char* const kRico[3] = {"RICO1", "RICO2", "RICO3"};
+    const std::string pick = kRico[enemyRandBelow(rt.rngState, 3)];
+    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                                 pick, hitPt);
+  }
   CombatFxEvent ev;
   ev.kind = CombatFxKind::kShotWallImpact;
-  ev.mode = (res & 1) ? 1 : 3;
+  ev.mode = fxMode;
   ev.variant = (res & 1) ? 2 : 1;
   ev.pos[0] = hitPt[0]; ev.pos[1] = hitPt[1]; ev.pos[2] = hitPt[2];
   ev.arena = &arena.dyn.col;   // FUN_00403f6c's record +0x08 bind
@@ -540,6 +554,10 @@ void detonateShot(TraversalRuntime& rt, PlayerShot& s, int dmg,
   splashDamage(rt, s.pos, static_cast<float>(half), radius, 1, directObj,
                1, kDetonateExcl);
   ++rt.seams.remnantSpawnCalls;   // FUN_004575fc(arena, pos, 2.0f)
+  // FUN_004575fc also plays EXPLODE (0x54c61c read at 0x45771f)
+  // positionally at the remnant point.
+  traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                               "EXPLODE", s.pos);
   CombatFxEvent fx;
   fx.kind = CombatFxKind::kDetonation;
   fx.pos[0] = s.pos[0]; fx.pos[1] = s.pos[1]; fx.pos[2] = s.pos[2];
@@ -1294,6 +1312,29 @@ void updateShot(TraversalRuntime& rt, PlayerShot& s, int frameStep,
       // Survived — FUN_00437444(arena, &field210, field150, 3,
       // flag21f) at 0x460059 (OBSERVED).
       ++rt.seams.shotImpactFxCalls;
+      // FUN_00437444's positional sound: when +0x150 binds a CMI name
+      // the original restart-positional-plays it (FUN_00402288); when
+      // empty it picks RICO1/2/3 with FUN_00401ed4 — a shared-LCG draw
+      // (OBSERVED) — so the pick consumes rngState here.
+      {
+        const std::string iname =
+            traversalAudioCmiName(rt, hitObj->field150);
+        // FUN_00437444 passes owner slot 0 on both branches
+        // (0x4374bc/0x437566: EAX=0) — unowned positionals at +0x210.
+        if (!iname.empty()) {
+          traversalAudioEmitPositional(
+              rt, TraversalAudioOp::kRestartPositional, iname,
+              hitObj->field210);
+        } else {
+          static const char* const kRico[3] = {"RICO1", "RICO2",
+                                               "RICO3"};
+          const std::string pick =
+              kRico[enemyRandBelow(rt.rngState, 3)];
+          traversalAudioEmitPositional(
+              rt, TraversalAudioOp::kSpawnPositional, pick,
+              hitObj->field210);
+        }
+      }
       CombatFxEvent fx;
       fx.kind = CombatFxKind::kShotObjectImpact;
       fx.mode = 3;

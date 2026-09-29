@@ -299,6 +299,10 @@ void sniperCoreUpdate(TraversalRuntime& rt, const RawGameplayInput& raw,
     rt.camera.zoom = 2.4f;
     rt.flag5414bc = false;
     ++rt.seams.hudEventCalls;         // FUN_0040210c + FUN_00402388
+    // 0x4649f9/0x464a13 — FUN_0040210c(BREATH) stop, then
+    // FUN_00402388(SNIPEROFF,1) restart.
+    traversalAudioEmit(rt, TraversalAudioOp::kStop, "BREATH");
+    traversalAudioEmit(rt, TraversalAudioOp::kRestart, "SNIPEROFF");
     rt.camera.eyeHeight = 4.5f;
     rt.scopeHudOffset = -101;
     rt.motion.zoomChannel = 0.0f;
@@ -307,6 +311,8 @@ void sniperCoreUpdate(TraversalRuntime& rt, const RawGameplayInput& raw,
     rt.motion.moveVel = 0.0f;
     rt.camera.pullback = 8.0f;
     rt.seams.hudEventCalls += 2;      // FUN_00402014 + FUN_0040210c
+    // 0x464a4c — FUN_0040210c(ZOOM): unscope cancels the ramp loop.
+    traversalAudioEmit(rt, TraversalAudioOp::kStop, "ZOOM");
   }
 
   // 0x464a56 — the fire gate: ce770 != 0 && d0c >= 5 &&
@@ -350,28 +356,36 @@ void sniperZoomUpdate(TraversalRuntime& rt, float f0) {
     linearDecay(rt.motion.zoomChannel, kZoomDecayRate, f0);
   }
 
-  // Apply the zoom to b58 (camera.zoom).
+  // Apply the zoom to b58 (camera.zoom). ZOOM (0x54c658) is the ramp
+  // loop: FUN_00402388(ZOOM,0) ensure-playing while the ramp moves
+  // (0x464bfc zoom-in / 0x464cd7 zoom-out), FUN_0040210c stop when the
+  // ramp is clamped or the channel is idle (0x464cb7).
   if (rt.motion.zoomChannel < 0.0f) {
     // d54 < 0 -> zoom in: b58 /= (1 - d54), floored.
     if (rt.camera.zoom > floor) {
       rt.camera.zoom = static_cast<float>(
           (double)rt.camera.zoom / (1.0 - (double)rt.motion.zoomChannel));
       ++rt.seams.hudEventCalls;   // FUN_00402388
+      traversalAudioEmit(rt, TraversalAudioOp::kEnsurePlaying, "ZOOM");
       if (rt.camera.zoom <= floor) rt.camera.zoom = floor;
     } else {
       ++rt.seams.hudEventCalls;   // at floor — FUN_0040210c
+      traversalAudioEmit(rt, TraversalAudioOp::kStop, "ZOOM");
     }
   } else if (rt.motion.zoomChannel > 0.0f) {
     // d54 > 0 -> zoom out: b58 *= (1 + d54) while b58 > 1.0.
     if (rt.camera.zoom > kZoomCeil) {
       ++rt.seams.hudEventCalls;   // FUN_00402388
+      traversalAudioEmit(rt, TraversalAudioOp::kEnsurePlaying, "ZOOM");
       rt.camera.zoom = static_cast<float>(
           (double)rt.camera.zoom * (1.0 + (double)rt.motion.zoomChannel));
     } else {
       ++rt.seams.hudEventCalls;   // at ceiling — FUN_0040210c
+      traversalAudioEmit(rt, TraversalAudioOp::kStop, "ZOOM");
     }
   } else {
     ++rt.seams.hudEventCalls;     // d54 == 0 — FUN_0040210c
+    traversalAudioEmit(rt, TraversalAudioOp::kStop, "ZOOM");
   }
   // Universal ceiling: b58 >= 1.0 -> 1.0.
   if (rt.camera.zoom >= kZoomCeil) rt.camera.zoom = kZoomCeil;
@@ -394,6 +408,10 @@ void sniperReset(TraversalRuntime& rt) {
   rt.motion.moveVel = 0.0f;             // d48 = 0
   rt.camera.zoom = 2.4f;                // b58 = 2.4
   rt.seams.hudEventCalls += 3;          // FUN_00402014 + 2x FUN_0040210c
+  // 0x4618fa/0x461909 — FUN_0040210c(ZOOM) + FUN_0040210c(BREATH):
+  // scope teardown stops both player loops.
+  traversalAudioEmit(rt, TraversalAudioOp::kStop, "ZOOM");
+  traversalAudioEmit(rt, TraversalAudioOp::kStop, "BREATH");
   rt.camera.eyeHeight = 4.5f;           // db8 = 4.5
   rt.transitionPhase = 0;               // ca0 = 0
   rt.scopeHudOffset = -101;             // d34 = -101

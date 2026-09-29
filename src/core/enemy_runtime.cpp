@@ -777,6 +777,15 @@ void objectArenaDeactivate(TraversalRuntime& rt, DynamicObject& o) {
     rt.seams.fireSoundCalls++;
     o.field158 = nullptr;
   }
+  // (audio contract) the release is owner-scoped: a bound +0x15c name
+  // means the original may hold a live voice instance here — the
+  // port's field158 stays null so the bound name stands in.
+  if (!o.field15c.empty()) {
+    TraversalAudioEvent& av = traversalAudioEmit(
+        rt, TraversalAudioOp::kRelease, o.field15c);
+    av.owner = TraversalAudioOwner::kObject;
+    av.ownerKey = &o;
+  }
   // OBSERVED 0x45a353..0x45a3a4 — the element-set release: +0x0c==0
   // or a shared-record sentinel (0x4edcc0/0x4edd48 — the port binds
   // only owned copies, so "shared" is the structural test
@@ -854,8 +863,12 @@ void objectArenaActivate(TraversalRuntime& rt, DynamicObject& o) {
   }
   // Voice restart: +0x158 == 0 with a nonempty +0x15c name restarts
   // the object voice (FUN_004020b4-ish path at 0x45a49d) — counted.
-  if (o.field158 == nullptr && !o.field15c.empty())
+  // The port models the respawn as an owned positional spawn.
+  if (o.field158 == nullptr && !o.field15c.empty()) {
     rt.seams.fireSoundCalls++;
+    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                                 o.field15c, o.pos, &o);
+  }
 }
 
 // Returns 1 when the object was transferred (skip the rest of its
@@ -913,9 +926,15 @@ void cmdArmAnim(DynamicObject& o, const void* rec, float acc) {
 // FX/spawn seams — counted, presentation-only (FUN_00402160 child FX
 // spawn, FUN_00405ffc afterimage, FUN_00403f6c/0x4108 spawn FX,
 // FUN_004575fc remnant, FUN_004387ec anim-ctx spawn).
+// FUN_00402160 doubles as the positional sound spawn: when the object
+// carries a bound +0x15c voice name the call starts the owned voice
+// instance at +0x10 (pos source) — emit that event here. An empty
+// name maps to the original's snd==0 early-out (no instance).
 DynamicObject* fxChildSpawn(TraversalRuntime& rt, DynamicObject& o) {
   rt.seams.reticleSpawnCalls++;    // same FUN_00402160 seam family
-  (void)o;
+  if (!o.field15c.empty())
+    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                                 o.field15c, o.pos, &o);
   return nullptr;                  // the FX child is presentation-only
 }
 
@@ -1361,6 +1380,9 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
       o.field30e = 0x3c;
       o.field302 = 0x2d;
       rt.seams.fireDenyCalls++;                // FUN_00402388(0) seam
+      if (!o.field15c.empty())
+        traversalAudioEmit(rt, TraversalAudioOp::kEnsurePlaying,
+                           o.field15c);
       return;
     }
     return;
@@ -1502,10 +1524,14 @@ void objectSubtypeUpdate(TraversalRuntime& rt, DynamicObject& o,
     }
     case 0x0f: {
       // Heartbeat — only while home == the player's arena; emits the
-      // sound seam and re-arms the 0x540d28 countdown.
+      // sound seam and re-arms the 0x540d28 countdown. FUN_00402160
+      // (0x453837): unowned positional ALERT (0x54c5f4) at +0x10,
+      // vol 0x7fff, rate 1.0, range 50.0, mode 0x1000e.
       if (home.owner != rt.cur) return;
       if ((rt.frameCounter & 0x1f) == 0) {
         rt.seams.fireSoundCalls++;             // FUN_00402160 seam
+        traversalAudioEmitPositional(
+            rt, TraversalAudioOp::kSpawnPositional, "ALERT", o.pos);
       }
       rt.fieldD2c = 10;                        // DAT_00540d28
       return;
@@ -2425,6 +2451,7 @@ void moverSwH150(TraversalRuntime& rt, DynamicObject& o, float dt,
   o.animFrame = -1;
   ++rt.seams.moverSfxCalls;                           // FUN_00402388
                                                     // (0x54c644, 0)
+  traversalAudioEmit(rt, TraversalAudioOp::kEnsurePlaying, "RUNNER");
 }
 
 } // namespace

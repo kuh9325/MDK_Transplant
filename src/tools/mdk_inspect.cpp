@@ -2892,6 +2892,14 @@ int main(int argc, char** argv) {
     };
     std::unordered_map<const mdk::DynamicObject*, BossSnap> lastSnap;
     const auto& bossMatches = combatBossMatches;
+    // Phase 17C.1 — audio event diagnostic. The runtime's drain-once
+    // audioFx queue is consumed each frame; events fold into a
+    // deterministic digest + op census, with the first few kept as a
+    // bounded sample log. No waveform data is touched.
+    std::uint64_t audioDg = 1469598103934665603ull;
+    std::size_t audioOps[9] = {};
+    std::size_t audioTotal = 0;
+    std::vector<mdk::TraversalAudioEvent> audioLog;
     for (int f = 0; f < travFrames; ++f) {
       const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
       // Phase 15A — combat harness: each pending --hit injects ONE
@@ -2914,6 +2922,37 @@ int main(int argc, char** argv) {
       const auto out =
           mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
       ++framesRun;
+      // Drain the frame's audio events (drain-once semantics) into the
+      // diagnostic census before any consumer could.
+      if (!rt.audioFx.empty()) {
+        for (const mdk::TraversalAudioEvent& ev : rt.audioFx) {
+          ++audioTotal;
+          const int oi = static_cast<int>(ev.op);
+          if (oi >= 0 && oi < 9) ++audioOps[oi];
+          for (int i = 0; i < 8; ++i) {
+            audioDg ^= (std::uint64_t(ev.seq) >> (i * 8)) & 0xff;
+            audioDg *= 1099511628211ull;
+          }
+          audioDg ^= std::uint64_t(ev.op) & 0xff;
+          audioDg *= 1099511628211ull;
+          for (const char c : ev.name) {
+            audioDg ^= (unsigned char)c;
+            audioDg *= 1099511628211ull;
+          }
+          for (int i = 0; i < 3; ++i) {
+            const std::uint32_t b =
+                static_cast<std::uint32_t>(ev.pos[i] * 256.0f);
+            for (int k = 0; k < 4; ++k) {
+              audioDg ^= (b >> (k * 8)) & 0xff;
+              audioDg *= 1099511628211ull;
+            }
+          }
+          audioDg ^= std::uint64_t(ev.hasPos) & 0xff;
+          audioDg *= 1099511628211ull;
+          if (audioLog.size() < 16) audioLog.push_back(ev);
+        }
+        rt.audioFx.clear();
+      }
       sawEndLevel = sawEndLevel || out.endLevelRequested;
       sawEnding = sawEnding || out.endingRequested;
       if (colProfFrame) {
@@ -3326,6 +3365,33 @@ int main(int argc, char** argv) {
           s.hudMsgPosts, s.hudMsgFlush, s.hudLutRemaps,
           h.fb.width(), h.fb.height(), hudNz,
           (unsigned long long)hudDg, h.bound ? "" : " (UNBOUND)");
+    }
+    // Phase 17C.1 — audio contract diagnostic: drained-event census +
+    // a digest over (seq, op, name, pos). The digest pins event ORDER
+    // + identity + position; ownerKey pointers are intentionally
+    // excluded (address-dependent — nondeterministic across runs).
+    std::printf(
+        "audio:     ev=%zu play=%zu ensure=%zu restart=%zu stop=%zu "
+        "pos=%zu repos=%zu release=%zu vol=%zu rate=%zu dg=%016llx\n",
+        audioTotal, audioOps[0], audioOps[1], audioOps[2], audioOps[3],
+        audioOps[4], audioOps[5], audioOps[6], audioOps[7], audioOps[8],
+        (unsigned long long)audioDg);
+    for (const mdk::TraversalAudioEvent& ev : audioLog) {
+      std::printf("           af=%03d seq=%u %s %s%s%s",
+                  ev.frame, ev.seq, mdk::traversalAudioOpName(ev.op),
+                  ev.name.c_str(),
+                  ev.owner == mdk::TraversalAudioOwner::kObject
+                      ? " owner=obj"
+                      : ev.owner == mdk::TraversalAudioOwner::kPlayer
+                            ? " owner=player"
+                            : ev.owner == mdk::TraversalAudioOwner::kZone
+                                  ? " owner=zone"
+                                  : "",
+                  ev.hasPos ? " pos=" : "");
+      if (ev.hasPos)
+        std::printf("(%.1f,%.1f,%.1f)", (double)ev.pos[0],
+                    (double)ev.pos[1], (double)ev.pos[2]);
+      std::printf("\n");
     }
     // Phase 15A — boss-runtime summary: end-state of each watched
     // object plus the completion-latch edges observed this run.

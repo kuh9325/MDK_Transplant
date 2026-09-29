@@ -491,9 +491,17 @@ void playerAnimTick(TraversalRuntime& rt,
       const int dir = rt.motion.moveDirLatch;
       if (playerAnimFrameCrossed(0, dir, shadow, rt.animFrame)) {
         ++rt.seams.animSoundCalls;       // FUN_004022b8(0x54c60c/14)
+        // 0x461f6d: latch 0x49b924 != 0 -> 0x54c60c (FOOT1),
+        // == 0 -> 0x54c614 (FOOT3).
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce,
+                           rt.animFootAlt ? "FOOT1" : "FOOT3");
       }
       if (playerAnimFrameCrossed(0xd, dir, shadow, rt.animFrame)) {
         ++rt.seams.animSoundCalls;       // FUN_004022b8(0x54c610/18)
+        // 0x461fa5: latch != 0 -> 0x54c610 (FOOT2), == 0 -> 0x54c618
+        // (FOOT4); the latch toggles on THIS crossing only.
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce,
+                           rt.animFootAlt ? "FOOT2" : "FOOT4");
         rt.animFootAlt = (rt.animFootAlt == 0) ? 1 : 0;
       }
     } else if (cac == 0x259) {
@@ -505,9 +513,13 @@ void playerAnimTick(TraversalRuntime& rt,
       const int dir = rt.motion.moveDirLatch;
       if (playerAnimFrameCrossed(4, dir, shadow, rt.animFrame)) {
         ++rt.seams.animSoundCalls;
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce,
+                           rt.animFootAlt ? "FOOT1" : "FOOT3");
       }
       if (playerAnimFrameCrossed(0x11, dir, shadow, rt.animFrame)) {
         ++rt.seams.animSoundCalls;
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce,
+                           rt.animFootAlt ? "FOOT2" : "FOOT4");
         rt.animFootAlt = (rt.animFootAlt == 0) ? 1 : 0;
       }
     } else if (cac == 0x2bc) {
@@ -516,6 +528,7 @@ void playerAnimTick(TraversalRuntime& rt,
       if (enter) { rt.animFrame = 0; shadow = 0; }
       else if (vertZero && grounded) {
         ++rt.seams.animSoundCalls;       // FUN_004022b8(0x54c608)
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "LAND");
         rt.animFrame = 0;
         rt.locoState = 0xc8;
         rt.eventPriority = 2;
@@ -534,6 +547,7 @@ void playerAnimTick(TraversalRuntime& rt,
       // K_CHUTEC while c80) or release-clamp on K_CHUTE.
       if (enter) {
         ++rt.seams.animSoundCalls;       // FUN_004022b8(0x54c5fc)
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "CHUTEOUT");
         rt.animFrame = 0; shadow = 0;
         setMain(t.chute, rt.animFrame);
       } else if (rt.animFrame < 4) {
@@ -552,6 +566,8 @@ void playerAnimTick(TraversalRuntime& rt,
         // not already playing, no-op when it is. OBSERVED via the
         // sound-name binds (0x4974c0 "CHUTEON" -> 0x54c604).
         ++rt.seams.animSoundCalls;
+        traversalAudioEmit(rt, TraversalAudioOp::kEnsurePlaying,
+                           "CHUTEON");
         rt.animChuteLoop = 1;
         muzzle(20, 0);
       } else {
@@ -564,7 +580,9 @@ void playerAnimTick(TraversalRuntime& rt,
         if (rt.animChuteLoop != 0) {
           rt.animChuteLoop = 0;          // FUN_0040210c stop
           ++rt.seams.animSoundCalls;     // FUN_0040210c(0x54c604)
+          traversalAudioEmit(rt, TraversalAudioOp::kStop, "CHUTEON");
           ++rt.seams.animSoundCalls;     // FUN_004022b8(0x54c600) CHUTEIN
+          traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "CHUTEIN");
         }
         rt.animFrame += step;
         const int last = static_cast<int>(recCount(t.chute)) - 1;
@@ -608,6 +626,7 @@ void playerAnimTick(TraversalRuntime& rt,
       // and after the transition too — a same-frame land is real).
       if (vertZero && grounded) {
         ++rt.seams.animSoundCalls;       // FUN_004022b8(0x54c608)
+        traversalAudioEmit(rt, TraversalAudioOp::kPlayOnce, "LAND");
         rt.locoState = 0xc8;
         rt.eventPriority = 2;
         rt.animFrame = 0;
@@ -623,6 +642,7 @@ void playerAnimTick(TraversalRuntime& rt,
         // FUN_0040210c(0x54c604) — stops CHUTEON (mantle cancels the
         // chute loop) + clears the playing latch.
         ++rt.seams.animSoundCalls;
+        traversalAudioEmit(rt, TraversalAudioOp::kStop, "CHUTEON");
         rt.animChuteLoop = 0;
         rt.animFrame = 0; shadow = 0;
       } else if (rt.vert.vertSkip != 1) {
@@ -701,8 +721,11 @@ void playerAnimTick(TraversalRuntime& rt,
       }
     } else if (cac == 0x323) {
       // scope-in — the shared body re-runs every frame.
-      if (enter) { rt.animFrame = 0; shadow = 0; }
-      else rt.animFrame += step;
+      if (enter) {
+        rt.animFrame = 0; shadow = 0;
+        // FUN_00402388(0x54c5d4=SNIPERON,1) — enter-edge restart.
+        traversalAudioEmit(rt, TraversalAudioOp::kRestart, "SNIPERON");
+      } else rt.animFrame += step;
       ++rt.seams.hudEventCalls;          // FUN_00402388(0x54c5d4)
       rt.scopeHudOffset = roundNearest(
           static_cast<double>(rt.scopeScale) *
@@ -807,6 +830,10 @@ void playerAnimTick(TraversalRuntime& rt,
       if (enter) {
         rt.animFrame = 0; shadow = 0;
         rt.seams.hudEventCalls += 2;     // FUN_0040210c + 0x402388
+        // 0x461ca0 — FUN_0040210c(0x54c5dc=BREATH) stop, then
+        // FUN_00402388(0x54c5d8=SNIPEROFF,1) restart.
+        traversalAudioEmit(rt, TraversalAudioOp::kStop, "BREATH");
+        traversalAudioEmit(rt, TraversalAudioOp::kRestart, "SNIPEROFF");
       } else {
         ++rt.seams.scopeOverlayCalls;    // FUN_00416700
         rt.scopeAnimLatch = 0;
@@ -822,6 +849,7 @@ void playerAnimTick(TraversalRuntime& rt,
       // bFlip entry clears e44/e48.
       if (enter) {
         ++rt.seams.animSoundCalls;       // FUN_0040210c(0x54c5dc)
+        traversalAudioEmit(rt, TraversalAudioOp::kStop, "BREATH");
         rt.animFrame = 0; shadow = 0;
       } else {
         const int bang = static_cast<int>(recCount(t.bang));
@@ -858,6 +886,7 @@ void playerAnimTick(TraversalRuntime& rt,
       // 0x3ea — terminal: K_BANG to last frame, hold (no release).
       if (enter) {
         ++rt.seams.animSoundCalls;       // FUN_0040210c(0x54c5dc)
+        traversalAudioEmit(rt, TraversalAudioOp::kStop, "BREATH");
         rt.animFrame = 0; shadow = 0;
       } else {
         rt.animFrame = nextFrame;

@@ -1,5 +1,7 @@
 #include "core/object_animation.h"
 
+#include "core/traversal_audio.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -262,7 +264,7 @@ void objectAnimApply(DynamicObject& o, const ObjectAnimView& anim,
 // FUN_004555bc — the per-tick driver.
 // ---------------------------------------------------------------------------
 void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
-                      float dtSec) {
+                      float dtSec, TraversalRuntime* rt) {
   // +0x04 == -1 -> FUN_00455500 (classless timing path). The original
   // resolves a timing record through FUN_0041a5ec (source UNKNOWN —
   // bounded seam): it advances +0xdc by +0xe0 * DT (no rate field),
@@ -313,7 +315,14 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
   if (!o.animSoundName.empty() &&
       o.animAcc < static_cast<float>(o.animSoundMark) &&
       static_cast<float>(o.animSoundMark) <= o.animAcc + step) {
-    o.animSoundName.clear();             // would emit here (seam)
+    // FUN_004555bc @ 0x45566c-0x455695 (OBSERVED): resolve +0x140 name,
+    // FUN_00402160(0, h, mode=0x1000e, pos=&obj->pos(+0x10), vol=0x7fff,
+    // rate=1.0, range=50.0), then +0x140 = 0 — an unowned positional
+    // one-shot (owner slot EAX=0; +0x10 is the ECX position pointer).
+    if (rt != nullptr)
+      traversalAudioEmitPositional(*rt, TraversalAudioOp::kSpawnPositional,
+                                   o.animSoundName, o.pos);
+    o.animSoundName.clear();
   }
 
   o.animAcc += step;
@@ -349,8 +358,9 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
     o.animLatch = static_cast<std::int16_t>(0xff00);
 }
 
-void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit) {
-  objectAnimTickDt(o, recLimit, kFrameDt);
+void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit,
+                    TraversalRuntime* rt) {
+  objectAnimTickDt(o, recLimit, kFrameDt, rt);
 }
 
 } // namespace mdk
