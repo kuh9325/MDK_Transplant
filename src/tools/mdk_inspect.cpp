@@ -27,6 +27,7 @@
 #include "core/enemy_runtime.h"
 #include "core/file_family.h"
 #include "core/freefall_runtime.h"
+#include "core/frontend_host.h"
 #include "core/frontend_machines.h"
 #include "core/frontend_shell.h"
 #include "core/fti_directory.h"
@@ -55,6 +56,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -1549,13 +1551,13 @@ void fireCombatHits(mdk::TraversalRuntime& rt,
 }
 
 // ---------------------------------------------------------------------------
-// Phase 18A — deterministic frontend scripted-input diagnostic.
-// Drives the Phase-18A FrontendShell (mode/sub-mode machine, overlay
-// arms, save list, name entry, abort console) with synthetic seams
-// and prints the resulting state each frame. With --data-path the
-// SAVES directory is enumerated for real; without it a synthetic
-// fixture set is used. The tool never writes save files — the
-// write seam is reported as a stub.
+// Phase 18A/18B.1 — deterministic frontend scripted-input
+// diagnostic. The shell now runs on the real FrontendHostServices
+// seams (Phase 18B.1): Phase A performs read-only probes against a
+// --data-path corpus (SAVES enumeration/inspect, LASTGAME, MDKS_*
+// slides) when one is supplied; Phase B drives the scripted-input
+// shell against a TEMP save root where writes are real. The tool
+// never writes into the supplied data path.
 
 const char* frontendRequestName(mdk::FrontendRequest r) {
   switch (r) {
@@ -1635,91 +1637,142 @@ void printFrontendState(const char* tag, mdk::FrontendShell& sh) {
               fx.empty() ? "-" : fx.c_str());
 }
 
+void printSlotDetail(const mdk::FrontendHostServices& host,
+                     std::string_view stem) {
+  const auto d = host.inspectSlotDetail(stem);
+  if (!d) {
+    std::printf("        slot %-8s: unopenable (invalid entry)\n",
+                std::string(stem).c_str());
+    return;
+  }
+  std::printf("        slot %-8s: valid=%d full=%d modeField=%d "
+              "level=%d health=%d deaths=%d thmb=%zuB err=%s\n",
+              std::string(stem).c_str(), d->summary.valid ? 1 : 0,
+              d->summary.fullSave ? 1 : 0, d->summary.modeField,
+              d->summary.levelId, d->summary.health,
+              d->summary.deathCount, d->thumbnail.size(),
+              mdk::saveErrorName(d->error));
+}
+
+void printSlideProbe(const mdk::FrontendHostServices& host, int n) {
+  const auto info = host.slideInfo(n);
+  if (!info) {
+    std::printf("        slide %d: no data root\n", n);
+    return;
+  }
+  const auto data = host.slideData(n);
+  std::printf("        slide %-3d %-16s exists=%d %dx%d %lluB "
+              "data=%zuB gate600x360=%d\n",
+              n, info->relPath.c_str(), info->exists ? 1 : 0,
+              info->width, info->height,
+              (unsigned long long)info->bytes,
+              data ? data->size() : 0,
+              host.slideExists(n) ? 1 : 0);
+}
+
 int frontendScript(const std::optional<std::string>& dataPath) {
   namespace fs = std::filesystem;
-  mdk::FrontendShellSeams seams;
-  std::vector<std::string> saveFiles;
-  fs::path savesDir;
-  const bool realData =
-      dataPath && fs::is_directory(fs::path(*dataPath) / "SAVES");
+  std::string err;
 
-  if (realData) {
-    savesDir = fs::path(*dataPath) / "SAVES";
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(savesDir, ec)) {
-      if (!e.is_regular_file(ec)) continue;
-      const auto name = e.path().filename().string();
-      const auto ext = e.path().extension().string();
-      if (ext == ".SAV" || ext == ".sav") {
-        saveFiles.push_back(name);
-      }
+  // ---- Phase A: read-only probes against the real corpus ------
+  std::optional<mdk::DataRoot> dataRoot;
+  std::optional<mdk::FrontendHostServices> realHost;
+  if (dataPath) {
+    dataRoot = mdk::DataRoot::open(*dataPath, &err);
+    if (dataRoot &&
+        fs::is_directory(fs::path(*dataPath) / "SAVES")) {
+      realHost.emplace(fs::path(*dataPath) / "SAVES");
+      realHost->setDataRoot(&*dataRoot);
     }
-    std::sort(saveFiles.begin(), saveFiles.end());
-    seams.lastGameExists = [savesDir] {
-      std::error_code ec;
-      return fs::exists(savesDir / "LASTGAME.SAV", ec) ||
-             fs::exists(savesDir / "lastgame.sav", ec);
-    };
-    seams.enumerateSaves = [&saveFiles] { return saveFiles; };
-    seams.inspectSlot =
-        [savesDir](std::string_view stem)
-        -> std::optional<mdk::SaveSlotSummary> {
-      mdk::SaveGame sg;
-      if (mdk::saveGameLoadFile(savesDir / (std::string(stem) + ".SAV"),
-                                sg, /*strictPackets=*/false) !=
-          mdk::SaveError::kOk) {
-        return std::nullopt;
-      }
-      mdk::SaveSlotSummary s;
-      s.valid = true;
-      s.fullSave = sg.game.full();
-      s.levelId = sg.game.levelId;
-      s.modeField = sg.game.modeField;
-      s.health = sg.game.health;
-      s.deathCount = sg.game.deathCount;
-      return s;
-    };
-    std::printf("frontend-script: real SAVES enumeration (%zu files)\n",
-                saveFiles.size());
-  } else {
-    // Synthetic fixtures: a full save, a header-only inter-level
-    // save, and an unreadable entry.
-    saveFiles = {"1.SAV", "BOSS2.SAV", "HDRONLY.SAV", "BAD.SAV"};
-    seams.lastGameExists = [] { return true; };
-    seams.enumerateSaves = [&saveFiles] { return saveFiles; };
-    seams.inspectSlot =
-        [](std::string_view stem)
-        -> std::optional<mdk::SaveSlotSummary> {
-      if (stem == "BAD") return std::nullopt;  // unreadable -> invalid
-      mdk::SaveSlotSummary s;
-      s.name = std::string(stem);
-      s.valid = true;
-      if (stem == "HDRONLY") {           // inter-level autosave shape
-        s.fullSave = false;
-        s.modeField = 6;
-        s.levelId = 2;
-        s.health = 100;
-      } else {
-        s.fullSave = true;               // modeField >= 1000
-        s.modeField = 1003;
-        s.levelId = stem == "1" ? 0 : 3;
-        s.health = stem == "1" ? 100 : 62;
-        s.deathCount = stem == "1" ? 0 : 4;
-      }
-      return s;
-    };
-    std::printf("frontend-script: synthetic SAVES fixtures "
-                "(%zu files)\n", saveFiles.size());
   }
-  // The diagnostic never writes save files — report the would-be
-  // write and let the shell believe it succeeded.
-  seams.writeSave = [](std::string_view name, bool headerOnly) {
-    std::printf("      [write-stub] SAVES\\%s.SAV headerOnly=%d\n",
-                std::string(name).c_str(), headerOnly ? 1 : 0);
-    return true;
-  };
+  if (realHost) {
+    std::printf("== host probes (read-only, %s/SAVES) ==\n",
+                dataPath->c_str());
+    std::printf("  LASTGAME.SAV exists+envelope-valid: %d\n",
+                realHost->lastGameExists() ? 1 : 0);
+    const auto names = realHost->enumerateSaves();
+    std::printf("  enumeration (%zu):", names.size());
+    for (const auto& n : names) std::printf(" %s", n.c_str());
+    std::printf("\n");
+    for (const auto& n : names) {
+      // The list controller sees saveListStem-truncated names; the
+      // host probes by stem.
+      printSlotDetail(*realHost, mdk::saveListStem(n));
+    }
+    for (int i = 0; i <= 5; ++i) printSlideProbe(*realHost, i);
+  } else {
+    std::printf("== host probes skipped (no --data-path) ==\n");
+  }
 
-  mdk::FrontendShell sh(std::move(seams));
+  // ---- Phase B: temp writable save root, real host seams ------
+  const fs::path tmp = fs::temp_directory_path() / "mdk_inspect_fehost";
+  fs::remove_all(tmp);
+  fs::create_directories(tmp / "SAVES");
+  fs::create_directories(tmp / "MISC");
+  mdk::FrontendHostServices host(tmp / "SAVES");
+  std::optional<mdk::DataRoot> tmpRoot =
+      mdk::DataRoot::open(tmp, &err);
+  if (tmpRoot) host.setDataRoot(&*tmpRoot);
+  std::printf("== host probes (temp root %s) ==\n",
+              host.saveRoot().string().c_str());
+  std::printf("  LASTGAME.SAV exists (empty root): %d\n",
+              host.lastGameExists() ? 1 : 0);
+
+  // Synthetic MDKS_* GIFs: the probe reads the GIF logical-screen
+  // header only (no decode — the 600x360 gate is the OBSERVED check).
+  {
+    auto putGif = [&](int n, unsigned w, unsigned h) {
+      const std::byte g[10] = {
+          std::byte('G'), std::byte('I'), std::byte('F'),
+          std::byte('8'), std::byte('9'), std::byte('a'),
+          std::byte(w & 0xff), std::byte(w >> 8),
+          std::byte(h & 0xff), std::byte(h >> 8)};
+      std::ofstream f(tmp / "MISC" /
+                          (std::string("MDKS_") +
+                           (n < 10 ? "00" : "0") +
+                           std::to_string(n) + ".GIF"),
+                      std::ios::binary);
+      f.write(reinterpret_cast<const char*>(g), sizeof(g));
+    };
+    putGif(0, 600, 360);
+    putGif(1, 320, 200);
+    std::ofstream(tmp / "MISC" / "MDKS_002.GIF") << "notagif!!";
+  }
+  for (int i = 0; i <= 3; ++i) printSlideProbe(host, i);
+
+  // Seed saves through the writer: two header-only + LASTGAME.
+  mdk::SaveWriteInput wi;
+  wi.modeField = 3; wi.levelId = 2; wi.health = 100;
+  host.writeSaveFile("SLOT01", mdk::saveGameWriteHeaderOnly(wi));
+  wi.levelId = 4; wi.deathCount = 1;
+  host.writeSaveFile("BOSS2", mdk::saveGameWriteHeaderOnly(wi));
+  wi.levelId = 1; wi.deathCount = 0;
+  std::printf("  writeLastgame: %d\n",
+              host.saves().writeLastgame(wi) ? 1 : 0);
+  std::printf("  LASTGAME.SAV exists (seeded): %d\n",
+              host.lastGameExists() ? 1 : 0);
+  {
+    const auto names = host.enumerateSaves();
+    std::printf("  enumeration (%zu):", names.size());
+    for (const auto& n : names) std::printf(" %s", n.c_str());
+    std::printf("\n");
+    for (const auto& n : names)
+      printSlotDetail(host, mdk::saveListStem(n));
+  }
+
+  // The write seam's content source: the embedder snapshots the live
+  // session into FrontendSaveData. The diagnostic has no live
+  // traversal runtime, so `full` stays empty — a full (F2) write then
+  // fails as the OBSERVED FUN_00422dec path does (dialog stays open).
+  mdk::FrontendSaveData saveData;
+  saveData.headerOnly.modeField = 3;
+  saveData.headerOnly.levelId = 1;
+  saveData.headerOnly.health = 80;
+  mdk::FrontendShell sh(host.makeSeams(
+      [&saveData]() -> std::optional<mdk::FrontendSaveData> {
+        return saveData;
+      }));
+
   mdk::FrontendMenuInput in;
   auto step = [&](const char* tag) {
     sh.update(in);
@@ -1733,7 +1786,7 @@ int frontendScript(const std::optional<std::string>& dataPath) {
     step("  (release)");
   };
 
-  std::printf("== frontend script ==\n");
+  std::printf("== frontend script (temp root, real seams) ==\n");
   std::printf("[boot] fresh entry (FUN_0041d85c arg=0)\n");
   step("boot");
 
@@ -1750,7 +1803,6 @@ int frontendScript(const std::optional<std::string>& dataPath) {
       std::printf("      slots (%d):", l->count());
       for (const auto& s : l->stems()) std::printf(" %s", s.c_str());
       std::printf("\n");
-      // Inspect each row by navigating down and reading the summary.
       for (int i = 0; i < l->count(); ++i) {
         if (i > 0) {
           press("  list down", &mdk::FrontendMenuInput::nextHeld);
@@ -1769,7 +1821,6 @@ int frontendScript(const std::optional<std::string>& dataPath) {
   step("Esc -> list exit");
 
   std::printf("[continue] sel0 Continue -> ContinueLastGame\n");
-  // Fresh re-entry left sel at 0.
   in.confirmEdge = true;
   step("confirm -> continue");
   std::printf("      (host reports load failure -> fresh re-entry)\n");
@@ -1804,6 +1855,32 @@ int frontendScript(const std::optional<std::string>& dataPath) {
   }
   in.confirmEdge = true;
   step("Enter -> commit");
+  std::printf("      full bytes not producible without a live session\n");
+  std::printf("      -> write fails, dialog stays open (OBSERVED)\n");
+  in.cancelEdge = true;
+  step("Esc -> cancel entry");
+
+  std::printf("[autosave] mode=5 armAutosave bypasses the manual\n");
+  std::printf("         gate; confirm -> writes a real header-only\n");
+  sh.setPrimaryMode(mdk::mode::observed::stats);
+  sh.setSaveBlockFlags(true, true, /*xStrike=*/true);
+  sh.setLevelIndex(2);
+  sh.armAutosave();
+  printFrontendState("autosave armed", sh);
+  in.confirmEdge = true;
+  step("confirm YES");
+  in.confirmEdge = true;
+  step("confirm name");
+  std::printf("      wrote %s: %d\n",
+              (tmp / "SAVES" / "3.SAV").string().c_str(),
+              int(fs::exists(tmp / "SAVES" / "3.SAV")));
+  printSlotDetail(host, "3");
+  {
+    const auto names = host.enumerateSaves();
+    std::printf("      re-enumeration (%zu):", names.size());
+    for (const auto& n : names) std::printf(" %s", n.c_str());
+    std::printf("\n");
+  }
 
   std::printf("[ingame] Esc arms the abort console and the same-frame\n");
   std::printf("         dispatch self-cancels it (OBSERVED quirk)\n");
@@ -1816,14 +1893,21 @@ int frontendScript(const std::optional<std::string>& dataPath) {
   in.keyYEdge = true;
   step("Y -> yes");
 
-  std::printf("[returning] enterFrontend(arg!=0): transition armed, "
-              "Esc arm suppressed\n");
+  std::printf("[returning] enterFrontend(arg!=0): transition armed,\n");
+  std::printf("            Esc arm suppressed; host ack releases\n");
   sh.enterFrontend(true);
+  mdk::frontendHostTransitionArmed(sh);
   printFrontendState("enterFrontend(1)", sh);
   in.cancelEdge = true;
   step("Esc (suppressed)");
+  mdk::frontendHostTransitionComplete(sh);
+  std::printf("      transition complete -> suppressEscAbort=%d\n",
+              sh.suppressEscAbort() ? 1 : 0);
+  in.cancelEdge = true;
+  step("Esc (released)");
 
-  std::printf("[done]\n");
+  fs::remove_all(tmp);
+  std::printf("[done] temp root removed\n");
   return 0;
 }
 

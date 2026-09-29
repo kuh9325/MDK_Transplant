@@ -122,6 +122,9 @@ enum class SaveError : int {
   kMissingGame,       // no GAME packet (the loader's first real read)
   kBadLevelId,        // GAME.levelId outside [0,6)
   kBadHealth,         // GAME.health outside (0,0x97]
+  kUnexpectedTag,     // FUN_00427ab4 expect-read: the stream tag did
+                      // not match the expected packet's tag (the
+                      // FUN_00428144 SAVE/THMB/GAME-in-order contract)
 };
 const char* saveErrorName(SaveError e);
 
@@ -183,6 +186,36 @@ SaveError saveGameParse(const std::byte* file, std::size_t len,
                         SaveGame& out, bool strictPackets = true);
 SaveError saveGameLoadFile(const std::filesystem::path& path,
                            SaveGame& out, bool strictPackets = true);
+
+// ---------------------------------------------------------------------------
+// Narrower probes (the frontend host seams — Phase 18B.1)
+// ---------------------------------------------------------------------------
+
+// FUN_004264f0's envelope gate alone — the check the FUN_00426618
+// stream open performs before any packet work: u32@0 (fileSize) must
+// equal the physical length and u32@4 must equal the byte sum of
+// [8, fileSize). This is exactly the validity level the Continue gate
+// FUN_00428290 reports — file opens AND the envelope is consistent;
+// no packet walk, no GAME validation.
+bool saveGameEnvelopeValid(std::span<const std::byte> file);
+bool saveGameEnvelopeValidFile(const std::filesystem::path& path);
+
+// FUN_00428144 — the save-list header/thumb inspect: the envelope
+// gate, then FUN_00427ab4 expect-reads of SAVE, THMB, GAME in order
+// (each packet's tag AND payload size must match the registry entry
+// for the expected tag). On success `game` receives the decoded GAME
+// dwords and `thumbnail` (when non-null) receives the raw 3648-byte
+// THMB payload. The original inspector does NOT apply FUN_004278c0's
+// level/health range checks — a save whose GAME carries out-of-range
+// fields still inspects OK (the load path rejects it later).
+// Likewise nothing after GAME is read — a corrupt tail does not fail
+// the inspect.
+SaveError saveGameInspectHead(const std::byte* file, std::size_t len,
+                              SaveGamePacket* game,
+                              std::vector<std::byte>* thumbnail);
+SaveError saveGameInspectHeadFile(const std::filesystem::path& path,
+                                  SaveGamePacket* game,
+                                  std::vector<std::byte>* thumbnail);
 
 // ---------------------------------------------------------------------------
 // Writer — header-only form (LASTGAME/checkpoint + briefing saves)

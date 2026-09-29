@@ -91,6 +91,7 @@ const char* saveErrorName(SaveError e) {
     case SaveError::kMissingGame: return "missing-game";
     case SaveError::kBadLevelId: return "bad-level-id";
     case SaveError::kBadHealth: return "bad-health";
+    case SaveError::kUnexpectedTag: return "unexpected-tag";
   }
   return "?";
 }
@@ -204,6 +205,119 @@ std::uint32_t saveEnvelopeChecksum(std::span<const std::byte> file,
   for (std::size_t i = streamOffset; i < file.size(); ++i)
     sum += std::uint8_t(file[i]);
   return sum;
+}
+
+// ---------------------------------------------------------------------------
+// Narrow probes (Phase 18B.1 — the frontend host seams)
+// ---------------------------------------------------------------------------
+
+bool saveGameEnvelopeValid(std::span<const std::byte> file) {
+  // FUN_004264f0: fileSize field == physical length, then
+  // checksum == sum of bytes [8, size). A file smaller than the
+  // 8-byte envelope can't produce a valid pair of u32 reads.
+  if (file.size() < 8) return false;
+  if (rd32(file.data()) != file.size()) return false;
+  return saveEnvelopeChecksum(file, 8) == rd32(file.data() + 4);
+}
+
+bool saveGameEnvelopeValidFile(const std::filesystem::path& path) {
+  // FUN_00426618 = open + FUN_004264f0: an unopenable file and a
+  // bad-envelope file both report "does not exist" upstream.
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return false;
+  const auto sz = f.tellg();
+  if (sz < 8 || sz > (1 << 22)) return false;
+  f.seekg(0);
+  std::vector<std::byte> buf;
+  buf.resize(std::size_t(sz));
+  if (!f.read(reinterpret_cast<char*>(buf.data()), sz))
+    return false;
+  return saveGameEnvelopeValid(buf);
+}
+
+SaveError saveGameInspectHead(const std::byte* file, std::size_t len,
+                              SaveGamePacket* game,
+                              std::vector<std::byte>* thumbnail) {
+  // FUN_004264f0 envelope gate (shared with saveGameParse).
+  if (file == nullptr || len < 18) return SaveError::kReadFail;
+  if (rd32(file) != len) return SaveError::kBadSizeField;
+  if (saveEnvelopeChecksum({file, len}, 8) != rd32(file + 4))
+    return SaveError::kChecksumMismatch;
+
+  const std::byte* stream = file + 8;
+  const std::size_t streamLen = len - 8;
+  // The leading SAVE packet is stored clear; the cipher state
+  // (0x54be40/41) starts at 0 so its read is a pass-through.
+  if (rd32(stream) != kTagSave || rd32(stream + 4) != 2)
+    return SaveError::kMissingSaveTag;
+  const std::uint16_t seed =
+      std::uint16_t(std::uint8_t(stream[8]) |
+                    (std::uint16_t(std::uint8_t(stream[9])) << 8));
+
+  // FUN_004266b8 reads the post-seed bytes through the rolling
+  // cipher — decode that region once (same range as saveGameParse).
+  std::vector<std::byte> plain(stream, stream + streamLen);
+  cipherRun(plain.data() + 10, streamLen - 10, seed);
+
+  // FUN_00427ab4 expect-read: the stream tag must equal the expected
+  // tag and the stream size must equal the registry size for it;
+  // the payload copies into the caller's buffer. The SAVE packet was
+  // already validated above — the ciphered stream resumes at offset
+  // 10, where the first expect-read is THMB (the inspector's
+  // SAVE/THMB/GAME sequence counts the open-time SAVE read).
+  std::size_t off = 10;  // first ciphered packet follows the seed
+  auto expectRead = [&](std::uint32_t tag,
+                        std::byte* payload) -> SaveError {
+    if (off + 8 > streamLen) return SaveError::kTruncatedPacket;
+    if (rd32(plain.data() + off) != tag)
+      return SaveError::kUnexpectedTag;
+    const std::uint32_t sz = rd32(plain.data() + off + 4);
+    const SavePacketSpec* spec = savePacketSpec(tag);
+    if (sz != spec->size) return SaveError::kPacketSize;
+    if (off + 8 + sz > streamLen) return SaveError::kTruncatedPacket;
+    if (payload != nullptr && sz != 0)
+      std::memcpy(payload, plain.data() + off + 8, sz);
+    off += 8 + sz;
+    return SaveError::kOk;
+  };
+
+  std::vector<std::byte> thmb;
+  if (thumbnail != nullptr) thmb.resize(3648);
+  if (const SaveError e =
+          expectRead(kTagThmb, thumbnail ? thmb.data() : nullptr);
+      e != SaveError::kOk)
+    return e;
+  if (thumbnail != nullptr) *thumbnail = std::move(thmb);
+  std::int32_t gbuf[6];
+  if (const SaveError e =
+          expectRead(kTagGame, reinterpret_cast<std::byte*>(gbuf));
+      e != SaveError::kOk)
+    return e;
+  if (game != nullptr) {
+    const auto* d = reinterpret_cast<const std::byte*>(gbuf);
+    game->modeField = rdi32(d + 0x00);
+    game->levelId = rdi32(d + 0x04);
+    game->field8 = rdi32(d + 0x08);
+    game->health = rdi32(d + 0x0c);
+    game->deathCount = rdi32(d + 0x10);
+    game->field54163b = rdi32(d + 0x14);
+  }
+  return SaveError::kOk;
+}
+
+SaveError saveGameInspectHeadFile(const std::filesystem::path& path,
+                                  SaveGamePacket* game,
+                                  std::vector<std::byte>* thumbnail) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return SaveError::kReadFail;
+  const auto sz = f.tellg();
+  if (sz <= 0 || sz > (1 << 22)) return SaveError::kReadFail;
+  f.seekg(0);
+  std::vector<std::byte> buf;
+  buf.resize(std::size_t(sz));
+  if (!f.read(reinterpret_cast<char*>(buf.data()), sz))
+    return SaveError::kReadFail;
+  return saveGameInspectHead(buf.data(), buf.size(), game, thumbnail);
 }
 
 std::vector<std::byte> saveGameWriteHeaderOnly(const SaveWriteInput& in) {

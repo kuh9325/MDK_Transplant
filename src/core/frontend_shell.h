@@ -236,8 +236,17 @@ public:
   FrontendFlowController& flow() { return *flow_; }
   const FrontendFlowController& flow() const { return *flow_; }
   SaveSlotListController* saveList() { return saveList_.get(); }
+  const SaveSlotListController* saveList() const {
+    return saveList_.get();
+  }
   SaveNameEntryController* saveName() { return saveName_.get(); }
+  const SaveNameEntryController* saveName() const {
+    return saveName_.get();
+  }
   AbortConsoleController* abortConsole() { return abortConsole_.get(); }
+  const AbortConsoleController* abortConsole() const {
+    return abortConsole_.get();
+  }
   bool helpOpen() const { return subMode_ == kSubHelp; }
   const FrontendMachineState& sharedMachine() const { return shared_; }
 

@@ -21,6 +21,7 @@
 #include "core/freefall_runtime.h"
 #include "core/freefall_scene.h"
 #include "core/frontend_flow.h"
+#include "core/frontend_host.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
 #include "core/frontend_shell.h"
@@ -8467,6 +8468,520 @@ void test_frontend_shell() {
     in = {}; in.nextHeld = true;
     sh.update(in);   // help exits -> sub 0
     CHECK(sh.sharedMachine().mouseX == mx);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18B.1 — the frontend HOST services over a temp save root: the
+// narrow save probes (FUN_004264f0 envelope / FUN_00428144 head
+// inspect), SAVES\ enumeration, the write seam routed through the
+// existing writers, the MISC\MDKS_* slide probe, and the transition
+// arm/ack lifecycle. Every write lands in fs::temp_directory_path() —
+// no real/original save is ever touched.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build an envelope-valid .SAV file body from explicit packets. The
+// stream must begin with the clear SAVE packet whose 2-byte payload
+// is the cipher seed — the same assembly the writers funnel through
+// (saveGameEnvelope ciphers [10..) and patches size+checksum).
+std::vector<std::byte> makeSaveFileBytes(
+    std::uint16_t seed,
+    const std::vector<std::pair<std::uint32_t, std::vector<std::byte>>>&
+        tail) {
+  std::vector<std::byte> stream;
+  auto put32 = [&](std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) stream.push_back(std::byte(v >> (8 * i)));
+  };
+  put32(mdk::saveTag('S', 'A', 'V', 'E'));
+  put32(2);
+  stream.push_back(std::byte(seed & 0xff));
+  stream.push_back(std::byte(seed >> 8));
+  for (const auto& [tag, payload] : tail) {
+    put32(tag);
+    put32(std::uint32_t(payload.size()));
+    stream.insert(stream.end(), payload.begin(), payload.end());
+  }
+  return mdk::saveGameEnvelope(std::move(stream), seed);
+}
+
+std::vector<std::byte> makeGamePayload(int modeField, int levelId,
+                                     int health, int deaths) {
+  std::vector<std::byte> g(24, std::byte(0));
+  auto put32 = [&](int off, std::int32_t v) {
+    for (int i = 0; i < 4; ++i)
+      g[std::size_t(off + i)] = std::byte(v >> (8 * i));
+  };
+  put32(0x00, modeField);
+  put32(0x04, levelId);
+  put32(0x0c, health);
+  put32(0x10, deaths);
+  return g;
+}
+
+void writeBytes(const std::filesystem::path& p,
+                std::span<const std::byte> bytes) {
+  std::ofstream f(p, std::ios::binary | std::ios::trunc);
+  f.write(reinterpret_cast<const char*>(bytes.data()),
+          std::streamsize(bytes.size()));
+}
+
+}  // namespace
+
+void test_frontend_host() {
+  namespace fs = std::filesystem;
+  using mdk::SaveError;
+  using mdk::SaveGamePacket;
+
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_fehost";
+  fs::remove_all(tmp);
+  fs::create_directories(tmp / "SAVES");
+  fs::create_directories(tmp / "MISC");
+
+  // ---- the narrow save probes -------------------------------------
+  // saveGameEnvelopeValid: FUN_004264f0's gate alone — size+checksum,
+  // nothing about the packet stream.
+  {
+    mdk::SaveWriteInput in;
+    in.modeField = 3;
+    in.levelId = 2;
+    in.health = 60;
+    in.deathCount = 1;
+    in.seed = 0xBEEF;
+    const auto hdr = mdk::saveGameWriteHeaderOnly(in);
+    CHECK(mdk::saveGameEnvelopeValid(hdr));
+    // Truncated / bad-size / bad-checksum all fail the same gate.
+    CHECK(!mdk::saveGameEnvelopeValid({}));
+    CHECK(!mdk::saveGameEnvelopeValid(
+        {hdr.data(), hdr.size() - 1}));
+    auto bad = hdr;
+    bad[0] = std::byte(std::uint8_t(bad[0]) + 1);  // size field lies
+    CHECK(!mdk::saveGameEnvelopeValid(bad));
+    bad = hdr;
+    bad[20] ^= std::byte(1);  // stream byte flips -> checksum breaks
+    CHECK(!mdk::saveGameEnvelopeValid(bad));
+    // The envelope says nothing about the packet stream — an
+    // envelope-valid file whose packets are nonsense still passes
+    // (FUN_00428290's Continue gate is exactly this shallow).
+    auto stream = std::vector<std::byte>(64, std::byte(0xAA));
+    std::vector<std::byte> bogus(8 + stream.size());
+    bogus[0] = std::byte(bogus.size());
+    bogus[1] = std::byte(bogus.size() >> 8);
+    bogus[2] = std::byte(bogus.size() >> 16);
+    bogus[3] = std::byte(bogus.size() >> 24);
+    std::memcpy(bogus.data() + 8, stream.data(), stream.size());
+    const std::uint32_t sum = mdk::saveEnvelopeChecksum(bogus, 8);
+    bogus[4] = std::byte(sum);
+    bogus[5] = std::byte(sum >> 8);
+    bogus[6] = std::byte(sum >> 16);
+    bogus[7] = std::byte(sum >> 24);
+    CHECK(mdk::saveGameEnvelopeValid(bogus));
+    CHECK(mdk::saveGameInspectHead(bogus.data(), bogus.size(), nullptr,
+                                   nullptr) ==
+          SaveError::kMissingSaveTag);
+  }
+
+  // saveGameInspectHead: the FUN_00428144 SAVE/THMB/GAME expect-read.
+  {
+    mdk::SaveWriteInput in;
+    in.modeField = 6;
+    in.levelId = 3;
+    in.health = 42;
+    in.deathCount = 5;
+    in.field54163b = 9;
+    in.seed = 0x1234;
+    std::vector<std::byte> thmb(3648);
+    for (std::size_t i = 0; i < thmb.size(); ++i)
+      thmb[i] = std::byte(i & 0xff);
+    in.thumbnail = thmb;
+    const auto file = mdk::saveGameWriteHeaderOnly(in);
+    SaveGamePacket g;
+    std::vector<std::byte> cap;
+    CHECK(mdk::saveGameInspectHead(file.data(), file.size(), &g, &cap) ==
+          SaveError::kOk);
+    // The header-only writer clamps mode 6 verbatim (not the +1000
+    // form) and floors health<0x65 to 100.
+    CHECK(g.modeField == 6 && g.levelId == 3 && g.health == 100 &&
+          g.deathCount == 5 && g.field54163b == 9 && !g.full());
+    CHECK(cap.size() == 3648 && cap[0] == std::byte(0) &&
+          cap[1000] == std::byte(1000 & 0xff) &&
+          cap[3647] == std::byte(3647 & 0xff));
+
+    // A "full" shape (GAME.modeField >= 1000) inspects identically —
+    // the inspector never looks past GAME.
+    auto full = makeSaveFileBytes(
+        0x777,
+        {{mdk::saveTag('T', 'H', 'M', 'B'), std::vector<std::byte>(3648)},
+         {mdk::saveTag('G', 'A', 'M', 'E'),
+          makeGamePayload(1003, 4, 150, 2)},
+         {mdk::saveTag('M', 'O', 'R', 'E'), std::vector<std::byte>(52)},
+         {mdk::saveTag('S', 'E', 'N', 'D'), {}}});
+    CHECK(mdk::saveGameInspectHead(full.data(), full.size(), &g,
+                                   nullptr) == SaveError::kOk);
+    CHECK(g.full() && g.modeField == 1003 && g.mode() == 3 &&
+          g.levelId == 4 && g.health == 150 && g.deathCount == 2);
+    // ...and it fully parses too (levelId 4 < 6, health 150 <= 0x97).
+    mdk::SaveGame sg;
+    CHECK(mdk::saveGameParse(full.data(), full.size(), sg) ==
+          SaveError::kOk);
+
+    // Out-of-range GAME fields still inspect OK — FUN_00428144 does
+    // not apply FUN_004278c0's levelId<6 / health<=0x97 checks; the
+    // full parse rejects them on the load path.
+    auto oor = makeSaveFileBytes(
+        0x111,
+        {{mdk::saveTag('T', 'H', 'M', 'B'), std::vector<std::byte>(3648)},
+         {mdk::saveTag('G', 'A', 'M', 'E'),
+          makeGamePayload(3, 99, 9999, 0)},
+         {mdk::saveTag('S', 'E', 'N', 'D'), {}}});
+    CHECK(mdk::saveGameInspectHead(oor.data(), oor.size(), &g,
+                                   nullptr) == SaveError::kOk);
+    CHECK(g.levelId == 99 && g.health == 9999);
+    CHECK(mdk::saveGameParse(oor.data(), oor.size(), sg) ==
+          SaveError::kBadLevelId);
+
+    // A corrupt tail does not fail the head inspect — the original
+    // stops reading after GAME.
+    auto tail = makeSaveFileBytes(
+        0x222,
+        {{mdk::saveTag('T', 'H', 'M', 'B'), std::vector<std::byte>(3648)},
+         {mdk::saveTag('G', 'A', 'M', 'E'), makeGamePayload(3, 1, 90, 0)},
+         {mdk::saveTag('Z', 'Z', 'Z', 'Z'), std::vector<std::byte>(40)}});
+    CHECK(mdk::saveGameInspectHead(tail.data(), tail.size(), &g,
+                                   nullptr) == SaveError::kOk);
+    CHECK(g.levelId == 1 && g.health == 90);
+    CHECK(mdk::saveGameParse(tail.data(), tail.size(), sg) ==
+          SaveError::kUnknownTag);
+
+    // Wrong order / wrong size / truncation — the expect-read ladder.
+    auto swapped = makeSaveFileBytes(
+        0x333,
+        {{mdk::saveTag('G', 'A', 'M', 'E'), makeGamePayload(3, 1, 90, 0)},
+         {mdk::saveTag('T', 'H', 'M', 'B'), std::vector<std::byte>(3648)},
+         {mdk::saveTag('S', 'E', 'N', 'D'), {}}});
+    CHECK(mdk::saveGameInspectHead(swapped.data(), swapped.size(), &g,
+                                   nullptr) == SaveError::kUnexpectedTag);
+    auto badSize = makeSaveFileBytes(
+        0x444,
+        {{mdk::saveTag('T', 'H', 'M', 'B'), std::vector<std::byte>(10)},
+         {mdk::saveTag('G', 'A', 'M', 'E'), makeGamePayload(3, 1, 90, 0)},
+         {mdk::saveTag('S', 'E', 'N', 'D'), {}}});
+    CHECK(mdk::saveGameInspectHead(badSize.data(), badSize.size(), &g,
+                                   nullptr) == SaveError::kPacketSize);
+    CHECK(mdk::saveGameInspectHead(file.data(), file.size() - 8, &g,
+                                   nullptr) == SaveError::kBadSizeField);
+    // Truncated inside the GAME payload (fix the envelope so the
+    // packet cut is what fails — THMB reads complete, GAME's payload
+    // runs past the end).
+    auto cut = file;
+    cut.resize(8 + 10 + 3656 + 16);   // envelope+SAVE+THMB+half a GAME
+    cut[0] = std::byte(cut.size());
+    cut[1] = std::byte(cut.size() >> 8);
+    const std::uint32_t c2 = mdk::saveEnvelopeChecksum(cut, 8);
+    cut[4] = std::byte(c2); cut[5] = std::byte(c2 >> 8);
+    cut[6] = std::byte(c2 >> 16); cut[7] = std::byte(c2 >> 24);
+    CHECK(mdk::saveGameInspectHead(cut.data(), cut.size(), &g,
+                                   nullptr) == SaveError::kTruncatedPacket);
+  }
+
+  // ---- the host services over a temp save root ---------------------
+  {
+    const fs::path saveDir = tmp / "SAVES";
+    mdk::FrontendHostServices host(saveDir);
+
+    // LASTGAME probe — absent.
+    CHECK(!host.lastGameExists());
+    // Malformed LASTGAME (openable, bad envelope) — the Continue gate
+    // requires FUN_004264f0-valid, not just present.
+    writeBytes(saveDir / "LASTGAME.SAV",
+               std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>("garbage!"), 8));
+    CHECK(!host.lastGameExists());
+    // Valid header-only LASTGAME -> the gate opens.
+    mdk::SaveWriteInput lg;
+    lg.modeField = 3;
+    lg.levelId = 4;
+    lg.health = 0;    // floored to 100 by the writer (death write)
+    lg.deathCount = 2;
+    lg.seed = 0x00C0;
+    CHECK(host.writeSaveFile("LASTGAME",
+                             mdk::saveGameWriteHeaderOnly(lg)));
+    CHECK(host.lastGameExists());
+    // Envelope-valid full-shaped LASTGAME also opens the gate.
+    const auto fullLg = makeSaveFileBytes(
+        0x5151,
+        {{mdk::saveTag('T', 'H', 'M', 'B'), std::vector<std::byte>(3648)},
+         {mdk::saveTag('G', 'A', 'M', 'E'),
+          makeGamePayload(1003, 2, 100, 0)},
+         {mdk::saveTag('S', 'E', 'N', 'D'), {}}});
+    CHECK(host.writeSaveFile("LASTGAME", fullLg));
+    CHECK(host.lastGameExists());
+
+    // Enumeration: unbounded, "*.SAV" case-folded, raw names sorted
+    // (LASTGAME.SAV is enumerated — the original does not filter it).
+    CHECK(host.enumerateSaves().size() == 1);   // just LASTGAME.SAV
+    CHECK(host.enumerateSaves()[0] == "LASTGAME.SAV");
+    for (int i = 0; i < 16; ++i) {
+      char name[16];
+      std::snprintf(name, sizeof(name), "SLOT%02d", i);
+      CHECK(host.writeSaveFile(name, mdk::saveGameWriteHeaderOnly(lg)));
+    }
+    {  // a lowercase-ext file matches; a non-save does not; a
+      // corrupt-but-readable .SAV enumerates but inspects invalid
+      const auto hdr = mdk::saveGameWriteHeaderOnly(lg);
+      writeBytes(saveDir / "low.sav", hdr);
+      std::vector<std::byte> junk(64, std::byte(0xA5));
+      writeBytes(saveDir / "BROKEN.SAV", junk);
+      writeBytes(saveDir / "notes.txt",
+                 std::span<const std::byte>(
+                     reinterpret_cast<const std::byte*>("x"), 1));
+    }
+    const auto names = host.enumerateSaves();
+    CHECK(names.size() == 19);  // LASTGAME + 16 slots + low.sav + BROKEN
+    CHECK(std::is_sorted(names.begin(), names.end()));
+    CHECK(std::find(names.begin(), names.end(), "low.sav") !=
+          names.end());
+    CHECK(std::find(names.begin(), names.end(), "BROKEN.SAV") !=
+          names.end());
+    CHECK(std::find(names.begin(), names.end(), "notes.txt") ==
+          names.end());
+
+    // inspectSlot — readable-but-corrupt reports valid=false;
+    // unopenable reports nullopt. (low.sav resolves to low.SAV on
+    // the case-insensitive host FS — the same fold the original's
+    // Win32 paths had.)
+    const auto ok = host.inspectSlot("SLOT03");
+    CHECK(ok && ok->valid && !ok->fullSave);
+    CHECK(ok->levelId == 4 && ok->health == 100 && ok->deathCount == 2);
+    const auto bad = host.inspectSlot("BROKEN");
+    CHECK(bad && !bad->valid);
+    CHECK(!host.inspectSlot("NOSLOT"));
+    // detail: the THMB capture + the probe error travel together.
+    writeBytes(saveDir / "FULLY.SAV", fullLg);
+    const auto det = host.inspectSlotDetail("FULLY");
+    CHECK(det && det->summary.valid && det->summary.fullSave);
+    CHECK(det->summary.levelId == 2 && det->summary.health == 100);
+    CHECK(det->thumbnail.size() == 3648);
+    // Escaping the save root is refused, not normalized.
+    CHECK(!host.writeSaveFile("../escape",
+                              mdk::saveGameWriteHeaderOnly(lg)));
+    CHECK(!fs::exists(tmp / "escape.SAV"));
+
+    // The slide probe — a synthetic GIF89a header advertising
+    // 600x360 passes the gate; the core never decodes further.
+    {
+      const std::byte gif[] = {
+          std::byte('G'), std::byte('I'), std::byte('F'),
+          std::byte('8'), std::byte('9'), std::byte('a'),
+          std::byte(600 & 0xff), std::byte(600 >> 8),
+          std::byte(360 & 0xff), std::byte(360 >> 8)};
+      writeBytes(tmp / "MISC" / "MDKS_001.GIF", gif);
+      // A 320x200 slide exists but fails the 600x360 decode gate.
+      const std::byte small[] = {
+          std::byte('G'), std::byte('I'), std::byte('F'),
+          std::byte('8'), std::byte('7'), std::byte('a'),
+          std::byte(320 & 0xff), std::byte(320 >> 8),
+          std::byte(200 & 0xff), std::byte(200 >> 8)};
+      writeBytes(tmp / "MISC" / "MDKS_002.GIF", small);
+      // Not a GIF at all.
+      writeBytes(tmp / "MISC" / "MDKS_003.GIF",
+                 std::span<const std::byte>(
+                     reinterpret_cast<const std::byte*>("notagif123"),
+                     10));
+    }
+    std::string err;
+    auto root = mdk::DataRoot::open(tmp, &err);
+    CHECK(root.has_value());
+    host.setDataRoot(&*root);
+    CHECK(host.slideExists(1));
+    const auto si = host.slideInfo(1);
+    CHECK(si && si->exists && si->width == 600 && si->height == 360);
+    CHECK(si->relPath == "MISC/MDKS_001.GIF");
+    CHECK(host.slideData(1).has_value());
+    CHECK(!host.slideExists(2));    // present but not 600x360
+    CHECK(host.slideInfo(2).has_value());   // identity still reported
+    CHECK(!host.slideExists(3));    // not a GIF
+    CHECK(!host.slideExists(0));    // absent
+    CHECK(!host.slideInfo(0).has_value() ||
+          !host.slideInfo(0)->exists);
+
+    // makeSeams + the shell over the real host — Continue arms on
+    // the valid LASTGAME (envelope gate only).
+    auto src = [&]() -> std::optional<mdk::FrontendSaveData> {
+      mdk::FrontendSaveData d;
+      d.headerOnly.modeField = 3;
+      d.headerOnly.levelId = 1;
+      d.headerOnly.health = 80;
+      d.headerOnly.deathCount = 0;
+      d.full = fullLg;   // the manual path's serialized content
+      return d;
+    };
+    mdk::FrontendShell sh(host.makeSeams(src));
+    CHECK(sh.flow().root().savesExist());   // LASTGAME.SAV present
+    CHECK(sh.flow().root().selection() == 0);
+
+    // In-game F2 manual save: mode 3 + sub 0 + gate open -> the
+    // dialog arms; typing + Enter writes through the seam and the
+    // file lands on disk under the temp root.
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    mdk::FrontendMenuInput in;
+    in.f2Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveName);
+    for (const char c : std::string_view("MYTEST")) {
+      in = {}; in.typedChar = c;
+      sh.update(in);
+    }
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(fs::exists(saveDir / "MYTEST.SAV"));
+    // Full-save content was supplied -> the written file is it.
+    {
+      SaveGamePacket g2;
+      CHECK(mdk::saveGameInspectHeadFile(saveDir / "MYTEST.SAV", &g2,
+                                         nullptr) == SaveError::kOk);
+      CHECK(g2.full() && g2.levelId == 2);
+    }
+    // Commit emitted WriteSaveDone then the teardown's ResumeTraversal
+    // (the OBSERVED pair in one teardown chain).
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::WriteSaveDone);
+    CHECK(sh.requestName() == "MYTEST" && !sh.requestHeaderOnly());
+    sh.consumeRequest();
+    CHECK(sh.pendingRequest() == mdk::FrontendRequest::ResumeTraversal);
+    sh.consumeRequest();
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+
+    // Re-enumeration sees the new save (the F3 arm re-scans).
+    in = {}; in.f3Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveList);
+    CHECK(sh.saveList()->count() == 21);  // +FULLY +MYTEST +BROKEN
+    // The shell truncated to <=8 stems itself.
+    CHECK(std::find(sh.saveList()->stems().begin(),
+                    sh.saveList()->stems().end(), "MYTEST") !=
+          sh.saveList()->stems().end());
+    in = {}; in.cancelEdge = true;
+    sh.update(in);   // Esc -> Exit -> resume (mode 3 stays)
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    sh.consumeRequest();  // ResumeTraversal
+
+    // Overwrite: the same name rewrites the same file.
+    in = {}; in.f2Edge = true;
+    sh.update(in);
+    for (const char c : std::string_view("MYTEST")) {
+      in = {}; in.typedChar = c;
+      sh.update(in);
+    }
+    in = {}; in.confirmEdge = true;
+    sh.update(in);
+    CHECK(fs::exists(saveDir / "MYTEST.SAV"));
+    while (sh.pendingRequest() != mdk::FrontendRequest::None)
+      sh.consumeRequest();
+
+    // Mid-fight manual-save gate (FUN_00422bc0 arg==0): mode 3 + sub
+    // 0 + a live X_STRIKE object -> the F2 press does NOT arm the
+    // dialog (the retail GUNT_10 mid-fight save is unreachable).
+    sh.setPrimaryMode(mdk::mode::observed::traversal);
+    sh.setSaveBlockFlags(false, false, /*xStrike=*/true);
+    CHECK(!sh.saveGateOpen());
+    in = {}; in.f2Edge = true;
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+    CHECK(sh.saveName() == nullptr);   // no arm — silent no-op
+    // Both block flags also close it independently.
+    sh.setSaveBlockFlags(true, false, false);
+    sh.update(in);   // f2Edge still set -> still gated
+    CHECK(sh.subMode() == mdk::kSubPrimary);
+
+    // Autosave: armAutosave bypasses the manual gate even with a
+    // live X_STRIKE + block flags set, runs the confirm phase first,
+    // and prefills "<levelIndex+1>" — header-only write on commit.
+    sh.setPrimaryMode(mdk::mode::observed::stats);  // mode 5
+    sh.setSaveBlockFlags(true, true, /*xStrike=*/true);
+    sh.setLevelIndex(2);
+    sh.armAutosave();
+    CHECK(sh.subMode() == mdk::kSubSaveName);
+    CHECK(sh.saveName()->confirmPhase());
+    CHECK(sh.saveName()->name() == "3");  // levelIndex+1
+    in = {}; in.confirmEdge = true;       // YES on the confirm phase
+    sh.update(in);
+    CHECK(sh.subMode() == mdk::kSubSaveName);   // typing phase now
+    CHECK(!sh.saveName()->confirmPhase());
+    in = {}; in.confirmEdge = true;             // commit "3"
+    sh.update(in);
+    CHECK(fs::exists(saveDir / "3.SAV"));
+    {
+      SaveGamePacket g2;
+      CHECK(mdk::saveGameInspectHeadFile(saveDir / "3.SAV", &g2,
+                                         nullptr) == SaveError::kOk);
+      CHECK(!g2.full() && g2.modeField == 3);  // header-only
+      // levelId verbatim; the writer's <0x65 floor stored 100.
+      CHECK(g2.levelId == 1 && g2.health == 100);
+    }
+    while (sh.pendingRequest() != mdk::FrontendRequest::None)
+      sh.consumeRequest();
+
+    // A failing write keeps the dialog open (the OBSERVED
+    // FUN_00422dec failure path — writeFailed latches, sub stays 8).
+    {
+      mdk::FrontendHostServices deadHost(tmp / "NO_SUCH" / "deep");
+      // A source that produces nothing -> the seam reports failure.
+      mdk::FrontendShell dead(
+          deadHost.makeSeams(
+              []() -> std::optional<mdk::FrontendSaveData> {
+                return std::nullopt;
+              }));
+      dead.setPrimaryMode(mdk::mode::observed::traversal);
+      dead.setRunning(true);
+      mdk::FrontendMenuInput din;
+      din.f2Edge = true;
+      dead.update(din);
+      CHECK(dead.subMode() == mdk::kSubSaveName);
+      din = {}; din.typedChar = 'X';
+      dead.update(din);
+      din = {}; din.confirmEdge = true;
+      dead.update(din);
+      CHECK(dead.subMode() == mdk::kSubSaveName);  // stays open
+      CHECK(dead.saveName()->writeFailed());
+    }
+
+    // The transition lifecycle: enterFrontend(true) arms the
+    // transition + Esc suppression; the host ack releases both. Esc
+    // arms the abort console but the same-frame dispatch self-cancels
+    // it (the OBSERVED quirk) — the arm evidence is the fx, not a
+    // surviving sub-mode.
+    {
+      mdk::FrontendShell sh2(host.makeSeams(src));
+      sh2.drainFx();
+      sh2.enterFrontend(true);
+      CHECK(sh2.suppressEscAbort());
+      mdk::frontendHostTransitionArmed(sh2);
+      mdk::FrontendMenuInput in2;
+      in2.cancelEdge = true;
+      sh2.update(in2);
+      bool armed = false;
+      for (const auto f : sh2.drainFx())
+        armed |= f == mdk::FrontendFx::AbortDialogResources;
+      CHECK(!armed);   // suppressed — the abort arm never ran
+      mdk::frontendHostTransitionComplete(sh2);
+      CHECK(!sh2.suppressEscAbort());
+      in2 = {}; in2.cancelEdge = true;
+      sh2.update(in2);
+      armed = false;
+      bool reentered = false;
+      for (const auto f : sh2.drainFx()) {
+        armed |= f == mdk::FrontendFx::AbortDialogResources;
+        reentered |= f == mdk::FrontendFx::LoadFrontendResources;
+      }
+      CHECK(armed);        // the abort arm ran (then self-canceled)
+      CHECK(reentered);    // abortNo at the menu -> fresh re-entry
+      CHECK(sh2.subMode() == mdk::kSubPrimary);
+    }
+
+    // No gameplay state moved: the host only touched the temp root.
+    CHECK(!fs::exists(saveDir / "escape.SAV"));
+    fs::remove_all(tmp);
   }
 }
 
@@ -24287,6 +24802,7 @@ int main() {
   test_save_name_entry();
   test_abort_console();
   test_frontend_shell();
+  test_frontend_host();
   test_display_render();
   test_sound_render();
   test_mouse_render();

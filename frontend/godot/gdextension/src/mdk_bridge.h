@@ -52,7 +52,9 @@
 #include "core/data_root.h"
 #include "core/freefall_runtime.h"
 #include "core/freefall_scene.h"
+#include "core/frontend_host.h"
 #include "core/frontend_machines.h"
+#include "core/frontend_shell.h"
 #include "core/fti_sprite.h"
 #include "core/gameplay_input.h"
 #include "core/progression_runtime.h"
@@ -192,6 +194,71 @@ class MdkBridge : public RefCounted {
   // is dead; GDScript rebuilds from the first post-restore
   // snapshot. Header-only saves (no MORE packet) are rejected.
   Dictionary restore_save(const PackedByteArray& bytes);
+
+  // --- Phase 18B.1 — frontend host services -------------------------
+  // The presentation-neutral shell (mdk::FrontendShell — Phase 18A)
+  // plus the host seams it needs (mdk::FrontendHostServices): the
+  // writable save root, the LASTGAME probe, slot inspect/enumerate,
+  // save writes routed through the existing writers, and the
+  // MISC\MDKS_* slide probe. Presentation draws menus from
+  // frontend_snapshot() and executes nothing itself — host-ownable
+  // requests are dispatched here, presentation-ownable ones stay in
+  // the drained queue for the app.
+  //
+  // `save_dir` is the writable save root — the caller picks it
+  // (production: the runtime's SAVES dir; tests: a temp dir). The
+  // data root must already be open (initialize()); it is used
+  // read-only for MISC\MDKS_*.
+  bool frontend_boot(const String& save_dir);
+  bool frontend_booted() const;
+  // FUN_0041d85c — frontend entry. `returning` is the original's arg
+  // (0 = fresh boot entry, 1 = returning from gameplay).
+  void frontend_enter(bool returning);
+  Dictionary frontend_snapshot() const;
+  // One frame. `input` keys mirror mdk::FrontendMenuInput
+  // (prev/next/confirm/attract/left/right/cancel as bools; "typed" +
+  // key edges as ints; "mouse_dx/dy/dz"/"mouse_buttons" as ints;
+  // "raw_edges" PackedInt32Array of four ints — the four raw edge
+  // bytes). Missing keys = inactive.
+  Dictionary frontend_update(const Dictionary& input);
+  // The end-of-frame ramp/timing update + the OBSERVED idle/attract
+  // cadence — call once per rendered frame after frontend_update.
+  void frontend_end_frame(double dt_ms);
+  // Drained queues: requests as Dictionaries
+  // {"request","name","header_only"}; fx as ints (mdk::FrontendFx).
+  Array frontend_drain_requests();
+  Array frontend_drain_fx();
+  // Host seams (the same functions the shell's seams call):
+  bool frontend_lastgame_exists();
+  Array frontend_enumerate_saves();
+  Dictionary frontend_inspect_slot(const String& stem);
+  // Direct write — {"name": stem, "header_only": bool}. Full saves
+  // serialize from the live traversal session through
+  // saveGameWriteFull; header-only through saveGameWriteHeaderOnly
+  // with the session's checkpoint fields. Equivalent to what the
+  // shell's write seam invokes when armed.
+  bool frontend_write_save(const Dictionary& request);
+  // The OBSERVED MISC\MDKS_%03d.GIF attract probe — the dictionary
+  // carries exists/path/dims/bytes (exists = the 600x360 gate
+  // verdict); raw bytes come separately for the caller's decoder.
+  Dictionary frontend_slide_probe(int64_t index);
+  PackedByteArray frontend_slide_data(int64_t index);
+  // The transition seam: presentation calls this when the transition
+  // the TransitionArmed fx requested has played — clears the
+  // Esc-abort suppression + the idle/attract blend gate
+  // (FUN_0041ebf4's clear point).
+  void frontend_transition_complete();
+  void frontend_notify_load_result(bool ok);
+  // Executes every drained request the host owns — LoadSave /
+  // ContinueLastGame (envelope parse + restore),
+  // AbortToFrontend (gameplay teardown + fresh frontend entry),
+  // StartNewGame (campaign start), ResumeTraversal + WriteSaveDone
+  // (no-ops for the bridge — the modes resume on their own frames).
+  // Returns a per-request report Array of Dictionaries
+  // {"request","handled","owner","ok"} — presentation/app-ownable
+  // requests (Quit, CycleBrightness, CaptureUtility,
+  // OpenLegacyScreen) report handled=false with the owner tag.
+  Array frontend_dispatch_requests();
 
   // --- Phase 17A — traversal combat presentation ----------------
   // All of this is copy-out presentation state produced by the core
@@ -549,6 +616,26 @@ class MdkBridge : public RefCounted {
   mdk::TraversalAudioMixer audioMixer_;
   mdk::TraversalAudioListener audioListener_;
   double lastDtSec_ = 0.0;             // stepCore_'s dt — mixer playhead
+
+  // --- Phase 18B.1 — frontend host ----------------------------------
+  std::unique_ptr<mdk::FrontendHostServices> feHost_;
+  std::unique_ptr<mdk::FrontendShell> feShell_;
+  // The write seam's content source — the original's writers read
+  // live globals at commit time; this snapshots sess_/rt_.
+  std::optional<mdk::FrontendSaveData> produceFrontendSave_();
+  // Dictionary -> FrontendMenuInput (see frontend_update's doc).
+  mdk::FrontendMenuInput frontendInput_(const Dictionary& input) const;
+  // FUN_00427f94 route for LoadSave/ContinueLastGame: parse, then
+  // GAME's mode field picks header-only (progressionApplyGamePacket
+  // + a fresh level load when mode==3) or full (the same
+  // applyFullSaveToTraversal rebuild restore_save runs).
+  bool frontendLoadSaveFile_(const std::string& stem,
+                             std::string& detail);
+  // Per-mode teardown before a fresh frontend entry (the
+  // FUN_004031b8 abort-yes path) — frees rt_/ff_ so no gameplay
+  // structure survives into mode 0.
+  void frontendTeardown_();
+  Dictionary frontendSnapshot_() const;
   // FUN_0040202c's SFX master (0x541308) — the SoundFX menu scalar;
   // the frontend never parses the user's MDK.CFG, so the OBSERVED
   // factory default (70 — frontend_settings' @0x49b0fc table).

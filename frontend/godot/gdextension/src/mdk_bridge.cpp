@@ -164,6 +164,41 @@ void MdkBridge::_bind_methods() {
       &MdkBridge::get_freefall_object_geometry);
   ClassDB::bind_method(D_METHOD("get_freefall_material", "name"),
                        &MdkBridge::get_freefall_material);
+  // Phase 18B.1 — frontend host services.
+  ClassDB::bind_method(D_METHOD("frontend_boot", "save_dir"),
+                       &MdkBridge::frontend_boot);
+  ClassDB::bind_method(D_METHOD("frontend_booted"),
+                       &MdkBridge::frontend_booted);
+  ClassDB::bind_method(D_METHOD("frontend_enter", "returning"),
+                       &MdkBridge::frontend_enter);
+  ClassDB::bind_method(D_METHOD("frontend_snapshot"),
+                       &MdkBridge::frontend_snapshot);
+  ClassDB::bind_method(D_METHOD("frontend_update", "input"),
+                       &MdkBridge::frontend_update);
+  ClassDB::bind_method(D_METHOD("frontend_end_frame", "dt_ms"),
+                       &MdkBridge::frontend_end_frame);
+  ClassDB::bind_method(D_METHOD("frontend_drain_requests"),
+                       &MdkBridge::frontend_drain_requests);
+  ClassDB::bind_method(D_METHOD("frontend_drain_fx"),
+                       &MdkBridge::frontend_drain_fx);
+  ClassDB::bind_method(D_METHOD("frontend_lastgame_exists"),
+                       &MdkBridge::frontend_lastgame_exists);
+  ClassDB::bind_method(D_METHOD("frontend_enumerate_saves"),
+                       &MdkBridge::frontend_enumerate_saves);
+  ClassDB::bind_method(D_METHOD("frontend_inspect_slot", "stem"),
+                       &MdkBridge::frontend_inspect_slot);
+  ClassDB::bind_method(D_METHOD("frontend_write_save", "request"),
+                       &MdkBridge::frontend_write_save);
+  ClassDB::bind_method(D_METHOD("frontend_slide_probe", "index"),
+                       &MdkBridge::frontend_slide_probe);
+  ClassDB::bind_method(D_METHOD("frontend_slide_data", "index"),
+                       &MdkBridge::frontend_slide_data);
+  ClassDB::bind_method(D_METHOD("frontend_transition_complete"),
+                       &MdkBridge::frontend_transition_complete);
+  ClassDB::bind_method(D_METHOD("frontend_notify_load_result", "ok"),
+                       &MdkBridge::frontend_notify_load_result);
+  ClassDB::bind_method(D_METHOD("frontend_dispatch_requests"),
+                       &MdkBridge::frontend_dispatch_requests);
 }
 
 void MdkBridge::setError_(const std::string& msg) {
@@ -2670,4 +2705,577 @@ void MdkBridge::shutdown() {
   mode_ = 0;
   hasFrame_ = false;
   lastError_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18B.1 — frontend host services
+// ---------------------------------------------------------------------------
+
+bool MdkBridge::frontend_boot(const String& save_dir) {
+  if (!root_) {
+    setError_("frontend_boot: initialize() first");
+    return false;
+  }
+  // The caller picks the writable save root — production passes the
+  // runtime's SAVES dir, tests pass a temp dir. The data root stays
+  // read-only (the MISC\MDKS_* slide probe).
+  feHost_ = std::make_unique<mdk::FrontendHostServices>(
+      std::string(save_dir.utf8().get_data()));
+  feHost_->setDataRoot(&*root_);
+  feShell_ = std::make_unique<mdk::FrontendShell>(feHost_->makeSeams(
+      [this] { return produceFrontendSave_(); }));
+  // The ctor ran the FUN_0041d85c(0) fresh entry; mirror the live
+  // host globals (0x541492 domain + the running flag — the app loop
+  // is live whenever this bridge is pumped).
+  feShell_->setPrimaryMode(mode_);
+  feShell_->setRunning(true);
+  feShell_->setLevelIndex(sess_.levelId);
+  return true;
+}
+
+bool MdkBridge::frontend_booted() const { return feShell_ != nullptr; }
+
+void MdkBridge::frontend_enter(bool returning) {
+  if (!feShell_) {
+    setError_("frontend_enter: frontend_boot() first");
+    return;
+  }
+  // FUN_0041d85c writes 0x541492 = 0 — mirror it in both stores.
+  mode_ = 0;
+  sess_.mode = 0;
+  feShell_->enterFrontend(returning);
+}
+
+std::optional<mdk::FrontendSaveData> MdkBridge::produceFrontendSave_() {
+  // FUN_00427ed4's writers read the live 0x541xxx globals at commit
+  // time — this source snapshots them (the session is the canonical
+  // store; the traversal runtime carries the live health while mode
+  // 3 runs). THMB capture is DEFERRED TO PRESENTATION — an empty
+  // thumbnail span emits the writer's zeroed 3648-byte record.
+  mdk::FrontendSaveData d;
+  d.headerOnly.modeField = mode_ != 0 ? mode_ : sess_.mode;
+  d.headerOnly.levelId = sess_.levelId;
+  d.headerOnly.health = (mode_ == 3 && rt_) ? rt_->fieldHealth
+                                          : sess_.health;
+  d.headerOnly.deathCount = sess_.deathCount;
+  d.headerOnly.field54163b = sess_.field54163b;
+  if (mode_ == 3 && rt_) {
+    mdk::SaveWriteFullInput in;  // seed 0, no thumbnail yet
+    mdk::FullWriteReport rep;
+    std::string detail;
+    d.full = mdk::saveGameWriteFull(*rt_, sess_, in, &rep, &detail);
+    for (const std::string& w : rep.warnings)
+      UtilityFunctions::printerr("MdkBridge: save write — ", w.c_str());
+    if (d.full.empty()) {
+      // No save content -> the write seam reports failure and the
+      // OBSERVED FUN_00422dec path keeps the name dialog open.
+      setError_("frontend save: " + detail);
+    }
+  }
+  return d;
+}
+
+mdk::FrontendMenuInput MdkBridge::frontendInput_(
+    const Dictionary& input) const {
+  mdk::FrontendMenuInput in;
+  in.prevHeld = bool(input.get("prev", false));
+  in.nextHeld = bool(input.get("next", false));
+  in.confirmEdge = bool(input.get("confirm", false));
+  in.attractEdge = bool(input.get("attract", false));
+  in.leftHeld = bool(input.get("left", false));
+  in.rightHeld = bool(input.get("right", false));
+  in.cancelEdge = bool(input.get("cancel", false));
+  in.mouseDx = int(input.get("mouse_dx", 0));
+  in.mouseDy = int(input.get("mouse_dy", 0));
+  in.mouseDz = int(input.get("mouse_dz", 0));
+  in.mouseButtons =
+      std::uint8_t(int(input.get("mouse_buttons", 0)) & 0xf);
+  in.pageUpEdge = bool(input.get("page_up", false));
+  in.pageDownEdge = bool(input.get("page_down", false));
+  in.homeEdge = bool(input.get("home", false));
+  in.endEdge = bool(input.get("end", false));
+  in.keyYEdge = bool(input.get("key_y", false));
+  in.keyNEdge = bool(input.get("key_n", false));
+  in.f1Edge = bool(input.get("f1", false));
+  in.f2Edge = bool(input.get("f2", false));
+  in.f3Edge = bool(input.get("f3", false));
+  in.f10Edge = bool(input.get("f10", false));
+  in.f11Edge = bool(input.get("f11", false));
+  in.f12Edge = bool(input.get("f12", false));
+  in.pauseEdge = bool(input.get("pause", false));
+  in.pauseAltEdge = bool(input.get("pause_alt", false));
+  in.utilityEdge = bool(input.get("utility", false));
+  in.typedChar = char(int(input.get("typed", 0)) & 0xff);
+  in.leftEdge = bool(input.get("left_edge", false));
+  in.rightEdge = bool(input.get("right_edge", false));
+  in.nameBackspaceEdge = bool(input.get("name_bs", false));
+  in.nameDeleteEdge = bool(input.get("name_del", false));
+  in.nameHomeEdge = bool(input.get("name_home", false));
+  in.nameEndEdge = bool(input.get("name_end", false));
+  const PackedInt32Array edges = input.get("raw_edges", {});
+  for (int i = 0; i < 4 && i < edges.size(); ++i)
+    in.rawKeyEdge[i] = std::uint32_t(edges[i]);
+  return in;
+}
+
+Dictionary MdkBridge::frontend_update(const Dictionary& input) {
+  if (!feShell_) {
+    setError_("frontend_update: frontend_boot() first");
+    return {};
+  }
+  // Mirror the live host state into the shell's process-global block
+  // before the frame. mode_ is authoritative while a runtime is live;
+  // sess_.mode covers the progression modes (5/6/7/8) with no
+  // presentation runtime.
+  feShell_->setPrimaryMode(mode_ != 0 ? mode_ : sess_.mode);
+  feShell_->setLevelIndex(sess_.levelId);
+  if (input.has("utility_enabled")) {
+    feShell_->setUtilityKeyEnabled(bool(input["utility_enabled"]));
+  }
+  // The manual-save gate inputs (FUN_00422bc0 arg==0 checks):
+  // 0x540e9c + 0x540d9c are live traversal globals; the X_STRIKE
+  // scan runs over every arena's +0x68 list for a live object of
+  // that class (the OBSERVED tag scan).
+  bool xStrike = false;
+  if (mode_ == 3 && rt_) {
+    for (const auto& a : rt_->arenas) {
+      for (const auto& up : a->dyn.storage) {
+        // The +6/+8 live-object predicate — despawned records keep
+        // their class tag until reaped, so col.named alone would
+        // over-block.
+        if (up->col.named && up->col.model != nullptr &&
+            up->scriptClass == "X_STRIKE") {
+          xStrike = true;
+          break;
+        }
+      }
+      if (xStrike) break;
+    }
+  }
+  feShell_->setSaveBlockFlags(
+      mode_ == 3 && rt_ && rt_->fieldE9c != 0,
+      (mode_ == 3 && rt_ && rt_->masterMoveGate) ||
+          sess_.victoryPhase != 0,
+      xStrike);
+  feShell_->update(frontendInput_(input));
+  return frontendSnapshot_();
+}
+
+void MdkBridge::frontend_end_frame(double dt_ms) {
+  if (!feShell_) return;
+  feShell_->endFrame(dt_ms);
+}
+
+Array MdkBridge::frontend_drain_requests() {
+  Array out;
+  if (!feShell_) return out;
+  while (feShell_->pendingRequest() != mdk::FrontendRequest::None) {
+    Dictionary d;
+    d["request"] = int64_t(feShell_->pendingRequest());
+    d["name"] = String(feShell_->requestName().c_str());
+    d["header_only"] = feShell_->requestHeaderOnly();
+    feShell_->consumeRequest();
+    out.push_back(d);
+  }
+  return out;
+}
+
+Array MdkBridge::frontend_drain_fx() {
+  Array out;
+  if (!feShell_) return out;
+  for (const mdk::FrontendFx f : feShell_->drainFx())
+    out.push_back(int64_t(f));
+  return out;
+}
+
+Dictionary MdkBridge::frontendSnapshot_() const {
+  Dictionary out;
+  if (!feShell_) return out;
+  const mdk::FrontendShell& sh = *feShell_;
+  out["mode"] = sh.primaryMode();
+  out["sub_mode"] = sh.subMode();
+  out["quit"] = sh.quitRequested();
+  out["paused"] = sh.paused();
+  out["transition_byte"] = sh.transitionByte();
+  out["suppress_esc_abort"] = sh.suppressEscAbort();
+  out["idle_ticks"] = sh.idleTicks();
+  out["noise_frame"] = sh.noiseFrameRan();
+  out["saves_exist"] = sh.flow().root().savesExist();
+  out["help_open"] = sh.helpOpen();
+  const char* screen = "root";
+  switch (sh.flow().screen()) {
+  case mdk::FrontendScreen::Root:     screen = "root";     break;
+  case mdk::FrontendScreen::Options:  screen = "options";  break;
+  case mdk::FrontendScreen::Display:  screen = "display";  break;
+  case mdk::FrontendScreen::Sound:    screen = "sound";    break;
+  case mdk::FrontendScreen::Mouse:    screen = "mouse";    break;
+  case mdk::FrontendScreen::Keyboard: screen = "keyboard"; break;
+  }
+  out["screen"] = screen;
+  if (sh.flow().screen() == mdk::FrontendScreen::Root) {
+    const mdk::FrontendMenuController& root = sh.flow().root();
+    out["selection"] = root.selection();
+    out["mouse_x"] = root.mouseX();
+    out["mouse_y"] = root.mouseY();
+    out["attract_state"] = root.attractState();
+    out["attract_slide_active"] = root.attractSlideActive();
+    out["menu_strings_hidden"] = root.menuStringsHidden();
+    out["idle_seconds"] = double(root.idleSeconds());
+  }
+  // The flow's settings globals (the 0x541xxx block) — presentation
+  // reads them to draw the options screens; the shell mutates them.
+  const mdk::FrontendFlowController& fl = sh.flow();
+  Dictionary settings;
+  settings["skill"] = fl.skill();
+  settings["dev_hidden"] = fl.devHidden();
+  settings["brightness"] = fl.brightness();
+  settings["force_p_correct"] = fl.forcePCorrect();
+  settings["sound_fx"] = fl.soundFx();
+  settings["sound_music"] = fl.soundMusic();
+  settings["mouse_on"] = fl.mouseOn();
+  settings["dirty"] = fl.settingsDirty();
+  out["settings"] = settings;
+  if (const mdk::SaveSlotListController* l = sh.saveList()) {
+    Dictionary d;
+    d["count"] = l->count();
+    d["selection"] = l->selection();
+    d["top_row"] = l->topRow();
+    d["mouse_track"] = l->mouseTrack();
+    Array stems;
+    for (const std::string& s : l->stems())
+      stems.push_back(String(s.c_str()));
+    d["stems"] = stems;
+    if (const mdk::SaveSlotSummary* s = l->selected()) {
+      Dictionary sd;
+      sd["name"] = String(s->name.c_str());
+      sd["valid"] = s->valid;
+      sd["full_save"] = s->fullSave;
+      sd["level_id"] = s->levelId;
+      sd["mode_field"] = s->modeField;
+      sd["health"] = s->health;
+      sd["death_count"] = s->deathCount;
+      d["selected"] = sd;
+    }
+    out["save_list"] = d;
+  }
+  if (const mdk::SaveNameEntryController* n = sh.saveName()) {
+    Dictionary d;
+    d["name"] = String(n->name().c_str());
+    d["cursor"] = n->cursor();
+    d["confirm_phase"] = n->confirmPhase();
+    d["confirm_selection"] = n->confirmSelection();
+    d["header_only"] = n->headerOnly();
+    d["write_failed"] = n->writeFailed();
+    out["save_name"] = d;
+  }
+  if (const mdk::AbortConsoleController* a = sh.abortConsole())
+    out["abort_selection"] = a->selection();
+  return out;
+}
+
+Dictionary MdkBridge::frontend_snapshot() const {
+  return frontendSnapshot_();
+}
+
+bool MdkBridge::frontend_lastgame_exists() {
+  // FUN_00428290 — SAVES\LASTGAME.SAV opens AND its envelope is
+  // consistent; no packet walk, no world load.
+  return feHost_ && feHost_->lastGameExists();
+}
+
+Array MdkBridge::frontend_enumerate_saves() {
+  Array out;
+  if (!feHost_) return out;
+  for (const std::string& n : feHost_->enumerateSaves())
+    out.push_back(String(n.c_str()));
+  return out;
+}
+
+Dictionary MdkBridge::frontend_inspect_slot(const String& stem) {
+  Dictionary out;
+  out["found"] = false;
+  if (!feHost_) return out;
+  const auto d = feHost_->inspectSlotDetail(
+      std::string(stem.utf8().get_data()));
+  if (!d) return out;
+  out["found"] = true;
+  out["error"] = String(mdk::saveErrorName(d->error));
+  out["name"] = String(d->summary.name.c_str());
+  out["valid"] = d->summary.valid;
+  out["full_save"] = d->summary.fullSave;
+  out["level_id"] = d->summary.levelId;
+  out["mode_field"] = d->summary.modeField;
+  out["health"] = d->summary.health;
+  out["death_count"] = d->summary.deathCount;
+  // The FUN_00428144 THMB capture — the 3648-byte record (768 palette
+  // + 64x45 indexed) when the file carries it.
+  out["thumbnail_size"] = int64_t(d->thumbnail.size());
+  if (!d->thumbnail.empty()) {
+    PackedByteArray t;
+    t.resize(int64_t(d->thumbnail.size()));
+    std::memcpy(t.ptrw(), d->thumbnail.data(), d->thumbnail.size());
+    out["thumbnail"] = t;
+  }
+  return out;
+}
+
+bool MdkBridge::frontend_write_save(const Dictionary& request) {
+  if (!feHost_) {
+    setError_("frontend_write_save: frontend_boot() first");
+    return false;
+  }
+  const std::string stem =
+      std::string(String(request.get("name", "")).utf8().get_data());
+  const bool headerOnly = bool(request.get("header_only", false));
+  // The same body the shell's write seam runs.
+  const auto data = produceFrontendSave_();
+  if (!data) return false;
+  const std::vector<std::byte> bytes =
+      headerOnly ? mdk::saveGameWriteHeaderOnly(data->headerOnly)
+                 : data->full;
+  return !bytes.empty() &&
+         feHost_->writeSaveFile(
+             stem, {bytes.data(), bytes.size()});
+}
+
+Dictionary MdkBridge::frontend_slide_probe(int64_t index) {
+  Dictionary out;
+  out["exists"] = false;
+  if (!feHost_) return out;
+  const auto info = feHost_->slideInfo(int(index));
+  if (!info) return out;
+  out["index"] = int64_t(info->index);
+  out["path"] = String(info->relPath.c_str());
+  out["bytes"] = int64_t(info->bytes);
+  out["width"] = info->width;
+  out["height"] = info->height;
+  // `exists` reports the OBSERVED verdict — the 600x360 decode gate
+  // (FUN_00416e98), not mere file presence.
+  out["exists"] = info->exists && info->width == 600 &&
+                  info->height == 360;
+  return out;
+}
+
+PackedByteArray MdkBridge::frontend_slide_data(int64_t index) {
+  PackedByteArray out;
+  if (!feHost_) return out;
+  const auto bytes = feHost_->slideData(int(index));
+  if (!bytes) return out;
+  out.resize(int64_t(bytes->size()));
+  std::memcpy(out.ptrw(), bytes->data(), bytes->size());
+  return out;
+}
+
+void MdkBridge::frontend_transition_complete() {
+  if (!feShell_) return;
+  // FUN_0041ebf4's clear point — the transition presentation
+  // finished; the Esc-abort suppression + the attract blend gate
+  // release together.
+  mdk::frontendHostTransitionComplete(*feShell_);
+}
+
+void MdkBridge::frontend_notify_load_result(bool ok) {
+  if (!feShell_) return;
+  feShell_->notifyLoadResult(ok);
+}
+
+bool MdkBridge::frontendLoadSaveFile_(const std::string& stem,
+                                      std::string& detail) {
+  // FUN_00427f94 — the shared Continue/save-list load path.
+  if (!root_ || !feHost_) return false;
+  mdk::SaveGame sg;
+  const mdk::SaveError pe =
+      mdk::saveGameLoadFile(feHost_->saves().pathFor(stem), sg);
+  if (pe != mdk::SaveError::kOk) {
+    detail = std::string("parse: ") + mdk::saveErrorName(pe);
+    return false;
+  }
+  if (!sg.game.full()) {
+    // Header-only save — GAME fields verbatim, then the 0x428088
+    // mode route: 3 -> a fresh traversal load of the saved level,
+    // 6 -> the briefing re-entry, else the frontend fallback.
+    mdk::progressionApplyGamePacket(sess_, sg.game);
+    if (sess_.mode == 3) {
+      auto trav = std::make_unique<mdk::TraversalRuntime>();
+      const mdk::ProgressionError e =
+          mdk::progressionLoadTraversalForCurrentLevel(
+              *root_, sess_, *trav, &detail);
+      if (e != mdk::ProgressionError::kOk) {
+        detail = std::string("load: ") +
+                 mdk::progressionErrorName(e) + " — " + detail;
+        return false;
+      }
+      rt_ = std::move(trav);
+      mode_ = 3;
+      hasFrame_ = false;
+      timing_ = mdk::FrontendTimingState{};
+      last_ = mdk::TraversalFrameResult{};
+      prevKeyLevel_ = {};
+      objIds_ = mdkfront::MdkObjectIds{};
+      arenaSets_.clear();
+      arenaSetFailed_.clear();
+      displaySet_.clear();
+      arenaIndex_ = -1;
+      arenaName_.clear();
+      arenaLoaded_ = false;
+      const int dir = mdk::progressionLevelDir(sess_.levelId);
+      char stemBuf[16], dirBuf[32];
+      std::snprintf(stemBuf, sizeof(stemBuf), "LEVEL%d", dir);
+      std::snprintf(dirBuf, sizeof(dirBuf), "TRAVERSE/LEVEL%d/", dir);
+      if (!presentTraversalLevel_(stemBuf, dirBuf)) {
+        detail = lastError_;
+        return false;
+      }
+      updateDisplaySet_();
+      refreshOrders_();
+    } else {
+      // mode 6 (briefing) / 0 (frontend) — the progression session
+      // holds the mode; no presentation runtime exists for them yet.
+      mode_ = sess_.mode;
+    }
+    return true;
+  }
+  // Full save — the FUN_00427218 rebuild, identical to restore_save.
+  auto trav = std::make_unique<mdk::TraversalRuntime>();
+  mdk::FullRestoreReport rep;
+  const mdk::SaveError re =
+      mdk::applyFullSaveToTraversal(sg, *root_, sess_, *trav, &rep,
+                                    &detail);
+  if (re != mdk::SaveError::kOk) {
+    detail = std::string("restore: ") + mdk::saveErrorName(re) +
+             " — " + detail;
+    return false;
+  }
+  rt_ = std::move(trav);
+  mode_ = 3;
+  hasFrame_ = false;
+  timing_ = mdk::FrontendTimingState{};
+  last_ = mdk::TraversalFrameResult{};
+  prevKeyLevel_ = {};
+  ff_.reset();
+  ffScene_.reset();
+  ffTex_.clear();
+  ffHandoffDone_ = false;
+  ffHandoffRoute_ = -1;
+  ffHandoffDetail_.clear();
+  objIds_ = mdkfront::MdkObjectIds{};
+  arenaSets_.clear();
+  arenaSetFailed_.clear();
+  displaySet_.clear();
+  arenaIndex_ = -1;
+  arenaName_.clear();
+  arenaLoaded_ = false;
+  const int dir = mdk::progressionLevelDir(sess_.levelId);
+  char stemBuf[16], dirBuf[32];
+  std::snprintf(stemBuf, sizeof(stemBuf), "LEVEL%d", dir);
+  std::snprintf(dirBuf, sizeof(dirBuf), "TRAVERSE/LEVEL%d/", dir);
+  if (!presentTraversalLevel_(stemBuf, dirBuf)) {
+    detail = lastError_;
+    return false;
+  }
+  updateDisplaySet_();
+  refreshOrders_();
+  return true;
+}
+
+void MdkBridge::frontendTeardown_() {
+  // The abort-yes per-mode teardown (FUN_004031b8's mode table —
+  // FUN_00418de4 / FUN_0040fa68 / FUN_004371bc / FUN_0042c824 /
+  // FUN_004295c4 / FUN_0047b0d8): everything derived from the mode's
+  // runtime dies. shutdown() is the port's proven superset of that
+  // free list (runtime, presentation caches, audio banks, session
+  // mirror); the frontend shell and save root are host-level and
+  // survive it, matching the original's process-global lifetime.
+  shutdown();
+}
+
+Array MdkBridge::frontend_dispatch_requests() {
+  Array out;
+  if (!feShell_) {
+    setError_("frontend_dispatch_requests: frontend_boot() first");
+    return out;
+  }
+  while (feShell_->pendingRequest() != mdk::FrontendRequest::None) {
+    const mdk::FrontendRequest req = feShell_->pendingRequest();
+    const std::string name = feShell_->requestName();
+    const bool headerOnly = feShell_->requestHeaderOnly();
+    feShell_->consumeRequest();
+    Dictionary r;
+    r["request"] = int64_t(req);
+    r["name"] = String(name.c_str());
+    r["header_only"] = headerOnly;
+    r["handled"] = true;
+    r["ok"] = true;
+    switch (req) {
+    case mdk::FrontendRequest::Quit:
+      // DAT_0054148e — the process quit belongs to the app.
+      r["handled"] = false;
+      r["ok"] = false;
+      r["owner"] = "app";
+      break;
+    case mdk::FrontendRequest::StartNewGame:
+      // FUN_0041b630 — the campaign host's authoritative entry: mode
+      // 6 at the briefing stage. The loader/freefall progression is
+      // driven by the campaign host frames after this.
+      mdk::progressionStartCampaign(sess_, feShell_->flow().skill());
+      mode_ = sess_.mode;
+      r["owner"] = "progression";
+      r["mode"] = sess_.mode;
+      break;
+    case mdk::FrontendRequest::ContinueLastGame:
+    case mdk::FrontendRequest::LoadSave: {
+      std::string detail;
+      const bool ok = frontendLoadSaveFile_(
+          req == mdk::FrontendRequest::ContinueLastGame ? "LASTGAME"
+                                                      : name,
+          detail);
+      feShell_->notifyLoadResult(ok);
+      r["owner"] = "host";
+      r["ok"] = ok;
+      if (!ok) r["detail"] = String(detail.c_str());
+      break;
+    }
+    case mdk::FrontendRequest::WriteSaveDone:
+      // The write itself already ran through the seam inside the
+      // name dialog (the OBSERVED FUN_00427ed4 callsite). This
+      // request is the commit notification.
+      r["owner"] = "host";
+      break;
+    case mdk::FrontendRequest::AbortToFrontend:
+      // Per-mode teardown + FUN_0041d85c(0) fresh entry.
+      frontendTeardown_();
+      feShell_->enterFrontend(false);
+      r["owner"] = "host";
+      break;
+    case mdk::FrontendRequest::ResumeTraversal:
+      // FUN_004348d4 unfreeze — frames resume on their own (the
+      // bridge drives no overlay freeze of its own).
+      r["owner"] = "host";
+      r["ok"] = (mode_ == 3 || sess_.mode == 3);
+      break;
+    case mdk::FrontendRequest::CycleBrightness:
+      // The brightness global already wrapped shell-side; the
+      // palette upload (FUN_0046c92c) is presentation-owned.
+      r["handled"] = false;
+      r["ok"] = false;
+      r["owner"] = "presentation";
+      break;
+    case mdk::FrontendRequest::CaptureUtility:
+      // FUN_00428340 frame capture — no host seam yet.
+      r["handled"] = false;
+      r["ok"] = false;
+      r["owner"] = "presentation";
+      break;
+    case mdk::FrontendRequest::OpenLegacyScreen:
+      // Sub-modes 3/6 (joystick/perf) — diagnostic only, not ported.
+      r["handled"] = false;
+      r["ok"] = false;
+      r["owner"] = "legacy";
+      break;
+    case mdk::FrontendRequest::None:
+      break;
+    }
+    out.push_back(r);
+  }
+  return out;
 }

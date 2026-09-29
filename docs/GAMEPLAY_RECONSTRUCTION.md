@@ -7137,3 +7137,107 @@ Regression: `mdk_tests` 6117/0 (+150 checks), CTest 1/1, pytest
 c0-c4 digests EXACT. Godot presentation NOT implemented — Phase 18B.
 
 **FRONTEND / MENU CORE: CLOSED FOR BUILD_A**
+
+# Phase 18B.1 — Frontend Host / Bridge Services
+
+## 236. Host seams (IMPLEMENTED)
+
+`core/frontend_host.{h,cpp}` — `FrontendHostServices` binds one
+explicit writable save root (the production `SAVES` dir; tests and
+the diagnostic use temp roots) plus an optional read-only
+`DataRoot` for the slide probe. It implements the five Phase-18A
+seams the shell consumes via `makeSeams(saveSource)`:
+
+- `lastGameExists` — FUN_00428290 → FUN_00426618 →
+  `saveGameEnvelopeValidFile`: `SAVES\LASTGAME.SAV` opens AND the
+  FUN_004264f0 envelope (size field == physical length, checksum ==
+  byte sum of [8, size)) is consistent. No packet walk, no GAME
+  validation — exactly the Continue-gate validity level.
+- `enumerateSaves` — FUN_004202cc's `*.SAV` scan: raw file names,
+  unbounded, case-folded extension (the original ran on
+  case-insensitive filesystems), byte-sorted for determinism. The
+  shell applies `saveListStem` (first ' '/'.', ≤8 chars) itself.
+- `inspectSlot`/`inspectSlotDetail` — FUN_00428144:
+  `saveGameInspectHead(File)` validates the envelope + clear SAVE
+  packet, decodes the rolling cipher, then expect-reads THMB + GAME
+  and STOPS. No FUN_004278c0 level/health range checks and no tail
+  read — an out-of-range GAME or corrupt tail still inspects
+  (the load path rejects it later). The detail form additionally
+  returns the raw 3648-byte THMB payload and the probe `SaveError`.
+  Unopenable → nullopt (the invalid-entry row); readable-but-bad →
+  `valid=false`.
+- `writeSaveFile` — the filesystem half of FUN_00422d84: verbatim
+  `<stem>.SAV` under the save root (stem-safety only refuses escape
+  characters — no invented normalization). Serialized bytes come
+  from the embedder's `FrontendSaveSource` (a live-session
+  snapshot); the host never re-serializes game state. Empty/unpro-
+  ducible bytes → write fails → the dialog stays open (OBSERVED
+  FUN_00422dec). Header-only commits route through
+  `saveGameWriteHeaderOnly`; full commits use embedder-supplied
+  `saveGameWriteFull` output.
+- `slideProbe` — `MISC/MDKS_%03d.GIF` (FUN_0041ef74): `slideInfo`
+  reads the GIF logical-screen header (signature + dims + byte
+  size) via the read-only `DataRoot`; `slideExists` applies the
+  OBSERVED 600x360 decode gate (FUN_00416e98). `slideData` returns
+  the raw file bytes. No GIF decode in core — the external-format
+  classification stands; presentation decodes.
+
+Transition seam: `frontendHostTransitionArmed` sets the
+`DAT_0049aa8c` blend gate; `frontendHostTransitionComplete` is the
+FUN_0041ebf4 clear point — releases `DAT_0054152c` (the
+returning-entry Esc suppression) + the blend gate.
+
+New parser probes (`core/save_game.*`):
+`saveGameEnvelopeValid(File)` — the FUN_004264f0 gate alone.
+`saveGameInspectHead(File)` — the FUN_00428144 head ladder
+(envelope → clear SAVE → THMB → GAME).
+
+## 237. Bridge API (IMPLEMENTED)
+
+`mdk_bridge` gains the presentation-neutral host surface (copy-safe
+Dictionaries/Arrays only): `frontend_boot(save_dir)` /
+`frontend_enter(returning)` / `frontend_update(input)` /
+`frontend_end_frame(dt_ms)` / `frontend_snapshot()` /
+`frontend_drain_requests()` / `frontend_drain_fx()` /
+`frontend_lastgame_exists()` / `frontend_enumerate_saves()` /
+`frontend_inspect_slot(stem)` / `frontend_write_save(request)` /
+`frontend_slide_probe(index)` / `frontend_slide_data(index)` /
+`frontend_transition_complete()` / `frontend_notify_load_result(ok)`
+/ `frontend_dispatch_requests()`.
+
+Request dispatch boundary — `frontend_dispatch_requests()` reports
+`{request, handled, owner, ok}` per entry: host-owned = `LoadSave`,
+`ContinueLastGame`, `AbortToFrontend`, `StartNewGame` (progression
+seam), `ResumeTraversal`/`WriteSaveDone` (no-op resume); app-owned
+= `Quit`, `CycleBrightness`, `CaptureUtility`, `OpenLegacyScreen`.
+
+## 238. Validation
+
+- Temp-root integration tests (`test_frontend_host`, +109 checks):
+  envelope-valid edge cases, head-inspect on header-only and full
+  saves, THMB capture, corrupt-tail/wrong-order/wrong-size/
+  in-GAME-truncation failures, enumeration incl. lowercase `.sav`
+  + corrupt `.SAV` + non-save exclusion, LASTGAME write/existence,
+  header-only + full writes, save-name commit + overwrite, escape
+  refusal, slide probes (600x360 gate, undersize, non-GIF,
+  absent), transition arm/ack, **GUNT_10 mid-fight gate** (mode 3
+  + live X_STRIKE → F2 does not arm; each block flag independently
+  closes the gate) and **autosave bypass** (mode 5 → confirm phase
+  → prefilled `<levelIndex+1>` → real header-only `3.SAV`).
+- `--frontend-script` now runs the shell on real host seams: Phase
+  A probes a `--data-path` corpus read-only (real `1.SAV`/`2.SAV`
+  inspect as full modeField=1003 / header-only modeField=6; real
+  MDKS_001-010.GIF all pass the 600x360 gate); Phase B drives the
+  script against a temp root with real writes (autosave produces a
+  real `3.SAV`, re-enumeration sees it).
+- Regression: `mdk_tests` 6226/0, CTest 1/1, `mdk_frontend_tests`
+  60/0, `mdkbridge` builds clean, traversal L3–L8 60f digests
+  EXACT, freefall c0–c4 digests EXACT.
+
+THMB CAPTURE: DEFERRED TO PRESENTATION — the arm-time
+`SaveNameThumbnailGrab` fx marks the grab point; writers emit the
+zeroed record until a presentation supplies the 3648-byte indexed
+capture.
+
+**FRONTEND HOST / SAVE SERVICES: CLOSED FOR BUILD_A** (Godot menu
+presentation is Phase 18B.2 and NOT closed by this.)
