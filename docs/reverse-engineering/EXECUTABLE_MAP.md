@@ -125,7 +125,8 @@ surfaces).
     `541554<=0` → `FUN_0041d85c` (mode 0); `541498<4` →
     `FUN_00429200(0)` (mode 6); `541498>=4` → `MOV [541498],5`
     @`0x4015ef` (literal store, not ++) + `FUN_00422bc0` overlay →
-    mode 7,
+    mode 7. The tally itself is a **scripted 3D cinematic scene**,
+    not a text table — see the mode-5 presentation inventory below,
   - `6` level-load/briefing — entry `FUN_00429200` (`EAX==0`→sub 2,
     `EAX!=0`→sub 3 briefing-only); frame `FUN_00422bc0` dispatch on
     `0x54bef8` (jump table `0x4296e0`): 2=`FUN_00429f40` intro →4,
@@ -156,6 +157,83 @@ surfaces).
   `FUN_004278c0` (save load).
 - Loop tail: `FUN_0041ab50` (shutdown-time file op on a path buffer —
   exact role TENTATIVE), then `thunk_FUN_0047f47f` exits.
+
+### Mode-5 tally/intermission — presentation inventory (Phase 18C, decomp-level)
+
+Mode 5 is **not** a statistics text screen: `FUN_0042c8b0` drives a
+scripted 3D intermission scene over `MISC\STATS.BNI`/`STATS.MTI`
+resources — same machinery family as the mode-8 `FINISH.BNI`
+cinematic. Presenting it faithfully requires porting that scene
+engine (§15-class seam — deferred to a dedicated cinematic phase).
+
+- Entry `FUN_0042b270`: builds a scene-object pool freelist
+  `0x540ed0` over `0x4f0740` (399 × `0x32e`-stride records — the
+  DynamicObject record class), loads `STATS.BNI` (`FUN_00403928` →
+  `0x4a1e38`), copies the record-header block `ctx+0xc0` → `0x4ed818`
+  (576 B) and the camera key block `0x540820` → `0x4ed758` (192 B),
+  resolves ~17 handles via `FUN_004039c8`/`FUN_00403a00`/
+  `FUN_00402e2c` (backdrop → `0x4eda88`, palette → `0x4eda8c/90/98`,
+  ~12 sound handles `0x4eda58..0x4eda78`, score-head slots
+  `0x4edaa0..0x4edab0`), spawns three model actors via
+  `FUN_00428400`+`FUN_00403490` (`BONES`, `PROFSHIP`, `SWH150` or
+  `GUNTA` when `0x4edad0`, name bufs `0x4edd48..0x4edee0`), registers
+  `FUN_0041a480(0,FUN_0041c884)`, seeds the three tally counters
+  `0x4edad4/d8/dc` from `541498` + `54147a` (skill): skill0
+  `id+6.0`/`17.0−id/2`/`10.0−id/2`; skill1 `id+8.0`/`17.0−id`/
+  `10.0−id/2`; skill2 `id+10.0`/`13.0−id/2`/`10.0−id/2` — scripted
+  flavor values, not tracked gameplay stats. Inits the trail ring
+  `0x4e74b0/b4=0` + defaults (`0x4eccc4..=1.0`, `0x4ed744=10.0`,
+  two `rand&0x3f` seeds), **pre-rolls `FUN_0042be4c` 31×** to fill
+  ribbon history, `FUN_0042fb30` frame-limiter init.
+- Frame `FUN_0042c8b0` (internal re-entry `0x42cb0b`: `ECX==1`→
+  update head else fade tail — reached only from `0x42c8e8`):
+  increments `0x4e74b4`; spawns the `0x4edac0` bonus object once via
+  `FUN_0042c6f0` when `541554>0 && (e74b4>186.0 || health==1)`;
+  per-bucket object updates over ring `0x4ed6b8[32]` —
+  `0x4edab4`→`FUN_0042d24c` (hero flight-path + ribbon feed +
+  score-drain: decrements `541554` health into the displayed
+  counters, can self-latch `0x4ed748` @`0x42d95b`),
+  `0x4edabc`→`FUN_0042db0c`, `0x4edab8`→`FUN_0042d034`,
+  `0x4edac8`→`FUN_0042d118`, `0x4edac0`→`FUN_0042dabc`,
+  generic→`FUN_0042cf6c`. Completion latch `0x4ed748`:
+  `edab4+0x39 > 0x50`, or `0x4edad0 && e74b4 >= 186.0`, or the
+  hero-update write — then `0x4eda9c` fades down at `0x49b6f4`/frame
+  → `<=0` returns 1. No key-edge/input path observed — scripted
+  completion only. `0x42b0b` style re-entrancy aside, single thread.
+- Render (inside the `0x5414d4` frame-due gate set by the
+  `FUN_0042fb68` limiter): `FUN_0042b060`/`FUN_0042b0c0` (camera
+  base + scroll rate `0x49b578`), backdrop blit `FUN_0042e684`
+  (`0x4eda88` 600×360 indexed map scrolled at `0x49b5fc`/`0x49b600`
+  timer-derived offsets, wrapped mod 600/0x168, into `0x541650`),
+  object+trail pass `FUN_0042e100` (ring walk → `FUN_0046b4f8`
+  transforms, `FUN_0042e620` ribbon verts, `FUN_00455e24` model
+  submit, `FUN_0042e55c`/`LAB_0042e49c` trail callbacks, z-tiers
+  `−0x405..−0x545`, `FUN_00409a00` batch flush), `FUN_0041cb44`,
+  `FUN_00417e20`, `FUN_0042b090`. Camera `FUN_0042dc68` (32-key
+  spline lerp over `0x4eccc4`, `round(t)&0x1f`+frac) +
+  `FUN_0042de28` (full `0x540b28..` projection rewrite —
+  600×360 c(300,180), `0x540b58=2.4`, M1 `0x540b80`/M2 `0x540bb0`).
+  Palette fade `0x4eda9c` 0→1 at `0x49b6f4` + `FUN_0047d59a`
+  noise mix + `FUN_0046d208` 0x300-byte DAC upload.
+- Trail engine: writer `FUN_0042be4c` (ring `0x4e74b8` 32×0xc0 +
+  `0x4e8cb8` 32×0x200 + `0x4ed2b8` 32×0x20), ring push
+  `FUN_0042da40`, ribbon submit `FUN_0042dcf4`. Spawn helpers
+  `FUN_0042bdc4` (pool pop + bucket link + `FUN_0042dc68` seed),
+  `FUN_0042c6f0`/`FUN_0042c7b4`/`FUN_0042c578`.
+- Assets: `MISC\STATS.BNI` — `CGUN`/`SNIPER`/`RICO1..3`/`ALDIE`
+  (scene SFX handles — audio deferred), `XGHEAD1` 15304 B/
+  `XGHEAD2` 7960 B/`XGHEAD` 616 B (score-head model/anim payloads),
+  `TELETYPE` 692 B (text script), `PAL` 768 B (scene palette),
+  `L1_INTRM` + `L1..L5_MAP` (6 × 216772 B = 600×360 indexed, the
+  `LBB`-style `{768B pal, u16le w/h, w*h px}` layout — backdrops);
+  `MISC\STATS.MTI` — `XG_BACK` 128×128 + `XG_BOD` 256×283 `.MAT`
+  images + 38 `PEN_*` index remaps (score-head sprites).
+- Teardown `FUN_0042c824`: frees the pool/ring + clears BNI state.
+- Port state: `progressionStepIntermission` models the entry/routing
+  only (Phase 18A) — the scene render is an unimplemented
+  presentation seam; a faithful port needs the ~2.8k-line scene
+  engine above plus STATS.BNI/MTI record decoding — dedicated
+  phase, not Phase 18C scope.
 
 ## Frontend/menu frame — `FUN_0041dc90` (OBSERVED)
 

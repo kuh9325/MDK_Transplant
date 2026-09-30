@@ -4592,8 +4592,15 @@ mode-8 entry (`0x49bd40` latch in `FUN_0047b06c`).
 
 - `FUN_0042b270`: entry — writes `0x541492 = 5`, records
   `0x4edad0 = (541498 > 3)`, initialises the tally/statistics state.
+  Phase 18C decomp resolves the "tally" as a **scripted 3D scene**
+  over `MISC\STATS.BNI`/`STATS.MTI` (object pool + scripted actors +
+  ribbon trails + spline camera + scrolling `L*_MAP` backdrop +
+  score-head counters) — full inventory in EXECUTABLE_MAP.md's
+  mode-5 presentation block.
 - `FUN_0042c8b0`: per-frame tally/fade — returns 0 while running, 1
-  when done (`0x4eda9c` fade in/out arms).
+  when done (`0x4eda9c` fade in/out arms). Completion is fully
+  scripted (`0x4ed748` latch: hero `+0x39>0x50` / `edad0 &&`
+  `e74b4>=186.0` / hero-update write) — no input path observed.
 - Dispatcher exit (`0x4015c3`): `FUN_0046ca84` + `FUN_0042c824`
   teardown, then the next-mode decision:
   - `0x541554 <= 0` → `FUN_0041d85c` → mode 0 (frontend). Reachable
@@ -7310,3 +7317,63 @@ L3–L8 and freefall c0–c4 digests all EXACT, diag=0.
 seams; intentionally not started)
 
 **FRONTEND NON-AUDIO PRESENTATION: CLOSED FOR BUILD_A**
+
+## 240. Phase 18C — mode-5 tally presentation investigation (STOP RULE)
+
+Phase 18C set out to render the mode-5 tally/statistics screen as a
+small bounded presentation phase. Instruction-level decomp of the
+mode-5 trio (`FUN_0042b270` entry, `FUN_0042c8b0` frame,
+`FUN_0042c824` teardown, dispatcher `0x4015b6..0x40160a`) instead
+resolved the "tally" as a **scripted 3D cinematic scene**, not a
+text/statistics table. The §15 stop rule applies (cinematic decoder
++ scene-engine RE); the seam is documented, not implemented.
+
+Findings (decomp-level unless noted):
+
+- Entry `FUN_0042b270` builds a scene-object freelist
+  (`0x540ed0` over `0x4f0740`, 399 × `0x32e` DynamicObject-class
+  records), loads `MISC\STATS.BNI`, resolves ~17 handles (backdrop,
+  scene palette, ~12 sound handles, score-head slots), spawns three
+  model actors (`BONES`, `PROFSHIP`, `SWH150` or `GUNTA` for course
+  `541498 > 3`), seeds the three tally counters
+  `0x4edad4/d8/dc = f(541498, 54147a-skill)` — scripted flavor values
+  (skill0 `id+6.0`/`17.0−id/2`/`10.0−id/2`; skill1 `id+8.0`/
+  `17.0−id`/`10.0−id/2`; skill2 `id+10.0`/`13.0−id/2`/`10.0−id/2`),
+  and pre-rolls the trail writer 31× before the first frame.
+- Frame `FUN_0042c8b0` ticks `0x4e74b4`, runs per-bucket scripted
+  animators over ring `0x4ed6b8[32]` — the hero object `0x4edab4`'s
+  update `FUN_0042d24c` drives the flight path, feeds the ribbon
+  trail, and **drains `0x541554` (health) into the score display**;
+  bonus object `0x4edac0` spawns once when `541554>0 &&
+  (e74b4>186.0 || health==1)`. Completion latch `0x4ed748`:
+  hero `+0x39>0x50`, or `0x4edad0 && e74b4>=186.0` (≈6.2 s cap on
+  the course>3 variant), or a hero-update write — then
+  `0x4eda9c` fades out → return 1. **No input path observed** —
+  the screen exits on scripted completion only.
+- Render: timer-driven scroll blit `FUN_0042e684` of the
+  `L*_MAP` 600×360 indexed backdrop into `0x541650`; object+trail
+  pass `FUN_0042e100` (shared `FUN_0046b4f8` transform,
+  `FUN_00455e24` model submit, `FUN_00409a00` batch flush);
+  spline camera `FUN_0042dc68` (32-key lerp `0x4eccc4`) +
+  `FUN_0042de28` (own `0x540b28..` projection); palette fades
+  via `0x4eda9c` + `FUN_0046d208` DAC upload; frame pacing via
+  `FUN_0042fb68`/`FUN_0042fb30`.
+- Assets (corpus census): `STATS.BNI` = `CGUN`/`SNIPER`/`RICO1..3`/
+  `ALDIE` (SFX), `XGHEAD1/2`/`XGHEAD` (score-head payloads),
+  `TELETYPE` 692 B, `PAL` 768 B, `L1_INTRM`+`L1..L5_MAP` (6×
+  216772 B indexed backdrops); `STATS.MTI` = `XG_BACK`/`XG_BOD`
+  `.MAT` sprites + 38 `PEN_*` remaps.
+- Faithful port requirement (~2.8k lines of decomp + 2 record
+  formats): scene-object pool + bucket ring, six scripted
+  animators, the ribbon-trail engine (`FUN_0042be4c`/`42da40`/
+  `42dcf4`/`42e620`/`42e100`), the spline camera, STATS.BNI/MTI
+  decoding, and the model submit (shared `FUN_00455e24`) — a
+  dedicated cinematic phase alongside the mode-8 `FINISH.BNI`
+  work, not Phase 18C scope.
+
+Port behaviour is unchanged: `progressionStepIntermission` keeps
+the mode-5 entry/exit routing (Phase 18A contract — no regression);
+the scene render remains the documented presentation seam.
+
+**MODE-5 TALLY / STATISTICS PRESENTATION: OPEN** — cinematic seam;
+stop rule invoked, inventory preserved for a dedicated phase.
