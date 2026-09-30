@@ -127,8 +127,13 @@ surfaces).
     @`0x4015ef` (literal store, not ++) + `FUN_00422bc0` overlay →
     mode 7. The tally itself is a **scripted 3D cinematic scene**,
     not a text table — see the mode-5 presentation inventory below,
-  - `6` level-load/briefing — entry `FUN_00429200` (`EAX==0`→sub 2,
-    `EAX!=0`→sub 3 briefing-only); frame `FUN_00422bc0` dispatch on
+  - `6` level-load/briefing/statistics — entry `FUN_00429200`
+    (`EAX==0`→sub 2, `EAX!=0`→sub 3 briefing-only) — OBSERVED owner
+    of `MISC\STATS.BNI`/`STATS.MTI` (opens both @`0x42926c/0x42928e`,
+    resolves `CGUN`/`SNIPER`/`RICO1..3`/`ALDIE`/`XGHEAD1`/`XGHEAD2`/
+    `TELETYPE` + `XGHEAD` proto into `0x54bf10..0x54bf34`; relinks
+    the SAME shared 399-record object pool `0x4f0740`/`0x540ed0`);
+    frame `FUN_004296f0` → `FUN_00422bc0` dispatch on
     `0x54bef8` (jump table `0x4296e0`): 2=`FUN_00429f40` intro →4,
     4=`FUN_00429984` debrief →1, 1=`FUN_00429fe4` load-bar →
     `541498++` @`0x4297d9` (the campaign advance; `==6`→early exit)
@@ -143,9 +148,23 @@ surfaces).
   - `8` cinematic/ending — `FUN_0047b038` (`541492=8`,
     `0x49bd40=1`); triggered by script opcode `0x51` via the `>0x32`
     script arm `FUN_0047baf4`; body `FUN_0047b06c` = one-shot
-    `FUN_004371bc` teardown + `FUN_0047b3f4` finish cinematic +
-    `FUN_0041d85c` → mode 0. Terminal route for the final level
-    (id 5 / `LEVEL5`).
+    `FUN_004371bc` teardown + `FUN_0047b0fc` init (streams
+    `MISC\FLIC\MDKEND.FLC` with a 350-px progress bar, resolves
+    FINISH.BNI WAVs `EXPLODE1`/`DROP`/`FLYBY`/`ENDEXP`/`DOGSHIP` →
+    `0x54f398..0x54f3a8`, inits FLIC ctx `0x54ef40`,
+    allocs the 600-wide decode buffer) + `FUN_0047b3f4` FLIC frame
+    pump (`FUN_00414158` chunked decode → `0x541650` →
+    `FUN_0046c86c`; frame-mark table `0x54f3b4`: 1=`DOGSHIP`,
+    `0x81`=`DROP`, `0x85`=`FLYBY`, `0xba`/`0xc4`=`EXPLODE1`,
+    `0xbc`=stop `DOGSHIP`, `0xc2`=`ENDEXP`, `0xd2..0xe8` brighten
+    ramp, `0xe9` ~30-tick hold, `0xe9..0x104` ramp down) →
+    `FUN_0047b674` second stage (`MISC\FLIC\MDKBZK.MVE` @`0x499130`,
+    callback-registered Interplay MVE player `0x489xxx`, 640×480)
+    + `FUN_0041d85c` → mode 0. Terminal route for the final level
+    (id 5 / `LEVEL5`). NOT the mode-5 engine — FLIC decode +
+    MVE playback vs. procedural tunnel scene; only generic plumbing
+    shared (limiter `FUN_0042fb68`, fb `0x541650`, palette
+    `FUN_0046d208`/`FUN_0047b384`).
 - Level-directory table `0x4999e8` (dword[8] = `{7,6,3,4,8,5,2,1}`) —
   indexed by `DAT_00541498` in `FUN_00433d40` (`0x433d7d`) and
   `FUN_0041b7b4` (`0x41b7d1`) to build `TRAVERSE\LEVEL%d\LEVEL%d.*`
@@ -158,82 +177,141 @@ surfaces).
 - Loop tail: `FUN_0041ab50` (shutdown-time file op on a path buffer —
   exact role TENTATIVE), then `thunk_FUN_0047f47f` exits.
 
-### Mode-5 tally/intermission — presentation inventory (Phase 18C, decomp-level)
+### Mode-5 stream/tunnel intermission — presentation inventory (Phase 19A, disasm+decomp-level)
 
-Mode 5 is **not** a statistics text screen: `FUN_0042c8b0` drives a
-scripted 3D intermission scene over `MISC\STATS.BNI`/`STATS.MTI`
-resources — same machinery family as the mode-8 `FINISH.BNI`
-cinematic. Presenting it faithfully requires porting that scene
-engine (§15-class seam — deferred to a dedicated cinematic phase).
+**Correction (Phase 19A):** the Phase-18C census misattributed
+`MISC\STATS.BNI`/`STATS.MTI` to mode 5. OBSERVED (disasm
+`FUN_0042b270` @ `0x42b3xx..0x42b5xx`): mode 5 opens
+`STREAM\STREAM.BNI` (`0x496e24`) and `STREAM\STREAM.MTI`
+(`0x496e38`) — same stream bundle already proven by
+`stream_context.cpp`. `MISC\STATS.BNI`/`STATS.MTI` are opened by the
+**mode-6 init `FUN_00429200`** (`0x496c78`/`0x496c88` @`0x42926c/
+0x42928e`; records `CGUN`/`SNIPER`/`RICO1..3`/`ALDIE`/`XGHEAD1`/
+`XGHEAD2`/`TELETYPE`/`XGHEAD` — the statistics/briefing screen) and
+have no code reference anywhere else. Mode 5 is a scripted,
+**steerable** 3D tunnel flight — Kurt's ship riding a procedurally
+generated tube to a BONES dropship rendezvous — not a tally table.
 
-- Entry `FUN_0042b270`: builds a scene-object pool freelist
-  `0x540ed0` over `0x4f0740` (399 × `0x32e`-stride records — the
-  DynamicObject record class), loads `STATS.BNI` (`FUN_00403928` →
-  `0x4a1e38`), copies the record-header block `ctx+0xc0` → `0x4ed818`
-  (576 B) and the camera key block `0x540820` → `0x4ed758` (192 B),
-  resolves ~17 handles via `FUN_004039c8`/`FUN_00403a00`/
-  `FUN_00402e2c` (backdrop → `0x4eda88`, palette → `0x4eda8c/90/98`,
-  ~12 sound handles `0x4eda58..0x4eda78`, score-head slots
-  `0x4edaa0..0x4edab0`), spawns three model actors via
-  `FUN_00428400`+`FUN_00403490` (`BONES`, `PROFSHIP`, `SWH150` or
-  `GUNTA` when `0x4edad0`, name bufs `0x4edd48..0x4edee0`), registers
-  `FUN_0041a480(0,FUN_0041c884)`, seeds the three tally counters
-  `0x4edad4/d8/dc` from `541498` + `54147a` (skill): skill0
-  `id+6.0`/`17.0−id/2`/`10.0−id/2`; skill1 `id+8.0`/`17.0−id`/
-  `10.0−id/2`; skill2 `id+10.0`/`13.0−id/2`/`10.0−id/2` — scripted
-  flavor values, not tracked gameplay stats. Inits the trail ring
-  `0x4e74b0/b4=0` + defaults (`0x4eccc4..=1.0`, `0x4ed744=10.0`,
-  two `rand&0x3f` seeds), **pre-rolls `FUN_0042be4c` 31×** to fill
-  ribbon history, `FUN_0042fb30` frame-limiter init.
+- Entry `FUN_0042b270` (`541492=5`, `0x4edad0 = (541498>3)` final-run
+  flag): links the shared 399-record dynamic-object freelist
+  (`0x4f0740`, stride `0x32e`, head `0x540ed0` — the SAME pool mode 6
+  links in `FUN_00429200`; NOT a private pool), loads STREAM.BNI,
+  composes the scene palette `0x4ed758` = SYS_PAL head `0x540820`
+  (entries 0–63) + `PAL[0xc0..0x300)` (entries 64–255) per the
+  proven `stream_context` path, resolves records: `BG` → `0x4eda88`
+  (216004 B = 600×360 indexed starfield), `PLANET` (128×128 sprite
+  → `0x4eda8c`), `LIGHT` (64×64 sprite → `0x4edacc`, debris image),
+  WAV handles `WIND`/`HITSIDE`/`RESCUE`/`HURT1..7`/`APPLE` →
+  `0x4eda58..0x4eda84`, text layout records `SC_BSTAT`/`SC_STAT`/
+  `SNIP_TXT` (name-table `0x49a7e0`), model protos `KURT`/
+  `BONES`/`PROFSHIP`/(`SWH150`|`GUNTA` by `0x4edad0`) →
+  `0x4edd48/0x4eddd0/0x4ede58/0x4edee0` (`FUN_00428400` parse +
+  `FUN_00403490` register, proto records `0x4edcc0+i*0x88`), anim
+  records `KURTANIM`→`0x4edaa4`, `BONESANIM`→`0x4edaa0`,
+  `GUNTANIM`→`0x4edab0`, `FL_HVR`→`0x4edaa8`, `FL_WAVE`→`0x4edaac`.
+  Seeds the tunnel-shape params `0x4edad4/d8/dc` from course
+  `541498` (`iVar2 = course>>1`) + skill `54147a`:
+  - skill 0: `edad4 = course+6.0`, `edad8 = 10.0−course/2`, `edadc = 17.0−course/2`
+  - skill 1: `edad4 = course+8.0`, `edad8 = 10.0−course/2`, `edadc = 17.0−course`
+  - skill 2: `edad4 = course+10.0`, `edad8 = 10.0−course/2`, `edadc = 13.0−course/2`
+  (`0x496f10=10`, `0x496f18=13`, `0x496f20=8`, `0x496f28=17`,
+  `0x496f30=6` f64 — OBSERVED). These clamp the tunnel drift
+  accumulators and radius — **difficulty shaping, not displayed
+  score counters** (Phase-18C "score counters" reading was wrong:
+  `FUN_0042be4c` clamps `|ed738/73c/740| ≤ edad4` with 0.8 damp and
+  `edad8 ≤ ed744 ≤ edadc`).
+  Ring cursors `0x4e74b0/b4=0`, node defaults `0x4eccb8/c4/e0=1.0`,
+  radius `0x4ed744=10.0`, pen-phase seeds `rand&0x3f` →
+  `0x4ed74c/0x4ed750`, **pre-rolls `FUN_0042be4c` 31×** to fill the
+  tunnel ring, clears the teletype queue `FUN_0041cf5c`, limiter
+  init `FUN_0042fb30`, `FUN_0041a480(0,FUN_0041c884)`, builds the
+  256-entry RGBQUAD work table from `0x4ed758` (BGR→RGB expansion).
 - Frame `FUN_0042c8b0` (internal re-entry `0x42cb0b`: `ECX==1`→
   update head else fade tail — reached only from `0x42c8e8`):
-  increments `0x4e74b4`; spawns the `0x4edac0` bonus object once via
-  `FUN_0042c6f0` when `541554>0 && (e74b4>186.0 || health==1)`;
-  per-bucket object updates over ring `0x4ed6b8[32]` —
-  `0x4edab4`→`FUN_0042d24c` (hero flight-path + ribbon feed +
-  score-drain: decrements `541554` health into the displayed
-  counters, can self-latch `0x4ed748` @`0x42d95b`),
-  `0x4edabc`→`FUN_0042db0c`, `0x4edab8`→`FUN_0042d034`,
-  `0x4edac8`→`FUN_0042d118`, `0x4edac0`→`FUN_0042dabc`,
-  generic→`FUN_0042cf6c`. Completion latch `0x4ed748`:
-  `edab4+0x39 > 0x50`, or `0x4edad0 && e74b4 >= 186.0`, or the
-  hero-update write — then `0x4eda9c` fades down at `0x49b6f4`/frame
-  → `<=0` returns 1. No key-edge/input path observed — scripted
-  completion only. `0x42b0b` style re-entrancy aside, single thread.
-- Render (inside the `0x5414d4` frame-due gate set by the
-  `FUN_0042fb68` limiter): `FUN_0042b060`/`FUN_0042b0c0` (camera
-  base + scroll rate `0x49b578`), backdrop blit `FUN_0042e684`
-  (`0x4eda88` 600×360 indexed map scrolled at `0x49b5fc`/`0x49b600`
-  timer-derived offsets, wrapped mod 600/0x168, into `0x541650`),
-  object+trail pass `FUN_0042e100` (ring walk → `FUN_0046b4f8`
-  transforms, `FUN_0042e620` ribbon verts, `FUN_00455e24` model
-  submit, `FUN_0042e55c`/`LAB_0042e49c` trail callbacks, z-tiers
-  `−0x405..−0x545`, `FUN_00409a00` batch flush), `FUN_0041cb44`,
-  `FUN_00417e20`, `FUN_0042b090`. Camera `FUN_0042dc68` (32-key
-  spline lerp over `0x4eccc4`, `round(t)&0x1f`+frac) +
-  `FUN_0042de28` (full `0x540b28..` projection rewrite —
-  600×360 c(300,180), `0x540b58=2.4`, M1 `0x540b80`/M2 `0x540bb0`).
-  Palette fade `0x4eda9c` 0→1 at `0x49b6f4` + `FUN_0047d59a`
-  noise mix + `FUN_0046d208` 0x300-byte DAC upload.
-- Trail engine: writer `FUN_0042be4c` (ring `0x4e74b8` 32×0xc0 +
-  `0x4e8cb8` 32×0x200 + `0x4ed2b8` 32×0x20), ring push
-  `FUN_0042da40`, ribbon submit `FUN_0042dcf4`. Spawn helpers
-  `FUN_0042bdc4` (pool pop + bucket link + `FUN_0042dc68` seed),
-  `FUN_0042c6f0`/`FUN_0042c7b4`/`FUN_0042c578`.
-- Assets: `MISC\STATS.BNI` — `CGUN`/`SNIPER`/`RICO1..3`/`ALDIE`
-  (scene SFX handles — audio deferred), `XGHEAD1` 15304 B/
-  `XGHEAD2` 7960 B/`XGHEAD` 616 B (score-head model/anim payloads),
-  `TELETYPE` 692 B (text script), `PAL` 768 B (scene palette),
-  `L1_INTRM` + `L1..L5_MAP` (6 × 216772 B = 600×360 indexed, the
-  `LBB`-style `{768B pal, u16le w/h, w*h px}` layout — backdrops);
-  `MISC\STATS.MTI` — `XG_BACK` 128×128 + `XG_BOD` 256×283 `.MAT`
-  images + 38 `PEN_*` index remaps (score-head sprites).
-- Teardown `FUN_0042c824`: frees the pool/ring + clears BNI state.
-- Port state: `progressionStepIntermission` models the entry/routing
-  only (Phase 18A) — the scene render is an unimplemented
-  presentation seam; a faithful port needs the ~2.8k-line scene
-  engine above plus STATS.BNI/MTI record decoding — dedicated
-  phase, not Phase 18C scope.
+  `0x49b5a4` scene tick++; rescue-twin spawn gate
+  `541554>0 && (0x4e74b0 > 177 || 541554==1)` and `edac0==0 &&
+  edad0==0` → `FUN_0042bdc4` clone of hero `0x4edab4`: copies hero
+  matrix `+0xac`(0x30B), pos `+0x10..18`, `+0x4c`, `+0x13c`, `+0x54`,
+  sets `+0x58=1.0`, clears hero `+0x148` bit3, binds **BONESANIM**
+  `0x4edaa0` to both `+0x114`, `+0xe4(animFrame)=0xffff`,
+  `+0x118=0xfffe`, `+0xe0=30.0f`, plays `RESCUE` (`0x4eda7c`)
+  — the BONES dropship dock; its `+0xe4 > 0x50` latches completion.
+  Final mode: `edad0 && e74b4 ≥ 186.0` also latches.
+- Per-frame object update — walks the consumed-bucket window
+  `[0x4e74b0, 0x4e74b4)`, per object skips if `+0x11a>>0x10 ==
+  0x49b5a4` (once-per-tick), else stamps `+0x11c` and dispatches on
+  object identity: `edab4`→`FUN_0042d24c` (hero), `edabc`→
+  `FUN_0042db0c` (companion SWH150/GUNTA), `edab8`→`FUN_0042d034`
+  (PROFSHIP flourish), `edac8`→`FUN_0042d118` (APPLE bonus pickup —
+  sets `541554=150` on reach), `edac0` skipped here (rescue twin —
+  `FUN_0042dabc` runs once after the walk), generic→`FUN_0042cf6c`
+  (scripted debris/props). Then `FUN_0042dabc` (shadow sync),
+  camera: `FUN_0042dc68(t = hero+0x5c·pathT + −0.75)` and
+  `(t + 2.0)` path lookups, eye lerp `(A·1.7 + B·0.6)` +
+  `hero-pos overshoot ·1.375` smoothing (`0x497028=−0.75`,
+  `0x497018=2.0`, `0x497030=1.375`, `0x497038=0.4`, `0x497040=0.6`),
+  `FUN_0042de28` rebuilds M1/M2 projection, `FUN_004026f8`.
+- Render (gated by `0x5414d4` frame-due from `FUN_0042fb68`):
+  stereo path when `0x541544` — `FUN_0042b060` (save camera) +
+  `FUN_0042b0c0` (eye offset `0x49b578`), render, `FUN_0042b090`
+  (restore), second eye render; always: `FUN_0042e684` backdrop
+  parallax (scroll accumulators `0x49b5fc/0x49b600` +=
+  `rint(prev + Δ)`; `Δy = (curR[2][2]·prevR[2][2]−curT[2]·prevR[1][2])·
+  0.5·360`... exact cross-terms from cam×prevCam matrices,
+  `Δx = (curR[1][0]·prevR[0][0]−curR[0][0]·prevR[1][0])·0.5·600`,
+  stereo eye subtracts `0x49b578` from x; then 0x30B rotation copy
+  `0x540bb0→0x49b604` and wrapped blit `BG`→fb `0x541650` mod
+  (600,360)), `FUN_0042e100` back-to-front ring walk — per slot:
+  project 16 ring points `FUN_0046b4f8`, emit 32 ribbon quads
+  (`FUN_0042e620` visibility/clip, pen bytes `0x4ed2b8` select
+  sprite rows), then flush slot objects through the shared draw
+  list `FUN_00409a00` (sprites `FUN_0042e55c`/`FUN_0042e49c`,
+  models `FUN_00455e24`), `FUN_0041cb44` (teletype — queue was
+  cleared at init; service only), `FUN_00417e20` (HUD health digits,
+  gated `541554>0x14`), present `FUN_0046c86c`,
+  limiter `FUN_0042fb68`.
+- Hero `FUN_0042d24c`: reads input axes `0x4ce758/0x4ce75c` via
+  `FUN_00407f2c` — **the flight is steerable**; integrates pos/vel,
+  feeds the tunnel generator via `FUN_0042be4c` ticks, probes wall
+  crossing `FUN_0042d97c` (plane records `0x4e8cb8`, bank-roll mix);
+  on crossing: ricochet response (speed `·0.9`, floor 4.5), crash
+  SFX (`HITSIDE`/`HURT1..7`), and health drain by skill —
+  skill0 `−2`, skill1 `−(rand+2)`, skill2 `−(rand·2+4)` per beat;
+  non-final clamps `541554 ≥ 1`; final allows 0 → writes
+  `0x4ed748` @`0x42d95b` + fast fade `0x4eda9c = 2.0`.
+- Palette/fade `0x4eda9c` (dt `0x49b6f4` = 1/30): ramps **in**
+  toward `1.0`; per-frame while `0<eda9c<1` the DAC buffer is
+  `rint(ed758[i]·eda9c + 255·(1−eda9c))` non-final (white-in),
+  `rint(ed758[i]·eda9c)` final (black-in), and when `541554 ≤ 0`
+  a gray-desaturate ramp (`eda9c·256` flat + scaled channels).
+  At `eda9c ≥ 1` → clamp + `FUN_00413b40(0x4ed758)` full upload.
+  Latched → ramps down; at `≤0`: `edad0==0 && 541554>0` → memset
+  DAC `0xff` (white flash) else `0` (black), `FUN_0046d208` upload,
+  return 1 → teardown. No key path — scripted completion only.
+- Trail/tunnel engine: `FUN_0042be4c` per emit tick writes a
+  path-node (ring `0x4e74b8`, 32 × `0xc0`) + node frame
+  (`0x4eccb8`+i·0x30) + 16-pt jittered cross-section ring
+  (step `22.5°`, radius `0x4ed744` jittered by
+  `rand·6.103515625e-05`, pen bytes `0x4ed2b8` triangle-fold) +
+  plane records (`0x4e8cb8`, 32 × `0x200`, `n·x+d`), reaps objects
+  in the overwritten bucket, spawns debris ~75% of ticks
+  (`FUN_0042c578`, `+0x108 = LIGHT` sprite). Bucket ring
+  `0x4ed6b8[32]`, window `[0x4e74b0, 0x4e74b4)`; migration
+  `FUN_0042da40` keys on `rint(obj+0x5c pathT)` — outside the
+  window → reap `FUN_0042c7b4` back to the shared pool.
+- Assets (all OBSERVED string→code bindings): `STREAM\STREAM.BNI`
+  29 records — `BG`/`PAL`/`PLANET`/`LIGHT`, WAVs `WIND`/`HITSIDE`/
+  `RESCUE`/`HURT1..7`/`APPLE`, text `SC_BSTAT`/`SC_STAT`/`SNIP_TXT`,
+  models `KURT`/`BONES`/`PROFSHIP`/`GUNTA`/`SWH150`, anims
+  `KURTANIM`/`BONESANIM`/`GUNTANIM`/`SWHANM`/`FL_HVR`/`FL_WAVE`;
+  `STREAM\STREAM.MTI` material table (existing MTI format).
+  `STATS.BNI`/`STATS.MTI` belong to **mode 6** (`FUN_00429200`).
+- Teardown `FUN_0042c824`: frees records/protos, returns objects to
+  the shared pool, clears BNI slot.
+- Port state: `progressionStepIntermission` models entry/routing
+  only (Phase 18A). Scene core lands in Phase 19A
+  (`src/core/stream_scene.*`) — engine contract documented in
+  `docs/reverse-engineering/STREAM_SCENE.md`.
 
 ## Frontend/menu frame — `FUN_0041dc90` (OBSERVED)
 

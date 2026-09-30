@@ -4591,16 +4591,19 @@ mode-8 entry (`0x49bd40` latch in `FUN_0047b06c`).
 ## 168. Mode 5 — post-traversal intermission (OBSERVED)
 
 - `FUN_0042b270`: entry — writes `0x541492 = 5`, records
-  `0x4edad0 = (541498 > 3)`, initialises the tally/statistics state.
-  Phase 18C decomp resolves the "tally" as a **scripted 3D scene**
-  over `MISC\STATS.BNI`/`STATS.MTI` (object pool + scripted actors +
-  ribbon trails + spline camera + scrolling `L*_MAP` backdrop +
-  score-head counters) — full inventory in EXECUTABLE_MAP.md's
-  mode-5 presentation block.
+  `0x4edad0 = (541498 > 3)`, initialises the stream/tunnel state.
+  Phase 18C decomp resolved the "tally" as a **scripted 3D scene**;
+  Phase 19A corrected the resource attribution: the scene runs over
+  `STREAM\STREAM.BNI`/`STREAM.MTI` (`STATS.*` belongs to the mode-6
+  init `FUN_00429200`) and is a **steerable** tunnel flight to a
+  BONES-dropship rendezvous — full corrected inventory in
+  `docs/reverse-engineering/STREAM_SCENE.md`.
 - `FUN_0042c8b0`: per-frame tally/fade — returns 0 while running, 1
   when done (`0x4eda9c` fade in/out arms). Completion is fully
-  scripted (`0x4ed748` latch: hero `+0x39>0x50` / `edad0 &&`
-  `e74b4>=186.0` / hero-update write) — no input path observed.
+  scripted (`0x4ed748` latch: rescue-twin `edac0+0xe4>0x50` /
+  `edad0 && e74b4>=186.0` / hero-update write @`0x42d95b`) — no
+  key-exit path observed (the flight itself IS steerable via
+  `0x4ce758/0x4ce75c`).
 - Dispatcher exit (`0x4015c3`): `FUN_0046ca84` + `FUN_0042c824`
   teardown, then the next-mode decision:
   - `0x541554 <= 0` → `FUN_0041d85c` → mode 0 (frontend). Reachable
@@ -7377,3 +7380,58 @@ the scene render remains the documented presentation seam.
 
 **MODE-5 TALLY / STATISTICS PRESENTATION: OPEN** — cinematic seam;
 stop rule invoked, inventory preserved for a dedicated phase.
+
+## 241. Phase 19A — cinematic engine RE (corrections + engine map)
+
+**Phase-18C census corrections (all OBSERVED, instruction-level):**
+
+- Mode 5 opens `STREAM\STREAM.BNI`/`STREAM.MTI` (`0x496e24`/
+  `0x496e38`), NOT `MISC\STATS.*`. STATS.BNI/MTI are the **mode-6**
+  resources (`FUN_00429200` @`0x42926c`/`0x42928e`; `XGHEAD*`,
+  `TELETYPE`, `CGUN`/`SNIPER`/`RICO1..3`/`ALDIE`, `L1_INTRM`+
+  `L1..L5_MAP` backdrops). Mode-5 records: `BG` (600×360 starfield),
+  `PAL`, `PLANET`/`LIGHT` sprites, `WIND`/`HITSIDE`/`RESCUE`/
+  `HURT1..7`/`APPLE` WAVs, `SC_BSTAT`/`SC_STAT`/`SNIP_TXT` text,
+  `KURT`/`BONES`/`PROFSHIP`/`SWH150`|`GUNTA` models,
+  `KURTANIM`/`BONESANIM`/`GUNTANIM`/`SWHANM`/`FL_HVR`/`FL_WAVE`
+  anims.
+- `0x4edad4/d8/dc` are **tunnel-shape parameters**, not displayed
+  score counters: `edad4` clamps the drift accumulators
+  (`|ed738/73c/740|`, 0.8 damp), `edad8`/`edadc` bound the tunnel
+  radius `0x4ed744`. Seed formulas (course `c=541498`, `h=c>>1`,
+  skill `s=54147a`): s0 `edad4=c+6 / edad8=10−h / edadc=17−h`;
+  s1 `c+8 / 10−h / 17−c`; s2 `c+10 / 10−h / 13−h`.
+- The object pool is the **shared** 399-record `DynamicObject`
+  arena (`0x4f0740`, `0x32e` stride, freelist `0x540ed0`) — the same
+  link loop runs in the mode-6 init.
+- The flight is **steerable** (`FUN_0042d24c` consumes input axes
+  `0x4ce758/0x4ce75c`); wall crossing (`FUN_0042d97c` plane probe)
+  ricochets (speed·0.9, floor 4.5) and drains health per beat —
+  s0 `−2`, s1 `−(rand+2)`, s2 `−(2·rand+4)`; non-final floors at 1,
+  final (`edad0`) drains to 0 → completion latch + fast fade.
+- The "score display"/completion is the **BONES rescue dock**:
+  once `e74b0>177` (or health==1) a twin ship `0x4edac0` clones the
+  hero, `BONESANIM` binds to both, `RESCUE` plays; the clone's
+  `+0xe4` animFrame `>0x50` latches `0x4ed748` → fade → exit.
+  (Non-final success exits on a white-flash DAC (`0xff` fill);
+  final/death exits to black.)
+- **Mode 5 and mode 8 do NOT share an engine.** Mode 8 is a video
+  pipeline: `FUN_0047b0fc` streams `MISC\FLIC\MDKEND.FLC` (350-px
+  progress bar, FINISH.BNI WAV bank `EXPLODE1`/`DROP`/`FLYBY`/
+  `ENDEXP`/`DOGSHIP`), `FUN_0047b3f4` pumps frames through the
+  bounded chunked decoder `FUN_00414158` (magic `0xF1FA`, chunk
+  types 4/7/0xb/0xf/0x10 handled, 0xc/0xd/0x12 skipped; handler
+  table `0x49a750` variant×5) with a frame-mark SFX/palette script
+  (marks `1`/`0x81`/`0x85`/`0xba`/`0xbc`/`0xc2`/`0xc4`, brighten
+  `0xd2..0xe8`, ~30-tick hold `0xe9`, ramp-down `0xe9..0x104`),
+  then `FUN_0047b674` plays `MISC\FLIC\MDKBZK.MVE` via the
+  `0x489xxx` callback-registered Interplay MVE player at 640×480,
+  then `FUN_0041d85c` → frontend. Shared with mode 5: only the
+  limiter `FUN_0042fb68`, framebuffer `0x541650`, palette upload
+  `FUN_0046d208`, present `FUN_0046c86c`.
+- The MVE stage is a second codec (Interplay movie player lib —
+  callbacks `0x47ae80`/`0x47af4c`/`0x47afe8`/`0x47b018`/`0x47b028`,
+  message pump) — documented as a boundary event for Build-A; codec
+  port is explicitly out of Phase-19A scope per §22.
+
+Engine contract: `docs/reverse-engineering/STREAM_SCENE.md`.
