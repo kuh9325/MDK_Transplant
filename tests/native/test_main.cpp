@@ -16371,6 +16371,104 @@ void test_object_animation() {
     CHECK(o.animFrame == 2);               // verts still applied
     CHECK(near(o.model.elemVerts[0][0], 2.0, 1e-6));
   }
+
+  // -- FRNDINT truncation fidelity (Phase 19A.1 — OBSERVED RC=11 at
+  //    0x455522 / 0x4556e1 / 0x455732 / 0x45586d; the driver truncates
+  //    toward zero, it never rounds) ----------------------------------
+  {
+    const std::uint8_t* lim = rec.data() + rec.size();
+
+    // FUN_00455500 timing path (+0x04 == -1): animFrame = trunc(acc).
+    // acc=+2.7 -> frame 2 (lround would give 3).
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.enemyIndex = 0xffff;
+      o.animAcc = 0.0f;
+      o.animFrame = 0;
+      mdk::objectAnimTickDt(o, lim, 0.09f);   // acc = 30*0.09 = 2.7
+      CHECK(o.animFrame == 2);
+      CHECK(near(o.animAcc, 2.7, 1e-6));
+    }
+    // Boundary-adjacent: acc = +0.5 -> trunc 0 (lround 1).
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.enemyIndex = 0xffff;
+      o.animAcc = 0.0f;
+      o.animFrame = 0;
+      o.animRate = 15.0f;
+      mdk::objectAnimTickDt(o, lim, 1.0f / 30.0f);  // acc = +0.5
+      CHECK(o.animFrame == 0);
+      CHECK(near(o.animAcc, 0.5, 1e-6));
+    }
+    // Negative fraction: trunc(-0.5) = 0 — the buggy lround(-0.5) = -1
+    // fed the frame<0 clamp, which also reset animAcc to 0.
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.enemyIndex = 0xffff;
+      o.animAcc = 0.0f;
+      o.animFrame = 0;
+      o.animRate = -15.0f;
+      mdk::objectAnimTickDt(o, lim, 1.0f / 30.0f);  // acc = -0.5
+      CHECK(o.animFrame == 0);
+      CHECK(near(o.animAcc, -0.5, 1e-6));
+    }
+    // Target clamp (0x4556e1): trunc(acc) >= latch. acc=2.7, latch=3 ->
+    // trunc=2 < 3: NO clamp, acc holds 2.7 (lround(2.7)=3 clamped to
+    // 3.0 and ran on to the frame-3 done latch).
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+      o.col.flags148 &= ~0x8u;
+      o.animLatch = 3;                        // fc-1 == 3
+      o.animRate = 37.0f;
+      mdk::objectAnimTickDt(o, lim, 0.1f);    // acc = -1 + 3.7 = 2.7
+      CHECK(near(o.animAcc, 2.7, 1e-6));      // unclamped
+      CHECK(o.animFrame == 2);                // trunc(2.7 - -1) = 3 steps
+      CHECK(o.animLatch == 3);                // no 0xff00 done latch
+    }
+    // Tail steps (0x45586d, acc < fc-1): trunc(acc - frame) — acc=2.6,
+    // frame=-1 -> trunc(3.6) = 3 steps (lround(acc)-frame gave 4).
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+      o.col.flags148 &= ~0x8u;
+      o.animRate = 36.0f;
+      mdk::objectAnimTickDt(o, lim, 0.1f);    // acc = -1 + 3.6 = 2.6
+      CHECK(o.animFrame == 2);
+      CHECK(near(o.animAcc, 2.6, 1e-6));
+    }
+    // Loop steps (0x455732): acc=3.5 >= fc-1=3, loop bit set ->
+    // trunc(3.5 - -1) = 4 steps -> frame 3 (lround gave 5 -> wraps to
+    // frame 0). acc < fc so the accumulator is NOT subtracted.
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+      o.col.flags148 |= 0x8u;                 // loop
+      o.animRate = 45.0f;
+      mdk::objectAnimTickDt(o, lim, 0.1f);    // acc = -1 + 4.5 = 3.5
+      CHECK(o.animFrame == 3);
+      CHECK(near(o.animAcc, 3.5, 1e-6));
+    }
+    // Loop wrap ordering: acc=4.5 >= fc=4 — steps are computed from
+    // the PRE-wrap accumulator (trunc(4.5 - -1) = 5 -> frame 0 after
+    // wrap), then acc -= fc -> 0.5.
+    {
+      mdk::DynamicArena da;
+      mdk::DynamicObject& o = animObject(da, rec);
+      o.model = makePlatformModel("MDL", "ELEM", 0.0f);
+      o.col.flags148 |= 0x8u;
+      o.animRate = 55.0f;
+      mdk::objectAnimTickDt(o, lim, 0.1f);    // acc = -1 + 5.5 = 4.5
+      CHECK(o.animFrame == 0);                // 5 steps: -1..3 then wrap
+      CHECK(near(o.animAcc, 0.5, 1e-6));
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

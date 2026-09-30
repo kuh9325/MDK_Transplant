@@ -275,7 +275,11 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
   // +0x04==-1 path does not run FUN_00455890.
   if (o.enemyIndex == 0xffff) {
     o.animAcc += o.animRate * dtSec;
-    o.animFrame = static_cast<std::int16_t>(lroundf(o.animAcc));
+    // FUN_00455500 @ 0x455522 (OBSERVED): FRNDINT with the x87 RC=11
+    // control word — truncation toward zero, then a fistp dword whose
+    // low 16 bits are stored (mod-2^16, not an int16 saturate).
+    o.animFrame = static_cast<std::int16_t>(
+        static_cast<std::int32_t>(std::trunc(o.animAcc)));
     ObjectAnimView av{reinterpret_cast<const std::uint8_t*>(o.animRec),
                       recLimit};
     const int fc =
@@ -332,23 +336,27 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
   // +0x118  ->  +0xdc = +0x118 (the accumulator caps AT the target;
   // OBSERVED >= at 0x4556e9).
   if (o.animLatch >= 0 && o.animFrame < o.animLatch &&
-      lroundf(o.animAcc) >= o.animLatch)
+      static_cast<int>(std::trunc(o.animAcc)) >= o.animLatch)
     o.animAcc = static_cast<float>(o.animLatch);
 
   const bool loop = (o.col.flags148 & 0x8u) != 0;   // +0x148 bit3
   int steps;
-  if (o.animAcc >= static_cast<float>(fc - 1)) {
-    if (loop) {
-      // OBSERVED order: steps from the PRE-wrap accumulator.
-      steps = static_cast<int>(lroundf(o.animAcc)) - o.animFrame;
-      if (o.animAcc >= static_cast<float>(fc))
-        o.animAcc -= static_cast<float>(fc);
-    } else {
-      o.animAcc = static_cast<float>(fc - 1);
-      steps = static_cast<int>(lroundf(o.animAcc)) - o.animFrame;
-    }
+  if (o.animAcc >= static_cast<float>(fc - 1) && loop) {
+    // OBSERVED order: steps from the PRE-wrap accumulator.
+    // 0x455732 — FILD +0xe4, FSUBR +0xdc, FRNDINT(RC=11): the x87
+    // difference is computed in extended precision then truncated
+    // toward zero (the prior lroundf rounded instead — off by one on
+    // fractions >= 0.5). The double subtract is exact for f32-i16.
+    steps = static_cast<int>(std::trunc(
+        static_cast<double>(o.animAcc) - o.animFrame));
+    if (o.animAcc >= static_cast<float>(fc))
+      o.animAcc -= static_cast<float>(fc);
   } else {
-    steps = static_cast<int>(lroundf(o.animAcc)) - o.animFrame;
+    if (o.animAcc >= static_cast<float>(fc - 1))
+      o.animAcc = static_cast<float>(fc - 1);   // 0x455858 (!loop clamp)
+    // 0x455861/0x45586d — the shared tail: same trunc(acc - frame).
+    steps = static_cast<int>(std::trunc(
+        static_cast<double>(o.animAcc) - o.animFrame));
   }
 
   objectAnimApply(o, anim, steps);
