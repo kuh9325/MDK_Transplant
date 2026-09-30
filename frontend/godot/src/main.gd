@@ -99,6 +99,7 @@ var fe_tex: ImageTexture = null
 # absent — the window then closes on the first tick).
 var fe_transition_ms := -1.0
 var fe_transition_total_ms := 0.0
+var fe_transition_acks := 0         # frontend_transition_complete calls
 var fe_stage_hold := 0         # intermission placeholder hold
 var fe_fx_counts := {}         # FrontendFx id -> count (diag/smoke)
 var fe_req_counts := {}        # request id -> count (diag/smoke)
@@ -4406,11 +4407,13 @@ func _fe_transition_input(input: Dictionary, dt_ms: float) -> Dictionary:
 		return input
 	if _fe_any_edge(input):
 		bridge.frontend_transition_complete()
+		fe_transition_acks += 1
 		fe_transition_ms = -1.0
 		return {}
 	fe_transition_ms += dt_ms
 	if fe_transition_ms >= fe_transition_total_ms:
 		bridge.frontend_transition_complete()
+		fe_transition_acks += 1
 		fe_transition_ms = -1.0
 	return {}
 
@@ -4531,6 +4534,98 @@ func _fe_smoke_step(input: Dictionary, n: int = 1) -> Dictionary:
 func _fe_press(field: String) -> Dictionary:
 	_fe_smoke_step({field: true}, 1)
 	return _fe_smoke_step({}, 1)
+
+
+# ---- Phase 18B.2B closeout helpers — deterministic frame folds ----
+
+# FNV-1a fold over the composed RGBA frame (600x360x4).
+func _ba_hash(b: PackedByteArray) -> int:
+	var h := -3750763034362895579   # 0xcbf29ce484222325
+	for i in range(0, b.size(), 253):
+		h = (h ^ int(b[i])) * 0x100000001b3
+	return h
+
+
+func _frame_hash(transition_ms: float = -1.0) -> int:
+	var fr: Dictionary = bridge.frontend_frame(transition_ms)
+	if fr.is_empty():
+		return 0
+	return _ba_hash(fr["rgba"])
+
+
+func _rect_hash(rgba: PackedByteArray, x0: int, y0: int,
+		w: int, h: int) -> int:
+	var hh := -3750763034362895579
+	for y in range(y0, y0 + h):
+		for x in range(x0, x0 + w):
+			var o := (y * 600 + x) * 4
+			hh = (hh ^ int(rgba[o])) * 0x100000001b3
+			hh = (hh ^ int(rgba[o + 1])) * 0x100000001b3
+			hh = (hh ^ int(rgba[o + 2])) * 0x100000001b3
+			hh = (hh ^ int(rgba[o + 3])) * 0x100000001b3
+	return hh
+
+
+# Per-row changed-pixel counts between two composed frames, bounded
+# to x < x_max (keeps the detail pane out of the bracket/row diff).
+func _row_diff_counts(a: PackedByteArray, b: PackedByteArray,
+		x_max: int) -> Array:
+	var counts := []
+	for r in 13:
+		counts.append(0)
+	for r in 13:
+		var y0 := 0x67 + r * 0x10
+		for y in range(y0 - 2, y0 + 14):
+			if y < 0 or y >= 360:
+				continue
+			for x in range(0, x_max):
+				var o := (y * 600 + x) * 4
+				if a[o] != b[o] or a[o + 1] != b[o + 1] or \
+						a[o + 2] != b[o + 2] or a[o + 3] != b[o + 3]:
+					counts[r] += 1
+					break
+	return counts
+
+
+# Leftmost pixel differing from bg inside [x_min, x_max) of a band —
+# used to read the row text origin off the composed frame.
+func _band_left_ink(rgba: PackedByteArray, y0: int, y1: int,
+		x_min: int, x_max: int, bg: PackedByteArray) -> int:
+	for x in range(x_min, x_max):
+		for y in range(y0, y1):
+			var o := (y * 600 + x) * 4
+			if rgba[o] != bg[0] or rgba[o + 1] != bg[1] or \
+					rgba[o + 2] != bg[2]:
+				return x
+	return -1
+
+
+func _px3(rgba: PackedByteArray, x: int, y: int) -> PackedByteArray:
+	var o := (y * 600 + x) * 4
+	return PackedByteArray([rgba[o], rgba[o + 1], rgba[o + 2]])
+
+
+# .FTI interior directory (fti_directory.h): image = file[4:]; u32
+# count @img+0, then N x {name[8], img-relative u32 offset}. Records
+# carry no stored size — the payload runs to the next offset.
+func _fti_record(fti: PackedByteArray, rec_name: String) -> PackedByteArray:
+	var n := fti.decode_u32(4)
+	for i in n:
+		var ro := 8 + i * 12
+		# Name compares match the original's zero-padded 8-byte query:
+		# ascii decode stops at the first NUL.
+		if fti.slice(ro, ro + 8).get_string_from_ascii() == rec_name:
+			return fti.slice(4 + fti.decode_u32(ro + 8))
+	return PackedByteArray()
+
+
+# The resident system palette head (64 RGB entries) — the merge's
+# source for preview pens < 64 (OBSERVED palette merge).
+func _sys_pal_head() -> PackedByteArray:
+	var fti := FileAccess.get_file_as_bytes(
+		data_root_path.path_join("MISC/MDKFONT.FTI"))
+	var rec := _fti_record(fti, "SYS_PAL")
+	return rec.slice(0, 192)
 
 
 func _run_smoke_frontend() -> void:
@@ -4779,6 +4874,415 @@ func _run_smoke_frontend() -> void:
 		data_root_path.path_join("SAVES/SMOKE1.SAV")),
 		"temp: no writes into the data root")
 
+	# ============================================================
+	# Phase 18B.2B closeout — runtime validation of the landed
+	# presentation seams. Every check composes through the real
+	# bridge path (no visual approximation).
+	# ============================================================
+
+	# --- V. attract: shell-owned idle entry -> real MDKS slides
+	#        -> corpus walk -> wrap to menu (FUN_0041dc90/0041ef74) --
+	# Normalize to a mode-0 root first — E's continue may have routed
+	# to mode 3/6; frontend_enter(false) is FUN_0041d85c(0) fresh.
+	bridge.frontend_enter(false)
+	snap = _fe_smoke_step({}, 2)
+	_check(int(bridge.get_mode()) == 0,
+		"V: frontend_enter returns to mode 0")
+	_check(int(snap.get("attract_state", -1)) == 0,
+		"V: fresh entry attract state 0")
+	var menu_hash := _frame_hash()
+	# The idle timer is shell-owned (DAT_0049aaa4 += frameStep) — the
+	# smoke input carries no attract field; 5s of empty frames fires
+	# state 0 -> 1 (OBSERVED 0x495a20 menu delay).
+	var vi := 0
+	while int(snap.get("attract_state", -1)) == 0 and vi < 200:
+		snap = _fe_smoke_step({}, 1)
+		vi += 1
+	_check(int(snap.get("attract_state", -1)) == 1,
+		"V: idle ~5s -> attract state 1 (shell timer, no GDScript timer)")
+	_check(bool(snap.get("attract_slide_active", false)),
+		"V: slide 1 live after idle entry")
+	_check(bool(snap.get("menu_strings_hidden", false)),
+		"V: menu strings hidden at state 1")
+	var dg1 := _frame_hash()
+	_check(dg1 != menu_hash, "V: state-1 frame is the slide, not menu")
+	# Corpus walk — each attract edge (DIK_RIGHT, 0x54b554) advances
+	# one slide; the probe-fail past the end wraps state > 1 to 0.
+	var slide_digests := {}
+	var wg := 0
+	var st := int(snap["attract_state"])
+	while st > 0 and wg < 24:
+		var dg := _frame_hash()
+		_check(dg != menu_hash,
+			"V: state %d composes a slide, not the menu" % st)
+		_check(not slide_digests.has(dg),
+			"V: state %d slide digest distinct" % st)
+		slide_digests[dg] = st
+		if st >= 2:
+			_check(not bool(snap.get("menu_strings_hidden", true)),
+				"V: strings overlay at state %d" % st)
+		snap = _fe_smoke_step({"attract": true}, 1)
+		st = int(snap.get("attract_state", -1))
+		wg += 1
+	_check(st == 0, "V: corpus end wraps attract to state 0")
+	_check(_frame_hash() == menu_hash,
+		"V: post-wrap frame is the plain menu (no slide residue)")
+	# Input mid-attract drives the menu underneath — the OBSERVED
+	# FUN_0041dc90 structure has no key-driven attract exit (0x49aa98
+	# is only written by the advance/wrap and the entry reset). The
+	# state-1 idle-reset quirk (0x4479c000 = 999.0f) auto-advances on
+	# the same frame the input lands.
+	snap = _fe_smoke_step({"attract": true}, 1)
+	_check(int(snap.get("attract_state", -1)) == 1,
+		"V: attract edge re-enters state 1")
+	var sel_before := int(snap.get("selection", -1))
+	snap = _fe_smoke_step({"next": true}, 1)
+	_check(int(snap.get("selection", -1)) != sel_before,
+		"V: input reaches the menu under attract (no exit)")
+	_check(int(snap.get("attract_state", -1)) == 2,
+		"V: state-1 999.0f idle quirk auto-advances on input")
+	snap = _fe_smoke_step({}, 1)
+	# Probe the whole corpus — the 600x360 gate per slide index.
+	var slide_n := 0
+	while slide_n < 24:
+		var pr: Dictionary = bridge.frontend_slide_probe(slide_n + 1)
+		if not bool(pr.get("exists", false)):
+			break
+		_check(int(pr.get("width", 0)) == 600 and
+			int(pr.get("height", 0)) == 360,
+			"V: MDKS_%03d passes the 600x360 gate" % (slide_n + 1))
+		slide_n += 1
+	_check(slide_n >= 2, "V: real MDKS corpus probed (%d)" % slide_n)
+	_check(slide_digests.size() == slide_n,
+		"V: every probed slide produced a distinct composed frame")
+	print("  V: slides probed=%d distinct=%d" % [
+		slide_n, slide_digests.size()])
+	# Walk out: advance past the corpus end again -> wrap to menu.
+	wg = 0
+	while int(snap.get("attract_state", -1)) > 0 and wg < 24:
+		snap = _fe_smoke_step({"attract": true}, 1)
+		wg += 1
+	_check(int(snap.get("attract_state", -1)) == 0,
+		"V: second walk wraps to menu")
+
+	# --- W. save-list geometry: OBSERVED rows/bracket/title -------
+	while int(snap.get("selection", -1)) != 2:
+		snap = _fe_press("next")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 1, "W: save list opens")
+	# Park the selection on row 0 for a deterministic diff.
+	var wsel := 0
+	while int(snap.get("save_list", {}).get("selection", -1)) != 0 \
+			and wsel < 20:
+		snap = _fe_press("prev")
+		wsel += 1
+	var lf0: Dictionary = bridge.frontend_frame()   # row 0 selected
+	snap = _fe_press("next")
+	_check(int(snap.get("save_list", {}).get("selection", -1)) == 1,
+		"W: next selects row 1")
+	var lf1: Dictionary = bridge.frontend_frame()   # row 1 selected
+	# The diff is the FUN_00414b28 bracket leaving row 0 and landing on
+	# row 1 — text is identical, so exactly the two adjacent 0x10
+	# bands change (the detail pane is excluded via x_max).
+	var rc := _row_diff_counts(lf0["rgba"], lf1["rgba"], 330)
+	var changed_rows := []
+	for r in 13:
+		if rc[r] > 0:
+			changed_rows.append(r)
+	_check(changed_rows == [0, 1],
+		"W: selection move diffs exactly rows 0+1 (step 0x10)")
+	# On the sel-1 frame row 0 is unselected — pure text ink, first
+	# column at the OBSERVED x=0x62 modulo glyph side-bearing.
+	var bg := _px3(lf1["rgba"], 590, 355)
+	var row0_left := _band_left_ink(
+		lf1["rgba"], 0x67 - 14, 0x67 + 4, 4, 330, bg)
+	_check(row0_left >= 94 and row0_left <= 112,
+		"W: row text starts at x~0x62 (got %d)" % row0_left)
+	# Title SVOPT1 centered at y=0x1f — centered ink, never at row x.
+	var title_ink := _band_left_ink(
+		lf1["rgba"], 0x1f, 0x1f + 30, 4, 596, bg)
+	_check(title_ink > 60 and title_ink < 400,
+		"W: SVOPT1 title band carries centered ink")
+	# Bracket blink cadence: the shared accumulator steps inside the
+	# flagged draw (fild/fadd/fistp in FUN_00414b28), bit 3 selects
+	# the phase — the bracket region alternates between exactly two
+	# phase frames at ~8 draws per phase.
+	snap = _fe_press("prev")   # selection back to row 0
+	var blink_hashes := []
+	for i in 20:
+		var bfr: Dictionary = bridge.frontend_frame()
+		# row-0 bracket box: x [96, end+2], y [89, 107]
+		blink_hashes.append(_rect_hash(bfr["rgba"], 90, 85, 160, 27))
+		_fe_smoke_step({}, 1)
+	var blink_set := {}
+	var toggles := 0
+	for i in 20:
+		blink_set[blink_hashes[i]] = true
+		if i > 0 and blink_hashes[i] != blink_hashes[i - 1]:
+			toggles += 1
+	_check(blink_set.size() == 2,
+		"W: bracket phase alternates between exactly 2 frames")
+	_check(toggles >= 2 and toggles <= 6,
+		"W: blink toggles on the ~8-draw accumulator cadence")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"W: Esc exits the save list")
+
+	# --- Y. THMB golden: traversal F2 arm -> capture -> write ->
+	#        byte-exact inspect -> list display ---------------------
+	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
+		"Y: traversal level loads")
+	_reset_audio()
+	_check(bridge.load_arena("HMO_1"), "Y: spawn arena bound")
+	_step_n({}, 2)
+	var hud0: Dictionary = bridge.get_hud_snapshot()
+	var hud_fb: PackedByteArray = hud0.get("fb", PackedByteArray())
+	_check(hud_fb.size() == 216000, "Y: indexed HUD frame present")
+	var pal0: PackedByteArray = bridge.get_active_palette()
+	_check(pal0.size() == 768, "Y: staged palette present")
+	var grab0 := int(fe_fx_counts.get(FE_FX_THUMB_GRAB, 0))
+	snap = _fe_smoke_step({"f2": true}, 1)
+	_check(int(snap.get("sub_mode", -1)) == 8,
+		"Y: F2 arms the save-name dialog in traversal")
+	_check(int(fe_fx_counts.get(FE_FX_THUMB_GRAB, 0)) == grab0 + 1,
+		"Y: SaveNameThumbnailGrab fired once at arm")
+	# Independent recomputation of FUN_00427e8c's sample formula over
+	# the same indexed frame the bridge captured.
+	var exp := PackedByteArray()
+	exp.resize(3648)
+	for i in 768:
+		exp[i] = pal0[i]
+	for r in 45:
+		for c in 64:
+			exp[768 + r * 64 + c] = hud_fb[r * 8 * 600 + 44 + c * 8]
+	for ch in "TST1":
+		_fe_smoke_step({"typed": ch.unicode_at(0)}, 1)
+	snap = _fe_smoke_step({"confirm": true}, 1)
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"Y: name commit closed the dialog")
+	var sav_abs2 := save_abs.path_join("TST1.SAV")
+	_check(FileAccess.file_exists(sav_abs2),
+		"Y: TST1.SAV written under the temp root")
+	# The stream (file+8) ciphers from offset 10 with the clear seed at
+	# stream 8..9: key = seed&0xff, byte ^= key, key += seed>>8.
+	var file_bytes := FileAccess.get_file_as_bytes(sav_abs2)
+	var fseed := int(file_bytes[16]) | (int(file_bytes[17]) << 8)
+	var fk := fseed & 0xff
+	var fdl := (fseed >> 8) & 0xff
+	var plain := PackedByteArray()
+	plain.resize(file_bytes.size() - 8)
+	for i in plain.size():
+		if i < 10:
+			plain[i] = file_bytes[8 + i]
+		else:
+			plain[i] = int(file_bytes[8 + i]) ^ fk
+			fk = (fk + fdl) & 0xff
+	# THMB packet at stream offset 10: 8B head + 3648B record.
+	_check(plain.slice(10, 14).get_string_from_ascii() == "THMB",
+		"Y: THMB packet tag in the written stream")
+	var file_thmb := plain.slice(18, 18 + 3648)
+	_check(file_thmb == exp,
+		"Y: captured THMB == bytes inside the written packet")
+	var ins: Dictionary = bridge.frontend_inspect_slot("TST1")
+	_check(bool(ins.get("found", false)) and
+		bool(ins.get("full_save", false)),
+		"Y: TST1 inspects as a full save")
+	_check(int(ins.get("thumbnail_size", 0)) == 3648,
+		"Y: inspection carries the 3648B THMB record")
+	var th: PackedByteArray = ins.get("thumbnail", PackedByteArray())
+	_check(th == exp,
+		"Y: inspected thumbnail == captured bytes")
+	var nz_px := 0
+	for i in range(768, 3648):
+		if int(th[i]) != 0:
+			nz_px += 1
+	_check(nz_px > 0, "Y: THMB pixel payload nonempty (%d)" % nz_px)
+	# Abort YES -> fresh frontend; select TST1; the detail pane must
+	# show the stored THMB at (0x1a2,0x67) expanded through the
+	# merged palette (pens >= 64 -> the record's own entries).
+	_fe_smoke_step({"f10": true}, 1)
+	snap = _fe_smoke_step({"key_y": true}, 1)
+	snap = _fe_smoke_step({}, 2)
+	_check(int(bridge.get_mode()) == 0,
+		"Y: abort YES returned to frontend mode")
+	while int(snap.get("selection", -1)) != 2:
+		snap = _fe_press("next")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 1,
+		"Y: save list reopens for TST1")
+	var gsel := 0
+	while String(snap.get("save_list", {}).get(
+			"selected", {}).get("name", "")) != "TST1" and gsel < 16:
+		snap = _fe_press("next")
+		gsel += 1
+	var sel_name := String(snap.get("save_list", {}).get(
+		"selected", {}).get("name", ""))
+	_check(sel_name == "TST1", "Y: TST1 row selectable")
+	var thfr: Dictionary = bridge.frontend_frame()
+	var trgba: PackedByteArray = thfr["rgba"]
+	# Byte-exact presentation compare over the full pen space: the
+	# OBSERVED merge sends pens < 64 through SYS_PAL's head and pens
+	# >= 64 through the record's own palette entries.
+	var spal := _sys_pal_head()
+	_check(spal.size() == 192, "Y: SYS_PAL head read for the merge")
+	var all_alpha := true
+	var ge64 := 0
+	var pal_ok := true
+	for r in 45:
+		for c in 64:
+			var o := ((0x67 + r) * 600 + (0x1a2 + c)) * 4
+			if int(trgba[o + 3]) != 255:
+				all_alpha = false
+			var v := int(th[768 + r * 64 + c])
+			var epal := th if v >= 64 else spal
+			if v >= 64:
+				ge64 += 1
+			if int(trgba[o]) != int(epal[v * 3]) or \
+					int(trgba[o + 1]) != int(epal[v * 3 + 1]) or \
+					int(trgba[o + 2]) != int(epal[v * 3 + 2]):
+				pal_ok = false
+	_check(all_alpha, "Y: THMB rect (0x1a2,0x67) fully drawn")
+	print("  Y: TST1 pen-space ge64=%d (HMO_1 spawn is dark)" % ge64)
+	_check(pal_ok,
+		"Y: presented pixels == saved THMB bytes via merged palette")
+	var thmb_rect := _rect_hash(trgba, 0x1a2, 0x67, 64, 45)
+	# Re-entering the list on a header-only row must swap the detail
+	# — the stale-detail cache was cleared on exit.
+	while String(snap.get("save_list", {}).get(
+			"selected", {}).get("name", "")) != "SMOKE1" and gsel < 32:
+		snap = _fe_press("prev")
+		gsel += 1
+	var sfr: Dictionary = bridge.frontend_frame()
+	_check(_rect_hash(sfr["rgba"], 0x1a2, 0x67, 64, 45) != thmb_rect,
+		"Y: header-only row drops the THMB detail (no stale cache)")
+	# The header-only detail is LOAD_<level>.LBB centered on x=0x1c2:
+	# corpus LBBs are 200x200 -> occupies (350,103)..(550,303).
+	var lbb_det := _rect_hash(sfr["rgba"], 350, 103, 200, 200)
+	var bg_zone := _rect_hash(sfr["rgba"], 560, 320, 30, 30)
+	_check(lbb_det != bg_zone,
+		"Y: LBB detail region carries decoded imagery")
+	snap = _fe_press("cancel")
+
+	# --- Z. transition: INTRO1A timeline, skip, swallow ------------
+	_check(bridge.frontend_transition_seconds() == 10.0,
+		"Z: INTRO1A decoded — 10s timeline live")
+	var acks0 := fe_transition_acks
+	bridge.frontend_enter(true)      # returning entry arms the window
+	snap = _fe_smoke_step({}, 1)     # drains TransitionArmed -> ms 0
+	_check(fe_transition_ms >= 0.0, "Z: transition window armed")
+	_check(bool(snap.get("suppress_esc_abort", false)),
+		"Z: Esc suppression held")
+	# Phase digests (FUN_0041e554): fade-in 0-1s, hold 1-4s, crossfade
+	# 4-6s, hold 6-9s, fade-out 9-10s. Holds are static; phases differ.
+	var d_in := _frame_hash(500.0)
+	var d_a1 := _frame_hash(2000.0)
+	var d_a2 := _frame_hash(3500.0)
+	var d_x := _frame_hash(5000.0)
+	var d_b1 := _frame_hash(7000.0)
+	var d_b2 := _frame_hash(8500.0)
+	var d_out := _frame_hash(9500.0)
+	_check(d_in != d_a1, "Z: fade-in mid != hold A")
+	_check(d_a1 == d_a2, "Z: hold A static across the window")
+	_check(d_x != d_a1 and d_x != d_b1,
+		"Z: crossfade mid distinct from both holds")
+	_check(d_b1 == d_b2, "Z: hold B static across the window")
+	_check(d_out != d_b1 and d_out != d_a1,
+		"Z: fade-out mid distinct from the holds")
+	_check(d_b1 != menu_hash or d_a1 != menu_hash,
+		"Z: transition still is INTRO1A, not the menu")
+	# Input contract: a held-level field is NOT an edge — it is
+	# swallowed while the transition owns the frame and neither skips
+	# nor reaches the menu pump (0x49aa7c routes the frame elsewhere).
+	sel_before = int(bridge.frontend_snapshot().get("selection", -1))
+	snap = _fe_smoke_step({"next": true}, 1)
+	_check(bool(snap.get("suppress_esc_abort", false)),
+		"Z: held-level input does not skip the transition")
+	_check(int(snap.get("selection", -1)) == sel_before,
+		"Z: swallowed input never reached the menu pump")
+	# A key edge skips AND is consumed — cancel would otherwise arm
+	# the abort console on this same frame.
+	snap = _fe_smoke_step({"cancel": true}, 1)
+	_check(fe_transition_ms < 0.0 and
+		not bool(snap.get("suppress_esc_abort", true)),
+		"Z: key edge completed the transition")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"Z: skip edge swallowed — no abort arm")
+	_check(fe_transition_acks == acks0 + 1,
+		"Z: frontend_transition_complete ran exactly once")
+	# Full timeline run: re-arm and let the clock finish it.
+	bridge.frontend_enter(true)
+	_fe_smoke_step({}, 1)
+	_check(fe_transition_ms >= 0.0, "Z: second window armed")
+	var tguard := 0
+	while fe_transition_ms >= 0.0 and tguard < 320:
+		snap = _fe_smoke_step({}, 1)
+		tguard += 1
+	_check(fe_transition_ms < 0.0, "Z: timeline ran to completion")
+	_check(tguard >= 280 and tguard <= 320,
+		"Z: ~10s playback (%d 33ms steps)" % tguard)
+	_check(fe_transition_acks == acks0 + 2,
+		"Z: natural completion acked exactly once more")
+	_check(not bool(snap.get("suppress_esc_abort", true)),
+		"Z: suppression cleared at completion")
+	# Post-clear the elapsed-ms argument is inert: suppression is
+	# gone, so ms=5000 can no longer route to the transition still —
+	# the result must match NONE of the captured phase digests. (An
+	# exact menu-hash compare would be flaky: the root selection
+	# bracket advances its blink phase inside each compose.)
+	var zlate := _frame_hash(5000.0)
+	_check(zlate != d_in and zlate != d_a1 and zlate != d_x and
+		zlate != d_b1 and zlate != d_out,
+		"Z: post-transition compose ignores the ms arg")
+
+	# --- X. bounded-resource cycles -------------------------------
+	# Repeated root->attract->list->root rounds must reproduce
+	# identical digests (decoded resources reuse, no growth). The
+	# attract edge runs at the root (it is inert inside sub-modes);
+	# confirm under attract dispatches through the menu per
+	# FUN_0041dc90 (no key exits attract — state clears on the
+	# list-exit re-entry).
+	var cyc_slides := []
+	var cyc_lists := []
+	var cyc_details := []
+	for i in 3:
+		bridge.frontend_enter(false)
+		_fe_smoke_step({}, 2)
+		snap = _fe_smoke_step({"attract": true}, 1)
+		_check(int(snap.get("attract_state", -1)) == 1,
+			"X: cycle %d attract state 1" % i)
+		cyc_slides.append(_frame_hash())
+		while int(snap.get("selection", -1)) != 2:
+			snap = _fe_press("next")
+		snap = _fe_press("confirm")
+		_check(int(snap.get("sub_mode", -1)) == 1,
+			"X: cycle %d list opened" % i)
+		var lf: Dictionary = bridge.frontend_frame()
+		# The selected row's bracket carries the blink phase (a
+		# 2-state alternator), so the whole-frame digest is bound to
+		# a 2-value set; the decoded detail region is phase-free and
+		# must be byte-identical every cycle.
+		cyc_lists.append(_ba_hash(lf["rgba"]))
+		cyc_details.append(_rect_hash(
+			lf["rgba"], 350, 103, 200, 200))
+		snap = _fe_press("cancel")
+	_check(cyc_slides[0] == cyc_slides[1] and
+		cyc_slides[1] == cyc_slides[2],
+		"X: attract slide compose identical across cycles")
+	var cyc_list_set := {}
+	for h in cyc_lists:
+		cyc_list_set[h] = true
+	_check(cyc_list_set.size() <= 2,
+		"X: save-list compose stable modulo the blink phase")
+	_check(cyc_details[0] == cyc_details[1] and
+		cyc_details[1] == cyc_details[2],
+		"X: LBB detail imagery identical across cycles")
+	# Presentation texture reuse — the single ImageTexture is updated
+	# in place, never re-allocated per frame.
+	_frontend_present()
+	var tex0 = fe_tex
+	_frontend_present()
+	_check(fe_tex == tex0, "X: fe_tex object reused across presents")
+
 	# fx coverage diagnostics — all bounded.
 	print("smoke: fe_fx=", fe_fx_counts, " fe_req=", fe_req_counts)
 	print("smoke(frontend): %d failure(s)" % failures)
@@ -4858,12 +5362,87 @@ func _run_smoke_real_saves() -> void:
 	var stems: Array = sl.get("stems", [])
 	_check(stems.has("1") and stems.has("2"),
 		"R: shell list carries stems 1 + 2")
+
+	# --- R2. real-save detail imagery through the live path -------
+	# Row 0 = "1" (full): the stored THMB record blits at
+	# (0x1a2,0x67); pens >= 64 expand through the record's own
+	# palette entries (the OBSERVED 64..255 merge).
+	var rsel := 0
+	while int(snap.get("save_list", {}).get("selection", -1)) != 0 \
+			and rsel < 8:
+		snap = _fe_press("prev")
+		rsel += 1
+	var sel_sum: Dictionary = snap.get("save_list", {}).get(
+		"selected", {})
+	_check(String(sel_sum.get("name", "")) == "1",
+		"R2: row 0 is the full save")
+	var r1fr: Dictionary = bridge.frontend_frame()
+	var r1rgba: PackedByteArray = r1fr["rgba"]
+	var th1: PackedByteArray = full.get("thumbnail", PackedByteArray())
+	_check(th1.size() == 3648, "R2: 1.SAV THMB bytes available")
+	# Full pen-space compare: <64 -> SYS_PAL head, >=64 -> the
+	# record's own palette entries (the OBSERVED merge).
+	var spal1 := _sys_pal_head()
+	var all_a := true
+	var ge64b := 0
+	var pal_ok1 := true
+	for r in 45:
+		for c in 64:
+			var o := ((0x67 + r) * 600 + (0x1a2 + c)) * 4
+			if int(r1rgba[o + 3]) != 255:
+				all_a = false
+			var v := int(th1[768 + r * 64 + c])
+			var epal := th1 if v >= 64 else spal1
+			if v >= 64:
+				ge64b += 1
+			if int(r1rgba[o]) != int(epal[v * 3]) or \
+					int(r1rgba[o + 1]) != int(epal[v * 3 + 1]) or \
+					int(r1rgba[o + 2]) != int(epal[v * 3 + 2]):
+				pal_ok1 = false
+	_check(all_a, "R2: 1.SAV THMB rect fully drawn")
+	_check(ge64b > 0,
+		"R2: preview pens reach the merged band (%d)" % ge64b)
+	_check(pal_ok1,
+		"R2: presented pixels == stored THMB bytes")
+	# Row 1 = "2" (header-only): levelId 1 -> LOAD_6.LBB (the
+	# 0x4999e8 table), centered at (0x1c2 - w/2, 0x67) = (350,103).
+	_check(int(hdr.get("level_id", -1)) == 1,
+		"R2: 2.SAV levelId==1 -> LOAD_6")
+	snap = _fe_press("next")
+	_check(int(snap.get("save_list", {}).get("selection", -1)) == 1,
+		"R2: row 1 selected")
+	var lbb_b := FileAccess.get_file_as_bytes(
+		data_root_path.path_join("MISC/LOAD_6.LBB"))
+	_check(lbb_b.size() == 40772, "R2: LOAD_6.LBB is 40772B")
+	var lw := int(lbb_b[768]) | (int(lbb_b[769]) << 8)
+	var lh := int(lbb_b[770]) | (int(lbb_b[771]) << 8)
+	_check(lw == 200 and lh == 200, "R2: LBB dims 200x200")
+	var lx0 := 0x1c2 - lw / 2
+	var r2rgba: PackedByteArray = bridge.frontend_frame()["rgba"]
+	var lbb_matched := 0
+	var lbb_ge64 := 0
+	for r in lh:
+		for c in lw:
+			var v := int(lbb_b[772 + r * lw + c])
+			var epal := lbb_b if v >= 64 else spal1
+			if v >= 64:
+				lbb_ge64 += 1
+			var o := ((0x67 + r) * 600 + (lx0 + c)) * 4
+			if int(r2rgba[o]) == int(epal[v * 3]) and \
+					int(r2rgba[o + 1]) == int(epal[v * 3 + 1]) and \
+					int(r2rgba[o + 2]) == int(epal[v * 3 + 2]):
+				lbb_matched += 1
+	_check(lbb_ge64 > 1000,
+		"R2: LBB image has pens in the merged band (%d)" % lbb_ge64)
+	_check(lbb_matched == lh * lw,
+		"R2: LBB pixels presented byte-exact through the merge")
 	snap = _fe_press("cancel")
 	_check(int(snap.get("sub_mode", -1)) == 0,
 		"R: Esc exits the list")
 
-	# Attract-slide probe — read-only MISC\MDKS_001.GIF head check
-	# (the slide renderer itself is the deferred 18B.2B seam).
+	# Attract-slide probe — read-only MISC\MDKS_001.GIF gate check.
+	# Full decode/compose coverage lives in the main frontend smoke
+	# (the V scenario walks the whole corpus).
 	var probe: Dictionary = bridge.frontend_slide_probe(1)
 	_check(bool(probe.get("exists", false)),
 		"R: MDKS_001 slide probe (600x360 gate)")

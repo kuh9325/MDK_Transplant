@@ -7241,3 +7241,72 @@ capture.
 
 **FRONTEND HOST / SAVE SERVICES: CLOSED FOR BUILD_A** (Godot menu
 presentation is Phase 18B.2 and NOT closed by this.)
+
+
+# Phase 18B.2B — Frontend Visual Fidelity (Presentation)
+
+## 239. Closeout validation (Godot runtime, canonical binary)
+
+The Phase 18B.2B seams committed earlier were pending Godot-runtime
+evidence (no binary on the prior machine). The headless smokes in
+`frontend/godot/src/main.gd` were extended — validation only, no
+production-path changes — and run under Godot
+`4.7.stable.official.5b4e0cb0f`:
+
+- **Attract (V):** idle 5s → state 1 over the shell's own timer (no
+  GDScript-side timer); the 10-file `MDKS_%03d.GIF` corpus all passes
+  the 600x360 gate, every state composes a distinct slide frame,
+  strings hide only at state 1, and the corpus end wraps state >1 to
+  0 restoring the plain menu. Input mid-attract reaches the menu
+  underneath (no key-driven exit — `DAT_0049aa98` is written only by
+  the advance/wrap and entry-reset paths), and the state-1
+  `999.0f` idle-reset quirk auto-advances to state 2 same-frame.
+- **Save list (W):** selection move diffs exactly the two adjacent
+  0x10 row bands; row text origin x~0x62; SVOPT1 centered at y=0x1f;
+  bracket blink alternates between exactly two phase frames on the
+  ~8-draw accumulator cadence (steps inside the flagged draw only).
+- **THMB golden (Y):** traversal F2 arms once →
+  `SaveNameThumbnailGrab` fires exactly once → the staged 3648-byte
+  record equals an independent recompute of the FUN_00427e8c sample
+  formula over `rt_->hud.fb` (`fb[(r*8)*600 + 44 + c*8]` + staged
+  palette) → `TST1.SAV` written → the ciphered stream decodes to a
+  `THMB` packet whose record is byte-identical to the capture →
+  re-inspection returns the same 3648 bytes → the save list draws
+  them at (0x1a2,0x67) byte-exact through the OBSERVED palette merge
+  (pens <64 → `SYS_PAL` head, >=64 → the record's own entries).
+  Selecting a header-only row afterward drops the THMB (no stale
+  detail cache) and shows `LOAD_*.LBB` imagery.
+- **Real corpus (R2, read-only):** `1.SAV` (full, modeField=1003)
+  presents its stored THMB byte-exact over all pens (776 pens >=64
+  exercise the merged band); `2.SAV` (header-only, levelId=1) maps
+  through the `0x4999e8` table to `LOAD_6.LBB` (40772 B, 200x200)
+  and the drawn region is byte-exact against the LBB bytes for all
+  40000 pixels (24924 pens >=64). SAVES dir fingerprint unchanged.
+- **Transition (Z):** `OPTIONS.BNI` record `INTRO1A` decodes to a
+  10s timeline; phase digests confirm fade-in/hold/crossfade/hold/
+  fade-out (1s+3s+2s+3s+1s) with static holds and distinct blend
+  frames; held-level input neither skips nor reaches the menu pump;
+  a key edge skips AND is swallowed (no same-frame abort arm);
+  `frontend_transition_complete` runs exactly once on both skip and
+  natural completion (~301 x 33ms steps); Esc suppression clears;
+  the elapsed-ms compose arg is inert afterward (no stale layer).
+- **Resource cycles (X):** three root→attract→list→root rounds
+  reproduce identical slide digests, identical LBB detail digests,
+  and save-list digests bounded to the two blink phases; the single
+  `fe_tex` ImageTexture object is reused across all presents.
+
+Headless (`--rendering-driver dummy`) smoke: `smoke(frontend): 0
+failure(s)`, `smoke(real-saves): 0 failure(s)`. Metal windowed run
+(Forward+, Apple M4) exits clean with the root menu compositing the
+real indexed frame. `pytest tests/` 27 passed / 0 skipped.
+`mdk_tests` 6280/0, `mdk_frontend_tests` 77/0, CTest 1/1; traversal
+L3–L8 and freefall c0–c4 digests all EXACT, diag=0.
+
+**ATTRACT GIF: CLOSED**
+**THMB CAPTURE/DISPLAY: CLOSED**
+**HEADER-ONLY LBB DISPLAY: CLOSED**
+**FRONTEND TRANSITION: CLOSED**
+**FRONTEND MUSIC: DEFERRED** (start/ambience fx remain counted-only
+seams; intentionally not started)
+
+**FRONTEND NON-AUDIO PRESENTATION: CLOSED FOR BUILD_A**
