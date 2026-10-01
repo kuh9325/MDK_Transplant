@@ -179,6 +179,9 @@ struct StreamSnapshot {
 // --- the runtime ------------------------------------------------------------
 class StreamScene {
 public:
+  StreamScene();                 // pool wipe + freelist link (the FUN_0042b270
+                                 // head — 0x4f0740 memset + 0x540ed0 chain)
+
   // Init (FUN_0042b270). course = 0x541498 (>=4 -> final), skill =
   // 0x54147a (0/1/2 — counter seeds + drain formula), rng = the mode's
   // rand state (FUN_0047d2b5 seed stream — same as enemyRandNext).
@@ -204,6 +207,9 @@ public:
   // Test hooks (private-state access without friendship).
   const DynamicObject& objectAt(int i) const { return pool_[i]; }
   int bucketHead(int b) const;                 // pool index or -1
+  int poolFreeCount() const;                   // freelist_ chain length
+  int poolBucketCount(int b) const;            // buckets_[b] chain length
+  int poolLinkIndex(const DynamicObject& o) const;  // +0x00 target | -1
   const float* nodeMat(int seg) const { return nodeMat_[seg & 0x1f]; }
   const float* ringPts(int seg) const { return ringPts_[seg & 0x1f]; }
   const float* planeSet(int seg) const { return planes_[seg & 0x1f]; }
@@ -238,6 +244,7 @@ private:
   DynamicObject* spawnDebris(float t, const void* vecHdr,
                              float speed);      // c578
   DynamicObject* spawnMarker(float t);          // c6f0
+  void poolReset();                             // b270 head — wipe + link
   void tunnelExtend();                          // be4c
   void heroUpdate(float dt);                    // d24c
   void genericUpdate(DynamicObject& o, float dt);   // cf6c
@@ -296,6 +303,13 @@ private:
   DynamicObject* freelist_ = nullptr;
   std::uint32_t rng_ = 1;
   std::vector<StreamEvent> events_;
+  // Diagnostic seams. poolErrorCalls_ counts the FUN_00408eb0 reports
+  // ("No Aliens available in stream!" / "Alien not in list to be
+  // freed") — the original prints+aborts; the port counts and returns.
+  // quit_ records the alloc-failure DAT_0054148e = 1 write (the host
+  // wires it to the mode dispatcher when the frame loop lands).
+  int poolErrorCalls_ = 0;                      // FUN_00408eb0 seam
+  bool quit_ = false;                           // DAT_0054148e
   bool exited_ = false;
   bool tornDown_ = false;
   int frameTick_ = 0;                           // +0x11c stamp source

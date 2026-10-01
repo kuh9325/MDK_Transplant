@@ -25441,6 +25441,340 @@ void test_stream_camera() {
   }
 }
 
+// Phase 19A.1B — the cinematic object pool / lifecycle / buckets.
+// FUN_0042b270 head (wipe+link), FUN_0042bdc4 alloc, FUN_0042c7b4 reap,
+// FUN_0042da40 migrate, and the spawn helpers FUN_0042c578 / c6f0.
+void test_stream_pool() {
+  using mdk::DynamicObject;
+  using mdk::StreamScene;
+
+  // --- initial state: 400-record freelist, empty buckets --------------
+  {
+    StreamScene s;
+    CHECK(s.freelist_ == &s.pool_[0]);
+    CHECK(s.poolFreeCount() == mdk::kStreamPoolSize);
+    for (int b = 0; b < mdk::kStreamSegs; ++b) {
+      CHECK(s.buckets_[b] == nullptr);
+      CHECK(s.poolBucketCount(b) == 0);
+      CHECK(s.bucketHead(b) == -1);
+    }
+    // Forward chain (OBSERVED b270 loop): record i -> i+1, tail -> 0.
+    for (int i = 0; i + 1 < mdk::kStreamPoolSize; ++i)
+      CHECK(s.poolLinkIndex(s.pool_[i]) == i + 1);
+    CHECK(s.poolLinkIndex(s.pool_[mdk::kStreamPoolSize - 1]) == -1);
+    // Records start inactive (memset-equivalent state).
+    for (int i = 0; i < mdk::kStreamPoolSize; ++i) {
+      const DynamicObject& o = s.pool_[i];
+      if (o.col.named || o.col.elements != nullptr ||
+          o.col.model != nullptr || o.enemyIndex != 0 ||
+          o.zBias != 0.0f || o.health != 0)
+        CHECK(false);
+    }
+  }
+
+  // --- alloc: pop order, field writes, head-insert --------------------
+  {
+    StreamScene s;
+    for (int i = 0; i < 32; ++i) {
+      s.nodeMat_[i][3] = float(2 * i);
+      s.nodeMat_[i][7] = float(i * i);
+      s.nodeMat_[i][11] = float(-i);
+    }
+    DynamicObject* a = s.alloc(5, 1.5f);
+    CHECK(a == &s.pool_[0]);             // freelist pop order = index order
+    CHECK(a->enemyIndex == 5);           // +0x04 bucket tag
+    CHECK(a->zBias == 1.5f);             // +0x5c path/time value
+    // pathPos(1.5): lerp node1->node2 at frac .5 = (3, 2.5, -1.5)
+    CHECK(near(a->pos[0], 3.0) && near(a->pos[1], 2.5) &&
+          near(a->pos[2], -1.5));
+    CHECK(a->col.baseZ == a->pos[2]);    // +0x18 mirror
+    CHECK(s.bucketHead(5) == 0);         // head-inserted
+    CHECK(s.freelist_ == &s.pool_[1]);
+    CHECK(s.poolFreeCount() == 399);
+
+    DynamicObject* b = s.alloc(5, 2.0f); // same bucket -> new head
+    CHECK(b == &s.pool_[1]);
+    CHECK(s.bucketHead(5) == 1);
+    CHECK(s.poolLinkIndex(*b) == 0);     // b -> a (LIFO order)
+    CHECK(s.poolLinkIndex(*a) == -1);    // a is tail
+
+    // Bucket arg masks for BOTH the array index and the +0x04 tag.
+    DynamicObject* c = s.alloc(0x2a, 0.0f);  // 0x2a & 0x1f = 10
+    CHECK(c == &s.pool_[2]);
+    CHECK(c->enemyIndex == 10);
+    CHECK(s.bucketHead(10) == 2);
+    CHECK(s.poolBucketCount(10) == 1 && s.poolBucketCount(5) == 2);
+    CHECK(s.poolFreeCount() == 397);
+  }
+
+  // --- exhaustion: 400 live, 401st fails clean ------------------------
+  {
+    StreamScene s;
+    DynamicObject* seen[mdk::kStreamPoolSize];
+    for (int i = 0; i < mdk::kStreamPoolSize; ++i) {
+      seen[i] = s.alloc(i, float(i) * 0.25f);
+      CHECK(seen[i] == &s.pool_[i]);
+      CHECK(seen[i]->enemyIndex == (i & 0x1f));
+      CHECK(near(seen[i]->zBias, i * 0.25));
+    }
+    CHECK(s.poolFreeCount() == 0);
+    CHECK(s.freelist_ == nullptr);
+    s.pool_[7].scriptClass = "sentinel";        // live record content
+    DynamicObject* fail = s.alloc(0, 0.0f);     // 401st — no overwrite
+    CHECK(fail == nullptr);
+    CHECK(s.poolErrorCalls_ == 1);              // FUN_00408eb0 counted
+    CHECK(s.quit_ == true);                     // DAT_0054148e = 1
+    CHECK(s.pool_[7].scriptClass == "sentinel");
+    // All 400 records reachable through the 32 bucket chains — no
+    // hidden growth, no phantom records.
+    int total = 0;
+    for (int b = 0; b < mdk::kStreamSegs; ++b)
+      total += s.poolBucketCount(b);
+    CHECK(total == mdk::kStreamPoolSize);
+  }
+
+  // --- reap: unlink head/middle/tail, empty-bucket miss, LIFO reuse ---
+  {
+    StreamScene s;
+    DynamicObject* a = s.alloc(3, 0.0f);   // pool0
+    DynamicObject* b = s.alloc(3, 0.0f);   // pool1
+    DynamicObject* c = s.alloc(3, 0.0f);   // pool2 — head: c,b,a
+    CHECK(s.bucketHead(3) == 2);
+    CHECK(s.poolLinkIndex(*c) == 1 && s.poolLinkIndex(*b) == 0);
+    CHECK(s.poolLinkIndex(*a) == -1);
+
+    s.reap(*b);                            // unlink middle
+    CHECK(s.bucketHead(3) == 2);
+    CHECK(s.poolLinkIndex(*c) == 0);
+    CHECK(s.freelist_ == b);               // reap pushes freelist head
+    CHECK(s.poolLinkIndex(*b) == 3);       // b.next = old free head
+    CHECK(s.poolFreeCount() == 398);
+
+    s.reap(*a);                            // unlink tail
+    CHECK(s.bucketHead(3) == 2);
+    CHECK(s.poolLinkIndex(*c) == -1);      // c now tail
+    CHECK(s.freelist_ == a);
+    CHECK(s.poolLinkIndex(*a) == 1);       // a.next = b (old free head)
+
+    // Not-in-list reap while the bucket still holds a record — walks
+    // the c-only chain to the end, reports, touches nothing.
+    DynamicObject stray;
+    stray.enemyIndex = 3;
+    int errs = s.poolErrorCalls_;
+    s.reap(stray);
+    CHECK(s.poolErrorCalls_ == errs + 1);
+    CHECK(s.bucketHead(3) == 2);           // c still linked
+
+    s.reap(*c);                            // unlink head -> empty bucket
+    CHECK(s.bucketHead(3) == -1);
+    CHECK(s.poolBucketCount(3) == 0);
+    CHECK(s.freelist_ == c);
+
+    // Stray on an EMPTY bucket hits the same error path.
+    errs = s.poolErrorCalls_;
+    s.reap(stray);
+    CHECK(s.poolErrorCalls_ == errs + 1);
+
+    // LIFO reuse: next alloc pops the last reaped record.
+    DynamicObject* d = s.alloc(9, 0.0f);
+    CHECK(d == c);
+    CHECK(d->enemyIndex == 9);
+    CHECK(s.bucketHead(9) == 2);
+    CHECK(s.poolLinkIndex(*d) == -1);      // no stale bucket link
+    CHECK(s.freelist_ == a);               // a is the new free head
+  }
+
+  // --- reuse reset: owning members + reap's +0x0c model gate ----------
+  {
+    StreamScene s;
+    DynamicObject* o = s.alloc(4, 1.0f);
+    const int idx = s.objIndex(o);
+    // Dirty every field family reap leaves in place (OBSERVED: reap
+    // does not wipe the body — the next alloc's reset does).
+    o->scriptClass = "XENEMY";
+    o->animSoundName = "BOOM.WAV";
+    o->elemHp = {1, 2, 3, 4};
+    o->elemThresh = {9, 9};
+    o->health = 55;
+    o->field34 = 7.5f;
+    o->col.xform[0] = 42.0f;
+    // Arm the +0x0c gate: a bound model record view.
+    o->model.flag = 0xdead;
+    o->elemSet.count = 2;
+    o->col.elements = &o->elemSet;
+    o->col.model = &o->model;
+    s.reap(*o);
+    // Gate taken: the model record is released and +0x0c cleared.
+    CHECK(o->col.elements == nullptr);
+    CHECK(o->model.flag == 0 && o->model.elems.empty());
+    CHECK(o->elemSet.count == 0);
+    // Body fields survive reap (stale until the alloc wipe).
+    CHECK(o->scriptClass == "XENEMY");
+    CHECK(o->health == 55);
+    // Re-alloc pops the same record, fully reset.
+    DynamicObject* r = s.alloc(2, 3.0f);
+    CHECK(r == o);
+    CHECK(r->scriptClass.empty());
+    CHECK(r->animSoundName.empty());
+    CHECK(r->elemHp.empty() && r->elemThresh.empty());
+    CHECK(r->health == 0 && r->field34 == 0.0f);
+    CHECK(r->col.xform[0] == 0.0f);
+    CHECK(r->col.elements == nullptr && r->col.model == nullptr);
+    CHECK(r->enemyIndex == 2 && r->zBias == 3.0f);
+    CHECK(s.bucketHead(2) == idx);
+
+    // +0x0c == 0 reap: the release path is skipped entirely.
+    DynamicObject* e = s.alloc(0, 0.0f);
+    e->model.flag = 7;             // stray model bytes, no +0x0c view
+    const int errs = s.poolErrorCalls_;
+    s.reap(*e);
+    CHECK(s.poolErrorCalls_ == errs);   // no error
+    CHECK(e->model.flag == 7);          // release skipped by the gate
+    CHECK(s.freelist_ == e);
+  }
+
+  // --- migrate: [winLo, winHi) gate, unlink/relink, tag rewrite -------
+  {
+    StreamScene s;
+    s.winLo_ = 10;
+    s.winHi_ = 20;
+    DynamicObject* a = s.alloc(5, 0.0f);
+    DynamicObject* b = s.alloc(5, 0.0f);   // b heads bucket 5
+    DynamicObject* cx = s.alloc(11, 0.0f); // bystander elsewhere
+
+    // Outside the window: no touch at all.
+    CHECK(!s.migrate(*a, 9));              // below winLo
+    CHECK(!s.migrate(*a, 20));             // exactly winHi
+    CHECK(a->enemyIndex == 5);
+    CHECK(s.bucketHead(5) == 1 && s.poolBucketCount(5) == 2);
+
+    // Inside, different bucket: unlink from 5, head-insert into 10.
+    CHECK(s.migrate(*a, 10));
+    CHECK(a->enemyIndex == 10);
+    CHECK(s.bucketHead(10) == 0);          // a heads bucket 10
+    CHECK(s.poolBucketCount(5) == 1);
+    CHECK(s.bucketHead(5) == 1);           // b survives as bucket-5 sole
+    CHECK(s.poolLinkIndex(*b) == -1);
+    CHECK(s.poolLinkIndex(*a) == -1);      // a alone in bucket 10
+
+    // Boundaries: winLo accepted, winHi-1 accepted, winHi rejected.
+    DynamicObject* e = s.alloc(3, 0.0f);
+    CHECK(s.migrate(*e, 10));              // == winLo
+    CHECK(e->enemyIndex == 10);
+    CHECK(s.bucketHead(10) == 3);          // e head-inserted over a
+    CHECK(s.poolLinkIndex(*e) == 0);       // e -> a
+    CHECK(s.migrate(*e, 19));              // winHi - 1
+    CHECK(e->enemyIndex == 19);
+    CHECK(s.bucketHead(19) == 3);
+    CHECK(s.poolBucketCount(10) == 1);     // a back alone
+    CHECK(!s.migrate(*e, 20));             // winHi — still rejected
+    CHECK(e->enemyIndex == 19);
+
+    // Same masked bucket -> success, list untouched (the native
+    // compares target&0x1f against the stored tag and returns 1
+    // without relinking — the window gate still runs first, so a
+    // same-bucket target must be inside [winLo, winHi) to reach it).
+    CHECK(s.migrate(*a, 10));              // a's tag is already 10
+    CHECK(a->enemyIndex == 10);
+    CHECK(s.bucketHead(10) == 0);
+    CHECK(s.poolLinkIndex(*a) == -1);
+
+    // Deterministic multi-object order in the destination bucket.
+    DynamicObject* f = s.alloc(0, 0.0f);
+    CHECK(s.migrate(*f, 19));              // joins e in bucket 19
+    CHECK(s.bucketHead(19) == s.objIndex(f));
+    CHECK(s.poolLinkIndex(*f) == s.objIndex(e));  // f -> e (insert order)
+    CHECK(s.poolLinkIndex(*e) == -1);
+    // Migrate a MID-chain record (e under f) — predecessor unlink.
+    CHECK(s.migrate(*e, 15));
+    CHECK(e->enemyIndex == 15);
+    CHECK(s.bucketHead(15) == 3);
+    CHECK(s.poolLinkIndex(*f) == -1);      // f tail of bucket 19
+    (void)cx;
+  }
+
+  // --- lifecycle helpers: spawnDebris (c578) / spawnMarker (c6f0) -----
+  {
+    StreamScene s;
+    s.assets_.lightTag = 77;
+    s.assets_.planetTag[0] = 55;
+    for (int i = 0; i < 32; ++i) {         // identity node matrices
+      s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    }
+
+    // vecHdr path: v copied into +0x1c/+0x20/+0x24, then +0x20 is
+    // overwritten by frac(t)*10 — the composed local t = {x, frac*10,z}.
+    const float v[3] = {1.5f, 9.0f, -2.5f};
+    DynamicObject* d = s.spawnDebris(3.5f, v, 0.0f);
+    CHECK(d != nullptr);
+    CHECK(d->enemyIndex == 3);             // trunc(3.5)
+    CHECK(d->zBias == 3.5f);
+    CHECK(d->col.elements == nullptr);     // +0x0c = 0 (sprite)
+    CHECK(d->field1c[0] == 1.5f && d->field1c[2] == -2.5f);
+    CHECK(d->field1c[1] == 5.0f);          // frac .5 * 10
+    // identity nodeMat o {I | local} -> xform I, origin = local t.
+    CHECK(d->col.xform[0] == 1.0f && d->col.xform[4] == 1.0f &&
+          d->col.xform[8] == 1.0f);
+    CHECK(d->col.origin[0] == 1.5f && d->col.origin[1] == 5.0f &&
+          d->col.origin[2] == -2.5f);
+    // One rand consumed for +0x58; speed==0 consumes none for +0x34.
+    std::uint32_t mirror = 1;
+    const double rScale = mdk::enemyRandNext(mirror);
+    CHECK(d->col.scale == float(rScale * 0x1p-13 + 4.0));
+    CHECK(d->field34 == 0.0f);
+    CHECK(reinterpret_cast<std::intptr_t>(d->field108) == 77);
+
+    // Null vecHdr: two rands draw +0x1c/+0x24 before the scale rand;
+    // speed > 0 draws a fourth for +0x34 = rand*2^-13 + speed.
+    DynamicObject* d2 = s.spawnDebris(4.0f, nullptr, 10.0f);
+    const std::int32_t rx = std::int32_t(mdk::enemyRandNext(mirror));
+    const std::int32_t rz = std::int32_t(mdk::enemyRandNext(mirror));
+    const double rS2 = mdk::enemyRandNext(mirror);
+    const double rV2 = mdk::enemyRandNext(mirror);
+    CHECK(d2->field1c[0] == float((rx - 0x4000) * 0x1p-12));
+    CHECK(d2->field1c[2] == float((rz - 0x4000) * 0x1p-12));
+    CHECK(d2->field1c[1] == 0.0f);         // frac(4.0)*10
+    CHECK(d2->col.scale == float(rS2 * 0x1p-13 + 4.0));
+    CHECK(d2->field34 == float(rV2 * 0x1p-13 + 10.0));
+
+    // speed < 0 -> +0x34 = speed - rand*2^-13.
+    DynamicObject* d3 = s.spawnDebris(5.0f, nullptr, -10.0f);
+    (void)mdk::enemyRandNext(mirror);      // +0x1c rand
+    (void)mdk::enemyRandNext(mirror);      // +0x24 rand
+    (void)mdk::enemyRandNext(mirror);      // +0x58 rand
+    const double rV3 = mdk::enemyRandNext(mirror);
+    CHECK(d3->field34 == float(-10.0 - rV3 * 0x1p-13));
+
+    // spawnMarker — static speed/scale, same compose shape.
+    DynamicObject* mk = s.spawnMarker(7.25f);
+    CHECK(mk != nullptr);
+    CHECK(mk->enemyIndex == 7);
+    CHECK(mk->zBias == 7.25f);
+    CHECK(mk->col.elements == nullptr);
+    CHECK(mk->field1c[0] == 0.0f && mk->field1c[2] == 0.0f);
+    CHECK(mk->field1c[1] == 2.5f);         // frac .25 * 10
+    CHECK(mk->col.origin[0] == 0.0f && mk->col.origin[1] == 2.5f &&
+          mk->col.origin[2] == 0.0f);
+    CHECK(mk->col.scale == std::bit_cast<float>(0x42100000u));  // 36.0f
+    CHECK(mk->field34 == 0.0f);
+    CHECK(reinterpret_cast<std::intptr_t>(mk->field108) == 55);
+  }
+
+  // --- poolReset re-arms the native init head --------------------------
+  {
+    StreamScene s;
+    s.alloc(0, 0.0f);
+    s.alloc(1, 0.0f);
+    s.poolReset();
+    CHECK(s.poolFreeCount() == mdk::kStreamPoolSize);
+    CHECK(s.freelist_ == &s.pool_[0]);
+    for (int b = 0; b < mdk::kStreamSegs; ++b)
+      CHECK(s.bucketHead(b) == -1);
+    CHECK(s.poolLinkIndex(s.pool_[0]) == 1);
+    CHECK(s.poolLinkIndex(s.pool_[mdk::kStreamPoolSize - 1]) == -1);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -25540,6 +25874,7 @@ int main() {
   test_frontend_transition();
   test_stream_math();
   test_stream_camera();
+  test_stream_pool();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
