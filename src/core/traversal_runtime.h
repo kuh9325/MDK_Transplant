@@ -61,7 +61,9 @@
 //   FUN_00404cd4 arena event/timer list (script-created, empty)
 //   FUN_00436d60 world tick (particles/HUD/event machinery)
 //   FUN_0046603c slide helper, FUN_0046a5b8 mantle,
-//   FUN_0046ae60 timers, FUN_00432f84 object prepass,
+//   FUN_0046ae60 projector select (0x49bbe8 install; counted at its
+//   call site — the mode-0 body is inlined in projectPlayerPoint),
+//   FUN_00432f84 object prepass,
 //   FUN_00430bf8 camera obstruction (5K — call site proven,
 //   gated 0x49b710 && |0x540d58|==0, may move player AND camera),
 //   0x540cdc teleport block, 0x540ebc pending view snap.
@@ -226,7 +228,10 @@ struct TraversalSeams {
   int arenaEventListCalls = 0;  // FUN_00404cd4 (+0x5c list, empty)
   int slideHelperCalls = 0;     // FUN_0046603c (slope-assist vec)
   int mantleCalls = 0;          // FUN_0046a5b8 (forwardIntent gate)
-  int timersCalls = 0;          // FUN_0046ae60
+  int timersCalls = 0;          // FUN_0046ae60 — the 0x49bbe8
+                                // projector install (misnamed
+                                // "timers" historically; field kept
+                                // for diagnostic compatibility)
   int worldTickCalls = 0;       // FUN_00436d60
   int extraWorldTickCalls = 0;  // FUN_0042b20c + FUN_00436d60(-1)
   int profilerHooks = 0;        // FUN_0042fecc rdtsc probe sites

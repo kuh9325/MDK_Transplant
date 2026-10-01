@@ -276,16 +276,20 @@ struct StreamSnapshot {
                                     // i32 t5} (t4 = the fade delta)
   std::uint32_t limiterBase = 0;    // 0x49b700 — ms window base
   std::uint32_t limiterTarget = 0;  // 0x49b704 — ms window target
+  // Phase 19A.2H0 — the 0x49bbe8 install contents (diagnostic only,
+  // not hashed): the FUN_0046ae60-selected projector variant.
+  std::int32_t projectorSel = 0;    // 0 = 46ad20 .. 4 = 46ae1c
 };
 
 // --- frame-stage counters -----------------------------------------------------
 // FUN_0042c8b0 (the native frame) dispatches per-object updaters and a
 // render pipeline. Implemented stages (the updater family, the
 // FUN_004555bc animator family, the TELETYPE queue service, the
-// Phase 19A.2F draw stage) count their dispatch reach; the remaining
-// host-side stages (listener, paletteRamp, resourceBind/Free) are
-// counted seams whose bodies only bump the counter — later phases
-// fill those in.
+// Phase 19A.2F draw stage, the 19A.2G ribbon engine, the limiter
+// state machine and the ae60 projector install) count their dispatch
+// reach; the remaining host-side stages (listener, paletteRamp,
+// resourceBind/Free) are counted seams whose bodies only bump the
+// counter — Phase 19B presentation fills those in.
 struct StreamSeams {
   int heroUpdate = 0;     // FUN_0042d24c — owns winLo++/tunnelExtend feed
   int genericUpdate = 0;  // FUN_0042cf6c — +0x34 swim (no anim call —
@@ -337,7 +341,9 @@ struct StreamSeams {
   int hudBlit = 0;        // FUN_004185fc calls — HUD icon + digits
   int listener = 0;       // FUN_004026f8 — audio listener xform update
   int limiter = 0;        // FUN_0042fb68 (frame) + 42fb30 (init) calls
-  int fillSelect = 0;     // FUN_0046ae60 — scanline filler mode select
+  int fillSelect = 0;     // FUN_0046ae60 — the 0x49bbe8 projector
+                          // install (EAX selects the variant; both
+                          // mode-5 sites pass 0 -> FUN_0046ad20)
   int paletteRamp = 0;    // init's 64-step DAC crossfade loop
   int resourceBind = 0;   // init MTI/BNI/HUD-table binds (host-side)
   int resourceFree = 0;   // teardown MTI/BNI/HUD-table frees
@@ -534,6 +540,8 @@ private:
                                                 // {x',y',z',sx,sy,flags}
                                                 // — point x camProj_ +
                                                 // clip flags + fill fn
+  void fillSelect(int mode);                    // FUN_0046ae60 — the
+                                                // 0x49bbe8 install
   void backdropScroll();                        // e684
   void emitDrawList();                          // e100 — records + flush
   // The 32x FUN_0042e620 band for slot `seg` — a = the higher slot's
@@ -681,6 +689,11 @@ private:
                                                 // the established harness
                                                 // contract arms it.
   std::int32_t hudBlink_ = 0;                   // 0x49a8dc
+  // The 0x49bbe8 projector slot — FUN_0046ae60's write target, modeled
+  // as the installed variant index: 0 = FUN_0046ad20 (full view),
+  // 1..4 = FUN_0046ad58/9c/e0/46ae1c (sub-window variants). Both
+  // mode-5 ae60 sites pass 0, so the runtime value is always 0.
+  int projectorSel_ = 0;
   // Limiter (FUN_0042fb68 path). limiter_[6] = the 0x49b6e4 tick record
   // {mul f32, t1 divisor, t2 tick-delta, t3 EMA, t4 = t3*(1/30) fade
   // delta, t5 remainder}; base_/target_ = 0x49b700/0x49b704 ms window;
@@ -716,7 +729,8 @@ private:
   // share the same frame values.
   StreamInput input_;
   float stepDt_ = 0.0f;
-  StreamSeams seams_;                           // deferred-hook counters
+  StreamSeams seams_;                           // call census + deferred-
+                                                // hook counters
   std::vector<StreamStage> stepLog_;            // per-step stage spine
   std::vector<StreamAnimTick> animLog_;         // per-step 555bc trace
   // TELETYPE service state (0x54b7a4..0x54b834 flat block — OBSERVED

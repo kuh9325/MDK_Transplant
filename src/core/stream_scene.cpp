@@ -2,11 +2,14 @@
 //
 // Implements the helper layer (the 0x42xxxx/0x46xxxx math/camera ports),
 // pool/lifecycle, init/tunnelExtend/teardown, the actor updater family,
-// the FUN_004555bc animator family, the TELETYPE queue service, and the
+// the FUN_004555bc animator family, the TELETYPE queue service, the
 // frame skeleton's counter/drain/completion core (0x541554 pool drain,
-// 0x4ed748 latch, 0x4eda9c drain accumulator, exit handoff). The
-// deferred seams (backdrop blit, drawList, HUD digits, present,
-// limiter bodies) stay counted — later phases fill those in.
+// 0x4ed748 latch, 0x4eda9c drain accumulator, exit handoff), the draw
+// stage (e684 scroll state, e100 records, 17e20 HUD emit, 2fb68/2fb30
+// limiter state) and the ae60 projector install. The intentional
+// host boundaries — the framebuffer blits/raster output, palette DAC
+// upload, audio dispatch and the present/wait sleeps — are the
+// Phase 19B presentation surface.
 //
 // All formulas are instruction-level ports of the captured disassembly
 // (analysis-private/logs/p19a_asm1/4/5.txt); quirks are preserved and
@@ -856,7 +859,8 @@ void StreamScene::tunnelExtend() {
     radius_ = radiusMin_;
   else if (radius_ > radiusMax_)
     radius_ = radiusMax_;
-  ++seams_.fillSelect;  // FUN_0046ae60(0) — scanline filler re-select
+  fillSelect(0);  // FUN_0046ae60(0) — be4c's tail re-installs the
+                  // full-view projector (XOR EAX,EAX; CALL 0x46ae60)
 }
 
 // ===========================================================================
@@ -1010,7 +1014,7 @@ bool StreamScene::init(const StreamAssets& a, int course, int skill,
   camPos_[0] = camPos_[1] = camPos_[2] = 0.0f;   // 540b28/2c/30
   for (int i = 0; i != 12; ++i) camView_[i] = 0.0f;
   camView_[0] = camView_[5] = camView_[10] = 1.0f;  // identity 3x4
-  ++seams_.fillSelect;   // FUN_0046ae60(0)
+  fillSelect(0);         // FUN_0046ae60(0) — init installs mode 0 too
 
   // --- hero spawn (ba45..bb0f) ---
   // alloc(winLo, f32(winLo + 0.75)); +0xc = 03720(protoKurt deep copy);
@@ -1784,15 +1788,49 @@ void StreamScene::backdropScroll() {
   events_.push_back(ev);
 }
 
+// FUN_0046ae60 — the 0x49bbe8 projector install (OBSERVED asm
+// p19a_helpers6_clean.txt): four comparators select the function
+// pointer the slot receives —
+//   EAX==1 -> 0x46ad58   EAX==2 -> 0x46ad9c   EAX==3 -> 0x46ade0
+//   EAX==4 -> 0x46ae1c   else   -> 0x46ad20   (the default arm)
+// All five bodies share one shape — sx = f32((x'+z')/z' * Sx + Bx + T),
+// sy = f32((y'+z')/z' * Sy + By + T) — differing only in the .rdata
+// constants they reference (0x498d84..0x498e2c, image-verified):
+//   sel  addr    Sx       Bx       Sy       By
+//   0    46ad20  299.95   —        180.40   —       full view
+//   1    46ad58  191.95   108.0    139.95   80.0    sub-window
+//   2    46ad9c  69.95    72.0     34.95    10.0
+//   3    46ade0  69.95    228.0    34.95    —
+//   4    46ae1c  69.95    384.0    34.95    10.0
+// (T = 0.05 for all five; the no-bias forms skip one FADD — Bx=0/
+// By=0 is value-identical). The port models the slot contents as the
+// variant index `projectorSel_`; project6b4f8's fill arm dispatches
+// on it. Both mode-5 call sites XOR EAX first — sel 0 always.
+namespace {
+constexpr double kProjFill[5][5] = {  // {Sx, Bx, T, Sy, By}
+    {299.95,   0.0, 0.05, 180.40,  0.0},   // 46ad20
+    {191.95, 108.0, 0.05, 139.95, 80.0},   // 46ad58
+    { 69.95,  72.0, 0.05,  34.95, 10.0},   // 46ad9c
+    { 69.95, 228.0, 0.05,  34.95,  0.0},   // 46ade0
+    { 69.95, 384.0, 0.05,  34.95, 10.0}};  // 46ae1c
+} // namespace
+
+void StreamScene::fillSelect(int mode) {
+  ++seams_.fillSelect;
+  projectorSel_ = (mode >= 1 && mode <= 4) ? mode : 0;
+}
+
 // FUN_0046b4f8 — project v through camProj_ (0x540b80) into the 6-word
 // record block {x',y',z',sx,sy,flags}:
 //   flags: bit0 y'>z', bit1 y'<-z', bit2 x'>z', bit3 x'<-z',
 //          bit4 (0x10) z'<f64 0.05 — near-clip zeroes sx/sy first.
-//   z' != 0 -> the selected fill fn (0x49bbe8 = 46ad20 in mode 5)
-//   computes sx = f32((x'+z')/z' * 299.95 + 0.05),
-//             sy = f32((y'+z')/z' * 180.40 + 0.05)
-//   — overwriting the near-clip zeros (OBSERVED: the fill runs even
-//   when bit4 was set, only z'==0 skips it).
+//   z' != 0 -> CALL [0x49bbe8] — the fillSelect-installed variant
+//   computes sx/sy (overwriting the near-clip zeros; OBSERVED: the
+//   fill runs even when bit4 was set, only z'==0 skips it). The
+//   fill-only sibling FUN_0046b5f0 (z'==0 -> zero both, else the
+//   same indirect call) serves the model submitter's per-vertex
+//   reproject — the host-side raster path consumes the kModelDraw
+//   matrix directly, so no port body is needed here.
 void StreamScene::project6b4f8(const float v[3], float out[6]) const {
   point6afe4(v, camProj_, out);
   const float xc = out[0], yc = out[1], zc = out[2];
@@ -1808,12 +1846,13 @@ void StreamScene::project6b4f8(const float v[3], float out[6]) const {
   out[3] = out[4] = 0.0f;
   if (zc < 0.05) flags |= 0x10;
   if (zc != 0.0f) {
-    out[3] = static_cast<float>(
-        (static_cast<double>(xc) + zc) / static_cast<double>(zc) *
-            299.95 + 0.05);
-    out[4] = static_cast<float>(
-        (static_cast<double>(yc) + zc) / static_cast<double>(zc) *
-            180.4 + 0.05);
+    const double* k = kProjFill[projectorSel_];
+    const double tx =
+        (static_cast<double>(xc) + zc) / static_cast<double>(zc);
+    const double ty =
+        (static_cast<double>(yc) + zc) / static_cast<double>(zc);
+    out[3] = static_cast<float>(tx * k[0] + k[1] + k[2]);
+    out[4] = static_cast<float>(ty * k[3] + k[4] + k[2]);
   }
   out[5] = std::bit_cast<float>(flags);
 }
@@ -2401,9 +2440,10 @@ void StreamScene::emitFrameDraw() {
 
 // ===========================================================================
 // FUN_0042c8b0 — frame skeleton. Stages in OBSERVED order; the actor
-// updater family (Phase 19A.2B) and the FUN_004555bc animator family
-// (Phase 19A.2C) are implemented — backdrop/drawList and the other
-// counted stages remain the deferred seams (see StreamSeams).
+// updater family (Phase 19A.2B), the FUN_004555bc animator family
+// (Phase 19A.2C), the draw stage (19A.2F), the ribbon engine (19A.2G)
+// and the limiter state machine are all implemented — the counted
+// remainder is host/presentation surface only (see StreamSeams).
 // ===========================================================================
 bool StreamScene::step(const StreamInput& in, float dtSec) {
   stepLog_.clear();
@@ -2638,6 +2678,7 @@ StreamSnapshot StreamScene::snapshot() const {
   // Phase 19A.2F draw-stage globals (diagnostic).
   s.drawDue = drawDue_;
   s.hudBlink = hudBlink_;
+  s.projectorSel = projectorSel_;             // 19A.2H0 — not hashed
   {
     std::uint64_t ph = 0xcbf29ce484222325ull;
     for (std::uint8_t b : paletteDac_)

@@ -28117,6 +28117,65 @@ void test_stream_draw() {
     CHECK(std::bit_cast<std::uint32_t>(out[5]) == (0x10u | 1u | 4u));
   }
 
+  // --- fillSelect: the FUN_0046ae60 0x49bbe8 install ----------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    // init runs 31x tunnelExtend + the ba40-adjacent call — every site
+    // passes literal 0 (XOR EAX,EAX; CALL 0x46ae60 — OBSERVED asm).
+    CHECK(s.seams().fillSelect == 32);
+    CHECK(s.projectorSel_ == 0);
+    // ae60's comparator arms: EAX in {1..4} installs the sub-window
+    // variant; anything else falls to the 46ad20 default arm.
+    s.fillSelect(5);   CHECK(s.projectorSel_ == 0);
+    s.fillSelect(-1);  CHECK(s.projectorSel_ == 0);
+    s.fillSelect(1);   CHECK(s.projectorSel_ == 1);
+    s.fillSelect(2);   CHECK(s.projectorSel_ == 2);
+    s.fillSelect(3);   CHECK(s.projectorSel_ == 3);
+    s.fillSelect(4);   CHECK(s.projectorSel_ == 4);
+    s.fillSelect(0);   CHECK(s.projectorSel_ == 0);
+    // The install writes only the 0x49bbe8 slot — no RNG draw, no sim
+    // state: the canonical stateHash is invariant across selects.
+    const std::uint64_t h0 = s.snapshot().stateHash;
+    s.fillSelect(3);
+    CHECK(s.snapshot().stateHash == h0);
+    CHECK(s.snapshot().projectorSel == 3);          // diagnostic surface
+    s.fillSelect(0);
+    CHECK(s.snapshot().stateHash == h0);
+
+    // The installed variant drives project6b4f8's fill arm — constants
+    // image-verified (0x498d84..0x498e2c).
+    for (int i = 0; i != 12; ++i) s.camProj_[i] = 0.0f;
+    s.camProj_[0] = s.camProj_[5] = s.camProj_[10] = 1.0f;
+    s.camProj_[11] = 500.0f;
+    const float v[3] = {60.0f, 30.0f, -400.0f};      // v' = (60,30,100)
+    float out[6];
+    static const double kExp[5][2][2] = {            // {{Sx,Bx},{Sy,By}}
+        {{299.95,   0.0}, {180.40,  0.0}},           // 46ad20
+        {{191.95, 108.0}, {139.95, 80.0}},           // 46ad58
+        {{ 69.95,  72.0}, { 34.95, 10.0}},           // 46ad9c
+        {{ 69.95, 228.0}, { 34.95,  0.0}},           // 46ade0
+        {{ 69.95, 384.0}, { 34.95, 10.0}}};          // 46ae1c
+    for (int m = 0; m != 5; ++m) {
+      s.fillSelect(m);
+      s.project6b4f8(v, out);
+      const double tx = (60.0 + 100.0) / 100.0;
+      const double ty = (30.0 + 100.0) / 100.0;
+      CHECK(near(out[3],
+                 (tx * kExp[m][0][0] + kExp[m][0][1]) + 0.05, 1e-3));
+      CHECK(near(out[4],
+                 (ty * kExp[m][1][0] + kExp[m][1][1]) + 0.05, 1e-3));
+    }
+    // tunnelExtend's tail is ae60(0) — a subsequent extend re-arms the
+    // full-view projector regardless of the current install.
+    s.fillSelect(2);
+    s.tunnelExtend();
+    CHECK(s.projectorSel_ == 0);
+    s.project6b4f8(v, out);
+    CHECK(near(out[3], 1.6 * 299.95 + 0.05, 1e-3));
+    CHECK(near(out[4], 1.3 * 180.40 + 0.05, 1e-3));
+  }
+
   // --- backdropScroll: accumulators, wraps, event payload ----------------
   {
     StreamScene s;

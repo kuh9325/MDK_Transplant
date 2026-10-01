@@ -606,3 +606,32 @@ c0–c4 canonical digests unchanged.
 **MODE-5 TRAIL / RIBBON ENGINE: CLOSED FOR BUILD_A** — explicitly
 not the full mode-5 core (backdrop internals, palette host upload,
 fillSelect internals, limiter, present remain seams).
+
+## 17. Phase 19A.2H0 — remaining-seam reconciliation (audit)
+
+Final core-boundary audit over the seam list §16 left open. Each
+seam was re-inspected against the current port and the committed
+asm/image evidence — no stale labels carried forward.
+
+| seam | BUILD_A | core state | verdict |
+|---|---|---|---|
+| backdrop internals | `FUN_0042e684` | scroll accumulators `0x49b5fc/0x49b600`, the `*0.5*{600,360}` cross-term math, signed-mod wraps, the `camView` prev-copy (`0x49b604`) and the dead `0x541548` stereo subtract — all implemented in `backdropScroll()`; the remaining body is `MOVSD.REP` copies `0x4eda88`→`0x541650` (two-piece toroidal blit) | **C** — host blit for 19B |
+| palette upload | `FUN_00413b40` → `FUN_0046d208` | `paletteRamp` writes the exact 768-byte `paletteDac_` for all five arms (0..4 + base install); `46d208` stages `{B,G,R}` quads into `0x54d7b8` and calls `46d0d0` — host DAC upload only | **C** — host upload for 19B |
+| `fillSelect` | `FUN_0046ae60` | four-comparator install into `0x49bbe8` — `EAX∈{1,2,3,4}` → `46ad58/9c/e0/ae1c`, else `46ad20`. Both mode-5 sites `XOR EAX,EAX` first (init + `be4c` tail) → always sel 0. **Implemented this phase**: `fillSelect(mode)` writes `projectorSel_`; `project6b4f8`'s fill arm dispatches on the image-verified per-variant constants `{Sx,Bx,T,Sy,By}` (T=0.05 all five; sel0/3 omit one bias FADD). No RNG, no sim-state writes — only the code-slot install. `FUN_0046b5f0` (fill-only sibling used by the model submitter) shares the dispatch | closed at core; variants 1..4 unreachable in mode 5 |
+| limiter body | `FUN_0042fb30` / `2fb68` → `2fcd0`/`2fdc8` | fully implemented in `limiterInit`/`limiterRun` (record init, `drawDue_=1` normal arm, `base==0` arming call, `ms<base` back-fix, `t2=Δ*120/1000`, the `0.25/0.75` EMA, `t4=t3·(1/30)`, `t5>>2` divisor + `>4` resync, `base += t2·(25/3)`, `target=base+34`). The `2fb68` demo arms (`0x49b284`/`0x49b288` streams, `RATE` reads, `5414d4` frame-skip) are dead — no writers in BUILD_A. Remainder: the `0x5414ac` pace-wait spins on `FUN_0046c650` until `ms ≥ target` (host sleep; the port's `in.nowMs` is the post-wait sample) | **C** — host wait/clock for 19B; the "limiter body" label was stale |
+| present | `FUN_0046c86c` | `kPresent` event emitted in the correct frame position (inside the `0x5414d4` gate, after HUD); the native body is the DirectDraw surface copy (600×360 → 640×480, +20/+60 centered) | **C** — DirectDraw host present for 19B |
+| `0c860` raster family | `FUN_0040c860` | material dispatch + scanline raster (`46daac` textured, `415260` flat, `412970` LUT-remap for `pen ≤ -1029`, `46e940`/pen forms) — all its inputs arrive via copy-safe events (`kRibbonTri` verts+pen+flags, `kModelDraw` composed matrix, `kSpriteDraw` sx/sy/size/vz/tags, ordering preserved). No state writes — pixel output only | **C** — raster for 19B |
+
+Result: no category-A (unresolved core semantics), no unresolved
+RNG-consuming or simulation-state-writing seam. `fillSelect` was the
+last real install seam and is now implemented; everything else on the
+list is verified host/presentation work for Phase 19B. Stale labels
+fixed: the `seams_.fillSelect` counter comment (it counts real calls
+now), the step()/file-header "deferred seams" text, and the
+traversal runtime's `FUN_0046ae60 "timers"` mislabel (the field name
+`timersCalls` is kept for diagnostic compatibility).
+
+New test coverage in `test_stream_draw` (`fillSelect` block): the
+four comparators + default arm, init's 32 counted installs, RNG/
+stateHash neutrality, all five variant projections against the
+image-verified constants, and `tunnelExtend`'s re-install of sel 0.
