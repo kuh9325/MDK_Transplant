@@ -1289,6 +1289,17 @@ int selftestCameraObstruction() {
   return ok ? 0 : 3;
 }
 
+// Phase 19A.2E — completion-writer reason labels (diagnostic-only;
+// maps the port-side StreamCompletion enum, not a native field).
+const char* streamCompletionName(mdk::StreamCompletion c) {
+  switch (c) {
+    case mdk::StreamCompletion::kHero:   return "hero";
+    case mdk::StreamCompletion::kWindow: return "window";
+    case mdk::StreamCompletion::kDeath:  return "death";
+    default:                             return "none";
+  }
+}
+
 } // namespace
 
 // Phase 15A — combat-harness shared helpers (used by
@@ -3050,6 +3061,16 @@ int main(int argc, char** argv) {
                 sc.poolBucketCount(5), sc.poolBucketCount(16));
     std::printf("flags:       fade=%.3f complete=%d health=%d\n",
                 (double)s.fade, s.complete, s.health);
+    // Phase 19A.2E — counter/drain/completion surface (all diagnostic;
+    // reason is the port-side first-writer tag, NOT a native field):
+    //   health  = 0x541554 displayed bonus pool (drained per wall beat)
+    //   fade    = 0x4eda9c frame drain accumulator
+    //   complete= 0x4ed748 latch  reason = first of the 3 write sites
+    //   exit    = frame fn returned 1 → dispatcher teardown
+    std::printf("counter:     health=%d win=[%d,%d) fade=%.3f "
+                "complete=%d reason=%s exit=%d\n",
+                s.health, s.winLo, s.winHi, (double)s.fade, s.complete,
+                streamCompletionName(s.completionSrc), sc.finished());
     std::printf("camera:      eye=(%.2f,%.2f,%.2f) lookT=%.2f "
                 "view.diag=(%.2f,%.2f,%.2f)\n",
                 (double)s.eye[0], (double)s.eye[1], (double)s.eye[2],
@@ -3080,9 +3101,21 @@ int main(int argc, char** argv) {
     if (streamFrames > 0 && ok) {
       std::printf("frames:      frame updaters winLo winHi ext anim "
                   "trace(slot:body[rec]f/acc/latch) "
-                  "hero(slot,pathT,spd) tt hash\n");
+                  "hero(slot,pathT,spd) tt hash "
+                  "ctr(hp,fade,c:reason,exit)\n");
       mdk::StreamInput in{};
       mdk::StreamSeams prev = sc.seams();
+      // Phase 19A.2E — deterministic semantic digest over the
+      // counter/completion state only (health, fade raw bits,
+      // latch+reason, exit, window bounds). Deliberately independent
+      // of stateHash so the diagnostic surface is diffable on its own.
+      std::uint64_t ctrDigest = 1469598103934665603ull;
+      auto mix = [&ctrDigest](std::uint64_t v) {
+        for (int i = 0; i != 8; ++i) {
+          ctrDigest ^= (v >> (i * 8)) & 0xff;
+          ctrDigest *= 1099511628211ull;
+        }
+      };
       for (int f = 0; f != streamFrames; ++f) {
         sc.step(in, 1.0f / 30.0f);
         const mdk::StreamSeams cur = sc.seams();
@@ -3120,13 +3153,26 @@ int main(int argc, char** argv) {
         }
         const mdk::StreamSnapshot fs = sc.snapshot();
         std::printf("             %5d  %-40s [%d,%d) %3d %4d%s "
-                    "h(%d,%.2f,%.2f)%s %016llx\n",
+                    "h(%d,%.2f,%.2f)%s %016llx "
+                    "hp=%d f=%.3f c=%d:%s x=%d\n",
                     f, fam.c_str(), fs.winLo, fs.winHi,
                     cur.fillSelect - prev.fillSelect,
                     cur.animCalls - prev.animCalls, tr.c_str(),
                     fs.heroIdx,
                     (double)fs.heroPathT, (double)fs.heroSpeed, ttb,
-                    (unsigned long long)fs.stateHash);
+                    (unsigned long long)fs.stateHash,
+                    fs.health, (double)fs.fade, fs.complete,
+                    streamCompletionName(fs.completionSrc),
+                    sc.finished());
+        mix((std::uint32_t)fs.health);
+        std::uint32_t fadeBits;
+        std::memcpy(&fadeBits, &fs.fade, 4);   // raw f32 — no rounding
+        mix(fadeBits);
+        mix((std::uint32_t)fs.complete |
+            ((std::uint64_t)fs.completionSrc << 32) |
+            ((std::uint64_t)sc.finished() << 40));
+        mix(((std::uint64_t)(std::uint32_t)fs.winLo) |
+            ((std::uint64_t)(std::uint32_t)fs.winHi << 32));
         prev = cur;
       }
       const mdk::StreamSnapshot ts = sc.snapshot();
@@ -3136,6 +3182,9 @@ int main(int argc, char** argv) {
                   (unsigned long long)ts.ttHash, sm.teletypePost,
                   sm.teletypeService, sm.teletypeDraw,
                   sm.teletypeOverflow);
+      std::printf("ctr-digest:  %016llx  (%d frames — health, fade "
+                  "bits, latch+reason, exit, win)\n",
+                  (unsigned long long)ctrDigest, streamFrames);
     }
     // Mode-8 boundary check (bounded): FINISH.BNI existence is the
     // only probe — mode 8 is FUN_0047b038's FLIC/MVE pipeline, a

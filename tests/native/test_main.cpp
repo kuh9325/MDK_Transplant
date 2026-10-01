@@ -27725,6 +27725,261 @@ void test_stream_teletype() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19A.2E — Mode-5 counter / health-drain / completion core.
+// Synthetic scenes only. Pins the three proven 0x4ed748 write sites,
+// the diagnostic-only StreamCompletion first-writer tag (BUILD_A keeps
+// just the dword — the tag is port bookkeeping, never folded into
+// stateHash), the fade->exit handoff, and the post-exit latch.
+// ---------------------------------------------------------------------------
+
+void test_stream_completion() {
+  using mdk::DynamicObject;
+  using mdk::StreamCompletion;
+  using mdk::StreamEvent;
+  using mdk::StreamInput;
+  using mdk::StreamScene;
+  using mdk::StreamStage;
+  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5 * kStreamAnimRec] = {};
+  const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+  StreamInput in{};
+  const float dt = std::bit_cast<float>(0x3d088889u);   // 0x49b6f4 = 1/30
+
+  auto exits = [](const StreamScene& s) {
+    int n = 0;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kExitMode) ++n;
+    return n;
+  };
+  // Wall-beat rig — the established ricochet fixture: slot-0 plane
+  // x<=0 (n=-x, d=0) is violated by the hero's +x offset.
+  auto beat = [&](StreamScene& s, int health, int skill, int isFinal,
+                  std::uint32_t rng = 1) -> DynamicObject* {
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.planes_[0][0] = -1.0f;
+    s.planes_[0][3] = 0.0f;
+    s.health_ = health;
+    s.skill_ = skill;
+    s.isFinal_ = isFinal;
+    s.rng_ = rng;
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 6.0f; h->yawDeg = 90.0f; h->field2c = 1.0f;
+    h->field1c[0] = 1.0f;
+    s.heroUpdate(dt);
+    return h;
+  };
+
+  // --- drain boundaries: skill-scaled decrement, <=0 arm ----------------
+  {
+    StreamScene s;
+    DynamicObject* h = beat(s, 100, 0, 0);
+    CHECK(s.health_ == 98);                // skill0 -> -2 exact
+    CHECK(h->field34 == 5.4f);             // d8c8 tail ran same frame
+    CHECK(s.complete_ == 0);
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+  }
+  {
+    // skill1 -(rand(2)+2) and skill2 -(2*rand(2)+4) — mirror the
+    // two-rand order (hurt index first, drain roll second) over a
+    // seed sweep so both reachable drain values are pinned.
+    for (std::uint32_t seed = 1; seed != 17; ++seed) {
+      StreamScene s;
+      beat(s, 100, 1, 0, seed);
+      std::uint32_t m = seed;
+      (void)mdk::enemyRandBelow(m, 7);
+      const int d = mdk::enemyRandBelow(m, 2) + 2;
+      CHECK(s.health_ == 100 - d);
+      CHECK(d == 2 || d == 3);             // rand(2) in {0,1}
+    }
+    for (std::uint32_t seed = 1; seed != 17; ++seed) {
+      StreamScene s;
+      beat(s, 100, 2, 0, seed);
+      std::uint32_t m = seed;
+      (void)mdk::enemyRandBelow(m, 7);
+      const int d = mdk::enemyRandBelow(m, 2) * 2 + 4;
+      CHECK(s.health_ == 100 - d);
+      CHECK(d == 4 || d == 6);
+    }
+    // Skill outside {0,1,2}: the decrement is skipped entirely and
+    // the <=0 arm runs on the (positive) pool — nothing happens.
+    StreamScene s;
+    beat(s, 100, 3, 0);
+    CHECK(s.health_ == 100);
+    CHECK(s.complete_ == 0);
+  }
+  {
+    // Exact zero crossing — non-final arm (d951) floors at 1.
+    StreamScene s;
+    DynamicObject* h = beat(s, 2, 0, 0);
+    CHECK(s.health_ == 1);
+    CHECK(s.complete_ == 0 && s.fade_ == 0.0f);
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+    CHECK(h->field34 == 5.4f);             // decay continues anyway
+    // One past zero — pool 1 drains to -1, same floor.
+    StreamScene s2;
+    beat(s2, 1, 0, 0);
+    CHECK(s2.health_ == 1);
+    CHECK(s2.complete_ == 0);
+    // Large pool (the 150 the pickup catch writes at 0x42d221).
+    StreamScene s3;
+    beat(s3, 150, 0, 0);
+    CHECK(s3.health_ == 148);
+  }
+
+  // --- writer 0x42d95b: hero death, final arm ----------------------------
+  {
+    StreamScene s;
+    DynamicObject* h = beat(s, 2, 0, 1);
+    CHECK(s.health_ == 0);                 // d955 write
+    CHECK(s.complete_ == 1);               // d95b write
+    CHECK(s.fade_ == 2.0f);                // d961 write — 0x40000000
+    CHECK(s.completionReason() == StreamCompletion::kDeath);
+    CHECK(s.snapshot().completionSrc == StreamCompletion::kDeath);
+    CHECK(h->field34 == 5.4f);             // d8c8 continuation, OBSERVED
+    // The latch is idempotent — dead-path heroUpdate never re-drains.
+    s.heroUpdate(dt);
+    CHECK(s.health_ == 0 && s.complete_ == 1 && s.fade_ == 2.0f);
+    CHECK(s.completionReason() == StreamCompletion::kDeath);
+
+    // Fade handoff: eda9c drains 1/30 per frame while complete; the
+    // frame body keeps running until fade < 0 (clamp + fill + exit).
+    s.clearEvents();
+    CHECK(s.step(in, dt));
+    CHECK(near(s.fade_, 2.0f - dt, 1e-5f));
+    int steps = 1;
+    while (steps != 70 && s.step(in, dt)) ++steps;
+    CHECK(s.finished());
+    CHECK(steps == 60 || steps == 61);     // 2.0/(1/30) = 60 ±f32 ulp
+    CHECK(exits(s) == 1);                  // exactly one kExitMode
+    bool black = false;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kExitMode && e.aux == 0x00) black = true;
+    CHECK(black);                          // final death -> 0x00 fill
+    CHECK(s.fade_ == 0.0f);
+
+    // Post-exit latch: the dispatcher contract — the frame fn is
+    // never re-entered. No stage log, no events, no state change.
+    const std::uint64_t h0 = s.snapshot().stateHash;
+    const std::size_t nev = s.events().size();
+    CHECK(!s.step(in, dt));
+    CHECK(s.stepLog().empty());
+    CHECK(s.events().size() == nev && exits(s) == 1);
+    CHECK(s.snapshot().stateHash == h0);
+    CHECK(s.finished());
+  }
+
+  // --- writer 0x42ca79: terminal window, final mode ----------------------
+  {
+    // Exact threshold — FILD(winHi) >= f64 186.0 (0x497008).
+    StreamScene s;
+    CHECK(s.init(a, 4, 0, 0x1234u, 100));
+    s.winLo_ = 200;                        // twin-gate entry (>177)
+    s.winHi_ = 186;
+    s.clearEvents();
+    CHECK(!s.step(in, dt));                // latch + exit, same frame
+    CHECK(s.complete_ == 1);
+    CHECK(s.completionReason() == StreamCompletion::kWindow);
+    CHECK(exits(s) == 1);
+    CHECK(s.finished());
+  }
+  {
+    // One below: ordinary frame, no latch. First value beyond the
+    // threshold latches on the next step (>= compare — distinct from
+    // tunnelExtend's >186 freeze gate).
+    StreamScene s;
+    CHECK(s.init(a, 4, 0, 0x1234u, 100));
+    s.winLo_ = 200; s.winHi_ = 185;
+    s.clearEvents();
+    CHECK(s.step(in, dt));
+    CHECK(s.complete_ == 0);
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+    s.winHi_ = 187;
+    CHECK(s.step(in, dt));                 // latches; fade 0 not <0
+    CHECK(s.complete_ == 1);
+    CHECK(s.completionReason() == StreamCompletion::kWindow);
+    CHECK(!s.step(in, dt));                // fade -1/30 -> exit
+    CHECK(s.finished());
+  }
+  {
+    // Non-final: edad0 gates the window write out — the gate is
+    // entered (winLo>177, twin may spawn) but nothing latches.
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x1234u, 100));
+    s.winLo_ = 200; s.winHi_ = 186;
+    s.clearEvents();
+    CHECK(s.step(in, dt));
+    CHECK(s.complete_ == 0);
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+  }
+
+  // --- writer 0x42ca55: rescue twin anim past frame 0x50 -----------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x7777u, 1));    // health==1 -> gate entry
+    s.step(in, dt);                        // spawns the twin
+    const int tw = s.snapshot().twinIdx;
+    CHECK(tw >= 0);
+    s.pool_[tw].animFrame = 0x51;
+    s.step(in, dt);                        // latches; fade 0 not <0
+    CHECK(s.complete_ == 1);
+    CHECK(s.completionReason() == StreamCompletion::kHero);
+    CHECK(!s.step(in, dt));                // next frame -> exit
+    bool white = false;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kExitMode && e.aux == 0xff) white = true;
+    CHECK(white);                          // non-final alive -> 0xff
+    CHECK(s.finished());
+  }
+
+  // --- writer ordering: the ca42 twin site precedes ca5f -----------------
+  {
+    // Final mode never spawns a twin naturally; force one so BOTH
+    // sites fire on the same frame — the first transition owns it.
+    StreamScene s;
+    CHECK(s.init(a, 4, 0, 0x1234u, 100));
+    DynamicObject* tw = s.alloc(0, 0.75f);
+    s.twin_ = tw;
+    tw->animFrame = 0x51;
+    s.winLo_ = 200; s.winHi_ = 186;
+    CHECK(!s.step(in, dt));
+    CHECK(s.complete_ == 1);
+    CHECK(s.completionReason() == StreamCompletion::kHero);
+    // Latch forced from outside: no writer ran -> reason stays kNone.
+    StreamScene s2;
+    CHECK(s2.init(a, 4, 0, 0x1234u, 100));
+    s2.complete_ = 1;
+    s2.winLo_ = 200; s2.winHi_ = 186;
+    CHECK(!s2.step(in, dt));
+    CHECK(s2.completionReason() == StreamCompletion::kNone);
+  }
+
+  // --- init/teardown reset -----------------------------------------------
+  {
+    StreamScene s;
+    beat(s, 2, 0, 1);
+    CHECK(s.completionReason() == StreamCompletion::kDeath);
+    s.teardown();
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+    CHECK(s.snapshot().completionSrc == StreamCompletion::kNone);
+    CHECK(s.init(a, 0, 0, 0x1234u, 100));
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+  }
+
+  // --- no premature completion on the ordinary path ----------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x8888u, 100));
+    for (int i = 0; i != 30; ++i) CHECK(s.step(in, dt));
+    CHECK(s.complete_ == 0);
+    CHECK(s.completionReason() == StreamCompletion::kNone);
+    CHECK(s.snapshot().completionSrc == StreamCompletion::kNone);
+    CHECK(!s.finished());
+    CHECK(exits(s) == 0);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -27832,6 +28087,7 @@ int main() {
   test_stream_updaters();
   test_stream_animator();
   test_stream_teletype();
+  test_stream_completion();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

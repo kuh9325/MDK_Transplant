@@ -167,6 +167,21 @@ struct StreamEvent {
                              // (empty for tag-bound forms)
 };
 
+// --- completion writer tags --------------------------------------------------
+// Diagnostic-only reason tag for the 0x4ed748 latch — records WHICH of the
+// three proven BUILD_A write sites first set it (the latch is monotone;
+// later writes are idempotent no-ops). Not native state — the original
+// keeps only the dword latch.
+enum class StreamCompletion : std::uint8_t {
+  kNone = 0,   // latch clear — no writer has fired
+  kHero,       // 0x42ca55 — rescue twin (0x4edac0) +0xe4 > 0x50: the
+               // BONESANIM dock sequence played out
+  kWindow,     // 0x42ca79 — isFinal && FILD(0x4e74b4) >= 186.0
+  kDeath,      // 0x42d95b — heroUpdate drain -> health<=0 (final only —
+               // the "counter drained" write and the death write are the
+               // SAME site; non-final clamps health to 1 instead)
+};
+
 // --- deterministic snapshot ------------------------------------------------
 // Flat, allocation-free view of the simulation state for tests/digests.
 // Native globals are named after their 0x4edxxx addresses where useful.
@@ -174,6 +189,8 @@ struct StreamSnapshot {
   std::int32_t winLo = 0;      // e74b0 — path window low
   std::int32_t winHi = 0;      // e74b4 — path window high
   std::int32_t complete = 0;   // e748
+  StreamCompletion completionSrc = StreamCompletion::kNone;  // which
+                               // writer (diagnostic only — not hashed)
   std::int32_t isFinal = 0;    // edad0 — course>=4
   std::int32_t health = 0;     // 541554 — hero health (incoming global;
                                // the scene drains/clamps/sets it)
@@ -346,6 +363,10 @@ public:
   void teardown();             // FUN_0042c824 — frees protos/objects,
                                // stops WIND, emits nothing visual
   bool finished() const { return exited_; }
+  // Which proven writer latched complete_ (diagnostic-only — BUILD_A
+  // stores only the dword). kNone while complete_ == 0 or when the
+  // latch was forced from outside the three write sites.
+  StreamCompletion completionReason() const { return completionSrc_; }
 
   StreamSnapshot snapshot() const;
 
@@ -512,6 +533,8 @@ private:
   float drift_[3] = {};                         // e738/73c/740 (a3,a1,a2)
   float radius_ = 0.0f;                         // e744
   std::int32_t complete_ = 0;                   // e748
+  StreamCompletion completionSrc_ =             // port-side diagnostic:
+      StreamCompletion::kNone;                  //   first writer to latch
   std::int32_t penBase_ = 0, penTarget_ = 0;    // e74c/e750
   float penT_ = 0.0f;                           // e754
   std::uint8_t palette_[768] = {};              // e758 (+0xc0 PAL half)

@@ -1,8 +1,12 @@
-// stream_scene.cpp — Phase 19A.1A: mode-5 cinematic math/camera layer.
+// stream_scene.cpp — Phase 19A mode-5 cinematic core.
 //
-// This file implements ONLY the helper layer declared in stream_scene.h
-// (the 0x42xxxx/0x46xxxx native helper ports). Pool/lifecycle, the
-// script-facing updaters, and the draw pipeline are later phases.
+// Implements the helper layer (the 0x42xxxx/0x46xxxx math/camera ports),
+// pool/lifecycle, init/tunnelExtend/teardown, the actor updater family,
+// the FUN_004555bc animator family, the TELETYPE queue service, and the
+// frame skeleton's counter/drain/completion core (0x541554 pool drain,
+// 0x4ed748 latch, 0x4eda9c drain accumulator, exit handoff). The
+// deferred seams (backdrop blit, drawList, HUD digits, present,
+// limiter bodies) stay counted — later phases fill those in.
 //
 // All formulas are instruction-level ports of the captured disassembly
 // (analysis-private/logs/p19a_asm1/4/5.txt); quirks are preserved and
@@ -877,6 +881,7 @@ bool StreamScene::init(const StreamAssets& a, int course, int skill,
   drift_[0] = drift_[1] = drift_[2] = 0.0f;
   radius_ = 0.0f;
   complete_ = 0;
+  completionSrc_ = StreamCompletion::kNone;
   penBase_ = 0; penTarget_ = 0;
   penT_ = 0.0f;
   std::memset(palette_, 0, sizeof palette_);
@@ -1101,6 +1106,7 @@ void StreamScene::teardown() {
   drift_[0] = drift_[1] = drift_[2] = 0.0f;
   radius_ = 0.0f;
   complete_ = 0;
+  completionSrc_ = StreamCompletion::kNone;
   penBase_ = 0; penTarget_ = 0;
   penT_ = 0.0f;
   std::memset(palette_, 0, sizeof palette_);
@@ -1331,6 +1337,10 @@ void StreamScene::heroUpdate(float dt) {
     }
     if (health_ <= 0) {
       if (isFinal_) {
+        // d940..d961: health=0 -> complete=1 -> fade=2.0, in that
+        // order; d967 falls through to the d8c8 speed decay (the
+        // same-frame continuation — OBSERVED).
+        if (!complete_) completionSrc_ = StreamCompletion::kDeath;
         health_ = 0;
         complete_ = 1;
         fade_ = 2.0f;                       // 0x40000000
@@ -1902,6 +1912,10 @@ bool StreamScene::step(const StreamInput& in, float dtSec) {
   stepLog_.clear();
   animLog_.clear();
   ttLog_.clear();
+  // Post-exit latch: the native frame fn returns 1 to the dispatcher,
+  // which tears the mode down — it is never re-entered. Model that
+  // contract so a second step() can't emit a duplicate kExitMode.
+  if (exited_) return false;
   ++frameTick_;                          // 0x49b5a4++
   stepLog_.push_back(StreamStage::kTick);
   // Frame context for the updaters — the native resolves the input
@@ -1945,9 +1959,17 @@ bool StreamScene::step(const StreamInput& in, float dtSec) {
       }
     }
     // Completion gates (ca42..ca82): rescue anim past frame 0x50, or
-    // final-mode winHi >= 186 (0x497008 — JC skips on <186).
-    if (twin_ && twin_->animFrame > 0x50) complete_ = 1;
-    if (isFinal_ && static_cast<double>(winHi_) >= 186.0) complete_ = 1;
+    // final-mode winHi >= 186 (0x497008 — JC skips on <186). Two
+    // DISTINCT write sites — kept separate like the native; the port
+    // additionally records which one latched first (diagnostic only).
+    if (twin_ && twin_->animFrame > 0x50) {
+      if (!complete_) completionSrc_ = StreamCompletion::kHero;
+      complete_ = 1;                    // 0x42ca55
+    }
+    if (isFinal_ && static_cast<double>(winHi_) >= 186.0) {
+      if (!complete_) completionSrc_ = StreamCompletion::kWindow;
+      complete_ = 1;                    // 0x42ca79
+    }
   }
 
   // --- fade stage (ca83..cd14) ---
@@ -2072,6 +2094,8 @@ StreamSnapshot StreamScene::snapshot() const {
   s.winLo = winLo_;
   s.winHi = winHi_;
   s.complete = complete_;
+  s.completionSrc = completionSrc_;    // diagnostic-only — kept out of
+                                       // the stateHash mix on purpose
   s.isFinal = isFinal_;
   s.health = health_;
   s.fade = fade_;

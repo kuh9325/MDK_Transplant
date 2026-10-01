@@ -173,6 +173,56 @@ dispatcher runs `FUN_0042c824` teardown → existing Phase-14
 routing (`541554≤0`→frontend, `id<4`→mode 6, `id≥4`→`541498=5`→
 mode 7).
 
+### Counter / drain / completion state inventory (OBSERVED)
+
+- `0x541554` — the displayed bonus/health pool. `FUN_00417e20`
+  draws it directly (decimal digits gated `541554 > 0x14`; at
+  ≤20 the digits blink — drawn only while the `0x49a8dc`
+  accumulator `< 0x10`). There is NO separate display copy in
+  mode 5: the rendered value IS the field. Writers inside the
+  mode-5 call graph: `FUN_0042d24c` drain/latch (below) and
+  `FUN_0042d118` pickup catch (`541554 = 150`, `0x42d221`).
+- Pool drain (`FUN_0042d24c` @`0x42d89d`, wall-beat only — reached
+  after the `FUN_0042d97c` probe hit + deflect + HITSIDE/HURTn
+  emits): `skill==0` `−2`; `skill==1` `−(rand15(2)+2)`;
+  `skill==2` `−(rand15(2)·2+4)`; skill outside {0,1,2} skips the
+  drain entirely. Then `541554 ≤ 0` → `edad0` arm: final →
+  `541554=0`, `ed748=1`, `eda9c=2.0` (writes in that order,
+  @`0x42d955/d95b/d961`), non-final → `541554=1`. Both paths
+  continue to the `0x42d8c8` speed decay the same frame.
+- `0x4eda9c` — the frame drain accumulator. `+1/30` (`0x49b6f4`
+  f32) per frame while `!complete`, clamps at `1.0` and installs
+  the base palette; skipped entirely at `fade==1.0 && !complete`
+  (`0x42ca90` JZ + `0x42cb19` re-check). While `complete`:
+  `−1/30` per frame; `fade ≥ 0` continues the frame (walk/camera/
+  draw all still run), `fade < 0` clamps to 0 and exits. The
+  death write seeds 2.0 — a 60-step red-ramp drain before exit.
+- `0x4ed748` — scene completion latch. Exactly three write sites:
+  `0x42ca55` (twin `+0xe4 > 0x50`, s16), `0x42ca79`
+  (`edad0 != 0 && FILD(e74b4) ≥ 186.0`, f64 `0x497008`),
+  `0x42d95b` (heroUpdate death). The two frame-fn sites sit
+  INSIDE the twin gate — `541554 ≤ 0` or `winLo ≤ 177 &&
+  health != 1` skips them too. The twin write precedes the
+  window write (`ca42` before `ca5f`).
+- `0x4edad0` — final flag (course ≥ 4), seeded once by init.
+- `0x4e74b0`/`0x4e74b4` — window bounds. Twin-gate entry uses
+  `e74b0 > 177` (f64 `0x497000`); the terminal latch uses
+  `e74b4 ≥ 186`; `FUN_0042be4c`'s final-mode freeze is a
+  DISTINCT gate — `e74b4 > 186` (f64 `0x496f70`), marker spawn
+  once, `winHi` pinned at 187. Latch and freeze never
+  double-write.
+- HUD-internal accumulators (inside `FUN_00417e20`, deferred
+  with the `present` seam — numeric state only): `0x49a8dc`
+  blink accumulator `+= 0x49b6e8 & 0x1f` per call (mode-5
+  active; gates the ≤20 digit draw); `0x49a8e0` score-chase
+  accumulator — sits behind `541492==3` (`0x417f54`), DEAD in
+  mode 5.
+- Exit handoff: `fade < 0` → `eda9c = 0`, DAC memset fill
+  `0xff` iff `!edad0 && 541554 > 0` else `0x00`,
+  `FUN_0046d208` install, return 1 → dispatcher teardown. The
+  frame fn is never re-entered after that (the port latches
+  `finished()`; a second `step()` is a no-op).
+
 ## 10. Palette / backdrop (OBSERVED)
 
 - Scene palette `0x4ed758` = SYS_PAL head (entries 0–63) +
