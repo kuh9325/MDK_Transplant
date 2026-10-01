@@ -95,6 +95,16 @@ struct StreamAssets {
   int sndRescue = -1;           // eda7c (twin spawn)
   int sndApple = -1;            // eda80 (pickup catch)
   int sndHurt[7] = {-1, -1, -1, -1, -1, -1, -1};  // eda60..78 random hurt
+  // Phase 19A.2F — the two entries of the global HUD image table the
+  // mode-5 HUD consumes (FUN_00418688(0x49a828) at 0x42b5ac binds an
+  // ENGINE-side table — these are not STREAM records): slot 2 =
+  // SC_STAT status icon (img 0x54b3e8, dims 0x54b44c = {w,h,w*h});
+  // slot 7 = SNIP_TXT digit strip (img 0x54b3fc, dims 0x54b488 — the
+  // record's w field is the strip's full row stride; drawn cells are
+  // 8 px wide).
+  int hudIconTag = -1, hudDigitTag = -1;
+  int hudIconW = 0, hudIconH = 0;
+  int hudDigitW = 0, hudDigitH = 0;
 };
 
 // --- per-frame input ------------------------------------------------------
@@ -104,6 +114,11 @@ struct StreamAssets {
 struct StreamInput {
   float axis0 = 0.0f;  // -> +0x4c roll steer (center 90, clamp [45,135])
   float axis1 = 0.0f;  // -> +0x13c pitch steer (center 0, clamp [-45,45])
+  std::uint32_t nowMs = 0;  // host ms clock (FUN_0046c650) feeding the
+                            // limiter (FUN_0042fb68 -> 42fcd0). 0 keeps
+                            // the native first-call arm (0x49b700==0):
+                            // the record re-initializes every step and
+                            // the frame delta stays pinned at 1/30.
 };
 
 // --- presentation events ---------------------------------------------------
@@ -122,7 +137,9 @@ struct StreamEvent {
                      // FUN_00402fe8, f[0..2]=+0x10 pos, aux=0x1000e
                      // (the FUN_00402160 mode word; OBSERVED)
     kStopSound,      // tag=sound tag (WIND at teardown)
-    kBackdropBlit,   // f[0]=scrollU f[1]=scrollV (600x360 toroidal)
+    kBackdropBlit,   // f[0]=scrollU f[1]=scrollV — the post-wrap i32
+                     // accumulators 0x49b5fc/0x49b600; host does the
+                     // 600x360 toroidal two-piece copy (e684)
     kRibbonTri,      // one e620/0ca00 emission. f[0..8] = the three
                      // view-space verts (vx,vy,vz — pre-divide, pre-clip);
                      // tag = pen (depth-tint base - pens_[2i|2i+1], the
@@ -133,10 +150,19 @@ struct StreamEvent {
                      // (AND of flags) passes; near-clipping is the host's.
     kModelDraw,      // f[0..11] = camProj o object xform (the +0x7c
                      // precompute, native 3x4 order); aux = pool index
-    kSpriteDraw,     // f[0..3] = {sx, sy, size, vz} (post-trunc ints);
-                     // tag = sprite tag (+0x108 -> lightTag/planetTag[0]);
-                     // aux = pool index. Marker variant additionally
-                     // carries f[4]/f[5] = planetTag[1]/planetTag[2]
+    kSpriteDraw,     // f[0..3] = {sx, sy, size, vz} (sx/sy/size are
+                     // post-trunc ints; vz = the view z'). tag = sprite
+                     // tag (+0x108 -> lightTag/planetTag[0]); aux =
+                     // pool index. f[4]/f[5] = the record's tag4/tag5
+                     // fields — planetTag[1]/planetTag[2] for the
+                     // marker (e55c), 0x40/0x40 otherwise (e49c).
+                     // Emit order is the OBSERVED 09a00 flush order:
+                     // flag-0 models first in chain order, flag-1
+                     // sprites after — sorted DESCENDING by key
+                     // vz*3.0f+8000.0f (far-first painter order; the
+                     // 0x47dc00 qsort comparator 0x40bd2c returns
+                     // keyB-keyA) under the 0x541500==1 deferred path,
+                     // 0x499f88==0 key form.
     kPaletteSet,     // aux = transform mode {0 install base palette,
                      // 1 black ramp (pal*fade — isFinal fade),
                      // 2 dark-in ramp (pal*fade + (fade-1)*255 —
@@ -158,6 +184,12 @@ struct StreamEvent {
                      // scale (the 41518c operand; 0 for the plain call,
                      // which takes none); name = the line text as a
                      // C-string at draw time.
+    kHudBlit,        // Phase 19A.2F — FUN_004185fc transparent-keyed
+                     // indexed blit into the 600x360 framebuffer
+                     // (0x541650). tag = image tag; aux = source byte
+                     // offset (digit cells = strip + digit*8);
+                     // f[0..5] = {dstX, dstY, w, h, srcStride, key}
+                     // (key = the transparent index, always 0 here).
   };
   Kind kind = kPresent;
   int tag = 0;
@@ -232,15 +264,28 @@ struct StreamSnapshot {
   float ttCharTimer = 0.0f;         // 0x54b7f4 — hold countdown
   float ttHoldTimer = 0.0f;         // 0x54b7f8 — slide/page envelope
   std::uint64_t ttHash = 0;         // FNV-1a over the 0x90 arena bytes
+  // Phase 19A.2F — draw-stage state (all diagnostic; none of it mixes
+  // into stateHash — the canonical digests are unchanged):
+  std::int32_t drawDue = 0;         // 0x5414d4 — limiter's draw gate
+  std::int32_t hudBlink = 0;        // 0x49a8dc — HUD digit blink phase
+  std::uint64_t paletteDacHash = 0; // FNV-1a over the 768B upload
+                                    // surface (the ramped palette the
+                                    // native hands FUN_0046d208)
+  std::uint32_t limiter[6] = {};    // 0x49b6e4 record — {f32 mul,
+                                    // i32 t1, i32 t2, f32 t3, f32 t4,
+                                    // i32 t5} (t4 = the fade delta)
+  std::uint32_t limiterBase = 0;    // 0x49b700 — ms window base
+  std::uint32_t limiterTarget = 0;  // 0x49b704 — ms window target
 };
 
 // --- frame-stage counters -----------------------------------------------------
 // FUN_0042c8b0 (the native frame) dispatches per-object updaters and a
 // render pipeline. Implemented stages (the updater family, the
-// FUN_004555bc animator family, the TELETYPE queue service) count
-// their dispatch reach; the still-deferred stages (backdrop, drawList,
-// listener, limiter, paletteRamp, resourceBind/Free) are counted seams
-// whose bodies only bump the counter — later phases fill those in.
+// FUN_004555bc animator family, the TELETYPE queue service, the
+// Phase 19A.2F draw stage) count their dispatch reach; the remaining
+// host-side stages (listener, paletteRamp, resourceBind/Free) are
+// counted seams whose bodies only bump the counter — later phases
+// fill those in.
 struct StreamSeams {
   int heroUpdate = 0;     // FUN_0042d24c — owns winLo++/tunnelExtend feed
   int genericUpdate = 0;  // FUN_0042cf6c — +0x34 swim (no anim call —
@@ -262,8 +307,19 @@ struct StreamSeams {
   int animSound = 0;      //   of those: +0x140/+0x144 marker consumed
   int backdrop = 0;       // FUN_0042e684 — toroidal scroll accumulate+blit
   int drawList = 0;       // FUN_0042e100 — back-to-front object draws
+  int drawFlush = 0;      // FUN_00409a00 calls — one per bucket that
+                          // appended at least one draw record (model
+                          // or sprite — gated sprites still consume
+                          // records, OBSERVED)
+  int drawListOverflow = 0;  // appends past the 64-record stack arena
+                             // (0xc00/0x30) — the native overflows its
+                             // frame stack; the port bounds + counts
+  int ribbonDraw = 0;     // FUN_0042e620 calls — 32 per drawn span
+                          // (15x2 loop + 2 tail). The bodies are
+                          // Phase 19A.2G trail geometry — counted here.
+  int hudBlit = 0;        // FUN_004185fc calls — HUD icon + digits
   int listener = 0;       // FUN_004026f8 — audio listener xform update
-  int limiter = 0;        // FUN_0042fb68 — frame limiter wait
+  int limiter = 0;        // FUN_0042fb68 (frame) + 42fb30 (init) calls
   int fillSelect = 0;     // FUN_0046ae60 — scanline filler mode select
   int paletteRamp = 0;    // init's 64-step DAC crossfade loop
   int resourceBind = 0;   // init MTI/BNI/HUD-table binds (host-side)
@@ -413,6 +469,9 @@ public:
   }
   // Base 768B scene palette (e758) — the source kPaletteSet transforms.
   const std::uint8_t* palette() const { return palette_; }
+  // The ramped 768B the frame's fade stage hands the DAC upload
+  // (FUN_0046d208) — the paletteDacHash snapshot field digests it.
+  const std::uint8_t* paletteDac() const { return paletteDac_; }
   std::uint32_t& rng() { return rng_; }
 
 private:
@@ -452,9 +511,21 @@ private:
   // the ordinary record driver (objectAnimTickDt).
   void animStep(DynamicObject& o, float dt);
   void logAnimTick(const DynamicObject& o, char body);
+  void paletteRamp(int mode);                   // fill paletteDac_ per
+                                                // the OBSERVED fade arms
+  void project6b4f8(const float v[3], float out[6]) const;
+                                                // {x',y',z',sx,sy,flags}
+                                                // — point x camProj_ +
+                                                // clip flags + fill fn
   void backdropScroll();                        // e684
+  void emitDrawList();                          // e100 — records + flush
+  void emitHud();                               // 17e20
+  void hudBlit(int tag, int srcOff, float x, float y,
+               float w, float h, float srcStride);  // 185fc seam
+  void limiterRun(std::uint32_t nowMs);         // 2fb68 -> 2fcd0
+  void limiterInit();                           // 2fb30 — table reset
   void emitFrameDraw();                         // e684 + e100 + 1cb44 +
-                                                // 17e20 seam + present
+                                                // 17e20 + present
   // -- TELETYPE queue service (Phase 19A.2D — OBSERVED 0x41cxxx) ------
   // The native owns the flat block 0x54b7a4..0x54b834: two 36-byte
   // line buffers, four scalars, the ring indices and the 4x0x0c queue
@@ -538,6 +609,9 @@ private:
   std::int32_t penBase_ = 0, penTarget_ = 0;    // e74c/e750
   float penT_ = 0.0f;                           // e754
   std::uint8_t palette_[768] = {};              // e758 (+0xc0 PAL half)
+  std::uint8_t paletteDac_[768] = {};           // the ramped 768B the
+                                                // native hands
+                                                // FUN_0046d208
   float fade_ = 0.0f;                           // ea9c
   DynamicObject* hero_ = nullptr;               // eab4
   DynamicObject* escort_ = nullptr;             // eab8
@@ -556,11 +630,45 @@ private:
   // Camera/view globals.
   float upRef_[3] = {0.0f, 0.0f, -1.0f};        // 49b5a8 (init {0,0,-1})
   float camView_[12] = {};                      // 540bb0 world->view
+  float camViewPrev_[12] = {};                  // 49b604 — the saved
+                                                // pre-update copy e684
+                                                // diffs against (init'd
+                                                // at 0x42b4d0)
   float camProj_[12] = {};                      // 540b80 proj-scaled view
   float camPos_[3] = {};                        // 540b28 eye
   float projScale_[2] = {};                     // 540bf0/540bf4
-  float bgScroll_[2] = {};                      // e684 accumulators
+  // 0x540b68/0x540b58 — sprite-size numerator (i32 600) and the 2.4f
+  // zoom denominator the camera writes every frame (2de28:4e..5a).
+  int spriteSizeNum_ = 600;
+  float projSizeF_ = 2.4f;
+  std::int32_t bgScroll_[2] = {};               // e684 accumulators —
+                                                // [0]=U 0x49b5fc,
+                                                // [1]=V 0x49b600 (the
+                                                // post-wrap toroidal
+                                                // i32s)
   float lastLookT_ = 0.0f;                      // last cameraAt t arg
+  // Phase 19A.2F draw-stage globals.
+  std::int32_t drawDue_ = 1;                    // 0x5414d4 — draw gate.
+                                                // Mode-5 init leaves it
+                                                // untouched (no write in
+                                                // 42b270's span); BSS
+                                                // cold-boot is 0 but the
+                                                // dispatcher's 4346e8
+                                                // inits set it first —
+                                                // the established harness
+                                                // contract arms it.
+  std::int32_t hudBlink_ = 0;                   // 0x49a8dc
+  // Limiter (FUN_0042fb68 path). limiter_[6] = the 0x49b6e4 tick record
+  // {mul f32, t1 divisor, t2 tick-delta, t3 EMA, t4 = t3*(1/30) fade
+  // delta, t5 remainder}; base_/target_ = 0x49b700/0x49b704 ms window;
+  // lastMs_ = the 46c650 clock sample 2fcd0 consumes; limSpan_ counts
+  // the draw-off frames the 2fb68 wrapper observes (the accum+50<budget
+  // stall accounting); limInSeq_/limTick_ are the 42fcc0 armed-timing
+  // bookkeeping the wrapper adds.
+  std::uint32_t limiter_[6] = {};
+  std::uint32_t limiterBase_ = 0, limiterTarget_ = 0;
+  std::uint32_t lastMs_ = 0;
+  int limSpan_ = 0, limInSeq_ = 0, limTick_ = 0;
   // Proto/anim bindings (asset views).
   StreamAssets assets_;
   // Pool + freelist (0x4f0740 / 0x540ed0).

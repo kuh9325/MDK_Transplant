@@ -26316,7 +26316,9 @@ void test_stream_step() {
     CHECK(s.seams().twinSync == 0);           // no twin
     CHECK(s.seams().backdrop == 1 && s.seams().drawList == 1);
     CHECK(s.seams().listener == 1);
-    CHECK(s.seams().limiter == 2);            // init + step
+    // init's 2fb30 + step's 2fb68 + the nested 2fb30 re-init inside
+    // 2fcd0's first-call arm (0x49b700==0 -> re-init the table).
+    CHECK(s.seams().limiter == 3);
     // +0x11c stamp: low word == frame tick (1) after dispatch.
     const DynamicObject& h = s.objectAt(s.snapshot().heroIdx);
     CHECK((h.behaviorByte & 0xffff) == 1);
@@ -27980,6 +27982,395 @@ void test_stream_completion() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19A.2F — the Mode-5 draw-stage core: paletteDac ramps, 6b4f8
+// projection/fill, e684 backdrop accumulators, e100 draw records
+// (model immediate / sprite deferred far-first), 17e20 HUD digits,
+// 2fb68 limiter state, and the 0x5414d4 draw gate. All synthetic —
+// real-course execution still goes through the owner-play gate.
+// ---------------------------------------------------------------------------
+void test_stream_draw() {
+  using mdk::DynamicObject;
+  using mdk::StreamScene;
+  using mdk::StreamEvent;
+  std::uint8_t pal[0x240], sys[0xc0], anims[5 * kStreamAnimRec] = {};
+  for (int i = 0; i != 0x240; ++i) pal[i] = static_cast<std::uint8_t>(i);
+  for (int i = 0; i != 0xc0; ++i) sys[i] = static_cast<std::uint8_t>(255 - i);
+  mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+  a.hudIconTag = 90;  a.hudIconW = 32; a.hudIconH = 16;
+  a.hudDigitTag = 91; a.hudDigitW = 80; a.hudDigitH = 12;
+  mdk::StreamInput in{};
+  const float dt = std::bit_cast<float>(0x3d088889u);   // 0x49b6f4 = 1/30
+
+  // --- paletteDac_: base install + the four ramp arms --------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    // init's 2fc08 arm copies palette_ verbatim (mode 0).
+    CHECK(s.paletteDac()[0] == sys[0]);
+    CHECK(s.paletteDac()[0xc0] == pal[0]);
+    CHECK(s.paletteDac()[0x2ff] == pal[0x23f]);
+    // fade==1.0 && !complete skips the transform — dac unchanged.
+    s.fade_ = 1.0f;
+    s.clearEvents();
+    CHECK(s.step(in, dt));
+    CHECK(s.snapshot().paletteDacHash != 0);
+
+    // mode 1 (final dark ramp): u8(trunc(pal*fade)).
+    StreamScene s2;
+    CHECK(s2.init(a, 4, 0, 0x9abcu, 100));   // isFinal
+    s2.fade_ = 0.5f;
+    s2.paletteRamp(1);
+    for (int i = 0; i != 768; ++i)
+      CHECK(s2.paletteDac()[i] ==
+            static_cast<std::uint8_t>(static_cast<int>(
+                std::trunc(s2.palette_[i] * 0.5))));
+
+    // mode 2 (non-final): u8(trunc(pal*fade + (fade-1)*255)) — the
+    // (fade-1) term is negative below fade 1: low-byte wrap observed.
+    s2.paletteRamp(2);
+    for (int i = 0; i != 768; ++i)
+      CHECK(s2.paletteDac()[i] ==
+            static_cast<std::uint8_t>(static_cast<int>(std::trunc(
+                s2.palette_[i] * 0.5 + (0.5 - 1.0) * 255.0))));
+
+    // mode 3 (death, fade<=1): R = u8(trunc(fade*256)) on every
+    // triplet; G/B = u8(trunc(pal*fade)).
+    s2.paletteRamp(3);
+    const std::uint8_t r3 = static_cast<std::uint8_t>(
+        static_cast<int>(std::trunc(0.5 * 256.0)));
+    CHECK(r3 == 128);
+    for (int i = 0; i != 768; i += 3) {
+      CHECK(s2.paletteDac()[i] == r3);
+      CHECK(s2.paletteDac()[i + 1] ==
+            static_cast<std::uint8_t>(static_cast<int>(
+                std::trunc(s2.palette_[i + 1] * 0.5))));
+      CHECK(s2.paletteDac()[i + 2] ==
+            static_cast<std::uint8_t>(static_cast<int>(
+                std::trunc(s2.palette_[i + 2] * 0.5))));
+    }
+
+    // mode 3 quirk: fade==1.0 -> R = low byte of 256 = 0.
+    s2.fade_ = 1.0f;
+    s2.paletteRamp(3);
+    CHECK(s2.paletteDac()[0] == 0 && s2.paletteDac()[3] == 0);
+
+    // mode 4 (death, fade>1): k = trunc((2-fade)*255); R =
+    // min(255, pal+k); G/B raw.
+    s2.fade_ = 1.5f;
+    s2.paletteRamp(4);
+    const int k4 = static_cast<int>(std::trunc((2.0 - 1.5) * 255.0));
+    CHECK(k4 == 127);
+    for (int i = 0; i != 768; i += 3) {
+      const int r = static_cast<int>(s2.palette_[i]) + k4;
+      CHECK(s2.paletteDac()[i] ==
+            (r > 0xff ? 0xff : static_cast<std::uint8_t>(r)));
+      CHECK(s2.paletteDac()[i + 1] == s2.palette_[i + 1]);
+      CHECK(s2.paletteDac()[i + 2] == s2.palette_[i + 2]);
+    }
+  }
+
+  // --- project6b4f8: fill constants + clip flags -------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    // camProj_ = translate +z 500 -> v' = v + (0,0,500).
+    for (int i = 0; i != 12; ++i) s.camProj_[i] = 0.0f;
+    s.camProj_[0] = s.camProj_[5] = s.camProj_[10] = 1.0f;
+    s.camProj_[11] = 500.0f;
+    float out[6] = {};
+    const float v0[3] = {60.0f, 30.0f, -400.0f};     // z' = 100
+    s.project6b4f8(v0, out);
+    CHECK(out[2] == 100.0f);
+    CHECK(out[5] == 0.0f);                            // no clip flags
+    CHECK(near(out[3], (60.0 + 100.0) / 100.0 * 299.95 + 0.05, 1e-3));
+    CHECK(near(out[4], (30.0 + 100.0) / 100.0 * 180.40 + 0.05, 1e-3));
+    // flags: y'<-z' -> bit1, x'>z' -> bit2.
+    const float v1[3] = {200.0f, -150.0f, -400.0f};   // x'=200,y'=-150,z'=100
+    s.project6b4f8(v1, out);
+    CHECK(std::bit_cast<std::uint32_t>(out[5]) == (2u | 4u));
+    // y'>z' -> bit0.
+    const float v2[3] = {0.0f, 400.0f, -400.0f};      // y'=400>z'=100
+    s.project6b4f8(v2, out);
+    CHECK(std::bit_cast<std::uint32_t>(out[5]) == 1u);
+    // x'<-z' only checked when x'<=z': x'=200>z'=100 skips bit3 even
+    // though x' < -z' is impossible here; check the z'<0 both-set
+    // case below. Near clip: z'=0.01 -> bit4, then fill still runs
+    // (z'!=0) overwriting the zeroed sx/sy.
+    const float v3[3] = {0.0f, 0.0f, -499.99f};       // z' = 0.01
+    s.project6b4f8(v3, out);
+    CHECK(std::bit_cast<std::uint32_t>(out[5]) == 0x10u);
+    CHECK(near(out[3], 1.0 * 299.95 + 0.05, 1e-3));
+    CHECK(near(out[4], 1.0 * 180.40 + 0.05, 1e-3));
+    // z' == 0: fill skipped, sx/sy stay 0, bit4 set.
+    const float v4[3] = {0.0f, 0.0f, -500.0f};        // z' = 0
+    s.project6b4f8(v4, out);
+    CHECK(std::bit_cast<std::uint32_t>(out[5]) == 0x10u);
+    CHECK(out[3] == 0.0f && out[4] == 0.0f);
+    // z'<0: bit4 plus the compare arms — y'=0 > z' sets bit0, x'=0 > z'
+    // sets bit2 and skips the bit3 check entirely.
+    const float v5[3] = {0.0f, 0.0f, -501.0f};        // z' = -1
+    s.project6b4f8(v5, out);
+    CHECK(std::bit_cast<std::uint32_t>(out[5]) == (0x10u | 1u | 4u));
+    const float v6[3] = {0.0f, 0.0f, -600.0f};        // z' = -100
+    s.project6b4f8(v6, out);
+    CHECK(std::bit_cast<std::uint32_t>(out[5]) == (0x10u | 1u | 4u));
+  }
+
+  // --- backdropScroll: accumulators, wraps, event payload ----------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    // camViewPrev_ BSS-zero -> deltas 0 -> U=V=0 first call.
+    s.backdropScroll();
+    CHECK(s.bgScroll_[0] == 0 && s.bgScroll_[1] == 0);
+    const StreamEvent& e0 = s.events().back();
+    CHECK(e0.kind == StreamEvent::kBackdropBlit && e0.tag == 40);
+    CHECK(e0.f[0] == 0.0f && e0.f[1] == 0.0f);
+    // Drive a known delta: prev = identity -> accV = cv[6],
+    // accU = -cv[4].
+    float pv[12] = {};
+    pv[0] = pv[5] = pv[10] = 1.0f;
+    std::memcpy(s.camViewPrev_, pv, sizeof pv);
+    float cv[12] = {};
+    cv[0] = cv[5] = cv[10] = 1.0f;
+    cv[6] = 0.5f;                                    // -> V += 90
+    cv[4] = -0.2f;                                   // -> U += 60
+    std::memcpy(s.camView_, cv, sizeof cv);
+    s.backdropScroll();
+    CHECK(s.bgScroll_[0] == 60 && s.bgScroll_[1] == 90);
+    // U wrap >=600 and V negative wrap (600-(-U%600) / 360-(-V%360)).
+    s.bgScroll_[0] = 590; s.bgScroll_[1] = 10;
+    std::memcpy(s.camViewPrev_, pv, sizeof pv);      // prev=identity again
+    s.backdropScroll();                              // U=650->50, V=100->? 
+    // wait V: trunc(10 + 0.5*0.5*360)=trunc(10+90)=100 -> in range.
+    CHECK(s.bgScroll_[0] == 50 && s.bgScroll_[1] == 100);
+    // Negative: V' = trunc(10 - 90) = -80 -> 360 - (80 % 360) = 280.
+    cv[6] = -0.5f; cv[4] = 0.0f;
+    std::memcpy(s.camView_, cv, sizeof cv);
+    std::memcpy(s.camViewPrev_, pv, sizeof pv);
+    s.bgScroll_[1] = 10;
+    s.backdropScroll();
+    CHECK(s.bgScroll_[1] == 280);
+  }
+
+  // --- emitDrawList: model immediate vs sprite deferred order ------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    for (int i = 0; i != 12; ++i) s.camProj_[i] = 0.0f;
+    s.camProj_[0] = s.camProj_[5] = s.camProj_[10] = 1.0f;
+    s.camProj_[11] = 500.0f;
+    s.winLo_ = 0; s.winHi_ = 4;                      // buckets 2..0 drawn
+    for (auto& h : s.buckets_) h = nullptr;          // drop init's hero
+    DynamicObject* mdl = s.alloc(2, 0.0f);
+    mdl->col.elements =
+        reinterpret_cast<const mdk::CollisionElementSet*>(0x1000);
+    mdl->col.origin[0] = 10.0f; mdl->col.origin[1] = 20.0f;
+    mdl->col.origin[2] = 30.0f;
+    mdl->col.xform[0] = mdl->col.xform[4] = mdl->col.xform[8] = 1.0f;
+    // Two debris in bucket 1: far first (chain pushes to head, so the
+    // LAST spawned is walked first — near/far order comes from the key
+    // sort, not chain order).
+    DynamicObject* nearD = s.spawnDebris(1.0f, nullptr, 0.0f);
+    nearD->col.origin[2] = 200.0f - 500.0f;          // vz' = 200 (near)
+    DynamicObject* farD = s.spawnDebris(1.25f, nullptr, 0.0f);
+    farD->col.origin[2] = 300.0f - 500.0f;           // vz' = 300 (far)
+    // Marker in bucket 0 (caller binds marker_ — the e55c selector).
+    DynamicObject* mk = s.spawnMarker(0.5f);
+    s.marker_ = mk;
+    mk->col.origin[2] = 600.0f - 500.0f;             // vz' = 100
+    s.emitDrawList();
+    // Event order: bucket 2 first — the model is immediate; bucket 1's
+    // two sprites drain key-DESCENDING (far vz=300 key 8900 before
+    // near vz=200 key 8600 — comparator 0x40bd2c = keyB-keyA, the
+    // painter's back-to-front order); bucket 0's marker last.
+    int nsp = 0;
+    const StreamEvent* sprite[4] = {};
+    const StreamEvent* model = nullptr;
+    for (const auto& e : s.events()) {
+      if (e.kind == StreamEvent::kModelDraw) model = &e;
+      if (e.kind == StreamEvent::kSpriteDraw && nsp < 4)
+        sprite[nsp++] = &e;
+    }
+    CHECK(model != nullptr);
+    CHECK(model->aux == s.objIndex(mdl));
+    // f[11] = composed tz = origin.z + 500.
+    CHECK(near(model->f[11], 30.0 + 500.0, 1e-4));
+    CHECK(nsp == 3);
+    // Bucket 1 drain: farD (vz 300 -> key 8900) before nearD (8600).
+    CHECK(sprite[0] && sprite[0]->aux == s.objIndex(farD));
+    CHECK(near(sprite[0]->f[3], 300.0, 1e-3));
+    CHECK(sprite[1] && sprite[1]->aux == s.objIndex(nearD));
+    CHECK(near(sprite[1]->f[3], 200.0, 1e-3));
+    // Debris tags: {0x40, 0x40} + lightTag.
+    CHECK(sprite[0]->tag == 60);
+    CHECK(sprite[0]->f[4] == 64.0f && sprite[0]->f[5] == 64.0f);
+    // size = trunc(600*scale / (vz*2.4)) — scale from spawn is rand
+    // based; just verify >0 and consistent with the formula.
+    const double wantSize = std::trunc(
+        600.0 * farD->col.scale / (300.0 * 2.4));
+    CHECK(near(sprite[0]->f[2], wantSize, 1e-3));
+    // Marker (bucket 0): planetTag[0] img + {planetTag[1], [2]} tags.
+    CHECK(sprite[2] && sprite[2]->aux == s.objIndex(mk));
+    CHECK(sprite[2]->tag == 50);
+    CHECK(sprite[2]->f[4] == 51.0f && sprite[2]->f[5] == 52.0f);
+    // 32 e620 ribbon calls per drawn span (3 buckets here).
+    CHECK(s.seams().ribbonDraw == 32 * 3);
+    CHECK(s.seams().drawFlush == 3);
+
+    // z' < 0.05 gate: a sprite that projects behind the clip emits no
+    // event but still consumed a record (drawFlush still fires).
+    StreamScene s2;
+    CHECK(s2.init(a, 0, 0, 0x9abcu, 100));
+    s2.clearEvents();
+    for (int i = 0; i != 12; ++i) s2.camProj_[i] = 0.0f;
+    s2.camProj_[0] = s2.camProj_[5] = s2.camProj_[10] = 1.0f;
+    s2.winLo_ = 0; s2.winHi_ = 3;
+    for (auto& h : s2.buckets_) h = nullptr;
+    DynamicObject* back = s2.spawnDebris(0.5f, nullptr, 0.0f);
+    back->col.origin[2] = -100.0f;                   // vz' = -100
+    s2.emitDrawList();
+    for (const auto& e : s2.events())
+      CHECK(e.kind != StreamEvent::kSpriteDraw);
+    CHECK(s2.seams().drawFlush == 1);
+
+    // Arena cap: 70 objects in one bucket -> 6 overflow attempts.
+    StreamScene s3;
+    CHECK(s3.init(a, 0, 0, 0x9abcu, 100));
+    s3.clearEvents();
+    for (int i = 0; i != 12; ++i) s3.camProj_[i] = 0.0f;
+    s3.camProj_[0] = s3.camProj_[5] = s3.camProj_[10] = 1.0f;
+    s3.camProj_[11] = 500.0f;
+    s3.winLo_ = 0; s3.winHi_ = 3;
+    for (auto& h : s3.buckets_) h = nullptr;
+    for (int i = 0; i != 70; ++i) {
+      DynamicObject* d = s3.spawnDebris(0.5f + i * 0.001f, nullptr, 0.0f);
+      CHECK(d != nullptr);
+    }
+    s3.emitDrawList();
+    CHECK(s3.seams().drawListOverflow == 6);
+  }
+
+  // --- emitHud: icon corner + digit decomposition ------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    s.limiter_[1] = 4;                               // blink += 4
+    s.health_ = 100;
+    s.emitHud();
+    // icon: (600-32-16, 360-16-10) = (552, 334); stride = iconW.
+    CHECK(s.events().size() >= 4);
+    const StreamEvent& ic = s.events()[0];
+    CHECK(ic.kind == StreamEvent::kHudBlit && ic.tag == 90);
+    CHECK(ic.aux == 0);
+    CHECK(ic.f[0] == 552.0f && ic.f[1] == 334.0f);
+    CHECK(ic.f[2] == 32.0f && ic.f[3] == 16.0f && ic.f[4] == 32.0f);
+    // blink = (0 + 4) & 0x1f = 4; health 100 > 20 -> digits drawn.
+    CHECK(s.hudBlink_ == 4);
+    // "100": bx = 552 + 16 = 568; cx0 = 568-12 = 556; cy =
+    // 334 + (16-12)/2 = 336. digits 1,0,0 -> aux = 8,0,0.
+    CHECK(s.events()[1].aux == 8 && s.events()[1].f[0] == 556.0f);
+    CHECK(s.events()[2].aux == 0 && s.events()[2].f[0] == 564.0f);
+    CHECK(s.events()[3].aux == 0 && s.events()[3].f[0] == 572.0f);
+    for (int i = 1; i != 4; ++i) {
+      const StreamEvent& e = s.events()[i];
+      CHECK(e.kind == StreamEvent::kHudBlit && e.tag == 91);
+      CHECK(e.f[1] == 336.0f && e.f[2] == 8.0f && e.f[3] == 12.0f);
+      CHECK(e.f[4] == 80.0f);                        // strip stride
+    }
+    CHECK(s.events().size() == 4);                   // icon + 3 digits
+    CHECK(s.seams().hudBlit == 4);
+
+    // 2-digit value 25 -> cx0 = bx - 8 = 560; digits 2,5.
+    s.clearEvents();
+    s.health_ = 25;
+    s.emitHud();
+    CHECK(s.events().size() == 3);
+    CHECK(s.events()[1].aux == 16 && s.events()[1].f[0] == 560.0f);
+    CHECK(s.events()[2].aux == 40 && s.events()[2].f[0] == 568.0f);
+    // 1-digit 7 -> cx0 = bx - 4 = 564.
+    s.clearEvents();
+    s.health_ = 7;
+    s.emitHud();                                     // blink 8<=15 draws
+    CHECK(s.events().size() == 2);
+    CHECK(s.events()[1].aux == 56 && s.events()[1].f[0] == 564.0f);
+    // clamp at 999.
+    s.clearEvents();
+    s.health_ = 1234;
+    s.emitHud();
+    CHECK(s.events().size() == 4);
+    CHECK(s.events()[1].aux == 72);                  // digit 9 * 8
+    // blink gate: blink > 15 && health <= 20 -> digits skipped.
+    StreamScene s2;
+    CHECK(s2.init(a, 0, 0, 0x9abcu, 100));
+    s2.clearEvents();
+    s2.limiter_[1] = 20;                             // blink = 20 > 15
+    s2.health_ = 10;
+    s2.emitHud();
+    CHECK(s2.events().size() == 1);                  // icon only
+    CHECK(s2.hudBlink_ == 20);
+  }
+
+  // --- limiterRun: init record + 2fcd0/2fdc8 semantics -------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    const mdk::StreamSnapshot s0 = s.snapshot();
+    CHECK(s0.limiter[0] == 0x3f800000u);             // mul = 1.0f
+    CHECK(s0.limiter[1] == 1 && s0.limiter[2] == 4); // t1 = 1, t2 = 4
+    CHECK(s0.limiter[3] == 0x3f800000u);             // t3 = 1.0f
+    CHECK(s0.limiter[4] ==
+          std::bit_cast<std::uint32_t>(static_cast<float>(
+              1.0 * static_cast<double>(
+                  std::bit_cast<float>(0x3d088889u)))));
+    CHECK(s0.limiter[5] == 0);
+    CHECK(s0.limiterBase == 0 && s0.limiterTarget == 0);
+    // First call (base==0 arm): re-init + base=ms, target=ms+34.
+    s.limiterRun(1000);
+    CHECK(s.limiterBase_ == 1000 && s.limiterTarget_ == 1034);
+    CHECK(s.limiter_[1] == 1 && s.limiter_[2] == 4); // re-init'ed
+    // 33ms later: t2 = 33*120/1000 = 3; EMA t3 = 1*.75 + .25*f32(3*.25)
+    // = 0.9375; t5 = 3 -> t1 = 0 -> clamp {1, t5=0}; base += trunc(
+    // 3*8.333333333333334) = +25 -> 1025; target 1059.
+    s.limiterRun(1033);
+    CHECK(s.limiter_[2] == 3);
+    CHECK(s.limiter_[0] == 0x3f400000u);             // mul = 0.75f
+    CHECK(std::bit_cast<float>(s.limiter_[3]) == 0.9375f);
+    CHECK(s.limiter_[1] == 1 && s.limiter_[5] == 0);
+    CHECK(s.limiterBase_ == 1025 && s.limiterTarget_ == 1059);
+    CHECK(s.drawDue_ == 1);
+    // Steady 33ms frames: t2=3 -> t1 stays 1 (30fps -> divisor 1).
+    s.limiterRun(1057);
+    CHECK(s.limiter_[1] == 1);
+  }
+
+  // --- frame order + draw gate -------------------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    CHECK(s.step(in, dt));
+    // OBSERVED order inside the draw block: backdrop, draw list,
+    // HUD, present — all after the fade's kPaletteSet.
+    int ipal = -1, ibg = -1, ihud = -1, ipres = -1;
+    for (int i = 0; i != static_cast<int>(s.events().size()); ++i) {
+      const auto k = s.events()[i].kind;
+      if (k == StreamEvent::kPaletteSet) ipal = i;
+      if (k == StreamEvent::kBackdropBlit && ibg < 0) ibg = i;
+      if (k == StreamEvent::kHudBlit && ihud < 0) ihud = i;
+      if (k == StreamEvent::kPresent) ipres = i;
+    }
+    CHECK(ipal >= 0 && ibg > ipal && ihud > ibg && ipres > ihud);
+    CHECK(ipres == static_cast<int>(s.events().size()) - 1);
+    // drawDue stays armed; stateHash untouched by draw diagnostics.
+    CHECK(s.snapshot().drawDue == 1);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -28088,6 +28479,7 @@ int main() {
   test_stream_animator();
   test_stream_teletype();
   test_stream_completion();
+  test_stream_draw();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

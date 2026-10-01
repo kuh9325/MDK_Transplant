@@ -360,6 +360,13 @@ void StreamScene::pathFrame(float out[12], float t0, float t1) const {
 //   1/(zoom*0.5f), 1/(zoom*360f*(1/600)f*0.5)
 // with the constants above (600x360 viewport, zoom 2.4).
 void StreamScene::cameraAt(const float eye[3], float t) {
+  // 2de38..5a — the view-config globals are rewritten every call:
+  // 0x540b58/0x540b64 = 2.4f zoom, 0x540b68/0x540b6c = 600x360
+  // viewport, 0x540b70/0x540b74 = 300x180 center, 0x540b78/7c = 0.
+  // The sprite emitters read 0x540b68 (i32 numerator) and 0x540b58
+  // (f32 denominator) — surfaced as fields so the size math is exact.
+  spriteSizeNum_ = 600;
+  projSizeF_ = kCamZoom;
   float look[3], d[3], s[3], up[3];
   pathPos(look, t);
   d[0] = static_cast<float>(static_cast<double>(look[0]) - eye[0]);
@@ -885,6 +892,15 @@ bool StreamScene::init(const StreamAssets& a, int course, int skill,
   penBase_ = 0; penTarget_ = 0;
   penT_ = 0.0f;
   std::memset(palette_, 0, sizeof palette_);
+  std::memset(paletteDac_, 0, sizeof paletteDac_);
+  drawDue_ = 1;                       // 0x5414d4 — no write inside
+                                      // 42b270's span; the dispatcher's
+                                      // prior mode inits armed it
+                                      // (cold-BSS would be 0 — the
+                                      // harness contract takes the
+                                      // armed lifecycle value)
+  hudBlink_ = 0;                      // 0x49a8dc — BSS at mode entry
+  lastMs_ = 0; limSpan_ = 0; limInSeq_ = 0; limTick_ = 0;
   fade_ = 0.0f;                       // wiped, then stored again (b33e)
   hero_ = escort_ = stray_ = twin_ = marker_ = pickup_ = nullptr;
   driftMax_ = 0.0f;
@@ -983,9 +999,10 @@ bool StreamScene::init(const StreamAssets& a, int course, int skill,
   // install, then the 64-step 0x406d84 crossfade ramp — all host-side
   // DAC ops; counted as seams, and the resulting base install is
   // emitted as the kPaletteSet aux=0 event. ---
-  ++seams_.limiter;        // 0x42fb30 — limiter init
+  limiterInit();           // 0x42fb30(0x49b6e4) — the tick record reset
   ++seams_.resourceBind;   // 0x41c884 — palette DAC buffer alloc
   ++seams_.paletteRamp;    // staging + 06b80 + 64x06d84 ramp
+  paletteRamp(0);          // 0x413b40 base install -> paletteDac_
   emit(StreamEvent::kPaletteSet, 0, 0, 1.0f);
 
   // --- camera reset (ba03..ba40) ---
@@ -1643,7 +1660,323 @@ void StreamScene::animStep(DynamicObject& o, float dt) {
   }
   logAnimTick(o, letter);
 }
-void StreamScene::backdropScroll() { ++seams_.backdrop; }
+// ---------------------------------------------------------------------------
+// Phase 19A.2F — the draw stage (FUN_0042e684 / e100 / 17e20 / 2fb68).
+// ---------------------------------------------------------------------------
+
+// FUN_0042fb30 — the tick-record init (0x49b6e4):
+//   {+0x00 mul=1.0f, +0x04 t1=1, +0x08 t2=4, +0x0c t3=1.0f,
+//    +0x10 t4=f32(1.0f*1/30f), +0x14 t5=0}.
+// The frame's 2fb68 normal arm calls it only when 0x49b700==0 (the
+// base never having been armed) — init calls it once directly.
+void StreamScene::limiterInit() {
+  ++seams_.limiter;
+  limiter_[0] = 0x3f800000u;                       // mul = 1.0f
+  limiter_[3] = 0x3f800000u;                       // t3  = 1.0f
+  limiter_[2] = 4;                                 // t2
+  limiter_[1] = 1;                                 // t1
+  limiter_[4] = std::bit_cast<std::uint32_t>(      // t4 = f32(t3*dt30)
+      static_cast<float>(static_cast<double>(1.0f) *
+                         static_cast<double>(
+                             std::bit_cast<float>(0x3d088889u))));
+  limiter_[5] = 0;                                 // t5
+}
+
+// FUN_0042fb68 normal arm (0x49b284==0 — demo flags are dead in mode
+// 5) -> FUN_0042fcd0(0x49b6e4). OBSERVED semantics:
+//   0x5414d4 = 1 unconditionally (drawDue for the NEXT frame).
+//   2fcd0: base==0 -> 2fb30(rec) + base=ms, target=ms+34, return
+//   (no t2/EMA on the arming call); ms<base -> base=ms; the pace-wait
+//   (5414ac && 5414d4 && ms<target) is dead — 0x5414ac is only armed
+//   by the 422558 wrapper's own call. t2 = delta*120/1000 (u32 div).
+//   2fdc8: mul=f32(t2*0.25); t3=f32(t3*0.75 + 0.25*mul);
+//   t4=f32(t3*1/30f); t5+=t2; t1=t5>>2; t5&=3; t1<1 -> {1,0};
+//   t3>4.0 || t1>4 -> resync {t1=4, t3=4.0f, t4=f32(4*1/30f), t5=0}.
+//   base = trunc(f64(base) + t2*8.333333333333334); target = base+34.
+// t4 (0x49b6f4) is the SAME dword the fade stage consumes as its
+// frame delta — the port's caller-supplied dtSec models that global.
+void StreamScene::limiterRun(std::uint32_t nowMs) {
+  ++seams_.limiter;
+  drawDue_ = 1;                                    // 42fc9c
+  if (limiterBase_ == 0) {                         // 49b700==0 arm
+    limiterInit();                                 //   nested 2fb30
+    limiterBase_ = nowMs;                          //   49b700 = ms
+    limiterTarget_ = nowMs + 34;                   //   49b704 = ms+0x22
+    lastMs_ = nowMs;
+    return;
+  }
+  lastMs_ = nowMs;
+  if (nowMs < limiterBase_) limiterBase_ = nowMs;  // fd55 back-fix
+  // (the 5414ac pace-wait is skipped — dead in mode 5)
+  const std::uint32_t delta = nowMs - limiterBase_;
+  const std::uint32_t t2 = delta * 120u / 1000u;   // u32 like SHL/SUB+DIV
+  limiter_[2] = t2;                                // rec+8
+  // 2fdc8 — the EMA/divisor update.
+  const float mul = static_cast<float>(            // rec+0 = f32(t2*0.25)
+      static_cast<double>(t2) * 0.25);
+  limiter_[0] = std::bit_cast<std::uint32_t>(mul);
+  const float t3 = static_cast<float>(             // rec+0xc
+      static_cast<double>(std::bit_cast<float>(limiter_[3])) * 0.75 +
+      0.25 * static_cast<double>(mul));
+  limiter_[3] = std::bit_cast<std::uint32_t>(t3);
+  limiter_[4] = std::bit_cast<std::uint32_t>(      // rec+0x10
+      static_cast<float>(static_cast<double>(t3) *
+                         static_cast<double>(
+                             std::bit_cast<float>(0x3d088889u))));
+  const int t5 = static_cast<int>(limiter_[5]) + static_cast<int>(t2);
+  int t1 = t5 >> 2;                                // arithmetic SAR
+  int rem = t5 & 3;
+  if (t1 < 1) { t1 = 1; rem = 0; }
+  else if (static_cast<double>(t3) > 4.0 || t1 > 4) {
+    // fe4c — 4-stall resync (EMA over 4.0 or divisor over 4).
+    t1 = 4; rem = 0;
+    limiter_[3] = 0x40800000u;                     // t3 = 4.0f
+    limiter_[4] = std::bit_cast<std::uint32_t>(
+        static_cast<float>(4.0 * static_cast<double>(
+                               std::bit_cast<float>(0x3d088889u))));
+  }
+  limiter_[1] = static_cast<std::uint32_t>(t1);
+  limiter_[5] = static_cast<std::uint32_t>(rem);
+  limiterBase_ = static_cast<std::uint32_t>(       // fild qword ->
+      static_cast<std::int64_t>(std::trunc(        //   trunc -> fistp
+          static_cast<double>(t2) * 8.333333333333334 +
+          static_cast<double>(limiterBase_))));
+  limiterTarget_ = limiterBase_ + 34;
+}
+
+// FUN_0042e684 — the backdrop scroll. f80 chains, RC=11 truncation
+// (47d59a), signed idiv wraps, OBSERVED:
+//   accV = camView[6]*prev[10] - camView[10]*prev[6]   (row1.z/row2.z)
+//   accU = camView[0]*prev[4]  - camView[4]*prev[0]    (row0.x/row1.x)
+//   V(0x49b600) = trunc(V + (accV*0.5)*360.0f)
+//   U(0x49b5fc) = trunc(U + (accU*0.5)*600.0f)   — stereo U -= 49b578
+//   (541544/541548 unwritten in mode 5 — skipped), then camView is
+//   copied to 49b604, then the wraps: U<0 -> 600-(-U%600),
+//   U>=600 -> U%600; same for V mod 360 (U==-600 wraps to 600 — the
+//   negative arm is written before the bound re-check, OBSERVED).
+//   The toroidal blit itself is host-side; the event carries the
+//   post-wrap accumulators and the BG tag.
+void StreamScene::backdropScroll() {
+  ++seams_.backdrop;
+  const double accV =
+      static_cast<double>(camView_[6]) * camViewPrev_[10] -
+      static_cast<double>(camView_[10]) * camViewPrev_[6];
+  const double accU =
+      static_cast<double>(camView_[0]) * camViewPrev_[4] -
+      static_cast<double>(camView_[4]) * camViewPrev_[0];
+  int V = static_cast<int>(std::trunc(
+      static_cast<double>(bgScroll_[1]) + accV * 0.5 * 360.0));
+  int U = static_cast<int>(std::trunc(
+      static_cast<double>(bgScroll_[0]) + accU * 0.5 * 600.0));
+  std::memcpy(camViewPrev_, camView_, sizeof camViewPrev_);
+  if (U < 0) U = 600 - (-U % 600);
+  else if (U >= 600) U %= 600;
+  if (V < 0) V = 360 - (-V % 360);
+  else if (V >= 360) V %= 360;
+  bgScroll_[0] = U;
+  bgScroll_[1] = V;
+  StreamEvent ev;
+  ev.kind = StreamEvent::kBackdropBlit;
+  ev.tag = assets_.bgTag;
+  ev.f[0] = static_cast<float>(U);
+  ev.f[1] = static_cast<float>(V);
+  events_.push_back(ev);
+}
+
+// FUN_0046b4f8 — project v through camProj_ (0x540b80) into the 6-word
+// record block {x',y',z',sx,sy,flags}:
+//   flags: bit0 y'>z', bit1 y'<-z', bit2 x'>z', bit3 x'<-z',
+//          bit4 (0x10) z'<f64 0.05 — near-clip zeroes sx/sy first.
+//   z' != 0 -> the selected fill fn (0x49bbe8 = 46ad20 in mode 5)
+//   computes sx = f32((x'+z')/z' * 299.95 + 0.05),
+//             sy = f32((y'+z')/z' * 180.40 + 0.05)
+//   — overwriting the near-clip zeros (OBSERVED: the fill runs even
+//   when bit4 was set, only z'==0 skips it).
+void StreamScene::project6b4f8(const float v[3], float out[6]) const {
+  point6afe4(v, camProj_, out);
+  const float xc = out[0], yc = out[1], zc = out[2];
+  std::uint32_t flags = 0;
+  // b559..b5da — mov (not or) arms: {y'>z' -> 1; -z'<=y' -> 0; else 2},
+  // then x'>z' -> |=4 else x'<-z' -> |=8 (the |8 arm is SKIPPED when
+  // |4 was taken — 46b580's jbe, so both never set together).
+  if (yc > zc) flags = 1;
+  else if (-zc <= yc) flags = 0;
+  else flags = 2;
+  if (xc > zc) flags |= 4;
+  else if (xc < -zc) flags |= 8;
+  out[3] = out[4] = 0.0f;
+  if (zc < 0.05) flags |= 0x10;
+  if (zc != 0.0f) {
+    out[3] = static_cast<float>(
+        (static_cast<double>(xc) + zc) / static_cast<double>(zc) *
+            299.95 + 0.05);
+    out[4] = static_cast<float>(
+        (static_cast<double>(yc) + zc) / static_cast<double>(zc) *
+            180.4 + 0.05);
+  }
+  out[5] = std::bit_cast<float>(flags);
+}
+
+// FUN_0042e100 — the object draw list. OBSERVED structure:
+//   cur = (winHi-1)&0x1f; stop = winLo&0x1f — exit when equal BEFORE
+//   decrementing, so buckets winHi-2..winLo are processed (the
+//   winHi-1 bucket's ring points feed the first ribbon span but its
+//   objects are never drawn — OBSERVED quirk).
+//   Per bucket: project 16 ring points (6b4f8 x16 — ribbon input,
+//   bodies deferred to 19A.2G), 32x e620 ribbon emits (counted only),
+//   then the object chain appends 0x30-stride records into a shared
+//   64-entry stack arena (count persists ACROSS buckets):
+//     +0x0c model != 0 -> fn=0x455e24, flag=0 — compose
+//       camProj o obj+0xac -> obj+0x7c at record-build time
+//     +0x0c == 0 -> fn=e55c (obj == marker_) else e49c, flag=1 —
+//       rec+8 = proj z' (the sort key source)
+//   then one FUN_00409a00 flush per bucket that appended >=1 record:
+//   with 0x541500==1 flag-0 records call fn in chain order, flag-1
+//   records defer (key = vz*3.0f + 8000.0f, 0x499f88==0 form) and the
+//   drain qsorts DESCENDING by key-bit i32 — far-first painter order
+//   (comparator 0x40bd2c returns keyB-keyA).
+void StreamScene::emitDrawList() {
+  ++seams_.drawList;
+  const int span = winHi_ - winLo_;
+  if (span <= 1) return;                  // (winHi-1)&31 == winLo&31
+  seams_.ribbonDraw += 32 * (span - 1);   // e620 calls — 19A.2G bodies
+  int recCount = 0;                       // shared arena [-0x1c]
+  for (int s = winHi_ - 2; s >= winLo_; --s) {
+    const int bucketStart = recCount;     // [-0x48]
+    // flag-1 records deferred for this bucket's flush.
+    struct Pend { float key; const DynamicObject* o; float pr[6]; };
+    std::vector<Pend> deferred;
+    for (DynamicObject* o = buckets_[s & 0x1f]; o; o = streamNext(o)) {
+      if (recCount >= 64) {               // arena 0xc00/0x30
+        ++seams_.drawListOverflow;        // each past-arena append
+        continue;
+      }
+      ++recCount;
+      if (o->col.elements) {              // +0x0c != 0 -> model 55e24
+        const float m[12] = {
+            o->col.xform[0], o->col.xform[1], o->col.xform[2],
+            o->col.origin[0],
+            o->col.xform[3], o->col.xform[4], o->col.xform[5],
+            o->col.origin[1],
+            o->col.xform[6], o->col.xform[7], o->col.xform[8],
+            o->col.origin[2]};
+        StreamEvent ev;
+        ev.kind = StreamEvent::kModelDraw;
+        ev.aux = objIndex(o);
+        compose6aeb0(camProj_, m, ev.f);
+        events_.push_back(ev);
+      } else {                            // sprite — flag 1 deferred
+        Pend p;
+        p.o = o;
+        project6b4f8(o->col.origin, p.pr);
+        p.key = static_cast<float>(static_cast<double>(p.pr[2]) * 3.0 +
+                                   8000.0);
+        deferred.push_back(p);
+      }
+    }
+    if (recCount == bucketStart) continue;    // e374 — no flush
+    ++seams_.drawFlush;                        // 09a00 for this bucket
+    // Deferred drain — qsort by key bits descending (i32 compare —
+    // OBSERVED far-first; comparator 0x40bd2c returns keyB-keyA).
+    std::stable_sort(deferred.begin(), deferred.end(),
+                     [](const Pend& a, const Pend& b) {
+                       return std::bit_cast<std::int32_t>(a.key) >
+                              std::bit_cast<std::int32_t>(b.key);
+                     });
+    for (const Pend& p : deferred) {
+      const float zc = p.pr[2];
+      // e49c/e55c re-project + gate z' >= f64 0.05 at EMIT time.
+      if (static_cast<double>(zc) < 0.05) continue;
+      const DynamicObject& o = *p.o;
+      const int sx = static_cast<int>(std::trunc(p.pr[3]));
+      const int sy = static_cast<int>(std::trunc(p.pr[4]));
+      const int size = static_cast<int>(std::trunc(
+          static_cast<double>(spriteSizeNum_) *
+              static_cast<double>(o.col.scale) /
+              (static_cast<double>(zc) *
+               static_cast<double>(projSizeF_))));
+      const bool marker = (&o == marker_);
+      StreamEvent ev;
+      ev.kind = StreamEvent::kSpriteDraw;
+      ev.tag = static_cast<int>(
+          reinterpret_cast<std::intptr_t>(o.field108));
+      ev.aux = objIndex(&o);
+      ev.f[0] = static_cast<float>(sx);
+      ev.f[1] = static_cast<float>(sy);
+      ev.f[2] = static_cast<float>(size);
+      ev.f[3] = zc;
+      ev.f[4] = marker ? static_cast<float>(assets_.planetTag[1])
+                       : 64.0f;   // tag5/tag4 = 0x40 regular
+      ev.f[5] = marker ? static_cast<float>(assets_.planetTag[2])
+                       : 64.0f;
+      events_.push_back(ev);
+    }
+  }
+}
+
+// FUN_004185fc — one transparent-keyed indexed blit. Event payload is
+// the resolved {dst, w, h, src stride, key} — key is always 0 in the
+// mode-5 HUD call sites.
+void StreamScene::hudBlit(int tag, int srcOff, float x, float y,
+                          float w, float h, float srcStride) {
+  ++seams_.hudBlit;
+  StreamEvent ev;
+  ev.kind = StreamEvent::kHudBlit;
+  ev.tag = tag;
+  ev.aux = srcOff;
+  ev.f[0] = x;
+  ev.f[1] = y;
+  ev.f[2] = w;
+  ev.f[3] = h;
+  ev.f[4] = srcStride;
+  ev.f[5] = 0.0f;
+  events_.push_back(ev);
+}
+
+// FUN_00417e20 — the mode-5 HUD. The 0x5414a0/a4/a8 scroll globals are
+// set to 1000.0f at dispatcher entry (0x401506) and have no mode-5
+// writers, so the (1-a0/a4)*2pi / (1-a8/a4)*2pi envelope collapses to
+// zero and the resync arm never fires — the SC_STAT icon draws at its
+// fixed corner position: x = 600 - w - 0x10, y = 360 - h - 0xa
+// (OBSERVED). Blink phase 0x49a8dc = (49a8dc + limiter t1) & 0x1f
+// AFTER the icon, before the digit gate. Digit gate: 0x540e10 <= 0 in
+// mode 5 (mount timer) so digits draw when health > 20 or blink <= 15
+// — the FUN_004181c0 printer: value >= 1000 -> 999; base x -12/-8/-4
+// for 3/2/1 digits; divisors 100/10/1; each cell 8px wide, blit img =
+// strip + digit*8, dims {8, digitH}, src stride = strip rec w.
+void StreamScene::emitHud() {
+  hudBlit(assets_.hudIconTag, 0,
+          static_cast<float>(600 - assets_.hudIconW - 16),
+          static_cast<float>(360 - assets_.hudIconH - 10),
+          static_cast<float>(assets_.hudIconW),
+          static_cast<float>(assets_.hudIconH),
+          static_cast<float>(assets_.hudIconW));
+  hudBlink_ = (hudBlink_ + static_cast<int>(limiter_[1])) & 0x1f;
+  if (!(health_ > 0x14 || hudBlink_ <= 15)) return;
+  // 4181c0 — health digits under the icon.
+  int v = health_;
+  int div;
+  float cx;
+  const float cy = static_cast<float>(
+      360 - (assets_.hudIconH + 10) +
+      ((assets_.hudIconH - assets_.hudDigitH) >> 1));
+  const float bx = static_cast<float>(
+      600 - (assets_.hudIconW + 16) + (assets_.hudIconW >> 1));
+  if (v >= 1000) { v = 999; cx = bx - 12; div = 100; }
+  else if (v >= 100) { cx = bx - 12; div = 100; }
+  else if (v >= 10) { cx = bx - 8; div = 10; }
+  else { cx = bx - 4; div = 1; }
+  for (;;) {
+    if (v < 0) break;
+    const int digit = v / div;        // idiv — signed
+    if (div == 1) v = -1;             // OBSERVED loop-exit quirk
+    else { v -= digit * div; div /= 10; }
+    hudBlit(assets_.hudDigitTag, digit * 8, cx, cy, 8.0f,
+            static_cast<float>(assets_.hudDigitH),
+            static_cast<float>(assets_.hudDigitW));
+    cx += 8.0f;
+  }
+}
 
 // ===========================================================================
 // TELETYPE queue service — Phase 19A.2D. FUN_0041cf5c (clear),
@@ -1887,6 +2220,73 @@ void StreamScene::teletypeService(int drawEnable) {
   ttLog_.push_back(tick);
 }
 
+// The fade stage's 768-byte palette transforms — the four OBSERVED
+// arms at 0x42cd2b/0x42ce9f/0x42ce24/0x42cda3 plus the base install.
+// Source = palette_ (0x4ed758); result lands in paletteDac_ — the
+// local stack buffer the native memsets/transforms then hands to
+// FUN_0046d208. All multiplies are f80 chains; truncations are the
+// RC=11 47d59a FRNDINT and stores take the LOW BYTE of the i32 —
+// including the >255 wrap (mode 1/2/3) and the mode-3 R channel's
+// fade*256 low-byte (OBSERVED: at fade==1.0 R wraps 256->0).
+//   0: base install (0x413b40) — palette_ verbatim
+//   1: isFinal black ramp  — buf[i] = u8(trunc(pal[i]*fade))
+//   2: non-final ramp      — buf[i] = u8(trunc(pal[i]*fade +
+//                                               (fade-1)*255.0))
+//                            (fsubrp gives fade-1.0; NEGATIVE at
+//                            fade<1 — the low-byte wrap is OBSERVED)
+//   3: death, fade<=1      — R=u8(trunc(f64(fade)*256.0)) for ALL
+//                            entries; G/B = u8(trunc(pal*fade))
+//   4: death, fade>1       — R = min(255, pal+k) where
+//                            k = trunc((2-f64(fade))*255.0) (signed
+//                            add, low-byte store on <=0xff);
+//                            G/B = raw palette bytes
+void StreamScene::paletteRamp(int mode) {
+  const double fd = static_cast<double>(fade_);
+  switch (mode) {
+    case 0:
+      std::memcpy(paletteDac_, palette_, sizeof paletteDac_);
+      break;
+    case 1:
+      for (int i = 0; i != 768; ++i)
+        paletteDac_[i] = static_cast<std::uint8_t>(static_cast<int>(
+            std::trunc(static_cast<double>(palette_[i]) * fd)));
+      break;
+    case 2:
+      for (int i = 0; i != 768; ++i)
+        paletteDac_[i] = static_cast<std::uint8_t>(static_cast<int>(
+            std::trunc(static_cast<double>(palette_[i]) * fd +
+                       (fd - 1.0) * 255.0)));
+      break;
+    case 3: {
+      const std::uint8_t r = static_cast<std::uint8_t>(
+          static_cast<int>(std::trunc(fd * 256.0)));
+      for (int i = 0; i != 768; i += 3) {
+        paletteDac_[i] = r;
+        paletteDac_[i + 1] = static_cast<std::uint8_t>(
+            static_cast<int>(std::trunc(
+                static_cast<double>(palette_[i + 1]) * fd)));
+        paletteDac_[i + 2] = static_cast<std::uint8_t>(
+            static_cast<int>(std::trunc(
+                static_cast<double>(palette_[i + 2]) * fd)));
+      }
+      break;
+    }
+    case 4: {
+      const int k = static_cast<int>(std::trunc((2.0 - fd) * 255.0));
+      for (int i = 0; i != 768; i += 3) {
+        const int r = static_cast<int>(palette_[i]) + k;
+        paletteDac_[i] = r > 0xff ? 0xff
+                                  : static_cast<std::uint8_t>(r);
+        paletteDac_[i + 1] = palette_[i + 1];
+        paletteDac_[i + 2] = palette_[i + 2];
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 // cc60..ccc7 — gated on 0x5414d4 (video enable) with a 0x541544 stereo
 // variant that re-runs e684/e100/1cb44/17e20 for the second eye;
 // 0x541544 has no writers in BUILD_A so only the single pass is
@@ -1894,11 +2294,11 @@ void StreamScene::teletypeService(int drawEnable) {
 // display.
 void StreamScene::emitFrameDraw() {
   backdropScroll();    // FUN_0042e684 — scroll accumulators + blit
-  ++seams_.drawList;   // FUN_0042e100 — back-to-front object draws
+  emitDrawList();      // FUN_0042e100 — records + per-bucket flush
   // FUN_0041cb44 — TELETYPE service; arg = the 0x5414d4 frame-due flag
   // (nonzero inside this gate — OBSERVED 0x42cc8b/ccb3).
-  teletypeService(1);
-  // 0x417e20 HUD digits — still folded into the present seam.
+  teletypeService(drawDue_);
+  emitHud();           // FUN_00417e20 — icon + health digits
   emit(StreamEvent::kPresent, 0, 0, 0.0f);   // 0x46c86c present+vsync
 }
 
@@ -1975,6 +2375,7 @@ bool StreamScene::step(const StreamInput& in, float dtSec) {
   // --- fade stage (ca83..cd14) ---
   stepLog_.push_back(StreamStage::kFade);
   auto emitPal = [this](int aux) {
+    paletteRamp(aux);   // the 768B transform the native hands 46d208
     StreamEvent ev;
     ev.kind = StreamEvent::kPaletteSet;
     ev.aux = aux;
@@ -1996,9 +2397,12 @@ bool StreamScene::step(const StreamInput& in, float dtSec) {
                              : (isFinal_ ? 1 : 2));
       } else {
         fade_ = 0.0f;
-        // cad8 / ccd8..ccf5: fill = 0x00 when isFinal or health<=0,
-        // else 0xff; 6d208 installs, native returns 1 (mode exit).
+        // cad8 / ccd8..ccf5: the terminal path memsets the 768B
+        // palette buffer 0x00 (isFinal or health<=0) else 0xff, hands
+        // it to 46d208, and returns 1 (mode exit) — before the draw
+        // block and limiter.
         const int fill = (isFinal_ || health_ <= 0) ? 0x00 : 0xff;
+        std::memset(paletteDac_, fill, sizeof paletteDac_);
         StreamEvent ev;
         ev.kind = StreamEvent::kExitMode;
         ev.aux = fill;
@@ -2081,10 +2485,15 @@ bool StreamScene::step(const StreamInput& in, float dtSec) {
   ++seams_.listener;                     // 4026f8(camView_) — audio
 
   // --- draw + limiter (cc60..ccc7) ---
-  stepLog_.push_back(StreamStage::kDraw);
-  emitFrameDraw();
+  // 0x5414d4 gate (cc60): zero skips the WHOLE draw block — backdrop,
+  // draw list, teletype, HUD AND present — but the limiter still runs
+  // (je 0x42ccc7). The normal-arm limiter re-arms it each frame.
+  if (drawDue_) {
+    stepLog_.push_back(StreamStage::kDraw);
+    emitFrameDraw();
+  }
   stepLog_.push_back(StreamStage::kLimiter);
-  ++seams_.limiter;                      // 42fb68 — frame limiter
+  limiterRun(in.nowMs);                  // 42fb68 — frame limiter
   return true;
 }
 
@@ -2127,8 +2536,20 @@ StreamSnapshot StreamScene::snapshot() const {
   }
   s.lookT = lastLookT_;
   for (int i = 0; i != 12; ++i) s.camView[i] = camView_[i];
-  s.bgScroll[0] = bgScroll_[0];
-  s.bgScroll[1] = bgScroll_[1];
+  s.bgScroll[0] = static_cast<float>(bgScroll_[0]);
+  s.bgScroll[1] = static_cast<float>(bgScroll_[1]);
+  // Phase 19A.2F draw-stage globals (diagnostic).
+  s.drawDue = drawDue_;
+  s.hudBlink = hudBlink_;
+  {
+    std::uint64_t ph = 0xcbf29ce484222325ull;
+    for (std::uint8_t b : paletteDac_)
+      ph = (ph ^ b) * 0x100000001b3ull;
+    s.paletteDacHash = ph;
+  }
+  for (int i = 0; i != 6; ++i) s.limiter[i] = limiter_[i];
+  s.limiterBase = limiterBase_;
+  s.limiterTarget = limiterTarget_;
   s.freeObjects = poolFreeCount();
   s.liveObjects = kStreamPoolSize - s.freeObjects;
   // TELETYPE service state (0x54b7a4 block) — surfaced, not hashed

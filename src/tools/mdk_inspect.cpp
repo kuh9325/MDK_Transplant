@@ -3104,6 +3104,9 @@ int main(int argc, char** argv) {
                   "hero(slot,pathT,spd) tt hash "
                   "ctr(hp,fade,c:reason,exit)\n");
       mdk::StreamInput in{};
+      // Synthetic 30Hz clock for the 2fb68 limiter (46c650 ms source)
+      // — deterministic across runs; starts past the base==0 arm.
+      in.nowMs = 1000;
       mdk::StreamSeams prev = sc.seams();
       // Phase 19A.2E — deterministic semantic digest over the
       // counter/completion state only (health, fade raw bits,
@@ -3116,9 +3119,53 @@ int main(int argc, char** argv) {
           ctrDigest *= 1099511628211ull;
         }
       };
+      // Phase 19A.2F — run totals + the draw semantic digest (FNV-1a
+      // over the per-frame event census and the post-frame draw
+      // globals; deterministic across runs, diagnostic only).
+      std::uint64_t drawDigest = 1469598103934665603ull;
+      auto dmix = [&drawDigest](std::uint64_t v) {
+        for (int i = 0; i != 8; ++i) {
+          drawDigest ^= (v >> (i * 8)) & 0xff;
+          drawDigest *= 1099511628211ull;
+        }
+      };
+      long evPalT = 0, evBgT = 0, evMdlT = 0, evSprT = 0, evHudT = 0,
+           evPresT = 0, evTtT = 0, evExitT = 0;
+      int framesRun = 0, exitFrame = -1;
       for (int f = 0; f != streamFrames; ++f) {
-        sc.step(in, 1.0f / 30.0f);
+        const std::size_t evBase = sc.events().size();
+        const bool keepGoing = sc.step(in, 1.0f / 30.0f);
+        in.nowMs += 33;                             // ~30.3fps wall ms
+        ++framesRun;
         const mdk::StreamSeams cur = sc.seams();
+        // Phase 19A.2F — per-frame draw-event census over the new
+        // events only (the queue holds the whole run).
+        int evPal = 0, evBg = 0, evMdl = 0, evSpr = 0, evHud = 0,
+            evPres = 0, evTt = 0;
+        for (std::size_t ei = evBase; ei != sc.events().size(); ++ei) {
+          switch (sc.events()[ei].kind) {
+            case mdk::StreamEvent::kPaletteSet:   ++evPal;  break;
+            case mdk::StreamEvent::kBackdropBlit: ++evBg;   break;
+            case mdk::StreamEvent::kModelDraw:    ++evMdl;  break;
+            case mdk::StreamEvent::kSpriteDraw:   ++evSpr;  break;
+            case mdk::StreamEvent::kHudBlit:      ++evHud;  break;
+            case mdk::StreamEvent::kTeletypeDraw: ++evTt;   break;
+            case mdk::StreamEvent::kPresent:      ++evPres; break;
+            case mdk::StreamEvent::kExitMode:     ++evExitT; break;
+            default: break;
+          }
+        }
+        evPalT += evPal; evBgT += evBg; evMdlT += evMdl;
+        evSprT += evSpr; evHudT += evHud; evPresT += evPres;
+        evTtT += evTt;
+        dmix((std::uint32_t)evPal | ((std::uint64_t)evBg << 8) |
+             ((std::uint64_t)evMdl << 16) | ((std::uint64_t)evSpr << 24) |
+             ((std::uint64_t)evHud << 32) | ((std::uint64_t)evPres << 40) |
+             ((std::uint64_t)evTt << 48));
+        const mdk::StreamSnapshot dfs = sc.snapshot();
+        dmix(dfs.paletteDacHash);
+        dmix(((std::uint64_t)dfs.limiter[1]) |
+             ((std::uint64_t)dfs.limiterBase << 32));
         std::string fam;
         if (cur.heroUpdate > prev.heroUpdate) fam += "hero ";
         if (cur.strayUpdate > prev.strayUpdate) fam += "stray ";
@@ -3151,7 +3198,7 @@ int main(int argc, char** argv) {
         } else {
           std::snprintf(ttb, sizeof ttb, " tt-");
         }
-        const mdk::StreamSnapshot fs = sc.snapshot();
+        const mdk::StreamSnapshot& fs = dfs;
         std::printf("             %5d  %-40s [%d,%d) %3d %4d%s "
                     "h(%d,%.2f,%.2f)%s %016llx "
                     "hp=%d f=%.3f c=%d:%s x=%d\n",
@@ -3173,6 +3220,23 @@ int main(int argc, char** argv) {
             ((std::uint64_t)sc.finished() << 40));
         mix(((std::uint64_t)(std::uint32_t)fs.winLo) |
             ((std::uint64_t)(std::uint32_t)fs.winHi << 32));
+        // Draw-stage line (19A.2F): event census, limiter record,
+        // backdrop accumulators, DAC hash, gates. Diagnostic only —
+        // folded into nothing; stateHash stays canonical.
+        std::printf("                 draw: pal=%d bg=%d mdl=%d spr=%d "
+                    "hud=%d pres=%d | lim t1=%u t2=%u t3=%.4f base=%u "
+                    "tgt=%u | uv=(%d,%d) dac=%016llx due=%d blink=%d "
+                    "ovf=%d\n",
+                    evPal, evBg, evMdl, evSpr, evHud, evPres,
+                    (unsigned)fs.limiter[1], (unsigned)fs.limiter[2],
+                    (double)std::bit_cast<float>(fs.limiter[3]),
+                    (unsigned)fs.limiterBase, (unsigned)fs.limiterTarget,
+                    (int)fs.bgScroll[0], (int)fs.bgScroll[1],
+                    (unsigned long long)fs.paletteDacHash, fs.drawDue,
+                    fs.hudBlink,
+                    cur.drawListOverflow - prev.drawListOverflow);
+        if (!keepGoing && exitFrame < 0) exitFrame = f;
+        if (!keepGoing) break;              // natural exit frame
         prev = cur;
       }
       const mdk::StreamSnapshot ts = sc.snapshot();
@@ -3182,6 +3246,30 @@ int main(int argc, char** argv) {
                   (unsigned long long)ts.ttHash, sm.teletypePost,
                   sm.teletypeService, sm.teletypeDraw,
                   sm.teletypeOverflow);
+      // Phase 19A.2F draw-stage run summary — the closure-gate report.
+      int exitFill = -1;
+      for (const auto& e : sc.events())
+        if (e.kind == mdk::StreamEvent::kExitMode) exitFill = e.aux;
+      std::printf("draw-summary: frames=%d exitFrame=%d | pal=%ld "
+                  "bg=%ld mdl=%ld spr=%ld hud=%ld tt=%ld pres=%ld "
+                  "exit=%ld fill=%d\n",
+                  framesRun, exitFrame, evPalT, evBgT, evMdlT, evSprT,
+                  evHudT, evTtT, evPresT, evExitT, exitFill);
+      std::printf("              limiter=%d rec{t1=%u,t2=%u,t3=%.4f,"
+                  "t4=%.6f,t5=%u} base=%u tgt=%u | ribbon=%d ovf=%d | "
+                  "dac=%016llx drawDigest=%016llx | reason=%s "
+                  "finished=%d\n",
+                  sm.limiter, (unsigned)ts.limiter[1],
+                  (unsigned)ts.limiter[2],
+                  (double)std::bit_cast<float>(ts.limiter[3]),
+                  (double)std::bit_cast<float>(ts.limiter[4]),
+                  (unsigned)ts.limiter[5], (unsigned)ts.limiterBase,
+                  (unsigned)ts.limiterTarget, sm.ribbonDraw,
+                  sm.drawListOverflow,
+                  (unsigned long long)ts.paletteDacHash,
+                  (unsigned long long)drawDigest,
+                  streamCompletionName(ts.completionSrc),
+                  sc.finished());
       std::printf("ctr-digest:  %016llx  (%d frames — health, fade "
                   "bits, latch+reason, exit, win)\n",
                   (unsigned long long)ctrDigest, streamFrames);
