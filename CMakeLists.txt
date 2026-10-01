@@ -84,6 +84,7 @@ add_library(mdk_core STATIC
   src/core/sni_wave.cpp
   src/core/sound_menu.cpp
   src/core/stream_context.cpp
+  src/core/stream_scene.cpp
   src/core/thmb_capture.cpp
   src/core/traversal_audio.cpp
   src/core/traversal_audio_dsp.cpp

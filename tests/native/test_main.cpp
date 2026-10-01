@@ -79,6 +79,16 @@
 #include <utility>
 #include <vector>
 
+// Phase 19A.1A — the stream helper layer is private; the tests below
+// exercise it directly, so the header is pulled in with private
+// sections flipped public. Every header stream_scene.h includes
+// (<array>/<cstdint>/<functional>/<vector>, dynamic_objects.h,
+// object_animation.h) is already processed above, so the macro reaches
+// only the StreamScene declaration itself.
+#define private public
+#include "core/stream_scene.h"
+#undef private
+
 namespace {
 
 int failures = 0;
@@ -25092,6 +25102,345 @@ void test_frontend_transition() {
   }
 }
 
+// Phase 19A.1A — StreamScene math helper layer (private members are
+// public in this TU; see the include shim above). All inputs are
+// synthetic — no captured data.
+void test_stream_math() {
+  using mdk::StreamScene;
+
+  // streamFrndInt — FRNDINT under RC=11: truncation TOWARD ZERO, both
+  // signs (not round-nearest, not floor).
+  CHECK(near(StreamScene::streamFrndInt(2.9f), 2.0));
+  CHECK(near(StreamScene::streamFrndInt(-2.9f), -2.0));
+  CHECK(near(StreamScene::streamFrndInt(-0.5f), 0.0));
+  CHECK(near(StreamScene::streamFrndInt(7.25f), 7.0));
+
+  // sincos37f98 — rad = f32(deg) * f64 0x497924; *s=sin, *c=cos.
+  float sv, cv;
+  StreamScene::sincos37f98(0.0f, &sv, &cv);
+  CHECK(near(sv, 0.0) && near(cv, 1.0));
+  StreamScene::sincos37f98(90.0f, &sv, &cv);
+  CHECK(near(sv, 1.0) && near(cv, 0.0));
+  StreamScene::sincos37f98(180.0f, &sv, &cv);
+  CHECK(near(sv, 0.0) && near(cv, -1.0));
+  StreamScene::sincos37f98(30.0f, &sv, &cv);
+  CHECK(near(sv, 0.5) && near(cv, 0.8660254037844386));
+
+  // Identity transforms (zero angles).
+  const float pos[3] = {5.0f, -3.0f, 2.0f};
+  float m[12];
+  StreamScene::euler6b180(0.0f, 0.0f, 0.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 1.0) && near(m[1], 0.0) && near(m[2], 0.0) &&
+        near(m[3], 5.0) && near(m[4], 0.0) && near(m[5], 1.0) &&
+        near(m[6], 0.0) && near(m[7], -3.0) && near(m[8], 0.0) &&
+        near(m[9], 0.0) && near(m[10], 1.0) && near(m[11], 2.0));
+  StreamScene::euler6b2f8(0.0f, 0.0f, 0.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 1.0) && near(m[1], 0.0) && near(m[2], 0.0) &&
+        near(m[3], 5.0) && near(m[4], 0.0) && near(m[5], 1.0) &&
+        near(m[6], 0.0) && near(m[7], -3.0) && near(m[8], 0.0) &&
+        near(m[9], 0.0) && near(m[10], 1.0) && near(m[11], 2.0));
+
+  // Scaling quirks (OBSERVED): 6b180 scales the basis AND t0/t1 but
+  // stores t2 raw; 6b2f8 stores all of t raw.
+  StreamScene::euler6b180(0.0f, 0.0f, 0.0f, 2.0f, pos, m);
+  CHECK(near(m[0], 2.0) && near(m[5], 2.0) && near(m[10], 2.0));
+  CHECK(near(m[3], 10.0) && near(m[7], -6.0) && near(m[11], 2.0));
+  StreamScene::euler6b2f8(0.0f, 0.0f, 0.0f, 2.0f, pos, m);
+  CHECK(near(m[0], 2.0) && near(m[5], 2.0) && near(m[10], 2.0));
+  CHECK(near(m[3], 5.0) && near(m[7], -3.0) && near(m[11], 2.0));
+
+  // One-axis rotations (90 deg). euler6b2f8(a1) = +90 about X:
+  StreamScene::euler6b2f8(90.0f, 0.0f, 0.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 1.0) && near(m[1], 0.0) && near(m[2], 0.0));
+  CHECK(near(m[4], 0.0) && near(m[5], 0.0) && near(m[6], -1.0));
+  CHECK(near(m[8], 0.0) && near(m[9], 1.0) && near(m[10], 0.0));
+  // euler6b2f8(a2) = +90 about Y (opposite handedness to 6b180's):
+  StreamScene::euler6b2f8(0.0f, 90.0f, 0.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 0.0) && near(m[1], 0.0) && near(m[2], -1.0));
+  CHECK(near(m[4], 0.0) && near(m[5], 1.0) && near(m[6], 0.0));
+  CHECK(near(m[8], 1.0) && near(m[9], 0.0) && near(m[10], 0.0));
+  // euler6b2f8(a3) = +90 about Z:
+  StreamScene::euler6b2f8(0.0f, 0.0f, 90.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 0.0) && near(m[1], -1.0) && near(m[2], 0.0));
+  CHECK(near(m[4], 1.0) && near(m[5], 0.0) && near(m[6], 0.0));
+  CHECK(near(m[8], 0.0) && near(m[9], 0.0) && near(m[10], 1.0));
+  // euler6b180(a3=first arg) about X:
+  StreamScene::euler6b180(90.0f, 0.0f, 0.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 1.0) && near(m[5], 0.0) && near(m[6], -1.0) &&
+        near(m[9], 1.0) && near(m[10], 0.0));
+  // euler6b180 about Y (second arg): opposite sign of 6b2f8's.
+  StreamScene::euler6b180(0.0f, 90.0f, 0.0f, 1.0f, pos, m);
+  CHECK(near(m[0], 0.0) && near(m[1], 0.0) && near(m[2], 1.0));
+  CHECK(near(m[4], 0.0) && near(m[5], 1.0) && near(m[6], 0.0));
+  CHECK(near(m[8], -1.0) && near(m[9], 0.0) && near(m[10], 0.0));
+
+  // compose6aeb0 — identity passthrough.
+  const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+  const float A[12] = {0, -1, 0, 1,   // rotZ90, t=(1,0,0)
+                       1, 0, 0, 0,
+                       0, 0, 1, 0};
+  const float B[12] = {1, 0, 0, 0,    // rotX90, t=(0,2,0)
+                       0, 0, -1, 2,
+                       0, 1, 0, 0};
+  float c[12];
+  StreamScene::compose6aeb0(I, B, c);
+  for (int i = 0; i < 12; ++i) CHECK(near(c[i], B[i]));
+  // A o B = apply B then A: basis A*B, t = A.rot*B.t + A.t.
+  StreamScene::compose6aeb0(A, B, c);
+  CHECK(near(c[0], 0.0) && near(c[1], 0.0) && near(c[2], 1.0) &&
+        near(c[3], -1.0) && near(c[4], 1.0) && near(c[5], 0.0) &&
+        near(c[6], 0.0) && near(c[7], 0.0) && near(c[8], 0.0) &&
+        near(c[9], 1.0) && near(c[10], 0.0) && near(c[11], 0.0));
+  // Reverse order differs (non-commutative): B o A has t=(1,2,0).
+  StreamScene::compose6aeb0(B, A, c);
+  CHECK(near(c[3], 1.0) && near(c[7], 2.0) && near(c[11], 0.0));
+
+  // point6afe4 — row dot + col-3 translation.
+  float p[3];
+  const float rx[12] = {1, 0, 0, 5,   // rotX90, t=(5,-3,2)
+                        0, 0, -1, -3,
+                        0, 1, 0, 2};
+  const float v0[3] = {0, 1, 0};
+  StreamScene::point6afe4(v0, rx, p);   // (0,1,0)->(0,0,1)+t
+  CHECK(near(p[0], 5.0) && near(p[1], -3.0) && near(p[2], 3.0));
+  const float v1[3] = {1, 2, 3};
+  StreamScene::point6afe4(v1, rx, p);   // (1,2,3)->(1,-3,2)+t
+  CHECK(near(p[0], 6.0) && near(p[1], -6.0) && near(p[2], 4.0));
+
+  // normalizeE9c4 — nonzero vector; ZERO stays zero (scale=1.0 quirk).
+  float n3[3] = {3.0f, 0.0f, 4.0f};
+  StreamScene::normalizeE9c4(n3);
+  CHECK(near(n3[0], 0.6) && near(n3[1], 0.0) && near(n3[2], 0.8));
+  float nz[3] = {0.0f, 0.0f, 0.0f};
+  StreamScene::normalizeE9c4(nz);
+  CHECK(nz[0] == 0.0f && nz[1] == 0.0f && nz[2] == 0.0f);
+  float nn[3] = {-3.0f, 0.0f, -4.0f};
+  StreamScene::normalizeE9c4(nn);
+  CHECK(near(nn[0], -0.6) && near(nn[2], -0.8));
+
+  // normalizeColsE978 — columns {M[c],M[c+4],M[c+8]}, translation col
+  // untouched. M = [3,0,0,9; 4,5,0,8; 0,0,2,7]:
+  float nm[12] = {3, 0, 0, 9, 4, 5, 0, 8, 0, 0, 2, 7};
+  StreamScene::normalizeColsE978(nm);
+  CHECK(near(nm[0], 0.6) && near(nm[4], 0.8) && near(nm[8], 0.0));
+  CHECK(near(nm[1], 0.0) && near(nm[5], 1.0) && near(nm[9], 0.0));
+  CHECK(near(nm[2], 0.0) && near(nm[6], 0.0) && near(nm[10], 1.0));
+  CHECK(nm[3] == 9.0f && nm[7] == 8.0f && nm[11] == 7.0f);
+  // No zero guard (OBSERVED): a zero column -> inf scale -> NaN.
+  float zm[12] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+  StreamScene::normalizeColsE978(zm);
+  CHECK(std::isnan(zm[1]) && std::isnan(zm[5]) && std::isnan(zm[9]));
+}
+
+// Phase 19A.1A — path/camera helpers. Synthetic node rings/planes only.
+void test_stream_camera() {
+  float p[3];
+
+  // --- pathPos: truncation, frac lerp, &0x1f ring --------------------
+  {
+    mdk::StreamScene s;
+    for (int i = 0; i < 32; ++i) {
+      s.nodeMat_[i][3] = float(2 * i);
+      s.nodeMat_[i][7] = float(i * i);
+      s.nodeMat_[i][11] = float(-i);
+    }
+    s.pathPos(p, 0.0f);   // endpoints
+    CHECK(near(p[0], 0.0) && near(p[1], 0.0) && near(p[2], 0.0));
+    s.pathPos(p, 1.0f);
+    CHECK(near(p[0], 2.0) && near(p[1], 1.0) && near(p[2], -1.0));
+    s.pathPos(p, 31.0f);
+    CHECK(near(p[0], 62.0) && near(p[1], 961.0) && near(p[2], -31.0));
+    s.pathPos(p, 0.5f);   // mid-segment
+    CHECK(near(p[0], 1.0) && near(p[1], 0.5) && near(p[2], -0.5));
+    s.pathPos(p, 2.25f);
+    CHECK(near(p[0], 4.5) && near(p[1], 5.25) && near(p[2], -2.25));
+    // wrap boundary: 31.5 blends slot31 with slot0.
+    s.pathPos(p, 31.5f);
+    CHECK(near(p[0], 31.0) && near(p[1], 480.5) && near(p[2], -15.5));
+    // negative t: trunc(-0.5)=0 -> frac -0.5 extrapolates below node0;
+    // trunc(-1.25)=-1 -> slot31/0 pair with frac -0.25.
+    s.pathPos(p, -0.5f);
+    CHECK(near(p[0], -1.0) && near(p[1], -0.5) && near(p[2], 0.5));
+    s.pathPos(p, -1.25f);
+    CHECK(near(p[0], 77.5) && near(p[1], 1201.25) && near(p[2], -38.75));
+  }
+
+  // --- pathFrame: {side, dir, side x dir, P0} columns ----------------
+  {
+    mdk::StreamScene s;
+    for (int i = 0; i < 32; ++i) {
+      s.nodeMat_[i][3] = float(10 * i);  // straight +x path
+    }
+    s.camView_[6] = -1.0f;               // prev camera up = (0,0,-1)
+    float f[12];
+    s.pathFrame(f, 0.0f, 1.0f);
+    // d=(1,0,0); nu=-up=(0,0,1); side=d x nu=(0,-1,0); up'=side x d=
+    // (0,0,1). Frame rows: [0,1,0,0; -1,0,0,0; 0,0,1,0].
+    CHECK(near(f[0], 0.0) && near(f[1], 1.0) && near(f[2], 0.0) &&
+          near(f[3], 0.0));
+    CHECK(near(f[4], -1.0) && near(f[5], 0.0) && near(f[6], 0.0) &&
+          near(f[7], 0.0));
+    CHECK(near(f[8], 0.0) && near(f[9], 0.0) && near(f[10], 1.0) &&
+          near(f[11], 0.0));
+    // t0 != node boundary: translation is pathPos(t0), not node 0.
+    s.pathFrame(f, 0.5f, 1.5f);
+    CHECK(near(f[3], 5.0) && near(f[7], 0.0) && near(f[11], 0.0));
+  }
+  {
+    // Non-axis path: verifies the normalizeE9c4 passes make dir and
+    // side unit (raw dir was (5,5,0)).
+    mdk::StreamScene s;
+    for (int i = 0; i < 32; ++i) {
+      s.nodeMat_[i][3] = float(5 * i);
+      s.nodeMat_[i][7] = float(5 * i);
+    }
+    s.camView_[6] = -1.0f;
+    float f[12];
+    s.pathFrame(f, 0.0f, 1.0f);
+    const double inv2 = 1.0 / std::sqrt(2.0);
+    CHECK(near(f[1], inv2) && near(f[5], inv2) && near(f[9], 0.0));
+    CHECK(near(std::sqrt(f[0] * f[0] + f[4] * f[4] + f[8] * f[8]), 1.0));
+    CHECK(near(std::sqrt(f[2] * f[2] + f[6] * f[6] + f[10] * f[10]),
+               1.0));
+  }
+
+  // --- cameraAt: basis rows, upRef writeback, projection scales ------
+  {
+    mdk::StreamScene s;   // nodeMat all zero -> look=(0,0,0) for any t
+    s.upRef_[0] = 0.0f;
+    s.upRef_[1] = 1.0f;
+    s.upRef_[2] = 0.0f;
+    const float eye[3] = {0, 0, 5};
+    s.cameraAt(eye, 0.0f);
+    // d=(0,0,-1); side=up x d=(-1,0,0); up'=d x side=(0,1,0).
+    CHECK(near(s.camPos_[0], 0.0) && near(s.camPos_[1], 0.0) &&
+          near(s.camPos_[2], 5.0));
+    const float* V = s.camView_;
+    CHECK(near(V[0], -1.0) && near(V[1], 0.0) && near(V[2], 0.0) &&
+          near(V[3], 0.0));
+    CHECK(near(V[4], 0.0) && near(V[5], 1.0) && near(V[6], 0.0) &&
+          near(V[7], 0.0));
+    CHECK(near(V[8], 0.0) && near(V[9], 0.0) && near(V[10], -1.0) &&
+          near(V[11], 5.0));
+    // upRef_ written back to the recomputed up row.
+    CHECK(near(s.upRef_[0], 0.0) && near(s.upRef_[1], 1.0) &&
+          near(s.upRef_[2], 0.0));
+    // 600x360 / 2.4 projection constants (OBSERVED).
+    CHECK(near(s.projScale_[0], 1.0 / 1.2));   // 0.8333...
+    CHECK(near(s.projScale_[1], 1.0 / 0.72));  // 1.3888...
+    // camProj_ = camView_ with rows 0/1 scaled, row 2 raw.
+    CHECK(near(s.camProj_[0], -1.0 / 1.2));
+    CHECK(near(s.camProj_[5], 1.0 / 0.72));
+    CHECK(near(s.camProj_[7], 0.0));
+    CHECK(near(s.camProj_[8], 0.0) && near(s.camProj_[10], -1.0) &&
+          near(s.camProj_[11], 5.0));
+  }
+  {
+    // Look-at +z.
+    mdk::StreamScene s;
+    s.upRef_[0] = 0.0f;
+    s.upRef_[1] = 1.0f;
+    s.upRef_[2] = 0.0f;
+    const float eye[3] = {0, 0, -5};
+    s.cameraAt(eye, 0.0f);
+    const float* V = s.camView_;
+    CHECK(near(V[0], 1.0) && near(V[5], 1.0) && near(V[10], 1.0) &&
+          near(V[11], 5.0));
+  }
+  {
+    // Arbitrary eye; all-zero path -> look=(0,0,0). Verify orthonormal
+    // rows, dir = normalize(look-eye), t = -(row . eye), writeback.
+    mdk::StreamScene s;
+    s.upRef_[0] = 0.0f;
+    s.upRef_[1] = 0.0f;
+    s.upRef_[2] = 1.0f;
+    const float eye[3] = {2, 3, 4};
+    s.cameraAt(eye, 0.0f);
+    const float* V = s.camView_;
+    CHECK(near(V[0] * V[0] + V[1] * V[1] + V[2] * V[2], 1.0));
+    CHECK(near(V[4] * V[4] + V[5] * V[5] + V[6] * V[6], 1.0));
+    CHECK(near(V[8] * V[8] + V[9] * V[9] + V[10] * V[10], 1.0));
+    CHECK(near(V[0] * V[4] + V[1] * V[5] + V[2] * V[6], 0.0));
+    CHECK(near(V[0] * V[8] + V[1] * V[9] + V[2] * V[10], 0.0));
+    CHECK(near(V[4] * V[8] + V[5] * V[9] + V[6] * V[10], 0.0));
+    const double L = std::sqrt(29.0);
+    CHECK(near(V[8], -2.0 / L) && near(V[9], -3.0 / L) &&
+          near(V[10], -4.0 / L));
+    CHECK(near(V[3], -(V[0] * 2 + V[1] * 3 + V[2] * 4)));
+    CHECK(near(V[7], -(V[4] * 2 + V[5] * 3 + V[6] * 4)));
+    CHECK(near(V[11], -(V[8] * 2 + V[9] * 3 + V[10] * 4)));
+    CHECK(near(s.upRef_[0], V[4]) && near(s.upRef_[1], V[5]) &&
+          near(s.upRef_[2], V[6]));
+    CHECK(near(s.camProj_[0], V[0] * s.projScale_[0]));
+    CHECK(near(s.camProj_[4], V[4] * s.projScale_[1]));
+    CHECK(s.camProj_[8] == V[8] && s.camProj_[9] == V[9] &&
+          s.camProj_[10] == V[10] && s.camProj_[11] == V[11]);
+  }
+
+  // --- wallProbe: first-hit dist<=0 plane, miss -1 -------------------
+  {
+    mdk::StreamScene s;   // all-zero nodeMat -> pathPos(t)=(0,0,0)
+    const float pos[3] = {0, 0, 9};
+    // plane0 = {n=(0,0,1), d=-10}: dist = 9-10-1.5 = -2.5 -> hit;
+    // delta=(0,0,-9) -> ret = -2.5 / 9.
+    s.planes_[0][2] = 1.0f;
+    s.planes_[0][3] = -10.0f;
+    CHECK(near(s.wallProbe(pos, 0.0f), -2.5 / 9.0));
+    // plane1 also inside but plane0 wins (first-hit rule).
+    s.planes_[0][6] = 1.0f;
+    s.planes_[0][7] = -20.0f;  // dist = -12.5
+    CHECK(near(s.wallProbe(pos, 0.0f), -2.5 / 9.0));
+    // plane0 pushed outside -> plane1's value.
+    s.planes_[0][3] = 100.0f;
+    CHECK(near(s.wallProbe(pos, 0.0f), -12.5 / 9.0));
+    // Sign variant: n=(0,0,-1), d=+10 -> dist = -9+10-1.5 = -0.5; nd =
+    // n.delta = (-1)(-9) = +9 -> ret = -0.5/-9 = +1/18.
+    mdk::StreamScene s2;
+    s2.planes_[0][2] = -1.0f;
+    s2.planes_[0][3] = 10.0f;
+    CHECK(near(s2.wallProbe(pos, 0.0f), -0.5 / -9.0));
+  }
+  {
+    // Miss: all 32 planes face away (all-zero planes would dist=-1.5 ->
+    // hit; the fill is required for a real miss).
+    mdk::StreamScene s;
+    for (int i = 0; i < 32; ++i) {
+      s.planes_[0][i * 4 + 2] = 1.0f;
+      s.planes_[0][i * 4 + 3] = 100.0f;
+    }
+    const float pos[3] = {0, 0, 9};
+    CHECK(near(s.wallProbe(pos, 0.0f), -1.0));
+  }
+  {
+    // Parallel ray: pathPos(t)=(1,0,9), pos=(0,0,9) -> delta=(1,0,0)
+    // perp to n=(0,0,1) -> n.delta = 0 -> dist/-0.0 = +inf.
+    mdk::StreamScene s;
+    s.nodeMat_[0][3] = 1.0f;
+    s.nodeMat_[0][7] = 0.0f;
+    s.nodeMat_[0][11] = 9.0f;
+    s.planes_[0][2] = 1.0f;
+    s.planes_[0][3] = -10.0f;
+    const float pos[3] = {0, 0, 9};
+    const float r = s.wallProbe(pos, 0.0f);
+    CHECK(std::isinf(r) && r > 0);
+  }
+  {
+    // Boundary: slot = trunc(t) & 0x1f. Only slot31 holds the wall.
+    mdk::StreamScene s;
+    const float pos[3] = {0, 0, 9};
+    for (int i = 0; i < 32; ++i) {
+      s.planes_[0][i * 4 + 2] = 1.0f;
+      s.planes_[0][i * 4 + 3] = 100.0f;  // slot0: all miss
+    }
+    s.planes_[31][2] = 1.0f;
+    s.planes_[31][3] = -10.0f;           // slot31 plane0: hit
+    CHECK(near(s.wallProbe(pos, 0.0f), -1.0));         // slot0 -> miss
+    CHECK(near(s.wallProbe(pos, 31.0f), -2.5 / 9.0));  // slot31 -> hit
+    CHECK(near(s.wallProbe(pos, -1.0f), -2.5 / 9.0));  // -1&31 -> slot31
+    CHECK(near(s.wallProbe(pos, 32.0f), -1.0));        // 32&31 -> slot0
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -25189,6 +25538,8 @@ int main() {
   test_lbb_image();
   test_thmb_capture();
   test_frontend_transition();
+  test_stream_math();
+  test_stream_camera();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
