@@ -373,6 +373,13 @@ private:
   bool exited_ = false;
   bool tornDown_ = false;
   int frameTick_ = 0;                           // 0x49b5a4 — +0x11c stamp source
+  // d24c/dabc frame context — the native reads the resolved input axes
+  // from the +0x4ce758/+0x4ce75c globals (written by the 407f2c fold
+  // inside heroUpdate) and the frame delta from the 0x49b6f4 constant;
+  // the port stages both at the head of step() so heroUpdate/twinSync
+  // share the same frame values.
+  StreamInput input_;
+  float stepDt_ = 0.0f;
   StreamSeams seams_;                           // deferred-hook counters
   std::vector<StreamStage> stepLog_;            // per-step stage spine
 };

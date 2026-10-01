@@ -112,6 +112,16 @@ int usage() {
                "                            steps the Phase 13A freefall core.\n"
                "                            Options: --course 0..4 --skill 0..2\n"
                "                            --seed N --frames N)\n"
+               "       mdk-inspect --data-path DIR --stream-init\n"
+               "                            (Phase 19A mode-5 init diagnostic on\n"
+               "                            STREAM/STREAM.{BNI,MTI}; bound actors,\n"
+               "                            window, counters, seams. Options:\n"
+               "                            --course 0..4 --skill 0..2 --seed N\n"
+               "                            --stream-frames N — bounded updater-\n"
+               "                            reach trace: per frame, updater\n"
+               "                            families dispatched, winLo/winHi,\n"
+               "                            tunnel feed, animStep seam, state\n"
+               "                            digest; no draw/anim bodies)\n"
                "       mdk-inspect --data-path DIR --campaign-handoff "
                "<relative-path>\n"
                "                            (a FALL3D.BNI path; fast-forwards\n"
@@ -1929,6 +1939,7 @@ int main(int argc, char** argv) {
   bool traversalRuntime = false;
   bool freefallRuntime = false;
   bool streamInit = false;
+  int streamFrames = 0;
   bool campaignHandoff = false;
   bool campaignSequence = false;
   bool frontendScriptMode = false;
@@ -2116,6 +2127,10 @@ int main(int argc, char** argv) {
       freefallRuntime = true;
     } else if (!std::strcmp(a, "--stream-init")) {
       streamInit = true;          // fixed paths — STREAM/STREAM.{BNI,MTI}
+    } else if (!std::strcmp(a, "--stream-frames")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      streamFrames = std::atoi(v); // frames to step after stream-init
     } else if (!std::strcmp(a, "--campaign-handoff")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -3040,6 +3055,40 @@ int main(int argc, char** argv) {
                 sm.paletteRamp, sm.fillSelect, sm.limiter);
     std::printf("events:      %zu  hash=%016llx\n",
                 sc.events().size(), (unsigned long long)s.stateHash);
+
+    // --stream-frames N: Phase 19A.2B bounded actor diagnostic. Steps
+    // the real-data scene (neutral input, 1/30s) and reports, per
+    // frame, which updater families the dispatch walk reached (seam
+    // deltas), the window bounds, the tunnelExtend feed (fillSelect —
+    // every non-terminal extend ends at ae60), the animStep seam count
+    // and a folded state digest. Bounded: no draw emission, no anim
+    // bodies, no completion work — updater reach only.
+    if (streamFrames > 0 && ok) {
+      std::printf("frames:      frame updaters winLo winHi ext anim "
+                  "hero(slot,pathT,spd) hash\n");
+      mdk::StreamInput in{};
+      mdk::StreamSeams prev = sc.seams();
+      for (int f = 0; f != streamFrames; ++f) {
+        sc.step(in, 1.0f / 30.0f);
+        const mdk::StreamSeams cur = sc.seams();
+        std::string fam;
+        if (cur.heroUpdate > prev.heroUpdate) fam += "hero ";
+        if (cur.strayUpdate > prev.strayUpdate) fam += "stray ";
+        if (cur.escortUpdate > prev.escortUpdate) fam += "escort ";
+        if (cur.pickupUpdate > prev.pickupUpdate) fam += "pickup ";
+        if (cur.genericUpdate > prev.genericUpdate) fam += "generic ";
+        if (cur.twinSync > prev.twinSync) fam += "twinSync";
+        const mdk::StreamSnapshot fs = sc.snapshot();
+        std::printf("             %5d  %-40s [%d,%d) %3d %4d "
+                    "h(%d,%.2f,%.2f) %016llx\n",
+                    f, fam.c_str(), fs.winLo, fs.winHi,
+                    cur.fillSelect - prev.fillSelect,
+                    cur.animStep - prev.animStep, fs.heroIdx,
+                    (double)fs.heroPathT, (double)fs.heroSpeed,
+                    (unsigned long long)fs.stateHash);
+        prev = cur;
+      }
+    }
     // Mode-8 boundary check (bounded): FINISH.BNI existence is the
     // only probe — mode 8 is FUN_0047b038's FLIC/MVE pipeline, a
     // distinct init path that this substrate does NOT host.

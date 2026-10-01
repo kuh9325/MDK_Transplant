@@ -74,6 +74,7 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <sstream>
 #include <tuple>
 #include <utility>
@@ -26412,7 +26413,12 @@ void test_stream_step() {
     const DynamicObject& tw = s.objectAt(q.twinIdx);
     const DynamicObject& h = s.objectAt(q.heroIdx);
     CHECK(tw.enemyIndex == h.enemyIndex);     // hero's bucket
-    CHECK(tw.zBias == h.zBias);
+    // dabc syncs pos + the +0xac block only — +0x5c is NOT copied, so
+    // the twin keeps its spawn-time zBias while the hero advances
+    // (OBSERVED desync — the mirror runs on pos/xform, not the path
+    // position). Hero spawned at 0.75, speed 6.0 * 1/30 = +0.2.
+    CHECK(tw.zBias == 0.75f);
+    CHECK(near(h.zBias, 0.95));
     CHECK(tw.pos[0] == h.pos[0] && tw.pos[1] == h.pos[1] &&
           tw.pos[2] == h.pos[2]);
     for (int i = 0; i != 9; ++i)
@@ -26454,6 +26460,572 @@ void test_stream_step() {
       CHECK(s.snapshot().complete == 0);
       CHECK(!s.finished());
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19A.2B — the mode-5 actor updater family (d24c / d034 / d118 /
+// db0c / cf6c / dabc). Synthetic scenes; the straight-path fixture keeps
+// the composed positions exactly predictable.
+// ---------------------------------------------------------------------------
+
+// Straight +y path fixture: nodeMat rot = I, t = (0,10i,0) so
+// pathPos(t) = (0,10t,0) and pathFrame gives {side=+x, dir=+y, up=+z}
+// (camView up row = {0,0,-1}). Planes are padded with a huge d so the
+// hero wall probe misses — a zero plane set would "hit" everywhere
+// (dist = -1.5 <= 0), the same degenerate state the native would read.
+static void makeStraightPath(mdk::StreamScene& s) {
+  for (int i = 0; i != mdk::kStreamSegs; ++i) {
+    s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    s.nodeMat_[i][7] = 10.0f * i;
+  }
+  s.camView_[6] = -1.0f;
+  for (int i = 0; i != mdk::kStreamSegs; ++i)
+    for (int j = 0; j != mdk::kStreamPlanes; ++j)
+      s.planes_[i][j * 4 + 3] = 1e9f;
+}
+
+void test_stream_updaters() {
+  using mdk::DynamicObject;
+  using mdk::StreamEvent;
+  using mdk::StreamInput;
+  using mdk::StreamScene;
+  const float dt = 1.0f / 30.0f;
+  StreamInput in{};
+
+  // --- genericUpdate: advance + migrate + frac tail (cf6c) ------------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    DynamicObject* o = s.alloc(3, 3.25f);
+    o->field34 = 2.0f;
+    s.genericUpdate(*o, 0.5f);
+    // zBias = 3.25 + 2*0.5 = 4.25 -> trunc 4 -> migrate to bucket 4.
+    CHECK(o->zBias == 4.25f);
+    CHECK(o->enemyIndex == 4);
+    CHECK(s.bucketHead(4) == s.objIndex(o));
+    // frac .25 * 10 -> +0x20 = 2.5 during the call, then cleared;
+    // pos = f1c through node4: (0,2.5,0) + t(0,40,0) = (0,42.5,0).
+    CHECK(o->field1c[1] == 0.0f);
+    CHECK(o->pos[0] == 0.0f && o->pos[1] == 42.5f && o->pos[2] == 0.0f);
+    CHECK(o->col.baseZ == 0.0f);
+    CHECK(o->col.origin[0] == 0.0f && o->col.origin[1] == 42.5f &&
+          o->col.origin[2] == 0.0f);
+    // cf6c has NO anim call site (OBSERVED — the one updater without).
+    CHECK(s.seams().animStep == 0);
+  }
+
+  // --- genericUpdate: field34 == 0 parks — no advance/migrate ---------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    DynamicObject* o = s.alloc(3, 3.25f);
+    o->field34 = 0.0f;
+    s.genericUpdate(*o, dt);
+    CHECK(o->zBias == 3.25f);              // untouched
+    CHECK(o->enemyIndex == 3);             // migrate never ran
+    CHECK(o->pos[1] == 32.5f);             // frac tail still ran
+    // Unordered (NaN) skips too — the native JZ covers it.
+    o->field34 = std::numeric_limits<float>::quiet_NaN();
+    s.genericUpdate(*o, dt);
+    CHECK(o->zBias == 3.25f);
+    CHECK(o->enemyIndex == 3);
+  }
+
+  // --- genericUpdate: migrate fail -> reap, frac tail skipped ---------
+  {
+    StreamScene s;
+    s.winLo_ = 10; s.winHi_ = 20;
+    makeStraightPath(s);
+    DynamicObject* o = s.alloc(3, 3.25f);
+    o->field34 = 20.0f;
+    o->field1c[1] = 9.0f;                  // sentinel — proves no store
+    const int free0 = s.poolFreeCount();
+    s.genericUpdate(*o, 1.0f);
+    CHECK(o->zBias == 23.25f);             // advanced then reaped
+    CHECK(o->enemyIndex == 3);             // reap leaves the +0x04 tag
+    CHECK(o->field1c[1] == 9.0f);          // tail skipped — early RET
+    CHECK(s.freelist_ == o);               // back on the freelist
+    CHECK(s.poolFreeCount() == free0 + 1);
+  }
+
+  // --- pickupUpdate: advance + anim + tail; hero-distance catch -------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.assets_.sndApple = 77;
+    s.health_ = 100;
+    DynamicObject* hero = s.alloc(0, 0.75f);
+    s.hero_ = hero;
+    DynamicObject* p = s.alloc(3, 3.0f);
+    s.pickup_ = p;
+    p->field34 = 1.0f;
+    s.pickupUpdate(*p, 0.5f);
+    CHECK(p->zBias == 3.5f);
+    CHECK(p->enemyIndex == 3);             // trunc 3 — same bucket
+    CHECK(s.seams().animStep == 1);        // 555bc call site reached
+    CHECK(p->field1c[1] == 0.0f);
+    CHECK(p->pos[0] == 0.0f && p->pos[1] == 35.0f && p->pos[2] == 0.0f);
+    CHECK(p->col.origin[1] == 35.0f);
+    CHECK(p->col.xform[0] == 1.0f && p->col.xform[4] == 1.0f &&
+          p->col.xform[8] == 1.0f);        // pathFrame basis stored
+    // Distance gate: exactly 5.0 -> no catch (JC is strict).
+    hero->pos[0] = 0.0f; hero->pos[1] = 40.0f; hero->pos[2] = 0.0f;
+    s.pickupUpdate(*p, 0.0f);
+    CHECK(s.pickup_ == p && s.health_ == 100);
+    // 4.99 < 5.0 -> catch: 541554=150, APPLE aux=1, reap, slot clear.
+    hero->pos[1] = 39.99f;
+    s.pickupUpdate(*p, 0.0f);
+    CHECK(s.health_ == 150);
+    CHECK(s.pickup_ == nullptr);
+    CHECK(s.freelist_ == p);
+    bool apple = false;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kPlaySound && e.tag == 77 &&
+          e.aux == 1)
+        apple = true;
+    CHECK(apple);
+  }
+
+  // --- pickupUpdate: migrate fail -> reap + edac8 clear, no anim ------
+  {
+    StreamScene s;
+    s.winLo_ = 10; s.winHi_ = 20;
+    makeStraightPath(s);
+    DynamicObject* p = s.alloc(3, 3.0f);
+    s.pickup_ = p;
+    p->field34 = 20.0f;
+    s.pickupUpdate(*p, 1.0f);
+    CHECK(s.pickup_ == nullptr);
+    CHECK(s.freelist_ == p);
+    CHECK(s.seams().animStep == 0);        // early RET before the tick
+  }
+
+  // --- escortUpdate: advance + anim + live pathFrame rebuild ----------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    DynamicObject* e = s.alloc(5, 5.0f);
+    s.escort_ = e;
+    e->field34 = 2.0f;
+    s.escortUpdate(*e, 0.5f);
+    CHECK(e->zBias == 6.0f);               // unconditional advance
+    CHECK(e->enemyIndex == 6);             // migrated to trunc 6
+    CHECK(s.bucketHead(6) == s.objIndex(e));
+    CHECK(s.seams().animStep == 1);
+    CHECK(e->field1c[1] == 0.0f);
+    CHECK(e->pos[1] == 60.0f);             // frac 0 -> node t
+    CHECK(e->col.origin[1] == 60.0f);
+    CHECK(e->col.xform[0] == 1.0f && e->col.xform[4] == 1.0f &&
+          e->col.xform[8] == 1.0f);
+  }
+
+  // --- escortUpdate: migrate fail -> reap + edab8 clear ---------------
+  {
+    StreamScene s;
+    s.winLo_ = 10; s.winHi_ = 20;
+    makeStraightPath(s);
+    DynamicObject* e = s.alloc(11, 11.0f);
+    s.escort_ = e;
+    e->field34 = 40.0f;
+    s.escortUpdate(*e, 1.0f);
+    CHECK(e->zBias == 51.0f);              // 11 + 40
+    CHECK(s.escort_ == nullptr);
+    CHECK(s.freelist_ == e);
+    CHECK(s.seams().animStep == 0);
+  }
+
+  // --- strayUpdate: hero-lead clamp + trailing frame ------------------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    DynamicObject* hero = s.alloc(0, 10.0f);
+    s.hero_ = hero;
+    hero->field34 = 6.0f;
+    DynamicObject* st = s.alloc(14, 14.9f);
+    s.stray_ = st;
+    st->field34 = 2.0f;
+    s.strayUpdate(*st, dt);
+    // advance 14.9 + 2/30 = 14.9667 < hero.zBias+5 = 15 -> clamp and
+    // adopt the hero's +0x34.
+    CHECK(st->zBias == 15.0f);
+    CHECK(st->field34 == 6.0f);
+    CHECK(st->enemyIndex == 15);
+    CHECK(s.seams().animStep == 1);
+    // Trailing frame at zBias-4/-3 with the node-15 translation
+    // patched back in: pos = node15.t + f1c = (0,150,0).
+    CHECK(st->pos[0] == 0.0f && st->pos[1] == 150.0f &&
+          st->pos[2] == 0.0f);
+    CHECK(st->col.origin[1] == 150.0f);
+  }
+
+  // --- strayUpdate: ahead of the lead -> no clamp; migrate fail reap --
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    DynamicObject* hero = s.alloc(0, 10.0f);
+    s.hero_ = hero;
+    hero->field34 = 6.0f;
+    DynamicObject* st = s.alloc(20, 20.0f);
+    s.stray_ = st;
+    st->field34 = 2.0f;
+    s.strayUpdate(*st, dt);
+    // 20 > 15 -> no clamp; advance only (2/30).
+    CHECK(near(st->zBias, 20.0 + 2.0 / 30.0));
+    CHECK(st->field34 == 2.0f);            // hero speed NOT adopted
+    CHECK(st->enemyIndex == 20);
+    // Migrate fail: reap WITHOUT clearing the slot pointer (OBSERVED —
+    // unlike escort/pickup, db0c writes no global on the reap path).
+    s.winHi_ = 21;
+    st->field34 = 40.0f;
+    s.strayUpdate(*st, 1.0f);              // 20.0667 + 40 -> trunc 60
+    CHECK(s.stray_ == st);
+    CHECK(s.freelist_ == st);
+  }
+
+  // --- twinSync: pos + 0x30-byte +0xac block copy + anim tick ---------
+  {
+    StreamScene s;
+    makeStraightPath(s);
+    DynamicObject* hero = s.alloc(0, 0.75f);
+    s.hero_ = hero;
+    DynamicObject* tw = s.alloc(0, 0.75f);
+    s.twin_ = tw;
+    hero->pos[0] = 1.0f; hero->pos[1] = 2.0f; hero->pos[2] = 3.0f;
+    for (int i = 0; i != 9; ++i) hero->col.xform[i] = 10.0f + i;
+    hero->col.origin[0] = 7.0f; hero->col.origin[1] = 8.0f;
+    hero->col.origin[2] = 9.0f;
+    tw->zBias = 42.0f;                     // +0x5c is NOT synced
+    s.stepDt_ = dt;
+    s.twinSync();
+    CHECK(tw->pos[0] == 1.0f && tw->pos[1] == 2.0f && tw->pos[2] == 3.0f);
+    CHECK(tw->col.baseZ == 3.0f);          // +0x18 alias copied too
+    for (int i = 0; i != 9; ++i)
+      CHECK(tw->col.xform[i] == 10.0f + i);
+    CHECK(tw->col.origin[0] == 7.0f && tw->col.origin[1] == 8.0f &&
+          tw->col.origin[2] == 9.0f);
+    CHECK(tw->zBias == 42.0f);             // OBSERVED: untouched
+    CHECK(s.seams().animStep == 1);
+    // Null twin -> the post-walk stage is a no-op beyond the count.
+    s.twin_ = nullptr;
+    s.twinSync();
+    CHECK(s.seams().animStep == 1);
+    CHECK(s.seams().twinSync == 2);
+  }
+
+  // --- heroUpdate: base advance + transform tail (d24c) ---------------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.health_ = 100;
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 6.0f;
+    h->yawDeg = 90.0f;
+    h->field2c = 1.0f;                     // swim dir +y (path dir)
+    s.heroUpdate(dt);
+    CHECK(h->field34 == 6.0f);             // at cap — no grow
+    CHECK(h->zBias == 0.95f);              // +6.0/30
+    CHECK(s.winLo_ == 0 && s.winHi_ == 32);// lead 0.2 < 1 — no feed
+    CHECK(s.seams().animStep == 1);
+    CHECK(h->yawDeg == 90.0f && h->bankDeg == 0.0f);
+    CHECK(h->prevPos[1] == 7.5f);          // pre-update pos latched
+    CHECK(h->pos[0] == 0.0f && h->pos[1] == 9.5f && h->pos[2] == 0.0f);
+    CHECK(h->col.baseZ == h->pos[2]);
+    CHECK(h->field1c[0] == 0.0f && h->field1c[2] == 0.0f);
+    CHECK(s.events().empty());             // probe missed — silent
+  }
+
+  // --- heroUpdate: speed grow clamps at 6.0 ----------------------------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.health_ = 100;
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 5.9f;
+    h->yawDeg = 90.0f;
+    h->field2c = 1.0f;
+    s.heroUpdate(dt);
+    CHECK(near(h->field34, 5.9 + 1.0 / 30.0));
+    s.heroUpdate(dt);
+    s.heroUpdate(dt);
+    CHECK(h->field34 == 6.0f);             // overshoot clamped
+  }
+
+  // --- heroUpdate: winLo++ + tunnelExtend + twin migration ------------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 30;
+    makeStraightPath(s);
+    s.health_ = 0;                         // gate=0 — isolates the feed
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 6.0f;
+    h->yawDeg = 90.0f;
+    h->field2c = 1.0f;
+    DynamicObject* tw = s.alloc(0, 0.75f);
+    s.twin_ = tw;
+    const int fs0 = s.seams().fillSelect;
+    for (int i = 0; i != 4; ++i) s.heroUpdate(dt);
+    CHECK(s.winLo_ == 0 && s.winHi_ == 30);// lead ~0.8 < 1 — no feed
+    s.heroUpdate(dt);                      // zBias ~1.75 -> lead > 1
+    CHECK(s.winLo_ == 1);
+    CHECK(s.winHi_ == 31);                 // tunnelExtend ran once
+    CHECK(s.seams().fillSelect == fs0 + 1);
+    CHECK(h->enemyIndex == 1);             // hero -> winLo+1 bucket
+    CHECK(tw->enemyIndex == 1);            // twin migrated with it
+    for (int i = 0; i != 4; ++i) s.heroUpdate(dt);
+    CHECK(s.winLo_ == 1 && s.winHi_ == 31);// no double extension
+    s.heroUpdate(dt);                      // zBias ~2.75 -> lead > 2
+    CHECK(s.winLo_ == 2 && s.winHi_ == 32);
+    CHECK(s.seams().fillSelect == fs0 + 2);
+    CHECK(h->enemyIndex == 2 && tw->enemyIndex == 2);
+  }
+
+  // --- heroUpdate: dead/twin path — decay + recenter, no probe --------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.health_ = 0;                         // gate=0
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 6.0f;
+    // Centered yaw/bank -> the d47f kicks skip; pure decay check.
+    h->yawDeg = 90.0f;
+    h->bankDeg = 0.0f;
+    h->field1c[0] = 2.0f;
+    h->field1c[2] = -1.0f;
+    s.heroUpdate(dt);
+    // Offsets decay 6.25*dt = 0.2083/frame (subtract/add branches).
+    CHECK(near(h->field1c[0], 2.0 - 6.25 / 30.0));
+    CHECK(near(h->field1c[2], -1.0 + 6.25 / 30.0));
+    // Off-center angles recenter at 180*dt = 6/frame: yaw 100 -> 94
+    // (subtract branch), bank -10 -> -4 (add branch).
+    h->yawDeg = 100.0f;
+    h->bankDeg = -10.0f;
+    s.heroUpdate(dt);
+    CHECK(near(h->yawDeg, 94.0, 1e-4));
+    CHECK(near(h->bankDeg, -4.0, 1e-4));
+    s.heroUpdate(dt);
+    CHECK(h->yawDeg == 90.0f);             // clamped on recenter
+    CHECK(h->bankDeg == 0.0f);
+    CHECK(s.seams().animStep == 3);
+    // gate=0 returns before d7b7 — zero planes would have "hit"
+    // everywhere, so silence proves the probe never ran.
+    CHECK(s.events().empty());
+    CHECK(s.health_ == 0);
+  }
+
+  // --- heroUpdate: steer clamps ----------------------------------------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.health_ = 100;
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 0.0f;                     // slow path — no crossings
+    h->yawDeg = 90.0f;
+    h->field2c = 1.0f;
+    s.input_.axis0 = -100.0f;
+    s.input_.axis1 = -100.0f;
+    s.heroUpdate(dt);
+    CHECK(near(h->yawDeg, 90.0 - 100.0 / 30.0, 1e-4));
+    CHECK(near(h->bankDeg, -100.0 / 30.0, 1e-4));
+    for (int i = 0; i != 20; ++i) s.heroUpdate(dt);
+    CHECK(h->yawDeg == 45.0f);             // floored
+    CHECK(h->bankDeg == -45.0f);
+    s.input_.axis0 = 100.0f;
+    s.input_.axis1 = 100.0f;
+    for (int i = 0; i != 40; ++i) s.heroUpdate(dt);
+    CHECK(h->yawDeg == 135.0f);            // capped
+    CHECK(h->bankDeg == 45.0f);
+    CHECK(s.events().empty());             // padded planes — no hits
+  }
+
+  // --- heroUpdate: wall ricochet — deflect, sounds, drain, decay ------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.health_ = 100;
+    s.skill_ = 0;
+    s.assets_.sndHitside = 71;
+    for (int i = 0; i != 7; ++i) s.assets_.sndHurt[i] = 80 + i;
+    // Slot-0 plane 0: n = (-1,0,0), d = 0 — the +x-offset pos violates
+    // it; the ray back to the path crosses at wp = 2.5.
+    s.planes_[0][0] = -1.0f;
+    s.planes_[0][3] = 0.0f;
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 6.0f;
+    h->yawDeg = 90.0f;
+    h->field2c = 1.0f;
+    h->field1c[0] = 1.0f;                  // +x offset -> pos (1,9.5,0)
+    const std::uint32_t rng0 = s.rng_;
+    s.heroUpdate(dt);
+    CHECK(h->yawDeg == 135.0f);            // f1c0*45/1 + 90
+    CHECK(h->bankDeg == 0.0f);             // -f1c2*45 -> -0
+    CHECK(h->field1c[0] == -1.5f);         // * (1 - 2.5)
+    CHECK(h->field1c[2] == 0.0f);
+    CHECK(near(h->pos[0], -1.5) && near(h->pos[1], 9.5));
+    CHECK(s.health_ == 98);                // skill0 -> -2
+    CHECK(h->field34 == 5.4f);             // *0.9, above the 4.5 floor
+    // Sounds: HITSIDE then HURT[rand(7)] — the rand sequence is
+    // replayed on a mirror state to pin the index.
+    std::uint32_t mirror = rng0;
+    const int hurtIdx = mdk::enemyRandBelow(mirror, 7);
+    bool hitside = false, hurt = false;
+    for (const auto& e : s.events()) {
+      if (e.kind == StreamEvent::kPlaySound && e.tag == 71 &&
+          e.aux == 0)
+        hitside = true;
+      if (e.kind == StreamEvent::kPlaySound && e.tag == 80 + hurtIdx)
+        hurt = true;
+    }
+    CHECK(hitside && hurt);
+    CHECK(s.rng_ == mirror);               // exactly one rand consumed
+  }
+
+  // --- heroUpdate: ricochet drains + death latch -----------------------
+  {
+    // skill1: drain = -(rand(2)+2).
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    s.planes_[0][0] = -1.0f;
+    s.planes_[0][3] = 0.0f;
+    s.health_ = 100;
+    s.skill_ = 1;
+    DynamicObject* h = s.alloc(0, 0.75f);
+    s.hero_ = h;
+    h->field34 = 6.0f; h->yawDeg = 90.0f; h->field2c = 1.0f;
+    h->field1c[0] = 1.0f;
+    const std::uint32_t rng0 = s.rng_;
+    s.heroUpdate(dt);
+    std::uint32_t mirror = rng0;
+    (void)mdk::enemyRandBelow(mirror, 7);  // hurt index first
+    const int drain = mdk::enemyRandBelow(mirror, 2) + 2;
+    CHECK(s.health_ == 100 - drain);
+    CHECK(s.rng_ == mirror);
+    // skill2: drain = -(2*rand(2)+4); speed floor 4.5.
+    StreamScene s2;
+    s2.winLo_ = 0; s2.winHi_ = 32;
+    makeStraightPath(s2);
+    s2.planes_[0][0] = -1.0f;
+    s2.planes_[0][3] = 0.0f;
+    s2.health_ = 100;
+    s2.skill_ = 2;
+    s2.rng_ = rng0;
+    DynamicObject* h2 = s2.alloc(0, 0.75f);
+    s2.hero_ = h2;
+    h2->field34 = 4.9f;
+    h2->yawDeg = 90.0f; h2->field2c = 1.0f;
+    h2->field1c[0] = 1.0f;
+    s2.heroUpdate(dt);
+    std::uint32_t m2 = rng0;
+    (void)mdk::enemyRandBelow(m2, 7);
+    const int drain2 = mdk::enemyRandBelow(m2, 2) * 2 + 4;
+    CHECK(s2.health_ == 100 - drain2);
+    CHECK(h2->field34 == 4.5f);            // 4.9*0.9 = 4.41 -> floor
+    // Death latch — non-final clamps health to 1.
+    StreamScene s3;
+    s3.winLo_ = 0; s3.winHi_ = 32;
+    makeStraightPath(s3);
+    s3.planes_[0][0] = -1.0f;
+    s3.planes_[0][3] = 0.0f;
+    s3.health_ = 2;
+    s3.skill_ = 0;
+    DynamicObject* h3 = s3.alloc(0, 0.75f);
+    s3.hero_ = h3;
+    h3->field34 = 6.0f; h3->yawDeg = 90.0f; h3->field2c = 1.0f;
+    h3->field1c[0] = 1.0f;
+    s3.heroUpdate(dt);
+    CHECK(s3.health_ == 1);                // non-final floor
+    CHECK(s3.complete_ == 0 && s3.fade_ == 0.0f);
+    // Death latch — final writes health=0/complete=1/fade=2.0.
+    StreamScene s4;
+    s4.winLo_ = 0; s4.winHi_ = 32;
+    makeStraightPath(s4);
+    s4.planes_[0][0] = -1.0f;
+    s4.planes_[0][3] = 0.0f;
+    s4.health_ = 2;
+    s4.skill_ = 0;
+    s4.isFinal_ = 1;
+    DynamicObject* h4 = s4.alloc(0, 0.75f);
+    s4.hero_ = h4;
+    h4->field34 = 6.0f; h4->yawDeg = 90.0f; h4->field2c = 1.0f;
+    h4->field1c[0] = 1.0f;
+    s4.heroUpdate(dt);
+    CHECK(s4.health_ == 0);
+    CHECK(s4.complete_ == 1);
+    CHECK(s4.fade_ == 2.0f);               // 0x40000000 long ramp
+  }
+
+  // --- step dispatch: native compare order + updater routing ----------
+  {
+    StreamScene s;
+    s.winLo_ = 0; s.winHi_ = 32;
+    makeStraightPath(s);
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    s.health_ = 100;
+    s.rng_ = 2;                            // first extend rand &3 == 0
+                                          // -> no mid-walk debris spawn
+    DynamicObject* h = s.alloc(0, 10.0f);
+    s.hero_ = h;
+    h->field34 = 6.0f;
+    h->yawDeg = 90.0f;
+    h->field2c = 1.0f;
+    DynamicObject* st = s.alloc(14, 14.9f);
+    s.stray_ = st;
+    st->field34 = 0.0f;
+    DynamicObject* e = s.alloc(5, 5.0f);
+    s.escort_ = e;
+    e->field34 = 2.0f;
+    DynamicObject* p = s.alloc(8, 8.0f);
+    s.pickup_ = p;
+    p->field34 = 1.0f;
+    DynamicObject* tw = s.alloc(0, 10.0f);
+    s.twin_ = tw;
+    DynamicObject* g = s.alloc(9, 9.0f);   // unbound -> generic
+    g->field34 = 0.0f;
+    CHECK(s.step(in, dt));
+    CHECK(s.seams().heroUpdate == 1);
+    CHECK(s.seams().strayUpdate == 1);
+    CHECK(s.seams().escortUpdate == 1);
+    CHECK(s.seams().pickupUpdate == 1);
+    CHECK(s.seams().genericUpdate == 1);   // only g
+    CHECK(s.seams().twinSync == 1);
+    // animStep call sites: hero + stray + escort + pickup + twin = 5;
+    // generic has none (OBSERVED).
+    CHECK(s.seams().animStep == 5);
+    // hero FIRST: the stray gate reads the post-advance zBias (10.2)
+    // — a pre-update read would have produced 15.0 instead of 15.2.
+    CHECK(near(s.hero_->zBias, 10.2));
+    CHECK(near(st->zBias, 15.2));
+    CHECK(st->field34 == 6.0f);            // hero speed adopted
+    CHECK(st->enemyIndex == 15);
+    CHECK(e->enemyIndex == 5 && near(e->zBias, 5.0 + 2.0 / 30.0));
+    CHECK(p->enemyIndex == 8 && near(p->zBias, 8.0 + 1.0 / 30.0));
+    CHECK(g->enemyIndex == 9 && g->pos[1] == 90.0f);
+    // twin stage ran post-walk: pos + xform mirror.
+    CHECK(tw->pos[0] == h->pos[0] && tw->pos[1] == h->pos[1] &&
+          tw->pos[2] == h->pos[2]);
+    for (int i = 0; i != 9; ++i)
+      CHECK(tw->col.xform[i] == h->col.xform[i]);
+    for (int i = 0; i != 3; ++i)
+      CHECK(tw->col.origin[i] == h->col.origin[i]);
   }
 }
 
@@ -26561,6 +27133,7 @@ int main() {
   test_stream_tunnel();
   test_stream_teardown();
   test_stream_step();
+  test_stream_updaters();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

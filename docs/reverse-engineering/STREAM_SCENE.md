@@ -235,3 +235,57 @@ pump) → `FUN_0041d85c` → frontend.
   effective table), counters, flags, completion.
 - Mode 8 core: bounded FLIC decoder + frame-mark events +
   palette ramps + completion; MVE stage = boundary event.
+
+## 13. Phase 19A.2B — actor updater family (implemented, OBSERVED)
+
+The six mode-5 actor updaters are implemented in
+`src/core/stream_scene.cpp` from the captured asm
+(`analysis-private/logs/p19a_asm1/2/4.txt`, `p19a_batch1/5/7.txt`,
+`p19a_dispatch.asm`). Dispatch order confirmed from the frame asm:
+**hero → stray → escort → pickup → (twin skipped — `twinSync` owns
+it) → generic**.
+
+- `heroUpdate` (`FUN_0042d24c`): input axes staged via `input_`/
+  `stepDt_`; speed grow `field34 → 6.0`; `zBias` advance; window feed
+  `zBias-0.75 > winLo+1` → `migrate(hero/twin, winLo+1)` →
+  `winLo_++` → `tunnelExtend()` in that order; animStep seam; path
+  frame `(zBias, zBias+1)`; gate `(twin_==null && health>0)` selects
+  swim-ease+steer vs offset decay; yaw `[45,135]`/bank `[-45,45]`
+  clamps and ±180°·dt recentre; d47f offset kicks
+  (`cos yaw`/`sin bank`·25·dt); wall probe + ricochet (deflect,
+  offset damp `1-wp`, HITSIDE + `rand(7)` HURT, skill-scaled drain,
+  `·0.9`/floor-4.5 speed decay); death latch (final: `health=0,
+  complete=1, fade=2.0`; non-final: `health=1` — arms the rescue gate
+  via the `health==1` re-entry).
+- `genericUpdate` (`FUN_0042cf6c`): `field34`-gated `zBias` advance;
+  trunc→migrate→reap-on-fail; fractional path offset cleared after
+  transform; no anim call.
+- `escortUpdate` (`FUN_0042d034`): unconditional advance; migrate,
+  reap+clear-pointer on fail; animStep; escort frac constant.
+- `pickupUpdate` (`FUN_0042d118`): advance, migrate, animStep,
+  transform, hero-distance gate → APPLE + `health=0x96` + reap +
+  pointer clear; fail path reaps without anim.
+- `strayUpdate` (`FUN_0042db0c`): lead clamp to `hero zBias + 5`
+  (copies hero `field34` when clamped); migrate; reap on fail keeps
+  the stray pointer (OBSERVED asymmetry); trailing frame
+  `(zBias-4, zBias-3)`.
+- `twinSync` (`FUN_0042dabc`): copies hero pos[3] + the 48-byte
+  `+0xac` transform block, ticks anim — **does NOT copy `zBias`**
+  (OBSERVED desync; the rescue twin keeps its spawn-time path slot
+  while mirroring position/orientation).
+
+Regression: `mdk_tests` 9662/0, CTest 1/1, traversal L3–8 and
+freefall c0–c4 canonical digests unchanged. Bounded real-data
+diagnostic: `mdk-inspect --data-path <installed> --stream-init
+--course N --skill 1 --stream-frames F` — per-frame updater reach,
+window feed, animStep seam, state digest. Non-final course: hero +
+pickup + generic every frame; course 4: hero + escort + generic;
+death latch on c0 arms the `health==1` twin gate → `twinSync`.
+`strayUpdate` unreachable on real data — nothing spawns the stray
+slot (`strayIdx=-1` at init; OBSERVED, not a port gap).
+
+Deferred seams preserved (counted, not implemented): `animStep`
+(FUN_004555bc family), backdrop/draw/present, teletype, limiter,
+fillSelect internals.
+
+**MODE-5 CINEMATIC ACTOR UPDATERS: CLOSED FOR BUILD_A.**

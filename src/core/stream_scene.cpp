@@ -1109,35 +1109,402 @@ void StreamScene::teardown() {
 }
 
 // ===========================================================================
-// Deferred updater/pipeline seams — bodies land in Phase 19A.2B. Each
-// preserves the native signature so the dispatch sites are final.
+// Phase 19A.2B — the mode-5 actor updater family, instruction-level
+// ports of the captured asm (p19a_asm1.txt / p19a_asm2.txt):
+//   hero    FUN_0042d24c   generic  FUN_0042cf6c
+//   escort  FUN_0042d034   pickup   FUN_0042d118
+//   stray   FUN_0042db0c   twinSync FUN_0042dabc
+// animStep stays the deferred FUN_004555bc seam — the animator family
+// is a later phase; the updaters only count their call sites.
 // ===========================================================================
+namespace {
+// d57b/d60d sub-block shared by the two hero lateral offsets on the
+// dead/twin path: f64 save -> ±6.25*frame-dt step toward 0 -> f32 store
+// -> clamp on the f80 residue compare. The two sub-branches differ on
+// unordered (the subtract side keeps NaN, the add side clears it) —
+// preserved per-branch like the JBE/JNC pairs in the original.
+void streamDecayOffset(float& v, float dt) {
+  const double save = v;
+  if (!(0.0 >= save)) {                       // v > 0 or NaN -> subtract
+    const double nv = save - static_cast<double>(dt) * 6.25;
+    v = static_cast<float>(nv);
+    if (nv < 0.0) v = 0.0f;
+  } else {                                    // v <= 0 ordered -> add
+    const double nv = save + static_cast<double>(dt) * 6.25;
+    v = static_cast<float>(nv);
+    if (!(nv <= 0.0)) v = 0.0f;
+  }
+}
+} // namespace
+
+// FUN_0042d24c — the hero updater. Owns winLo progression: the
+// winLo+1 boundary crossing migrates hero+twin, increments winLo_ and
+// feeds tunnelExtend() — the only updater that touches the window.
 void StreamScene::heroUpdate(float dt) {
-  // FUN_0042d24c — owns winLo++ + da40 bucket migration + tunnelExtend
-  // feed + input fold; deferred.
-  (void)dt;
   ++seams_.heroUpdate;
+  DynamicObject& h = *hero_;
+  // FUN_00407f2c — the input fold resolves device state into the two
+  // +0x4ce758/+0x4ce75c axis globals; step() stages the resolved pair
+  // into input_ at the head of the frame.
+  const float axis0 = input_.axis0;
+  const float axis1 = input_.axis1;
+  // d25f — the gate flag (native ECX): twin present -> 0; else health
+  // > 0 -> 1. Dead/twin frames still run movement, anim and the
+  // transform tail but skip steering, the swim ease, and the whole
+  // wall-probe/ricochet block.
+  const bool gate = (twin_ == nullptr && health_ > 0);
+
+  // d274 — speed grow: field34 < 6.0 -> += frame dt (f64 add, f32
+  // store), overshoot clamps to 6.0 on the f80 residue compare.
+  if (!((double)h.field34 >= 6.0)) {
+    const double nv = (double)dt + (double)h.field34;
+    h.field34 = (float)nv;
+    if (nv > 6.0) h.field34 = 6.0f;
+  }
+  // d2a9 — path advance: zBias += field34 * dt.
+  h.zBias = (float)((double)h.field34 * (double)dt + (double)h.zBias);
+
+  // d2bd — window feed: fires when zBias - 0.75 passes winLo+1
+  // (unordered falls INTO the block like the native JNC). Migrations
+  // land in the new low bucket BEFORE the winLo_++ / tunnelExtend
+  // pair — native order.
+  if (!((double)(winLo_ + 1) >= (double)h.zBias - 0.75)) {
+    migrate(h, winLo_ + 1);               // da40 — return ignored
+    if (twin_) migrate(*twin_, winLo_ + 1);
+    ++winLo_;                             // 0x4e74b0++
+    tunnelExtend();                       // be4c — winHi++
+  }
+
+  animStep(h, dt);                        // 555bc — deferred seam
+
+  // d310 — path frame at (zBias, zBias+1); basis for the rebuild.
+  float pf[12];
+  pathFrame(pf, h.zBias, (float)((double)h.zBias + 1.0));
+
+  if (gate) {
+    // d338 — swim ease: vel = vel*0.75 + pathdir*0.25, renormalized;
+    // the unit swim vector spreads lateral/vertical drift through the
+    // frame's side (pf[0,4,8]) and up (pf[2,6,10]) columns at
+    // 100*frame-dt.
+    h.field28 = (float)((double)h.field28 * 0.75 + (double)pf[1] * 0.25);
+    h.field2c = (float)((double)h.field2c * 0.75 + (double)pf[5] * 0.25);
+    h.field30 = (float)((double)h.field30 * 0.75 + (double)pf[9] * 0.25);
+    float swim[3] = {h.field28, h.field2c, h.field30};
+    normalizeE9c4(swim);
+    h.field28 = swim[0]; h.field2c = swim[1]; h.field30 = swim[2];
+    const double lat = (double)h.field2c * (double)pf[4] +
+                       (double)h.field28 * (double)pf[0] +
+                       (double)h.field30 * (double)pf[8];
+    h.field1c[0] =
+        (float)((double)h.field1c[0] + lat * 100.0 * (double)dt);
+    const double ver = (double)h.field28 * (double)pf[2] +
+                       (double)h.field2c * (double)pf[6] +
+                       (double)h.field30 * (double)pf[10];
+    h.field1c[2] =
+        (float)((double)h.field1c[2] + ver * 100.0 * (double)dt);
+  } else {
+    // d57b — dead/twin: both offsets decay to 0 at 6.25*dt.
+    streamDecayOffset(h.field1c[0], dt);
+    streamDecayOffset(h.field1c[2], dt);
+  }
+
+  // d3ee/d638 — yaw steer: axis0 < 0 steers down (floor 45), > 0
+  // steers up (cap 135); released or dead recenters to 90 at 180*dt.
+  if (gate && axis0 < 0.0f) {
+    const double nv = (double)axis0 * (double)dt + (double)h.yawDeg;
+    h.yawDeg = (float)nv;
+    if (!(nv >= 45.0)) h.yawDeg = 45.0f;   // JNC — NaN clamps
+  } else if (gate && !(axis0 <= 0.0f)) {
+    const double nv = (double)axis0 * (double)dt + (double)h.yawDeg;
+    h.yawDeg = (float)nv;
+    if (nv > 135.0) h.yawDeg = 135.0f;     // JBE — NaN keeps
+  } else {
+    const double save = h.yawDeg;
+    if (!(save >= 90.0)) {
+      const double nv = save + (double)dt * 180.0;
+      h.yawDeg = (float)nv;
+      if (nv > 90.0) h.yawDeg = 90.0f;
+    } else {
+      const double nv = save - (double)dt * 180.0;
+      h.yawDeg = (float)nv;
+      if (!(nv >= 90.0)) h.yawDeg = 90.0f;
+    }
+  }
+  // d432/d6ee — bank steer: axis1 < 0 down (floor -45), > 0 up (cap
+  // +45); released or dead recenters to 0.
+  if (gate && axis1 < 0.0f) {
+    const double nv = (double)axis1 * (double)dt + (double)h.bankDeg;
+    h.bankDeg = (float)nv;
+    if (!(nv >= -45.0)) h.bankDeg = -45.0f;
+  } else if (gate && !(axis1 <= 0.0f)) {
+    const double nv = (double)axis1 * (double)dt + (double)h.bankDeg;
+    h.bankDeg = (float)nv;
+    if (nv > 45.0) h.bankDeg = 45.0f;
+  } else {
+    const double save = h.bankDeg;
+    if (save < 0.0) {                       // ordered < 0 -> add branch
+      const double nv = save + (double)dt * 180.0;
+      h.bankDeg = (float)nv;
+      if (!(nv <= 0.0)) h.bankDeg = 0.0f;
+    } else {                                // >= 0 or NaN -> subtract
+      const double nv = save - (double)dt * 180.0;
+      h.bankDeg = (float)nv;
+      if (nv < 0.0) h.bankDeg = 0.0f;
+    }
+  }
+
+  // d47f — steer kicks: yaw != 90 (ordered compare — the native JZ
+  // skips on equal OR unordered) pumps the lateral offset by
+  // cosd(yaw)*25*dt; bank != 0 pumps the vertical by sind(bank)*25*dt.
+  if (!std::isnan(h.yawDeg) && h.yawDeg != 90.0f) {
+    h.field1c[0] = (float)(std::cos((double)h.yawDeg * kDegToRad) * 25.0 *
+                           (double)dt + (double)h.field1c[0]);
+  }
+  if (!std::isnan(h.bankDeg) && h.bankDeg != 0.0f) {
+    h.field1c[2] = (float)(std::sin((double)h.bankDeg * kDegToRad) * 25.0 *
+                           (double)dt + (double)h.field1c[2]);
+  }
+
+  // d4df — prevPos latch (MOVSD x3), then local euler + compose into
+  // the live +0xac block. The transform drives the position — pos :=
+  // origin, the opposite direction from the other updaters.
+  h.prevPos[0] = h.pos[0];
+  h.prevPos[1] = h.pos[1];
+  h.prevPos[2] = h.pos[2];
+  float localB[12];
+  euler6b2f8(h.pitchDeg, h.bankDeg, h.yawDeg, h.col.scale, h.field1c,
+             localB);
+  float m[12];
+  compose6aeb0(pf, localB, m);
+  streamStoreMatrix(h, m);
+  h.setPosition(h.col.origin[0], h.col.origin[1], h.col.origin[2]);
+
+  if (!gate) return;                        // d557 — dead/twin RET
+
+  // d7b7 — wall probe at the new pos; a miss (wp < 0 ordered) ends
+  // the update. On hit the bank/yaw deflect off the offset ratio and
+  // the offsets damp by (1-wp); the euler translation column is
+  // patched in place and the transform recomposed.
+  const float wp = wallProbe(h.pos, h.zBias);
+  if (wp < 0.0f) return;                    // JA — unordered falls in
+  const double rr = std::sqrt((double)h.field1c[0] * h.field1c[0] +
+                              (double)h.field1c[2] * h.field1c[2]);
+  const double k = 45.0 / rr;
+  const float bank = (float)(-(double)h.field1c[2] * k);
+  h.yawDeg = (float)((double)h.field1c[0] * k + 90.0);
+  h.bankDeg = bank;
+  const double inv = 1.0 - (double)wp;
+  h.field1c[0] = (float)((double)h.field1c[0] * inv);
+  h.field1c[2] = (float)((double)h.field1c[2] * inv);
+  localB[3] = h.field1c[0];
+  localB[7] = h.field1c[1];
+  localB[11] = h.field1c[2];
+  compose6aeb0(pf, localB, m);
+  streamStoreMatrix(h, m);
+  h.setPosition(h.col.origin[0], h.col.origin[1], h.col.origin[2]);
+
+  // d878 — ricochet audio: HITSIDE (aux=0) then one of the 7 HURT
+  // tags at rand(7) (aux = EDX call-residue in the native — the port
+  // emits the stable one-shot flag 0).
+  emit(StreamEvent::kPlaySound, assets_.sndHitside, 0, 0.0f);
+  const int hurt = enemyRandBelow(rng_, 7);
+  emit(StreamEvent::kPlaySound, assets_.sndHurt[hurt], 0, 0.0f);
+
+  // d89d — health drain (the JLE shape is kept though gate already
+  // guarantees health_ > 0): skill0 -2; skill1 -(rand(2)+2); skill2
+  // -(2*rand(2)+4). Death latch: final -> health=0/complete=1/
+  // fade=2.0 (the long death ramp); non-final -> health=1.
+  if (health_ > 0) {
+    switch (skill_) {
+      case 0: health_ -= 2; break;
+      case 1: health_ -= enemyRandBelow(rng_, 2) + 2; break;
+      case 2: health_ -= enemyRandBelow(rng_, 2) * 2 + 4; break;
+      default: break;
+    }
+    if (health_ <= 0) {
+      if (isFinal_) {
+        health_ = 0;
+        complete_ = 1;
+        fade_ = 2.0f;                       // 0x40000000
+      } else {
+        health_ = 1;
+      }
+    }
+  }
+  // d8c8 — ricochet speed decay: *0.9, floor 4.5 on the f80 product.
+  const double nv = (double)h.field34 * 0.9;
+  h.field34 = (float)nv;
+  if (!(nv >= 4.5)) h.field34 = 4.5f;
 }
+
+// FUN_0042cf6c — the scripted-prop updater. +0x34 nonzero advances
+// zBias and migrates to the trunc bucket (reap on window exit skips
+// the frac tail entirely); the tail writes field1c[1] = frac(zBias)*10
+// (0x497048), drives pos from field1c through the node frame, clears
+// +0x20 and latches the transform origin. OBSERVED: no anim tick —
+// cf6c never calls 0x4555bc.
 void StreamScene::genericUpdate(DynamicObject& o, float dt) {
-  (void)o; (void)dt;
   ++seams_.genericUpdate;
+  if (o.field34 != 0.0f && !std::isnan(o.field34)) {
+    // FLDZ/FCOMPP/JZ — equal OR unordered skips the advance.
+    o.zBias = (float)((double)o.field34 * (double)dt + (double)o.zBias);
+    const int n = (int)streamFrndInt(o.zBias);
+    if (!migrate(o, n)) {                   // da40 — outside [winLo,winHi)
+      reap(o);
+      return;
+    }
+  }
+  const int n = (int)streamFrndInt(o.zBias);
+  o.field1c[1] = (float)(((double)o.zBias - (double)n) * 10.0);
+  float p[3];
+  point6afe4(o.field1c, nodeMat_[n & 0x1f], p);
+  o.setPosition(p[0], p[1], p[2]);
+  o.field1c[1] = 0.0f;
+  o.col.origin[0] = o.pos[0];
+  o.col.origin[1] = o.pos[1];
+  o.col.origin[2] = o.pos[2];
 }
+
+// FUN_0042d034 — the final-mode escort: unconditional advance
+// (field34*dt), migrate to the trunc bucket — on window exit reap +
+// clear edab8 — then the anim tick, the live pathFrame rebuild at
+// (zBias, zBias+1), and the same frac/pos/origin tail (scale
+// 0x497050 = 10.0).
 void StreamScene::escortUpdate(DynamicObject& o, float dt) {
-  (void)o; (void)dt;
   ++seams_.escortUpdate;
+  o.zBias = (float)((double)o.field34 * (double)dt + (double)o.zBias);
+  const int n0 = (int)streamFrndInt(o.zBias);
+  if (!migrate(o, n0)) {
+    reap(o);
+    escort_ = nullptr;                      // DAT_004edab8 = 0
+    return;
+  }
+  animStep(o, dt);                          // 555bc — deferred seam
+  // d082 — the native pathFrame writes the live +0xac block directly.
+  float m[12];
+  pathFrame(m, o.zBias, (float)((double)o.zBias + 1.0));
+  streamStoreMatrix(o, m);
+  const int n = (int)streamFrndInt(o.zBias);
+  o.field1c[1] = (float)(((double)o.zBias - (double)n) * 10.0);
+  float p[3];
+  point6afe4(o.field1c, nodeMat_[n & 0x1f], p);
+  o.setPosition(p[0], p[1], p[2]);
+  o.field1c[1] = 0.0f;
+  o.col.origin[0] = o.pos[0];
+  o.col.origin[1] = o.pos[1];
+  o.col.origin[2] = o.pos[2];
 }
+
+// FUN_0042d118 — the non-final pickup: same advance/migrate/rebuild
+// tail as the escort (frac scale 0x497058 = 10.0, edac8 cleared on
+// migrate-fail), then the hero-distance gate: the f80 3-D distance vs
+// the f32 5.0 constant (0x497060), JC on < — within reach it restores
+// 541554 to 150 (0x96), plays APPLE with the aux=1 loop flag, reaps
+// and clears the slot.
 void StreamScene::pickupUpdate(DynamicObject& o, float dt) {
-  (void)o; (void)dt;
   ++seams_.pickupUpdate;
+  o.zBias = (float)((double)o.field34 * (double)dt + (double)o.zBias);
+  const int n0 = (int)streamFrndInt(o.zBias);
+  if (!migrate(o, n0)) {
+    reap(o);
+    pickup_ = nullptr;                      // DAT_004edac8 = 0
+    return;
+  }
+  animStep(o, dt);                          // 555bc — deferred seam
+  float m[12];
+  pathFrame(m, o.zBias, (float)((double)o.zBias + 1.0));
+  streamStoreMatrix(o, m);
+  const int n = (int)streamFrndInt(o.zBias);
+  o.field1c[1] = (float)(((double)o.zBias - (double)n) * 10.0);
+  float p[3];
+  point6afe4(o.field1c, nodeMat_[n & 0x1f], p);
+  o.setPosition(p[0], p[1], p[2]);
+  o.field1c[1] = 0.0f;
+  o.col.origin[0] = o.pos[0];
+  o.col.origin[1] = o.pos[1];
+  o.col.origin[2] = o.pos[2];
+  if (!hero_) return;                       // edab4 deref is
+                                           // unconditional; bounded
+  const double dx = (double)o.pos[0] - (double)hero_->pos[0];
+  const double dy = (double)o.pos[1] - (double)hero_->pos[1];
+  const double dz = (double)o.pos[2] - (double)hero_->pos[2];
+  const double dist =
+      std::sqrt((dx * dx + dy * dy) + dz * dz);   // FUN_00430160 f80
+  if (!(dist >= 5.0)) {                       // FCOMP f32 5.0, JC
+    health_ = 0x96;                           // 541554 = 150
+    emit(StreamEvent::kPlaySound, assets_.sndApple, 1, 0.0f);
+    reap(o);
+    pickup_ = nullptr;
+  }
 }
+
+// FUN_0042db0c — the stray updater (the db0c dispatch slot — the
+// companion that trails the hero's path position). field34 != 0
+// advances zBias; the catch-up gate clamps the stray to
+// hero.zBias + 5.0 and copies the hero speed; migrate to the trunc
+// bucket reaps on window exit (no slot clear — OBSERVED); then the
+// anim tick, the trailing pathFrame at (zBias-4, zBias-3) with the
+// node translation patched back in, the frac/yaw euler, compose and
+// the pos := origin tail.
 void StreamScene::strayUpdate(DynamicObject& o, float dt) {
-  (void)o; (void)dt;
   ++seams_.strayUpdate;
+  if (o.field34 != 0.0f && !std::isnan(o.field34)) {
+    o.zBias = (float)((double)o.field34 * (double)dt + (double)o.zBias);
+  }
+  if (hero_) {                              // db32 — edab4 read is
+    // Catch-up: stray.zBias < hero.zBias + 5.0 (or unordered) snaps
+    // forward to the gate and adopts the hero's +0x34 speed.
+    const double lead = (double)hero_->zBias + 5.0;
+    if (!((double)o.zBias >= lead)) {
+      o.zBias = (float)lead;
+      o.field34 = hero_->field34;
+    }
+  }
+  const int n = (int)streamFrndInt(o.zBias);
+  if (!migrate(o, n)) {
+    reap(o);
+    return;
+  }
+  animStep(o, dt);                          // 555bc — deferred seam
+  const int n2 = (int)streamFrndInt(o.zBias);
+  float pf[12];
+  pathFrame(pf, (float)((double)o.zBias - 4.0),
+            (float)((double)o.zBias - 3.0));
+  // dbd2 — the node translation is patched back over the trailing
+  // frame's (the path frame's own column comes from zBias-4/-3).
+  pf[3] = nodeMat_[n2 & 0x1f][3];
+  pf[7] = nodeMat_[n2 & 0x1f][7];
+  pf[11] = nodeMat_[n2 & 0x1f][11];
+  const int n3 = (int)streamFrndInt(o.zBias);
+  o.field1c[1] = (float)(((double)o.zBias - (double)n3) * 10.0);
+  // dc04 — yaw-only euler (a3=a2=0, scale 1.0) over the frac-window
+  // translation, then pf o localB into the live +0xac block.
+  float localB[12];
+  euler6b180(0.0f, 0.0f, o.yawDeg, 1.0f, o.field1c, localB);
+  float m[12];
+  compose6aeb0(pf, localB, m);
+  streamStoreMatrix(o, m);
+  o.field1c[1] = 0.0f;
+  o.setPosition(o.col.origin[0], o.col.origin[1], o.col.origin[2]);
 }
-void StreamScene::twinSync() { ++seams_.twinSync; }
+
+// FUN_0042dabc — rescue-twin mirror, runs after the object walk (the
+// per-object dispatch skips the twin at cb78): pos + the 0x30-byte
+// +0xac xform block copy from the hero, then the twin's anim tick.
+void StreamScene::twinSync() {
+  ++seams_.twinSync;
+  if (!twin_ || !hero_) return;             // native derefs raw; bounded
+  twin_->setPosition(hero_->pos[0], hero_->pos[1], hero_->pos[2]);
+  for (int i = 0; i != 9; ++i)
+    twin_->col.xform[i] = hero_->col.xform[i];
+  for (int i = 0; i != 3; ++i)
+    twin_->col.origin[i] = hero_->col.origin[i];
+  animStep(*twin_, stepDt_);
+}
+
 void StreamScene::animStep(DynamicObject& o, float dt) {
   (void)o; (void)dt;
-  ++seams_.animStep;
+  ++seams_.animStep;                        // 555bc — deferred seam
 }
 void StreamScene::backdropScroll() { ++seams_.backdrop; }
 
@@ -1151,14 +1518,19 @@ void StreamScene::emitFrameDraw() {
 }
 
 // ===========================================================================
-// FUN_0042c8b0 — frame skeleton. Stages in OBSERVED order; updater
-// bodies are deferred seams (see StreamSeams).
+// FUN_0042c8b0 — frame skeleton. Stages in OBSERVED order; the actor
+// updater family is implemented (Phase 19A.2B) — animStep/backdrop/
+// drawList remain the deferred seams (see StreamSeams).
 // ===========================================================================
 bool StreamScene::step(const StreamInput& in, float dtSec) {
-  (void)in;  // axis0/axis1 fold into heroUpdate — deferred
   stepLog_.clear();
   ++frameTick_;                          // 0x49b5a4++
   stepLog_.push_back(StreamStage::kTick);
+  // Frame context for the updaters — the native resolves the input
+  // axes into globals inside heroUpdate's 407f2c fold and reads the
+  // 0x49b6f4 frame delta directly; the port stages both here.
+  input_ = in;
+  stepDt_ = dtSec;
 
   // --- rescue-twin gate + completion (c8d1..ca82) ---
   // Entered iff health>0 && (winLo>177 || health==1) — the health==1
