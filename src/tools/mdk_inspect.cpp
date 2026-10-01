@@ -47,6 +47,7 @@
 #include "core/save_game.h"
 #include "core/sni_directory.h"
 #include "core/stream_context.h"
+#include "core/stream_scene.h"
 #include "core/traversal_runtime.h"
 
 #include <algorithm>
@@ -1927,6 +1928,7 @@ int main(int argc, char** argv) {
   bool arenaRender = false;
   bool traversalRuntime = false;
   bool freefallRuntime = false;
+  bool streamInit = false;
   bool campaignHandoff = false;
   bool campaignSequence = false;
   bool frontendScriptMode = false;
@@ -2112,6 +2114,8 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       target = v;                 // FALL3D.BNI path
       freefallRuntime = true;
+    } else if (!std::strcmp(a, "--stream-init")) {
+      streamInit = true;          // fixed paths — STREAM/STREAM.{BNI,MTI}
     } else if (!std::strcmp(a, "--campaign-handoff")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -2852,6 +2856,200 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+
+  // --stream-init: Phase 19A.2A mode-5 init diagnostic. Loads the
+  // proven STREAM/STREAM.{BNI,MTI} + MISC/MDKFONT.FTI record set, binds
+  // StreamAssets by the OBSERVED record names (FUN_0042b270), runs
+  // StreamScene::init, and prints the post-init state: resource-bind
+  // status, pool/bucket occupancy, window bounds, actor identities,
+  // counter seeds, camera state, fade/completion flags and the seam
+  // counters. No rendering, no script execution.
+  if (streamInit) {
+    if (!dataPath) return usage();
+    std::string err;
+    const auto root = mdk::DataRoot::open(*dataPath, &err);
+    if (!root) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 2;
+    }
+    const auto bni = root->readFile("STREAM/STREAM.BNI",
+                                    kEntriesMaxBytes, &err);
+    const auto mti = root->readFile("STREAM/STREAM.MTI",
+                                    kEntriesMaxBytes, &err);
+    const auto fti = root->readFile("MISC/MDKFONT.FTI",
+                                    kEntriesMaxBytes, &err);
+    std::printf("stream-init: course=%d skill=%d seed=%08x health=100\n",
+                ffCourse, ffSkill, ffSeed);
+    std::printf("files:       STREAM.BNI=%s  STREAM.MTI=%s  "
+                "MDKFONT.FTI=%s\n",
+                bni ? "ok" : "MISSING", mti ? "ok" : "MISSING",
+                fti ? "ok" : "MISSING");
+    if (!bni) {
+      std::fprintf(stderr, "read: %s\n", err.c_str());
+      return 1;
+    }
+    const auto dir = mdk::inspectBniDirectory(
+        std::span<const std::byte>(bni->data(), bni->size()));
+    if (dir.status != mdk::BniDirectoryStatus::kOk) {
+      std::fprintf(stderr, "bni: %s — %s\n",
+                   std::string(mdk::bniDirectoryStatusName(dir.status))
+                       .c_str(),
+                   dir.detail.c_str());
+      return 1;
+    }
+    auto tagOf = [&](const char* name) -> int {
+      const mdk::BniRecord* r = mdk::findBniRecord(dir, name);
+      return r ? static_cast<int>(r - dir.records.data()) : -1;
+    };
+    auto payloadOf = [&](const char* name) -> const std::byte* {
+      const mdk::BniRecord* r = mdk::findBniRecord(dir, name);
+      return r ? bni->data() + r->payloadFileOffset : nullptr;
+    };
+    auto payloadEnd = [&](const char* name) -> const std::byte* {
+      const mdk::BniRecord* r = mdk::findBniRecord(dir, name);
+      return r ? bni->data() + r->payloadEnd : nullptr;
+    };
+    mdk::StreamAssets a{};
+    const std::byte* pal = payloadOf("PAL");
+    a.palettePal = pal ? reinterpret_cast<const std::uint8_t*>(pal) +
+                           mdk::kStreamPaletteTailOffset
+                       : nullptr;
+    if (fti) {
+      const auto fdir = mdk::inspectFtiDirectory(
+          std::span<const std::byte>(fti->data(), fti->size()));
+      if (fdir.status == mdk::FtiDirectoryStatus::kOk) {
+        if (const mdk::FtiRecord* sp =
+                mdk::findFtiRecord(fdir, mdk::kStreamSystemRecord))
+          a.paletteGlobal = reinterpret_cast<const std::uint8_t*>(
+              fti->data() + sp->payloadFileOffset);
+      }
+    }
+    a.bgTag = tagOf("BG");
+    const int planet = tagOf("PLANET");
+    for (int i = 0; i != 4; ++i) a.planetTag[i] = planet;  // sub-images
+                                                         // not decomposed
+    a.lightTag = tagOf("LIGHT");
+    a.sndWind = tagOf("WIND");
+    a.sndHitside = tagOf("HITSIDE");
+    a.sndRescue = tagOf("RESCUE");
+    a.sndApple = tagOf("APPLE");
+    for (int i = 0; i != 7; ++i) {
+      char nm[8];
+      std::snprintf(nm, sizeof nm, "HURT%d", i + 1);
+      a.sndHurt[i] = tagOf(nm);
+    }
+    std::optional<mdk::RuntimeModel> pKurt, pBones, pProf, pEsc;
+    int protoAbsent = 0, protoParseFail = 0;
+    auto bindProto = [&](const char* name,
+                         std::optional<mdk::RuntimeModel>& out) {
+      const std::byte* p = payloadOf(name);
+      if (!p) {
+        ++protoAbsent;
+        return;
+      }
+      // BNI payloads omit the record's leading flag word — the
+      // original passes it as FUN_00428400's EDX arg (flag=1 for the
+      // named-element stream records; OBSERVED at the FUN_0042b270
+      // call sites). Re-head for the shared parser, same convention
+      // as traversalShotModel.
+      const std::byte* pe = payloadEnd(name);
+      std::vector<std::uint8_t> headed(
+          4 + static_cast<std::size_t>(pe - p));
+      const std::uint8_t fl[4] = {1, 0, 0, 0};
+      std::memcpy(headed.data(), fl, 4);
+      std::memcpy(headed.data() + 4, p,
+                  static_cast<std::size_t>(pe - p));
+      out = mdk::parseGeometryRecord(headed.data(),
+                                     headed.data() + headed.size());
+      if (!out) ++protoParseFail;
+    };
+    bindProto("KURT", pKurt);
+    bindProto("BONES", pBones);
+    bindProto("PROFSHIP", pProf);
+    const bool isFinal = ffCourse >= 4;
+    bindProto(isFinal ? "GUNTA" : "SWH150", pEsc);
+    a.protoKurt = pKurt ? &*pKurt : nullptr;
+    a.protoBones = pBones ? &*pBones : nullptr;
+    a.protoProfship = pProf ? &*pProf : nullptr;
+    a.protoEscort = pEsc ? &*pEsc : nullptr;
+    a.animEscort = reinterpret_cast<const std::uint8_t*>(
+        payloadOf(isFinal ? "GUNTANIM" : "SWHANM"));
+    a.animBones = reinterpret_cast<const std::uint8_t*>(
+        payloadOf("BONESANIM"));
+    a.animKurt = reinterpret_cast<const std::uint8_t*>(
+        payloadOf("KURTANIM"));
+    a.animHvr = reinterpret_cast<const std::uint8_t*>(
+        payloadOf("FL_HVR"));
+    a.animWave = reinterpret_cast<const std::uint8_t*>(
+        payloadOf("FL_WAVE"));
+    auto yesno = [](const void* p) { return p ? "ok" : "MISSING"; };
+    std::printf("binds:       PAL=%s SYS_PAL=%s BG=%s PLANET=%s "
+                "LIGHT=%s\n",
+                yesno(a.palettePal), yesno(a.paletteGlobal),
+                a.bgTag >= 0 ? "ok" : "MISSING",
+                planet >= 0 ? "ok" : "MISSING",
+                a.lightTag >= 0 ? "ok" : "MISSING");
+    int hurtBound = 0;
+    for (int i = 0; i != 7; ++i) hurtBound += a.sndHurt[i] >= 0;
+    std::printf("             WIND=%s HITSIDE=%s RESCUE=%s APPLE=%s "
+                "HURT=%d/7\n",
+                a.sndWind >= 0 ? "ok" : "MISSING",
+                a.sndHitside >= 0 ? "ok" : "MISSING",
+                a.sndRescue >= 0 ? "ok" : "MISSING",
+                a.sndApple >= 0 ? "ok" : "MISSING", hurtBound);
+    std::printf("             KURT=%s BONES=%s PROFSHIP=%s %s=%s "
+                "(absent=%d parseFail=%d)\n",
+                yesno(a.protoKurt), yesno(a.protoBones),
+                yesno(a.protoProfship), isFinal ? "GUNTA" : "SWH150",
+                yesno(a.protoEscort), protoAbsent, protoParseFail);
+    std::printf("             anims %s=%s BONESANIM=%s KURTANIM=%s "
+                "FL_HVR=%s FL_WAVE=%s\n",
+                isFinal ? "GUNTANIM" : "SWHANM", yesno(a.animEscort),
+                yesno(a.animBones), yesno(a.animKurt), yesno(a.animHvr),
+                yesno(a.animWave));
+
+    mdk::StreamScene sc;
+    const bool ok = sc.init(a, ffCourse, ffSkill, ffSeed, 100);
+    const mdk::StreamSnapshot s = sc.snapshot();
+    std::printf("init:        %s  window=[%d,%d) radius=%.4f penT=%.3f\n",
+                ok ? "ok" : "FAILED", s.winLo, s.winHi,
+                (double)s.radius, (double)s.penT);
+    std::printf("seeds:       driftMax=%.2f radiusMin=%.2f "
+                "radiusMax=%.2f penBase=%d penTarget=%d\n",
+                (double)s.driftMax, (double)s.radiusMin,
+                (double)s.radiusMax, s.penBase, s.penTarget);
+    std::printf("actors:      hero=%d escort=%d pickup=%d marker=%d "
+                "twin=%d strayIdx=-1\n",
+                s.heroIdx, s.escortIdx, s.pickupIdx, s.markerIdx,
+                s.twinIdx);
+    std::printf("pool:        live=%d free=%d  buckets[0]=%d [5]=%d "
+                "[16]=%d errors=0\n",
+                s.liveObjects, s.freeObjects, sc.poolBucketCount(0),
+                sc.poolBucketCount(5), sc.poolBucketCount(16));
+    std::printf("flags:       fade=%.3f complete=%d health=%d\n",
+                (double)s.fade, s.complete, s.health);
+    std::printf("camera:      eye=(%.2f,%.2f,%.2f) lookT=%.2f "
+                "view.diag=(%.2f,%.2f,%.2f)\n",
+                (double)s.eye[0], (double)s.eye[1], (double)s.eye[2],
+                (double)s.lookT, (double)s.camView[0],
+                (double)s.camView[5], (double)s.camView[10]);
+    const mdk::StreamSeams& sm = sc.seams();
+    std::printf("seams:       bind=%d free=%d teletype=%d palRamp=%d "
+                "fillSel=%d limiter=%d\n",
+                sm.resourceBind, sm.resourceFree, sm.teletype,
+                sm.paletteRamp, sm.fillSelect, sm.limiter);
+    std::printf("events:      %zu  hash=%016llx\n",
+                sc.events().size(), (unsigned long long)s.stateHash);
+    // Mode-8 boundary check (bounded): FINISH.BNI existence is the
+    // only probe — mode 8 is FUN_0047b038's FLIC/MVE pipeline, a
+    // distinct init path that this substrate does NOT host.
+    const auto fin = root->resolve("MISC/FINISH.BNI", nullptr);
+    std::printf("mode8:       FINISH.BNI=%s — distinct FLIC/MVE "
+                "pipeline (FUN_0047b038); not hosted by StreamScene\n",
+                fin ? "present" : "absent");
+    return ok ? 0 : 1;
+  }
+
 
   if (!dataPath || !target) {
     return usage();

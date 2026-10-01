@@ -123,9 +123,14 @@ struct StreamEvent {
                      // aux = pool index. Marker variant additionally
                      // carries f[4]/f[5] = planetTag[1]/planetTag[2]
     kPaletteSet,     // aux = transform mode {0 install base palette,
-                     // 1 black ramp, 2 white lerp(255), 3 red ramp
-                     // (R=trunc(fade*256), G/B=pal*fade)}; f[0] = fade.
-                     // Host applies to the base palette via palette().
+                     // 1 black ramp (pal*fade — isFinal fade),
+                     // 2 dark-in ramp (pal*fade + (fade-1)*255 —
+                     // non-final fade), 3 red ramp (death fade<=1:
+                     // R=trunc(fade*256), G/B=pal*fade), 4 red
+                     // saturate (death fade>1: R=min(255,pal.R+
+                     // trunc((2-fade)*255)), G/B unchanged)};
+                     // f[0] = fade. Host applies to the base palette
+                     // via palette().
     kPresent,        // end of frame — host displays the assembled image
     kExitMode,       // aux = exit-frame palette fill (0xff alive non-
                      // final, 0x00 final-or-dead); the mode dispatcher
@@ -176,6 +181,46 @@ struct StreamSnapshot {
   std::uint64_t stateHash = 0; // FNV-1a over the sim fields
 };
 
+// --- deferred-stage seam counters --------------------------------------------
+// FUN_0042c8b0 (the native frame) dispatches per-object updaters and a
+// render pipeline that Phase 19A.2A does NOT implement. Rather than
+// silently skipping them, the skeleton calls the real hook functions,
+// whose bodies currently only bump these counters — tests verify call
+// order/count, later phases fill the bodies in place.
+struct StreamSeams {
+  int heroUpdate = 0;     // FUN_0042d24c — owns winLo++/tunnelExtend feed
+  int genericUpdate = 0;  // FUN_0042cf6c — +0x34 swim + anim tick
+  int escortUpdate = 0;   // FUN_0042d034 — escort lane keeper
+  int pickupUpdate = 0;   // FUN_0042d118 — pickup catch/proximity
+  int strayUpdate = 0;    // FUN_0042db0c — edabc slot (never spawned in 19A.2A)
+  int twinSync = 0;       // FUN_0042dabc — rescue-twin mirror pass
+  int animStep = 0;       // FUN_004555bc family ticks inside updaters
+  int backdrop = 0;       // FUN_0042e684 — toroidal scroll accumulate+blit
+  int drawList = 0;       // FUN_0042e100 — back-to-front object draws
+  int listener = 0;       // FUN_004026f8 — audio listener xform update
+  int limiter = 0;        // FUN_0042fb68 — frame limiter wait
+  int fillSelect = 0;     // FUN_0046ae60 — scanline filler mode select
+  int paletteRamp = 0;    // init's 64-step DAC crossfade loop
+  int resourceBind = 0;   // init MTI/BNI/HUD-table binds (host-side)
+  int resourceFree = 0;   // teardown MTI/BNI/HUD-table frees
+  int teletype = 0;       // FUN_0041cf5c script-queue clear (init)
+};
+
+// The stage tag sequence step() records into stepLog_ — the frame's
+// control-flow spine minus the stages a branch skips (e.g. the twin
+// gate only appears when entered; kExitMode is the terminal stage).
+enum class StreamStage : std::uint8_t {
+  kTick,         // 0x49b5a4++ — global frame counter
+  kTwinGate,     // guarded rescue-twin spawn + completion gates
+  kFade,         // fade accumulator + palette transform / exit emit
+  kObjectWalk,   // slot scan +0x11c-stamped updater dispatch
+  kTwinSync,     // twinSync() hook
+  kCamera,       // eye blend + cameraAt
+  kDraw,         // backdrop/draw/present seams + kPresent emit
+  kLimiter,      // frame limiter wait
+  kExit,         // fade-out terminal — kExitMode emitted, step ends
+};
+
 // --- the runtime ------------------------------------------------------------
 class StreamScene {
 public:
@@ -203,6 +248,11 @@ public:
 
   const std::vector<StreamEvent>& events() const { return events_; }
   void clearEvents() { events_.clear(); }
+  // Stage tags appended during the last step() call (cleared each
+  // step) — the frame skeleton's recorded control-flow spine.
+  const std::vector<StreamStage>& stepLog() const { return stepLog_; }
+  const StreamSeams& seams() const { return seams_; }
+  const StreamAssets& assets() const { return assets_; }
 
   // Test hooks (private-state access without friendship).
   const DynamicObject& objectAt(int i) const { return pool_[i]; }
@@ -255,6 +305,14 @@ private:
   void animStep(DynamicObject& o, float dt);    // 555bc via objectAnimTickDt
   void backdropScroll();                        // e684
   void emitFrameDraw();                         // e684 + e100 + present
+  void emit(StreamEvent::Kind kind, int tag, int aux, float f0) {
+    StreamEvent ev;
+    ev.kind = kind;
+    ev.tag = tag;
+    ev.aux = aux;
+    ev.f[0] = f0;
+    events_.push_back(ev);
+  }
   int objIndex(const DynamicObject* o) const {
     return o ? static_cast<int>(o - pool_.data()) : -1;
   }
@@ -286,6 +344,7 @@ private:
   std::int32_t isFinal_ = 0;                    // ead0 (course >= 4)
   float driftMax_ = 0.0f;                       // ead4
   float radiusMin_ = 0.0f, radiusMax_ = 0.0f;   // ead8/eadc
+  int windHandle_ = -1;                         // ea84 — WIND instance
   std::int32_t health_ = 0;                     // 541554
   std::int32_t skill_ = 0;                      // 54147a
   std::int32_t course_ = 0;                     // 541498
@@ -296,6 +355,7 @@ private:
   float camPos_[3] = {};                        // 540b28 eye
   float projScale_[2] = {};                     // 540bf0/540bf4
   float bgScroll_[2] = {};                      // e684 accumulators
+  float lastLookT_ = 0.0f;                      // last cameraAt t arg
   // Proto/anim bindings (asset views).
   StreamAssets assets_;
   // Pool + freelist (0x4f0740 / 0x540ed0).
@@ -312,7 +372,9 @@ private:
   bool quit_ = false;                           // DAT_0054148e
   bool exited_ = false;
   bool tornDown_ = false;
-  int frameTick_ = 0;                           // +0x11c stamp source
+  int frameTick_ = 0;                           // 0x49b5a4 — +0x11c stamp source
+  StreamSeams seams_;                           // deferred-hook counters
+  std::vector<StreamStage> stepLog_;            // per-step stage spine
 };
 
 } // namespace mdk

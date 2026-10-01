@@ -25775,6 +25775,688 @@ void test_stream_pool() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19A.2A — StreamScene::init (FUN_0042b270), tunnelExtend
+// (FUN_0042be4c), teardown (FUN_0042c824) and the step skeleton
+// (FUN_0042c8b0). Synthetic assets only — no captured data.
+// ---------------------------------------------------------------------------
+
+// Minimal StreamAssets: palettes as ramp patterns, tag ids = small ints,
+// anims as distinct pointer sentinels, protos null (the proto binding
+// itself is covered separately with a tiny synthetic RuntimeModel).
+static mdk::StreamAssets makeStreamAssets(std::uint8_t (&pal)[0x240],
+                                        std::uint8_t (&sys)[0xc0],
+                                        std::uint8_t (&anims)[5]) {
+  mdk::StreamAssets a;
+  a.paletteGlobal = sys;
+  a.palettePal = pal;
+  a.animEscort = anims + 0;
+  a.animBones = anims + 1;
+  a.animKurt = anims + 2;
+  a.animHvr = anims + 3;
+  a.animWave = anims + 4;
+  a.bgTag = 40;
+  a.planetTag[0] = 50; a.planetTag[1] = 51;
+  a.planetTag[2] = 52; a.planetTag[3] = 53;
+  a.lightTag = 60;
+  a.sndWind = 70; a.sndHitside = 71; a.sndRescue = 76; a.sndApple = 77;
+  for (int i = 0; i != 7; ++i) a.sndHurt[i] = 80 + i;
+  return a;
+}
+
+void test_stream_init() {
+  using mdk::DynamicObject;
+  using mdk::StreamScene;
+  using mdk::StreamEvent;
+  std::uint8_t pal[0x240], sys[0xc0], anims[5] = {1, 2, 3, 4, 5};
+  for (int i = 0; i != 0x240; ++i) pal[i] = static_cast<std::uint8_t>(i);
+  for (int i = 0; i != 0xc0; ++i) sys[i] = static_cast<std::uint8_t>(255 - i);
+  const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+
+  // --- init: non-final base state --------------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x12345678u, 100));
+    const mdk::StreamSnapshot s0 = s.snapshot();
+    CHECK(s0.winLo == 0 && s0.winHi == 31);   // 1 + 30 tunnelExtend calls
+    CHECK(s0.complete == 0 && s0.isFinal == 0 && s0.fade == 0.0f);
+    CHECK(s0.health == 100);
+    // Seed formulas — skill0 (OBSERVED f64 chains -> f32 stores):
+    // driftMax = course+6, radiusMax = 17-(course>>1), radiusMin =
+    // 10-(course>>1); constants 0x496f30/0x496f28/0x496f10.
+    CHECK(s0.driftMax == 6.0f && s0.radiusMax == 17.0f &&
+          s0.radiusMin == 10.0f);
+    CHECK(s0.penBase >= 0 && s0.penBase < 64);
+    CHECK(s0.penTarget >= 0 && s0.penTarget < 64);
+    CHECK(s0.radius >= s0.radiusMin && s0.radius <= s0.radiusMax);
+    CHECK(s0.heroIdx >= 0 && s0.pickupIdx >= 0 && s0.escortIdx == -1 &&
+          s0.twinIdx == -1 && s0.markerIdx == -1);
+    CHECK(s0.liveObjects == mdk::kStreamPoolSize - s0.freeObjects);
+    // Palette composition (OBSERVED): 0xc0..0x300 <- PAL+0xc0,
+    // 0..0xc0 <- SYS_PAL head.
+    const std::uint8_t* P = s.palette();
+    for (int i = 0; i != 0xc0; ++i) CHECK(P[i] == sys[i]);
+    for (int i = 0; i != 0x240; ++i) CHECK(P[0xc0 + i] == pal[i]);
+    // Seam counters for the host-side binds/stages.
+    CHECK(s.seams().teletype == 1);
+    CHECK(s.seams().paletteRamp == 1);
+    CHECK(s.seams().limiter == 1);              // init limiter only
+    CHECK(s.seams().fillSelect == 32);          // init ae60 + 31 extends
+    CHECK(s.seams().resourceBind == 21);
+    CHECK(s.seams().resourceFree == 0);
+    // Events: base-palette install (aux=0, f=1.0) then WIND loop.
+    const auto& ev = s.events();
+    CHECK(ev.size() == 2);
+    CHECK(ev[0].kind == StreamEvent::kPaletteSet && ev[0].aux == 0 &&
+          ev[0].f[0] == 1.0f);
+    CHECK(ev[1].kind == StreamEvent::kPlaySound && ev[1].tag == 70 &&
+          ev[1].aux == 1);
+  }
+
+  // --- hero spawn state (ba45..bb0f, OBSERVED fields) -------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x1u, 100));
+    const int hi = s.snapshot().heroIdx;
+    const DynamicObject& h = s.objectAt(hi);
+    CHECK(h.enemyIndex == 0);                 // bucket winLo & 0x1f
+    CHECK(h.zBias == 0.75f);                  // f32(winLo + 0.75 f64)
+    // pathPos(0.75): node0 t=(0,0,0) -> node1 t=(0,10,0) -> (0,7.5,0).
+    CHECK(near(h.pos[0], 0.0) && near(h.pos[1], 7.5) &&
+          near(h.pos[2], 0.0));
+    CHECK(h.col.baseZ == h.pos[2]);
+    CHECK(h.yawDeg == 90.0f);                 // 0x42b40000 pre-euler
+    CHECK(h.bankDeg == 0.0f && h.pitchDeg == 0.0f);
+    CHECK(h.col.scale == 1.0f);               // +0x58 = ECX residue 1.0f
+    CHECK(h.field34 == 6.0f);                 // 0x40c00000
+    CHECK(h.field28 == 0.0f && h.field2c == 1.0f && h.field30 == 0.0f);
+    CHECK(h.animRec == a.animKurt);           // +0x114 = edaa4
+    CHECK(h.animFrame == -1 && h.animAcc == -1.0f && h.animLatch == -1 &&
+          h.animRate == 30.0f);
+    CHECK((h.col.flags148 & 0x8) != 0);       // +0x148 |= 8
+    CHECK(h.col.elements == nullptr);         // null proto -> +0xc unset
+  }
+
+  // --- non-final pickup spawn (bcf2..bdbc) ------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 1, 0, 0x2u, 100));
+    const DynamicObject& p = s.objectAt(s.snapshot().pickupIdx);
+    CHECK(p.enemyIndex == 16);                // bucket (winLo+16) & 0x1f
+    CHECK(p.zBias == 16.0f);                  // f32(winLo) + 16.0f
+    CHECK(p.yawDeg == 0.0f);                  // EDI=0
+    CHECK(p.field34 == std::bit_cast<float>(0x40af5c29u));  // 5.48f
+    CHECK(p.animRec == a.animEscort);         // +0x114 = edab0 (SWHANM)
+    CHECK(p.animFrame == -1 && p.animAcc == -1.0f &&
+          p.animLatch == -1 && p.animRate == 30.0f);
+    CHECK((p.col.flags148 & 0x8) != 0);
+  }
+
+  // --- final-mode escort (bb1c..bbe4) + pickup absent -------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 4, 0, 0x3u, 100));
+    const mdk::StreamSnapshot sf = s.snapshot();
+    CHECK(sf.isFinal == 1);
+    CHECK(sf.escortIdx >= 0 && sf.pickupIdx == -1);
+    const DynamicObject& e = s.objectAt(sf.escortIdx);
+    CHECK(e.enemyIndex == 5);                 // bucket (winLo+5) & 0x1f
+    CHECK(e.zBias == 5.0f);                   // f64(winLo) + 5.0 f64
+    CHECK(e.yawDeg == 90.0f);
+    CHECK(e.field34 == 6.0f);                 // 0x40c00000
+    CHECK(e.animRec == a.animEscort);         // edab0 (GUNTANIM)
+  }
+
+  // --- proto binding: deep copy lands on the record (03720) -------------
+  {
+    mdk::RuntimeModel proto;
+    proto.flag = 1;
+    proto.elems.resize(1);
+    proto.elemNames.resize(1);
+    std::memcpy(proto.elemNames[0].data(), "HEAD", 4);
+    mdk::StreamAssets ap = a;
+    ap.protoKurt = &proto;
+    StreamScene s;
+    CHECK(s.init(ap, 0, 0, 0x4u, 100));
+    const DynamicObject& h = s.objectAt(s.snapshot().heroIdx);
+    CHECK(h.col.elements != nullptr);         // +0x0c bound
+    CHECK(h.model.flag == 1);
+    CHECK(std::string(h.model.elemNames[0].data(), 4) == "HEAD");
+    CHECK(h.elemSet.count == 1);
+  }
+
+  // --- counter seeds across skill x course ------------------------------
+  {
+    // skill0: drift=course+6, rMax=17-(c>>1), rMin=10-(c>>1).
+    for (int c = 0; c != 7; ++c) {
+      StreamScene s;
+      CHECK(s.init(a, c, 0, 0x5u, 100));
+      const mdk::StreamSnapshot q = s.snapshot();
+      const int ch = c >> 1;
+      CHECK(q.driftMax == float(6.0 + c));
+      CHECK(q.radiusMax == float(17.0 - ch));
+      CHECK(q.radiusMin == float(10.0 - ch));
+      CHECK(q.isFinal == (c >= 4 ? 1 : 0));
+    }
+    // skill1: drift=course+8, rMax=17-course (NOT half), rMin=10-(c>>1).
+    for (int c = 0; c != 5; ++c) {
+      StreamScene s;
+      CHECK(s.init(a, c, 1, 0x6u, 100));
+      const mdk::StreamSnapshot q = s.snapshot();
+      CHECK(q.driftMax == float(8.0 + c));
+      CHECK(q.radiusMax == float(17.0 - c));
+      CHECK(q.radiusMin == float(10.0 - (c >> 1)));
+    }
+    // skill2: drift=course+10, rMax=13-(c>>1), rMin=10-(c>>1).
+    for (int c = 0; c != 5; ++c) {
+      StreamScene s;
+      CHECK(s.init(a, c, 2, 0x7u, 100));
+      const mdk::StreamSnapshot q = s.snapshot();
+      CHECK(q.driftMax == float(10.0 + c));
+      CHECK(q.radiusMax == float(13.0 - (c >> 1)));
+      CHECK(q.radiusMin == float(10.0 - (c >> 1)));
+    }
+    // Out-of-range skill leaves the wiped zeros (OBSERVED dead branch).
+    {
+      StreamScene s;
+      CHECK(s.init(a, 0, 3, 0x8u, 100));
+      const mdk::StreamSnapshot q = s.snapshot();
+      CHECK(q.driftMax == 0.0f && q.radiusMax == 0.0f &&
+            q.radiusMin == 0.0f);
+    }
+    // Odd course: >>1 arithmetic shift (course 5 -> 2).
+    {
+      StreamScene s;
+      CHECK(s.init(a, 5, 0, 0x9u, 100));
+      CHECK(s.snapshot().radiusMin == 8.0f);
+    }
+  }
+
+  // --- determinism: same seed -> same hash; different -> differs --------
+  {
+    StreamScene s1, s2, s3;
+    CHECK(s1.init(a, 0, 0, 0xdeadbeefu, 100));
+    CHECK(s2.init(a, 0, 0, 0xdeadbeefu, 100));
+    CHECK(s3.init(a, 0, 0, 0xcafeu, 100));
+    CHECK(s1.snapshot().stateHash == s2.snapshot().stateHash);
+    CHECK(s1.snapshot().stateHash != s3.snapshot().stateHash);
+  }
+}
+
+void test_stream_tunnel() {
+  using mdk::DynamicObject;
+  using mdk::StreamScene;
+
+  // --- bare window advance: first segment, no prev ----------------------
+  {
+    StreamScene s;
+    s.radius_ = 10.0f;
+    s.radiusMin_ = 0.0f; s.radiusMax_ = 100.0f; s.driftMax_ = 100.0f;
+    s.nodeMat_[0][0] = s.nodeMat_[0][5] = s.nodeMat_[0][10] = 1.0f;
+    s.rng_ = 0x11u;
+    s.tunnelExtend();
+    CHECK(s.winHi_ == 1);
+    // Ring regenerated at cur=0 with identity node: pts = jittered
+    // circle in xz, y == 0 exactly.
+    for (int i = 0; i != mdk::kStreamRingPts; ++i) {
+      const float* p = &s.ringPts_[0][i * 3];
+      CHECK(p[1] == 0.0f);
+      const double r = std::hypot((double)p[0], (double)p[2]);
+      CHECK(r > 9.0 && r < 11.0);             // j in [0.9,1.1) * 10
+    }
+    // Angle order preserved: pt1 at ~22.5 deg (x/z ratio).
+    {
+      const float* p0 = &s.ringPts_[0][0];
+      const float* p1 = &s.ringPts_[0][3];
+      // Both have positive x-ish start; pt1's |z|/|x| = tan(22.5).
+      CHECK(std::fabs(std::fabs(p1[2] / p1[0]) - 0.41421356) < 0.1);
+      CHECK(p0[2] >= 0.0f);
+    }
+    // No plane/pen writes without a previous segment.
+    for (int i = 0; i != mdk::kStreamPlanes * 4; ++i)
+      CHECK(s.planes_[0][i] == 0.0f);
+    CHECK(s.seams().fillSelect == 1);
+    CHECK(s.penT_ == 0.0f);                   // untouched pre-prev
+  }
+
+  // --- second segment: node compose, planes, pens, penT -----------------
+  {
+    StreamScene s;
+    s.radius_ = 10.0f;
+    s.radiusMin_ = 0.0f; s.radiusMax_ = 100.0f; s.driftMax_ = 100.0f;
+    s.penBase_ = 10; s.penTarget_ = 20;
+    for (int i = 0; i != mdk::kStreamSegs; ++i)
+      s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    s.rng_ = 0x22u;
+    s.tunnelExtend();                         // winHi 0 -> 1
+    s.tunnelExtend();                         // winHi 1 -> 2
+    CHECK(s.winHi_ == 2);
+    // nodeMat[1] = nodeMat[0] o local{rot=drift euler, t={0,10,0}} —
+    // translation col lands exactly on (0,10,0).
+    CHECK(s.nodeMat_[1][3] == 0.0f && s.nodeMat_[1][7] == 10.0f &&
+          s.nodeMat_[1][11] == 0.0f);
+    // Columns renormalized to unit length (e978).
+    for (int c = 0; c != 3; ++c) {
+      const double L = std::sqrt(
+          (double)s.nodeMat_[1][c] * s.nodeMat_[1][c] +
+          (double)s.nodeMat_[1][c + 4] * s.nodeMat_[1][c + 4] +
+          (double)s.nodeMat_[1][c + 8] * s.nodeMat_[1][c + 8]);
+      CHECK(near(L, 1.0));
+    }
+    // penT stepped by 0.1f and no reset yet.
+    CHECK(s.penT_ == 0.1f);
+    CHECK(s.penBase_ == 10 && s.penTarget_ == 20);
+    // pens_[0][2i] = fold((winHi+2i)&0x1f) + trunc(penBase) — penVal=10.
+    for (int i = 0; i != 4; ++i) {
+      int pa = (1 + 2 * i) & 0x1f;
+      if (pa >= 16) pa = 31 - pa;
+      CHECK(s.pens_[0][2 * i] == ((pa + 10) & 0x3f));
+      int pb = (1 + 2 * i + 1) & 0x1f;
+      if (pb >= 16) pb = 31 - pb;
+      CHECK(s.pens_[0][2 * i + 1] == ((pb + 10) & 0x3f));
+    }
+    // planes_[prev=0]: 32 records; each normal unit length (or NaN-free),
+    // d = -(n . prev[i]) so the plane passes through prev[i].
+    for (int i = 0; i != mdk::kStreamRingPts; ++i) {
+      const float* n0 = &s.planes_[0][(2 * i) * 4];
+      const double L = std::sqrt(n0[0] * (double)n0[0] +
+                                 n0[1] * (double)n0[1] +
+                                 n0[2] * (double)n0[2]);
+      CHECK(near(L, 1.0));
+      const float* P = &s.ringPts_[0][i * 3];
+      CHECK(near(n0[0] * P[0] + n0[1] * P[1] + n0[2] * P[2] + n0[3],
+                 0.0));
+    }
+  }
+
+  // --- wrap + recycle: bucket cur is reaped before regeneration ---------
+  {
+    StreamScene s;
+    s.radius_ = 10.0f;
+    s.radiusMin_ = 0.0f; s.radiusMax_ = 100.0f; s.driftMax_ = 100.0f;
+    for (int i = 0; i != mdk::kStreamSegs; ++i)
+      s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    s.rng_ = 0x33u;
+    // Walk the window to 32 so cur wraps to slot 0.
+    for (int i = 0; i != 32; ++i) s.tunnelExtend();
+    CHECK(s.winHi_ == 32);
+    // A dummy object parked in bucket 0 gets reaped by the wrap.
+    DynamicObject* d = s.alloc(0, 0.0f);
+    const int didx = s.objIndex(d);
+    CHECK(s.poolBucketCount(0) >= 1);
+    s.winLo_ = 1;
+    s.tunnelExtend();                         // winHi 32 -> 33, cur=0
+    CHECK(s.winHi_ == 33);
+    // d was reaped — out of bucket 0's chain and on the freelist
+    // (stale body kept — reap does not wipe the record).
+    bool inB0 = false;
+    for (int idx = s.bucketHead(0); idx >= 0;
+         idx = s.poolLinkIndex(s.objectAt(idx))) {
+      if (idx == didx) inB0 = true;
+    }
+    CHECK(!inB0);
+    bool onFree = false;
+    for (DynamicObject* o = s.freelist_; o;) {
+      if (o == d) onFree = true;
+      const int nx = s.poolLinkIndex(*o);
+      o = nx >= 0 ? &s.pool_[nx] : nullptr;
+    }
+    CHECK(onFree);
+    CHECK(s.poolErrorCalls_ == 0);
+    (void)didx;
+  }
+
+  // --- penT reset quirk: >1.0 (or unordered) resets and re-targets ------
+  {
+    StreamScene s;
+    s.radius_ = 10.0f;
+    s.radiusMin_ = 0.0f; s.radiusMax_ = 100.0f; s.driftMax_ = 100.0f;
+    for (int i = 0; i != mdk::kStreamSegs; ++i)
+      s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    s.rng_ = 0x44u;
+    s.penT_ = 0.95f;
+    s.penBase_ = 7; s.penTarget_ = 42;
+    s.tunnelExtend();                         // 0->1 (no prev path)
+    s.tunnelExtend();                         // 1->2: penT .95+.1 = 1.05
+    CHECK(s.penT_ == 0.0f);                   // reset
+    CHECK(s.penBase_ == 42);                  // target -> base
+    CHECK(s.penTarget_ >= 0 && s.penTarget_ < 64);
+    CHECK(s.penTarget_ != 42 ||
+          s.penTarget_ == (int)(0x2au & 0x3f)); // rand-drawn (any 0..63)
+  }
+
+  // --- radius clamp -----------------------------------------------------
+  {
+    StreamScene s;
+    s.radius_ = 10.0f;
+    s.radiusMin_ = 9.9f; s.radiusMax_ = 10.0f; s.driftMax_ = 100.0f;
+    for (int i = 0; i != mdk::kStreamSegs; ++i)
+      s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    s.rng_ = 0x55u;
+    for (int i = 0; i != 8; ++i) s.tunnelExtend();
+    CHECK(s.radius_ >= 9.9f && s.radius_ <= 10.0f);
+    StreamScene s2;
+    s2.radius_ = 5.0f;
+    s2.radiusMin_ = 10.0f; s2.radiusMax_ = 10.0f; s2.driftMax_ = 100.0f;
+    for (int i = 0; i != mdk::kStreamSegs; ++i)
+      s2.nodeMat_[i][0] = s2.nodeMat_[i][5] = s2.nodeMat_[i][10] = 1.0f;
+    s2.rng_ = 0x56u;
+    s2.tunnelExtend();
+    CHECK(s2.radius_ == 10.0f);               // clamped up
+  }
+
+  // --- final-mode end gate: marker at winHi-3 once, window frozen -------
+  {
+    StreamScene s;
+    s.isFinal_ = 1;
+    s.radius_ = 10.0f;
+    s.radiusMin_ = 0.0f; s.radiusMax_ = 100.0f; s.driftMax_ = 100.0f;
+    s.assets_.planetTag[0] = 55;
+    for (int i = 0; i != mdk::kStreamSegs; ++i)
+      s.nodeMat_[i][0] = s.nodeMat_[i][5] = s.nodeMat_[i][10] = 1.0f;
+    s.rng_ = 0x66u;
+    s.winHi_ = 186; s.winLo_ = 155;
+    s.tunnelExtend();                         // 186 not > 186 -> normal
+    CHECK(s.winHi_ == 187 && s.snapshot().markerIdx == -1);
+    s.tunnelExtend();                         // 187 > 186 -> marker
+    CHECK(s.winHi_ == 187);                   // frozen (early RET)
+    const int mi = s.snapshot().markerIdx;
+    CHECK(mi >= 0);
+    const DynamicObject& mk = s.objectAt(mi);
+    CHECK(mk.zBias == 184.0f);                // winHi - 3
+    CHECK(mk.enemyIndex == (184 & 0x1f));
+    CHECK(mk.col.scale == std::bit_cast<float>(0x42100000u));
+    const int errs = s.poolErrorCalls_;
+    s.tunnelExtend();                         // second call -> early RET
+    CHECK(s.snapshot().markerIdx == mi);
+    CHECK(s.poolErrorCalls_ == errs);         // no reap/spawn churn
+  }
+
+  // --- determinism -------------------------------------------------------
+  {
+    StreamScene s1, s2;
+    for (StreamScene* s : {&s1, &s2}) {
+      s->radius_ = 10.0f;
+      s->radiusMin_ = 0.0f; s->radiusMax_ = 100.0f; s->driftMax_ = 100.0f;
+      for (int i = 0; i != mdk::kStreamSegs; ++i)
+        s->nodeMat_[i][0] = s->nodeMat_[i][5] = s->nodeMat_[i][10] = 1.0f;
+      s->rng_ = 0x77u;
+    }
+    for (int i = 0; i != 40; ++i) {
+      s1.tunnelExtend(); s2.tunnelExtend();
+    }
+    CHECK(s1.snapshot().stateHash == s2.snapshot().stateHash);
+  }
+}
+
+void test_stream_teardown() {
+  using mdk::StreamEvent;
+  using mdk::StreamScene;
+  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5] = {1, 2, 3, 4, 5};
+  const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+
+  // --- teardown after init: pool/scene reset, WIND stop, no visuals -----
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    const std::uint64_t h0 = s.snapshot().stateHash;
+    s.clearEvents();
+    s.teardown();
+    const mdk::StreamSnapshot q = s.snapshot();
+    CHECK(q.winLo == 0 && q.winHi == 0 && q.radius == 0.0f &&
+          q.fade == 0.0f && q.complete == 0);
+    CHECK(q.heroIdx == -1 && q.pickupIdx == -1 && q.escortIdx == -1 &&
+          q.twinIdx == -1 && q.markerIdx == -1);
+    CHECK(s.poolFreeCount() == mdk::kStreamPoolSize);
+    int total = 0;
+    for (int b = 0; b != mdk::kStreamSegs; ++b)
+      total += s.poolBucketCount(b);
+    CHECK(total == 0);
+    CHECK(s.poolLinkIndex(s.objectAt(0)) == 1);   // freelist re-linked
+    // kStopSound emitted for the WIND instance; no visual events.
+    const auto& ev = s.events();
+    CHECK(ev.size() == 1);
+    CHECK(ev[0].kind == StreamEvent::kStopSound && ev[0].tag == 70);
+    CHECK(s.seams().resourceFree == 5);
+    // Re-init reproduces the exact post-init state.
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    CHECK(s.snapshot().stateHash == h0);
+  }
+
+  // --- idempotent + safe on a never-inited scene -------------------------
+  {
+    StreamScene s;
+    s.teardown();                             // no init — safe
+    CHECK(s.poolFreeCount() == mdk::kStreamPoolSize);
+    CHECK(s.events().empty());                // no WIND bound -> no emit
+    s.teardown();                             // second call — safe
+    CHECK(s.poolErrorCalls_ == 0);
+  }
+
+  // --- teardown is not a progression trigger -----------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0xddddu, 100));
+    s.complete_ = 1;
+    s.teardown();
+    // Teardown emits no completion/exit progression of its own.
+    CHECK(s.snapshot().complete == 0);
+    for (const auto& e : s.events())
+      CHECK(e.kind != StreamEvent::kExitMode &&
+            e.kind != StreamEvent::kPresent);
+  }
+}
+
+void test_stream_step() {
+  using mdk::DynamicObject;
+  using mdk::StreamEvent;
+  using mdk::StreamInput;
+  using mdk::StreamScene;
+  using mdk::StreamStage;
+  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5] = {1, 2, 3, 4, 5};
+  const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+  StreamInput in{};
+
+  auto logIs = [](const StreamScene& s,
+                  std::initializer_list<StreamStage> want) {
+    const auto& got = s.stepLog();
+    if (got.size() != want.size()) return false;
+    int i = 0;
+    for (StreamStage st : want) if (got[i++] != st) return false;
+    return true;
+  };
+
+  // --- base step: stage order, seams, fade-in, camera -------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x1111u, 100));
+    s.clearEvents();
+    const int live = s.snapshot().liveObjects;
+    CHECK(s.step(in, 1.0f / 30.0f));
+    CHECK(logIs(s, {StreamStage::kTick, StreamStage::kFade,
+                    StreamStage::kObjectWalk, StreamStage::kTwinSync,
+                    StreamStage::kCamera, StreamStage::kDraw,
+                    StreamStage::kLimiter}));
+    // fade += 1/30 (the 0x49b6f4 constant — caller dt ignored).
+    CHECK(s.snapshot().fade == std::bit_cast<float>(0x3d088889u));
+    // Non-final alive fade -> dark-in transform (aux=2, f=fade).
+    bool palSeen = false, presentSeen = false;
+    for (const auto& e : s.events()) {
+      if (e.kind == StreamEvent::kPaletteSet) {
+        palSeen = true;
+        CHECK(e.aux == 2 &&
+              e.f[0] == std::bit_cast<float>(0x3d088889u));
+      }
+      if (e.kind == StreamEvent::kPresent) presentSeen = true;
+    }
+    CHECK(palSeen && presentSeen);
+    // Updater dispatch: hero + pickup once each; the rest generic.
+    CHECK(s.seams().heroUpdate == 1);
+    CHECK(s.seams().pickupUpdate == 1);
+    CHECK(s.seams().escortUpdate == 0);
+    CHECK(s.seams().strayUpdate == 0);
+    CHECK(s.seams().genericUpdate == live - 2);
+    CHECK(s.seams().twinSync == 0);           // no twin
+    CHECK(s.seams().backdrop == 1 && s.seams().drawList == 1);
+    CHECK(s.seams().listener == 1);
+    CHECK(s.seams().limiter == 2);            // init + step
+    // +0x11c stamp: low word == frame tick (1) after dispatch.
+    const DynamicObject& h = s.objectAt(s.snapshot().heroIdx);
+    CHECK((h.behaviorByte & 0xffff) == 1);
+    // Camera ran: eye blend -> camPos off origin; lookT = zBias+2.
+    CHECK(s.snapshot().lookT == h.zBias + 2.0f);
+    CHECK(s.snapshot().camView[0] != 0.0f ||
+          s.snapshot().camView[5] != 0.0f);
+    // No completion, no exit.
+    CHECK(s.snapshot().complete == 0 && !s.finished());
+  }
+
+  // --- +0x11c stamp gate: one dispatch per object per tick --------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x2222u, 100));
+    s.step(in, 1.0f / 30.0f);
+    s.step(in, 1.0f / 30.0f);
+    const DynamicObject& h = s.objectAt(s.snapshot().heroIdx);
+    CHECK((h.behaviorByte & 0xffff) == 2);
+    CHECK(s.seams().heroUpdate == 2);
+    CHECK(s.seams().pickupUpdate == 2);
+    // An object stamped with the CURRENT tick is skipped on re-dispatch:
+    // pre-stamp a parked record to frame 2's tick and force a re-walk by
+    // observing the seam delta across another step.
+    const int g0 = s.seams().genericUpdate;
+    s.step(in, 1.0f / 30.0f);
+    CHECK(s.seams().genericUpdate > g0);      // debris re-dispatched
+  }
+
+  // --- objects parked at slot winHi are not walked ----------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x3333u, 100));
+    DynamicObject* parked = s.alloc(31, 31.0f);   // bucket 31 == winHi
+    CHECK(parked != nullptr);
+    const int g0 = s.seams().genericUpdate;
+    s.step(in, 1.0f / 30.0f);
+    // Bucket 31 is outside [winLo,winHi) — not dispatched.
+    CHECK(s.seams().genericUpdate ==
+          g0 + (s.snapshot().liveObjects - 1 - 2));
+    // -1 for the parked record itself, -2 for hero+pickup.
+    CHECK((parked->behaviorByte & 0xffff) == 0);   // never stamped
+  }
+
+  // --- fade saturates: fade==1 && !complete skips the emit --------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x4444u, 100));
+    for (int i = 0; i != 30; ++i) s.step(in, 1.0f / 30.0f);
+    CHECK(s.snapshot().fade == 1.0f);
+    s.clearEvents();
+    CHECK(s.step(in, 1.0f / 30.0f));
+    for (const auto& e : s.events())
+      CHECK(e.kind != StreamEvent::kPaletteSet);   // ca90 JZ path
+    CHECK(!s.finished());
+  }
+
+  // --- completion: isFinal && winHi>=186 latches ed748; fade-out exits --
+  {
+    StreamScene s;
+    CHECK(s.init(a, 4, 0, 0x5555u, 100));
+    s.winLo_ = 200;                           // gate entry (winLo>177)
+    s.winHi_ = 186;                           // end gate (>=186)
+    s.clearEvents();
+    CHECK(!s.step(in, 1.0f / 30.0f));         // returns false = exit
+    CHECK(s.finished());
+    CHECK(logIs(s, {StreamStage::kTick, StreamStage::kTwinGate,
+                    StreamStage::kFade, StreamStage::kExit}));
+    CHECK(s.snapshot().complete == 1);
+    bool exitSeen = false;
+    for (const auto& e : s.events()) {
+      if (e.kind == StreamEvent::kExitMode) {
+        exitSeen = true;
+        CHECK(e.aux == 0x00);                 // isFinal -> black fill
+      }
+      CHECK(e.kind != StreamEvent::kPresent); // no frame presented
+    }
+    CHECK(exitSeen);
+    CHECK(s.snapshot().fade == 0.0f);         // clamped
+  }
+
+  // --- non-final alive exit: fill 0xff -----------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x6666u, 100));
+    s.complete_ = 1;                          // latch directly
+    s.clearEvents();
+    CHECK(!s.step(in, 1.0f / 30.0f));
+    bool exitSeen = false;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kExitMode) {
+        exitSeen = true;
+        CHECK(e.aux == 0xff);                 // alive non-final -> white
+      }
+    CHECK(exitSeen);
+  }
+
+  // --- rescue-twin gate (health==1): spawn + fields + sync order --------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x7777u, 1));       // health=1 -> gate entry
+    s.clearEvents();
+    CHECK(s.step(in, 1.0f / 30.0f));
+    CHECK(logIs(s, {StreamStage::kTick, StreamStage::kTwinGate,
+                    StreamStage::kFade, StreamStage::kObjectWalk,
+                    StreamStage::kTwinSync, StreamStage::kCamera,
+                    StreamStage::kDraw, StreamStage::kLimiter}));
+    const mdk::StreamSnapshot q = s.snapshot();
+    CHECK(q.twinIdx >= 0);
+    const DynamicObject& tw = s.objectAt(q.twinIdx);
+    const DynamicObject& h = s.objectAt(q.heroIdx);
+    CHECK(tw.enemyIndex == h.enemyIndex);     // hero's bucket
+    CHECK(tw.zBias == h.zBias);
+    CHECK(tw.pos[0] == h.pos[0] && tw.pos[1] == h.pos[1] &&
+          tw.pos[2] == h.pos[2]);
+    for (int i = 0; i != 9; ++i)
+      CHECK(tw.col.xform[i] == h.col.xform[i]);
+    for (int i = 0; i != 3; ++i)
+      CHECK(tw.col.origin[i] == h.col.origin[i]);
+    CHECK(tw.yawDeg == h.yawDeg && tw.bankDeg == h.bankDeg &&
+          tw.pitchDeg == h.pitchDeg);
+    CHECK(tw.col.scale == 1.0f);
+    CHECK((h.col.flags148 & 0x8) == 0);       // hero hides
+    CHECK(tw.animRec == a.animBones);         // edaa0
+    CHECK(h.animRec == a.animBones);          // hero rebinds too
+    CHECK(tw.animFrame == -1 && tw.animAcc == 0.0f &&
+          tw.animLatch == -2 && tw.animRate == 30.0f);
+    CHECK(h.animFrame == -1 && h.animAcc == 0.0f &&
+          h.animLatch == -2 && h.animRate == 30.0f);
+    bool rescueSnd = false;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kPlaySound && e.tag == 76)
+        rescueSnd = true;
+    CHECK(rescueSnd);                          // eda7c -> 402388
+    CHECK(s.seams().twinSync == 1);            // cb89 gate hit
+    // Second step: twin gate re-entered (health still 1) but the spawn
+    // is skipped (edac0 already set) — same twin index.
+    s.step(in, 1.0f / 30.0f);
+    CHECK(s.snapshot().twinIdx == q.twinIdx);
+    // Push the dock anim past frame 0x50 -> completion latch.
+    s.pool_[q.twinIdx].animFrame = 0x51;
+    s.step(in, 1.0f / 30.0f);
+    CHECK(s.snapshot().complete == 1);
+  }
+
+  // --- no premature completion on the base path --------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x8888u, 100));
+    for (int i = 0; i != 5; ++i) {
+      CHECK(s.step(in, 1.0f / 30.0f));
+      CHECK(s.snapshot().complete == 0);
+      CHECK(!s.finished());
+    }
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -25875,6 +26557,10 @@ int main() {
   test_stream_math();
   test_stream_camera();
   test_stream_pool();
+  test_stream_init();
+  test_stream_tunnel();
+  test_stream_teardown();
+  test_stream_step();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
