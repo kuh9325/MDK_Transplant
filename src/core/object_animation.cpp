@@ -263,8 +263,9 @@ void objectAnimApply(DynamicObject& o, const ObjectAnimView& anim,
 // ---------------------------------------------------------------------------
 // FUN_004555bc — the per-tick driver.
 // ---------------------------------------------------------------------------
-void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
-                      float dtSec, TraversalRuntime* rt) {
+ObjectAnimBody objectAnimTickDt(DynamicObject& o,
+                                const std::uint8_t* recLimit,
+                                float dtSec, TraversalRuntime* rt) {
   // +0x04 == -1 -> FUN_00455500 (classless timing path). The original
   // resolves a timing record through FUN_0041a5ec (source UNKNOWN —
   // bounded seam): it advances +0xdc by +0xe0 * DT (no rate field),
@@ -287,14 +288,14 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
     if (fc <= 0) {                       // unresolved record -> hold 0
       o.animFrame = 0;
       o.animAcc = 0.0f;
-      return;
+      return ObjectAnimBody::kClassless;
     }
     while (o.animFrame >= fc) {          // wrap by the record bound
       o.animFrame = static_cast<std::int16_t>(o.animFrame - fc);
       o.animAcc -= static_cast<float>(fc);
     }
     if (o.animFrame < 0) { o.animFrame = 0; o.animAcc = 0.0f; }
-    return;
+    return ObjectAnimBody::kClassless;
   }
 
   // Idle gate: +0x118 >= 0 && +0xe4 == +0x118, or the 0xff00 done
@@ -302,14 +303,14 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
   if ((o.animLatch >= 0 && o.animFrame == o.animLatch) ||
       static_cast<std::uint16_t>(o.animLatch) == 0xff00u) {
     o.animAcc = static_cast<float>(o.animFrame);
-    return;
+    return ObjectAnimBody::kIdleHold;
   }
-  if (!o.animRec) return;
+  if (!o.animRec) return ObjectAnimBody::kNoRecord;
   ObjectAnimView anim{
       reinterpret_cast<const std::uint8_t*>(o.animRec), recLimit};
   const float rate = anim.rate();
   const int fc = static_cast<int>(anim.frameCount());
-  if (!anim.ok || fc <= 0) return;
+  if (!anim.ok || fc <= 0) return ObjectAnimBody::kNoRecord;
 
   // Sound marker consume (OBSERVED): when the accumulator crosses the
   // +0x144 mark the original emits the +0x140 name once and clears it.
@@ -365,11 +366,13 @@ void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
   // not aimed at a +0x118 target.
   if (o.animFrame == fc - 1 && !loop && o.animFrame != o.animLatch)
     o.animLatch = static_cast<std::int16_t>(0xff00);
+  return ObjectAnimBody::kAdvance;
 }
 
-void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit,
-                    TraversalRuntime* rt) {
-  objectAnimTickDt(o, recLimit, kFrameDt, rt);
+ObjectAnimBody objectAnimTick(DynamicObject& o,
+                              const std::uint8_t* recLimit,
+                              TraversalRuntime* rt) {
+  return objectAnimTickDt(o, recLimit, kFrameDt, rt);
 }
 
 } // namespace mdk

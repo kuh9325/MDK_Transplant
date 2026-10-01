@@ -34,6 +34,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "dynamic_objects.h"
@@ -75,6 +76,15 @@ struct StreamAssets {
   const std::uint8_t* animHvr = nullptr;     // FL_HVR    -> edaa8
   const std::uint8_t* animWave = nullptr;    // FL_WAVE   -> edaac
   const std::uint8_t* animLimit = nullptr;   // shared rec bound
+  // The fuse-table bound dword for the FUN_004555bc 0x4edcc0 arm
+  // (OBSERVED asm chain): `bound = *(u32*)(*(*(u32*)(rec0+0x10)) +
+  // 0xc) >> 0x10` — the port flattens that triple deref; this field
+  // carries the raw dword (the hi16 is the fuse frame bound, read by
+  // SAR so the sign bit propagates). No mode-5 spawn produces a
+  // class-table-bound object (OBSERVED: every spawn binds a deep copy
+  // or null), so this stays 0 on real data — synthetic fixtures
+  // supply the decoded dword.
+  std::uint32_t animFuseBound = 0;
   // Presentation tags (opaque to the runtime; echoed in draw/sound
   // events so the host can bind real images/audio).
   int bgTag = -1;               // BG bitmap (600x360 indexed backdrop)
@@ -105,7 +115,12 @@ struct StreamInput {
 // events here so the runtime stays headless; order is preserved.
 struct StreamEvent {
   enum Kind : std::uint8_t {
-    kPlaySound,      // tag=sound tag (loop flag in aux)
+    kPlaySound,      // tag=sound tag (loop flag in aux). The
+                     // FUN_004555bc sound-marker arm emits the
+                     // name-bound form instead: tag=-1, `name` carries
+                     // the +0x140 text the original resolves through
+                     // FUN_00402fe8, f[0..2]=+0x10 pos, aux=0x1000e
+                     // (the FUN_00402160 mode word; OBSERVED)
     kStopSound,      // tag=sound tag (WIND at teardown)
     kBackdropBlit,   // f[0]=scrollU f[1]=scrollV (600x360 toroidal)
     kRibbonTri,      // one e620/0ca00 emission. f[0..8] = the three
@@ -140,6 +155,8 @@ struct StreamEvent {
   int tag = 0;
   int aux = 0;
   float f[12] = {};
+  std::string name;          // sound/record name for name-bound events
+                             // (empty for tag-bound forms)
 };
 
 // --- deterministic snapshot ------------------------------------------------
@@ -181,20 +198,32 @@ struct StreamSnapshot {
   std::uint64_t stateHash = 0; // FNV-1a over the sim fields
 };
 
-// --- deferred-stage seam counters --------------------------------------------
+// --- frame-stage counters -----------------------------------------------------
 // FUN_0042c8b0 (the native frame) dispatches per-object updaters and a
-// render pipeline that Phase 19A.2A does NOT implement. Rather than
-// silently skipping them, the skeleton calls the real hook functions,
-// whose bodies currently only bump these counters — tests verify call
-// order/count, later phases fill the bodies in place.
+// render pipeline. Implemented stages (the updater family, the
+// FUN_004555bc animator family) count their dispatch reach; the still-
+// deferred stages (backdrop, drawList, listener, limiter, paletteRamp,
+// teletype, resourceBind/Free) are counted seams whose bodies only bump
+// the counter — later phases fill those in place.
 struct StreamSeams {
   int heroUpdate = 0;     // FUN_0042d24c — owns winLo++/tunnelExtend feed
-  int genericUpdate = 0;  // FUN_0042cf6c — +0x34 swim + anim tick
+  int genericUpdate = 0;  // FUN_0042cf6c — +0x34 swim (no anim call —
+                          // OBSERVED the one updater without)
   int escortUpdate = 0;   // FUN_0042d034 — escort lane keeper
   int pickupUpdate = 0;   // FUN_0042d118 — pickup catch/proximity
   int strayUpdate = 0;    // FUN_0042db0c — edabc slot (never spawned in 19A.2A)
   int twinSync = 0;       // FUN_0042dabc — rescue-twin mirror pass
-  int animStep = 0;       // FUN_004555bc family ticks inside updaters
+  // FUN_004555bc animator family — IMPLEMENTED (Phase 19A.2C), these
+  // are dispatch counters (which terminal body each tick took), not
+  // deferred seams. The sum over the body counters == the calls.
+  int animCalls = 0;      // total FUN_004555bc dispatches
+  int animClassless = 0;  // +0x04==-1 -> FUN_00455500 tail
+  int animFuse = 0;       // +0x0c==classRec0 (0x4edcc0) fuse arm
+  int animFuseEnd = 0;    //   of those: non-loop fuse teardowns (5828c)
+  int animHold = 0;       // latch resync / 0xff00 done-hold
+  int animNull = 0;       // +0x114 null or bounded-fail record
+  int animAdvance = 0;    // record advance -> FUN_00455890 apply
+  int animSound = 0;      //   of those: +0x140/+0x144 marker consumed
   int backdrop = 0;       // FUN_0042e684 — toroidal scroll accumulate+blit
   int drawList = 0;       // FUN_0042e100 — back-to-front object draws
   int listener = 0;       // FUN_004026f8 — audio listener xform update
@@ -219,6 +248,25 @@ enum class StreamStage : std::uint8_t {
   kDraw,         // backdrop/draw/present seams + kPresent emit
   kLimiter,      // frame limiter wait
   kExit,         // fade-out terminal — kExitMode emitted, step ends
+};
+
+// --- per-tick animator trace -------------------------------------------------
+// One entry per FUN_004555bc dispatch (animStep), appended in call order
+// and cleared at the head of each step() — the diagnostic surface for
+// "which animator body ran on which object". `rec` indexes the bound
+// StreamAssets slots {0 escort, 1 bones, 2 kurt, 3 hvr, 4 wave} or -1.
+// Post-tick object state (frame/acc/latch) is recorded — a fuse
+// teardown therefore reports the wiped record (body 'T').
+struct StreamAnimTick {
+  int slot = -1;            // pool index of the object
+  char body = '?';          // C classless | F fuse | T fuse-teardown |
+                            // H latch/done hold | N null record |
+                            // A record advance | S advance+sound
+  int rec = -1;             // bound anim slot 0..4, or -1
+  std::int16_t frame = 0;   // +0xe4 after the body
+  float acc = 0.0f;         // +0xdc after the body
+  std::int16_t latch = 0;   // +0x118 after the body
+  std::uint8_t flags148 = 0;// loop bit lives at &0x8
 };
 
 // --- the runtime ------------------------------------------------------------
@@ -251,8 +299,15 @@ public:
   // Stage tags appended during the last step() call (cleared each
   // step) — the frame skeleton's recorded control-flow spine.
   const std::vector<StreamStage>& stepLog() const { return stepLog_; }
+  // Per-tick animator trace (cleared at the head of each step).
+  const std::vector<StreamAnimTick>& animLog() const { return animLog_; }
   const StreamSeams& seams() const { return seams_; }
   const StreamAssets& assets() const { return assets_; }
+  // DAT_004edcc0 — the shared class-table record-0 identity the
+  // FUN_004555bc dispatch compares +0x0c against. A stable sentinel —
+  // never dereferenced (the fuse arm reads the bound through
+  // assets_.animFuseBound instead). Tests bind col.elements to it.
+  static const CollisionElementSet* classRec0();
 
   // Test hooks (private-state access without friendship).
   const DynamicObject& objectAt(int i) const { return pool_[i]; }
@@ -302,7 +357,11 @@ private:
   void pickupUpdate(DynamicObject& o, float dt);    // d118
   void strayUpdate(DynamicObject& o, float dt);     // db0c (edabc slot)
   void twinSync();                              // dabc
-  void animStep(DynamicObject& o, float dt);    // 555bc via objectAnimTickDt
+  // FUN_004555bc — the shared per-object animator dispatch. Order
+  // (OBSERVED asm): +0x04==-1 classless -> +0x0c==classRec0 fuse ->
+  // the ordinary record driver (objectAnimTickDt).
+  void animStep(DynamicObject& o, float dt);
+  void logAnimTick(const DynamicObject& o, char body);
   void backdropScroll();                        // e684
   void emitFrameDraw();                         // e684 + e100 + present
   void emit(StreamEvent::Kind kind, int tag, int aux, float f0) {
@@ -382,6 +441,7 @@ private:
   float stepDt_ = 0.0f;
   StreamSeams seams_;                           // deferred-hook counters
   std::vector<StreamStage> stepLog_;            // per-step stage spine
+  std::vector<StreamAnimTick> animLog_;         // per-step 555bc trace
 };
 
 } // namespace mdk

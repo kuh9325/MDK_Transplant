@@ -248,7 +248,7 @@ it) → generic**.
 - `heroUpdate` (`FUN_0042d24c`): input axes staged via `input_`/
   `stepDt_`; speed grow `field34 → 6.0`; `zBias` advance; window feed
   `zBias-0.75 > winLo+1` → `migrate(hero/twin, winLo+1)` →
-  `winLo_++` → `tunnelExtend()` in that order; animStep seam; path
+  `winLo_++` → `tunnelExtend()` in that order; animStep (`§14`); path
   frame `(zBias, zBias+1)`; gate `(twin_==null && health>0)` selects
   swim-ease+steer vs offset decay; yaw `[45,135]`/bank `[-45,45]`
   clamps and ±180°·dt recentre; d47f offset kicks
@@ -261,7 +261,7 @@ it) → generic**.
   trunc→migrate→reap-on-fail; fractional path offset cleared after
   transform; no anim call.
 - `escortUpdate` (`FUN_0042d034`): unconditional advance; migrate,
-  reap+clear-pointer on fail; animStep; escort frac constant.
+  reap+clear-pointer on fail; animStep (`§14`); escort frac constant.
 - `pickupUpdate` (`FUN_0042d118`): advance, migrate, animStep,
   transform, hero-distance gate → APPLE + `health=0x96` + reap +
   pointer clear; fail path reaps without anim.
@@ -278,14 +278,82 @@ Regression: `mdk_tests` 9662/0, CTest 1/1, traversal L3–8 and
 freefall c0–c4 canonical digests unchanged. Bounded real-data
 diagnostic: `mdk-inspect --data-path <installed> --stream-init
 --course N --skill 1 --stream-frames F` — per-frame updater reach,
-window feed, animStep seam, state digest. Non-final course: hero +
+window feed, animStep dispatch, state digest. Non-final course: hero +
 pickup + generic every frame; course 4: hero + escort + generic;
 death latch on c0 arms the `health==1` twin gate → `twinSync`.
 `strayUpdate` unreachable on real data — nothing spawns the stray
 slot (`strayIdx=-1` at init; OBSERVED, not a port gap).
 
-Deferred seams preserved (counted, not implemented): `animStep`
-(FUN_004555bc family), backdrop/draw/present, teletype, limiter,
-fillSelect internals.
+Deferred seams preserved (counted, not implemented):
+backdrop/draw/present, teletype, limiter, fillSelect internals.
+`animStep` is implemented — see §14.
 
 **MODE-5 CINEMATIC ACTOR UPDATERS: CLOSED FOR BUILD_A.**
+
+## 14. Phase 19A.2C — the `FUN_004555bc` animator family (implemented)
+
+`StreamScene::animStep` is the mode-5 port of `FUN_004555bc`, the
+shared per-object animator dispatch called from `heroUpdate`,
+`strayUpdate`, `escortUpdate`, `pickupUpdate` and `twinSync` (never
+`genericUpdate` — OBSERVED). The dispatch order is the native one
+(`p19a_helpers5.txt` 0x4555bc..0x4557ac, OBSERVED):
+
+1. `+0x04 == -1` → **classless body** (`FUN_00455500` tail): rate-free
+   timing — `+0xdc += +0xe0 * DT`, `+0xe4 = FRNDINT(+0xdc)`, repeat-wrap
+   by the bound record's frame count (or the 0-frame hold when no
+   record resolves). Never runs `FUN_00455890`. In
+   `object_animation.cpp` (`objectAnimTickDt`), letter `C`.
+2. `+0x0c == DAT_004edcc0` (shared class-table record 0) → **fuse
+   body**: `+0xdc += DAT_0049b6f0` frame units (the port: `dt*30`);
+   bound read through rec0's `+0x10` chain, `SAR >>0x10` — carried as
+   `StreamAssets::animFuseBound` since no mode-5 spawn binds a
+   class-table record (OBSERVED: spawns bind deep copies or null).
+   `+0x149 & 0x40` selects loop-hold (`+0xe4 = bound-1`, letter `F`)
+   vs `FUN_0045828c` in-place teardown keeping `+0x00`/`+0x60`
+   (letter `T`). Unordered `FCOMP` lands on the end branch — NaN
+   accumulators teardown/hold like the native JBE/JA.
+3. **Hold body**: `+0x118 >= 0 && +0xe4 == +0x118`, or the `0xff00`
+   done latch — resyncs `+0xdc = +0xe4`, no record read. Letter `H`.
+4. **Null body**: `+0x114 == 0` or a record that fails the bounded
+   `ObjectAnimView` walk — plain return. Letter `N`.
+5. **Advance body**: `+0xdc += rate * +0xe0 * DT`; `+0x118` target
+   clamp (caps AT the target); `+0x148 & 8` loop vs `frameCount-1`
+   clamp; `FUN_00455890` applies `FRNDINT(+0xdc) - +0xe4` single-frame
+   steps (root impulse `+0x294..+0x29c`, ref keys, named-channel
+   vertex deltas/rigid frames, local bounds rebuild); non-loop end
+   latches `0xff00`. Letter `A`.
+6. **Advance + sound-marker body**: same path after consuming the
+   `+0x140`/`+0x144` marker — the accumulator crossing the mark emits
+   the name once (`FUN_00402fe8` resolve → `FUN_00402160` mode
+   `0x1000e` positional at `+0x10`) and clears the slot. Ported as a
+   name-bound `kPlaySound` event (`tag=-1`, `name` = the `+0x140`
+   text, `aux=0x1000e`, `f[0..2]` = pos). Letter `S`.
+
+Diagnostics: `StreamSeams` carries per-body counters
+(`animCalls`/`animClassless`/`animFuse`/`animFuseEnd`/`animHold`/
+`animNull`/`animAdvance`/`animSound` — body counters sum to calls);
+`StreamScene::animLog()` is the per-step trace
+(`slot : body [recSlot] frame/acc/latch`); `mdk-inspect
+--stream-frames` prints it per frame. Real anim records are bound
+with `animLimit` = the BNI image end so the `ObjectAnimView` walk is
+bounded.
+
+Reachability on real data (course 0/4 `--stream-frames` runs, bounded):
+| body | non-final | final | notes |
+|---|---|---|---|
+| C classless | — | — | no `+0x04==-1` stream spawn observed |
+| F/T fuse | — | — | no `+0x0c==classRec0` spawn observed (synthetic-only) |
+| H hold | — | — | reachable state, not hit in bounded runs |
+| N null | — | — | every spawned actor binds a valid record |
+| A advance | **yes** | **yes** | hero KURTANIM + pickup SWHANM / escort GUNTANIM |
+| S advance+sound | — | — | no `+0x140` writer on stream spawns (synthetic-only) |
+
+Regression: `mdk_tests` 9723/0 (new `test_stream_animator` covers all
+six bodies + malformed record + NaN acc), CTest 1/1; traversal L3–8
+and freefall c0–c4 canonical digests unchanged; the real-data
+`--stream-frames` state digests are bit-identical to the pre-19A.2C
+baseline (animator state is not hash-covered).
+
+**MODE-5 CINEMATIC ANIMATOR FAMILY: CLOSED FOR BUILD_A** — explicitly
+not the full mode-5 core (backdrop/draw/teletype/limiter seams
+remain).

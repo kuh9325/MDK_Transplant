@@ -109,6 +109,19 @@ bool animChannelIsRigid(const std::uint8_t* ch);        // scale==0
 void objectAnimApply(DynamicObject& o, const ObjectAnimView& anim,
                      int steps);
 
+// Which terminal arm of the FUN_004555bc dispatch a tick took
+// (diagnostic return — callers that don't need it can ignore it).
+// The +0x0c==classTable[0] fuse arm is NOT in this enum: it lives in
+// the stream-side dispatch (StreamScene::animStep) where the shared
+// class-table binding is representable.
+enum class ObjectAnimBody : std::uint8_t {
+  kClassless,   // +0x04 == -1 -> the FUN_00455500 timing tail
+  kIdleHold,    // latch resync / 0xff00 done-hold — no record touched
+  kNoRecord,    // +0x114 null, or the bounded view fails (port guard)
+  kAdvance,     // accumulate -> FUN_00455890 apply (the +0x140/+0x144
+                // sound-marker consume fires inside this arm)
+};
+
 // FUN_004555bc — the per-tick driver. `recLimit` bounds the animRec
 // walk (pass the owning image end; nullptr disables bounds checks —
 // test path). Sound emission: on the +0x144 marker crossing the
@@ -117,8 +130,9 @@ void objectAnimApply(DynamicObject& o, const ObjectAnimView& anim,
 // consume-on-cross transition is preserved either way). Freefall
 // passes nullptr — its sounds stay in the FreefallEvent family.
 struct TraversalRuntime;
-void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit,
-                    TraversalRuntime* rt = nullptr);
+ObjectAnimBody objectAnimTick(DynamicObject& o,
+                              const std::uint8_t* recLimit,
+                              TraversalRuntime* rt = nullptr);
 
 // The same driver with an explicit seconds delta: the original's
 // accumulator step is `rate * +0xe0 * DAT_0049b6f4` where 0x49b6f4 is
@@ -126,8 +140,10 @@ void objectAnimTick(DynamicObject& o, const std::uint8_t* recLimit,
 // the locked-timing (dt = 1/30) call convention; the freefall object
 // walk runs every mode-2 frame with the real dt, so its twins use
 // this form (Phase 16C).
-void objectAnimTickDt(DynamicObject& o, const std::uint8_t* recLimit,
-                      float dtSec, TraversalRuntime* rt = nullptr);
+ObjectAnimBody objectAnimTickDt(DynamicObject& o,
+                                const std::uint8_t* recLimit,
+                                float dtSec,
+                                TraversalRuntime* rt = nullptr);
 
 } // namespace mdk
 

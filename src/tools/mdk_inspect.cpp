@@ -118,10 +118,11 @@ int usage() {
                "                            window, counters, seams. Options:\n"
                "                            --course 0..4 --skill 0..2 --seed N\n"
                "                            --stream-frames N — bounded updater-\n"
-               "                            reach trace: per frame, updater\n"
-               "                            families dispatched, winLo/winHi,\n"
-               "                            tunnel feed, animStep seam, state\n"
-               "                            digest; no draw/anim bodies)\n"
+               "                            reach + animator trace: per frame,\n"
+               "                            updater families dispatched, winLo/\n"
+               "                            winHi, tunnel feed, FUN_004555bc body\n"
+               "                            per object, state digest; no draw/\n"
+               "                            TELETYPE bodies)\n"
                "       mdk-inspect --data-path DIR --campaign-handoff "
                "<relative-path>\n"
                "                            (a FALL3D.BNI path; fast-forwards\n"
@@ -2997,6 +2998,12 @@ int main(int argc, char** argv) {
         payloadOf("FL_HVR"));
     a.animWave = reinterpret_cast<const std::uint8_t*>(
         payloadOf("FL_WAVE"));
+    // The bound the ObjectAnimView walk is checked against — all the
+    // animation records live in the BNI image, so the file end is the
+    // faithful upper limit (matches the native's unrestricted in-image
+    // reach while keeping a malformed record inside the file).
+    a.animLimit = reinterpret_cast<const std::uint8_t*>(
+        bni->data() + bni->size());
     auto yesno = [](const void* p) { return p ? "ok" : "MISSING"; };
     std::printf("binds:       PAL=%s SYS_PAL=%s BG=%s PLANET=%s "
                 "LIGHT=%s\n",
@@ -3056,15 +3063,19 @@ int main(int argc, char** argv) {
     std::printf("events:      %zu  hash=%016llx\n",
                 sc.events().size(), (unsigned long long)s.stateHash);
 
-    // --stream-frames N: Phase 19A.2B bounded actor diagnostic. Steps
-    // the real-data scene (neutral input, 1/30s) and reports, per
-    // frame, which updater families the dispatch walk reached (seam
-    // deltas), the window bounds, the tunnelExtend feed (fillSelect —
-    // every non-terminal extend ends at ae60), the animStep seam count
-    // and a folded state digest. Bounded: no draw emission, no anim
-    // bodies, no completion work — updater reach only.
+    // --stream-frames N: Phase 19A.2B/2C bounded actor+animator
+    // diagnostic. Steps the real-data scene (neutral input, 1/30s)
+    // and reports, per frame, which updater families the dispatch
+    // walk reached (seam deltas), the window bounds, the tunnelExtend
+    // feed (fillSelect — every non-terminal extend ends at ae60), the
+    // FUN_004555bc dispatch count, the per-object animator trace
+    // (slot:body[rec]frame/acc/latch — C classless, F fuse, T fuse
+    // teardown, H hold, N null, A advance, S advance+sound) and a
+    // folded state digest. Bounded: no draw emission, no TELETYPE
+    // execution — updater + animator reach only.
     if (streamFrames > 0 && ok) {
       std::printf("frames:      frame updaters winLo winHi ext anim "
+                  "trace(slot:body[rec]f/acc/latch) "
                   "hero(slot,pathT,spd) hash\n");
       mdk::StreamInput in{};
       mdk::StreamSeams prev = sc.seams();
@@ -3078,12 +3089,22 @@ int main(int argc, char** argv) {
         if (cur.pickupUpdate > prev.pickupUpdate) fam += "pickup ";
         if (cur.genericUpdate > prev.genericUpdate) fam += "generic ";
         if (cur.twinSync > prev.twinSync) fam += "twinSync";
+        // Per-object animator trace — one entry per 555bc dispatch.
+        std::string tr;
+        for (const mdk::StreamAnimTick& t : sc.animLog()) {
+          char buf[64];
+          std::snprintf(buf, sizeof buf, " %d:%c[%d]f%d/%.2f/%d",
+                        t.slot, t.body, t.rec, (int)t.frame,
+                        (double)t.acc, (int)t.latch);
+          tr += buf;
+        }
         const mdk::StreamSnapshot fs = sc.snapshot();
-        std::printf("             %5d  %-40s [%d,%d) %3d %4d "
+        std::printf("             %5d  %-40s [%d,%d) %3d %4d%s "
                     "h(%d,%.2f,%.2f) %016llx\n",
                     f, fam.c_str(), fs.winLo, fs.winHi,
                     cur.fillSelect - prev.fillSelect,
-                    cur.animStep - prev.animStep, fs.heroIdx,
+                    cur.animCalls - prev.animCalls, tr.c_str(),
+                    fs.heroIdx,
                     (double)fs.heroPathT, (double)fs.heroSpeed,
                     (unsigned long long)fs.stateHash);
         prev = cur;

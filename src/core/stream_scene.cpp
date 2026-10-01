@@ -64,6 +64,12 @@ void cross3(const float a[3], const float b[3], float out[3]) {
                               static_cast<double>(a[1]) * b[0]);
 }
 
+// DAT_004edcc0 — the shared class-table record-0 identity that the
+// FUN_004555bc dispatch compares an object's +0x0c against (the fuse
+// arm). The native value is a fixed global address; the port keeps a
+// process-unique sentinel — identity only, never dereferenced.
+CollisionElementSet kStreamClassRec0{};
+
 // ---------------------------------------------------------------------------
 // Phase 19A.1B — pool/lifecycle link helpers.
 //
@@ -1114,8 +1120,9 @@ void StreamScene::teardown() {
 //   hero    FUN_0042d24c   generic  FUN_0042cf6c
 //   escort  FUN_0042d034   pickup   FUN_0042d118
 //   stray   FUN_0042db0c   twinSync FUN_0042dabc
-// animStep stays the deferred FUN_004555bc seam — the animator family
-// is a later phase; the updaters only count their call sites.
+// animStep = FUN_004555bc, the shared per-object animator dispatch —
+// implemented in Phase 19A.2C below (the callsites were always real;
+// only the body was deferred).
 // ===========================================================================
 namespace {
 // d57b/d60d sub-block shared by the two hero lateral offsets on the
@@ -1175,7 +1182,7 @@ void StreamScene::heroUpdate(float dt) {
     tunnelExtend();                       // be4c — winHi++
   }
 
-  animStep(h, dt);                        // 555bc — deferred seam
+  animStep(h, dt);              // 555bc — animator dispatch
 
   // d310 — path frame at (zBias, zBias+1); basis for the rebuild.
   float pf[12];
@@ -1379,7 +1386,7 @@ void StreamScene::escortUpdate(DynamicObject& o, float dt) {
     escort_ = nullptr;                      // DAT_004edab8 = 0
     return;
   }
-  animStep(o, dt);                          // 555bc — deferred seam
+  animStep(o, dt);              // 555bc — animator dispatch
   // d082 — the native pathFrame writes the live +0xac block directly.
   float m[12];
   pathFrame(m, o.zBias, (float)((double)o.zBias + 1.0));
@@ -1410,7 +1417,7 @@ void StreamScene::pickupUpdate(DynamicObject& o, float dt) {
     pickup_ = nullptr;                      // DAT_004edac8 = 0
     return;
   }
-  animStep(o, dt);                          // 555bc — deferred seam
+  animStep(o, dt);              // 555bc — animator dispatch
   float m[12];
   pathFrame(m, o.zBias, (float)((double)o.zBias + 1.0));
   streamStoreMatrix(o, m);
@@ -1465,7 +1472,7 @@ void StreamScene::strayUpdate(DynamicObject& o, float dt) {
     reap(o);
     return;
   }
-  animStep(o, dt);                          // 555bc — deferred seam
+  animStep(o, dt);              // 555bc — animator dispatch
   const int n2 = (int)streamFrndInt(o.zBias);
   float pf[12];
   pathFrame(pf, (float)((double)o.zBias - 4.0),
@@ -1502,9 +1509,128 @@ void StreamScene::twinSync() {
   animStep(*twin_, stepDt_);
 }
 
+// ===========================================================================
+// Phase 19A.2C — FUN_004555bc, the shared per-object animator dispatch
+// (instruction-level port of the captured asm, p19a_helpers5.txt
+// 0x4555bc..0x4557ac). Terminal bodies in native order:
+//
+//   0x4555c9  +0x04 == -1        -> FUN_00455500 classless timing tail
+//   0x4555d4  +0x0c == 0x4edcc0  -> the class-table "fuse" arm
+//   0x4555e2  latch>=0 && frame==latch | latch==0xff00 -> resync hold
+//   0x45561a  +0x114 == 0        -> return (no advance)
+//   0x455628  +0x140/+0x144      -> sound-marker consume (one-shot)
+//   0x45569f  record advance     -> accumulate, clamp/wrap, 55890 apply
+//
+// The classless and ordinary bodies live in object_animation.cpp's
+// shared objectAnimTickDt (same code traversal/freefall use); the
+// class-table fuse is stream-side here because the +0x0c sentinel and
+// its bound chain are representable only through the stream bindings.
+// ===========================================================================
+const CollisionElementSet* StreamScene::classRec0() {
+  return &kStreamClassRec0;
+}
+
+void StreamScene::logAnimTick(const DynamicObject& o, char body) {
+  StreamAnimTick t;
+  t.slot = objIndex(&o);
+  t.body = body;
+  const std::uint8_t* recs[5] = {assets_.animEscort, assets_.animBones,
+                                 assets_.animKurt, assets_.animHvr,
+                                 assets_.animWave};
+  for (int i = 0; i != 5; ++i)
+    if (o.animRec == recs[i] && recs[i]) t.rec = i;
+  t.frame = o.animFrame;
+  t.acc = o.animAcc;
+  t.latch = o.animLatch;
+  t.flags148 = static_cast<std::uint8_t>(o.col.flags148 & 0xffu);
+  animLog_.push_back(t);
+}
+
 void StreamScene::animStep(DynamicObject& o, float dt) {
-  (void)o; (void)dt;
-  ++seams_.animStep;                        // 555bc — deferred seam
+  ++seams_.animCalls;
+  // 0x4555c9 — +0x04 == -1 -> FUN_00455500, the classless timing tail
+  // (rate-free: +0xdc += +0xe0 * DT, frame = trunc, repeat-wrap by the
+  // record bound). objectAnimTickDt owns the shared body.
+  if (o.enemyIndex == 0xffff) {
+    objectAnimTickDt(o, assets_.animLimit, dt, nullptr);
+    ++seams_.animClassless;
+    logAnimTick(o, 'C');
+    return;
+  }
+  // 0x4555d4 — +0x0c == DAT_004edcc0 (shared class-table record 0):
+  // the "fuse" arm. acc += f0 (DAT_0049b6f0 frame units — the dtSec
+  // arg x30), the bound read through rec0's +0x10 chain (port:
+  // assets_.animFuseBound carries the decoded dword, SAR >>0x10).
+  // flags149 & 0x40 selects loop-hold vs teardown; the non-loop end
+  // calls FUN_0045828c — the same in-place wipe objectTeardownNow
+  // ports (keep +0x00 link / +0x60 arena).
+  if (o.col.elements == &kStreamClassRec0) {
+    ++seams_.animFuse;
+    const std::int32_t raw =
+        static_cast<std::int32_t>(assets_.animFuseBound);
+    const int bound = raw >> 0x10;                  // SAR — sign kept
+    o.animAcc += dt * 30.0f;                        // +0xdc += f0
+    if ((o.col.flags149 & 0x40u) == 0) {
+      // 0x4557d8: FCOMP bound vs acc; JBE (<= or unordered) -> 5828c.
+      if (!((float)bound > o.animAcc)) {
+        ++seams_.animFuseEnd;
+        const CollisionObject* next = o.col.next;
+        DynamicArena* arena = o.arena;              // +0x60
+        o.~DynamicObject();
+        new (&o) DynamicObject();
+        o.col.next = next;
+        o.arena = arena;
+        logAnimTick(o, 'T');
+        return;
+      }
+    } else if (!((float)bound > o.animAcc)) {
+      // 0x45582d — loop end: frame = bound-1 and hold (JA covers the
+      // ordered bound>acc compare; <= or NaN lands here).
+      o.animFrame = static_cast<std::int16_t>(bound - 1);
+      logAnimTick(o, 'F');
+      return;
+    }
+    // 0x4557e9 — running: frame = FRNDINT(acc) truncated to i16
+    // (FISTP dword -> low word store, same mod-2^16 convention).
+    o.animFrame = static_cast<std::int16_t>(
+        static_cast<std::int32_t>(std::trunc(o.animAcc)));
+    logAnimTick(o, 'F');
+    return;
+  }
+  // Ordinary record driver — 0x4555e2..0x455794 inside
+  // objectAnimTickDt. The sound-marker arm (+0x140 name, +0x144 mark)
+  // consumes inside the advance; the native emits FUN_00402160
+  // (mode 0x1000e, vol 0x7fff, rate 1.0, range 50.0, pos=&+0x10) —
+  // surfaced here as a name-bound kPlaySound event.
+  const bool hadSound = !o.animSoundName.empty();
+  const std::string soundName = o.animSoundName;
+  const ObjectAnimBody body =
+      objectAnimTickDt(o, assets_.animLimit, dt, nullptr);
+  char letter = '?';
+  switch (body) {
+    case ObjectAnimBody::kClassless:  // unreachable — dispatched above
+      ++seams_.animClassless; letter = 'C'; break;
+    case ObjectAnimBody::kIdleHold:
+      ++seams_.animHold; letter = 'H'; break;
+    case ObjectAnimBody::kNoRecord:
+      ++seams_.animNull; letter = 'N'; break;
+    case ObjectAnimBody::kAdvance:
+      ++seams_.animAdvance;
+      letter = 'A';
+      if (hadSound && o.animSoundName.empty()) {
+        ++seams_.animSound;
+        StreamEvent ev;
+        ev.kind = StreamEvent::kPlaySound;
+        ev.tag = -1;                  // name-bound (host resolves)
+        ev.aux = 0x1000e;             // FUN_00402160 mode word
+        ev.f[0] = o.pos[0]; ev.f[1] = o.pos[1]; ev.f[2] = o.pos[2];
+        ev.name = soundName;
+        events_.push_back(ev);
+        letter = 'S';
+      }
+      break;
+  }
+  logAnimTick(o, letter);
 }
 void StreamScene::backdropScroll() { ++seams_.backdrop; }
 
@@ -1519,11 +1645,13 @@ void StreamScene::emitFrameDraw() {
 
 // ===========================================================================
 // FUN_0042c8b0 — frame skeleton. Stages in OBSERVED order; the actor
-// updater family is implemented (Phase 19A.2B) — animStep/backdrop/
-// drawList remain the deferred seams (see StreamSeams).
+// updater family (Phase 19A.2B) and the FUN_004555bc animator family
+// (Phase 19A.2C) are implemented — backdrop/drawList and the other
+// counted stages remain the deferred seams (see StreamSeams).
 // ===========================================================================
 bool StreamScene::step(const StreamInput& in, float dtSec) {
   stepLog_.clear();
+  animLog_.clear();
   ++frameTick_;                          // 0x49b5a4++
   stepLog_.push_back(StreamStage::kTick);
   // Frame context for the updaters — the native resolves the input

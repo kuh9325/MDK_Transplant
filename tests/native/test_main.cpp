@@ -25783,19 +25783,35 @@ void test_stream_pool() {
 // ---------------------------------------------------------------------------
 
 // Minimal StreamAssets: palettes as ramp patterns, tag ids = small ints,
-// anims as distinct pointer sentinels, protos null (the proto binding
-// itself is covered separately with a tiny synthetic RuntimeModel).
-static mdk::StreamAssets makeStreamAssets(std::uint8_t (&pal)[0x240],
-                                        std::uint8_t (&sys)[0xc0],
-                                        std::uint8_t (&anims)[5]) {
+// protos null (the proto binding itself is covered separately with a
+// tiny synthetic RuntimeModel). The anim slots are REAL minimal records
+// — 0 channels, 0 refs, 4 frames, zeroed root keys: +0x00 rate f32,
+// +0x04 chanCount, +0x08 frameCount, 12B x frameCount root keys, u32
+// refCount. One record per slot so the animRec identity checks stay
+// distinct; animLimit is the buffer end.
+constexpr std::size_t kStreamAnimRec = 0x0c + 12 * 4 + 4;
+
+static void makeStreamAnim(std::uint8_t* p, float rate,
+                           std::uint32_t frames) {
+  std::memset(p, 0, kStreamAnimRec);
+  std::memcpy(p, &rate, 4);
+  std::memcpy(p + 8, &frames, 4);          // chanCount (+0x04) stays 0
+}
+
+static mdk::StreamAssets makeStreamAssets(
+    std::uint8_t (&pal)[0x240], std::uint8_t (&sys)[0xc0],
+    std::uint8_t (&anims)[5 * kStreamAnimRec]) {
   mdk::StreamAssets a;
   a.paletteGlobal = sys;
   a.palettePal = pal;
-  a.animEscort = anims + 0;
-  a.animBones = anims + 1;
-  a.animKurt = anims + 2;
-  a.animHvr = anims + 3;
-  a.animWave = anims + 4;
+  for (int i = 0; i != 5; ++i)
+    makeStreamAnim(anims + i * kStreamAnimRec, 1.0f, 4);
+  a.animEscort = anims + 0 * kStreamAnimRec;
+  a.animBones = anims + 1 * kStreamAnimRec;
+  a.animKurt = anims + 2 * kStreamAnimRec;
+  a.animHvr = anims + 3 * kStreamAnimRec;
+  a.animWave = anims + 4 * kStreamAnimRec;
+  a.animLimit = anims + sizeof(anims);
   a.bgTag = 40;
   a.planetTag[0] = 50; a.planetTag[1] = 51;
   a.planetTag[2] = 52; a.planetTag[3] = 53;
@@ -25809,7 +25825,7 @@ void test_stream_init() {
   using mdk::DynamicObject;
   using mdk::StreamScene;
   using mdk::StreamEvent;
-  std::uint8_t pal[0x240], sys[0xc0], anims[5] = {1, 2, 3, 4, 5};
+  std::uint8_t pal[0x240], sys[0xc0], anims[5 * kStreamAnimRec] = {};
   for (int i = 0; i != 0x240; ++i) pal[i] = static_cast<std::uint8_t>(i);
   for (int i = 0; i != 0xc0; ++i) sys[i] = static_cast<std::uint8_t>(255 - i);
   const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
@@ -26193,7 +26209,7 @@ void test_stream_tunnel() {
 void test_stream_teardown() {
   using mdk::StreamEvent;
   using mdk::StreamScene;
-  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5] = {1, 2, 3, 4, 5};
+  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5 * kStreamAnimRec] = {};
   const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
 
   // --- teardown after init: pool/scene reset, WIND stop, no visuals -----
@@ -26254,7 +26270,7 @@ void test_stream_step() {
   using mdk::StreamInput;
   using mdk::StreamScene;
   using mdk::StreamStage;
-  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5] = {1, 2, 3, 4, 5};
+  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5 * kStreamAnimRec] = {};
   const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
   StreamInput in{};
 
@@ -26431,9 +26447,12 @@ void test_stream_step() {
     CHECK((h.col.flags148 & 0x8) == 0);       // hero hides
     CHECK(tw.animRec == a.animBones);         // edaa0
     CHECK(h.animRec == a.animBones);          // hero rebinds too
-    CHECK(tw.animFrame == -1 && tw.animAcc == 0.0f &&
+    // Both ticked once this step (hero in heroUpdate, twin in
+    // twinSync): frame -1 -> +1 step -> 0, +1 step -> 1 on the
+    // 4-frame record; acc advanced ~1.0 frame-unit.
+    CHECK(tw.animFrame == 1 && near(tw.animAcc, 1.0) &&
           tw.animLatch == -2 && tw.animRate == 30.0f);
-    CHECK(h.animFrame == -1 && h.animAcc == 0.0f &&
+    CHECK(h.animFrame == 1 && near(h.animAcc, 1.0) &&
           h.animLatch == -2 && h.animRate == 30.0f);
     bool rescueSnd = false;
     for (const auto& e : s.events())
@@ -26513,7 +26532,7 @@ void test_stream_updaters() {
     CHECK(o->col.origin[0] == 0.0f && o->col.origin[1] == 42.5f &&
           o->col.origin[2] == 0.0f);
     // cf6c has NO anim call site (OBSERVED — the one updater without).
-    CHECK(s.seams().animStep == 0);
+    CHECK(s.seams().animCalls == 0);
   }
 
   // --- genericUpdate: field34 == 0 parks — no advance/migrate ---------
@@ -26566,7 +26585,7 @@ void test_stream_updaters() {
     s.pickupUpdate(*p, 0.5f);
     CHECK(p->zBias == 3.5f);
     CHECK(p->enemyIndex == 3);             // trunc 3 — same bucket
-    CHECK(s.seams().animStep == 1);        // 555bc call site reached
+    CHECK(s.seams().animCalls == 1);        // 555bc call site reached
     CHECK(p->field1c[1] == 0.0f);
     CHECK(p->pos[0] == 0.0f && p->pos[1] == 35.0f && p->pos[2] == 0.0f);
     CHECK(p->col.origin[1] == 35.0f);
@@ -26601,7 +26620,7 @@ void test_stream_updaters() {
     s.pickupUpdate(*p, 1.0f);
     CHECK(s.pickup_ == nullptr);
     CHECK(s.freelist_ == p);
-    CHECK(s.seams().animStep == 0);        // early RET before the tick
+    CHECK(s.seams().animCalls == 0);        // early RET before the tick
   }
 
   // --- escortUpdate: advance + anim + live pathFrame rebuild ----------
@@ -26616,7 +26635,7 @@ void test_stream_updaters() {
     CHECK(e->zBias == 6.0f);               // unconditional advance
     CHECK(e->enemyIndex == 6);             // migrated to trunc 6
     CHECK(s.bucketHead(6) == s.objIndex(e));
-    CHECK(s.seams().animStep == 1);
+    CHECK(s.seams().animCalls == 1);
     CHECK(e->field1c[1] == 0.0f);
     CHECK(e->pos[1] == 60.0f);             // frac 0 -> node t
     CHECK(e->col.origin[1] == 60.0f);
@@ -26636,7 +26655,7 @@ void test_stream_updaters() {
     CHECK(e->zBias == 51.0f);              // 11 + 40
     CHECK(s.escort_ == nullptr);
     CHECK(s.freelist_ == e);
-    CHECK(s.seams().animStep == 0);
+    CHECK(s.seams().animCalls == 0);
   }
 
   // --- strayUpdate: hero-lead clamp + trailing frame ------------------
@@ -26656,7 +26675,7 @@ void test_stream_updaters() {
     CHECK(st->zBias == 15.0f);
     CHECK(st->field34 == 6.0f);
     CHECK(st->enemyIndex == 15);
-    CHECK(s.seams().animStep == 1);
+    CHECK(s.seams().animCalls == 1);
     // Trailing frame at zBias-4/-3 with the node-15 translation
     // patched back in: pos = node15.t + f1c = (0,150,0).
     CHECK(st->pos[0] == 0.0f && st->pos[1] == 150.0f &&
@@ -26682,11 +26701,13 @@ void test_stream_updaters() {
     CHECK(st->enemyIndex == 20);
     // Migrate fail: reap WITHOUT clearing the slot pointer (OBSERVED —
     // unlike escort/pickup, db0c writes no global on the reap path).
+    const int animCalls0 = s.seams().animCalls;
     s.winHi_ = 21;
     st->field34 = 40.0f;
     s.strayUpdate(*st, 1.0f);              // 20.0667 + 40 -> trunc 60
     CHECK(s.stray_ == st);
     CHECK(s.freelist_ == st);
+    CHECK(s.seams().animCalls == animCalls0);  // reap precedes animStep
   }
 
   // --- twinSync: pos + 0x30-byte +0xac block copy + anim tick ---------
@@ -26711,11 +26732,11 @@ void test_stream_updaters() {
     CHECK(tw->col.origin[0] == 7.0f && tw->col.origin[1] == 8.0f &&
           tw->col.origin[2] == 9.0f);
     CHECK(tw->zBias == 42.0f);             // OBSERVED: untouched
-    CHECK(s.seams().animStep == 1);
+    CHECK(s.seams().animCalls == 1);
     // Null twin -> the post-walk stage is a no-op beyond the count.
     s.twin_ = nullptr;
     s.twinSync();
-    CHECK(s.seams().animStep == 1);
+    CHECK(s.seams().animCalls == 1);
     CHECK(s.seams().twinSync == 2);
   }
 
@@ -26734,7 +26755,7 @@ void test_stream_updaters() {
     CHECK(h->field34 == 6.0f);             // at cap — no grow
     CHECK(h->zBias == 0.95f);              // +6.0/30
     CHECK(s.winLo_ == 0 && s.winHi_ == 32);// lead 0.2 < 1 — no feed
-    CHECK(s.seams().animStep == 1);
+    CHECK(s.seams().animCalls == 1);
     CHECK(h->yawDeg == 90.0f && h->bankDeg == 0.0f);
     CHECK(h->prevPos[1] == 7.5f);          // pre-update pos latched
     CHECK(h->pos[0] == 0.0f && h->pos[1] == 9.5f && h->pos[2] == 0.0f);
@@ -26819,7 +26840,7 @@ void test_stream_updaters() {
     s.heroUpdate(dt);
     CHECK(h->yawDeg == 90.0f);             // clamped on recenter
     CHECK(h->bankDeg == 0.0f);
-    CHECK(s.seams().animStep == 3);
+    CHECK(s.seams().animCalls == 3);
     // gate=0 returns before d7b7 — zero planes would have "hit"
     // everywhere, so silence proves the probe never ran.
     CHECK(s.events().empty());
@@ -26977,7 +26998,7 @@ void test_stream_updaters() {
     StreamScene s;
     s.winLo_ = 0; s.winHi_ = 32;
     makeStraightPath(s);
-    std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5] = {};
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5 * kStreamAnimRec] = {};
     s.assets_ = makeStreamAssets(pal, sys, anims);
     s.health_ = 100;
     s.rng_ = 2;                            // first extend rand &3 == 0
@@ -27009,7 +27030,7 @@ void test_stream_updaters() {
     CHECK(s.seams().twinSync == 1);
     // animStep call sites: hero + stray + escort + pickup + twin = 5;
     // generic has none (OBSERVED).
-    CHECK(s.seams().animStep == 5);
+    CHECK(s.seams().animCalls == 5);
     // hero FIRST: the stray gate reads the post-advance zBias (10.2)
     // — a pre-update read would have produced 15.0 instead of 15.2.
     CHECK(near(s.hero_->zBias, 10.2));
@@ -27026,6 +27047,266 @@ void test_stream_updaters() {
       CHECK(tw->col.xform[i] == h->col.xform[i]);
     for (int i = 0; i != 3; ++i)
       CHECK(tw->col.origin[i] == h->col.origin[i]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19A.2C — StreamScene::animStep (FUN_004555bc) — the six terminal
+// bodies of the shared animator dispatch, exercised per body:
+//   C +0x04==-1 classless timing tail (FUN_00455500)
+//   F +0x0c==classRec0 fuse arm (running + loop-hold ends)
+//   T   fuse non-loop end -> FUN_0045828c in-place teardown
+//   H +0x118 latch resync / 0xff00 done-hold
+//   N null / bounded-fail record
+//   A ordinary record advance (-> 55890 apply)
+//   S   ordinary advance that consumed the +0x140/+0x144 sound marker
+// ---------------------------------------------------------------------------
+void test_stream_animator() {
+  using mdk::DynamicObject;
+  using mdk::StreamScene;
+  using mdk::StreamEvent;
+  const float dt = 1.0f / 30.0f;
+
+  // ---- body C: +0x04==-1 classless (55500 tail) ----------------------------
+  {
+    StreamScene s;
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {},
+                 anims[5 * kStreamAnimRec] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    DynamicObject* o = s.alloc(0, 0.0f);
+    o->enemyIndex = 0xffff;                  // +0x04 == -1
+    o->animRec = s.assets_.animKurt;         // 4-frame record
+    o->animRate = 30.0f;                     // +0xe0 — the multiplier
+    o->animAcc = -1.0f;
+    o->animFrame = -1;
+    s.animStep(*o, dt);
+    // acc: -1 + 30*(1/30f) = ~0 (f32 dt isn't exact) -> frame 0.
+    CHECK(near(o->animAcc, 0.0) && o->animFrame == 0);
+    CHECK(s.seams().animCalls == 1 && s.seams().animClassless == 1);
+    CHECK(s.animLog().size() == 1 && s.animLog()[0].body == 'C');
+    s.animStep(*o, dt);                      // acc~1 -> frame 1
+    CHECK(near(o->animAcc, 1.0) && o->animFrame == 1);
+    // Repeat-wrap by the record bound: acc 3.5 -> +~1 = ~4.5 -> frame 4
+    // wraps once to 0, acc ~0.5.
+    o->animAcc = 3.5f;
+    s.animStep(*o, dt);
+    CHECK(o->animFrame == 0 && near(o->animAcc, 0.5));
+    // Multi-wrap: acc 8.5 -> ~9.5 -> frame 9 -> -4 -4 -> 1, acc ~1.5.
+    o->animAcc = 8.5f;
+    s.animStep(*o, dt);
+    CHECK(o->animFrame == 1 && near(o->animAcc, 1.5));
+    // Negative tail: acc -2.5 -> -1.5 -> trunc -1 -> clamp 0/0.
+    o->animAcc = -2.5f;
+    s.animStep(*o, dt);
+    CHECK(o->animFrame == 0 && o->animAcc == 0.0f);
+    // Classless never runs the 55890 applier (OBSERVED) — the
+    // accumulator bookkeeping is the whole body; with an unbound
+    // record it self-resolves to the 0-frame hold.
+    DynamicObject* o2 = s.alloc(1, 1.0f);
+    o2->enemyIndex = 0xffff;
+    o2->animAcc = 5.0f; o2->animFrame = 5;
+    s.animStep(*o2, dt);
+    CHECK(o2->animFrame == 0 && o2->animAcc == 0.0f);
+    CHECK(s.seams().animClassless == 6);
+    CHECK(s.seams().animAdvance == 0 && s.seams().animHold == 0);
+  }
+
+  // ---- body F/T: +0x0c==classRec0 fuse arm ---------------------------------
+  {
+    StreamScene s;
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {},
+                 anims[5 * kStreamAnimRec] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    s.assets_.animFuseBound = 3u << 16;      // decoded bound = 3 frames
+    // Running: acc += dt*30; frame = trunc(acc) while acc < bound.
+    DynamicObject* o = s.alloc(0, 0.0f);
+    o->col.elements = StreamScene::classRec0();
+    o->col.flags149 = 0x40;                  // loop-hold arm
+    o->animAcc = 0.5f; o->animFrame = 0;
+    s.animStep(*o, dt);
+    CHECK(near(o->animAcc, 1.5) && o->animFrame == 1);
+    CHECK(s.seams().animCalls == 1 && s.seams().animFuse == 1);
+    CHECK(s.animLog().size() == 1 && s.animLog()[0].body == 'F');
+    // Loop end: acc 2.5 -> ~3.5 >= bound -> frame = bound-1 = 2, held.
+    o->animAcc = 2.5f;
+    s.animStep(*o, dt);
+    CHECK(o->animFrame == 2 && near(o->animAcc, 3.5));
+    CHECK(s.animLog().size() == 2 && s.animLog()[1].body == 'F');
+    // Holds: another tick stays at bound-1.
+    s.animStep(*o, dt);
+    CHECK(o->animFrame == 2);
+    // Non-loop end -> FUN_0045828c in-place wipe: record re-inits,
+    // +0x00 link and +0x60 arena preserved, no freelist relink.
+    DynamicObject* n = s.alloc(2, 2.0f);     // neighbor for the link
+    DynamicObject* t = s.alloc(3, 3.0f);
+    t->col.elements = StreamScene::classRec0();
+    t->col.flags149 = 0x00;                  // no loop -> teardown
+    t->col.next = &n->col;
+    t->animAcc = 9.0f;                       // past bound on add
+    t->animFrame = 2;
+    const int free0 = s.poolFreeCount();
+    s.animStep(*t, dt);
+    CHECK(s.seams().animFuseEnd == 1);
+    CHECK(s.animLog().back().body == 'T');
+    CHECK(t->col.next == &n->col);           // +0x00 preserved
+    CHECK(t->animRec == nullptr && t->animFrame == 0 &&
+          t->animAcc == 0.0f);               // wiped record
+    CHECK(s.poolFreeCount() == free0);       // in-place, not re-linked
+    // NaN acc: FCOMP unordered -> JBE -> teardown (non-loop arm).
+    DynamicObject* q = s.alloc(4, 4.0f);
+    q->col.elements = StreamScene::classRec0();
+    q->animAcc = std::numeric_limits<float>::quiet_NaN();
+    s.animStep(*q, dt);
+    CHECK(s.seams().animFuseEnd == 2);
+    CHECK(s.animLog().back().body == 'T');
+    CHECK(s.seams().animFuse == 5);
+    CHECK(s.seams().animAdvance == 0 && s.seams().animNull == 0);
+  }
+
+  // ---- body H: latch resync + 0xff00 done-hold ------------------------------
+  {
+    StreamScene s;
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {},
+                 anims[5 * kStreamAnimRec] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    DynamicObject* o = s.alloc(0, 0.0f);
+    o->animRec = s.assets_.animKurt;
+    o->animRate = 30.0f;
+    // +0x118 >= 0 && +0xe4 == +0x118 -> resync +0xdc = +0xe4, hold.
+    o->animLatch = 2; o->animFrame = 2; o->animAcc = 9.25f;
+    s.animStep(*o, dt);
+    CHECK(o->animAcc == 2.0f && o->animFrame == 2);
+    CHECK(s.seams().animCalls == 1 && s.seams().animHold == 1);
+    CHECK(s.animLog().size() == 1 && s.animLog()[0].body == 'H');
+    // The 0xff00 done latch holds even with a stale accumulator.
+    o->animLatch = static_cast<std::int16_t>(0xff00);
+    o->animFrame = 3; o->animAcc = 7.0f;
+    s.animStep(*o, dt);
+    CHECK(o->animAcc == 3.0f && o->animFrame == 3);
+    CHECK(s.seams().animHold == 2 &&
+          s.animLog().back().body == 'H');
+    // latch >= 0 but frame != latch -> NOT the hold body (falls
+    // through to advance — checked under body A below).
+  }
+
+  // ---- body N: null + bounded-fail record -----------------------------------
+  {
+    StreamScene s;
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {},
+                 anims[5 * kStreamAnimRec] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    DynamicObject* o = s.alloc(0, 0.0f);
+    o->animLatch = -1;
+    o->animRec = nullptr;                    // +0x114 == 0 -> RET
+    o->animAcc = 4.5f; o->animFrame = 2;
+    s.animStep(*o, dt);
+    CHECK(o->animAcc == 4.5f && o->animFrame == 2);  // untouched
+    CHECK(s.seams().animCalls == 1 && s.seams().animNull == 1);
+    CHECK(s.animLog().size() == 1 && s.animLog()[0].body == 'N');
+    // Bounded-fail: a record whose header can't be read inside the
+    // limit (rec within 4B of the end -> frameCount probe fails).
+    o->animRec = s.assets_.animLimit - 4;
+    s.animStep(*o, dt);
+    CHECK(s.seams().animNull == 2 &&
+          s.animLog().back().body == 'N');
+    // Zero-frame record parses but has no advance surface.
+    std::uint8_t z[kStreamAnimRec] = {};
+    makeStreamAnim(z, 1.0f, 0);
+    o->animRec = z;
+    s.animStep(*o, dt);
+    CHECK(s.seams().animNull == 3 &&
+          s.animLog().back().body == 'N');
+  }
+
+  // ---- body A: ordinary record advance --------------------------------------
+  {
+    StreamScene s;
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {},
+                 anims[5 * kStreamAnimRec] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    DynamicObject* o = s.alloc(0, 0.0f);
+    o->animRec = s.assets_.animKurt;         // rate 1.0, 4 frames
+    o->animRate = 30.0f;
+    o->animAcc = -1.0f; o->animFrame = -1; o->animLatch = -1;
+    // Initial frame: step = 1.0*30*(1/30f) = ~1.0 -> acc ~0 -> 1 step.
+    s.animStep(*o, dt);
+    CHECK(o->animFrame == 0 && near(o->animAcc, 0.0));
+    CHECK(s.seams().animCalls == 1 && s.seams().animAdvance == 1);
+    CHECK(s.animLog().size() == 1 && s.animLog()[0].body == 'A');
+    CHECK(s.animLog()[0].rec == 2);          // animKurt slot index
+    // Fractional phase: rate 15 -> ~0.5 frame/tick — trunc keeps the
+    // frame until the accumulator crosses a whole step.
+    o->animRate = 15.0f;
+    s.animStep(*o, dt);                      // acc ~0.5 -> trunc=0 steps
+    CHECK(o->animFrame == 0 && near(o->animAcc, 0.5));
+    s.animStep(*o, dt);                      // acc ~1.0 -> 1 step -> f1
+    CHECK(o->animFrame == 1 && near(o->animAcc, 1.0));
+    // Boundary wrap (alloc leaves flags148 0; set the +0x148 loop bit
+    // explicitly).
+    o->animRate = 30.0f;
+    o->col.flags148 = static_cast<std::uint16_t>(
+        o->col.flags148 | 0x0008u);
+    o->animAcc = 3.5f; o->animFrame = 3;
+    s.animStep(*o, dt);
+    // acc ~4.5 >= fc-1 && loop: steps = trunc(4.5-3)=1, acc>=4 -> ~0.5;
+    // ++frame 3->4 wraps to 0.
+    CHECK(o->animFrame == 0 && near(o->animAcc, 0.5));
+    CHECK(s.animLog().back().body == 'A');
+    // Target clamp: latch 3 with acc crossing -> caps AT the latch.
+    o->animLatch = 3; o->animFrame = 2; o->animAcc = 2.9f;
+    s.animStep(*o, dt);
+    CHECK(o->animAcc == 3.0f && o->animFrame == 3);
+    // Terminal: non-loop end latches 0xff00, next tick is the hold.
+    DynamicObject* p = s.alloc(1, 1.0f);
+    p->animRec = s.assets_.animKurt;
+    p->animRate = 30.0f;
+    p->animAcc = 2.5f; p->animFrame = 2; p->animLatch = -1;
+    s.animStep(*p, dt);                      // acc 3.5 -> clamp 3
+    CHECK(p->animAcc == 3.0f && p->animFrame == 3);
+    CHECK(p->animLatch == static_cast<std::int16_t>(0xff00));
+    s.animStep(*p, dt);                      // done-hold
+    CHECK(p->animFrame == 3 && p->animAcc == 3.0f);
+    CHECK(s.animLog().back().body == 'H');
+  }
+
+  // ---- body S: advance consuming the +0x140/+0x144 sound marker -------------
+  {
+    StreamScene s;
+    std::uint8_t pal[0x240] = {}, sys[0xc0] = {},
+                 anims[5 * kStreamAnimRec] = {};
+    s.assets_ = makeStreamAssets(pal, sys, anims);
+    DynamicObject* o = s.alloc(0, 0.0f);
+    o->animRec = s.assets_.animKurt;
+    o->animRate = 30.0f;
+    o->animAcc = 1.5f; o->animFrame = 1; o->animLatch = -1;
+    o->animSoundName = "BOOM_SND";
+    o->animSoundMark = 2;                    // crossed by acc 1.5->2.5
+    o->pos[0] = 11.0f; o->pos[1] = 22.0f; o->pos[2] = 33.0f;
+    s.animStep(*o, dt);
+    CHECK(o->animSoundName.empty());         // consumed
+    CHECK(s.seams().animAdvance == 1 && s.seams().animSound == 1);
+    CHECK(s.animLog().size() == 1 && s.animLog()[0].body == 'S');
+    // The name-bound event: tag=-1 (unresolved name), aux=0x1000e
+    // (FUN_00402160 mode), f[0..2] = +0x10 position, name text kept.
+    CHECK(s.events().size() == 1);
+    const StreamEvent& ev = s.events()[0];
+    CHECK(ev.kind == StreamEvent::kPlaySound);
+    CHECK(ev.tag == -1 && ev.aux == 0x1000e);
+    CHECK(ev.name == "BOOM_SND");
+    CHECK(ev.f[0] == 11.0f && ev.f[1] == 22.0f && ev.f[2] == 33.0f);
+    // Marker not reached -> stays armed, plain 'A'.
+    o->animSoundName = "LATE_SND";
+    o->animSoundMark = 3;
+    o->animAcc = 1.0f; o->animFrame = 1;
+    s.animStep(*o, dt);                      // acc 1->2, mark 3 not hit
+    CHECK(o->animSoundName == "LATE_SND");
+    CHECK(s.seams().animSound == 1);
+    CHECK(s.animLog().back().body == 'A');
+    // One-shot: a consumed marker never refires.
+    o->animSoundMark = 1;
+    s.animStep(*o, dt);
+    CHECK(s.seams().animSound == 1);
+    CHECK(s.animLog().back().body == 'A');
   }
 }
 
@@ -27134,6 +27415,7 @@ int main() {
   test_stream_teardown();
   test_stream_step();
   test_stream_updaters();
+  test_stream_animator();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
