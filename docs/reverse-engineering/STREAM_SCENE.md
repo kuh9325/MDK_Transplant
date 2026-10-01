@@ -468,3 +468,141 @@ mixed into `stateHash` (`ttHash` covers the arena).
 **MODE-5 TELETYPE SCRIPT SERVICE: CLOSED FOR BUILD_A** — not the full
 mode-5 core (backdrop/draw/palette/fillSelect/limiter/trail seams
 remain).
+
+## 16. Phase 19A.2G — the Mode-5 trail/ribbon engine (implemented)
+
+The trail the tunnel leaves behind the fly-through is a per-slot
+triangle-band skin over the §6 ring geometry — decoded from
+`p19a_asm2.txt` (e620), `p19a_asm3.txt`/`g1_walk.txt` (e100),
+`g1_spanemit.txt` (0ca00), `p19a_batch7.txt` (be4c tail). All asm-
+verified OBSERVED.
+
+### Call chain (OBSERVED)
+
+`FUN_0042c8b0` frame → `emitDrawList` (`FUN_0042e100`) → per bucket:
+16× `project6b4f8` (FUN_0046b4f8) ring projection → 32×
+`FUN_0042e620` ribbon calls → object chain → `FUN_00409a00` flush.
+Each `e620` plane-tests then tail-calls the shared triangle gate
+`FUN_0040ca00`, which trivial-rejects or hands the clipper
+(`FUN_0040c860` raster dispatch — negative-pen family, host seam).
+
+### Ribbon geometry — `FUN_0042e620` (OBSERVED)
+
+Per bucket `cur` the native makes **exactly 32 calls**: a
+15-iteration loop over `i=0..14`, then the `i=15` wrap segment as an
+unrolled tail (loop bound = the `b[15]` record address):
+
+| call | verts | plane | pen |
+|---|---|---|---|
+| `2i`   | `(b[i], a[i+1], b[i+1])` | `plane[2i]`   | `penBase − pen[2i]` |
+| `2i+1` | `(b[i], a[i], a[i+1])` | `plane[2i+1]` | `penBase − pen[2i+1]` |
+
+`a` = the higher slot's projected ring (native buf `[-0x44]`),
+`b` = this bucket's (`[-0x38]`); the buffers swap at the bucket tail
+so each ring projects exactly once. The two triangle families share
+no pen byte — `pen[2i]`/`pen[2i+1]` are distinct pairs per ring edge
+(OBSERVED: be4c writes two pen bytes per edge).
+
+`e620` body (asm-exact):
+
+```
+dist = n.y*eye.y + n.x*eye.x + n.z*eye.z + d   (f80 order y,x,z,+d)
+dist < 0  → return 1                          (backface skip)
+else      → FUN_0040ca00(v0,v1,v2,aux,pen)    (≥0 or NaN/unordered)
+```
+
+The port accumulates in `double` to stand in for the x87 extended-
+precision chain, same operand order.
+
+`0ca00` order (OBSERVED): draw gate `0x5414d4==0` → return; then the
+**AND** of the three verts' `+0x14` clip-flag bytes — nonzero is the
+trivial reject; then the OR — nonzero enters the clipper, zero
+dispatches direct. The port emits a pre-clip `kRibbonTri` event:
+`tag` = the raw negative pen scalar, `aux` = `f0 | f1<<8 | f2<<16`
+(the three packed flag bytes), `f[0..8]` = the three view-space
+verts — copy-safe values, never pointers into the ring buffers.
+
+### Window / bucket traversal quirks (OBSERVED)
+
+`cur = (winHi−1)&0x1f`, `stop = winLo&0x1f`; the exit test runs on
+the MASKED slots BEFORE the decrement, so:
+
+- buckets `winHi−2 .. winLo` are processed — `winHi−1`'s ring feeds
+  the first ribbon band but **its objects are never drawn**;
+- a window with `(winHi−winLo) ≡ 1 (mod 32)` draws zero buckets —
+  `span 33` silently no-ops like `span 1`;
+- `span 32` draws the full 31 buckets `winHi−2..winLo`.
+
+Pen base is distance-banded on `dist = cur − winLo` (decremented
+per bucket, OBSERVED ladder):
+`>25 → −0x545 / 21..25 → −0x505 / 16..20 → −0x4c5 /
+11..15 → −0x485 / 6..10 → −0x445 / ≤5 → −0x405`. All values are the
+negative material indices the `0c860` dispatch remaps through the
+`0x412970` filler LUT (`(−1029−pen)·256` row select).
+
+### Ordering (OBSERVED)
+
+Per bucket: 32 e620 calls **first**, then the object-chain record
+appends (models flag-0, sprites flag-1), then one 09a00 flush iff ≥1
+record appended — flag-0 records fire in chain order, flag-1 drain
+descending by key (far-first). So ribbon triangles precede that
+bucket's models and sprites; the closed model/sprite ordering is
+unchanged (19A.2F tests still pass untouched).
+
+### Trail update — `FUN_0042be4c` tail (OBSERVED, pre-existing)
+
+`seams_.trailUpdate` now counts be4c calls: `cur = winHi&0x1f`,
+`prev = (winHi−1)&0x1f`; final-mode freeze gate `winHi > 186`; the
+current bucket drains, 16 ring points regenerate at 22.5° with
+jittered radius, and — when a `prev` segment exists — 2 pen bytes +
+2 plane records per ring edge write into the PREVIOUS slot
+(truncated `penBase·(1−penT) + penTarget·penT`, `penT += 0.1`,
+target re-roll at completion), plane normals normalized and `d`
+computed; `winHi++`; drift/radius update; `fillSelect(0)` seam.
+
+### Diagnostics (course 0 / course 4, `--stream-frames` to natural exit)
+
+| metric | course 0 | course 4 |
+|---|---|---|
+| frames / exitFrame | 466 / 465 (hero latch) | 354 / 353 (death) |
+| e620 calls | 446400 (13950 buckets ×32) | 338880 (10590 ×32) |
+| `kRibbonTri` emitted | 139162 | 97740 |
+| plane culls | 252576 | 193316 |
+| gate skips | 0 | 0 |
+| trivial rejects | 54662 | 47824 |
+| clip takes | 10738 | 8333 |
+| trail updates (be4c) | 114 | 94 |
+| window high water | 31 | 31 |
+| record arena high water / overflow | 28 / 0 | 28 / 0 |
+| pen digest | `2191c615a6734cee` | `9c2bfe130e0a4b90` |
+| geometry digest | `3e4b35eba5ec4c8f` | `ae71dbe78491c257` |
+
+`emit + cull + reject + gate = calls` on both courses. The ~57%
+plane cull is the backfacing half of the tube; gate never fires on
+the real path (`emitDrawList` is itself `drawDue_`-gated).
+
+### Reachability
+
+| branch | course 0 | course 4 | synthetic |
+|---|---|---|---|
+| 32-call band emit | yes | yes | yes |
+| plane backface cull | yes | yes | yes |
+| 0ca00 draw gate | no (`due=1` always) | no | yes |
+| trivial reject (AND) | yes | yes | yes |
+| clip take (OR) | yes | yes | yes |
+| `span≡1 (mod 32)` zero-draw | no (span≤31) | no | yes |
+| 64-record arena overflow | no | no | yes |
+| distance-band ladder bands | yes (all six) | yes | yes |
+| negative-pen `0c860` remap | — host seam — | — host seam — | tag passthrough |
+
+Regression: `mdk_tests` 145846/0 (new `test_stream_ribbon` covers
+minimum/zero/wrapped windows, multi-segment order, tri count/order/
+winding, pen pairs + the six-band ladder, plane cull, gate, trivial
+reject, per-vert flag packing, near/side clip, arena capacity, copy
+safety across ring mutation, reap, window slide, teardown/re-init,
+and deterministic replay), CTest 1/1; traversal L3–8 and freefall
+c0–c4 canonical digests unchanged.
+
+**MODE-5 TRAIL / RIBBON ENGINE: CLOSED FOR BUILD_A** — explicitly
+not the full mode-5 core (backdrop internals, palette host upload,
+fillSelect internals, limiter, present remain seams).

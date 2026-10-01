@@ -314,9 +314,26 @@ struct StreamSeams {
   int drawListOverflow = 0;  // appends past the 64-record stack arena
                              // (0xc00/0x30) — the native overflows its
                              // frame stack; the port bounds + counts
-  int ribbonDraw = 0;     // FUN_0042e620 calls — 32 per drawn span
-                          // (15x2 loop + 2 tail). The bodies are
-                          // Phase 19A.2G trail geometry — counted here.
+  int ribbonDraw = 0;     // FUN_0042e620 calls — 32 per drawn bucket
+                          // (15x2 loop + 2 unrolled i=15 tail)
+  int ribbonEmit = 0;     //   of those: kRibbonTri emitted (plane faces
+                          //   the eye + 0ca00 gates passed)
+  int ribbonPlaneCull = 0;//   e620's plane test: n.eye + d < 0 — the
+                          //   backface skip, returns before 0ca00
+  int ribbonGate = 0;     //   0ca00's 0x5414d4==0 draw-gate skip —
+                          //   emitDrawList is itself gated on drawDue_,
+                          //   reachable only when the fn runs outside
+                          //   the frame path
+  int ribbonReject = 0;   //   0ca00's trivial reject — the AND of the
+                          //   three verts' clip-flag bytes != 0
+  int ribbonClip = 0;     //   of the emitted: OR of the flag bytes != 0
+                          //   (0ca00 takes the clipper; the port emits
+                          //   the pre-clip tri, flags packed in aux)
+  int trailUpdate = 0;    // FUN_0042be4c calls — path-history appends
+                          // (ring/plane/pen regeneration per slot)
+  int trailMax = 0;       // draw-window high water — max live
+                          // winHi-winLo slots feeding e100
+  int drawListMax = 0;    // 64-record (0xc00/0x30) arena high water
   int hudBlit = 0;        // FUN_004185fc calls — HUD icon + digits
   int listener = 0;       // FUN_004026f8 — audio listener xform update
   int limiter = 0;        // FUN_0042fb68 (frame) + 42fb30 (init) calls
@@ -519,6 +536,12 @@ private:
                                                 // clip flags + fill fn
   void backdropScroll();                        // e684
   void emitDrawList();                          // e100 — records + flush
+  // The 32x FUN_0042e620 band for slot `seg` — a = the higher slot's
+  // projected ring records (native bufA), b = this bucket's (bufB);
+  // penBase = the distance-banded negative material index.
+  void ribbonEmit(std::uint32_t seg,
+                  const float a[kStreamRingPts][6],
+                  const float b[kStreamRingPts][6], int penBase);
   void emitHud();                               // 17e20
   void hudBlit(int tag, int srcOff, float x, float y,
                float w, float h, float srcStride);  // 185fc seam

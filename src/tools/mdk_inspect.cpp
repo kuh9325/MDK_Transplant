@@ -3129,8 +3129,26 @@ int main(int argc, char** argv) {
           drawDigest *= 1099511628211ull;
         }
       };
+      // Phase 19A.2G — ribbon/trail digests: penDigest folds the
+      // emitted pen scalar + packed clip flags per kRibbonTri (the
+      // pen-pair stream); ribDigest folds the full pre-clip geometry
+      // (9 view-space floats + pen + flags) in emit order.
+      std::uint64_t penDigest = 1469598103934665603ull;
+      std::uint64_t ribDigest = 1469598103934665603ull;
+      auto pmix = [&penDigest](std::uint64_t v) {
+        for (int i = 0; i != 8; ++i) {
+          penDigest ^= (v >> (i * 8)) & 0xff;
+          penDigest *= 1099511628211ull;
+        }
+      };
+      auto rmix = [&ribDigest](std::uint64_t v) {
+        for (int i = 0; i != 8; ++i) {
+          ribDigest ^= (v >> (i * 8)) & 0xff;
+          ribDigest *= 1099511628211ull;
+        }
+      };
       long evPalT = 0, evBgT = 0, evMdlT = 0, evSprT = 0, evHudT = 0,
-           evPresT = 0, evTtT = 0, evExitT = 0;
+           evPresT = 0, evTtT = 0, evExitT = 0, evRibT = 0;
       int framesRun = 0, exitFrame = -1;
       for (int f = 0; f != streamFrames; ++f) {
         const std::size_t evBase = sc.events().size();
@@ -3141,9 +3159,10 @@ int main(int argc, char** argv) {
         // Phase 19A.2F — per-frame draw-event census over the new
         // events only (the queue holds the whole run).
         int evPal = 0, evBg = 0, evMdl = 0, evSpr = 0, evHud = 0,
-            evPres = 0, evTt = 0;
+            evPres = 0, evTt = 0, evRib = 0;
         for (std::size_t ei = evBase; ei != sc.events().size(); ++ei) {
-          switch (sc.events()[ei].kind) {
+          const mdk::StreamEvent& ev = sc.events()[ei];
+          switch (ev.kind) {
             case mdk::StreamEvent::kPaletteSet:   ++evPal;  break;
             case mdk::StreamEvent::kBackdropBlit: ++evBg;   break;
             case mdk::StreamEvent::kModelDraw:    ++evMdl;  break;
@@ -3152,16 +3171,26 @@ int main(int argc, char** argv) {
             case mdk::StreamEvent::kTeletypeDraw: ++evTt;   break;
             case mdk::StreamEvent::kPresent:      ++evPres; break;
             case mdk::StreamEvent::kExitMode:     ++evExitT; break;
+            case mdk::StreamEvent::kRibbonTri:
+              ++evRib;
+              pmix((std::uint32_t)ev.tag |
+                   ((std::uint64_t)(std::uint32_t)ev.aux << 32));
+              for (int k = 0; k != 9; ++k)
+                rmix(std::bit_cast<std::uint32_t>(ev.f[k]));
+              rmix((std::uint32_t)ev.tag |
+                   ((std::uint64_t)(std::uint32_t)ev.aux << 32));
+              break;
             default: break;
           }
         }
         evPalT += evPal; evBgT += evBg; evMdlT += evMdl;
         evSprT += evSpr; evHudT += evHud; evPresT += evPres;
-        evTtT += evTt;
+        evTtT += evTt; evRibT += evRib;
         dmix((std::uint32_t)evPal | ((std::uint64_t)evBg << 8) |
              ((std::uint64_t)evMdl << 16) | ((std::uint64_t)evSpr << 24) |
              ((std::uint64_t)evHud << 32) | ((std::uint64_t)evPres << 40) |
              ((std::uint64_t)evTt << 48));
+        dmix((std::uint32_t)evRib);
         const mdk::StreamSnapshot dfs = sc.snapshot();
         dmix(dfs.paletteDacHash);
         dmix(((std::uint64_t)dfs.limiter[1]) |
@@ -3220,21 +3249,26 @@ int main(int argc, char** argv) {
             ((std::uint64_t)sc.finished() << 40));
         mix(((std::uint64_t)(std::uint32_t)fs.winLo) |
             ((std::uint64_t)(std::uint32_t)fs.winHi << 32));
-        // Draw-stage line (19A.2F): event census, limiter record,
-        // backdrop accumulators, DAC hash, gates. Diagnostic only —
-        // folded into nothing; stateHash stays canonical.
+        // Draw-stage line (19A.2F/2G): event census, limiter record,
+        // backdrop accumulators, DAC hash, gates, ribbon trims.
+        // Diagnostic only — folded into nothing; stateHash stays
+        // canonical.
         std::printf("                 draw: pal=%d bg=%d mdl=%d spr=%d "
-                    "hud=%d pres=%d | lim t1=%u t2=%u t3=%.4f base=%u "
-                    "tgt=%u | uv=(%d,%d) dac=%016llx due=%d blink=%d "
-                    "ovf=%d\n",
-                    evPal, evBg, evMdl, evSpr, evHud, evPres,
+                    "hud=%d pres=%d rib=%d | lim t1=%u t2=%u t3=%.4f "
+                    "base=%u tgt=%u | uv=(%d,%d) dac=%016llx due=%d "
+                    "blink=%d ovf=%d | rc=%d cull=%d rej=%d clip=%d\n",
+                    evPal, evBg, evMdl, evSpr, evHud, evPres, evRib,
                     (unsigned)fs.limiter[1], (unsigned)fs.limiter[2],
                     (double)std::bit_cast<float>(fs.limiter[3]),
                     (unsigned)fs.limiterBase, (unsigned)fs.limiterTarget,
                     (int)fs.bgScroll[0], (int)fs.bgScroll[1],
                     (unsigned long long)fs.paletteDacHash, fs.drawDue,
                     fs.hudBlink,
-                    cur.drawListOverflow - prev.drawListOverflow);
+                    cur.drawListOverflow - prev.drawListOverflow,
+                    cur.ribbonDraw - prev.ribbonDraw,
+                    cur.ribbonPlaneCull - prev.ribbonPlaneCull,
+                    cur.ribbonReject - prev.ribbonReject,
+                    cur.ribbonClip - prev.ribbonClip);
         if (!keepGoing && exitFrame < 0) exitFrame = f;
         if (!keepGoing) break;              // natural exit frame
         prev = cur;
@@ -3255,6 +3289,19 @@ int main(int argc, char** argv) {
                   "exit=%ld fill=%d\n",
                   framesRun, exitFrame, evPalT, evBgT, evMdlT, evSprT,
                   evHudT, evTtT, evPresT, evExitT, exitFill);
+      // Phase 19A.2G — trail/ribbon diagnostic: e620 call census by
+      // outcome, emitted-tri total, path-history updates and window
+      // high water, the arena high water, and the two ribbon digests
+      // (pen-pair stream / full pre-clip geometry in emit order).
+      std::printf("ribbon:        calls=%d tris=%ld emit=%d cull=%d "
+                  "gate=%d reject=%d clip=%d | trail upd=%d max=%d "
+                  "arena=%d ovf=%d | penDg=%016llx ribDg=%016llx\n",
+                  sm.ribbonDraw, evRibT, sm.ribbonEmit,
+                  sm.ribbonPlaneCull, sm.ribbonGate, sm.ribbonReject,
+                  sm.ribbonClip, sm.trailUpdate, sm.trailMax,
+                  sm.drawListMax, sm.drawListOverflow,
+                  (unsigned long long)penDigest,
+                  (unsigned long long)ribDigest);
       std::printf("              limiter=%d rec{t1=%u,t2=%u,t3=%.4f,"
                   "t4=%.6f,t5=%u} base=%u tgt=%u | ribbon=%d ovf=%d | "
                   "dac=%016llx drawDigest=%016llx | reason=%s "

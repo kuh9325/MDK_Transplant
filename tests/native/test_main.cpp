@@ -28371,6 +28371,446 @@ void test_stream_draw() {
   }
 }
 
+// Phase 19A.2G — the Mode-5 trail/ribbon engine: the 32-slot path
+// history (ringPts_/planes_/pens_ fed by tunnelExtend) drawn by
+// FUN_0042e100's masked-slot walk -> 32x FUN_0042e620 per bucket ->
+// the 0ca00 gate/reject prologue -> kRibbonTri events.
+void test_stream_ribbon() {
+  using mdk::DynamicObject;
+  using mdk::StreamScene;
+  using mdk::StreamEvent;
+  std::uint8_t pal[0x240], sys[0xc0], anims[5 * kStreamAnimRec] = {};
+  for (int i = 0; i != 0x240; ++i) pal[i] = static_cast<std::uint8_t>(i);
+  for (int i = 0; i != 0xc0; ++i) sys[i] = static_cast<std::uint8_t>(255 - i);
+  mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+  a.hudIconTag = 90;  a.hudIconW = 32; a.hudIconH = 16;
+  a.hudDigitTag = 91; a.hudDigitW = 80; a.hudDigitH = 12;
+  mdk::StreamInput in{};
+  const float dt = std::bit_cast<float>(0x3d088889u);
+
+  // Fixture helpers. camProj_ = identity + translate z+500 (view z' =
+  // z+500); eye at origin. Ring x encodes (seg,i) = seg*16 + i*0.25 —
+  // max 499.75 < z' so the synthetic verts stay clip-flag clean.
+  auto prep = [](StreamScene& s) {
+    for (int i = 0; i != 12; ++i) s.camProj_[i] = 0.0f;
+    s.camProj_[0] = s.camProj_[5] = s.camProj_[10] = 1.0f;
+    s.camProj_[11] = 500.0f;
+    s.camPos_[0] = s.camPos_[1] = s.camPos_[2] = 0.0f;
+    for (auto& h : s.buckets_) h = nullptr;
+    std::memset(s.ringPts_, 0, sizeof s.ringPts_);
+    std::memset(s.planes_, 0, sizeof s.planes_);
+    std::memset(s.pens_, 0, sizeof s.pens_);
+  };
+  auto ringId = [](StreamScene& s, int seg, float z) {
+    for (int i = 0; i != 16; ++i) {
+      const float x = seg * 16.0f + i * 0.25f;
+      s.ringPts_[seg][i * 3 + 0] = x;
+      s.ringPts_[seg][i * 3 + 1] = -x;
+      s.ringPts_[seg][i * 3 + 2] = z;
+    }
+  };
+  // All-emitting plane set: n=(0,0,-1), d=5 — eye·n + d = 5 > 0.
+  auto planesFace = [](StreamScene& s, int seg) {
+    for (int j = 0; j != 32; ++j) {
+      s.planes_[seg][j * 4 + 0] = 0.0f;
+      s.planes_[seg][j * 4 + 1] = 0.0f;
+      s.planes_[seg][j * 4 + 2] = -1.0f;
+      s.planes_[seg][j * 4 + 3] = 5.0f;
+    }
+  };
+  auto ribbons = [](const StreamScene& s) {
+    std::vector<const StreamEvent*> v;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kRibbonTri) v.push_back(&e);
+    return v;
+  };
+  // View-space x of slot `seg` ring pt i under the fixture camProj.
+  auto vx = [](int seg, int i) { return seg * 16.0f + i * 0.25f; };
+
+  // --- minimum drawable span: one bucket -> 32 e620 calls ------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    ringId(s, 0, 0.0f); ringId(s, 1, 0.0f);
+    planesFace(s, 0);
+    for (int j = 0; j != 32; ++j) s.pens_[0][j] = (std::uint8_t)j;
+    s.winLo_ = 0; s.winHi_ = 2;                    // span 2 -> bucket 0
+    s.emitDrawList();
+    const auto v = ribbons(s);
+    CHECK(s.seams().ribbonDraw == 32);
+    CHECK(s.seams().ribbonEmit == 32);
+    CHECK(s.seams().ribbonPlaneCull == 0 && s.seams().ribbonReject == 0);
+    CHECK(s.seams().ribbonClip == 0 && s.seams().ribbonGate == 0);
+    CHECK(v.size() == 32);
+    CHECK(s.seams().trailMax == 2);
+    // Tri order/winding — bucket 0's band is (b=ring[0], a=ring[1]):
+    //   call 2i   = (b[i], a[i+1], b[i+1])  pen -0x405 - pen[2i]
+    //   call 2i+1 = (b[i], a[i], a[i+1])    pen -0x405 - pen[2i+1]
+    // and the i=15 tail wraps (i+1)->0.
+    for (int i = 0; i != 15; ++i) {
+      const StreamEvent& t0 = *v[2 * i];
+      CHECK(t0.f[0] == vx(0, i));                    // b[i].x
+      CHECK(t0.f[3] == vx(1, i + 1));                // a[i+1].x
+      CHECK(t0.f[6] == vx(0, i + 1));                // b[i+1].x
+      CHECK(t0.tag == -0x405 - 2 * i);
+      const StreamEvent& t1 = *v[2 * i + 1];
+      CHECK(t1.f[0] == vx(0, i));                    // b[i]
+      CHECK(t1.f[3] == vx(1, i));                    // a[i]
+      CHECK(t1.f[6] == vx(1, i + 1));                // a[i+1]
+      CHECK(t1.tag == -0x405 - (2 * i + 1));
+    }
+    // Tail (i=15 wrap): (b15,a0,b0) pen[30]; (b15,a15,a0) pen[31].
+    CHECK(v[30]->f[0] == vx(0, 15) && v[30]->f[3] == vx(1, 0) &&
+          v[30]->f[6] == vx(0, 0));
+    CHECK(v[30]->tag == -0x405 - 30);
+    CHECK(v[31]->f[0] == vx(0, 15) && v[31]->f[3] == vx(1, 15) &&
+          v[31]->f[6] == vx(1, 0));
+    CHECK(v[31]->tag == -0x405 - 31);
+    // Adjacent tris carry DISTINCT pen bytes (2i vs 2i+1).
+    CHECK(v[0]->tag != v[1]->tag);
+    for (int i = 0; i != 32; ++i) CHECK(v[i]->aux == 0);  // clean flags
+    // The emitted verts are view-space (vx,vy,vz): y' = -x', z' = 500.
+    CHECK(v[0]->f[1] == -vx(0, 0) && v[0]->f[2] == 500.0f);
+  }
+
+  // --- multiple segments + bucket traversal order --------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    for (int sg = 0; sg != 5; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    for (int sg = 0; sg != 5; ++sg)
+      for (int j = 0; j != 32; ++j)
+        s.pens_[sg][j] = (std::uint8_t)(sg * 40 + j & 0x3f);
+    s.winLo_ = 0; s.winHi_ = 5;                    // buckets 3,2,1,0
+    s.emitDrawList();
+    const auto v = ribbons(s);
+    CHECK(s.seams().ribbonDraw == 32 * 4);
+    CHECK(v.size() == 128);
+    // Bucket 3 first (cur=3 -> band ring[4]/ring[3], planes/pens[3]);
+    // dist = cur - winLo -> buckets 3..0 all land on the -0x405 base.
+    for (int bk = 0; bk != 4; ++bk) {
+      const int cur = 3 - bk;
+      const StreamEvent& t = *v[bk * 32];          // call 2i i=0
+      CHECK(t.f[0] == vx(cur, 0));                   // b[0] of slot cur
+      CHECK(t.f[3] == vx(cur + 1, 1));               // a[1] of slot cur+1
+      CHECK(t.f[6] == vx(cur, 1));                   // b[1]
+      CHECK(t.tag == -0x405 - ((cur * 40 + 0) & 0x3f));
+      const StreamEvent& t1 = *v[bk * 32 + 1];
+      CHECK(t1.tag == -0x405 - ((cur * 40 + 1) & 0x3f));
+    }
+    CHECK(s.seams().trailMax == 5);
+  }
+
+  // --- distance band ladder (OBSERVED e1ad..e3d9) ---------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    for (int sg = 0; sg != 32; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    s.winLo_ = 0; s.winHi_ = 32;                   // buckets 30..0
+    s.emitDrawList();
+    const auto v = ribbons(s);
+    CHECK(v.size() == 32 * 31);
+    // Bucket bk covers cur = 30-bk -> dist = cur; the OBSERVED ladder:
+    // dist>25 -0x545 / 21..25 -0x505 / 16..20 -0x4c5 / 11..15 -0x485 /
+    // 6..10 -0x445 / <=5 -0x405.
+    const int band[] = {-0x405, -0x405, -0x405, -0x405, -0x405, -0x405,
+                        -0x445, -0x445, -0x445, -0x445, -0x445,
+                        -0x485, -0x485, -0x485, -0x485, -0x485,
+                        -0x4c5, -0x4c5, -0x4c5, -0x4c5, -0x4c5,
+                        -0x505, -0x505, -0x505, -0x505, -0x505,
+                        -0x545, -0x545, -0x545, -0x545, -0x545};
+    for (int bk = 0; bk != 31; ++bk) {
+      const int cur = 30 - bk;
+      CHECK(v[bk * 32]->tag == band[cur]);          // pens zeroed
+      CHECK(v[bk * 32 + 1]->tag == band[cur]);      // pair shares band
+    }
+    CHECK(s.seams().trailMax == 32);               // full window
+  }
+
+  // --- ring wrap: slots cross the 32-slot boundary --------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    for (int sg = 0; sg != 32; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    s.winLo_ = 30; s.winHi_ = 34;                  // cur=(33)&31=1 ->
+    s.emitDrawList();                              // buckets 0,31,30
+    const auto v = ribbons(s);
+    CHECK(s.seams().ribbonDraw == 32 * 3);
+    CHECK(v.size() == 96);
+    // Bucket order: 0 (band ring1/ring0), 31 (ring0/ring31), 30.
+    CHECK(v[0]->f[0] == vx(0, 0));                   // b[0] of slot 0
+    CHECK(v[32]->f[0] == vx(31, 0));                 // b[0] of slot 31
+    CHECK(v[64]->f[0] == vx(30, 0));                 // b[0] of slot 30
+  }
+
+  // --- plane test: facing, away, edge 0, and the real n·eye math ------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    ringId(s, 0, 0.0f); ringId(s, 1, 0.0f);
+    s.winLo_ = 0; s.winHi_ = 2;
+    s.camPos_[2] = 7.0f;                           // eye at +z 7
+    // plane 0: n=(0,0,1), d=-3 -> 7-3 = 4 >= 0 emit (call 0)
+    s.planes_[0][0] = 0.0f; s.planes_[0][1] = 0.0f;
+    s.planes_[0][2] = 1.0f; s.planes_[0][3] = -3.0f;
+    // plane 1: n=(0,0,-1), d=+3 -> -7+3 = -4 < 0 cull (call 1)
+    s.planes_[0][4] = 0.0f; s.planes_[0][5] = 0.0f;
+    s.planes_[0][6] = -1.0f; s.planes_[0][7] = 3.0f;
+    // plane 2: n=(0,0,-1), d=7 -> -7+7 = 0 -> emit (edge, not <0)
+    s.planes_[0][8] = 0.0f; s.planes_[0][9] = 0.0f;
+    s.planes_[0][10] = -1.0f; s.planes_[0][11] = 7.0f;
+    // planes 3..31 all cull: n=(0,0,-1), d=-8 -> -7-8 = -15.
+    for (int j = 3; j != 32; ++j) {
+      s.planes_[0][j * 4 + 2] = -1.0f;
+      s.planes_[0][j * 4 + 3] = -8.0f;
+    }
+    s.emitDrawList();
+    const auto v = ribbons(s);
+    CHECK(s.seams().ribbonDraw == 32);
+    CHECK(s.seams().ribbonPlaneCull == 30);        // calls 1,3..31
+    CHECK(v.size() == 2);                          // calls 0 + 2
+    CHECK(v[0]->f[6] == vx(0, 1));                 // (b0,a1,b1) -> b[1]
+    CHECK(v[1]->f[6] == vx(0, 2));                 // (b1,a2,b2) -> b[2]
+    // NaN dist falls through to emit (FCOMPP unordered -> JBE taken).
+    StreamScene s2;
+    CHECK(s2.init(a, 0, 0, 0x9abcu, 100));
+    s2.clearEvents();
+    prep(s2);
+    ringId(s2, 0, 0.0f); ringId(s2, 1, 0.0f);
+    s2.planes_[0][3] = std::numeric_limits<float>::quiet_NaN();
+    for (int j = 1; j != 32; ++j)
+      s2.planes_[0][j * 4 + 3] = -1.0f;
+    s2.winLo_ = 0; s2.winHi_ = 2;
+    s2.emitDrawList();
+    CHECK(s2.seams().ribbonPlaneCull == 31);
+    CHECK(s2.seams().ribbonEmit == 1);             // the NaN plane emits
+  }
+
+  // --- 0ca00 prologue: gate, AND-reject, OR-clip flags -----------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    ringId(s, 0, 0.0f); ringId(s, 1, 0.0f);
+    planesFace(s, 0);
+    s.winLo_ = 0; s.winHi_ = 2;
+    // draw gate: drawDue_=0 -> every call gates, nothing emits.
+    s.drawDue_ = 0;
+    s.emitDrawList();
+    CHECK(s.seams().ribbonDraw == 32);
+    CHECK(s.seams().ribbonGate == 32);
+    CHECK(s.seams().ribbonEmit == 0);
+    // Trivial reject: flag ALL verts of both rings near (z'=-100) ->
+    // every tri's AND has 0x10 -> 32 rejects, 0 emits.
+    StreamScene s2;
+    CHECK(s2.init(a, 0, 0, 0x9abcu, 100));
+    s2.clearEvents();
+    prep(s2);
+    ringId(s2, 0, -600.0f); ringId(s2, 1, -600.0f);
+    planesFace(s2, 0);
+    s2.winLo_ = 0; s2.winHi_ = 2;
+    s2.emitDrawList();
+    CHECK(s2.seams().ribbonReject == 32);
+    CHECK(s2.seams().ribbonEmit == 0);
+    // Partial visibility: flag ONE vert — b[5] = ring[0][5] pushed
+    // past z' on x' (600 > 500 -> bit 2 = side-clip right). The three
+    // tris touching it emit with the flag packed into the right slot.
+    StreamScene s3;
+    CHECK(s3.init(a, 0, 0, 0x9abcu, 100));
+    s3.clearEvents();
+    prep(s3);
+    ringId(s3, 0, 0.0f); ringId(s3, 1, 0.0f);
+    planesFace(s3, 0);
+    s3.ringPts_[0][5 * 3] = 600.0f;                // b[5]: x'=600
+    s3.winLo_ = 0; s3.winHi_ = 2;
+    s3.emitDrawList();
+    const auto v = ribbons(s3);
+    CHECK(v.size() == 32);                          // none rejected
+    CHECK(s3.seams().ribbonClip == 3);
+    CHECK(v[8]->aux == (4 << 16));  // (b4,a5,b5) — v2 flagged
+    CHECK(v[10]->aux == 4);         // (b5,a6,b6) — v0 flagged
+    CHECK(v[11]->aux == 4);         // (b5,a5,a6) — v0 flagged
+    CHECK(v[9]->aux == 0);          // (b4,a4,a5) — clean
+    CHECK(v[10]->f[0] == 600.0f);                   // the flagged vert
+    // Near flag (z'=0.01 < 0.05 -> 0x10) packs the same way.
+    StreamScene s4;
+    CHECK(s4.init(a, 0, 0, 0x9abcu, 100));
+    s4.clearEvents();
+    prep(s4);
+    ringId(s4, 0, 0.0f); ringId(s4, 1, 0.0f);
+    planesFace(s4, 0);
+    // a[7] near-clips cleanly: x'/y' kept tiny so ONLY 0x10 fires
+    // (x',y' > |z'| would add the side bits).
+    s4.ringPts_[1][7 * 3 + 0] = 0.001f;
+    s4.ringPts_[1][7 * 3 + 1] = -0.001f;
+    s4.ringPts_[1][7 * 3 + 2] = -499.99f;          // a[7]: z'=0.01
+    s4.winLo_ = 0; s4.winHi_ = 2;
+    s4.emitDrawList();
+    const auto w = ribbons(s4);
+    CHECK(s4.seams().ribbonClip == 3);             // calls 12,13,15
+    CHECK(w[12]->aux == (0x10 << 8));              // (b6,a7,b7) — v1
+    CHECK(w[13]->aux == (0x10 << 16));             // (b6,a6,a7) — v2
+    CHECK(w[14]->aux == 0);                        // (b7,a8,b8) — clean
+    CHECK(w[15]->aux == (0x10 << 8));              // (b7,a7,a8) — v1
+  }
+
+  // --- ordering: ribbons precede the bucket's model + sprite drain ----
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    for (int sg = 0; sg != 3; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    s.winLo_ = 0; s.winHi_ = 3;                    // buckets 1,0
+    DynamicObject* mdl = s.alloc(1, 0.0f);
+    mdl->col.elements =
+        reinterpret_cast<const mdk::CollisionElementSet*>(0x1000);
+    DynamicObject* spr = s.spawnDebris(1.0f, nullptr, 0.0f);
+    spr->col.origin[2] = -200.0f;                  // vz' = 300
+    s.emitDrawList();
+    const auto& ev = s.events();
+    CHECK(ev.size() == 66);                        // 32+model+sprite+32
+    for (int i = 0; i != 32; ++i)
+      CHECK(ev[i].kind == StreamEvent::kRibbonTri);
+    CHECK(ev[32].kind == StreamEvent::kModelDraw);
+    CHECK(ev[33].kind == StreamEvent::kSpriteDraw);
+    for (int i = 34; i != 66; ++i)
+      CHECK(ev[i].kind == StreamEvent::kRibbonTri);
+    CHECK(s.seams().drawFlush == 1);               // only bucket 1
+    CHECK(s.seams().drawListMax == 2);
+    // Ribbon tris emit BEFORE the bucket's object records; the sprite
+    // drain is part of the same per-bucket 09a00 flush.
+  }
+
+  // --- owner reap: a reaped object no longer feeds the bucket ---------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    for (int sg = 0; sg != 3; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    s.winLo_ = 0; s.winHi_ = 3;
+    DynamicObject* d = s.spawnDebris(1.0f, nullptr, 0.0f);
+    CHECK(s.poolBucketCount(1) == 1);
+    s.reap(*d);
+    CHECK(s.poolBucketCount(1) == 0);
+    s.emitDrawList();
+    for (const auto& e : s.events())
+      CHECK(e.kind == StreamEvent::kRibbonTri);    // 64 tris, no objects
+    CHECK(s.seams().drawFlush == 0);               // no bucket appended
+    // Copy safety: emitted events survive trail mutation — scribble
+    // the ring state and confirm the stored commands are unchanged.
+    const float f0 = s.events()[0].f[0];
+    const int t0 = s.events()[0].tag;
+    std::memset(s.ringPts_, 0x7f, sizeof s.ringPts_);
+    CHECK(s.events()[0].f[0] == f0 && s.events()[0].tag == t0);
+    s.emitDrawList();                              // mutated state still
+    CHECK(s.seams().ribbonDraw == 128);            // emits per bucket
+  }
+
+  // --- window slide: winLo++ shifts the draw band (history shift) -----
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    for (int sg = 0; sg != 4; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    s.winLo_ = 0; s.winHi_ = 4;                    // buckets 2,1,0
+    s.emitDrawList();
+    CHECK(s.seams().ribbonDraw == 96);
+    const auto v0 = ribbons(s);
+    CHECK(v0[0]->f[0] == vx(2, 0));                // first bucket: cur=2
+    s.clearEvents();
+    s.winLo_ = 1;                                  // window slid
+    s.emitDrawList();
+    const auto v1 = ribbons(s);
+    CHECK(s.seams().ribbonDraw == 96 + 64);        // buckets 2,1
+    CHECK(v1[0]->f[0] == vx(2, 0));                // still slot 2 first
+    CHECK(v1[32]->f[0] == vx(1, 0));               // then slot 1
+    CHECK(s.seams().trailMax == 4);                // high-water, not
+                                                 // the current span
+  }
+
+  // --- teardown + re-init leaves the trail machinery clean -------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.teardown();
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    ringId(s, 0, 0.0f); ringId(s, 1, 0.0f);
+    planesFace(s, 0);
+    s.winLo_ = 0; s.winHi_ = 2;
+    s.emitDrawList();
+    CHECK(ribbons(s).size() == 32);
+    // The init window (winHi=31) appends 31 history slots — trailUpdate
+    // counts every tunnelExtend dispatch incl. init's.
+    CHECK(s.seams().trailUpdate >= 31);
+  }
+
+  // --- deterministic replay: identical runs emit identical ribbons ----
+  {
+    StreamScene r1, r2;
+    CHECK(r1.init(a, 0, 0, 0x5eedu, 100));
+    CHECK(r2.init(a, 0, 0, 0x5eedu, 100));
+    int tris1 = 0;
+    for (int f = 0; f != 12; ++f) {
+      CHECK(r1.step(in, dt) == r2.step(in, dt));
+      const auto& e1 = r1.events();
+      const auto& e2 = r2.events();
+      CHECK(e1.size() == e2.size());
+      for (std::size_t i = 0; i != e1.size(); ++i) {
+        const auto& x = e1[i];
+        const auto& y = e2[i];
+        if (x.kind != y.kind || x.tag != y.tag || x.aux != y.aux ||
+            x.name != y.name) { CHECK(false); break; }
+        if (x.kind == StreamEvent::kRibbonTri) {
+          ++tris1;
+          for (int k = 0; k != 9; ++k)
+            CHECK(std::bit_cast<std::uint32_t>(x.f[k]) ==
+                  std::bit_cast<std::uint32_t>(y.f[k]));
+        }
+      }
+    }
+    CHECK(tris1 > 0);                              // real data emits
+    CHECK(r1.seams().ribbonDraw == r2.seams().ribbonDraw);
+    CHECK(r1.seams().ribbonPlaneCull == r2.seams().ribbonPlaneCull);
+  }
+
+  // --- empty / degenerate windows --------------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x9abcu, 100));
+    s.clearEvents();
+    prep(s);
+    s.winLo_ = 5; s.winHi_ = 6;                    // span 1 -> cur==stop
+    s.emitDrawList();
+    CHECK(s.seams().ribbonDraw == 0 && s.events().empty());
+    // Masked exit: (winHi-1)&31 == winLo&31 -> 0 buckets. span 33 wraps
+    // to the same masked equality — the OBSERVED quirk.
+    s.winLo_ = 0; s.winHi_ = 33;
+    s.emitDrawList();
+    CHECK(s.seams().ribbonDraw == 0);
+    // ...while span 32 draws the full 31-bucket window (cur 30..0).
+    for (int sg = 0; sg != 32; ++sg) { ringId(s, sg, 0.0f); planesFace(s, sg); }
+    s.winHi_ = 32;
+    s.emitDrawList();
+    CHECK(s.seams().ribbonDraw == 32 * 31);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -28480,6 +28920,7 @@ int main() {
   test_stream_teletype();
   test_stream_completion();
   test_stream_draw();
+  test_stream_ribbon();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

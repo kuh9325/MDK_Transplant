@@ -723,6 +723,7 @@ int StreamScene::poolLinkIndex(const DynamicObject& o) const {
 //     [radiusMin, radiusMax]; then ae60(0) filler-select seam.
 // ===========================================================================
 void StreamScene::tunnelExtend() {
+  ++seams_.trailUpdate;   // be4c dispatch — path-history append pass
   const int cur = winHi_ & 0x1f;
   const int prev = (winHi_ - 1) & 0x1f;
 
@@ -1817,15 +1818,86 @@ void StreamScene::project6b4f8(const float v[3], float out[6]) const {
   out[5] = std::bit_cast<float>(flags);
 }
 
+// FUN_0042e620 — the ribbon band emitter. For bucket slot `seg` the
+// native makes 32 calls: a 15-iteration loop over i=0..14 then the
+// i=15 wrap segment as an unrolled tail (OBSERVED p19a_asm3.txt — the
+// loop bound is the b[15] record address; the wrap is hand-coded):
+//   call 2i   = (b[i], a[i+1], b[i+1])  plane[2i]   penBase - pen[2i]
+//   call 2i+1 = (b[i], a[i], a[i+1])    plane[2i+1] penBase - pen[2i+1]
+// where a = the higher slot's projected ring (bufA) and b = this
+// bucket's (bufB); the tail is the same pattern with (i+1) wrapping
+// to 0. penBase is the distance-banded ladder from e100 (all values
+// <= -1029 — the c860 negative dispatch lands every ribbon tri on the
+// 0x412970 LUT-remap filler with offset (-1029-pen)*256 + 0x540b20,
+// i.e. band*64 + penByte selects a 256-entry shade row; the port's
+// event tag carries the raw pen scalar and the host resolves it).
+//
+// Each e620 (asm-verified p19a_asm2.txt):
+//   dist = eye.y*n.y + eye.x*n.x + eye.z*n.z + d   (f80 order y,x,z,+d)
+//   FLDZ/FCOMPP/JBE — dist >= 0 OR unordered (NaN) -> call 0ca00,
+//   dist < 0 -> return 1 (backface skip).
+// 0ca00 (g1_spanemit.txt): 0x5414d4==0 gate first; then the AND of
+// the three verts' +0x14 flag bytes — nonzero is the trivial reject;
+// 0x4ce518 = 0x54b724 material-table install (host plumbing — the
+// negative-pen dispatch never reads it, not modeled); then the OR —
+// 0 means dispatch direct, nonzero takes the clipper. The port emits
+// the pre-clip tri with the packed flag bytes; the host owns the
+// clip+draw.
+void StreamScene::ribbonEmit(std::uint32_t seg,
+                             const float a[kStreamRingPts][6],
+                             const float b[kStreamRingPts][6],
+                             int penBase) {
+  const float* pl = &planes_[seg][0];
+  const std::uint8_t* pen = &pens_[seg][0];
+  const auto e620 = [&](const float v0[6], const float v1[6],
+                        const float v2[6], const float* plane, int p) {
+    ++seams_.ribbonDraw;
+    const double d =
+        static_cast<double>(plane[1]) * camPos_[1] +
+        static_cast<double>(plane[0]) * camPos_[0] +
+        static_cast<double>(plane[2]) * camPos_[2] +
+        static_cast<double>(plane[3]);
+    if (d < 0.0) { ++seams_.ribbonPlaneCull; return; }
+    if (drawDue_ == 0) { ++seams_.ribbonGate; return; }
+    const std::uint32_t f0 = std::bit_cast<std::uint32_t>(v0[5]);
+    const std::uint32_t f1 = std::bit_cast<std::uint32_t>(v1[5]);
+    const std::uint32_t f2 = std::bit_cast<std::uint32_t>(v2[5]);
+    if ((f0 & f1 & f2) != 0) { ++seams_.ribbonReject; return; }
+    if ((f0 | f1 | f2) != 0) ++seams_.ribbonClip;
+    StreamEvent ev;
+    ev.kind = StreamEvent::kRibbonTri;
+    ev.tag = p;
+    ev.aux = static_cast<int>(f0 | (f1 << 8) | (f2 << 16));
+    ev.f[0] = v0[0]; ev.f[1] = v0[1]; ev.f[2] = v0[2];
+    ev.f[3] = v1[0]; ev.f[4] = v1[1]; ev.f[5] = v1[2];
+    ev.f[6] = v2[0]; ev.f[7] = v2[1]; ev.f[8] = v2[2];
+    events_.push_back(ev);
+    ++seams_.ribbonEmit;
+  };
+  for (int i = 0; i != 15; ++i) {
+    e620(b[i], a[i + 1], b[i + 1], pl + (2 * i) * 4,
+         penBase - pen[2 * i]);
+    e620(b[i], a[i], a[i + 1], pl + (2 * i + 1) * 4,
+         penBase - pen[2 * i + 1]);
+  }
+  e620(b[15], a[0], b[0], pl + 30 * 4, penBase - pen[30]);
+  e620(b[15], a[15], a[0], pl + 31 * 4, penBase - pen[31]);
+}
+
 // FUN_0042e100 — the object draw list. OBSERVED structure:
-//   cur = (winHi-1)&0x1f; stop = winLo&0x1f — exit when equal BEFORE
-//   decrementing, so buckets winHi-2..winLo are processed (the
-//   winHi-1 bucket's ring points feed the first ribbon span but its
-//   objects are never drawn — OBSERVED quirk).
-//   Per bucket: project 16 ring points (6b4f8 x16 — ribbon input,
-//   bodies deferred to 19A.2G), 32x e620 ribbon emits (counted only),
-//   then the object chain appends 0x30-stride records into a shared
-//   64-entry stack arena (count persists ACROSS buckets):
+//   cur = (winHi-1)&0x1f; stop = winLo&0x1f — the exit test runs on
+//   the MASKED slots BEFORE decrementing, so buckets winHi-2..winLo
+//   are processed (the winHi-1 bucket's ring points feed the first
+//   ribbon span but its objects are never drawn — OBSERVED quirk) and
+//   a window with (winHi-winLo) ≡ 1 (mod 32) exits immediately.
+//   Per bucket: project the 16 ring points of slot cur into the near
+//   buffer (6b4f8 x16), 32x e620 ribbon emits for the band between
+//   the higher slot's ring and cur's (pen base picked by the
+//   OBSERVED distance ladder on dist = cur-winLo:
+//   >25 -0x545 / 21..25 -0x505 / 16..20 -0x4c5 / 11..15 -0x485 /
+//   6..10 -0x445 / <=5 -0x405), then the object chain appends
+//   0x30-stride records into a shared 64-entry stack arena (count
+//   persists ACROSS buckets):
 //     +0x0c model != 0 -> fn=0x455e24, flag=0 — compose
 //       camProj o obj+0xac -> obj+0x7c at record-build time
 //     +0x0c == 0 -> fn=e55c (obj == marker_) else e49c, flag=1 —
@@ -1834,25 +1906,45 @@ void StreamScene::project6b4f8(const float v[3], float out[6]) const {
 //   with 0x541500==1 flag-0 records call fn in chain order, flag-1
 //   records defer (key = vz*3.0f + 8000.0f, 0x499f88==0 form) and the
 //   drain qsorts DESCENDING by key-bit i32 — far-first painter order
-//   (comparator 0x40bd2c returns keyB-keyA).
+//   (comparator 0x40bd2c returns keyB-keyA). The two projected-ring
+//   buffers swap at the bucket tail so each ring projects once.
 void StreamScene::emitDrawList() {
   ++seams_.drawList;
+  std::uint32_t cur = static_cast<std::uint32_t>(winHi_ - 1) & 0x1f;
+  const std::uint32_t stop = static_cast<std::uint32_t>(winLo_) & 0x1f;
+  if (cur == stop) return;
   const int span = winHi_ - winLo_;
-  if (span <= 1) return;                  // (winHi-1)&31 == winLo&31
-  seams_.ribbonDraw += 32 * (span - 1);   // e620 calls — 19A.2G bodies
-  int recCount = 0;                       // shared arena [-0x1c]
-  for (int s = winHi_ - 2; s >= winLo_; --s) {
-    const int bucketStart = recCount;     // [-0x48]
+  if (span > seams_.trailMax) seams_.trailMax = span;
+  int dist = span - 1;                     // [-0x40], decremented per bucket
+  // The projected-ring double buffer: a = the higher slot's records
+  // (native [-0x44], first filled with ring[winHi-1]), b = the current
+  // bucket's ([-0x38]).
+  float bufA[kStreamRingPts][6], bufB[kStreamRingPts][6];
+  for (int i = 0; i != kStreamRingPts; ++i)
+    project6b4f8(&ringPts_[cur][i * 3], bufA[i]);
+  float (*a)[6] = bufA;
+  float (*b)[6] = bufB;
+  int recCount = 0;                        // shared arena [-0x1c]
+  while (cur != stop) {
+    const int bucketStart = recCount;      // [-0x48]
+    --dist;
+    const int penBase = dist > 25 ? -0x545 : dist > 20 ? -0x505
+                      : dist > 15 ? -0x4c5 : dist > 10 ? -0x485
+                      : dist >  5 ? -0x445 : -0x405;
+    cur = (cur - 1) & 0x1f;
+    for (int i = 0; i != kStreamRingPts; ++i)
+      project6b4f8(&ringPts_[cur][i * 3], b[i]);
+    ribbonEmit(cur, a, b, penBase);        // 32x e620 BEFORE the bucket
     // flag-1 records deferred for this bucket's flush.
     struct Pend { float key; const DynamicObject* o; float pr[6]; };
     std::vector<Pend> deferred;
-    for (DynamicObject* o = buckets_[s & 0x1f]; o; o = streamNext(o)) {
-      if (recCount >= 64) {               // arena 0xc00/0x30
-        ++seams_.drawListOverflow;        // each past-arena append
+    for (DynamicObject* o = buckets_[cur]; o; o = streamNext(o)) {
+      if (recCount >= 64) {                // arena 0xc00/0x30
+        ++seams_.drawListOverflow;         // each past-arena append
         continue;
       }
       ++recCount;
-      if (o->col.elements) {              // +0x0c != 0 -> model 55e24
+      if (o->col.elements) {               // +0x0c != 0 -> model 55e24
         const float m[12] = {
             o->col.xform[0], o->col.xform[1], o->col.xform[2],
             o->col.origin[0],
@@ -1865,7 +1957,7 @@ void StreamScene::emitDrawList() {
         ev.aux = objIndex(o);
         compose6aeb0(camProj_, m, ev.f);
         events_.push_back(ev);
-      } else {                            // sprite — flag 1 deferred
+      } else {                             // sprite — flag 1 deferred
         Pend p;
         p.o = o;
         project6b4f8(o->col.origin, p.pr);
@@ -1874,43 +1966,48 @@ void StreamScene::emitDrawList() {
         deferred.push_back(p);
       }
     }
-    if (recCount == bucketStart) continue;    // e374 — no flush
-    ++seams_.drawFlush;                        // 09a00 for this bucket
-    // Deferred drain — qsort by key bits descending (i32 compare —
-    // OBSERVED far-first; comparator 0x40bd2c returns keyB-keyA).
-    std::stable_sort(deferred.begin(), deferred.end(),
-                     [](const Pend& a, const Pend& b) {
-                       return std::bit_cast<std::int32_t>(a.key) >
-                              std::bit_cast<std::int32_t>(b.key);
-                     });
-    for (const Pend& p : deferred) {
-      const float zc = p.pr[2];
-      // e49c/e55c re-project + gate z' >= f64 0.05 at EMIT time.
-      if (static_cast<double>(zc) < 0.05) continue;
-      const DynamicObject& o = *p.o;
-      const int sx = static_cast<int>(std::trunc(p.pr[3]));
-      const int sy = static_cast<int>(std::trunc(p.pr[4]));
-      const int size = static_cast<int>(std::trunc(
-          static_cast<double>(spriteSizeNum_) *
-              static_cast<double>(o.col.scale) /
-              (static_cast<double>(zc) *
-               static_cast<double>(projSizeF_))));
-      const bool marker = (&o == marker_);
-      StreamEvent ev;
-      ev.kind = StreamEvent::kSpriteDraw;
-      ev.tag = static_cast<int>(
-          reinterpret_cast<std::intptr_t>(o.field108));
-      ev.aux = objIndex(&o);
-      ev.f[0] = static_cast<float>(sx);
-      ev.f[1] = static_cast<float>(sy);
-      ev.f[2] = static_cast<float>(size);
-      ev.f[3] = zc;
-      ev.f[4] = marker ? static_cast<float>(assets_.planetTag[1])
-                       : 64.0f;   // tag5/tag4 = 0x40 regular
-      ev.f[5] = marker ? static_cast<float>(assets_.planetTag[2])
-                       : 64.0f;
-      events_.push_back(ev);
+    if (recCount > seams_.drawListMax) seams_.drawListMax = recCount;
+    if (recCount != bucketStart) {           // e374 — flush iff appended
+      ++seams_.drawFlush;                    // 09a00 for this bucket
+      // Deferred drain — qsort by key bits descending (i32 compare —
+      // OBSERVED far-first; comparator 0x40bd2c returns keyB-keyA).
+      std::stable_sort(deferred.begin(), deferred.end(),
+                       [](const Pend& x, const Pend& y) {
+                         return std::bit_cast<std::int32_t>(x.key) >
+                                std::bit_cast<std::int32_t>(y.key);
+                       });
+      for (const Pend& p : deferred) {
+        const float zc = p.pr[2];
+        // e49c/e55c re-project + gate z' >= f64 0.05 at EMIT time.
+        if (static_cast<double>(zc) < 0.05) continue;
+        const DynamicObject& o = *p.o;
+        const int sx = static_cast<int>(std::trunc(p.pr[3]));
+        const int sy = static_cast<int>(std::trunc(p.pr[4]));
+        const int size = static_cast<int>(std::trunc(
+            static_cast<double>(spriteSizeNum_) *
+                static_cast<double>(o.col.scale) /
+                (static_cast<double>(zc) *
+                 static_cast<double>(projSizeF_))));
+        const bool marker = (&o == marker_);
+        StreamEvent ev;
+        ev.kind = StreamEvent::kSpriteDraw;
+        ev.tag = static_cast<int>(
+            reinterpret_cast<std::intptr_t>(o.field108));
+        ev.aux = objIndex(&o);
+        ev.f[0] = static_cast<float>(sx);
+        ev.f[1] = static_cast<float>(sy);
+        ev.f[2] = static_cast<float>(size);
+        ev.f[3] = zc;
+        ev.f[4] = marker ? static_cast<float>(assets_.planetTag[1])
+                         : 64.0f;   // tag5/tag4 = 0x40 regular
+        ev.f[5] = marker ? static_cast<float>(assets_.planetTag[2])
+                         : 64.0f;
+        events_.push_back(ev);
+      }
     }
+    // Bucket tail — bufA<->bufB so the near ring becomes the next
+    // bucket's far ring (each ring projects exactly once).
+    std::swap(a, b);
   }
 }
 
