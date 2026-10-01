@@ -635,3 +635,159 @@ New test coverage in `test_stream_draw` (`fillSelect` block): the
 four comparators + default arm, init's 32 counted installs, RNG/
 stateHash neutrality, all five variant projections against the
 image-verified constants, and `tunnelExtend`'s re-install of sel 0.
+
+## 18. Phase 19A.3 — Mode-5 native golden / core closure (OBSERVED)
+
+Final audit of the assembled mode-5 core on real installed data
+(`original/installed`), all five courses, skill 1, seed `0xC0FFEE`
+(the established StreamScene diagnostic default — the same value the
+freefall canonical passes as `--seed 12648430`). Canonical
+invocation per course `N` (the `--stream-frames` value is a safety
+cap only — the loop always breaks at natural exit; ~4x headroom over
+the longest observed run):
+
+```
+mdk-inspect --data-path <installed> --stream-init --course N \
+    --skill 1 --seed 12648430 --stream-frames 2000
+```
+
+Golden contract = the existing diagnostic surface, no new hashes:
+`draw-summary` (frames/exitFrame/event census/exit fill), the
+per-frame `stateHash` (terminal value), `ctr-digest` (FNV-1a fold of
+health + fade raw bits + latch+reason+exit + win bounds per stepped
+frame), `dac` (final `paletteDacHash`), `drawDigest`, `tt-digest`,
+the `ribbon:` line (calls/tris/cull/reject/clip/trail/window/arena/
+penDg/ribDg), the limiter record, the per-course `seam-census` line
+(updater/animator/draw/host-boundary counters + `poolErr` + `quit`),
+and the init block (resource binds + course seeds).
+
+### Golden values — courses 0..4 (run on 8ee571e + census print)
+
+| field | c0 | c1 | c2 | c3 | c4 |
+|---|---|---|---|---|---|
+| frames (steps run) | 466 | 452 | 413 | 413 | 354 |
+| exitFrame | 465 | 451 | 412 | 412 | 353 |
+| completion source | hero | hero | hero | hero | death |
+| terminal win [lo,hi) | [83,114) | [82,113) | [74,105) | [74,105) | [63,94) |
+| terminal health | 1 | 1 | 1 | 1 | 0 |
+| terminal stateHash | `f800e0f63353888e` | `b440930994e956d1` | `70769318cd2f82f6` | `df9f6c60def0ce4b` | `118e2d51c433da26` |
+| ctr-digest | `d3ec6bcbe41d1f6c` | `3ea4fd9b90d4ac06` | `1f27adc9fb24a244` | `1f27adc9fb24a244` | `e555102af8c94e23` |
+| drawDigest | `3ab1a2f49722aab8` | `69668d3a86fcb604` | `dba633d6d36f43c2` | `639a82770e59e572` | `f8c24f3e62d62646` |
+| paletteDacHash (final) | `02b99a68d9993a25` | `02b99a68d9993a25` | `02b99a68d9993a25` | `02b99a68d9993a25` | `9fa9e040e0eedf25` |
+| ttHash | `ec32669a74fcae65` | `ec32669a74fcae65` | `ec32669a74fcae65` | `ec32669a74fcae65` | `ec32669a74fcae65` |
+| exit events / fill byte | 1 / 0xff | 1 / 0xff | 1 / 0xff | 1 / 0xff | 1 / 0x00 |
+| pal / bg / pres | 59 / 465 / 465 | 59 / 451 / 451 | 59 / 412 / 412 | 59 / 412 / 412 | 90 / 353 / 353 |
+| mdl / spr / hud / tt | 1040 / 6120 / 1201 / 0 | 1012 / 6043 / 1083 / 0 | 934 / 5552 / 1041 / 0 | 934 / 5552 / 1041 / 0 | 706 / 4764 / 932 / 0 |
+| ribbon calls (e620) | 446400 | 432960 | 395520 | 395520 | 338880 |
+| tris emitted | 139162 | 137140 | 112156 | 112173 | 97740 |
+| plane culls | 252576 | 247627 | 224802 | 224809 | 193316 |
+| trivial rejects | 54662 | 48193 | 58562 | 58538 | 47824 |
+| clipper takes | 10738 | 8863 | 9355 | 9345 | 8333 |
+| gate skips | 0 | 0 | 0 | 0 | 0 |
+| trail updates (be4c) | 114 | 113 | 105 | 105 | 94 |
+| window high water | 31 | 31 | 31 | 31 | 31 |
+| draw arena high / ovf | 28 / 0 | 28 / 0 | 28 / 0 | 28 / 0 | 28 / 0 |
+| penDg | `2191c615a6734cee` | `7eca3b79b9779a29` | `e0f611cb9c31a802` | `7d33def5763fbc6d` | `9c2bfe130e0a4b90` |
+| ribDg | `3e4b35eba5ec4c8f` | `40c77bedecb130c3` | `13dddebdd80ff6cb` | `a6257eb5c01432eb` | `ae71dbe78491c257` |
+| limiter calls | 467 | 453 | 414 | 414 | 355 |
+| limiter rec t1/t2 | 1 / 4 | 1 / 4 | 1 / 4 | 1 / 4 | 1 / 4 |
+| limiter t3 / t4 / t5 | 1.0 / 0.033333 / 0 | 1.0 / 0.033333 / 0 | 1.0 / 0.033333 / 0 | 1.0 / 0.033333 / 0 | 1.0 / 0.033333 / 0 |
+| limiter base / target | 16304 / 16338 | 15842 / 15876 | 14555 / 14589 | 14555 / 14589 | 12608 / 12642 |
+| tt posts / svc / draws / ovf | 0 / 465 / 0 / 0 | 0 / 451 / 0 / 0 | 0 / 412 / 0 / 0 | 0 / 412 / 0 / 0 | 0 / 353 / 0 / 0 |
+
+Init seeds (skill 1): `driftMax`/`radiusMin`/`radiusMax` =
+8/10/17 (c0), 9/10/16 (c1), 10/9/15 (c2), 11/9/14 (c3), 12/8/13
+(c4); `penBase=29 penTarget=51` all; escort lane binds SWH150 pickup
+(c0–3) / GUNTA escort (c4); all protos/anims/sprites/sounds resolve
+(`absent=0 parseFail=0`).
+
+Seam census (identical structure each course; counters are the
+documented dispatch/host boundaries, no category-A seam exists):
+`hero`=exitFrame, `stray=0` (unreachable on real data — OBSERVED
+spawn-site absence), `escort`=exitFrame (c4 only), `pickup`=exitFrame
+(c0–3), `generic`=per-frame debris walk (6253/6214/5720/5720/4934),
+`twin=110` (c0–3 rescue dock),
+anim all `A` (=mdl count; C/F/T/H/N/S arms stay synthetic-only),
+`backdrop`/`drawList`/`listener`=exitFrame, `palRamp=1`,
+`fillSel`=32+frame-extends (115/114/106/106/95), `limiter`=exitFrame
++2, `ttClear=1`, `bind=21`, `free=0` (diagnostic does not run
+teardown), **`poolErr=0 quit=0 drawListOverflow=0
+teletypeOverflow=0`** on all five.
+
+Determinism: every course re-run with the identical invocation
+produced a **byte-identical** log — all digests and every per-frame
+field match run 1 exactly (no tolerance).
+
+Cross-course sanity (all plausible consequences of the implemented
+semantics):
+
+- c0–3 complete via the rescue-twin latch (`0x42ca55`, BONESANIM
+  dock `+0xe4 > 0x50`): health drains to the non-final 1 clamp, the
+  `health==1` arm spawns the twin mid-run (`twinSync` 110 calls),
+  dock completes, fade drains 1.0→0. c4 completes via the hero-death
+  write (`0x42d95b` — health reaches 0 on the final course),
+  `fade=2.0` red-ramp drain, black fill.
+- Exit fill matches §9 exactly: `0xff` iff `!isFinal && health>0`
+  (c0–3 all `0xff`, c4 `0x00` — health 0).
+- `paletteDacHash` is a pure function of the fade arms: c0–3 share
+  the terminal `0xff` fill table hash, c4 the `0x00` table.
+- `ttHash` identical across courses — the arena is deterministic
+  post-clear; the scene never posts (OBSERVED).
+- **c2/c3 counter-surface coincidence (audited):** `ctr-digest`,
+  exitFrame, win bounds, health/fade trajectory, and the full
+  per-frame diagnostic line are identical between c2 and c3 once the
+  `stateHash` column is masked. `stateHash` folds the seed constants
+  `driftMax`/`radiusMin`/`radiusMax` themselves, so the hashes
+  legitimately differ. The counter surface coincides because the
+  course-dependent caps do not bind on the folded state: `driftMax`
+  (10 vs 11) is never reached (camera path `uv` accumulators are
+  frame-identical → nodeMat/drift identical), and `radiusMax`
+  (15 vs 14) only perturbs ring extent — visible as ±1–3 tri
+  emit/cull differences on ~120 frame pairs and the distinct
+  penDg/ribDg/drawDigest — while the wall-probe crossings never sit
+  marginal, so win/health/fade evolve identically. `pal`, `dac`,
+  `uv`, and the model/sprite/HUD census are frame-identical.
+- c4 differences follow the documented final-course path: GUNTA
+  escort instead of SWH150 pickup, `pal=90` (extra red-ramp arms on
+  the death fade), marker/end-gate freeze (`winHi` pinned ≤187 —
+  observed [63,94) at exit since death precedes the window latch),
+  `twin=0` (rescue gate is non-final only).
+
+Host/presentation boundaries remaining (all category C — Phase 19B,
+counted but correctly unimplemented at core): backdrop framebuffer
+blit (`bg` events — scroll math in `backdropScroll()` is core and
+runs), palette DAC upload (`pal` events + `paletteDac_` surface),
+DirectDraw present (`pres` events), `0c860` raster/material pixels
+(inputs arrive as copy-safe `kRibbonTri`/`kModelDraw`/`kSpriteDraw`),
+audio listener/output (`listener` seam + `kPlaySound`/`kStopSound`),
+resource IO bindings (`bind`/`free`), host pace-wait inside the
+limiter (ms clock injection via `StreamInput::nowMs`).
+
+Closure audit (§13): (1) no unimplemented Mode-5 simulation-state
+function — all writers ported and exercised; (2) no unimplemented
+RNG-consuming function — RNG consumed only by `tunnelExtend`/
+`heroUpdate` paths, all live; (3) no unimplemented object/tunnel/
+window writer; (4) no unimplemented animation-state writer;
+(5) no unimplemented draw-command producer — all emit copy-safe
+events; (6) no unimplemented completion writer — all three latch
+sites observed live across the five courses (`hero` on c0–3,
+`death` on c4; `window` needs `winHi≥186` which the death/rescue
+latches pre-empt on this input); (7) no unknown/unhandled native
+branch executed — every dispatch counter lands on a documented
+implemented body, all placeholder/overflow/error counters 0;
+(8) all remaining boundaries are host/presentation-only per §17;
+(9) courses 0–4 deterministic end-to-end (byte-identical replay);
+(10) traversal six and freefall five canonicals unchanged
+(`25766a67ce50ea46`/`950219ddeae8b679`/`2379f7e90204e671`/
+`5686edbf38de3fda`/`57bdd179a944a4c9`/`2edeb4aa6c7ef486`,
+`ba5ffd4ee90e6d10`/`2bdb2d0406748d28`/`a2dee1b1ed981475`/
+`8fa58b04419ad8d8`/`3c5867b3e7901c8c`, all diag=0).
+
+Regression: `mdk_tests` 145872/0, CTest 1/1. These are external
+diagnostic goldens — they require real installed data and are
+deliberately not baked into `mdk_tests` (no proprietary bytes in the
+repository).
+
+**MODE-5 CINEMATIC CORE: CLOSED FOR BUILD_A** — golden established
+for courses 0–4 at skill 1 / seed 0xC0FFEE; deterministic end-to-end;
+remaining work is Phase-19B host/presentation only.

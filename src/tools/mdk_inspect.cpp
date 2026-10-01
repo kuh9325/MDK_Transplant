@@ -3317,6 +3317,26 @@ int main(int argc, char** argv) {
                   (unsigned long long)drawDigest,
                   streamCompletionName(ts.completionSrc),
                   sc.finished());
+      // Phase 19A.3 — full seam/error census for the golden audit:
+      // every dispatch/lifecycle counter plus the FUN_00408eb0 pool-
+      // error seam and the DAT_0054148e quit latch. On a clean
+      // real-data run poolErr/quit/stay 0 and the host-boundary
+      // counters carry only their documented call counts.
+      std::printf("seam-census: hero=%d stray=%d escort=%d pickup=%d "
+                  "generic=%d twin=%d | anim=%d C=%d F=%d T=%d H=%d "
+                  "N=%d A=%d S=%d | backdrop=%d drawList=%d flush=%d "
+                  "hudBlit=%d listener=%d palRamp=%d fillSel=%d "
+                  "limiter=%d | ttClear=%d bind=%d free=%d | "
+                  "poolErr=%d quit=%d\n",
+                  sm.heroUpdate, sm.strayUpdate, sm.escortUpdate,
+                  sm.pickupUpdate, sm.genericUpdate, sm.twinSync,
+                  sm.animCalls, sm.animClassless, sm.animFuse,
+                  sm.animFuseEnd, sm.animHold, sm.animNull,
+                  sm.animAdvance, sm.animSound, sm.backdrop,
+                  sm.drawList, sm.drawFlush, sm.hudBlit, sm.listener,
+                  sm.paletteRamp, sm.fillSelect, sm.limiter,
+                  sm.teletype, sm.resourceBind, sm.resourceFree,
+                  sc.poolErrorCalls(), sc.quitSignaled() ? 1 : 0);
       std::printf("ctr-digest:  %016llx  (%d frames — health, fade "
                   "bits, latch+reason, exit, win)\n",
                   (unsigned long long)ctrDigest, streamFrames);

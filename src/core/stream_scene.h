@@ -442,6 +442,11 @@ public:
   void teardown();             // FUN_0042c824 — frees protos/objects,
                                // stops WIND, emits nothing visual
   bool finished() const { return exited_; }
+  // FUN_00408eb0 census + the DAT_0054148e alloc-fail latch — the
+  // diagnostic surface for the golden seam audit (both stay 0 on a
+  // clean real-data run).
+  int poolErrorCalls() const { return poolErrorCalls_; }
+  bool quitSignaled() const { return quit_; }
   // Which proven writer latched complete_ (diagnostic-only — BUILD_A
   // stores only the dword). kNone while complete_ == 0 or when the
   // latch was forced from outside the three write sites.
