@@ -855,10 +855,11 @@ bool StreamScene::init(const StreamAssets& a, int course, int skill,
   // --- head: host-side seams (b270..b2a8) ---
   // FUN_0041c86c(10) mode-entry hook; 0x541544 busy-gate spins
   // FUN_0042b20c(3) until clear (host wait — counted, not spun);
-  // FUN_0041cf5c teletype/script-queue clear; 0x46ca84+0x415678 x2 =
-  // video clear+present pair. None touch scene state.
+  // FUN_0041cf5c TELETYPE queue clear (0x54b800/7fc/7f4/7f8 = 0 —
+  // real body now, Phase 19A.2D); 0x46ca84+0x415678 x2 = video
+  // clear+present pair.
   ++seams_.resourceBind;
-  ++seams_.teletype;
+  teletypeClear();
   seams_.resourceBind += 4;  // 46ca84/415678 pair x2
 
   // --- the 0x4e74b0..0x4edae0 wipe (0x6630) + proto table + pool ---
@@ -1634,13 +1635,261 @@ void StreamScene::animStep(DynamicObject& o, float dt) {
 }
 void StreamScene::backdropScroll() { ++seams_.backdrop; }
 
-// cc60..ccc7 — gated on 0x5414d4 (video enable) with a 0x541544-busy
-// variant; the headless port always emits — the host decides display.
+// ===========================================================================
+// TELETYPE queue service — Phase 19A.2D. FUN_0041cf5c (clear),
+// FUN_0041cad0 (post), FUN_0041cb44 (per-frame service). All OBSERVED
+// asm (p19a_teletype.asm, verified vs MDK95.EXE). The service is
+// engine-global (traversal 0x410920, mode-5 0x42cc90/b8, mode-6 paths
+// all reach it); in mode 5 it runs once per draw block with
+// EAX=[0x5414d4] (frame-due = draw enable; the 0x541544 stereo branch
+// re-enters it for the second eye — unwritten in BUILD_A).
+//
+// It is a 4-deep ring of {f32 rate, u32 flags, char* str} feeding a
+// timed two-line status display — NOT a bytecode VM: no opcode
+// dispatch, no PC, no object/camera operands exist in this boundary
+// (OBSERVED). The only per-entry program state is the live str cursor
+// the consume loop mutates; the only escape is the literal "\n"
+// two-byte sequence. The STATS.BNI record *named* TELETYPE is a RIFF
+// WAVE (the mode-6 briefing typing sfx) — unrelated data, no script.
+// ===========================================================================
+void StreamScene::teletypeClear() {      // FUN_0041cf5c
+  ++seams_.teletype;
+  // OBSERVED write order: qWrite, qRead, charTimer, holdTimer. The
+  // line buffers, entryFlags, curLine and the queue payloads are left
+  // alone — stale bytes stay addressable by later draws.
+  ttSetU32(kTtQWrite, 0);
+  ttSetU32(kTtQRead, 0);
+  ttSetF32(kTtChar, 0.0f);
+  ttSetF32(kTtHold, 0.0f);
+}
+
+std::uint8_t StreamScene::ttStrByte(std::uint32_t cursor) const {
+  const unsigned slot = cursor >> 20, off = cursor & 0xfffffu;
+  // A cursor whose slot escapes the table is the corrupt-pointer case
+  // (native chases the wild char* until a 0) — the port reads the
+  // terminator, which is also where this arm ends up at end-of-text.
+  if (slot >= ttText_.size()) return 0;
+  const std::string& t = ttText_[slot];
+  if (off > t.size()) return 0;
+  return static_cast<std::uint8_t>(t.c_str()[off]);  // off==size -> 0
+}
+
+std::string StreamScene::ttLineStr(int line) const {
+  // C-string at ttMem_ + line*36 — the native draw reads until NUL
+  // with no line bound (a 36-byte-full line keeps going into line1 /
+  // the scalars / the queue); the port bounds at the arena end.
+  const std::size_t base = static_cast<unsigned>(line) * 36u;
+  std::string s;
+  for (std::size_t i = base; i < ttMem_.size() && ttMem_[i]; ++i)
+    s.push_back(static_cast<char>(ttMem_[i]));
+  return s;
+}
+
+void StreamScene::ttDraw(int renderer, int line, int y, float scale) {
+  // FUN_00414d2c (renderer 0 — EAX?,EDX=y,EBX=str) and FUN_0041518c
+  // (renderer 1 — EAX=0,EDX=y,EBX=str,+stack f32 scale).
+  StreamEvent ev;
+  ev.kind = StreamEvent::kTeletypeDraw;
+  ev.tag = renderer;
+  ev.aux = y;
+  ev.f[0] = scale;
+  ev.name = ttLineStr(line);
+  events_.push_back(ev);
+  ++seams_.teletypeDraw;
+  ++ttTickDraws_;
+}
+
+bool StreamScene::teletypePost(const char* text, std::uint32_t flags,
+                               float rate) {
+  // FUN_0041cad0 — EAX=name, EDX=flags, [EBP+8]=rate; RET 0x4.
+  ++seams_.teletypePost;
+  std::uint32_t slot;
+  if (flags & 2u) {                         // TEST CL,0x2 -> 0x41cb2e
+    const std::uint32_t rd = (ttU32(kTtQRead) - 1u) & 3u;
+    ttSetU32(kTtQRead, rd);   // committed BEFORE the resolve — a failed
+    slot = rd;                // front-push keeps the decrement (quirk)
+  } else {
+    slot = ttU32(kTtQWrite);
+  }
+  const int rec = kTtQueue + static_cast<int>(slot) * 0x0c;
+  // FUN_00414890 resolve -> queue[slot].str — the native stores the
+  // pointer even when the lookup returns NULL, then bails (no
+  // qWrite advance, no flags/rate write).
+  ttText_[slot] = text ? text : "";
+  ttSetU32(rec + 8, slot << 20);            // str cursor := slot base
+  if (!text) return false;                  // 0x41cb25 — resolve miss
+  ttSetU32(rec + 4, flags);
+  ttSetF32(rec + 0, rate);
+  if (!(flags & 2u))
+    ttSetU32(kTtQWrite, (ttU32(kTtQWrite) + 1u) & 3u);
+  return true;
+}
+
+void StreamScene::teletypeService(int drawEnable) {
+  // FUN_0041cb44 — EAX = drawEnable (the 0x5414d4 frame-due flag).
+  ++seams_.teletypeService;
+  StreamTtTick tick{};
+  ttTickDraws_ = 0;
+  ttTickOv_ = 0;
+  const float dt30 = std::bit_cast<float>(0x3d088889u);   // 0x49b6f4
+  const std::uint32_t qr = ttU32(kTtQRead);
+  // EBX = pending entry ptr — queue non-empty iff qRead != qWrite.
+  const int entry = qr != ttU32(kTtQWrite) ? static_cast<int>(qr) : -1;
+  // [EBP-0x24] localRate: empty queue -> dt; pending -> f32(dt*2.0)
+  // (FLD f32; FMUL f64 0x4958e0; FSTP f32) — pending work makes the
+  // CURRENT message expire twice as fast.
+  const float localRate =
+      entry >= 0
+          ? static_cast<float>(static_cast<double>(dt30) * 2.0)
+          : dt30;
+  // x87 FLDZ;FCOMPP;JZ — the zero arm is taken on ==0 OR unordered, so
+  // a NaN charTimer (line-overflow scribble) lands in the zero arm.
+  auto x87Zero = [](float v) { return !(v > 0.0f) && !(v < 0.0f); };
+  // Same shape vs a constant — FCOMP f64 + JZ: equal OR unordered.
+  auto x87Eq = [](float v, float c) { return !(v > c) && !(v < c); };
+  // The suppress gate: 0x4999d0 && 0x541548 — both nonzero skips the
+  // timer update (draws already emitted). 0x541548 is never written
+  // in BUILD_A so the gate is dead on real data.
+  const bool suppressed = flag4999d0_ != 0 && flag541548_ != 0;
+
+  if (x87Zero(ttF32(kTtChar))) {            // 0x41cd9b arm
+    // holdTimer zero test is INTEGER — f32 bits & 0x7fffffff == 0,
+    // i.e. only +/-0.0 (a NaN holdTimer takes the page-out arm).
+    if ((ttU32(kTtHold) & 0x7fffffffu) != 0) {
+      // ---- page-out (0x41cdba): hold counts down to zero ----
+      tick.phase = 'P';
+      if (drawEnable) {
+        const float s2 = static_cast<float>(
+            static_cast<double>(ttF32(kTtHold)) * 2.0);
+        if (ttU32(kTtLine) == 1) {
+          ttDraw(1, 0, 0x78, s2);                       // 0x41cdd5
+        } else {                                      // 0x41ce27
+          const float t = s2 * 15.0f;                 // 0x4958e8
+          ttDraw(1, 0, static_cast<int>(
+                           streamFrndInt(120.0f - t)),// 0x4958ec - t
+                 s2);
+          ttDraw(1, 1,
+                 static_cast<int>(streamFrndInt(t + 120.0f)), s2);
+        }
+      }
+      if (!suppressed) {                              // 0x41cdf6
+        const float h = ttF32(kTtHold) - dt30;        // FSUBR
+        ttSetF32(kTtHold, h);
+        if (h < 0.0f) ttSetF32(kTtHold, 0.0f);        // JA -> 0
+      }                                              // (NaN kept)
+    } else if (entry >= 0) {
+      // ---- entry load + consume (0x41ce98..0x41cf4d) ----
+      tick.phase = 'C';
+      const int rec = kTtQueue + entry * 0x0c;
+      ttSetF32(kTtChar, ttF32(rec));                  // charTimer=rate
+      ttSetU32(kTtFlags, ttU32(rec + 4));             // entryFlags
+      ttSetU32(kTtHold, 0);                           // holdTimer=0
+      ttSetU32(kTtLine, 0);                           // curLine=0
+      int col = 0;                                    // EDX
+      const std::uint32_t cur0 = ttU32(rec + 8);      // cursor start
+      for (;;) {
+        const std::uint32_t cur = ttU32(rec + 8);     // str cursor
+        ttSetU32(rec + 8, cur + 1);                   // ptr++ first
+        const std::uint8_t c = ttStrByte(cur);        // then read old
+        if (c == 0) break;                            // -> 0x41cf26
+        if (c == '\\' &&
+            ttStrByte(cur + 1) == 'n') {              // "\n" escape
+          ttSetU32(rec + 8, cur + 2);                 // eat the 'n'
+          const unsigned pos =
+              ttU32(kTtLine) * 36u + static_cast<unsigned>(col);
+          if (ttU32(kTtLine) == 1) {                  // 0x41cf1e
+            ttPutByte(pos, 0);   // line1 NUL -> falls into TERM below
+            break;
+          }
+          ttPutByte(pos, 0);                          // line0 NUL
+          ttSetU32(kTtLine, ttU32(kTtLine) + 1);      // curLine++
+          col = 0;
+          continue;
+        }
+        ttPutByte(ttU32(kTtLine) * 36u + static_cast<unsigned>(col),
+                  c);                                 // 0x41ceca
+        ++col;
+      }
+      // 0x41cf26 TERM: current line NUL, curLine++, qRead++ mod 4.
+      ttPutByte(ttU32(kTtLine) * 36u + static_cast<unsigned>(col), 0);
+      ttSetU32(kTtLine, ttU32(kTtLine) + 1);
+      ttSetU32(kTtQRead, (ttU32(kTtQRead) + 1u) & 3u);
+      tick.chars = static_cast<int>((ttU32(rec + 8) - cur0) & 0xfffffu);
+    }
+    // else — queue empty and timers dead: idle RET (0x41cbeb).
+  } else if ((ttU32(kTtFlags) & 1u) && !x87Eq(ttF32(kTtHold), 0.5f)) {
+    // ---- slide-in (0x41cc1a): entryFlags&1, hold ramps to 0.5 ----
+    tick.phase = 'N';
+    const double holdF = static_cast<double>(ttF32(kTtHold));
+    if (drawEnable) {
+      const float s2 = static_cast<float>(holdF * 2.0);
+      if (ttU32(kTtLine) == 1) {
+        ttDraw(1, 0, 0x78, s2);                       // 0x41cc4c
+      } else {                                      // 0x41cca2
+        const float t = s2 * 15.0f;
+        ttDraw(1, 0, static_cast<int>(streamFrndInt(120.0f - t)), s2);
+        ttDraw(1, 1, static_cast<int>(streamFrndInt(t + 120.0f)), s2);
+      }
+    }
+    if (!suppressed) {                              // 0x41cc6d
+      const float h = dt30 + ttF32(kTtHold);          // FADD
+      ttSetF32(kTtHold, h);
+      if (h > 0.5f) ttSetF32(kTtHold, 0.5f);          // else JBE keeps
+    }                                                // (NaN kept)
+  } else {
+    // ---- steady hold (0x41cb8e): flags&1==0 OR hold x87==0.5 ----
+    tick.phase = 'S';
+    if (drawEnable) {
+      if (flag541548_ == 0) {                         // 0x41cd30+
+        if (ttU32(kTtLine) == 1) {
+          ttDraw(0, 0, 0x78, 0.0f);                   // 414d2c plain
+        } else {
+          ttDraw(0, 0, 0x69, 0.0f);
+          ttDraw(0, 1, 0x87, 0.0f);
+        }
+      } else {                                       // 0x41cb9f+
+        if (ttU32(kTtLine) == 1) {
+          ttDraw(1, 0, 0x78, 1.0f);
+        } else {                                     // 0x41cd0b
+          ttDraw(1, 0, 0x69, 1.0f);
+          ttDraw(1, 1, 0x87, 1.0f);
+        }
+      }
+    }
+    if (!suppressed) {                              // 0x41cbcf
+      const float t = ttF32(kTtChar) - localRate;     // FSUB
+      ttSetF32(kTtChar, t);
+      if (t < 0.0f) ttSetF32(kTtChar, 0.0f);          // JA -> 0
+    }                                                // (NaN kept)
+  }
+
+  tick.qRead = static_cast<int>(ttU32(kTtQRead));
+  tick.qWrite = static_cast<int>(ttU32(kTtQWrite));
+  tick.curLine = static_cast<int>(ttU32(kTtLine));
+  tick.flags = ttU32(kTtFlags);
+  tick.charTimer = ttF32(kTtChar);
+  tick.holdTimer = ttF32(kTtHold);
+  tick.cursor = entry >= 0
+                    ? ttU32(kTtQueue + entry * 0x0c + 8)
+                    : 0;
+  tick.draws = ttTickDraws_;
+  tick.overflow = ttTickOv_;
+  ttLog_.push_back(tick);
+}
+
+// cc60..ccc7 — gated on 0x5414d4 (video enable) with a 0x541544 stereo
+// variant that re-runs e684/e100/1cb44/17e20 for the second eye;
+// 0x541544 has no writers in BUILD_A so only the single pass is
+// modeled, and the headless port always emits — the host decides
+// display.
 void StreamScene::emitFrameDraw() {
   backdropScroll();    // FUN_0042e684 — scroll accumulators + blit
   ++seams_.drawList;   // FUN_0042e100 — back-to-front object draws
-  // 0x41cb44/0x417e20/0x46c86c — present + vsync pair (host-side)
-  emit(StreamEvent::kPresent, 0, 0, 0.0f);
+  // FUN_0041cb44 — TELETYPE service; arg = the 0x5414d4 frame-due flag
+  // (nonzero inside this gate — OBSERVED 0x42cc8b/ccb3).
+  teletypeService(1);
+  // 0x417e20 HUD digits — still folded into the present seam.
+  emit(StreamEvent::kPresent, 0, 0, 0.0f);   // 0x46c86c present+vsync
 }
 
 // ===========================================================================
@@ -1652,6 +1901,7 @@ void StreamScene::emitFrameDraw() {
 bool StreamScene::step(const StreamInput& in, float dtSec) {
   stepLog_.clear();
   animLog_.clear();
+  ttLog_.clear();
   ++frameTick_;                          // 0x49b5a4++
   stepLog_.push_back(StreamStage::kTick);
   // Frame context for the updaters — the native resolves the input
@@ -1857,6 +2107,19 @@ StreamSnapshot StreamScene::snapshot() const {
   s.bgScroll[1] = bgScroll_[1];
   s.freeObjects = poolFreeCount();
   s.liveObjects = kStreamPoolSize - s.freeObjects;
+  // TELETYPE service state (0x54b7a4 block) — surfaced, not hashed
+  // into stateHash (canonical digests stay put); ttHash is the
+  // service's own FNV-1a over the whole arena.
+  s.ttQRead = ttU32(kTtQRead);
+  s.ttQWrite = ttU32(kTtQWrite);
+  s.ttCurLine = ttU32(kTtLine);
+  s.ttEntryFlags = ttU32(kTtFlags);
+  s.ttCharTimer = ttF32(kTtChar);
+  s.ttHoldTimer = ttF32(kTtHold);
+  std::uint64_t th = 0xcbf29ce484222325ull;
+  for (std::uint8_t b : ttMem_)
+    th = (th ^ b) * 0x100000001b3ull;
+  s.ttHash = th;
   // FNV-1a over the deterministic sim fields (init+step+tunnel state).
   std::uint64_t h = 0xcbf29ce484222325ull;
   auto mix = [&h](const void* p, std::size_t n) {

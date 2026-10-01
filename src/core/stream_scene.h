@@ -150,6 +150,14 @@ struct StreamEvent {
     kExitMode,       // aux = exit-frame palette fill (0xff alive non-
                      // final, 0x00 final-or-dead); the mode dispatcher
                      // picks the next mode (course>=4 -> 7, else return)
+    kTeletypeDraw,   // Phase 19A.2D — FUN_0041cb44 line draw. tag =
+                     // renderer id (0 = FUN_00414d2c plain — the steady
+                     // phase when 0x541548==0, 1 = FUN_0041518c scaled —
+                     // slide/page transitions and the 541548 steady
+                     // variant); aux = the post-FISTP y coord; f[0] =
+                     // scale (the 41518c operand; 0 for the plain call,
+                     // which takes none); name = the line text as a
+                     // C-string at draw time.
   };
   Kind kind = kPresent;
   int tag = 0;
@@ -196,15 +204,26 @@ struct StreamSnapshot {
   float bgScroll[2] = {};      // e684 accumulators (pre-wrap)
   std::int32_t liveObjects = 0, freeObjects = 0;
   std::uint64_t stateHash = 0; // FNV-1a over the sim fields
+  // Phase 19A.2D — TELETYPE service globals (0x54b7a4 block; all
+  // OBSERVED). None of this mixes into stateHash — the canonical
+  // traversal/freefall digests are unchanged; ttHash is the service's
+  // own digest (FNV-1a over the whole 0x90-byte arena).
+  std::uint32_t ttQRead = 0;        // 0x54b7fc ring read index
+  std::uint32_t ttQWrite = 0;       // 0x54b800 ring write index
+  std::uint32_t ttCurLine = 0;      // 0x54b7f0 — line count (1|2)
+  std::uint32_t ttEntryFlags = 0;   // 0x54b7ec — current entry flags
+  float ttCharTimer = 0.0f;         // 0x54b7f4 — hold countdown
+  float ttHoldTimer = 0.0f;         // 0x54b7f8 — slide/page envelope
+  std::uint64_t ttHash = 0;         // FNV-1a over the 0x90 arena bytes
 };
 
 // --- frame-stage counters -----------------------------------------------------
 // FUN_0042c8b0 (the native frame) dispatches per-object updaters and a
 // render pipeline. Implemented stages (the updater family, the
-// FUN_004555bc animator family) count their dispatch reach; the still-
-// deferred stages (backdrop, drawList, listener, limiter, paletteRamp,
-// teletype, resourceBind/Free) are counted seams whose bodies only bump
-// the counter — later phases fill those in place.
+// FUN_004555bc animator family, the TELETYPE queue service) count
+// their dispatch reach; the still-deferred stages (backdrop, drawList,
+// listener, limiter, paletteRamp, resourceBind/Free) are counted seams
+// whose bodies only bump the counter — later phases fill those in.
 struct StreamSeams {
   int heroUpdate = 0;     // FUN_0042d24c — owns winLo++/tunnelExtend feed
   int genericUpdate = 0;  // FUN_0042cf6c — +0x34 swim (no anim call —
@@ -232,7 +251,20 @@ struct StreamSeams {
   int paletteRamp = 0;    // init's 64-step DAC crossfade loop
   int resourceBind = 0;   // init MTI/BNI/HUD-table binds (host-side)
   int resourceFree = 0;   // teardown MTI/BNI/HUD-table frees
-  int teletype = 0;       // FUN_0041cf5c script-queue clear (init)
+  int teletype = 0;       // FUN_0041cf5c queue clear (init)
+  // Phase 19A.2D — the TELETYPE queue service is IMPLEMENTED; these
+  // count its real call sites/behavior (the OBSERVED bodies run —
+  // nothing deferred). `teletype` above stays the init clear count.
+  int teletypePost = 0;     // FUN_0041cad0 calls (incl. FTI-miss fails)
+  int teletypeService = 0;  // FUN_0041cb44 calls (one per draw block;
+                          // the 0x541544 stereo branch calls it twice
+                          // per frame — unwritten in BUILD_A, untaken)
+  int teletypeDraw = 0;     // FUN_00414d2c / FUN_0041518c emits
+  int teletypeOverflow = 0; // consume line writes clipped at the
+                          // 0x54b834 arena end — the native write is
+                          // UNBOUNDED (past the queue block into BSS);
+                          // the port keeps it inside the modeled arena
+                          // and counts the clip
 };
 
 // The stage tag sequence step() records into stepLog_ — the frame's
@@ -269,6 +301,29 @@ struct StreamAnimTick {
   std::uint8_t flags148 = 0;// loop bit lives at &0x8
 };
 
+// --- per-call TELETYPE service trace ----------------------------------------
+// One entry per FUN_0041cb44 call, appended in call order and cleared
+// at the head of each step() — the diagnostic surface for the queue
+// service. There is no script PC/opcode in BUILD_A (OBSERVED — the
+// "script" is a posted C-string; the only per-entry program state is
+// the live str cursor the consume loop mutates, surfaced here as
+// `cursor` packed (slot<<20)|byteOffset).
+struct StreamTtTick {
+  char phase = 'I';       // arm taken this call: 'I' idle | 'C' entry
+                          // load+consume | 'S' steady hold | 'N'
+                          // slide-in (entryFlags&1, hold<0.5) | 'P'
+                          // page-out (hold != 0 after charTimer 0)
+  int qRead = 0, qWrite = 0;          // post-call ring indices
+  int curLine = 0;                    // 0x54b7f0 post-call
+  std::uint32_t flags = 0;            // 0x54b7ec post-call
+  float charTimer = 0.0f;             // 0x54b7f4 post-call
+  float holdTimer = 0.0f;             // 0x54b7f8 post-call
+  std::uint32_t cursor = 0;           // queue[slot].str post-call
+  int chars = 0;                      // source bytes consumed (phase C)
+  int draws = 0;                      // 414d2c/41518c emits this call
+  int overflow = 0;                   // arena-clipped writes this call
+};
+
 // --- the runtime ------------------------------------------------------------
 class StreamScene {
 public:
@@ -301,6 +356,20 @@ public:
   const std::vector<StreamStage>& stepLog() const { return stepLog_; }
   // Per-tick animator trace (cleared at the head of each step).
   const std::vector<StreamAnimTick>& animLog() const { return animLog_; }
+  // Per-call TELETYPE service trace (cleared at the head of each step;
+  // one record per FUN_0041cb44 call in the draw block).
+  const std::vector<StreamTtTick>& ttLog() const { return ttLog_; }
+  // Phase 19A.2D — TELETYPE queue post (FUN_0041cad0). The native
+  // resolves a NAME through FTI (FUN_00414890) and stores the resolved
+  // char*; the FTI table is process-global host state, so the port
+  // takes the resolved text — text==nullptr models the resolve miss
+  // and returns false (0). flags bits OBSERVED: 0x1 = slide-in intro
+  // (holdTimer ramps 0->0.5 before the steady hold, then pages out),
+  // 0x2 = front-push (qRead decremented BEFORE the resolve — a failed
+  // front-push still keeps the decrement, OBSERVED quirk). rate =
+  // seconds on screen. The 4-deep ring has NO full check — posting
+  // into a full ring silently overwrites the unread tail.
+  bool teletypePost(const char* text, std::uint32_t flags, float rate);
   const StreamSeams& seams() const { return seams_; }
   const StreamAssets& assets() const { return assets_; }
   // DAT_004edcc0 — the shared class-table record-0 identity the
@@ -363,7 +432,61 @@ private:
   void animStep(DynamicObject& o, float dt);
   void logAnimTick(const DynamicObject& o, char body);
   void backdropScroll();                        // e684
-  void emitFrameDraw();                         // e684 + e100 + present
+  void emitFrameDraw();                         // e684 + e100 + 1cb44 +
+                                                // 17e20 seam + present
+  // -- TELETYPE queue service (Phase 19A.2D — OBSERVED 0x41cxxx) ------
+  // The native owns the flat block 0x54b7a4..0x54b834: two 36-byte
+  // line buffers, four scalars, the ring indices and the 4x0x0c queue
+  // records — one contiguous region, which the port keeps verbatim as
+  // `ttMem_` so the consume loop's unbounded line write aliases the
+  // trailing globals/queue exactly like the original. Layout:
+  //   +0x00 lineBuf[0][36]          +0x24 lineBuf[1][36]
+  //   +0x48 entryFlags u32          +0x4c curLine u32
+  //   +0x50 charTimer f32           +0x54 holdTimer f32
+  //   +0x58 qRead u32               +0x5c qWrite u32
+  //   +0x60 queue[4] {f32 rate; u32 flags; u32 strCursor}
+  // The str cursor packs (textSlot<<20)|byteOffset — the native's raw
+  // char* cannot be reproduced, so resolved payloads live in the
+  // ttText_ side table and a corrupt/out-of-range cursor reads as the
+  // terminating 0 (the native would chase the wild pointer — the one
+  // place the port bounds rather than emulates, counted).
+  void teletypeClear();                   // 1cf5c — init clear
+  void teletypeService(int drawEnable);   // 1cb44 — arg = 5414d4
+  static std::uint32_t ttLd32(const std::uint8_t* p) {
+    return static_cast<std::uint32_t>(p[0]) |
+           (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) |
+           (static_cast<std::uint32_t>(p[3]) << 24);
+  }
+  static void ttSt32(std::uint8_t* p, std::uint32_t v) {
+    p[0] = static_cast<std::uint8_t>(v);
+    p[1] = static_cast<std::uint8_t>(v >> 8);
+    p[2] = static_cast<std::uint8_t>(v >> 16);
+    p[3] = static_cast<std::uint8_t>(v >> 24);
+  }
+  static constexpr int kTtFlags = 0x48, kTtLine = 0x4c,
+                       kTtChar = 0x50, kTtHold = 0x54,
+                       kTtQRead = 0x58, kTtQWrite = 0x5c,
+                       kTtQueue = 0x60;
+  std::uint32_t ttU32(int off) const { return ttLd32(&ttMem_[off]); }
+  void ttSetU32(int off, std::uint32_t v) { ttSt32(&ttMem_[off], v); }
+  float ttF32(int off) const {
+    return std::bit_cast<float>(ttLd32(&ttMem_[off]));
+  }
+  void ttSetF32(int off, float v) {
+    ttSt32(&ttMem_[off], std::bit_cast<std::uint32_t>(v));
+  }
+  // Line write — bounded at the arena end (0x54b834); past it the
+  // native corrupts BSS, the port clips and counts.
+  void ttPutByte(unsigned pos, std::uint8_t v) {
+    if (pos < ttMem_.size()) ttMem_[pos] = v;
+    else ++seams_.teletypeOverflow, ++ttTickOv_;
+  }
+  // One byte of the consume loop's str cursor (packed u32).
+  std::uint8_t ttStrByte(std::uint32_t cursor) const;
+  std::string ttLineStr(int line) const;    // C-string at line*36
+  void ttDraw(int renderer, int line, int y, float scale);
+
   void emit(StreamEvent::Kind kind, int tag, int aux, float f0) {
     StreamEvent ev;
     ev.kind = kind;
@@ -442,6 +565,22 @@ private:
   StreamSeams seams_;                           // deferred-hook counters
   std::vector<StreamStage> stepLog_;            // per-step stage spine
   std::vector<StreamAnimTick> animLog_;         // per-step 555bc trace
+  // TELETYPE service state (0x54b7a4..0x54b834 flat block — OBSERVED
+  // contiguous in BUILD_A). ttMem_ is byte-addressed so the consume
+  // loop's unbounded line write aliases the trailing scalars and queue
+  // entries exactly like the original; ttText_ holds the resolved
+  // payload each slot's str cursor indexes (the native stores a raw
+  // char* into FTI memory).
+  std::array<std::uint8_t, 0x90> ttMem_{};      // 0x54b7a4..0x54b834
+  std::array<std::string, 4> ttText_{};         // posted payloads
+  std::vector<StreamTtTick> ttLog_;             // per-call trace
+  int ttTickDraws_ = 0, ttTickOv_ = 0;          // per-call accumulators
+  // The service's two suppress/draw gates: 0x4999d0 is the pause/debug
+  // word, 0x541548 has no writer anywhere in BUILD_A (stays 0 — both
+  // gate paths live but untaken). Staged as fields so synthetic tests
+  // can exercise the gated arm.
+  std::int32_t flag4999d0_ = 0;                 // 0x4999d0 pause word
+  std::int32_t flag541548_ = 0;                 // 0x541548 (no writers)
 };
 
 } // namespace mdk

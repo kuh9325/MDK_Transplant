@@ -3063,20 +3063,24 @@ int main(int argc, char** argv) {
     std::printf("events:      %zu  hash=%016llx\n",
                 sc.events().size(), (unsigned long long)s.stateHash);
 
-    // --stream-frames N: Phase 19A.2B/2C bounded actor+animator
-    // diagnostic. Steps the real-data scene (neutral input, 1/30s)
-    // and reports, per frame, which updater families the dispatch
-    // walk reached (seam deltas), the window bounds, the tunnelExtend
-    // feed (fillSelect — every non-terminal extend ends at ae60), the
-    // FUN_004555bc dispatch count, the per-object animator trace
-    // (slot:body[rec]frame/acc/latch — C classless, F fuse, T fuse
-    // teardown, H hold, N null, A advance, S advance+sound) and a
-    // folded state digest. Bounded: no draw emission, no TELETYPE
-    // execution — updater + animator reach only.
+    // --stream-frames N: Phase 19A.2B/2C/2D bounded actor+animator+
+    // teletype diagnostic. Steps the real-data scene (neutral input,
+    // 1/30s) and reports, per frame, which updater families the
+    // dispatch walk reached (seam deltas), the window bounds, the
+    // tunnelExtend feed (fillSelect — every non-terminal extend ends
+    // at ae60), the FUN_004555bc dispatch count, the per-object
+    // animator trace (slot:body[rec]f/acc/latch — C classless, F fuse,
+    // T fuse teardown, H hold, N null, A advance, S advance+sound),
+    // the TELETYPE service trace (phase I/C/S/N/P, ring indices,
+    // char/hold timers, line count, entry flags, str cursor, per-call
+    // draws) and a folded state digest. Bounded: no draw emission —
+    // updater + animator + queue-service reach only. The real mode-5
+    // stream posts no TELETYPE text (OBSERVED), so the service runs
+    // the idle arm each frame.
     if (streamFrames > 0 && ok) {
       std::printf("frames:      frame updaters winLo winHi ext anim "
                   "trace(slot:body[rec]f/acc/latch) "
-                  "hero(slot,pathT,spd) hash\n");
+                  "hero(slot,pathT,spd) tt hash\n");
       mdk::StreamInput in{};
       mdk::StreamSeams prev = sc.seams();
       for (int f = 0; f != streamFrames; ++f) {
@@ -3098,17 +3102,40 @@ int main(int argc, char** argv) {
                         (double)t.acc, (int)t.latch);
           tr += buf;
         }
+        // Phase 19A.2D — TELETYPE service trace (one record per
+        // FUN_0041cb44 call; the real stream never posts).
+        const mdk::StreamTtTick* tt =
+            sc.ttLog().empty() ? nullptr : &sc.ttLog().back();
+        char ttb[112];
+        if (tt) {
+          std::snprintf(
+              ttb, sizeof ttb,
+              " tt%c q%u/%u t4=%.3f t8=%.3f ln=%u fl=%x cur=%08x "
+              "ch=%d dr=%d ov=%d",
+              tt->phase, tt->qRead, tt->qWrite, (double)tt->charTimer,
+              (double)tt->holdTimer, tt->curLine, tt->flags, tt->cursor,
+              tt->chars, tt->draws, tt->overflow);
+        } else {
+          std::snprintf(ttb, sizeof ttb, " tt-");
+        }
         const mdk::StreamSnapshot fs = sc.snapshot();
         std::printf("             %5d  %-40s [%d,%d) %3d %4d%s "
-                    "h(%d,%.2f,%.2f) %016llx\n",
+                    "h(%d,%.2f,%.2f)%s %016llx\n",
                     f, fam.c_str(), fs.winLo, fs.winHi,
                     cur.fillSelect - prev.fillSelect,
                     cur.animCalls - prev.animCalls, tr.c_str(),
                     fs.heroIdx,
-                    (double)fs.heroPathT, (double)fs.heroSpeed,
+                    (double)fs.heroPathT, (double)fs.heroSpeed, ttb,
                     (unsigned long long)fs.stateHash);
         prev = cur;
       }
+      const mdk::StreamSnapshot ts = sc.snapshot();
+      const mdk::StreamSeams sm = sc.seams();
+      std::printf("tt-digest:   hash=%016llx posts=%d svc=%d draws=%d "
+                  "ovf=%d (arena FNV-1a over 0x54b7a4..0x54b834)\n",
+                  (unsigned long long)ts.ttHash, sm.teletypePost,
+                  sm.teletypeService, sm.teletypeDraw,
+                  sm.teletypeOverflow);
     }
     // Mode-8 boundary check (bounded): FINISH.BNI existence is the
     // only probe — mode 8 is FUN_0047b038's FLIC/MVE pipeline, a

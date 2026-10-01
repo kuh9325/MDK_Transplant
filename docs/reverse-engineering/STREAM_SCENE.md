@@ -108,11 +108,13 @@ a direct record census of `original/installed/STREAM/STREAM.BNI`,
 There is **no bytecode VM** in mode 5 — the "scripts" are the six
 hardcoded per-object updaters dispatched on object identity inside
 `FUN_0042c8b0`, plus generic `FUN_0042cf6c` scripted-prop behavior
-(param fields on the record). Teletype `FUN_0041cb44` is a service
-(queue `0x54b7fc`×4 of `{rate,flags,str}`); mode-5 init clears it
-(`FUN_0041cf5c`) — the scene posts no queued text (the `SC_*`/
-`SNIP_TXT` records feed `FUN_00417e20`-style HUD/layout drawing —
-exact usage TENTATIVE).
+(param fields on the record). Teletype `FUN_0041cb44` is a queue
+service (ring `0x54b7fc`/`0x54b800`×4 of `{rate,flags,str}` —
+implemented §15); mode-5 init clears it (`FUN_0041cf5c`) and the
+scene posts no queued text (the `SC_*`/`SNIP_TXT` records feed
+`FUN_00417e20`-style HUD/layout drawing — exact usage TENTATIVE).
+The `TELETYPE` *record* (in mode-6 `STATS.BNI`) is a RIFF WAVE
+typing-sfx sample, not a script (OBSERVED bytes).
 
 ## 6. Tunnel generator — `FUN_0042be4c` (OBSERVED)
 
@@ -285,8 +287,9 @@ death latch on c0 arms the `health==1` twin gate → `twinSync`.
 slot (`strayIdx=-1` at init; OBSERVED, not a port gap).
 
 Deferred seams preserved (counted, not implemented):
-backdrop/draw/present, teletype, limiter, fillSelect internals.
-`animStep` is implemented — see §14.
+backdrop/draw/present, limiter, fillSelect internals.
+`animStep` is implemented — see §14; the TELETYPE queue service is
+implemented — see §15.
 
 **MODE-5 CINEMATIC ACTOR UPDATERS: CLOSED FOR BUILD_A.**
 
@@ -356,4 +359,62 @@ baseline (animator state is not hash-covered).
 
 **MODE-5 CINEMATIC ANIMATOR FAMILY: CLOSED FOR BUILD_A** — explicitly
 not the full mode-5 core (backdrop/draw/teletype/limiter seams
+remain).
+
+## 15. Phase 19A.2D — the TELETYPE queue service (implemented)
+
+Format finding (OBSERVED, `p19a_teletype.asm` + STATS.BNI bytes):
+**there is no TELETYPE bytecode in BUILD_A.** The boundary is a
+4-deep message queue plus a timed two-line text renderer — no opcode
+dispatch, no PC, no object/camera operand anywhere in it. The STATS.BNI
+record named `TELETYPE` is a `00 2c 00 00` + `RIFF WAVE` (8-bit mono
+16 kHz) typing-sfx sample — unrelated data. Engine-global service:
+traversal (`0x410920`), mode 5 (`0x42cc90`/`0x42ccb8`) and mode-6 paths
+all call it.
+
+- `FUN_0041cf5c` clear (init): writes `0x54b800`/`0x54b7fc`/`0x54b7f4`/
+  `0x54b7f8` = 0 only — line buffers, entry flags and queue payloads
+  stay stale.
+- `FUN_0041cad0` post `(EAX=name, EDX=flags, [stk]=rate; RET 4)`:
+  resolves the name through FTI (`FUN_00414890`) and stores the char*;
+  `flags&2` front-pushes by decrementing `qRead` **before** the
+  resolve — a failed front-push keeps the decrement (quirk). The ring
+  has no full check — a post onto a full ring overwrites the tail.
+- `FUN_0041cb44` service `(EAX = draw enable = 0x5414d4)`:
+  `localRate = dt` when the queue is empty, `f32(dt * 2.0)` when an
+  entry is pending — queued work halves the current message's hold.
+  `charTimer==0` (x87: equal-or-unordered) with `holdTimer` integer
+  ±0 and a pending entry → load `charTimer=rate`, `entryFlags`,
+  `holdTimer=0`, `curLine=0`, then consume the str cursor: bytes into
+  `lineBuf[curLine][col++]`, `\n` splits at line0/line1 (a second `\n`
+  terminates mid-string), `\0` terminates → `curLine++`, `qRead++`.
+  `charTimer!=0`: steady (`flags&1==0` or hold x87==0.5) draws the
+  line(s) plain (`FUN_00414d2c` y=0x78 | 0x69+0x87 — the 0x541548!=0
+  variant uses scaled `FUN_0041518c` at 1.0) then `charTimer -=
+  localRate`, clamped at 0; `flags&1` and hold<0.5 → slide-in —
+  `holdTimer += dt` to 0.5, scaled draws at `hold*2` (y `120∓t`,
+  `t = hold*2*15` FRNDINT-trunc); `charTimer==0` with hold≠±0 →
+  page-out — `holdTimer -= dt` to 0, same scaled geometry. Draws are
+  `kTeletypeDraw` events; `0x4999d0 && 0x541548` suppresses only the
+  timer update (never drawn out — no 0x541548 writer in BUILD_A).
+- The service never touches pool objects, the camera, palette, or the
+  trail config — object/camera command families do not exist here.
+
+The port keeps the whole `0x54b7a4..0x54b834` block as one flat
+byte arena (`ttMem_`) so the consume loop's **unbounded** line write
+aliases the trailing scalars/queue exactly like the original (a line
+past 36 bytes runs into `entryFlags`/`curLine`/timers/`qRead`/`qWrite`/
+the queue); writes past the arena end are clipped and counted
+(`seams().teletypeOverflow` — the one place the native would chase a
+wild pointer is a corrupt str cursor, which the port bounds at the
+entry's text).
+
+Mode-5 reachability (course 0/4 bounded `--stream-frames`): the scene
+posts nothing — the service runs the idle arm every frame; all live
+arms are exercised synthetically. Regression: `mdk_tests` 9994/0,
+CTest 1/1; traversal/freefall digests unchanged; teletype state is not
+mixed into `stateHash` (`ttHash` covers the arena).
+
+**MODE-5 TELETYPE SCRIPT SERVICE: CLOSED FOR BUILD_A** — not the full
+mode-5 core (backdrop/draw/palette/fillSelect/limiter/trail seams
 remain).

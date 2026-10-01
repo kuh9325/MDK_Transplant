@@ -27310,6 +27310,421 @@ void test_stream_animator() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19A.2D — the TELETYPE queue service (FUN_0041cf5c clear,
+// FUN_0041cad0 post, FUN_0041cb44 per-frame service). OBSERVED asm
+// verified vs MDK95.EXE: a 4-deep {rate,flags,str} ring + two 36-byte
+// line buffers; no bytecode/PC exists in this boundary. Synthetic
+// payloads only — no proprietary bytes.
+// ---------------------------------------------------------------------------
+void test_stream_teletype() {
+  using mdk::StreamScene;
+  using mdk::StreamEvent;
+  using mdk::StreamInput;
+  using mdk::StreamTtTick;
+  std::uint8_t pal[0x240] = {}, sys[0xc0] = {}, anims[5 * kStreamAnimRec] = {};
+  const mdk::StreamAssets a = makeStreamAssets(pal, sys, anims);
+  const float dt = std::bit_cast<float>(0x3d088889u);   // 0x49b6f4 1/30
+  const int QW = StreamScene::kTtQWrite, QR = StreamScene::kTtQRead;
+  const int CT = StreamScene::kTtChar, HT = StreamScene::kTtHold;
+  const int LN = StreamScene::kTtLine, FL = StreamScene::kTtFlags;
+
+  // --- init clear (FUN_0041cf5c): only the four dwords ----------------
+  {
+    StreamScene s;
+    s.ttSetU32(FL, 0xdeadbeefu);         // pre-scribble the untouched
+    s.ttSetU32(LN, 7);                   // fields — clear must keep them
+    CHECK(s.init(a, 0, 0, 0x99u, 100));
+    CHECK(s.seams().teletype == 1);      // the clear call itself
+    const mdk::StreamSnapshot sn = s.snapshot();
+    CHECK(sn.ttQRead == 0 && sn.ttQWrite == 0);
+    CHECK(sn.ttCharTimer == 0.0f && sn.ttHoldTimer == 0.0f);
+    CHECK(s.ttU32(FL) == 0xdeadbeefu && s.ttU32(LN) == 7);   // not reset
+    CHECK(s.ttLog().empty());            // service not run during init
+  }
+
+  // --- post mechanics (FUN_0041cad0) -----------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0xaau, 100));
+    CHECK(s.teletypePost("HELLO", 0, 2.0f));       // slot0 append
+    CHECK(s.ttU32(QW) == 1 && s.ttU32(QR) == 0);
+    CHECK(s.ttF32(StreamScene::kTtQueue) == 2.0f); // rate @+0
+    CHECK(s.ttU32(StreamScene::kTtQueue + 4) == 0);// flags @+4
+    CHECK(s.ttU32(StreamScene::kTtQueue + 8) == (0u << 20)); // cursor
+    // Ring fills to 4 and wraps with NO full check.
+    CHECK(s.teletypePost("B", 0, 1.0f));
+    CHECK(s.teletypePost("C", 0, 1.0f));
+    CHECK(s.teletypePost("D", 0, 1.0f));
+    CHECK(s.ttU32(QW) == 0);                        // wrapped mod 4
+    CHECK(s.teletypePost("E", 0, 3.0f));            // overwrites slot0
+    CHECK(s.ttU32(QW) == 1);
+    CHECK(s.ttF32(StreamScene::kTtQueue) == 3.0f);  // tail clobbered
+    // Front-push (flags&2): qRead decremented, entry at new qRead.
+    s.ttSetU32(QR, 2);
+    CHECK(s.teletypePost("F", 2, 1.0f));
+    CHECK(s.ttU32(QR) == 1);
+    CHECK(s.ttU32(StreamScene::kTtQueue + 12 + 4) == 2);   // slot1 flags
+    // Resolve miss: qWrite NOT advanced; cursor write still lands.
+    const std::uint32_t qw = s.ttU32(QW);
+    CHECK(!s.teletypePost(nullptr, 0, 9.0f));
+    CHECK(s.ttU32(QW) == qw);
+    // Front-push miss keeps the qRead decrement (OBSERVED quirk).
+    CHECK(!s.teletypePost(nullptr, 2, 9.0f));
+    CHECK(s.ttU32(QR) == 0);
+    CHECK(s.seams().teletypePost == 8);
+  }
+
+  // --- consume + steady + idle (flag&1 clear) --------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0xbbu, 100));
+    s.clearEvents();
+    CHECK(s.teletypePost("HELLO", 0, 3.0f * dt));
+    // call 1 — queue nonempty at entry; entry load + consume (no draw).
+    s.teletypeService(1);
+    const StreamTtTick& t1 = s.ttLog().back();
+    CHECK(t1.phase == 'C' && t1.draws == 0 && t1.chars == 6);
+    CHECK(t1.qRead == 1 && t1.qWrite == 1);           // dequeued
+    CHECK(t1.curLine == 1 && t1.flags == 0);
+    CHECK(t1.charTimer == 3.0f * dt);                 // <- entry rate
+    CHECK(s.ttLineStr(0) == "HELLO");
+    CHECK(s.events().empty());                        // consume draws nil
+    // calls 2..5 — steady (queue now empty -> localRate = dt); 3*dt
+    // drains in 4 calls: f32 subtraction leaves a 0x1p-27 residue
+    // at call 3, the JA clamp clears it at call 4.
+    for (int i = 0; i != 4; ++i) {
+      s.clearEvents();
+      s.teletypeService(1);
+      const StreamTtTick& t = s.ttLog().back();
+      CHECK(t.phase == 'S' && t.draws == 1);
+      CHECK(s.events().size() == 1);
+      const StreamEvent& ev = s.events()[0];
+      CHECK(ev.kind == StreamEvent::kTeletypeDraw);
+      CHECK(ev.tag == 0 && ev.aux == 0x78);           // plain, y=0x78
+      CHECK(ev.f[0] == 0.0f && ev.name == "HELLO");
+    }
+    CHECK(s.ttF32(CT) == 0.0f);                       // fully expired
+    // call 6 — timers dead, queue empty: idle RET.
+    s.teletypeService(1);
+    CHECK(s.ttLog().back().phase == 'I');
+    CHECK(s.seams().teletypeDraw == 4 && s.seams().teletypeService == 6);
+  }
+
+  // --- two-line consume + steady pair ----------------------------------
+  // The native escape is the two-byte '\' 'n' (CMP 0x5c / CMP 0x6e).
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0xccu, 100));
+    s.clearEvents();
+    CHECK(s.teletypePost("AB\\nCD", 0, dt));
+    s.teletypeService(1);
+    const StreamTtTick& t = s.ttLog().back();
+    CHECK(t.phase == 'C' && t.chars == 7 && t.curLine == 2);
+    CHECK(s.ttLineStr(0) == "AB" && s.ttLineStr(1) == "CD");
+    s.clearEvents();
+    s.teletypeService(1);                    // steady: both lines plain
+    CHECK(s.events().size() == 2);
+    CHECK(s.events()[0].aux == 0x69 && s.events()[0].name == "AB");
+    CHECK(s.events()[1].aux == 0x87 && s.events()[1].name == "CD");
+    CHECK(s.events()[0].tag == 0 && s.events()[1].tag == 0);
+  }
+
+  // --- \n edge cases ----------------------------------------------------
+  // (Each posted entry leaves charTimer = dt — one steady call is
+  // needed to drain it before the next post can be consumed.)
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0xddu, 100));
+    // "A\n": trailing escape -> line0 "A", line1 "", curLine 2.
+    s.teletypePost("A\\n", 0, dt);
+    s.teletypeService(1);
+    CHECK(s.ttLineStr(0) == "A" && s.ttLineStr(1) == "");
+    CHECK(s.ttU32(LN) == 2);
+    // second \n terminates the entry mid-string ("EF" never read —
+    // the cursor stops just past it; consumed bytes = 8).
+    s.teletypeClear();                        // fresh queue, stale lines
+    s.teletypePost("AB\\nCD\\nEF", 0, dt);
+    s.teletypeService(1);
+    CHECK(s.ttU32(LN) == 2 && s.ttLog().back().chars == 8);
+    CHECK(s.ttLineStr(0) == "AB" && s.ttLineStr(1) == "CD");
+    s.teletypeService(1);                     // drain charTimer
+    // lone trailing backslash is literal (next byte isn't 'n').
+    s.teletypePost("AB\\", 0, dt);
+    s.teletypeService(1);
+    CHECK(s.ttLineStr(0) == "AB\\");
+    CHECK(s.ttLog().back().chars == 4);
+    s.teletypeService(1);                     // drain
+    // leading escape -> empty line0, text on line1.
+    s.teletypePost("\\nX", 0, dt);
+    s.teletypeService(1);
+    CHECK(s.ttLineStr(0) == "" && s.ttLineStr(1) == "X");
+    CHECK(s.ttU32(LN) == 2);
+  }
+
+  // --- slide-in / steady / page-out (flags&1) ---------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0xeeu, 100));
+    s.clearEvents();
+    CHECK(s.teletypePost("HI", 1, 10.0f * dt));
+    s.teletypeService(1);                    // C: load+consume
+    CHECK(s.ttLog().back().phase == 'C');
+    // Slide-in: hold ramps 0 -> 0.5 in dt steps; charTimer untouched.
+    for (int i = 0; i != 15; ++i) {
+      s.clearEvents();
+      s.teletypeService(1);
+      const StreamTtTick& t = s.ttLog().back();
+      CHECK(t.phase == 'N' && t.draws == 1);          // single line
+      CHECK(t.charTimer == 10.0f * dt);               // not ticking yet
+      const StreamEvent& ev = s.events()[0];
+      CHECK(ev.kind == StreamEvent::kTeletypeDraw &&
+            ev.tag == 1 && ev.aux == 0x78);           // scaled, y=0x78
+      // s2 = f32(f64(hold)*2.0) BEFORE the increment (hold_i ~= i*dt
+      // with f32 accumulation drift).
+      CHECK(near(ev.f[0], 2.0f * ((float)i) * dt, 1e-4f));
+    }
+    CHECK(s.ttF32(HT) == 0.5f);                       // clamped exactly
+    // Steady: hold == 0.5 -> plain renderer (541548==0), charTimer
+    // now ticks at localRate (queue empty -> dt). 10*dt drains in 11
+    // calls — f32 subtraction leaves a ~1e-8 residue at call 10 that
+    // the JA clamp clears at 11 (verified against the original's f32
+    // arithmetic).
+    for (int i = 0; i != 11; ++i) {
+      s.clearEvents();
+      s.teletypeService(1);
+      const StreamTtTick& t = s.ttLog().back();
+      CHECK(t.phase == 'S' && t.draws == 1);
+      CHECK(s.events()[0].tag == 0 && s.events()[0].aux == 0x78);
+    }
+    CHECK(s.ttF32(CT) == 0.0f);
+    // Page-out: hold counts down 0.5 -> 0 in dt steps — 16 calls, the
+    // f32 residue (2e-8) keeps the 15th above zero for one extra draw.
+    for (int i = 0; i != 16; ++i) {
+      s.clearEvents();
+      s.teletypeService(1);
+      const StreamTtTick& t = s.ttLog().back();
+      CHECK(t.phase == 'P' && t.draws == 1);
+      CHECK(s.events()[0].tag == 1 && s.events()[0].aux == 0x78);
+    }
+    CHECK(s.ttF32(HT) == 0.0f);
+    s.teletypeService(1);
+    CHECK(s.ttLog().back().phase == 'I');
+    CHECK(s.seams().teletypeDraw == 15 + 11 + 16);
+  }
+
+  // --- two-line scaled geometry (slide-in, flags&1) ---------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x11u, 100));
+    s.clearEvents();
+    s.teletypePost("AA\\nBB", 1, 60.0f * dt);
+    s.teletypeService(1);                             // C
+    // hold = dt after first slide call? No — draws use PRE-increment
+    // hold: call1 draws s2=0 then hold=dt; call2 draws s2=2*dt...
+    s.clearEvents();
+    s.teletypeService(1);                             // hold was 0 -> s2=0
+    CHECK(s.events().size() == 2);
+    CHECK(s.events()[0].aux == 120 && s.events()[1].aux == 120);
+    CHECK(s.events()[0].f[0] == 0.0f);
+    for (int i = 0; i != 2; ++i) s.teletypeService(1);
+    s.clearEvents();
+    s.teletypeService(1);            // hold=3dt -> s2=6dt, t=s2*15
+    const float s2 = s.events()[0].f[0];
+    const float t2 = s2 * 15.0f;
+    CHECK(s.events()[0].aux == (int)(120.0f - t2));   // FRNDINT trunc
+    CHECK(s.events()[1].aux == (int)(t2 + 120.0f));   // + FISTP
+  }
+
+  // --- drawEnable=0: timers tick, no emits -------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x22u, 100));
+    s.clearEvents();
+    s.teletypePost("GO", 0, 2.0f * dt);
+    s.teletypeService(0);                             // consume anyway
+    CHECK(s.ttLog().back().phase == 'C');
+    CHECK(s.ttLineStr(0) == "GO");
+    s.teletypeService(0);                             // steady, headless
+    CHECK(s.ttLog().back().phase == 'S');
+    CHECK(s.ttLog().back().draws == 0);
+    CHECK(s.events().empty());
+    CHECK(s.ttF32(CT) == dt);                         // still ticked
+    s.teletypeService(0);
+    CHECK(s.ttF32(CT) == 0.0f);
+  }
+
+  // --- suppress gate: 0x4999d0 && 0x541548 freeze timers -----------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x33u, 100));
+    s.clearEvents();
+    s.teletypePost("GATE", 0, 5.0f * dt);
+    s.teletypeService(1);
+    s.flag4999d0_ = 1; s.flag541548_ = 1;
+    s.clearEvents();
+    s.teletypeService(1);             // draws still emit (scaled path —
+    CHECK(s.events().size() == 1);    // 541548!=0 selects 41518c 1.0)
+    CHECK(s.events()[0].tag == 1 && s.events()[0].f[0] == 1.0f);
+    CHECK(s.ttF32(CT) == 5.0f * dt);  // timer frozen
+    s.teletypeService(1);
+    CHECK(s.ttF32(CT) == 5.0f * dt);
+    s.flag4999d0_ = 0;                // 541548 alone: ticks + scaled draw
+    s.clearEvents();
+    s.teletypeService(1);
+    CHECK(s.events().size() == 1 && s.events()[0].tag == 1);
+    CHECK(s.ttF32(CT) == 4.0f * dt);
+  }
+
+  // --- pending queue doubles the tick rate --------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x44u, 100));
+    s.clearEvents();
+    s.teletypePost("A", 0, 10.0f * dt);
+    s.teletypePost("B", 0, dt);
+    s.teletypeService(1);                     // C(A)
+    CHECK(s.ttLog().back().chars == 2);       // 'A' + NUL
+    s.teletypeService(1);                     // S — B still queued -> 2dt
+    CHECK(s.ttLog().back().phase == 'S');
+    CHECK(s.ttF32(CT) == 8.0f * dt);
+    // 5 more steady calls: f32 chain 6,4,2 leaves a 0x1p-26 residue,
+    // the 6th -2dt underflows and clamps to 0.
+    for (int i = 0; i != 5; ++i) s.teletypeService(1);
+    CHECK(s.ttF32(CT) == 0.0f);
+    s.teletypeService(1);                     // zero arm -> C(B)
+    const StreamTtTick& tc = s.ttLog().back();
+    CHECK(tc.phase == 'C');
+    CHECK(s.ttLineStr(0) == "B" && s.ttU32(LN) == 1);
+    CHECK(s.ttU32(QR) == 2 && s.ttU32(QW) == 2);
+  }
+
+  // --- front-push ordering: pushed entry consumed first --------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x55u, 100));
+    s.clearEvents();
+    s.teletypePost("AAA", 0, dt);
+    s.teletypePost("BBB", 2, dt);             // front-push ahead
+    CHECK(s.ttU32(QR) == 3);
+    s.teletypeService(1);                     // consumes slot3 (BBB)
+    CHECK(s.ttLineStr(0) == "BBB");
+    CHECK(s.ttU32(QR) == 0);
+    s.teletypeService(1);                     // steady B (still queued A
+    CHECK(s.ttLog().back().phase == 'S');     // -> localRate = 2dt)
+    s.teletypeService(1);                     // -> consume AAA
+    CHECK(s.ttLog().back().phase == 'C');
+    CHECK(s.ttLineStr(0) == "AAA");
+    // flags=3: front-push AND slide-in bits both honored.
+    s.teletypePost("CCC", 3, 20.0f * dt);     // qR 1->0, entry slot0
+    CHECK(s.ttU32(QR) == 0);
+    s.teletypeService(1);                     // S — AAA still ticking
+                                              // (CCC pending -> 2dt)
+    s.teletypeService(1);                     // C — entryFlags = 3
+    const StreamTtTick& t3 = s.ttLog().back();
+    CHECK(t3.phase == 'C' && t3.flags == 3 && s.ttLineStr(0) == "CCC");
+    s.teletypeService(1);                     // flags&1 -> slide-in arm
+    CHECK(s.ttLog().back().phase == 'N');
+  }
+
+  // --- stale line1 survives a single-line rebind ------------------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x66u, 100));
+    s.clearEvents();
+    s.teletypePost("HELLO\\nWORLD", 0, dt);
+    s.teletypeService(1);
+    s.teletypeService(1);                     // S (dt rate -> expires)
+    s.teletypeService(1);                     // I — timers dead, queue mt
+    CHECK(s.ttLog().back().phase == 'I');
+    s.teletypePost("Q", 0, 2.0f * dt);
+    s.teletypeService(1);                     // C — curLine resets to 1
+    CHECK(s.ttU32(LN) == 1 && s.ttLineStr(0) == "Q");
+    CHECK(s.ttLineStr(1) == "WORLD");         // stale bytes remain
+    s.clearEvents();
+    s.teletypeService(1);                     // only line0 drawn
+    CHECK(s.events().size() == 1 && s.events()[0].name == "Q");
+  }
+
+  // --- rate<=0: consume still runs, the display never ticks ------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x77u, 100));
+    s.clearEvents();
+    s.teletypePost("ZERO", 0, 0.0f);
+    s.teletypeService(1);                     // C — charTimer := 0
+    CHECK(s.ttLog().back().phase == 'C');
+    s.teletypeService(1);                     // charT==0 already -> idle
+    CHECK(s.ttLog().back().phase == 'I');     // (no steady frame ever)
+    CHECK(s.events().empty());
+    // Negative rate: x87 FLDZ/FCOMPP at the top -> nonzero arm ->
+    // steady; FSUB result -1-dt < 0 -> JA (0x41cd89) clamps to 0.
+    s.teletypePost("NEG", 0, -1.0f);
+    s.teletypeService(1);                     // C — charTimer := -1
+    CHECK(s.ttLog().back().phase == 'C');
+    s.clearEvents();
+    s.teletypeService(1);                     // S — draw still emits
+    CHECK(s.ttLog().back().phase == 'S');
+    CHECK(s.events().size() == 1);
+    CHECK(s.ttF32(CT) == 0.0f);               // clamped, not kept
+    s.teletypeService(1);                     // dead -> idle RET
+    CHECK(s.ttLog().back().phase == 'I');
+  }
+
+  // --- malformed: >36B line overflows into the flat arena ----------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x88u, 100));
+    s.clearEvents();
+    std::string big(200, 'X');
+    s.teletypePost(big.c_str(), 0, dt);
+    s.teletypeService(1);
+    const StreamTtTick& t = s.ttLog().back();
+    CHECK(t.phase == 'C' && t.chars == 201);
+    // pos 0..76 land (lines0/1 + entryFlags + curLine lo byte); the
+    // curLine write at pos 0x4c bumps it to 'X'=0x58 so every later
+    // write pos=0x58*36+col >= 3168 clips: 200-77 writes + term = 124.
+    CHECK(t.overflow == 124);
+    CHECK(s.seams().teletypeOverflow == 124);
+    CHECK(s.ttU32(LN) == 0x59u);              // 0x58 + TERM increment
+    CHECK(s.ttU32(FL) == 0x58585858u);        // entryFlags scribbled
+    CHECK(s.ttU32(QR) == 1);                  // dequeued normally
+    // Arena C-string: 76 X's + byte76 = 0x59 ('Y') — TERM's curLine++
+    // stores 0x58+1 into the arena field the line overflowed into.
+    CHECK(s.ttLineStr(0) == std::string(76, 'X') + 'Y');
+    s.teletypeService(1);                     // corrupted flags &1 == 0
+    CHECK(s.ttLog().back().phase == 'S');     // -> steady, two-line draw
+    // line1 view: pos 36..75 are 'X', pos 76 is the scribbled 'Y'.
+    CHECK(s.events().back().name == std::string(40, 'X') + 'Y');
+  }
+
+  // --- per-step integration: the service runs inside kDraw -------------------
+  {
+    StreamScene s;
+    CHECK(s.init(a, 0, 0, 0x99u, 100));
+    StreamInput in{};
+    s.clearEvents();
+    CHECK(s.step(in, dt));
+    CHECK(s.seams().teletypeService == 1);    // one 1cb44 per frame
+    CHECK(s.ttLog().size() == 1);
+    CHECK(s.ttLog().back().phase == 'I');     // real stream posts none
+    bool drew = false;
+    for (const auto& e : s.events())
+      if (e.kind == StreamEvent::kTeletypeDraw) drew = true;
+    CHECK(!drew);
+    // Present still lands after the service (draw block order kept).
+    CHECK(s.events().back().kind == StreamEvent::kPresent);
+    // Digest surface: deterministic across identical runs.
+    StreamScene s2;
+    CHECK(s2.init(a, 0, 0, 0x99u, 100));
+    s2.step(in, dt);
+    CHECK(s.snapshot().ttHash == s2.snapshot().ttHash);
+    s.teletypePost("HASHED", 0, dt);
+    s.teletypeService(1);
+    CHECK(s.snapshot().ttHash != s2.snapshot().ttHash);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -27416,6 +27831,7 @@ int main() {
   test_stream_step();
   test_stream_updaters();
   test_stream_animator();
+  test_stream_teletype();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
