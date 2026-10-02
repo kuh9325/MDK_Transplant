@@ -54,20 +54,32 @@ void StreamPresenter::blitBackdrop(const mdk::IndexedImage& src,
   }
 }
 
+const char* streamSpriteResultName(StreamSpriteResult r) {
+  switch (r) {
+    case StreamSpriteResult::kDrew:        return "drew";
+    case StreamSpriteResult::kMissResource: return "resource";
+    case StreamSpriteResult::kMissMetadata: return "metadata";
+    case StreamSpriteResult::kZeroSize:    return "zerosize";
+    case StreamSpriteResult::kClipped:     return "clipped";
+    case StreamSpriteResult::kTransparent: return "transparent";
+  }
+  return "?";
+}
+
 // FUN_00403a40 (OBSERVED — traversal_hud.cpp's SKULL blit is the same
 // port): effW/H = (src.dim*dst)>>8 (the record's dst field is the 8.8
 // projector size), center-anchored at (cx,cy), 16.16 DDA sampling,
-// pen 0 transparent, clipped to the view rect.
-void StreamPresenter::blitScaled(int cx, int cy, int dstW, int dstH,
-                                 const mdk::IndexedImage& src,
-                                 bool& drew) {
-  drew = false;
-  if (src.pixels.empty() || src.width <= 0 || src.height <= 0) return;
+// pen 0 transparent, clipped to the view rect. The return class is
+// diagnostic only — the raster itself is unchanged.
+StreamSpriteResult StreamPresenter::blitScaled(
+    int cx, int cy, int dstW, int dstH, const mdk::IndexedImage& src) {
+  if (src.pixels.empty() || src.width <= 0 || src.height <= 0)
+    return StreamSpriteResult::kMissMetadata;
   int effW = static_cast<int>(
       (static_cast<std::int64_t>(src.width) * dstW) >> 8);
   int effH = static_cast<int>(
       (static_cast<std::int64_t>(src.height) * dstH) >> 8);
-  if (effW <= 0 || effH <= 0) return;
+  if (effW <= 0 || effH <= 0) return StreamSpriteResult::kZeroSize;
   const int stepX = static_cast<int>(
       (static_cast<std::int64_t>(src.width) << 16) / effW);
   const int stepY = static_cast<int>(
@@ -76,7 +88,7 @@ void StreamPresenter::blitScaled(int cx, int cy, int dstW, int dstH,
   int srcX0 = 0;
   if (x < 0) {                          // left clip
     effW += x;
-    if (effW <= 0) return;
+    if (effW <= 0) return StreamSpriteResult::kClipped;
     srcX0 = -x * stepX;
     x = 0;
   }
@@ -84,14 +96,15 @@ void StreamPresenter::blitScaled(int cx, int cy, int dstW, int dstH,
   std::int64_t srcY0 = 0;
   if (y < 0) {                          // top clip
     effH += y;
-    if (effH <= 0) return;
+    if (effH <= 0) return StreamSpriteResult::kClipped;
     srcY0 = -static_cast<std::int64_t>(y) * stepY;
     y = 0;
   }
-  if (x >= fb_.width() || y >= fb_.height()) return;
+  if (x >= fb_.width() || y >= fb_.height())
+    return StreamSpriteResult::kClipped;
   if (effW > fb_.width() - x) effW = fb_.width() - x;
   if (effH > fb_.height() - y) effH = fb_.height() - y;
-  drew = true;
+  StreamSpriteResult res = StreamSpriteResult::kTransparent;
   std::int64_t srcY = srcY0;
   for (int r = 0; r < effH; ++r) {
     const int sy = static_cast<int>(srcY >> 16);
@@ -101,12 +114,43 @@ void StreamPresenter::blitScaled(int cx, int cy, int dstW, int dstH,
       if (sy < src.height && sx < src.width) {
         const std::uint8_t p =
             src.pixels[static_cast<std::size_t>(sy) * src.stride + sx];
-        if (p != 0) fb_.put(x + c, y + r, p);
+        if (p != 0) {
+          fb_.put(x + c, y + r, p);
+          res = StreamSpriteResult::kDrew;
+        }
       }
       srcX += stepX;
     }
     srcY += stepY;
   }
+  return res;
+}
+
+void StreamPresenter::noteSprite(StreamSpriteResult r, int tag,
+                                 int srcW, int srcH, int dstSize) {
+  switch (r) {
+    case StreamSpriteResult::kDrew:        ++diag_.spriteDrawn; return;
+    case StreamSpriteResult::kMissResource:
+      ++diag_.spriteMissRes; break;
+    case StreamSpriteResult::kMissMetadata:
+      ++diag_.spriteMissMeta; break;
+    case StreamSpriteResult::kZeroSize:    ++diag_.spriteZeroSize; break;
+    case StreamSpriteResult::kClipped:     ++diag_.spriteClipped; break;
+    case StreamSpriteResult::kTransparent:
+      ++diag_.spriteTransparent; break;
+  }
+  if (r == StreamSpriteResult::kMissResource ||
+      r == StreamSpriteResult::kMissMetadata)
+    ++diag_.spriteMisses;
+  auto& row = diag_.spriteCensus[
+      StreamSpriteMissKey{static_cast<int>(r), tag, srcW, srcH}];
+  if (row.count == 0) {
+    row.sizeMin = row.sizeMax = dstSize;
+  } else {
+    row.sizeMin = dstSize < row.sizeMin ? dstSize : row.sizeMin;
+    row.sizeMax = dstSize > row.sizeMax ? dstSize : row.sizeMax;
+  }
+  ++row.count;
 }
 
 // FUN_004185fc (OBSERVED): the HUD blit — transparent-keyed subrect
@@ -184,16 +228,22 @@ void StreamPresenter::consume(const mdk::StreamEvent& ev,
     case mdk::StreamEvent::kSpriteDraw: {
       ++diag_.sprites;
       const auto it = images_.find(ev.tag);
-      if (it == images_.end()) { ++diag_.spriteMisses; break; }
+      if (it == images_.end()) {
+        noteSprite(StreamSpriteResult::kMissResource, ev.tag, 0, 0,
+                   static_cast<int>(ev.f[2]));
+        break;
+      }
       // f[0..2] = {sx, sy, size}; the record's dst W/H are the same
       // projected size (e49c/e55c write it to both fields); f[4]/f[5]
       // mirror the source image dims the native caches (0x40 LIGHT,
       // planetTag[1..2] marker) — blitScaled reads the image's own.
-      bool drew = false;
-      blitScaled(static_cast<int>(ev.f[0]), static_cast<int>(ev.f[1]),
-                 static_cast<int>(ev.f[2]), static_cast<int>(ev.f[2]),
-                 it->second, drew);
-      if (!drew) ++diag_.spriteMisses;
+      const StreamSpriteResult r =
+          blitScaled(static_cast<int>(ev.f[0]),
+                     static_cast<int>(ev.f[1]),
+                     static_cast<int>(ev.f[2]),
+                     static_cast<int>(ev.f[2]), it->second);
+      noteSprite(r, ev.tag, it->second.width, it->second.height,
+                 static_cast<int>(ev.f[2]));
       break;
     }
     case mdk::StreamEvent::kHudBlit: {

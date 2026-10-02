@@ -63,6 +63,7 @@ var smoke := false
 var interactive := false
 var failures := 0
 var shot_path := ""
+var stream_shot_dir := ""    # --stream-shots DIR (19B.1A evidence)
 var shot_frames_left := 0
 var frames_left := 0
 var obj_debug := false
@@ -302,10 +303,15 @@ func _ready() -> void:
 	if stream:
 		stream_course = int(st_course)
 	shot_path = _arg_value(args, "--screenshot", "")
+	stream_shot_dir = _arg_value(args, "--stream-shots", "")
 	if shot_path.is_relative_path() and not shot_path.is_empty():
 		var launch_dir := OS.get_environment("PWD")
 		if not launch_dir.is_empty():
 			shot_path = launch_dir.path_join(shot_path).simplify_path()
+	if stream_shot_dir.is_relative_path() and not stream_shot_dir.is_empty():
+		var shot_cwd := OS.get_environment("PWD")
+		if not shot_cwd.is_empty():
+			stream_shot_dir = shot_cwd.path_join(stream_shot_dir).simplify_path()
 	frames_left = int(_arg_value(args, "--frames", "0"))
 	interactive = not smoke and shot_path.is_empty() and frames_left <= 0
 
@@ -2005,6 +2011,16 @@ func _run_smoke_stream(course: int) -> void:
 	var res := {}
 	var frames := 0
 	var exited := false
+	# Phase 19B.1A — optional framebuffer evidence: --stream-shots DIR
+	# captures early/mid/near-exit presented frames as PNGs. A sparse
+	# checkpoint ring (every 20 presented frames + seq 2) keeps the
+	# mid pick deterministic; the last presented frame is kept for
+	# the near-exit shot (the kExitMode fill never overwrites it in
+	# the ring — the exit frame is a uniform palette, not a scene).
+	var shot_dir := stream_shot_dir
+	var st_ckpt := {}          # seq -> {rgba, fb, pal, spr dict}
+	var st_last := {}          # last kPresent frame dict
+	var st_last_seq := -1
 	while frames < 2200:
 		res = bridge.step_frame_input(33.333, {"actions": 0})
 		frames += 1
@@ -2012,6 +2028,25 @@ func _run_smoke_stream(course: int) -> void:
 			_check(false, "stream step failed: %s" %
 				bridge.get_last_error())
 			return
+		if bool(res.get("frame_ready", false)) and \
+				not shot_dir.is_empty():
+			var fr_now: Dictionary = bridge.stream_frame()
+			if not fr_now.is_empty():
+				var sq := int(res.get("seq", 0))
+				var dnow: Dictionary = fr_now["diag"]
+				var entry := {
+					"seq": sq,
+					"rgba": fr_now["rgba"],
+					"fb": int(dnow["fb_hash"]),
+					"pal": int(dnow["palette_hash"]),
+					"spr": int(dnow["sprites"]),
+					"drawn": int(dnow["sprite_drawn"]),
+				}
+				if not bool(res.get("exited", false)):
+					st_last = entry
+					st_last_seq = sq
+					if sq <= 2 or sq % 20 == 0:
+						st_ckpt[sq] = entry
 		if bool(res.get("exited", false)):
 			exited = true
 			break
@@ -2027,6 +2062,19 @@ func _run_smoke_stream(course: int) -> void:
 	_check(int(d["presented"]) > 0, "frames presented")
 	_check(int(d["backdrop_blits"]) > 0, "backdrop blits")
 	_check(int(d["sprites"]) > 0, "sprite draw events")
+	# 19B.1A closure gate — a sprite that reached the presenter with
+	# an unbound tag or an unusable bound image is a true resource
+	# miss; both counters must stay zero. Clipped/zero-size/keyed
+	# outcomes are faithful FUN_00403a40 raster results, tracked
+	# separately (never "misses").
+	_check(int(d["sprite_miss_res"]) == 0,
+		"no sprite resource misses (unbound tag)")
+	_check(int(d["sprite_miss_meta"]) == 0,
+		"no sprite metadata misses (bad bound image)")
+	_check(int(d["sprite_drawn"]) + int(d["sprite_misses"]) +
+		int(d["sprite_zero_size"]) + int(d["sprite_clipped"]) +
+		int(d["sprite_transparent"]) == int(d["sprites"]),
+		"sprite outcome census covers every command")
 	_check(int(d["hud_blits"]) > 0, "HUD blits")
 	_check(int(d["palette_sets"]) > 0, "palette uploads")
 	# Real streams post no TELETYPE text (OBSERVED) — the count is
@@ -2055,12 +2103,17 @@ func _run_smoke_stream(course: int) -> void:
 	# negative int64s signed.
 	var fbh := int(d["fb_hash"])
 	var plh := int(d["palette_hash"])
-	print(("  stream%d: frames=%d pres=%d bg=%d spr=%d+%dmiss " +
+	print(("  stream%d: frames=%d pres=%d bg=%d spr=%d drawn=%d " +
+		"miss=%d(res=%d,meta=%d) zsize=%d clip=%d key=%d " +
 		"hud=%d+%dmiss tt=%d pal=%d mdl=%d rib=%d snd=%d " +
 		"fill=0x%02x fb=%08x%08x pal=%08x%08x mode=%d") % [
 		course, frames,
 		int(d["presented"]), int(d["backdrop_blits"]),
-		int(d["sprites"]), int(d["sprite_misses"]),
+		int(d["sprites"]), int(d["sprite_drawn"]),
+		int(d["sprite_misses"]), int(d["sprite_miss_res"]),
+		int(d["sprite_miss_meta"]),
+		int(d["sprite_zero_size"]), int(d["sprite_clipped"]),
+		int(d["sprite_transparent"]),
 		int(d["hud_blits"]), int(d["hud_misses"]),
 		int(d["teletype_draws"]), int(d["palette_sets"]),
 		int(d["models_deferred"]), int(d["ribbons_deferred"]),
@@ -2068,7 +2121,54 @@ func _run_smoke_stream(course: int) -> void:
 		(fbh >> 32) & 0xffffffff, fbh & 0xffffffff,
 		(plh >> 32) & 0xffffffff, plh & 0xffffffff,
 		int(bridge.get_mode())])
+	# The deterministic miss census — every non-drawn sprite outcome,
+	# bucketed by (class, tag, src dims); names join from the bind.
+	for e in d.get("sprite_census", []):
+		print(("    sprmiss %s tag=%d(%s) src=%dx%d " +
+			"size=[%d..%d] n=%d") % [
+			e["cls"], int(e["tag"]), String(e["name"]),
+			int(e["src_w"]), int(e["src_h"]),
+			int(e["size_min"]), int(e["size_max"]), int(e["count"])])
+	if not shot_dir.is_empty():
+		_stream_shot_dump(shot_dir, course, st_ckpt, st_last,
+			st_last_seq, int(d["presented"]))
 	print("smoke(stream): %d failure(s)" % failures)
+
+
+func _stream_shot_dump(shot_dir: String, course: int, ckpt: Dictionary,
+		last: Dictionary, last_seq: int, pres_total: int) -> void:
+	# Pick early / mid / near-exit frames from the checkpoint ring and
+	# save them under the ignored diagnostic dir. Mid = the stored
+	# checkpoint nearest the half-presented seq. PNGs carry decoded
+	# proprietary art — out/ is .gitignore'd, nothing is committed.
+	DirAccess.make_dir_recursive_absolute(shot_dir)
+	var mid_target := int(pres_total / 2)
+	var mid_seq := -1
+	for sq in ckpt.keys():
+		if mid_seq < 0 or absi(sq - mid_target) < absi(mid_seq - mid_target):
+			mid_seq = sq
+	var early_seq := -1
+	for sq in ckpt.keys():
+		if sq >= 60 and (early_seq < 0 or sq < early_seq):
+			early_seq = sq
+	var picks := {"early": early_seq, "mid": mid_seq, "exit": last_seq}
+	for label in ["early", "mid", "exit"]:
+		var sq: int = picks[label]
+		if sq < 0:
+			continue
+		var e: Dictionary = last if sq == last_seq else ckpt[sq]
+		var img := Image.create_from_data(600, 360, false,
+			Image.FORMAT_RGBA8, e["rgba"])
+		var path := shot_dir.path_join(
+			"stream%d_%s_f%04d.png" % [course, label, sq])
+		var err := img.save_png(path)
+		print(("    shot stream%d %s seq=%d -> %s " +
+			"fb=%08x%08x pal=%08x%08x spr=%d drawn=%d " +
+			"rc=%d") % [
+			course, label, sq, path,
+			(int(e["fb"]) >> 32) & 0xffffffff, int(e["fb"]) & 0xffffffff,
+			(int(e["pal"]) >> 32) & 0xffffffff, int(e["pal"]) & 0xffffffff,
+			int(e["spr"]), int(e["drawn"]), err])
 
 
 func _update_debug_label() -> void:

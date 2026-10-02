@@ -794,6 +794,156 @@ int main() {
             pres.diag().spriteMisses >= 1);
     }
 
+    // --- 19B.1A: sprite outcome classification + miss census ------
+    {
+      pres.reset();
+      using SR = mdkbridge::StreamSpriteResult;
+      using CK = mdkbridge::StreamSpriteMissKey;
+      auto mkImg = [](int w, int h, std::uint8_t pen) {
+        mdk::IndexedImage im;
+        im.width = w;
+        im.height = h;
+        im.stride = w;
+        im.pixels.assign(std::size_t(w) * h, pen);
+        return im;
+      };
+      auto censusHas = [&](const mdkbridge::StreamPresenter& p,
+                           SR cls, int tag, int w, int h,
+                           int count) {
+        const auto it = p.diag().spriteCensus.find(
+            CK{int(cls), tag, w, h});
+        return it != p.diag().spriteCensus.end() &&
+               it->second.count == count;
+      };
+
+      // LIGHT-shaped source (the debris family): 64x64, opaque.
+      // Correct tag resolution -> kDrew (not a miss, no census row).
+      pres.bindImage(11, mkImg(64, 64, 0x55));
+      {
+        StreamEvent e = mkEv(StreamEvent::kSpriteDraw);
+        e.tag = 11;
+        e.f[0] = 300.0f; e.f[1] = 180.0f; e.f[2] = 256.0f;
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteDrawn == 1 &&
+              pres.diag().spriteMisses == 0);
+        CHECK(pres.framebuffer().at(300, 180) == 0x55);
+        CHECK(pres.framebuffer().at(268, 148) == 0x55);  // 64px box
+        CHECK(pres.framebuffer().at(267, 148) == 0);
+        CHECK(pres.diag().spriteCensus.empty());
+      }
+
+      // PLANET-shaped source (the marker family): 128x128, opaque.
+      pres.bindImage(4, mkImg(128, 128, 0x66));
+      {
+        StreamEvent e = mkEv(StreamEvent::kSpriteDraw);
+        e.tag = 4;
+        e.f[0] = 300.0f; e.f[1] = 180.0f; e.f[2] = 128.0f;
+        pres.consume(e, dac);   // 0.5x -> 64x64 footprint
+        CHECK(pres.diag().spriteDrawn == 2);
+        CHECK(pres.framebuffer().at(268, 148) == 0x66);
+        CHECK(pres.framebuffer().at(267, 148) == 0);     // past edge
+      }
+
+      // Source dims are the bound image's own: a non-square source
+      // scales each axis independently (srcW!=srcH -> non-square
+      // footprint at a square dst size).
+      pres.bindImage(40, mkImg(16, 8, 0x77));
+      {
+        StreamEvent e = mkEv(StreamEvent::kSpriteDraw);
+        e.tag = 40;
+        e.f[0] = 100.0f; e.f[1] = 40.0f; e.f[2] = 256.0f;  // 16x8
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteDrawn == 3);
+        CHECK(pres.framebuffer().at(92, 36) == 0x77);   // c-(8,4)
+        CHECK(pres.framebuffer().at(107, 43) == 0x77);  // c+(7,3)
+        CHECK(pres.framebuffer().at(91, 36) == 0);      // 16 wide
+        CHECK(pres.framebuffer().at(92, 35) == 0);      // 8 tall
+      }
+
+      // Copy-safe retained lifetime: mutating the caller's image
+      // after bind must not affect the retained table copy.
+      {
+        mdk::IndexedImage mut = mkImg(4, 4, 0x21);
+        pres.bindImage(50, mut);
+        mut.pixels.assign(16, 0x99);   // caller-side mutation
+        StreamEvent e = mkEv(StreamEvent::kSpriteDraw);
+        e.tag = 50;
+        e.f[0] = 500.0f; e.f[1] = 60.0f; e.f[2] = 256.0f;
+        pres.consume(e, dac);
+        CHECK(pres.framebuffer().at(500, 60) == 0x21);
+      }
+
+      // Faithful no-draw classes — none are resource misses.
+      {
+        const int drawn0 = pres.diag().spriteDrawn;
+
+        // Zero-size: dst size 3 on a 64px source -> effW/H = 0.
+        StreamEvent e = mkEv(StreamEvent::kSpriteDraw);
+        e.tag = 11;
+        e.f[0] = 300.0f; e.f[1] = 180.0f; e.f[2] = 3.0f;
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteZeroSize == 1 &&
+              pres.diag().spriteMisses == 0);
+        CHECK(censusHas(pres, SR::kZeroSize, 11, 64, 64, 1));
+
+        // Clipped: dest rect entirely right of the view.
+        e.f[0] = 2000.0f; e.f[1] = 180.0f; e.f[2] = 256.0f;
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteClipped == 1 &&
+              pres.diag().spriteMisses == 0);
+
+        // Transparent: bound, onscreen, every source byte pen 0 —
+        // the raster runs but commits nothing.
+        pres.bindImage(60, mkImg(8, 8, 0x00));
+        e.tag = 60;
+        e.f[0] = 300.0f; e.f[1] = 60.0f; e.f[2] = 256.0f;
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteTransparent == 1 &&
+              pres.diag().spriteMisses == 0);
+        CHECK(censusHas(pres, SR::kTransparent, 60, 8, 8, 1));
+
+        // TRUE misses:
+        // resource — the tag was never bound.
+        e.tag = 999;
+        e.f[0] = 300.0f; e.f[1] = 60.0f; e.f[2] = 256.0f;
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteMissRes == 1 &&
+              pres.diag().spriteMisses == 1);
+        CHECK(censusHas(pres, SR::kMissResource, 999, 0, 0, 1));
+
+        // metadata — bound under a tag but the image is unusable
+        // (empty pixels / nonpos dims).
+        mdk::IndexedImage bad;
+        bad.width = 8;
+        bad.height = 8;                 // dims claim 8x8, no pixels
+        pres.bindImage(70, bad);
+        e.tag = 70;
+        pres.consume(e, dac);
+        CHECK(pres.diag().spriteMissMeta == 1 &&
+              pres.diag().spriteMisses == 2);
+        CHECK(censusHas(pres, SR::kMissMetadata, 70, 8, 8, 1));
+
+        // The census accumulates: a repeat of the same bucket grows
+        // count and widens the size range, never duplicates rows.
+        e.tag = 11;
+        e.f[0] = 300.0f; e.f[1] = 180.0f; e.f[2] = 1.0f;
+        pres.consume(e, dac);
+        {
+          const auto it = pres.diag().spriteCensus.find(
+              CK{int(SR::kZeroSize), 11, 64, 64});
+          CHECK(it != pres.diag().spriteCensus.end() &&
+                it->second.count == 2 &&
+                it->second.sizeMin == 1 && it->second.sizeMax == 3);
+        }
+        CHECK(pres.diag().spriteDrawn == drawn0);
+        // sprites == drawn + misses + faithful non-draws.
+        const auto& dd = pres.diag();
+        CHECK(dd.spriteDrawn + dd.spriteMisses + dd.spriteZeroSize +
+                  dd.spriteClipped + dd.spriteTransparent ==
+              dd.sprites);
+      }
+    }
+
     // --- HUD subrect blit (kHudBlit) -------------------------------
     {
       pres.reset();

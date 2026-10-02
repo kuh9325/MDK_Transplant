@@ -16,7 +16,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 
 #include "core/framebuffer.h"
@@ -26,13 +28,52 @@
 
 namespace mdkbridge {
 
+// Phase 19B.1A — sprite presentation outcome classes. Only the two
+// Miss* classes are resource failures (the tag never reached the
+// table, or the bound image is unusable); the rest are faithful
+// FUN_00403a40 raster outcomes — zero footprint after the >>8 size
+// collapse, a fully offscreen dest rect, or a blit that ran but
+// committed no non-key pixel. They are classified separately so a
+// clipped/transparent sprite is never reported as a missing asset.
+enum class StreamSpriteResult : int {
+  kDrew = 0,       // raster ran, >=1 non-key pixel committed
+  kMissResource,   // event tag never bound — TRUE MISS
+  kMissMetadata,   // bound image empty / nonpos dims — TRUE MISS
+  kZeroSize,       // (src.dim*dst)>>8 -> 0 footprint — faithful
+  kClipped,        // dest rect fully outside the 600x360 view
+  kTransparent,    // raster ran, committed no pixel (all key / OOB)
+};
+
+// Deterministic per-bucket miss census row. Key = (cls, tag, srcW,
+// srcH); the row accumulates count and the observed dst-size range
+// (the record's 8.8 projector size). `tag` is the opaque image
+// identity the core echoed — on real data that is the BNI record
+// index (4 = PLANET/marker, 11 = LIGHT/debris); the bridge joins
+// the record name for the report.
+struct StreamSpriteMissRow {
+  int count = 0;
+  int sizeMin = 0;  // min/max dst size observed in this bucket
+  int sizeMax = 0;
+};
+using StreamSpriteMissKey = std::tuple<int, int, int, int>;
+using StreamSpriteMissCensus =
+    std::map<StreamSpriteMissKey, StreamSpriteMissRow>;
+
+const char* streamSpriteResultName(StreamSpriteResult r);
+
 // Presentation-side counters (all diagnostic — none of this feeds
 // back into the core). `terminalFill` stays -1 until kExitMode.
 struct StreamPresenterDiag {
   int presented = 0;        // kPresent frame boundaries consumed
   int backdropBlits = 0;    // kBackdropBlit copies
   int sprites = 0;          // kSpriteDraw events consumed
-  int spriteMisses = 0;     //   unbound image / fully clipped / 0-size
+  int spriteDrawn = 0;      //   blit committed >=1 pixel
+  int spriteMisses = 0;     //   TRUE misses = missRes + missMeta
+  int spriteMissRes = 0;    //   tag never bound (no image)
+  int spriteMissMeta = 0;   //   bound image empty / nonpos dims
+  int spriteZeroSize = 0;   //   dst size collapses footprint to 0
+  int spriteClipped = 0;    //   dest rect fully outside the view
+  int spriteTransparent = 0;//   raster ran, wrote no pixel
   int hudBlits = 0;         // kHudBlit copies
   int hudMisses = 0;        //   unbound image / empty source
   int teletypeDraws = 0;    // kTeletypeDraw lines
@@ -45,6 +86,8 @@ struct StreamPresenterDiag {
   std::uint64_t fbHash = 0;      // FNV-1a over indexed pixels at
                                  // the last present (pre-palette)
   std::uint64_t paletteHash = 0; // FNV-1a over the applied 768B
+  // Every non-kDrew sprite outcome, bucketed — deterministic order.
+  StreamSpriteMissCensus spriteCensus;
 };
 
 class StreamPresenter {
@@ -81,8 +124,14 @@ private:
   // FUN_00403a40 (the shared scaled sprite blit — the same body
   // traversal_hud.cpp carries for SKULL): center-anchored at
   // (cx,cy), effW/H = (src*dst)>>8, 16.16 DDA, pen 0 transparent.
-  void blitScaled(int cx, int cy, int dstW, int dstH,
-                  const mdk::IndexedImage& src, bool& drew);
+  // Returns the classified outcome (never kMissResource — the
+  // caller owns tag resolution).
+  StreamSpriteResult blitScaled(int cx, int cy, int dstW, int dstH,
+                                const mdk::IndexedImage& src);
+  // Bump the outcome's diag counter and (for every non-kDrew
+  // result) accumulate the miss-census bucket.
+  void noteSprite(StreamSpriteResult r, int tag, int srcW, int srcH,
+                  int dstSize);
   // FUN_004185fc — transparent-keyed subrect blit. srcOff is a byte
   // offset into the source pixels (row-major, srcStride rows pitch);
   // the key is the transparent pen (0 here).

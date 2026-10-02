@@ -2734,6 +2734,7 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
   streamProtoProf_.reset();
   streamProtoEsc_.reset();
   streamAssets_ = mdk::StreamAssets{};
+  streamImageNames_.clear();
 
   std::string err;
   auto bni = root_->readFile("STREAM/STREAM.BNI", 1 << 28, &err);
@@ -2839,6 +2840,7 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
     if (!img) return false;
     if (outW) *outW = img->width;
     if (outH) *outH = img->height;
+    streamImageNames_[tag] = name;
     streamPresenter_.bindImage(tag, std::move(*img));
     return true;
   };
@@ -3073,7 +3075,36 @@ Dictionary MdkBridge::stream_diag() {
   out["presented"] = int64_t(d.presented);
   out["backdrop_blits"] = int64_t(d.backdropBlits);
   out["sprites"] = int64_t(d.sprites);
-  out["sprite_misses"] = int64_t(d.spriteMisses);
+  out["sprite_drawn"] = int64_t(d.spriteDrawn);
+  out["sprite_misses"] = int64_t(d.spriteMisses);      // res + meta
+  out["sprite_miss_res"] = int64_t(d.spriteMissRes);  // unbound tag
+  out["sprite_miss_meta"] = int64_t(d.spriteMissMeta);// bad bound img
+  out["sprite_zero_size"] = int64_t(d.spriteZeroSize);// >>8 collapse
+  out["sprite_clipped"] = int64_t(d.spriteClipped);   // offscreen
+  out["sprite_transparent"] = int64_t(d.spriteTransparent);
+  // The deterministic miss census — every non-drawn outcome bucketed
+  // by (class, tag, source dims); the record name joins from the
+  // bind table where known.
+  {
+    Array cen;
+    for (const auto& [k, r] : d.spriteCensus) {
+      Dictionary e;
+      const auto cls = static_cast<mdkbridge::StreamSpriteResult>(
+          std::get<0>(k));
+      e["cls"] = streamSpriteResultName(cls);
+      e["tag"] = int64_t(std::get<1>(k));
+      const auto nm = streamImageNames_.find(std::get<1>(k));
+      e["name"] = nm != streamImageNames_.end()
+                      ? String(nm->second.c_str()) : String();
+      e["src_w"] = int64_t(std::get<2>(k));
+      e["src_h"] = int64_t(std::get<3>(k));
+      e["count"] = int64_t(r.count);
+      e["size_min"] = int64_t(r.sizeMin);
+      e["size_max"] = int64_t(r.sizeMax);
+      cen.push_back(e);
+    }
+    out["sprite_census"] = cen;
+  }
   out["hud_blits"] = int64_t(d.hudBlits);
   out["hud_misses"] = int64_t(d.hudMisses);
   out["teletype_draws"] = int64_t(d.teletypeDraws);
@@ -3133,6 +3164,7 @@ void MdkBridge::shutdown() {
   streamBniBytes_.clear();
   streamFtiBytes_.clear();
   streamHudBytes_.clear();
+  streamImageNames_.clear();
   streamAssets_ = mdk::StreamAssets{};
   streamProtoKurt_.reset();
   streamProtoBones_.reset();

@@ -247,11 +247,16 @@ class GodotStreamSmoke(unittest.TestCase):
 
     def test_stream_course0(self):
         # Alive exit: fill 0xff, mode 6; census matches the 19A
-        # golden draw-summary (spr/hud/mdl/rib verbatim).
+        # golden draw-summary (spr/hud/mdl/rib verbatim). 19B.1A —
+        # the sprite outcome split: zero true misses; every non-drawn
+        # sprite is a faithful FUN_00403a40 raster outcome on the
+        # LIGHT debris image (zero-size >>8 collapse, full clip, or
+        # an all-pen-0 sampled footprint).
         self.check_course(0, extra=(
             "fill=0xff",
             "exit handoff -> mode 6",
-            "spr=6120+1806miss",
+            "spr=6120 drawn=3047",
+            "miss=0(res=0,meta=0) zsize=283 clip=1523 key=1267",
             "rib=139162",
             "pal=02b99a68d9993a25"))
 
@@ -261,7 +266,8 @@ class GodotStreamSmoke(unittest.TestCase):
         self.check_course(4, extra=(
             "fill=0x00",
             "exit handoff -> mode 0",
-            "spr=4764+1402miss",
+            "spr=4764 drawn=3074",
+            "miss=0(res=0,meta=0) zsize=111 clip=1291 key=288",
             "rib=97740",
             "pal=9fa9e040e0eedf25"))
 

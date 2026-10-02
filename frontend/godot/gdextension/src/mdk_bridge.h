@@ -38,6 +38,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -642,6 +643,9 @@ class MdkBridge : public RefCounted {
   std::vector<std::byte> streamBniBytes_;
   std::vector<std::byte> streamFtiBytes_;
   std::vector<std::byte> streamHudBytes_;
+  // Phase 19B.1A — tag -> bound record name (BG/PLANET/LIGHT/
+  // SC_STAT/SNIP_TXT), for naming census buckets in the diag dump.
+  std::map<int, std::string> streamImageNames_;
   std::optional<mdk::RuntimeModel> streamProtoKurt_, streamProtoBones_,
       streamProtoProf_, streamProtoEsc_;
   int streamNowMs_ = 0;          // synthetic 46c650 clock (ms)
