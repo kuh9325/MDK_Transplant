@@ -6,9 +6,10 @@
 // (FUN_0042e684 tail), the scaled sprite blit (FUN_00403a40), the
 // HUD subrect blit (FUN_004185fc), the TELETYPE text draws
 // (FUN_00414d2c / FUN_0041518c), the terminal palette fill, and the
-// kPresent frame boundary. Model/ribbon raster (the 0c860 family)
-// is counted and deferred to Phase 19B.2 — no mutation, no
-// reordering.
+// kPresent frame boundary. Phase 19B.2A added the indexed-triangle
+// raster backend (stream_raster.h) — kRibbonTri is drawn in-stream;
+// kModelDraw is still counted and deferred to Phase 19B.2B — no
+// mutation, no reordering.
 //
 // Godot-free by design: the bridge owns the instance, consumes the
 // scene's event queue after each step, and palette-expands the
@@ -25,6 +26,7 @@
 #include "core/fti_font.h"
 #include "core/indexed_image.h"
 #include "core/stream_scene.h"
+#include "stream_raster.h"
 
 namespace mdkbridge {
 
@@ -78,8 +80,8 @@ struct StreamPresenterDiag {
   int hudMisses = 0;        //   unbound image / empty source
   int teletypeDraws = 0;    // kTeletypeDraw lines
   int paletteSets = 0;      // kPaletteSet DAC uploads applied
-  int modelsDeferred = 0;   // kModelDraw carried through (19B.2)
-  int ribbonsDeferred = 0;  // kRibbonTri carried through (19B.2)
+  int modelsDeferred = 0;   // kModelDraw carried through (19B.2B)
+  StreamRibbonDiag ribbon;  // kRibbonTri raster census (19B.2A)
   int soundEvents = 0;      // kPlaySound/kStopSound (audio deferred)
   int terminalFills = 0;    // kExitMode palette fills
   int terminalFill = -1;    // the aux fill byte (0x00/0xff)
@@ -102,6 +104,10 @@ public:
   // by the 600px measure rule; renderer 1 is FONTBIG scaled).
   void bindFonts(const mdk::FtiFont& fontBig,
                  const mdk::FtiFont& fontSml);
+  // Binds the scene's composed 768B base palette — the LUT source
+  // for the mode-5 ribbon material ramp (native 0x4ed758; the DAC
+  // surface is the faded copy and must NOT feed the LUT).
+  void bindRibbonPalette(const std::uint8_t* palette768);
   void reset();
 
   // One StreamEvent, in the core's emission order. `paletteDac` is
@@ -144,6 +150,7 @@ private:
   mdk::IndexedFramebuffer fb_;            // 600x360, the 0x541650
                                           // surface
   mdk::Palette palette_;                  // the applied DAC image
+  StreamRibbonRaster ribbon_;             // 19B.2A indexed tri raster
   std::unordered_map<int, mdk::IndexedImage> images_;
   std::optional<mdk::FtiFont> fontBig_, fontSml_;
   StreamPresenterDiag diag_;

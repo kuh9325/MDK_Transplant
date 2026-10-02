@@ -1059,16 +1059,234 @@ int main() {
       CHECK(fb.at(291, 80) == 0);
     }
 
+    // --- Phase 19B.2A — Mode-5 ribbon raster (synthetic) ----------
+    // The events are the authoritative kRibbonTri payloads:
+    // f[0..8] = view-space {x,y,z} per vert, aux = packed clip flags
+    // (f0 | f1<<8 | f2<<16), tag = the raw pen scalar. The host
+    // projects (sel-0), clips (0ca00), dispatches (0c860), and fills
+    // into the 600x360 indexed surface.
+    //
+    // View->screen inversion used below (sel 0):
+    //   sx = ((x+z)/z)*299.95 + 0.05 ; sy = ((y+z)/z)*180.40 + 0.05
+    // z=1: (x,y) = (-1,-1)->(0,0), (0,-1)->(300,0), (0,0)->(300,180),
+    // (-1,0)->(0,180) — all flags 0 (x==±z, y==±z compare strict).
+    auto mkTri = [](int pen, float ax, float ay, float az,
+                    float bx, float by, float bz,
+                    float cx, float cy, float cz,
+                    std::uint32_t flags) {
+      StreamEvent e;
+      e.kind = StreamEvent::kRibbonTri;
+      e.tag = pen;
+      e.aux = int(flags);
+      e.f[0] = ax; e.f[1] = ay; e.f[2] = az;
+      e.f[3] = bx; e.f[4] = by; e.f[5] = bz;
+      e.f[6] = cx; e.f[7] = cy; e.f[8] = cz;
+      return e;
+    };
+    using BR = mdkbridge::StreamTriBranch;
+    auto branchN = [&](const mdkbridge::StreamPresenter& p,
+                       BR b) {
+      const auto it = p.diag().ribbon.branch.find(int(b));
+      return it == p.diag().ribbon.branch.end() ? 0 : it->second;
+    };
+    {
+      pres.reset();
+      // No palette bound -> the LUT branch reports a miss; the fb
+      // stays untouched and the command is still consumed.
+      StreamEvent r = mkTri(-1029, -1,-1,1, 0,-1,1, 0,0,1, 0);
+      pres.consume(r, dac);
+      CHECK(pres.diag().ribbon.commands == 1);
+      CHECK(pres.diag().ribbon.lutMisses == 1);
+      CHECK(pres.diag().ribbon.unsupported == 0);
+      CHECK(pres.diag().ribbon.rasterized == 0);
+      bool clean = true;
+      for (std::size_t i = 0; i < pres.framebuffer().pixelCount();
+           ++i)
+        clean &= pres.framebuffer().pixels()[i] == 0;
+      CHECK(clean);
+    }
+    {
+      pres.reset();
+      // 0c860 flat arm [-989,-1]: pen -500 -> byte 500 & 0xff = 0xf4.
+      // Right-angle tri, flat top at y=0: sorted order (0,0),(300,0),
+      // (300,180); midH = 0 -> bottom half only; INCLUSIVE right edge.
+      StreamEvent r = mkTri(-500, -1,-1,1, 0,-1,1, 0,0,1, 0);
+      pres.consume(r, dac);
+      const auto& fb = pres.framebuffer();
+      CHECK(fb.at(0, 0) == 0xf4);
+      CHECK(fb.at(300, 0) == 0xf4);         // inclusive right edge
+      CHECK(fb.at(301, 0) == 0);
+      // row 179: l = (0x8000 + 179*109226)>>16 = 298 -> [298,300]
+      CHECK(fb.at(299, 179) == 0xf4);
+      CHECK(fb.at(300, 179) == 0xf4);
+      CHECK(fb.at(298, 179) == 0xf4);
+      CHECK(fb.at(297, 179) == 0);
+      CHECK(fb.at(300, 180) == 0);          // row iBotY excluded
+      CHECK(pres.diag().ribbon.commands == 1 &&
+            pres.diag().ribbon.rasterized == 1);
+      CHECK(branchN(pres, BR::kFlat) == 1);
+      CHECK(pres.diag().ribbon.pixels > 0);
+    }
+    {
+      pres.reset();
+      // Flat arm [-1023,-1011]: pen -1015 -> byte 0x3f7 & 0xff = 0xf7.
+      StreamEvent r = mkTri(-1015, -1,-1,1, 0,-1,1, 0,0,1, 0);
+      pres.consume(r, dac);
+      CHECK(pres.framebuffer().at(150, 90) == 0xf7);
+      CHECK(branchN(pres, BR::kFlat) == 1);
+    }
+    {
+      pres.reset();
+      // LUT arm (pen <= -1029). A palette with all 256 entries the
+      // same color degenerates the octree to one leaf chain — the
+      // last insert wins, so every LUT row maps src -> 255.
+      std::uint8_t flatPal[768];
+      for (int i = 0; i < 256; ++i) {
+        flatPal[i * 3 + 0] = 7;
+        flatPal[i * 3 + 1] = 7;
+        flatPal[i * 3 + 2] = 7;
+      }
+      pres.bindRibbonPalette(flatPal);
+      // Seed the area so the RMW read side is observable.
+      for (int y = 0; y < 200; ++y)
+        for (int x = 0; x < 400; ++x)
+          pres.framebuffer().put(x, y, 0x42);
+      StreamEvent r = mkTri(-1029, -1,-1,1, 0,-1,1, 0,0,1, 0);
+      pres.consume(r, dac);
+      const auto& fb = pres.framebuffer();
+      CHECK(fb.at(0, 0) == 255);            // lut[0x42] = 255
+      CHECK(fb.at(299, 0) == 255);
+      CHECK(fb.at(300, 0) == 0x42);         // EXCLUSIVE right edge
+      CHECK(fb.at(299, 179) == 255);
+      CHECK(fb.at(300, 179) == 0x42);
+      CHECK(pres.diag().ribbon.rasterized == 1 &&
+            pres.diag().ribbon.lutMisses == 0);
+      CHECK(branchN(pres, BR::kLut1029) == 1);
+      CHECK(pres.diag().ribbon.pixels > 0);
+      // The other LUT arm [-1027,-1024]: pen -1025 -> row
+      // (-1024 +1025) = 1 — same all-255 LUT, distinct census id.
+      pres.consume(mkTri(-1025, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+      CHECK(branchN(pres, BR::kLut1024) == 1);
+
+      // DAC independence: kPaletteSet mutates the presentation DAC
+      // only; the indexed raster result is built from the bound
+      // base palette — identical draw, identical indices.
+      std::uint8_t dac2[768];
+      for (int i = 0; i < 768; ++i) dac2[i] = std::uint8_t(i * 37);
+      StreamEvent ps = mkEv(StreamEvent::kPaletteSet);
+      pres.consume(ps, dac2);
+      CHECK(fb.at(0, 0) == 255);
+      pres.consume(mkTri(-1030, -1,-1,1, 0,-1,1, 0,0,1, 0), dac2);
+      CHECK(fb.at(0, 0) == 255);
+      CHECK(branchN(pres, BR::kLut1029) == 2);
+
+      // A different BASE palette changes the LUT -> different
+      // indexed output (the LUT tracks the bound palette, not a
+      // fixed table).
+      pres.reset();
+      std::uint8_t grayPal[768];
+      for (int i = 0; i < 256; ++i) {
+        grayPal[i * 3 + 0] = std::uint8_t(i);
+        grayPal[i * 3 + 1] = std::uint8_t(i);
+        grayPal[i * 3 + 2] = std::uint8_t(i);
+      }
+      pres.bindRibbonPalette(grayPal);
+      StreamEvent g = mkTri(-1029, -1,-1,1, 0,-1,1, 0,0,1, 0);
+      pres.consume(g, dac);
+      const std::uint8_t firstRun = pres.framebuffer().at(100, 50);
+      pres.reset();
+      std::uint8_t revPal[768];
+      for (int i = 0; i < 256; ++i) {
+        revPal[i * 3 + 0] = std::uint8_t(255 - i);
+        revPal[i * 3 + 1] = std::uint8_t(255 - i);
+        revPal[i * 3 + 2] = std::uint8_t(255 - i);
+      }
+      pres.bindRibbonPalette(revPal);
+      pres.consume(g, dac);
+      const std::uint8_t secondRun = pres.framebuffer().at(100, 50);
+      CHECK(firstRun != secondRun);
+      CHECK(pres.diag().ribbon.lutMisses == 0);
+    }
+    {
+      pres.reset();
+      // 0ca00 near-plane clip: v0 z = 0.01 flags 0x10 -> one
+      // clipped event fans into two surviving tris.
+      StreamEvent r = mkTri(-500, 0,0,0.01f, -0.5f,0,1,
+                            0.5f,0.5f,1, 0x10);
+      pres.consume(r, dac);
+      CHECK(pres.diag().ribbon.commands == 1);
+      CHECK(pres.diag().ribbon.clipped == 1);
+      CHECK(pres.diag().ribbon.rasterized == 2);   // 4-vert fan
+      CHECK(pres.diag().ribbon.clipDropped == 0);
+      CHECK(pres.diag().ribbon.pixels > 0);
+
+      // Trivial reject (f0 & f1 & f2) != 0 — consumed, never
+      // reaches the clip path or a filler.
+      const int rast0 = pres.diag().ribbon.rasterized;
+      const int clip0 = pres.diag().ribbon.clipped;
+      StreamEvent rej = mkTri(-500, 0,0,0.01f, 0,0,0.02f,
+                              0,0,0.03f, 0x101010);
+      pres.consume(rej, dac);
+      CHECK(pres.diag().ribbon.commands == 2);
+      CHECK(pres.diag().ribbon.rasterized == rast0);
+      CHECK(pres.diag().ribbon.clipped == clip0);
+      CHECK(pres.diag().ribbon.unsupported == 0);
+    }
+    {
+      pres.reset();
+      // Degenerate triangle — all three verts at the same screen Y
+      // -> totalH <= 0 -> the filler commits nothing.
+      StreamEvent r = mkTri(-500, -1,-1,1, 0,-1,1, 1,-1,1, 0);
+      pres.consume(r, dac);
+      CHECK(pres.diag().ribbon.rasterized == 1);
+      CHECK(pres.diag().ribbon.zeroPixels == 1);
+      CHECK(pres.diag().ribbon.pixels == 0);
+
+      // Unported 0c860 arms — counted on their census id, flagged
+      // unsupported, no pixels.
+      const auto uns0 = pres.diag().ribbon.unsupported;
+      pres.consume(mkTri(-1000, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+      pres.consume(mkTri(-1028, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+      pres.consume(mkTri(0, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+      CHECK(branchN(pres, BR::kFx47a770) == 1);
+      CHECK(branchN(pres, BR::kFx46e940) == 1);
+      CHECK(branchN(pres, BR::kMaterial) == 1);
+      CHECK(pres.diag().ribbon.unsupported == uns0 + 3);
+      CHECK(pres.diag().ribbon.pixels == 0);
+    }
+    {
+      pres.reset();
+      // Two-triangle quad, flat pens 0xf4 / 0xf5 — the shared
+      // diagonal packs with no gap; the later command wins the
+      // shared pixel (painter order, event order preserved).
+      //   A: (0,0),(300,0),(300,180)   pen -500 -> 0xf4
+      //   B: (0,0),(0,180),(300,180)   pen -501 -> 0xf5
+      pres.consume(mkTri(-500, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+      pres.consume(mkTri(-501, -1,-1,1, -1,0,1, 0,0,1, 0), dac);
+      const auto& fb = pres.framebuffer();
+      CHECK(fb.at(150, 90) == 0xf5);    // on the shared diagonal
+      CHECK(fb.at(151, 90) == 0xf4);    // just below/right of it
+      CHECK(fb.at(0, 179) == 0xf5);     // B's flat bottom band
+      CHECK(fb.at(299, 0) == 0xf4);     // A's top-right run
+      CHECK(pres.diag().ribbon.commands == 2 &&
+            pres.diag().ribbon.rasterized == 2);
+      CHECK(branchN(pres, BR::kFlat) == 2);
+    }
+    {
+      pres.reset();
+      // Model carry-through unchanged: counted, fb untouched.
+      StreamEvent m = mkEv(StreamEvent::kModelDraw);
+      pres.consume(m, dac);
+      CHECK(pres.diag().modelsDeferred == 1);
+    }
+
     // --- present boundary + digests --------------------------------
     {
       pres.reset();
-      // Model/ribbon carry-through: counted, framebuffer untouched.
+      // Model carry-through: counted, framebuffer untouched.
       StreamEvent m = mkEv(StreamEvent::kModelDraw);
-      StreamEvent r = mkEv(StreamEvent::kRibbonTri);
       pres.consume(m, dac);
-      pres.consume(r, dac);
-      CHECK(pres.diag().modelsDeferred == 1 &&
-            pres.diag().ribbonsDeferred == 1);
+      CHECK(pres.diag().modelsDeferred == 1);
       bool clean = true;
       for (std::size_t i = 0; i < pres.framebuffer().pixelCount();
            ++i)

@@ -21,12 +21,17 @@ void StreamPresenter::bindFonts(const mdk::FtiFont& fontBig,
   fontSml_ = fontSml;
 }
 
+void StreamPresenter::bindRibbonPalette(const std::uint8_t* pal768) {
+  ribbon_.bindPalette(pal768);
+}
+
 void StreamPresenter::reset() {
   fb_.clear(0);
   palette_ = mdk::Palette{};
   images_.clear();
   fontBig_.reset();
   fontSml_.reset();
+  ribbon_.bindPalette(nullptr);
   diag_ = StreamPresenterDiag{};
   framePending_ = false;
 }
@@ -282,10 +287,13 @@ void StreamPresenter::consume(const mdk::StreamEvent& ev,
       }
       break;
     case mdk::StreamEvent::kModelDraw:
-      ++diag_.modelsDeferred;   // 19B.2 — counted, not rasterized
+      ++diag_.modelsDeferred;   // 19B.2B — counted, not rasterized
       break;
     case mdk::StreamEvent::kRibbonTri:
-      ++diag_.ribbonsDeferred;  // 19B.2 — counted, not rasterized
+      // 19B.2A — the host raster chain (project -> clip -> 0c860
+      // dispatch -> filler) writes indexed pixels in event order.
+      ribbon_.draw(fb_, ev.tag, ev.f,
+                   static_cast<std::uint32_t>(ev.aux), diag_.ribbon);
       break;
     case mdk::StreamEvent::kPlaySound:
     case mdk::StreamEvent::kStopSound:

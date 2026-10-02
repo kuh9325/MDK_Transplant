@@ -1998,12 +1998,12 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 
 
 func _run_smoke_stream(course: int) -> void:
-	# Headless mode-5 presentation smoke (Phase 19B.1). Drives the
-	# same step path _process uses; asserts the host-side contract:
-	# indexed composition counters, palette uploads, the natural
-	# kExitMode exit, the terminal fill byte, and the deferred
-	# model/ribbon census. Model/ribbon raster is Phase 19B.2 — the
-	# deferred counters are the assertions, not visuals.
+	# Headless mode-5 presentation smoke (Phase 19B.1 + 19B.2A).
+	# Drives the same step path _process uses; asserts the host-side
+	# contract: indexed composition counters, palette uploads, the
+	# natural kExitMode exit, the terminal fill byte, the deferred
+	# model census, and the ribbon raster census. kModelDraw raster
+	# remains Phase 19B.2B — models_deferred stays the assertion.
 	print("smoke(stream): course=%d" % course)
 	_check(int(bridge.get_mode()) == 5, "mode == 5 (stream)")
 	_check(bridge.stream_active(), "stream_active after load")
@@ -2080,9 +2080,19 @@ func _run_smoke_stream(course: int) -> void:
 	# Real streams post no TELETYPE text (OBSERVED) — the count is
 	# reported, not asserted.
 	_check(int(d["models_deferred"]) > 0,
-		"model draws deferred (19B.2)")
-	_check(int(d["ribbons_deferred"]) > 0,
-		"ribbon tris deferred (19B.2)")
+		"model draws deferred (19B.2B)")
+	# 19B.2A — every kRibbonTri consumed is a command; the census must
+	# show rasterized tris and no unported material branch / LUT miss.
+	_check(int(d["ribbon_commands"]) > 0,
+		"ribbon tri commands received")
+	_check(int(d["ribbon_rasterized"]) > 0,
+		"ribbon tris rasterized")
+	_check(int(d["ribbon_pixels"]) > 0,
+		"ribbon indexed pixels written")
+	_check(int(d["ribbon_unsupported"]) == 0,
+		"no unsupported ribbon material branches")
+	_check(int(d["ribbon_lut_misses"]) == 0,
+		"no ribbon LUT misses (base palette bound)")
 	var fr: Dictionary = bridge.stream_frame()
 	_check(not fr.is_empty(),
 		"stream_frame returns the terminal image")
@@ -2116,11 +2126,21 @@ func _run_smoke_stream(course: int) -> void:
 		int(d["sprite_transparent"]),
 		int(d["hud_blits"]), int(d["hud_misses"]),
 		int(d["teletype_draws"]), int(d["palette_sets"]),
-		int(d["models_deferred"]), int(d["ribbons_deferred"]),
+		int(d["models_deferred"]), int(d["ribbon_commands"]),
 		int(d["sound_events"]), int(d["terminal_fill"]),
 		(fbh >> 32) & 0xffffffff, fbh & 0xffffffff,
 		(plh >> 32) & 0xffffffff, plh & 0xffffffff,
 		int(bridge.get_mode())])
+	# 19B.2A ribbon raster census + material branch breakdown.
+	print(("    ribbon: cmd=%d rast=%d zero=%d clip=%d drop=%d " +
+		"unsup=%d lutmiss=%d px=%d") % [
+		int(d["ribbon_commands"]), int(d["ribbon_rasterized"]),
+		int(d["ribbon_zero_pixels"]), int(d["ribbon_clipped"]),
+		int(d["ribbon_clip_dropped"]), int(d["ribbon_unsupported"]),
+		int(d["ribbon_lut_misses"]), int(d["ribbon_pixels"])])
+	for e in d.get("ribbon_branch", []):
+		print("      branch %s n=%d" % [
+			String(e["branch"]), int(e["count"])])
 	# The deterministic miss census — every non-drawn sprite outcome,
 	# bucketed by (class, tag, src dims); names join from the bind.
 	for e in d.get("sprite_census", []):

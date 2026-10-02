@@ -2824,6 +2824,10 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
   const std::span<const std::byte> palSpan(
       reinterpret_cast<const std::byte*>(streamPal.data()),
       streamPal.size());
+  // 19B.2A — the ribbon raster LUT builds from the composed BASE
+  // palette (native 0x4ed758 — the same bytes the core's
+  // StreamScene::palette() holds), never the faded DAC surface.
+  streamPresenter_.bindRibbonPalette(streamPal.data());
 
   // The indexed image records — decoded into the presenter's table
   // keyed by the tag the core echoes in its events. Fail-soft per
@@ -3110,7 +3114,31 @@ Dictionary MdkBridge::stream_diag() {
   out["teletype_draws"] = int64_t(d.teletypeDraws);
   out["palette_sets"] = int64_t(d.paletteSets);
   out["models_deferred"] = int64_t(d.modelsDeferred);
-  out["ribbons_deferred"] = int64_t(d.ribbonsDeferred);
+  // 19B.2A — the kRibbonTri raster census: commands = events
+  // consumed (== the native golden triangle census), rasterized =
+  // triangles that reached a filler (fan members counted), clipped =
+  // events that entered 0ca00, clip_dropped = clip-path events with
+  // no surviving fan, unsupported = dispatches on an unported
+  // 0c860 branch, lut_misses = LUT-row draws with no bound palette.
+  out["ribbon_commands"] = int64_t(d.ribbon.commands);
+  out["ribbon_rasterized"] = int64_t(d.ribbon.rasterized);
+  out["ribbon_zero_pixels"] = int64_t(d.ribbon.zeroPixels);
+  out["ribbon_clipped"] = int64_t(d.ribbon.clipped);
+  out["ribbon_clip_dropped"] = int64_t(d.ribbon.clipDropped);
+  out["ribbon_unsupported"] = int64_t(d.ribbon.unsupported);
+  out["ribbon_lut_misses"] = int64_t(d.ribbon.lutMisses);
+  out["ribbon_pixels"] = static_cast<int64_t>(d.ribbon.pixels);
+  {
+    Array br;
+    for (const auto& [id, n] : d.ribbon.branch) {
+      Dictionary e;
+      e["branch"] = streamTriBranchName(
+          static_cast<mdkbridge::StreamTriBranch>(id));
+      e["count"] = int64_t(n);
+      br.push_back(e);
+    }
+    out["ribbon_branch"] = br;
+  }
   out["sound_events"] = int64_t(d.soundEvents);
   out["terminal_fills"] = int64_t(d.terminalFills);
   out["terminal_fill"] = int64_t(d.terminalFill);
