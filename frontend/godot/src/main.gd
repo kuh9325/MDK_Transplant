@@ -25,9 +25,13 @@ extends Node3D
 #   --freefall N      mode-2 freefall course 0..4 instead of --level
 #                     (Phase 16C; hands off to traversal on landing,
 #                     or the frontend route on death)
-#   --skill N         difficulty 0..2 for --freefall (default 0)
-#   --seed N          RNG seed for --freefall (default 0xC0FFEE —
-#                     the mdk-inspect freefall digest seed)
+#   --stream N        mode-5 intermission course 0..4 instead of
+#                     --level (Phase 19B.1; indexed framebuffer +
+#                     palette presentation, model/ribbon deferred)
+#   --skill N         difficulty 0..2 for --freefall/--stream
+#                     (default 0)
+#   --seed N          RNG seed for --freefall/--stream (default
+#                     0xC0FFEE — the mdk-inspect digest seed)
 #   --frontend        boot the authoritative frontend menu (mode 0)
 #                     instead of a level — Godot presents + routes,
 #                     FrontendShell owns all menu semantics
@@ -74,6 +78,14 @@ var freefall := false        # --freefall launcher flag
 var ff_materials := {}       # "m:<name>" / "pen:<n>" -> StandardMaterial3D
 var ff_palette := PackedByteArray()  # FALLP_<c+1> bytes (768)
 var ff_handoff_seen := false # printed the mode transition once
+
+# Phase 19B.1 — mode-5 intermission presentation. The StreamScene
+# core owns simulation; the bridge owns the indexed framebuffer.
+# st_* are view-side texture caches for the presented RGBA frame.
+var stream := false            # --stream N launcher flag
+var stream_course := 0         #   parsed --stream value
+var st_img: Image = null
+var st_tex: ImageTexture = null
 
 # Raw mouse accumulators — device deltas for the next frame only.
 var mouse_dx := 0
@@ -280,11 +292,15 @@ func _ready() -> void:
 	var start_yaw := float(_arg_value(args, "--start-yaw", "0"))
 	var ff_course := _arg_value(args, "--freefall", "")
 	var ff_skill := int(_arg_value(args, "--skill", "0"))
+	var st_course := _arg_value(args, "--stream", "")
 	frontend = "--frontend" in args
 	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
 	# digest runs use, so driven courses are cross-checkable.
 	var ff_seed := int(_arg_value(args, "--seed", "12648430"))
 	freefall = not ff_course.is_empty()
+	stream = not st_course.is_empty()
+	if stream:
+		stream_course = int(st_course)
 	shot_path = _arg_value(args, "--screenshot", "")
 	if shot_path.is_relative_path() and not shot_path.is_empty():
 		var launch_dir := OS.get_environment("PWD")
@@ -349,6 +365,12 @@ func _ready() -> void:
 				bridge.get_last_error())
 			get_tree().quit(1)
 			return
+	elif stream:
+		if not bridge.load_stream(stream_course, ff_skill, ff_seed):
+			printerr("MdkBridge.load_stream failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
 	else:
 		if not bridge.load_level(level):
 			printerr("MdkBridge.load_level failed: ", bridge.get_last_error())
@@ -358,7 +380,8 @@ func _ready() -> void:
 			printerr("MdkBridge.load_arena failed: ", bridge.get_last_error())
 			get_tree().quit(1)
 			return
-	if not frontend and not freefall and not start.is_empty():
+	if not frontend and not freefall and not stream and \
+			not start.is_empty():
 		# NATIVE DIAGNOSTIC — re-anchor into --arena at the given MDK
 		# position (mirrors mdk-inspect's --arena/--start selftests).
 		var parts := start.split(" ", false)
@@ -395,11 +418,13 @@ func _ready() -> void:
 		# The frontend owns the screen; all gameplay layers stay
 		# hidden until a request lands a runtime mode.
 		_frontend_show()
-	elif not freefall:
+	elif not freefall and not stream:
 		# One idle frame settles the deterministic spawn camera.
 		bridge.step_frame_input(0.0, {})
 	if freefall:
 		_apply_freefall()
+	elif stream:
+		_apply_stream()
 	elif not frontend:
 		_apply_arena_snapshots()
 		_apply_object_snapshots()
@@ -425,6 +450,8 @@ func _ready() -> void:
 			_run_smoke_restore()
 		elif freefall:
 			_run_smoke_freefall(int(ff_course), ff_skill, ff_seed)
+		elif stream:
+			_run_smoke_stream(stream_course)
 		elif level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
 				arena == "HMO_1" and start.is_empty():
 			_run_smoke(data_root)
@@ -456,6 +483,10 @@ func _ready() -> void:
 		print(("mdk-godot: FREEFALL course=%d skill=%d seed=%08x  " +
 			"(arrows/WASD steer, F3 debug, Esc release/quit)") %
 			[int(ff_course), ff_skill, ff_seed])
+	elif stream:
+		print(("mdk-godot: STREAM course=%d skill=%d seed=%08x  " +
+			"(mode-5 intermission; Esc quits)") %
+			[stream_course, ff_skill, ff_seed])
 	else:
 		print(("mdk-godot: arena=%s arenas=%d  (WASD/QE move+strafe, " +
 			"AD turn, RF look, Space jump, mouse=captured, F1 " +
@@ -1617,6 +1648,9 @@ func _apply_freefall() -> void:
 		return
 	# Traversal HUD/view is mode-3 only — never over freefall.
 	_hide_hud()
+	# A prior mode-5 frame never overlaps the freefall view.
+	if $StreamLayer.visible:
+		$StreamLayer.visible = false
 	if ff_palette.is_empty() and bool(ff.get("palette_ok", false)):
 		ff_palette = ff["palette"]
 
@@ -1701,6 +1735,30 @@ func _apply_freefall() -> void:
 			child.queue_free()
 
 	_update_ff_debug(ff)
+
+
+# --- Phase 19B.1 — mode-5 intermission presentation ------------------
+# bridge.stream_frame() returns the last presented indexed frame
+# expanded through the applied 768B palette (the DAC surface — fades
+# and the terminal fill live in it). The texture is a persistent
+# ImageTexture updated in place, same contract as the frontend.
+
+func _apply_stream() -> void:
+	var fr: Dictionary = bridge.stream_frame()
+	if fr.is_empty():
+		return
+	var w := int(fr["w"])
+	var h := int(fr["h"])
+	st_img = Image.create_from_data(w, h, false, Image.FORMAT_RGBA8,
+		fr["rgba"])
+	if st_tex == null:
+		st_tex = ImageTexture.create_from_image(st_img)
+	else:
+		st_tex.update(st_img)
+	var r: TextureRect = $StreamLayer/StreamRect
+	r.texture = st_tex
+	r.visible = true
+	$StreamLayer.visible = true
 
 
 func _update_ff_debug(ff: Dictionary) -> void:
@@ -1933,6 +1991,86 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 	print("smoke(freefall): %d failure(s)" % failures)
 
 
+func _run_smoke_stream(course: int) -> void:
+	# Headless mode-5 presentation smoke (Phase 19B.1). Drives the
+	# same step path _process uses; asserts the host-side contract:
+	# indexed composition counters, palette uploads, the natural
+	# kExitMode exit, the terminal fill byte, and the deferred
+	# model/ribbon census. Model/ribbon raster is Phase 19B.2 — the
+	# deferred counters are the assertions, not visuals.
+	print("smoke(stream): course=%d" % course)
+	_check(int(bridge.get_mode()) == 5, "mode == 5 (stream)")
+	_check(bridge.stream_active(), "stream_active after load")
+
+	var res := {}
+	var frames := 0
+	var exited := false
+	while frames < 2200:
+		res = bridge.step_frame_input(33.333, {"actions": 0})
+		frames += 1
+		if not bool(res.get("ok", true)):
+			_check(false, "stream step failed: %s" %
+				bridge.get_last_error())
+			return
+		if bool(res.get("exited", false)):
+			exited = true
+			break
+	_check(exited, "stream reaches natural exit")
+	_apply_stream()
+	var d: Dictionary = bridge.stream_diag()
+	_check(int(d["terminal_fills"]) == 1, "one terminal fill")
+	# OBSERVED exit fills: 0xff for courses 0..3 (alive, non-final),
+	# 0x00 for course 4 (the final/dead path).
+	var want_fill := 0x00 if course >= 4 else 0xff
+	_check(int(d["terminal_fill"]) == want_fill,
+		"terminal fill == 0x%02x" % want_fill)
+	_check(int(d["presented"]) > 0, "frames presented")
+	_check(int(d["backdrop_blits"]) > 0, "backdrop blits")
+	_check(int(d["sprites"]) > 0, "sprite draw events")
+	_check(int(d["hud_blits"]) > 0, "HUD blits")
+	_check(int(d["palette_sets"]) > 0, "palette uploads")
+	# Real streams post no TELETYPE text (OBSERVED) — the count is
+	# reported, not asserted.
+	_check(int(d["models_deferred"]) > 0,
+		"model draws deferred (19B.2)")
+	_check(int(d["ribbons_deferred"]) > 0,
+		"ribbon tris deferred (19B.2)")
+	var fr: Dictionary = bridge.stream_frame()
+	_check(not fr.is_empty(),
+		"stream_frame returns the terminal image")
+	if not fr.is_empty():
+		_check(int(fr["w"]) == 600 and int(fr["h"]) == 360,
+			"presented frame is 600x360")
+		_check(PackedByteArray(fr["rgba"]).size() == 600 * 360 * 4,
+			"rgba payload == 600*360*4")
+	# Exit routes (OBSERVED dispatcher tail, checked in order):
+	# health<=0 -> mode 0 frontend; levelId<4 -> mode 6 loader;
+	# else levelId=5 + mode 7. On the canonical seed courses 0..3
+	# exit alive (hero latch) while course 4 drains the counter to
+	# the death latch -> health 0 -> mode 0.
+	var want_mode := 0 if course >= 4 else 6
+	_check(int(bridge.get_mode()) == want_mode,
+		"exit handoff -> mode %d" % want_mode)
+	# u64 digests print as two u32 halves — GDScript %x renders
+	# negative int64s signed.
+	var fbh := int(d["fb_hash"])
+	var plh := int(d["palette_hash"])
+	print(("  stream%d: frames=%d pres=%d bg=%d spr=%d+%dmiss " +
+		"hud=%d+%dmiss tt=%d pal=%d mdl=%d rib=%d snd=%d " +
+		"fill=0x%02x fb=%08x%08x pal=%08x%08x mode=%d") % [
+		course, frames,
+		int(d["presented"]), int(d["backdrop_blits"]),
+		int(d["sprites"]), int(d["sprite_misses"]),
+		int(d["hud_blits"]), int(d["hud_misses"]),
+		int(d["teletype_draws"]), int(d["palette_sets"]),
+		int(d["models_deferred"]), int(d["ribbons_deferred"]),
+		int(d["sound_events"]), int(d["terminal_fill"]),
+		(fbh >> 32) & 0xffffffff, fbh & 0xffffffff,
+		(plh >> 32) & 0xffffffff, plh & 0xffffffff,
+		int(bridge.get_mode())])
+	print("smoke(stream): %d failure(s)" % failures)
+
+
 func _update_debug_label() -> void:
 	if not $DebugUI.visible:
 		return
@@ -2100,6 +2238,9 @@ func _process(delta: float) -> void:
 			get_tree().quit(0)
 			return
 	var mode := int(bridge.get_mode())
+	# Standalone mode-5 flag — under the frontend route the scene is
+	# stepped inside _frontend_frame instead (one step per frame).
+	var stream_standalone := mode == 5 and not fe_active
 	if fe_active and (mode == 0 or (mode >= 5 and mode <= 8)):
 		# The frontend route owns the frame: mode 0 runs the shell
 		# loop, modes 5-8 run the progression pump until a presented
@@ -2115,7 +2256,8 @@ func _process(delta: float) -> void:
 			_frontend_hide()
 		else:
 			pass
-	if shot_path.is_empty() and (mode == 2 or mode == 3):
+	if shot_path.is_empty() and (mode == 2 or mode == 3 or
+			stream_standalone):
 		# Screenshot mode keeps the exact frame-0 spawn pose.
 		var input := {
 			"actions": _input_mask(),
@@ -2151,11 +2293,30 @@ func _process(delta: float) -> void:
 		# FUN_004123f4 fixed-orientation camera + 0x4edc04 fade.
 		_apply_freefall()
 		return
+	if mode == 5:
+		# Standalone StreamScene — the step above may have run the
+		# exit handoff; the terminal fill frame still uploads. Under
+		# the frontend route _frontend_frame already presented.
+		if stream_standalone:
+			_apply_stream()
+		return
+	if stream_standalone:
+		# The mode-5 exit flipped the mode inside the step — upload
+		# the terminal-fill frame once, then idle (modes 6/7/8 have
+		# no standalone presenter; the frontend route owns them when
+		# a campaign drives the progression).
+		_apply_stream()
 	if mode == 0:
 		# Frontend route (post-death handoff or unload) — the mode-0
 		# shell is a documented seam; freeze the last frame.
 		return
+	if mode != 3:
+		# Post-intermission progression modes (6/7/8) present nothing
+		# on the standalone route.
+		return
 	# Mode 3 (traversal — reached directly or via the handoff).
+	if $StreamLayer.visible:
+		$StreamLayer.visible = false
 	if $FreefallRoot.visible:
 		$FreefallRoot.visible = false
 		$FadeLayer/FadeRect.visible = false
@@ -4323,6 +4484,7 @@ func _hide_gameplay_layers() -> void:
 	$ScopeLayer.visible = false
 	$ShotCamLayer.visible = false
 	$HudLayer.visible = false
+	$StreamLayer.visible = false
 
 
 func _show_gameplay_layers() -> void:
@@ -4488,6 +4650,17 @@ func _frontend_frame(delta: float, mode: int) -> void:
 	# Modes 5..8 — the progression pump. No runtime/presentation of
 	# their own: a bounded placeholder hold (or a confirm) marks the
 	# stage-complete seam, then the bridge installs the next mode.
+	#
+	# Mode 5 is the exception once the pump installs the live
+	# StreamScene (frontend_progression_step arms campaignStreamEnter_
+	# on first contact): the scene is stepped + presented here, one
+	# frame per tick, until its kExitMode drives the handoff.
+	if mode == 5 and bridge.stream_active():
+		bridge.step_frame_input(delta * 1000.0,
+			{"actions": _input_mask()})
+		_apply_stream()
+		bridge.frontend_end_frame(delta * 1000.0)
+		return
 	fe_stage_hold -= 1
 	var done := fe_stage_hold <= 0 or \
 		bool(input.get("confirm", false))

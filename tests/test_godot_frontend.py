@@ -207,6 +207,65 @@ class GodotFreefallSmoke(unittest.TestCase):
                           extra=("bones flyby on course>=4",))
 
 
+def have_stream_data():
+    data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
+    return (Path(data) / "STREAM" / "STREAM.BNI").exists()
+
+
+@unittest.skipUnless(*have_prereqs())
+class GodotStreamSmoke(unittest.TestCase):
+    """Phase 19B.1 — mode-5 intermission presentation smoke.
+
+    Runs the canonical launcher with --stream on the two boundary
+    courses: c0 (alive exit -> white fill 0xff, mode-6 loader route)
+    and c4 (final course — death latch -> black fill 0x00, mode-0
+    frontend route). Asserts the presentation counters and deferred
+    model/ribbon census via the smoke's own checks; the diagnostic
+    line pins the golden event census verbatim.
+    """
+
+    def run_smoke(self, course, skill, seed):
+        return subprocess.run(
+            [str(RUN_SH), "--smoke", "--stream", str(course),
+             "--skill", str(skill), "--seed", str(seed)],
+            capture_output=True, text=True, timeout=600)
+
+    def check_course(self, course, extra=()):
+        if not have_stream_data():
+            self.skipTest("no STREAM data in data root")
+        proc = self.run_smoke(course, 1, 0xC0FFEE)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("SCRIPT ERROR", out)
+        m = re.search(r"smoke\(stream\): (\d+) failure", out)
+        self.assertIsNotNone(m, f"no smoke verdict in output:\n{out}")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"godot exited {proc.returncode}:\n{out}")
+        self.assertEqual(m.group(1), "0", f"smoke failures:\n{out}")
+        for pat in extra:
+            self.assertIn(pat, out)
+
+    def test_stream_course0(self):
+        # Alive exit: fill 0xff, mode 6; census matches the 19A
+        # golden draw-summary (spr/hud/mdl/rib verbatim).
+        self.check_course(0, extra=(
+            "fill=0xff",
+            "exit handoff -> mode 6",
+            "spr=6120+1806miss",
+            "rib=139162",
+            "pal=02b99a68d9993a25"))
+
+    def test_stream_course4(self):
+        # Final course: the counter drains to the death latch ->
+        # black fill 0x00 -> mode 0 frontend route.
+        self.check_course(4, extra=(
+            "fill=0x00",
+            "exit handoff -> mode 0",
+            "spr=4764+1402miss",
+            "rib=97740",
+            "pal=9fa9e040e0eedf25"))
+
+
 def have_level(num):
     data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
     d = f"LEVEL{num}"

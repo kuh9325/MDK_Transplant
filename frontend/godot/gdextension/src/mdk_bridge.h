@@ -64,9 +64,11 @@
 #include "core/traversal_audio_mixer.h"
 #include "core/traversal_runtime.h"
 #include "core/player_projectiles.h"
+#include "core/stream_scene.h"
 
 #include "frontend_presenter.h"
 #include "mdk_objid.h"
+#include "stream_presenter.h"
 
 namespace godot {
 
@@ -446,6 +448,28 @@ class MdkBridge : public RefCounted {
   // names return an empty dict.
   Dictionary get_freefall_material(const String& name);
 
+  // --- Phase 19B.1 — Mode-5 StreamScene presentation --------------
+  // Direct mode-5 entry (the --stream launcher): loads
+  // STREAM/STREAM.BNI + MISC/MDKFONT.FTI + TRAVERSE/TRAVSPRT.BNI,
+  // binds StreamAssets by the OBSERVED FUN_0042b270 record names,
+  // inits StreamScene and arms the progression session so the exit
+  // routes exactly like the campaign path (health<=0 -> frontend,
+  // levelId<4 -> loader, else mode 7). `skill` is 0..2 (54147a);
+  // `seed` loads the shared LCG state.
+  bool load_stream(int64_t course, int64_t skill, int64_t seed);
+  // A StreamScene is bound and stepping (mode_ == 5).
+  bool stream_active() const { return stream_ != nullptr; }
+  // The last presented Mode-5 frame — {w,h,rgba} 600x360 RGBA8 plus
+  // the presentation diagnostics and the terminal-fill byte. The
+  // indexed surface is copy-safe (a fresh PackedByteArray per call);
+  // seq increments once per presented frame so callers can skip
+  // redundant texture uploads.
+  Dictionary stream_frame();
+  // The running presentation counters — presented/backdrop/sprite/
+  // HUD/teletype/palette/deferred-model/deferred-ribbon/fill counts
+  // and the fb/palette FNV digests (pre-palette / 768B applied).
+  Dictionary stream_diag();
+
  private:
   // One arena's complete presentation bundle — collision parse,
   // render data, palette-composed textures, ordered tris, and the
@@ -587,6 +611,41 @@ class MdkBridge : public RefCounted {
   int ffHandoffRoute_ = -1;          // ProgressionRoute, or -1
   std::string ffHandoffDetail_;
   std::unordered_map<std::string, Ref<ImageTexture>> ffTex_;
+
+  // --- Phase 19B.1 — Mode-5 StreamScene host ----------------------
+  // The mode-5 step behind stepCore_ when mode_ == 5: folds the QA
+  // action mask into the two steering axes (the host's FUN_00407f2c
+  // domain — digital +-180), runs one StreamScene tick on the
+  // canonical 1/30 frame delta + synthetic 30Hz limiter clock (the
+  // golden harness convention — host pacing is a later phase),
+  // drains the event queue into the presenter, and runs the
+  // dispatcher-exit handoff once the scene signals finished.
+  Dictionary stepStream_(double dt_ms, int64_t action_mask,
+                         const Dictionary* input);
+  // Shared StreamAssets bind + presenter resource table — used by
+  // load_stream (fresh session) and campaignStreamEnter_ (the
+  // session carries levelId/skill/rng/health through).
+  bool streamLoadAssets_(std::string& detail);
+  bool campaignStreamEnter_(std::string& detail);
+  // Dispatcher exit (0x4015c3): health/rng writeback to the session
+  // globals, teardown (FUN_0042c824), then the tally-done
+  // progression step (health<=0 -> 0, levelId<4 -> 6, else 7).
+  void streamHandoff_();
+
+  std::unique_ptr<mdk::StreamScene> stream_;
+  mdk::StreamAssets streamAssets_{};   // bound pointers alias the
+                                       // byte buffers below
+  mdkbridge::StreamPresenter streamPresenter_;
+  // Owning buffers every bound pointer aliases (StreamAssets spans
+  // point into streamBniBytes_; the palette head + fonts read
+  // streamFtiBytes_; HUD images decode out of streamHudBytes_).
+  std::vector<std::byte> streamBniBytes_;
+  std::vector<std::byte> streamFtiBytes_;
+  std::vector<std::byte> streamHudBytes_;
+  std::optional<mdk::RuntimeModel> streamProtoKurt_, streamProtoBones_,
+      streamProtoProf_, streamProtoEsc_;
+  int streamNowMs_ = 0;          // synthetic 46c650 clock (ms)
+  std::uint64_t streamFrameSeq_ = 0;   // presented-frame counter
 
   std::optional<mdk::DataRoot> root_;
   std::unique_ptr<mdk::TraversalRuntime> rt_;

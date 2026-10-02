@@ -12,12 +12,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "core/dynamic_objects.h"
+#include "core/stream_scene.h"
 #include "gif_decode.h"
 #include "mdk_math.h"
 #include "mdk_objid.h"
+#include "stream_presenter.h"
 
 static int gChecks = 0, gFailures = 0;
 
@@ -647,6 +651,324 @@ int main() {
         g.push_back(0x3b);
         CHECK(!mdkbridge::decodeGifImage(g));
       }
+    }
+  }
+
+  // ---- Phase 19B.1 — StreamPresenter synthetic tests --------------
+  // Every fixture is synthetic: indexed images, a 768B DAC image, and
+  // two-glyph FTI fonts. No proprietary data. The events are the
+  // core's StreamEvent PODs built field-by-field — the same surface
+  // the bridge drains.
+  {
+    using mdk::StreamEvent;
+    mdkbridge::StreamPresenter pres;
+
+    auto mkEv = [](StreamEvent::Kind k) {
+      StreamEvent e;
+      e.kind = k;
+      return e;
+    };
+
+    // --- palette application (kPaletteSet) -------------------------
+    // A DAC image the core would hand the host: index i -> (i,255-i,
+    // i*2). The presenter copies it verbatim — the transform math
+    // stays in core (paletteRamp is CLOSED there).
+    std::uint8_t dac[768];
+    for (int i = 0; i < 256; ++i) {
+      dac[i * 3 + 0] = std::uint8_t(i);
+      dac[i * 3 + 1] = std::uint8_t(255 - i);
+      dac[i * 3 + 2] = std::uint8_t(i * 2);
+    }
+    {
+      StreamEvent e = mkEv(StreamEvent::kPaletteSet);
+      pres.consume(e, dac);
+      const auto& d = pres.diag();
+      CHECK(d.paletteSets == 1);
+      CHECK(d.paletteHash ==
+            mdk::fnv1a64(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(dac), 768)));
+      const auto& pal = pres.palette();
+      CHECK(pal.get(7).r == 7 && pal.get(7).g == 248 &&
+            pal.get(7).b == 14 && pal.get(7).a == 255);
+      // Palette update does not touch the indexed framebuffer.
+      const auto& fb0 = pres.framebuffer();
+      bool fbClean = true;
+      for (std::size_t i = 0; i < fb0.pixelCount(); ++i)
+        fbClean &= fb0.pixels()[i] == 0;
+      CHECK(fbClean);
+    }
+
+    // --- toroidal backdrop blit (kBackdropBlit) --------------------
+    // dst(x,y) = src((x+U) mod 600, (y+V) mod 360) — the two-piece
+    // e684 copy. Synthetic image: pixel (x,y) holds (x^y)&0xff.
+    {
+      mdk::IndexedImage bg;
+      bg.width = 600;
+      bg.height = 360;
+      bg.stride = 600;
+      bg.pixels.resize(600 * 360);
+      for (int y = 0; y < 360; ++y)
+        for (int x = 0; x < 600; ++x)
+          bg.pixels[std::size_t(y) * 600 + x] =
+              std::uint8_t((x ^ y) & 0xff);
+      pres.bindImage(10, bg);
+      StreamEvent e = mkEv(StreamEvent::kBackdropBlit);
+      e.tag = 10;
+      e.f[0] = 137.0f;              // U
+      e.f[1] = 201.0f;              // V
+      pres.consume(e, dac);
+      const auto& fb = pres.framebuffer();
+      auto at = [&](int x, int y) { return fb.at(x, y); };
+      CHECK(at(0, 0) == std::uint8_t((137 ^ 201) & 0xff));
+      CHECK(at(463, 0) == std::uint8_t((0 ^ 201) & 0xff));   // wrap x
+      CHECK(at(0, 159) == std::uint8_t((137 ^ 0) & 0xff));   // wrap y
+      CHECK(at(599, 359) ==
+            std::uint8_t(((599 + 137) % 600 ^
+                          (359 + 201) % 360) & 0xff));
+      CHECK(pres.diag().backdropBlits == 1);
+    }
+
+    // --- sprite draw: center anchor, 8.8 size, pen-0 key, order ----
+    {
+      // 8x8 image, pen 0x80; a hole at (3,3) stays transparent.
+      mdk::IndexedImage spr;
+      spr.width = 8;
+      spr.height = 8;
+      spr.stride = 8;
+      spr.pixels.assign(64, 0x80);
+      spr.pixels[3 * 8 + 3] = 0;
+      pres.bindImage(20, spr);
+
+      // Lay a marker region first so the pen-0 hole is observable.
+      for (int y = 50; y < 80; ++y)
+        for (int x = 90; x < 115; ++x)
+          pres.framebuffer().put(x, y, 0x11);
+
+      // size 0x100 = 1:1 — effW = 8*256>>8 = 8, center-anchored.
+      StreamEvent e = mkEv(StreamEvent::kSpriteDraw);
+      e.tag = 20;
+      e.f[0] = 100.0f;
+      e.f[1] = 60.0f;
+      e.f[2] = 256.0f;
+      pres.consume(e, dac);
+      const auto& fb = pres.framebuffer();
+      CHECK(fb.at(100, 60) == 0x80);          // covered by the sprite
+      CHECK(fb.at(96, 56) == 0x80);           // top-left = c-4
+      CHECK(fb.at(103, 63) == 0x80);          // bottom-right = c+3
+      CHECK(fb.at(95, 56) == 0x11);           // left of the sprite
+      CHECK(fb.at(104, 63) == 0x11);          // right of it
+      CHECK(fb.at(99, 59) == 0x11);           // (3,3) hole: pen 0 skips
+      CHECK(pres.diag().sprites == 1 &&
+            pres.diag().spriteMisses == 0);
+
+      // Painter order: a second sprite drawn over the same area wins
+      // (consume order is the core's far-first emission order).
+      mdk::IndexedImage spr2 = spr;
+      spr2.pixels.assign(64, 0x90);
+      pres.bindImage(21, spr2);
+      e.tag = 21;
+      pres.consume(e, dac);
+      CHECK(fb.at(100, 60) == 0x90);
+
+      // 2x scale: size 0x200 -> effW = 8*512>>8 = 16, center holds.
+      StreamEvent e2 = mkEv(StreamEvent::kSpriteDraw);
+      e2.tag = 21;
+      e2.f[0] = 300.0f;
+      e2.f[1] = 200.0f;
+      e2.f[2] = 512.0f;
+      pres.consume(e2, dac);
+      CHECK(fb.at(300, 200) == 0x90);
+      CHECK(fb.at(292, 192) == 0x90);         // c-8 corner
+      CHECK(fb.at(307, 207) == 0x90);         // c+7 corner
+      CHECK(fb.at(291, 192) != 0x90);
+
+      // Unbound tag -> counted miss, no draw.
+      StreamEvent e3 = mkEv(StreamEvent::kSpriteDraw);
+      e3.tag = 999;
+      e3.f[0] = 50.0f;
+      e3.f[1] = 50.0f;
+      e3.f[2] = 256.0f;
+      const int spritesBefore = pres.diag().sprites;
+      pres.consume(e3, dac);
+      CHECK(pres.diag().sprites == spritesBefore + 1 &&
+            pres.diag().spriteMisses >= 1);
+    }
+
+    // --- HUD subrect blit (kHudBlit) -------------------------------
+    {
+      pres.reset();
+      // 80x4 digit strip — cell d starts at byte offset d*8.
+      mdk::IndexedImage strip;
+      strip.width = 80;
+      strip.height = 4;
+      strip.stride = 80;
+      strip.pixels.assign(320, 0x00);
+      for (int d = 0; d < 10; ++d)
+        for (int r = 0; r < 4; ++r)
+          for (int c = 0; c < 8; ++c)
+            strip.pixels[std::size_t(r) * 80 + d * 8 + c] =
+                std::uint8_t(0x40 + d);
+      pres.bindImage(30, strip);
+      StreamEvent e = mkEv(StreamEvent::kHudBlit);
+      e.tag = 30;
+      e.aux = 5 * 8;                          // srcOff = digit 5 cell
+      e.f[0] = 20.0f;                         // dstX
+      e.f[1] = 30.0f;                         // dstY
+      e.f[2] = 8.0f;                          // w
+      e.f[3] = 4.0f;                          // h
+      e.f[4] = 80.0f;                         // srcStride (strip width)
+      e.f[5] = 0.0f;                          // transparent key
+      pres.consume(e, dac);
+      const auto& fb = pres.framebuffer();
+      CHECK(fb.at(20, 30) == 0x45);
+      CHECK(fb.at(27, 33) == 0x45);
+      CHECK(fb.at(28, 30) == 0);              // past cell w
+      CHECK(pres.diag().hudBlits == 1 &&
+            pres.diag().hudMisses == 0);
+
+      // Pen-key skip: a 0 byte in the cell stays transparent — the
+      // second blit leaves the first blit's 0x45 in place (a non-keyed
+      // copy would overwrite it with 0).
+      mdk::IndexedImage s2 = strip;
+      s2.pixels[1 * 80 + 5 * 8 + 0] = 0;
+      pres.bindImage(30, s2);
+      pres.consume(e, dac);
+      CHECK(fb.at(20, 31) == 0x45);           // keyed byte skipped
+    }
+
+    // --- TELETYPE (kTeletypeDraw) ----------------------------------
+    {
+      pres.reset();
+      // Synthetic fonts: FONTBIG 'A' = 8x13 solid pen 0x77 (advance
+      // = width); FONTSML 'z' = 4x6 pen 0x33. Everything else falls
+      // back to the missing-glyph advance (6 / 4).
+      mdk::FtiFont fontBig{}, fontSml{};
+      fontBig.glyphs.resize(256);
+      fontSml.glyphs.resize(256);
+      {
+        mdk::FtiGlyph g;
+        g.code = 'A';
+        g.top = 10;
+        g.bottom = 2;                         // rows = 13
+        g.width = 8;
+        g.pixels.assign(8 * 13, 0x77);
+        fontBig.glyphs['A'] = g;
+        fontBig.mappedCount = 1;
+        fontBig.firstMapped = fontBig.lastMapped = 'A';
+      }
+      {
+        mdk::FtiGlyph g;
+        g.code = 'z';
+        g.top = 4;
+        g.bottom = 1;                         // rows = 6
+        g.width = 4;
+        g.pixels.assign(4 * 6, 0x33);
+        fontSml.glyphs['z'] = g;
+        fontSml.mappedCount = 1;
+        fontSml.firstMapped = fontSml.lastMapped = 'z';
+      }
+      pres.bindFonts(fontBig, fontSml);
+
+      // Renderer 0, short line: FONTBIG centered — "AA" measures 16,
+      // x = (600-16)/2 = 292; pen y = 100 puts glyph rows 90..102.
+      StreamEvent e = mkEv(StreamEvent::kTeletypeDraw);
+      e.tag = 0;
+      e.aux = 100;
+      e.f[0] = 0.0f;
+      e.name = "AA";
+      pres.consume(e, dac);
+      const auto& fb = pres.framebuffer();
+      CHECK(fb.at(292, 90) == 0x77);          // centered origin
+      CHECK(fb.at(299, 102) == 0x77);         // glyph 0 bottom-right
+      CHECK(fb.at(300, 90) == 0x77);          // glyph 1 starts
+      CHECK(fb.at(291, 90) == 0);
+      CHECK(pres.diag().teletypeDraws == 1);
+
+      // Renderer 0 fallback: unmapped bytes measure 6 each in
+      // FONTBIG — 120 * 6 = 720 >= 600 -> FONTSML draws (advance 4,
+      // 'z' mapped): 119*4 + 4 = 480 wide, x = 60.
+      pres.reset();
+      pres.bindFonts(fontBig, fontSml);
+      e.name = std::string(120, 'z');
+      pres.consume(e, dac);
+      CHECK(fb.at(60, 100 - 4) == 0x33);
+      CHECK(fb.at(59, 100 - 4) == 0);
+
+      // Renderer 1 (scaled): "A" at scale 2.0 -> w = trunc(8*2)=16,
+      // x = trunc((600-16)/2) = 292; glyphTopY = trunc(100-10*2) = 80
+      // and the glyph scales to 16 px wide.
+      pres.reset();
+      pres.bindFonts(fontBig, fontSml);
+      e.tag = 1;
+      e.f[0] = 2.0f;
+      e.name = "A";
+      pres.consume(e, dac);
+      CHECK(fb.at(292, 80) == 0x77);
+      CHECK(fb.at(307, 80) == 0x77);          // 16-px wide glyph
+      CHECK(fb.at(308, 80) == 0);
+      CHECK(fb.at(291, 80) == 0);
+    }
+
+    // --- present boundary + digests --------------------------------
+    {
+      pres.reset();
+      // Model/ribbon carry-through: counted, framebuffer untouched.
+      StreamEvent m = mkEv(StreamEvent::kModelDraw);
+      StreamEvent r = mkEv(StreamEvent::kRibbonTri);
+      pres.consume(m, dac);
+      pres.consume(r, dac);
+      CHECK(pres.diag().modelsDeferred == 1 &&
+            pres.diag().ribbonsDeferred == 1);
+      bool clean = true;
+      for (std::size_t i = 0; i < pres.framebuffer().pixelCount();
+           ++i)
+        clean &= pres.framebuffer().pixels()[i] == 0;
+      CHECK(clean && !pres.framePending());
+
+      StreamEvent p = mkEv(StreamEvent::kPresent);
+      pres.consume(p, dac);
+      CHECK(pres.diag().presented == 1);
+      CHECK(pres.framePending());
+      const std::uint64_t h0 = pres.diag().fbHash;
+      pres.clearFramePending();
+      CHECK(!pres.framePending());
+      // A non-present event does not advance the fb digest.
+      StreamEvent m2 = mkEv(StreamEvent::kModelDraw);
+      pres.consume(m2, dac);
+      CHECK(pres.diag().fbHash == h0);
+      // Mutate the fb then present again — the digest tracks it.
+      pres.framebuffer().put(0, 0, 0x55);
+      pres.consume(p, dac);
+      CHECK(pres.diag().presented == 2);
+      CHECK(pres.diag().fbHash != h0);
+    }
+
+    // --- terminal fill (kExitMode) ----------------------------------
+    {
+      pres.reset();
+      // The core memsets paletteDac before the event — the host sees
+      // the uniform 768B table. White exit (alive, non-final).
+      std::uint8_t fillPal[768];
+      std::memset(fillPal, 0xff, sizeof fillPal);
+      StreamEvent e = mkEv(StreamEvent::kExitMode);
+      e.aux = 0xff;
+      pres.consume(e, fillPal);
+      CHECK(pres.diag().terminalFills == 1);
+      CHECK(pres.diag().terminalFill == 0xff);
+      CHECK(pres.palette().get(0).r == 255 &&
+            pres.palette().get(0).g == 255 &&
+            pres.palette().get(0).b == 255);
+      CHECK(pres.framePending());   // terminal frame still uploads
+
+      // Black exit (final/dead course).
+      pres.reset();
+      std::memset(fillPal, 0x00, sizeof fillPal);
+      e.aux = 0x00;
+      pres.consume(e, fillPal);
+      CHECK(pres.diag().terminalFill == 0x00);
+      CHECK(pres.palette().get(200).r == 0 &&
+            pres.palette().get(200).g == 0 &&
+            pres.palette().get(200).b == 0);
     }
   }
 

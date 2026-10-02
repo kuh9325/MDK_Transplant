@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "core/bni_directory.h"
+#include "core/bni_image.h"
 #include "core/dti_structure.h"
 #include "core/enemy_runtime.h"
 #include "core/frontend_transition.h"
@@ -26,6 +28,7 @@
 #include "core/mto_directory.h"
 #include "core/save_full_restore.h"
 #include "core/save_full_write.h"
+#include "core/stream_context.h"
 #include "core/thmb_capture.h"
 
 #include "arena_presenter.h"
@@ -166,6 +169,16 @@ void MdkBridge::_bind_methods() {
       &MdkBridge::get_freefall_object_geometry);
   ClassDB::bind_method(D_METHOD("get_freefall_material", "name"),
                        &MdkBridge::get_freefall_material);
+  // Phase 19B.1 — mode-5 StreamScene presentation.
+  ClassDB::bind_method(
+      D_METHOD("load_stream", "course", "skill", "seed"),
+      &MdkBridge::load_stream);
+  ClassDB::bind_method(D_METHOD("stream_active"),
+                       &MdkBridge::stream_active);
+  ClassDB::bind_method(D_METHOD("stream_frame"),
+                       &MdkBridge::stream_frame);
+  ClassDB::bind_method(D_METHOD("stream_diag"),
+                       &MdkBridge::stream_diag);
   // Phase 18B.1 — frontend host services.
   ClassDB::bind_method(D_METHOD("frontend_boot", "save_dir"),
                        &MdkBridge::frontend_boot);
@@ -1139,9 +1152,11 @@ Dictionary MdkBridge::step_frame_input(double dt_ms,
 Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
                                 const Dictionary* input) {
   Dictionary out;
-  // Mode routing (0x541492): mode 2 runs the freefall core, mode 3
-  // (and the standalone load_level path) runs traversal.
+  // Mode routing (0x541492): mode 2 runs the freefall core, mode 5
+  // the StreamScene, mode 3 (and the standalone load_level path)
+  // runs traversal.
   if (mode_ == 2) return stepFreefall_(dt_ms, action_mask, input);
+  if (mode_ == 5) return stepStream_(dt_ms, action_mask, input);
   if (!rt_) {
     setError_("no level loaded");
     return out;
@@ -2671,6 +2686,409 @@ Ref<ImageTexture> MdkBridge::freefallTexture_(
   return tex;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19B.1 — Mode-5 StreamScene presentation host
+//
+// The StreamScene core (Phase 19A, CLOSED) owns the simulation; this
+// block is the host half of its documented seams: the FUN_0042b270
+// resource bind, the 600x360 indexed surface, the 768B DAC surface,
+// the toroidal backdrop copy, the FUN_00403a40 scaled sprite blit,
+// the FUN_004185fc HUD blit, the TELETYPE line draws, the terminal
+// palette fill, and the kPresent/kExitMode frame boundaries. The
+// 0c860 model/ribbon raster family stays deferred (Phase 19B.2) —
+// the events are consumed and counted, never rasterized/reordered.
+// ---------------------------------------------------------------------------
+
+bool MdkBridge::load_stream(int64_t course, int64_t skill,
+                            int64_t seed) {
+  if (!root_) {
+    setError_("initialize() first");
+    return false;
+  }
+  shutdown();   // drops rt_/ff_/stream_ buffers on reload; root_ kept
+  if (course < 0 || course > 4 || skill < 0 || skill > 2) {
+    setError_("load_stream: course 0..4, skill 0..2");
+    return false;
+  }
+  // The standalone entry arms the same session globals the campaign
+  // carries into mode 5 (541492/541498/54147a/541554 + the shared
+  // LCG state) — a fresh-session health=100.
+  sess_.mode = 5;
+  sess_.levelId = int(course);
+  sess_.skill = int(skill);
+  sess_.rng = std::uint32_t(seed);
+  sess_.health = 100;
+  std::string detail;
+  if (!campaignStreamEnter_(detail)) {
+    setError_("load_stream: " + detail);
+    return false;
+  }
+  return true;
+}
+
+bool MdkBridge::streamLoadAssets_(std::string& detail) {
+  stream_.reset();
+  streamPresenter_.reset();
+  streamProtoKurt_.reset();
+  streamProtoBones_.reset();
+  streamProtoProf_.reset();
+  streamProtoEsc_.reset();
+  streamAssets_ = mdk::StreamAssets{};
+
+  std::string err;
+  auto bni = root_->readFile("STREAM/STREAM.BNI", 1 << 28, &err);
+  if (!bni) {
+    detail = "STREAM/STREAM.BNI: " + err;
+    return false;
+  }
+  auto fti = root_->readFile("MISC/MDKFONT.FTI", 1 << 28, &err);
+  if (!fti) {
+    detail = "MISC/MDKFONT.FTI: " + err;
+    return false;
+  }
+  // The mode-5 HUD consumes the ENGINE-side image table slots
+  // (FUN_00418688 at 0x49a828), not STREAM records — slot 2 = SC_STAT
+  // status icon, slot 7 = the SNIP_TXT digit strip (OBSERVED).
+  auto hud = root_->readFile("TRAVERSE/TRAVSPRT.BNI", 1 << 28, &err);
+  if (!hud) {
+    detail = "TRAVERSE/TRAVSPRT.BNI: " + err;
+    return false;
+  }
+  streamBniBytes_ = std::move(*bni);
+  streamFtiBytes_ = std::move(*fti);
+  streamHudBytes_ = std::move(*hud);
+
+  const auto bdir = mdk::inspectBniDirectory(
+      std::span<const std::byte>(streamBniBytes_.data(),
+                                 streamBniBytes_.size()));
+  if (bdir.status != mdk::BniDirectoryStatus::kOk) {
+    detail = std::string("STREAM.BNI: ") +
+             std::string(mdk::bniDirectoryStatusName(bdir.status)) +
+             " — " + bdir.detail;
+    return false;
+  }
+  const auto hdir = mdk::inspectBniDirectory(
+      std::span<const std::byte>(streamHudBytes_.data(),
+                                 streamHudBytes_.size()));
+  if (hdir.status != mdk::BniDirectoryStatus::kOk) {
+    detail = std::string("TRAVSPRT.BNI: ") +
+             std::string(mdk::bniDirectoryStatusName(hdir.status)) +
+             " — " + hdir.detail;
+    return false;
+  }
+  const auto fdir = mdk::inspectFtiDirectory(
+      std::span<const std::byte>(streamFtiBytes_.data(),
+                                 streamFtiBytes_.size()));
+  if (fdir.status != mdk::FtiDirectoryStatus::kOk) {
+    detail = std::string("MDKFONT.FTI: ") +
+             std::string(mdk::ftiDirectoryStatusName(fdir.status)) +
+             " — " + fdir.detail;
+    return false;
+  }
+
+  auto tagOf = [&](const mdk::BniDirectory& d,
+                   const char* name) -> int {
+    const mdk::BniRecord* r = mdk::findBniRecord(d, name);
+    return r ? static_cast<int>(r - d.records.data()) : -1;
+  };
+  auto payload = [&](const mdk::BniDirectory& d,
+                     const std::vector<std::byte>& bytes,
+                     const char* name) -> std::span<const std::byte> {
+    const mdk::BniRecord* r = mdk::findBniRecord(d, name);
+    if (!r) return {};
+    return {bytes.data() + r->payloadFileOffset,
+            static_cast<std::size_t>(r->payloadEnd -
+                                     r->payloadFileOffset)};
+  };
+
+  // The proven STREAM palette compose (stream_context.h): 192B
+  // SYS_PAL head + PAL[0xc0..0x300) — the 768B scene palette.
+  std::array<std::uint8_t, 768> streamPal{};
+  if (const mdk::FtiRecord* sp =
+          mdk::findFtiRecord(fdir, mdk::kStreamSystemRecord)) {
+    streamAssets_.paletteGlobal =
+        reinterpret_cast<const std::uint8_t*>(
+            streamFtiBytes_.data() + sp->payloadFileOffset);
+    std::memcpy(streamPal.data(), streamAssets_.paletteGlobal, 192);
+  }
+  const std::span<const std::byte> pal =
+      payload(bdir, streamBniBytes_, "PAL");
+  if (!pal.empty()) {
+    streamAssets_.palettePal =
+        reinterpret_cast<const std::uint8_t*>(pal.data()) +
+        mdk::kStreamPaletteTailOffset;
+    std::memcpy(streamPal.data() + 192, streamAssets_.palettePal,
+                576);
+  }
+  const std::span<const std::byte> palSpan(
+      reinterpret_cast<const std::byte*>(streamPal.data()),
+      streamPal.size());
+
+  // The indexed image records — decoded into the presenter's table
+  // keyed by the tag the core echoes in its events. Fail-soft per
+  // record: a missing image leaves the event counted-but-undrawn.
+  auto bindIndexed = [&](const mdk::BniDirectory& d,
+                         const std::vector<std::byte>& bytes,
+                         const char* name, int tag,
+                         int* outW = nullptr,
+                         int* outH = nullptr) -> bool {
+    const std::span<const std::byte> p = payload(d, bytes, name);
+    if (p.empty() || tag < 0) return false;
+    std::string derr;
+    auto img = mdk::decodeBniIndexedImage(p, palSpan, &derr);
+    if (!img) return false;
+    if (outW) *outW = img->width;
+    if (outH) *outH = img->height;
+    streamPresenter_.bindImage(tag, std::move(*img));
+    return true;
+  };
+
+  mdk::StreamAssets& a = streamAssets_;
+  a.bgTag = tagOf(bdir, "BG");
+  bindIndexed(bdir, streamBniBytes_, "BG", a.bgTag);
+  int planetW = 0, planetH = 0;
+  a.planetTag[0] = tagOf(bdir, "PLANET");
+  // The native's PLANET table entry is {img, w, h, w*h} — the draw
+  // record reads [1]/[2] as the source dims (the e55c tail).
+  if (bindIndexed(bdir, streamBniBytes_, "PLANET", a.planetTag[0],
+                  &planetW, &planetH)) {
+    a.planetTag[1] = planetW;
+    a.planetTag[2] = planetH;
+    a.planetTag[3] = planetW * planetH;
+  }
+  a.lightTag = tagOf(bdir, "LIGHT");
+  bindIndexed(bdir, streamBniBytes_, "LIGHT", a.lightTag);
+  a.sndWind = tagOf(bdir, "WIND");
+  a.sndHitside = tagOf(bdir, "HITSIDE");
+  a.sndRescue = tagOf(bdir, "RESCUE");
+  a.sndApple = tagOf(bdir, "APPLE");
+  for (int i = 0; i != 7; ++i) {
+    char nm[8];
+    std::snprintf(nm, sizeof nm, "HURT%d", i + 1);
+    a.sndHurt[i] = tagOf(bdir, nm);
+  }
+
+  // Engine HUD table slots (0x49a828): 2 = SC_STAT, 7 = SNIP_TXT —
+  // the OBSERVED native bindings; the tags are those slot ids.
+  a.hudIconTag = 2;
+  a.hudDigitTag = 7;
+  bindIndexed(hdir, streamHudBytes_, "SC_STAT", a.hudIconTag,
+              &a.hudIconW, &a.hudIconH);
+  bindIndexed(hdir, streamHudBytes_, "SNIP_TXT", a.hudDigitTag,
+              &a.hudDigitW, &a.hudDigitH);
+
+  auto bindProto = [&](const char* name,
+                       std::optional<mdk::RuntimeModel>& out) {
+    const mdk::BniRecord* r = mdk::findBniRecord(bdir, name);
+    if (!r) return;
+    const std::byte* p =
+        streamBniBytes_.data() + r->payloadFileOffset;
+    const std::size_t n = static_cast<std::size_t>(
+        r->payloadEnd - r->payloadFileOffset);
+    // Re-head for the shared parser — the original passes the flag
+    // word as FUN_00428400's EDX arg (flag=1, OBSERVED); BNI payloads
+    // omit it. Same convention as --stream-init/traversalShotModel.
+    std::vector<std::uint8_t> headed(4 + n);
+    const std::uint8_t fl[4] = {1, 0, 0, 0};
+    std::memcpy(headed.data(), fl, 4);
+    std::memcpy(headed.data() + 4, p, n);
+    out = mdk::parseGeometryRecord(headed.data(),
+                                   headed.data() + headed.size());
+  };
+  bindProto("KURT", streamProtoKurt_);
+  bindProto("BONES", streamProtoBones_);
+  bindProto("PROFSHIP", streamProtoProf_);
+  const bool isFinal = sess_.levelId >= 4;
+  bindProto(isFinal ? "GUNTA" : "SWH150", streamProtoEsc_);
+  a.protoKurt = streamProtoKurt_ ? &*streamProtoKurt_ : nullptr;
+  a.protoBones = streamProtoBones_ ? &*streamProtoBones_ : nullptr;
+  a.protoProfship = streamProtoProf_ ? &*streamProtoProf_ : nullptr;
+  a.protoEscort = streamProtoEsc_ ? &*streamProtoEsc_ : nullptr;
+
+  auto payloadPtr = [&](const char* name) -> const std::uint8_t* {
+    const std::span<const std::byte> p =
+        payload(bdir, streamBniBytes_, name);
+    return p.empty() ? nullptr
+                     : reinterpret_cast<const std::uint8_t*>(
+                         p.data());
+  };
+  a.animEscort = payloadPtr(isFinal ? "GUNTANIM" : "SWHANM");
+  a.animBones = payloadPtr("BONESANIM");
+  a.animKurt = payloadPtr("KURTANIM");
+  a.animHvr = payloadPtr("FL_HVR");
+  a.animWave = payloadPtr("FL_WAVE");
+  // The bound the ObjectAnimView walk is checked against — the BNI
+  // image end (the --stream-init convention).
+  a.animLimit = reinterpret_cast<const std::uint8_t*>(
+      streamBniBytes_.data() + streamBniBytes_.size());
+
+  // TELETYPE fonts — FONTBIG (the plain + scaled renderers) and the
+  // FONTSML fallback for the 600px measure overflow.
+  std::string ferr;
+  auto decodeFont = [&](const char* name)
+      -> std::optional<mdk::FtiFont> {
+    const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, name);
+    if (!r) return std::nullopt;
+    return mdk::decodeFtiFont(
+        std::span<const std::byte>(
+            streamFtiBytes_.data() + r->payloadFileOffset,
+            static_cast<std::size_t>(r->payloadEnd -
+                                     r->payloadFileOffset)),
+        &ferr);
+  };
+  const auto fbBig = decodeFont("FONTBIG");
+  const auto fbSml = decodeFont("FONTSML");
+  if (fbBig && fbSml) streamPresenter_.bindFonts(*fbBig, *fbSml);
+
+  return true;
+}
+
+bool MdkBridge::campaignStreamEnter_(std::string& detail) {
+  // The mode-5 entry — StreamAssets bind + scene init. The session
+  // carries levelId/skill/rng/health (the campaign globals — no
+  // fresh reset here; load_stream seeds them for the standalone
+  // path).
+  if (!streamLoadAssets_(detail)) return false;
+  stream_ = std::make_unique<mdk::StreamScene>();
+  if (!stream_->init(streamAssets_, sess_.levelId, sess_.skill,
+                     sess_.rng, sess_.health)) {
+    detail = "StreamScene::init failed";
+    stream_.reset();
+    return false;
+  }
+  // Synthetic 46c650 clock — the canonical harness' +33ms/frame feed
+  // (host pacing is a later phase; this keeps draws deterministic).
+  streamNowMs_ = 1000;
+  streamFrameSeq_ = 0;
+  timing_ = mdk::FrontendTimingState{};
+  prevKeyLevel_ = {};
+  mode_ = 5;
+  hasFrame_ = false;
+  return true;
+}
+
+Dictionary MdkBridge::stepStream_(double dt_ms, int64_t action_mask,
+                                  const Dictionary* input) {
+  Dictionary out;
+  out["ok"] = true;
+  out["mode"] = mode_;
+  if (!stream_) {
+    setError_("load_stream() first");
+    out["ok"] = false;
+    return out;
+  }
+  (void)dt_ms;   // pinned 1/30 — the golden harness' frame delta;
+                 // host pacing is a later phase
+  // Host input fold (the FUN_00407f2c domain — digital +-180 on the
+  // two steering axes; the runtime consumes the resolved axes).
+  mdk::StreamInput in{};
+  if (action_mask & kActTurnLeft) in.axis0 = -180.0f;
+  if (action_mask & kActTurnRight) in.axis0 = 180.0f;
+  if (action_mask & kActLookUp) in.axis1 = 180.0f;
+  if (action_mask & kActLookDown) in.axis1 = -180.0f;
+  in.nowMs = static_cast<std::uint32_t>(streamNowMs_);
+  streamNowMs_ += 33;
+
+  const bool running = stream_->step(in, 1.0f / 30.0f);
+  // Event drain — order is the core's emission order (backdrop ->
+  // sprites -> teletype -> HUD -> present; kExitMode may cut the
+  // frame early). The scene's paletteDac is the live DAC surface the
+  // upload events apply.
+  for (const mdk::StreamEvent& ev : stream_->events())
+    streamPresenter_.consume(ev, stream_->paletteDac());
+  stream_->clearEvents();
+
+  const bool frameReady = streamPresenter_.framePending();
+  if (frameReady) {
+    streamPresenter_.clearFramePending();
+    ++streamFrameSeq_;
+  }
+  if (!running || stream_->finished()) streamHandoff_();
+
+  out["mode"] = mode_;
+  out["sess_mode"] = sess_.mode;
+  out["level_id"] = sess_.levelId;
+  out["exited"] = stream_ == nullptr;
+  out["frame_ready"] = frameReady;
+  out["seq"] = static_cast<int64_t>(streamFrameSeq_);
+  out["diag"] = stream_diag();
+  return out;
+}
+
+void MdkBridge::streamHandoff_() {
+  // Dispatcher exit (0x4015c3): the scene's terminal globals write
+  // back to the campaign session, the FUN_0042c824 teardown frees
+  // the protos/objects, then the tally-done progression step routes
+  // health<=0 -> frontend / levelId<4 -> loader / else mode 7.
+  if (stream_) {
+    const mdk::StreamSnapshot s = stream_->snapshot();
+    sess_.health = s.health;
+    sess_.rng = stream_->rng();
+    stream_->teardown();
+    stream_.reset();
+  }
+  const mdk::ProgressionError e =
+      mdk::progressionStepIntermission(sess_, true);
+  if (e != mdk::ProgressionError::kOk)
+    setError_(std::string("stream handoff: ") +
+              std::string(mdk::progressionErrorName(e)));
+  mode_ = sess_.mode;
+  if (sess_.mode == 0 && feShell_)
+    // The dead-hero route lands the campaign's frontend exit — the
+    // same fresh entry the progression pump's mode-0 arm runs
+    // (returning=false; only the mode-8 tail passes nonzero).
+    feShell_->enterFrontend(false);
+  hasFrame_ = false;
+}
+
+Dictionary MdkBridge::stream_frame() {
+  Dictionary out;
+  const mdkbridge::StreamPresenterDiag& d = streamPresenter_.diag();
+  if (d.presented == 0 && d.terminalFills == 0) return out;
+  const mdk::IndexedFramebuffer& fb = streamPresenter_.framebuffer();
+  const mdk::Palette& pal = streamPresenter_.palette();
+  out["w"] = fb.width();
+  out["h"] = fb.height();
+  // Indexed -> RGBA expand through the applied DAC — a fresh
+  // PackedByteArray per call (copy-safe; no core buffer escapes).
+  PackedByteArray rgba;
+  rgba.resize(static_cast<int64_t>(fb.pixelCount()) * 4);
+  std::uint8_t* dst = rgba.ptrw();
+  for (std::size_t i = 0; i < fb.pixelCount(); ++i) {
+    const mdk::Palette::Color c = pal.get(fb.pixels()[i]);
+    dst[i * 4 + 0] = c.r;
+    dst[i * 4 + 1] = c.g;
+    dst[i * 4 + 2] = c.b;
+    dst[i * 4 + 3] = c.a;
+  }
+  out["rgba"] = rgba;
+  out["seq"] = static_cast<int64_t>(streamFrameSeq_);
+  out["diag"] = stream_diag();
+  return out;
+}
+
+Dictionary MdkBridge::stream_diag() {
+  Dictionary out;
+  const mdkbridge::StreamPresenterDiag& d = streamPresenter_.diag();
+  out["presented"] = int64_t(d.presented);
+  out["backdrop_blits"] = int64_t(d.backdropBlits);
+  out["sprites"] = int64_t(d.sprites);
+  out["sprite_misses"] = int64_t(d.spriteMisses);
+  out["hud_blits"] = int64_t(d.hudBlits);
+  out["hud_misses"] = int64_t(d.hudMisses);
+  out["teletype_draws"] = int64_t(d.teletypeDraws);
+  out["palette_sets"] = int64_t(d.paletteSets);
+  out["models_deferred"] = int64_t(d.modelsDeferred);
+  out["ribbons_deferred"] = int64_t(d.ribbonsDeferred);
+  out["sound_events"] = int64_t(d.soundEvents);
+  out["terminal_fills"] = int64_t(d.terminalFills);
+  out["terminal_fill"] = int64_t(d.terminalFill);
+  out["fb_hash"] = static_cast<int64_t>(d.fbHash);       // bit-cast
+  out["palette_hash"] = static_cast<int64_t>(d.paletteHash);
+  out["seq"] = static_cast<int64_t>(streamFrameSeq_);
+  return out;
+}
+
 void MdkBridge::shutdown() {
   arenaLoaded_ = false;
   arenaIndex_ = -1;
@@ -2708,6 +3126,20 @@ void MdkBridge::shutdown() {
   rt_.reset();
   ff_.reset();
   ffScene_.reset();
+  // Phase 19B.1 — the StreamScene and its bound buffers die with the
+  // session (presenter state is host-side; reset with the mode).
+  stream_.reset();
+  streamPresenter_.reset();
+  streamBniBytes_.clear();
+  streamFtiBytes_.clear();
+  streamHudBytes_.clear();
+  streamAssets_ = mdk::StreamAssets{};
+  streamProtoKurt_.reset();
+  streamProtoBones_.reset();
+  streamProtoProf_.reset();
+  streamProtoEsc_.reset();
+  streamNowMs_ = 0;
+  streamFrameSeq_ = 0;
   sess_ = mdk::ProgressionSession{};
   ffHandoffDone_ = false;
   ffHandoffRoute_ = -1;
@@ -3497,8 +3929,29 @@ Dictionary MdkBridge::frontend_progression_step(const Dictionary& input) {
   const int prevMode = sess_.mode;
   switch (prevMode) {
   case 5:
-    e = mdk::progressionStepIntermission(sess_, stageDone);
-    break;
+    if (stream_) {
+      // A live StreamScene owns mode 5 — its own kExitMode drives
+      // the transition (stepCore_ -> stepStream_ -> streamHandoff_).
+      // The pump is a no-op while it runs.
+      return out;
+    }
+    // First pump after the transition — install the scene (the
+    // FUN_0042b270 bind + init carrying the campaign globals).
+    {
+      std::string detail;
+      if (!campaignStreamEnter_(detail)) {
+        setError_("campaign stream: " + detail);
+        out["ok"] = false;
+        out["detail"] = String(detail.c_str());
+        return out;
+      }
+    }
+    out["pumped"] = true;
+    out["error"] = String(mdk::progressionErrorName(
+        mdk::ProgressionError::kStageRunning));
+    out["mode"] = mode_;
+    out["sess_mode"] = sess_.mode;
+    return out;
   case 6:
     e = mdk::progressionStepLoader(sess_, stageDone);
     break;

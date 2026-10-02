@@ -127,3 +127,18 @@ grow_vertical = 2
 mouse_filter = 2
 expand_mode = 1
 stretch_mode = 0
+
+[node name="StreamLayer" type="CanvasLayer" parent="."]
+layer = 8
+
+[node name="StreamRect" type="TextureRect" parent="StreamLayer"]
+visible = false
+texture_filter = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 0
