@@ -828,9 +828,57 @@ All courses: `lookup_miss = invalid_geometry = overflow =
 elements_masked = 0`; every command resolved to the live object set.
 Real model geometry reaches ONLY the textured (A — `FUN_0046daac`)
 and flat (B — `FUN_00415260`) arms; neither effect arm nor either
-LUT arm is ever taken. Flat renders through the closed 19B.2A path;
-A is counted as `model_material_deferred_textured` (not drawn —
-`c0 18235 / c1 28362 / c2 19877 / c3 19877 / c4 100741` reached
-dispatch after trivial-reject/clip). Geometry submission is closed;
-full model presentation stays OPEN pending the `46daac` textured
-filler (next phase).
+LUT arm is ever taken. Flat renders through the closed 19B.2A path.
+
+The textured model path is now implemented in
+`frontend/godot/gdextension/src/stream_raster.cpp` (OBSERVED,
+byte-level verified against the `MDK95.EXE` disassembly — see
+`analysis-private/TEXSPEC.md` for the full drawer-machine spec):
+
+- `STREAM/STREAM.MTI` loads as mode-5 bank A (`FUN_0041a1e0` record
+  decode — already in `src/core/arena_render.cpp`); model material
+  names resolve through `resolveModelMaterials`
+  (`FUN_0041a694`: bank A then bank B, miss → flat `0xff` arm).
+- Tri-record UV pairs ride the clipper bank (+0x08/+0x10/+0x18,
+  lerped with the position `t`) into the dispatch sort.
+- `FUN_0046daac`: y-sorted scanline walk, `ebec += ±2·ebfc`
+  cross-product adjust, near-z clamp (`maxZ/64`), affine gate
+  (`param0c < minZ && (maxZ-minZ)·param10 < minZ`, gate flag
+  `DAT_00541482 == 0` in mode 5) → `FUN_0046e52c` affine.
+- A0–A3 perspective drawers: 32-px block pipeline (head/blocks/
+  tail partition on `leftpx & 31`), delayed-write texel carry,
+  `count+1` writes per row, duplicated final texel, R[k]=1/k
+  reciprocal stepping, magic-bias fixed-point extraction
+  (1.5·2³⁶ → 16.16, 1.5·2⁴⁰ → 20.12).
+- A8–A11 affine drawers: per-triangle row loop, closed-interval
+  writes (`count+1` px/row, +1 overrun mirrored in arm B),
+  wrap variant masks the running offset per pixel, keyed variant
+  guards each write site on `texel != 0`.
+- OBSERVED quirks preserved: the perspective drawer's row-axis
+  accumulator is seeded with V but stepped by the U-channel
+  delta (and vice versa for the column), with the first boundary
+  eval per row subtracting cross-channel carry slots
+  (`U−V0`, `V−U0`); the mid-block register advance adds the
+  ×32-prescaled gradients once; the affine arm-B writes
+  right-to-left while texels advance forward.
+
+Real-data census (courses 0–4, same skill/seed):
+
+| course | dispatch material | persp | affine | matflat | px |
+|--------|-------------------|-------|--------|---------|----|
+| 0 | 18235 | 263 | 14946 | 0 | 802501 |
+| 1 | 28362 | 517 | 24747 | 0 | 1818210 |
+| 2 | 19877 | 646 | 16848 | 2 | 1185006 |
+| 3 | 19877 | 646 | 16848 | 2 | 1185006 |
+| 4 | 100741 | 275 | 83233 | 0 | 1971957 |
+
+Affine dominates (the gate is narrow: `maxZ < 1.286·minZ` —
+mid-distance cinematic models almost always qualify); perspective
+fires only on large-z-spread tris. The two `matflat` tris on
+courses 2/3 are the BONES model's `WHITE` name slot (pen 2) — the
+name exists in no bound bank (`STREAM.MTI` lacks it and mode 5
+binds no embedded `.MAT` bank B), so matlkup leaves the slot NULL
+and the draw takes the `+0x24==0` flat-`0xff` arm — the same
+OBSERVED miss behavior as the arena's OLYM_9 precedent. No
+index-record fallback fires on these courses (the `PEN_n` index
+records resolve but are never drawn).

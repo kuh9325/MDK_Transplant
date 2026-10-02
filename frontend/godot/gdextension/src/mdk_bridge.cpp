@@ -25,6 +25,7 @@
 #include "core/fti_directory.h"
 #include "core/indexed_image.h"
 #include "core/keyboard_menu.h"
+#include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/save_full_restore.h"
 #include "core/save_full_write.h"
@@ -2735,12 +2736,36 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
   streamProtoEsc_.reset();
   streamAssets_ = mdk::StreamAssets{};
   streamImageNames_.clear();
+  streamMtiBytes_.clear();
+  streamBankA_.clear();
 
   std::string err;
   auto bni = root_->readFile("STREAM/STREAM.BNI", 1 << 28, &err);
   if (!bni) {
     detail = "STREAM/STREAM.BNI: " + err;
     return false;
+  }
+  // STREAM.MTI — the mode-5 model material bank (the original binds
+  // it via the 496e10 multi-file table, bank A for model+0x10
+  // lookups). Fail-soft on a directory miss: models still load and
+  // every textured pen falls back to flat 0xff like the original's
+  // unresolved path.
+  auto mti = root_->readFile("STREAM/STREAM.MTI", 1 << 28, &err);
+  if (mti) {
+    streamMtiBytes_ = std::move(*mti);
+    const std::span<const std::byte> mtiSpan(
+        streamMtiBytes_.data(), streamMtiBytes_.size());
+    const mdk::MtiDirectory mdir = mdk::inspectMtiDirectory(mtiSpan);
+    if (mdir.status == mdk::MtiDirectoryStatus::kOk) {
+      streamBankA_.reserve(mdir.entries.size());
+      for (const mdk::MtiEntry& e : mdir.entries) {
+        mdk::ArenaRenderMaterial rec;
+        if (mdk::arenaRenderMaterialDecode(
+                mtiSpan, e.payloadFileOffset(), e.fieldAt0x08,
+                e.fieldAt0x0C, e.fieldAt0x10, e.nameField, &rec))
+          streamBankA_.push_back(std::move(rec));
+      }
+    }
   }
   auto fti = root_->readFile("MISC/MDKFONT.FTI", 1 << 28, &err);
   if (!fti) {
@@ -2910,6 +2935,20 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
   a.protoBones = streamProtoBones_ ? &*streamProtoBones_ : nullptr;
   a.protoProfship = streamProtoProf_ ? &*streamProtoProf_ : nullptr;
   a.protoEscort = streamProtoEsc_ ? &*streamProtoEsc_ : nullptr;
+
+  // 19B.2C — the model+0x10 material tables: each name-table slot
+  // resolves against STREAM.MTI (bank A) — bank B is unbound for
+  // stream models. streamBankA_ is fully populated by here (the
+  // pointers alias its storage; deepCopyModel propagates the table
+  // into spawned pool objects verbatim, matching the original's
+  // shared material arena).
+  {
+    const std::span<const mdk::ArenaRenderMaterial> bank(
+        streamBankA_.data(), streamBankA_.size());
+    for (auto* mp : {&streamProtoKurt_, &streamProtoBones_,
+                     &streamProtoProf_, &streamProtoEsc_})
+      if (*mp) mdk::resolveModelMaterials(**mp, bank);
+  }
 
   auto payloadPtr = [&](const char* name) -> const std::uint8_t* {
     const std::span<const std::byte> p =
@@ -3160,6 +3199,30 @@ Dictionary MdkBridge::stream_diag() {
     out["model_branch"] = br;
   }
   out["model_clip_dropped"] = int64_t(d.model.raster.clipDropped);
+  // 19B.2B2 — the material-path census: submitted A-arm tris reach
+  // the dispatch kMaterial arm, then split into the perspective /
+  // affine drawers or the three flat-0xff fallback classes.
+  out["model_mat_persp"] = int64_t(d.model.raster.matPersp);
+  out["model_mat_affine"] = int64_t(d.model.raster.matAffine);
+  out["model_mat_flat"] = int64_t(d.model.raster.matFlat);
+  out["model_mat_index_rec"] = int64_t(d.model.raster.matIndexRec);
+  out["model_mat_lookup_miss"] =
+      int64_t(d.model.raster.matLookupMiss);
+  out["model_mat_invalid_rec"] =
+      int64_t(d.model.raster.matInvalidRec);
+  out["model_mat_clip_fan"] = int64_t(d.model.raster.matClipFan);
+  out["model_mat_degenerate"] =
+      int64_t(d.model.raster.matDegenerate);
+  out["model_mat_zero"] = int64_t(d.model.raster.matZero);
+  out["model_tex_lookup_miss"] =
+      int64_t(d.model.raster.texLookupMiss);
+  out["model_tex_invalid_meta"] =
+      int64_t(d.model.raster.texInvalidMeta);
+  out["model_mat_pixels"] =
+      static_cast<int64_t>(d.model.raster.matPixels);
+  out["model_tex_transparent"] =
+      static_cast<int64_t>(d.model.raster.texTransparent);
+  out["model_mat_rasterized"] = int64_t(d.model.raster.rasterized);
   out["model_deferred_textured"] = int64_t(d.model.matCls[0]);
   out["model_deferred_fx47a770"] = int64_t(d.model.matCls[2]);
   out["model_deferred_fx46e940"] = int64_t(d.model.matCls[5]);
@@ -3247,6 +3310,8 @@ void MdkBridge::shutdown() {
   streamProtoBones_.reset();
   streamProtoProf_.reset();
   streamProtoEsc_.reset();
+  streamMtiBytes_.clear();
+  streamBankA_.clear();
   streamNowMs_ = 0;
   streamFrameSeq_ = 0;
   sess_ = mdk::ProgressionSession{};

@@ -27,6 +27,7 @@
 #include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/indexed_image.h"
+#include "core/mti_directory.h"
 #include "core/stream_context.h"
 #include "core/stream_scene.h"
 
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -149,6 +151,13 @@ struct BoundAssets {
   std::optional<mdk::RuntimeModel> protoKurt, protoBones, protoProf,
       protoEsc;
   std::vector<std::byte> bniBytes, ftiBytes, hudBytes;
+  // 19B.2C — STREAM.MTI bytes + the decoded bank A; model material
+  // tables point into bankA (pixels alias mtiBytes). bankANames is
+  // parallel to bankA — the decoded record's 8-byte name for the
+  // closure identity report.
+  std::vector<std::byte> mtiBytes;
+  std::vector<mdk::ArenaRenderMaterial> bankA;
+  std::vector<std::string> bankANames;
 };
 
 bool bindStreamAssets(const mdk::DataRoot& root, int course,
@@ -280,6 +289,34 @@ bool bindStreamAssets(const mdk::DataRoot& root, int course,
   a.protoBones = out.protoBones ? &*out.protoBones : nullptr;
   a.protoProfship = out.protoProf ? &*out.protoProf : nullptr;
   a.protoEscort = out.protoEsc ? &*out.protoEsc : nullptr;
+
+  // 19B.2C — STREAM.MTI = the model material bank A (mirrors the
+  // bridge's streamLoadAssets_ wiring); resolve each proto's model
+  // name table against it.
+  auto mti = root.readFile("STREAM/STREAM.MTI", 1 << 28, &err);
+  if (mti) {
+    out.mtiBytes = std::move(*mti);
+    const std::span<const std::byte> mtiSpan(
+        out.mtiBytes.data(), out.mtiBytes.size());
+    const auto mdir = mdk::inspectMtiDirectory(mtiSpan);
+    if (mdir.status == mdk::MtiDirectoryStatus::kOk) {
+      out.bankA.reserve(mdir.entries.size());
+      for (const mdk::MtiEntry& e : mdir.entries) {
+        mdk::ArenaRenderMaterial rec;
+        if (mdk::arenaRenderMaterialDecode(
+                mtiSpan, e.payloadFileOffset(), e.fieldAt0x08,
+                e.fieldAt0x0C, e.fieldAt0x10, e.nameField, &rec)) {
+          out.bankA.push_back(std::move(rec));
+          out.bankANames.push_back(e.name());
+        }
+      }
+    }
+    const std::span<const mdk::ArenaRenderMaterial> bank(
+        out.bankA.data(), out.bankA.size());
+    for (auto* mp : {&out.protoKurt, &out.protoBones, &out.protoProf,
+                     &out.protoEsc})
+      if (*mp) mdk::resolveModelMaterials(**mp, bank);
+  }
 
   auto payloadPtr = [&](const char* name) -> const std::uint8_t* {
     const std::span<const std::byte> p =
@@ -425,16 +462,98 @@ int runCourse(const mdk::DataRoot& root, int course, int skill,
   std::printf("\n");
   std::printf(
       "  model raster: px=%llu clip=%d drop=%d unsup=%d lutmiss=%d "
-      "fbdig=%016llx\n",
+      "persp=%d affine=%d matflat=%d fbdig=%016llx\n",
       (unsigned long long)d.model.raster.pixels,
       d.model.raster.clipped, d.model.raster.clipDropped,
       d.model.raster.unsupported, d.model.raster.lutMisses,
+      d.model.raster.matPersp, d.model.raster.matAffine,
+      d.model.raster.matFlat,
       (unsigned long long)d.model.fbDigest);
+  std::printf(
+      "  material classes: indexRec=%d lookupMiss=%d invalidRec=%d "
+      "texMiss=%d texMeta=%d clipFan=%d degenerate=%d zero=%d "
+      "matPx=%llu keyedSkip=%llu\n",
+      d.model.raster.matIndexRec, d.model.raster.matLookupMiss,
+      d.model.raster.matInvalidRec, d.model.raster.texLookupMiss,
+      d.model.raster.texInvalidMeta, d.model.raster.matClipFan,
+      d.model.raster.matDegenerate, d.model.raster.matZero,
+      (unsigned long long)d.model.raster.matPixels,
+      (unsigned long long)d.model.raster.texTransparent);
   for (const auto& [id, n] : d.model.raster.branch)
     std::printf("    dispatch %s n=%d\n",
                 mdkbridge::streamTriBranchName(
                     static_cast<mdkbridge::StreamTriBranch>(id)),
                 n);
+
+  // Index-record identity report — the closure gate requires each
+  // flat-0xff index-record fallback named by record, model and slot.
+  if (!d.model.raster.matIndexRecHits.empty()) {
+    // bankA pointer -> record name (parallel vectors).
+    std::map<const mdk::ArenaRenderMaterial*, std::string> recName;
+    for (std::size_t i = 0; i != bnd.bankA.size(); ++i)
+      recName[&bnd.bankA[i]] = bnd.bankANames[i];
+    // bankA pointer -> [(proto name, model slot name)].
+    std::map<const mdk::ArenaRenderMaterial*,
+             std::vector<std::pair<std::string, std::string>>> slots;
+    auto addSlots = [&](const char* proto,
+                        const std::optional<mdk::RuntimeModel>& pm) {
+      if (!pm) return;
+      for (std::size_t i = 0; i != pm->materials.size(); ++i) {
+        if (pm->materials[i] == nullptr) continue;
+        std::string slot;
+        if (i < pm->names.size()) {
+          const auto& nf = pm->names[i].name;
+          slot.assign(nf.data(),
+                      strnlen(nf.data(), nf.size()));
+        }
+        slots[pm->materials[i]].push_back({proto, slot});
+      }
+    };
+    addSlots("KURT", bnd.protoKurt);
+    addSlots("BONES", bnd.protoBones);
+    addSlots("PROFSHIP", bnd.protoProf);
+    addSlots(course >= 4 ? "GUNTA" : "SWH150", bnd.protoEsc);
+    for (const auto& [mp, n] : d.model.raster.matIndexRecHits) {
+      const auto rn = recName.find(mp);
+      std::printf("    indexRec hit n=%d rec=%s", n,
+                  rn != recName.end() ? rn->second.c_str() : "?");
+      const auto sl = slots.find(mp);
+      if (sl != slots.end())
+        for (const auto& [proto, slot] : sl->second)
+          std::printf(" %s:%s", proto.c_str(), slot.c_str());
+      std::printf("\n");
+    }
+  }
+  // Lookup-miss identity — join the missed pens with each proto's
+  // unresolved name slots / table size. A null slot is a name that
+  // matched no bank record at resolve time; an OOB pen indexes past
+  // the +0x18 name count entirely.
+  if (!d.model.raster.matLookupMissPens.empty()) {
+    for (const auto& [ps, n] : d.model.raster.matLookupMissPens)
+      std::printf("    lookupMiss pen=%d tableSize=%d n=%d\n",
+                  ps.first, ps.second, n);
+    auto dumpSlots = [&](const char* proto,
+                         const std::optional<mdk::RuntimeModel>& pm) {
+      if (!pm) return;
+      for (std::size_t i = 0; i != pm->names.size(); ++i) {
+        const mdk::ArenaRenderMaterial* mp =
+            i < pm->materials.size() ? pm->materials[i] : nullptr;
+        const auto& nf = pm->names[i].name;
+        const std::string slot(nf.data(),
+                               strnlen(nf.data(), nf.size()));
+        std::printf("    slot %s[%zu] name=%s -> %s\n", proto, i,
+                    slot.c_str(),
+                    mp == nullptr ? "UNRESOLVED"
+                    : mp->isIndexRecord ? "indexRec" : "record");
+      }
+      std::printf("    slot %s table size=%zu names=%zu\n", proto,
+                  pm->materials.size(), pm->names.size());
+    };
+    dumpSlots("KURT", bnd.protoKurt);
+    dumpSlots("BONES", bnd.protoBones);
+    dumpSlots("PROFSHIP", bnd.protoProf);
+    dumpSlots(course >= 4 ? "GUNTA" : "SWH150", bnd.protoEsc);
+  }
 
   if (!shotDir.empty()) {
     const int midT = d.presented / 2;

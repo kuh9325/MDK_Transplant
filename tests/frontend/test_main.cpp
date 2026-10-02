@@ -1244,16 +1244,19 @@ int main() {
       CHECK(pres.diag().ribbon.pixels == 0);
 
       // Unported 0c860 arms — counted on their census id, flagged
-      // unsupported, no pixels.
+      // unsupported, no pixels. The pen >= 0 arm with no bound
+      // material table is the OBSERVED miss path — flat 0xff.
       const auto uns0 = pres.diag().ribbon.unsupported;
+      const auto flat0 = pres.diag().ribbon.matFlat;
       pres.consume(mkTri(-1000, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
       pres.consume(mkTri(-1028, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
       pres.consume(mkTri(0, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
       CHECK(branchN(pres, BR::kFx47a770) == 1);
       CHECK(branchN(pres, BR::kFx46e940) == 1);
       CHECK(branchN(pres, BR::kMaterial) == 1);
-      CHECK(pres.diag().ribbon.unsupported == uns0 + 3);
-      CHECK(pres.diag().ribbon.pixels == 0);
+      CHECK(pres.diag().ribbon.unsupported == uns0 + 2);
+      CHECK(pres.diag().ribbon.matFlat == flat0 + 1);
+      CHECK(pres.diag().ribbon.pixels > 0);
     }
     {
       pres.reset();
@@ -1534,10 +1537,13 @@ int main() {
               dm.matCls[5] == 1 && dm.matCls[4] == 1);
         StreamEvent p = mkEv(StreamEvent::kPresent);
         pres.consume(p, dac);
-        CHECK(dm.raster.unsupported == 3);  // A, C, F
+        CHECK(dm.raster.unsupported == 2);  // C, F (the fx arms)
+        // A (pen 5) indexes an unbound material table -> the
+        // OBSERVED miss arm flat-fills 0xff and commits pixels.
+        CHECK(dm.raster.matFlat == 1);
         // E (-1025) hit the LUT arm without a bound palette -> miss.
         CHECK(dm.raster.lutMisses == 1);
-        CHECK(dm.raster.pixels == 0);
+        CHECK(dm.raster.pixels > 0);
         pres.clearFramePending();
       }
 

@@ -21,10 +21,12 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
+#include "core/arena_render.h"
 #include "core/framebuffer.h"
 #include "core/fti_font.h"
 #include "core/indexed_image.h"
@@ -84,7 +86,11 @@ const char* streamSpriteResultName(StreamSpriteResult r);
 struct StreamModelPoly {              // the pushed record's host form
   float key;                          // z'-sum sort key (499f88==0)
   int pen;                            // tri+0x06 i16 — dispatch scalar
-  StreamTriVert v[3];                 // projected/flagged verts
+  StreamTriVert v[3];                 // projected/flagged verts + UVs
+  // the record +0xc slot — the model's resolved material table
+  // (RuntimeModel::materials; aliases bridge-owned storage that
+  // outlives the deferred drain).
+  std::span<const mdk::ArenaRenderMaterial* const> mats;
 };
 struct StreamModelDiag {
   int commands = 0;        // kModelDraw events consumed

@@ -2165,6 +2165,32 @@ func _run_smoke_stream(course: int) -> void:
 	for e in d.get("model_branch", []):
 		print("      mbranch %s n=%d" % [
 			String(e["branch"]), int(e["count"])])
+	# 19B.2B2 — the material-path split: persp/affine drawers vs the
+	# three flat-0xff fallback classes, plus texel/keyed counters.
+	# texMiss/texMeta/invalidRec are defect classes — always zero;
+	# indexRec/lookupMiss are reported (proven-native null-slot
+	# arms may be nonzero — BONES WHITE precedent).
+	_check(int(d["model_tex_lookup_miss"]) == 0,
+		"no texel fetch misses")
+	_check(int(d["model_tex_invalid_meta"]) == 0,
+		"no invalid texture metadata")
+	_check(int(d["model_mat_invalid_rec"]) == 0,
+		"no invalid material records")
+	print(("    matpath: persp=%d affine=%d indexRec=%d " +
+		"lookupMiss=%d invalidRec=%d texMiss=%d texMeta=%d " +
+		"clipFan=%d degen=%d zero=%d matPx=%d keyedSkip=%d " +
+		"rast=%d") % [
+		int(d["model_mat_persp"]), int(d["model_mat_affine"]),
+		int(d["model_mat_index_rec"]),
+		int(d["model_mat_lookup_miss"]),
+		int(d["model_mat_invalid_rec"]),
+		int(d["model_tex_lookup_miss"]),
+		int(d["model_tex_invalid_meta"]),
+		int(d["model_mat_clip_fan"]),
+		int(d["model_mat_degenerate"]), int(d["model_mat_zero"]),
+		int(d["model_mat_pixels"]),
+		int(d["model_tex_transparent"]),
+		int(d["model_mat_rasterized"])])
 	# 19B.2A ribbon raster census + material branch breakdown.
 	print(("    ribbon: cmd=%d rast=%d zero=%d clip=%d drop=%d " +
 		"unsup=%d lutmiss=%d px=%d") % [

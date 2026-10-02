@@ -648,6 +648,12 @@ class MdkBridge : public RefCounted {
   std::map<int, std::string> streamImageNames_;
   std::optional<mdk::RuntimeModel> streamProtoKurt_, streamProtoBones_,
       streamProtoProf_, streamProtoEsc_;
+  // Phase 19B.2C — the mode-5 model material bank: STREAM.MTI is the
+  // originals' bank A for the stream path (the record pixels alias
+  // streamMtiBytes_; the proto/pool model material tables point into
+  // streamBankA_ — both must outlive the scene).
+  std::vector<std::byte> streamMtiBytes_;
+  std::vector<mdk::ArenaRenderMaterial> streamBankA_;
   int streamNowMs_ = 0;          // synthetic 46c650 clock (ms)
   std::uint64_t streamFrameSeq_ = 0;   // presented-frame counter
 

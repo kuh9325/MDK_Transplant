@@ -135,6 +135,7 @@
 #include <string>
 #include <vector>
 
+#include "core/arena_render.h"
 #include "core/collision_query.h"
 #include "core/cmi_directory.h"
 #include "core/dti_structure.h"
@@ -157,6 +158,16 @@ struct RuntimeModel {
 
   std::uint32_t flag = 0;             // the record's flag u32
   std::vector<NameRec> names;         // name table (all records)
+
+  // The original's model +0x10 — the material-pointer table the
+  // geometry parse fills through FUN_0041a694 (matlkup): one slot
+  // per name-table record, resolved by name against the bound MTI
+  // banks; nullptr = the dispatch's flat-0xff fallback arm. The
+  // pointers alias the bank vectors — banks must outlive the model
+  // (the original aliases into its arena too). resolveModelMaterials
+  // fills it; deepCopyModel copies the pointers verbatim (the
+  // original's copy shares the same material arena).
+  std::vector<const ArenaRenderMaterial*> materials;
 
   // Per-element owned storage (parallel to `elems`; rebound by
   // rebind() after parse/copy so the views always point here).
@@ -202,6 +213,21 @@ std::optional<RuntimeModel> parseGeometryRecord(
 // FUN_00403720 — deep copy: fresh element array + fresh vertex/
 // triangle storage, views rebound to the copy.
 RuntimeModel deepCopyModel(const RuntimeModel& src);
+
+// FUN_0041a694 (matlkup, OBSERVED shape) — fill model.materials by
+// resolving each name-table record against the MTI banks. The
+// original compares the 10-byte runtime name copy against each
+// record's 8-byte name field with an unbounded C-string streq
+// (FUN_0042fa50) — equivalent here to comparing NUL-trimmed strings
+// because record names never exceed 8 chars. Bank A is searched
+// first, then bank B; the first name match wins; a miss stores
+// nullptr — dispatch then takes the flat-0xff arm. Index records
+// (isIndexRecord) DO participate in the lookup — a name that matches
+// one resolves to a record whose pixel span is empty, which the
+// dispatcher likewise falls back to flat 0xff on.
+void resolveModelMaterials(RuntimeModel& m,
+                           std::span<const ArenaRenderMaterial> bankA,
+                           std::span<const ArenaRenderMaterial> bankB = {});
 
 // ---------------------------------------------------------------------------
 // Enemy table — FUN_004286c8's table-1 product (0x88-stride records,

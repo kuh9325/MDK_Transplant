@@ -221,6 +221,31 @@ RuntimeModel deepCopyModel(const RuntimeModel& src) {
 }
 
 // ---------------------------------------------------------------------------
+// FUN_0041a694 — matlkup: per name slot, bank A first then bank B,
+// miss -> nullptr (the flat-0xff arm; the original logs the name and
+// stores NULL — the dispatcher checks +0x24 == 0 the same way).
+// ---------------------------------------------------------------------------
+
+void resolveModelMaterials(RuntimeModel& m,
+                           std::span<const ArenaRenderMaterial> bankA,
+                           std::span<const ArenaRenderMaterial> bankB) {
+  m.materials.assign(m.names.size(), nullptr);
+  for (std::size_t i = 0; i < m.names.size(); ++i) {
+    // The runtime copy is the record's first 10 bytes (OBSERVED,
+    // FUN_00428400's 10-iteration copy loop); the file record's
+    // remaining 2 bytes never reach the compare.
+    const std::string want = printable(m.names[i].name.data(), 10);
+    for (const ArenaRenderMaterial& r : bankA) {
+      if (r.name == want) { m.materials[i] = &r; break; }
+    }
+    if (m.materials[i]) continue;
+    for (const ArenaRenderMaterial& r : bankB) {
+      if (r.name == want) { m.materials[i] = &r; break; }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Enemy table (FUN_004286c8 product) + geometry resolution
 // ---------------------------------------------------------------------------
 

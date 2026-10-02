@@ -203,6 +203,13 @@ void StreamPresenter::submitModel(const mdk::StreamEvent& ev) {
       p.key = v0.z + v1.z + v2.z;     // 499f88==0: z'-sum key
       p.pen = pen;
       p.v[0] = v0; p.v[1] = v1; p.v[2] = v2;
+      // The tri record's float2 uv pairs (+0x08/+0x10/+0x18) bind
+      // positionally to indices i0/i1/i2 — the clipper lerps them
+      // with the same t as the verts.
+      std::memcpy(&p.v[0].u, tr + 0x08, 8);
+      std::memcpy(&p.v[1].u, tr + 0x10, 8);
+      std::memcpy(&p.v[2].u, tr + 0x18, 8);
+      p.mats = m.materials;
       pendingPolys_.push_back(p);
     }
   }
@@ -224,7 +231,7 @@ void StreamPresenter::flushModelPolys() {
   ++d.flushes;
   const std::uint64_t px0 = d.raster.pixels;
   for (const StreamModelPoly& p : pendingPolys_)
-    ribbon_.drawTri(fb_, p.pen, p.v, d.raster);
+    ribbon_.drawTri(fb_, p.pen, p.v, p.mats, d.raster);
   pendingPolys_.clear();
   if (d.raster.pixels != px0)
     d.fbDigest = d.fbDigest * 0x100000001b3ull ^
