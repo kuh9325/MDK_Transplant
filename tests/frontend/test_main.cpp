@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1272,21 +1273,372 @@ int main() {
             pres.diag().ribbon.rasterized == 2);
       CHECK(branchN(pres, BR::kFlat) == 2);
     }
+    // --- Phase 19B.2B1 — Mode-5 model geometry submission (synthetic)
+    // kModelDraw: f[0..11] = the composed camProj-o-xform 3x4 (row
+    // major), aux = the object's pool index. The host resolves aux
+    // through the bound resolver, walks the object's LIVE element set
+    // in order, fills verts via projectVert (46b4f8), winding-tests
+    // each 0x24 tri record, pushes survivors into the deferred table,
+    // and drains (z'-sum sort + 0ca00 + 0c860) when the first
+    // non-model event arrives — the native per-bucket boundary.
     {
+      // 0x24-byte tri record: u16 idx @ +0/2/4, i16 pen @ +0x06.
+      auto mkTriRec = [](int i0, int i1, int i2, int pen) {
+        std::vector<std::uint8_t> r(0x24, 0);
+        r[0] = std::uint8_t(i0);       r[1] = std::uint8_t(i0 >> 8);
+        r[2] = std::uint8_t(i1);       r[3] = std::uint8_t(i1 >> 8);
+        r[4] = std::uint8_t(i2);       r[5] = std::uint8_t(i2 >> 8);
+        const std::uint16_t p =
+            std::uint16_t(std::int16_t(pen));
+        r[6] = std::uint8_t(p);        r[7] = std::uint8_t(p >> 8);
+        return r;
+      };
+      // Single-element object: verts = f32 triples, tris = packed
+      // 0x24 records, triCount + elemMaskB (+0x2c8) explicit.
+      auto mkObj = [&](const std::vector<float>& verts,
+                       const std::vector<std::uint8_t>& tris,
+                       int triCount, std::uint32_t mask) {
+        auto o = std::make_unique<mdk::DynamicObject>();
+        o->model.elems.resize(1);
+        o->model.elemVerts.assign(1, verts);
+        o->model.elemTris.assign(1, tris);
+        o->model.rebind();
+        o->model.elems[0].triCount = triCount;
+        o->elemSet = o->model.elementSet();
+        o->col.elements = &o->elemSet;
+        o->col.elemMaskB = mask;
+        return o;
+      };
+      auto mkMdl = [](int aux) {
+        StreamEvent e;
+        e.kind = StreamEvent::kModelDraw;
+        e.aux = aux;
+        e.f[0] = 1; e.f[5] = 1; e.f[10] = 1;   // identity 3x4
+        return e;
+      };
+      const auto& dm = pres.diag().model;
+
+      // Lookup/lifetime — no resolver bound: every command is a
+      // counted miss, never a deref.
       pres.reset();
-      // Model carry-through unchanged: counted, fb untouched.
-      StreamEvent m = mkEv(StreamEvent::kModelDraw);
-      pres.consume(m, dac);
-      CHECK(pres.diag().modelsDeferred == 1);
+      pres.consume(mkMdl(0), dac);
+      CHECK(dm.commands == 1);
+      CHECK(dm.lookupMiss == 1);
+      CHECK(dm.resolved == 0);
+
+      // One triangle, flat pen -500 -> byte 0xf4. Verts project to
+      // (0,0),(300,0),(300,180) — the same screen tri as the ribbon
+      // flat test. The submit only PUSHES; kPresent is the drain.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -500), 1, 0);
+        pres.bindModelResolver(
+            [&](int i) -> const mdk::DynamicObject* {
+              return i == 7 ? obj.get() : nullptr;
+            });
+        pres.consume(mkMdl(7), dac);
+        CHECK(dm.commands == 1);
+        CHECK(dm.resolved == 1 && dm.lookupMiss == 0);
+        CHECK(dm.elementsWalked == 1 && dm.elementsMasked == 0);
+        CHECK(dm.trisWalked == 1);
+        CHECK(dm.matCls[1] == 1);          // B — flat [-989,-1]
+        CHECK(dm.raster.pixels == 0);      // still pending — no draw
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);              // the drain boundary
+        CHECK(dm.flushes == 1);
+        CHECK(dm.raster.pixels > 0);
+        CHECK(pres.framebuffer().at(150, 90) == 0xf4);
+        CHECK(pres.framebuffer().at(100, 90) == 0);
+        pres.clearFramePending();
+
+        // aux out of range — a counted miss.
+        pres.consume(mkMdl(8), dac);
+        CHECK(dm.lookupMiss == 1);
+      }
+
+      // Backface — reversed index order fails the winding predicate:
+      // counted on trisWalked, never pushed, no census arm taken.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 2, 1, -500), 1, 0);
+        pres.bindModelResolver(
+            [&](int i) -> const mdk::DynamicObject* {
+              return i == 0 ? obj.get() : nullptr;
+            });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.trisWalked == 1);
+        CHECK(dm.polysBackface == 1);
+        CHECK(dm.raster.pixels == 0);
+        CHECK(dm.flushes == 0);            // empty batch — no drain
+        bool clean = true;
+        for (std::size_t i = 0; i < pres.framebuffer().pixelCount();
+             ++i)
+          clean &= pres.framebuffer().pixels()[i] == 0;
+        CHECK(clean);
+      }
+
+      // Transform application — the 3x4 is applied once to each
+      // local vert. +x translate by 1 moves the tri right 300px.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -500), 1, 0);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        StreamEvent m = mkMdl(0);
+        m.f[3] = 1.0f;                     // x' = x + 1
+        pres.consume(m, dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(pres.framebuffer().at(500, 90) == 0xf4);
+        CHECK(pres.framebuffer().at(400, 90) == 0);
+        pres.clearFramePending();
+      }
+
+      // Animated-vertex visibility — the resolver's view aliases the
+      // LIVE elemVerts storage; mutating it after the bind (the
+      // object animator's write path) changes the submitted shape.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -500), 1, 0);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        obj->model.elemVerts[0][0] = -0.5f;  // vert0 x: -1 -> -0.5
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        // The mutated tri is (150,0),(300,0),(300,180): (280,90)
+        // stays inside; (200,90) — covered before — is now outside.
+        CHECK(pres.framebuffer().at(280, 90) == 0xf4);
+        CHECK(pres.framebuffer().at(200, 90) == 0);
+        pres.clearFramePending();
+      }
+
+      // Element mask — +0x2c8 bit set skips the element entirely.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -500), 1, 1u);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.elementsMasked == 1 && dm.elementsWalked == 0);
+        CHECK(dm.trisWalked == 0);
+        CHECK(dm.raster.pixels == 0);
+        pres.clearFramePending();
+      }
+
+      // Multi-element walk — elements submit in stored order; the
+      // drain sorts by z'-sum descending (far first).
+      {
+        pres.reset();
+        auto obj = std::make_unique<mdk::DynamicObject>();
+        obj->model.elems.resize(2);
+        obj->model.elemVerts.assign(
+            2, std::vector<float>{-1,-1,1, 0,-1,1, 0,0,1});
+        obj->model.elemTris.assign(
+            2, mkTriRec(0, 1, 2, -500));   // pen 0xf4 both
+        obj->model.rebind();
+        obj->model.elems[0].triCount = 1;
+        obj->model.elems[1].triCount = 1;
+        obj->elemSet = obj->model.elementSet();
+        obj->col.elements = &obj->elemSet;
+        obj->col.elemMaskB = 0;
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.elementsWalked == 2 && dm.trisWalked == 2);
+        CHECK(dm.matCls[1] == 2);
+        pres.clearFramePending();
+      }
+
+      // Face ordering — two overlapping tris in one element; the
+      // drain sorts by z'-sum DESCENDING (far first) so the nearer
+      // tri paints over the farther regardless of record order.
+      {
+        pres.reset();
+        auto obj = std::make_unique<mdk::DynamicObject>();
+        obj->model.elems.resize(1);
+        // A: z=2 (far, z-sum 6) -> (150,90),(450,90),(300,270); 0xf4.
+        // B: z=1 (near, z-sum 3) -> (0,0),(300,0),(300,180);   0xf5.
+        obj->model.elemVerts.assign(
+            1, std::vector<float>{-1,-1,2, 1,-1,2, 0,1,2,
+                                  -1,-1,1, 0,-1,1, 0,0,1});
+        auto tris = mkTriRec(0, 1, 2, -500);       // A first
+        auto b = mkTriRec(3, 4, 5, -501);          // B second
+        tris.insert(tris.end(), b.begin(), b.end());
+        obj->model.elemTris.assign(1, tris);
+        obj->model.rebind();
+        obj->model.elems[0].triCount = 2;
+        obj->elemSet = obj->model.elementSet();
+        obj->col.elements = &obj->elemSet;
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.trisWalked == 2);
+        // (200,95) is inside both tris — the nearer B wins.
+        CHECK(pres.framebuffer().at(200, 95) == 0xf5);
+        // (300,200) is inside A only — the far pen survives there.
+        CHECK(pres.framebuffer().at(300, 200) == 0xf4);
+        pres.clearFramePending();
+      }
+
+      // Near-plane clip — v0 z = 0.01 carries flag 0x10: the winding
+      // test takes the 3D plane-sign arm, the push survives, and the
+      // drain's clipper fans the tri.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,0.01f, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -500), 1, 0);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.trisWalked == 1);
+        CHECK(dm.matCls[1] == 1);
+        CHECK(dm.raster.clipped == 1);
+        CHECK(dm.raster.rasterized >= 1);
+        CHECK(dm.raster.pixels > 0);
+        pres.clearFramePending();
+      }
+
+      // Unsupported 0c860 arms — counted on their census id and the
+      // raster's unsupported bucket; no pixels are committed.
+      {
+        pres.reset();
+        auto tris = mkTriRec(0, 1, 2, 5);          // A material
+        auto c = mkTriRec(0, 1, 2, -1000);         // C fx47a770
+        auto f = mkTriRec(0, 1, 2, -1028);         // F fx46e940
+        auto e = mkTriRec(0, 1, 2, -1025);         // E lut1024
+        tris.insert(tris.end(), c.begin(), c.end());
+        tris.insert(tris.end(), f.begin(), f.end());
+        tris.insert(tris.end(), e.begin(), e.end());
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1}, tris, 4, 0);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        CHECK(dm.trisWalked == 4);
+        CHECK(dm.matCls[0] == 1 && dm.matCls[2] == 1 &&
+              dm.matCls[5] == 1 && dm.matCls[4] == 1);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.raster.unsupported == 3);  // A, C, F
+        // E (-1025) hit the LUT arm without a bound palette -> miss.
+        CHECK(dm.raster.lutMisses == 1);
+        CHECK(dm.raster.pixels == 0);
+        pres.clearFramePending();
+      }
+
+      // LUT arm end-to-end — the degenerate all-gray palette maps
+      // every src index to 255 (same trick as the ribbon LUT test).
+      {
+        pres.reset();
+        std::uint8_t flatPal[768];
+        for (int i = 0; i < 256; ++i) {
+          flatPal[i * 3 + 0] = 7;
+          flatPal[i * 3 + 1] = 7;
+          flatPal[i * 3 + 2] = 7;
+        }
+        pres.bindRibbonPalette(flatPal);
+        for (int y = 0; y < 200; ++y)
+          for (int x = 0; x < 400; ++x)
+            pres.framebuffer().put(x, y, 0x42);
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -1029), 1, 0);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.matCls[6] == 1);          // G — lut <=-1029
+        CHECK(pres.framebuffer().at(150, 90) == 255);
+        CHECK(dm.raster.pixels > 0);
+        pres.clearFramePending();
+      }
+
+      // Invalid geometry — a tri index past the vert bound is a
+      // counted invalid record, never classified or drawn.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 9, -500), 1, 0);
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(dm.trisWalked == 1);
+        CHECK(dm.invalidGeometry == 1);
+        CHECK(dm.matCls[1] == 0);
+        CHECK(dm.raster.pixels == 0);
+        pres.clearFramePending();
+      }
+
+      // classRec0 sentinel — the fuse arm binds +0x0c to 0x4edcc0;
+      // there is no geometry to walk, counted on its own bucket.
+      {
+        pres.reset();
+        auto obj = std::make_unique<mdk::DynamicObject>();
+        obj->col.elements = mdk::StreamScene::classRec0();
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        CHECK(dm.commands == 1);
+        CHECK(dm.classRec0 == 1);
+        CHECK(dm.resolved == 0 && dm.trisWalked == 0);
+      }
+
+      // Event-order preservation — the batch drains at the first
+      // non-model event, so model pixels land UNDER the next event's
+      // draw and OVER everything before it.
+      {
+        pres.reset();
+        auto obj = mkObj({-1,-1,1, 0,-1,1, 0,0,1},
+                         mkTriRec(0, 1, 2, -500), 1, 0);  // 0xf4
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        // Ribbon first, then model -> the model flush (at kPresent)
+        // paints over the ribbon pixel.
+        pres.consume(mkTri(-1015, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+        pres.consume(mkMdl(0), dac);
+        StreamEvent p = mkEv(StreamEvent::kPresent);
+        pres.consume(p, dac);
+        CHECK(pres.framebuffer().at(150, 90) == 0xf4);
+
+        // Model first, then ribbon -> the kRibbonTri consume drains
+        // the pending model batch BEFORE the ribbon draws.
+        pres.reset();
+        pres.bindModelResolver(
+            [&](int) -> const mdk::DynamicObject* { return obj.get(); });
+        pres.consume(mkMdl(0), dac);
+        pres.consume(mkTri(-1015, -1,-1,1, 0,-1,1, 0,0,1, 0), dac);
+        pres.consume(p, dac);
+        CHECK(pres.framebuffer().at(150, 90) == 0xf7);
+        pres.clearFramePending();
+      }
     }
 
     // --- present boundary + digests --------------------------------
     {
       pres.reset();
-      // Model carry-through: counted, framebuffer untouched.
+      // Model carry-through: counted (resolver unbound -> miss),
+      // framebuffer untouched.
       StreamEvent m = mkEv(StreamEvent::kModelDraw);
       pres.consume(m, dac);
-      CHECK(pres.diag().modelsDeferred == 1);
+      CHECK(pres.diag().model.commands == 1);
+      CHECK(pres.diag().model.lookupMiss == 1);
       bool clean = true;
       for (std::size_t i = 0; i < pres.framebuffer().pixelCount();
            ++i)

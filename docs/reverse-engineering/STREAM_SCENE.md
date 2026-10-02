@@ -791,3 +791,46 @@ repository).
 **MODE-5 CINEMATIC CORE: CLOSED FOR BUILD_A** — golden established
 for courses 0–4 at skill 1 / seed 0xC0FFEE; deterministic end-to-end;
 remaining work is Phase-19B host/presentation only.
+
+## 19. Host: kModelDraw geometry submission (Phase 19B.2B1 — OBSERVED asm, live census)
+
+The host `StreamPresenter::submitModel` ports the deferred model
+submit arm: `FUN_00455e24` → `FUN_0040c3a0` on the `0x541500==1`
+path. Per `kModelDraw` (`f[0..11]` = `camProj ∘ object xform`,
+`aux` = pool index) the object's LIVE element set is walked in
+order under the `+0x2c8` mask; every element's verts are filled once
+through the matrix (`FUN_0046b4f8` — `projectVert`); each 0x24 tri
+record yields `{u16 idx ×3 @ +0, i16 pen @ +0x06}`; the winding
+predicate is the 2D projected cross when no vert carries the near
+bit else the 3D plane-sign triple product (`NaN` rejects). Passing
+tris push into the shared record table (0x1000 bound); the batch
+drains at the first non-`kModelDraw` event — exactly the native
+per-bucket boundary (`FUN_0040c694` qsort by z'-sum i32 descending,
+stable ties, then `FUN_0040ca00` clip + `FUN_0040c860` dispatch per
+tri). Model polys land after the bucket's ribbons and before its
+sprite drain — ordering preserved end to end.
+
+Material reachability (`mdk_stream_census`, courses 0–4, skill 1,
+seed 0xC0FFEE — every pushed tri classified into the `0c860` arms
+A pen≥0 material / B [-989,-1] flat / C [-1010,-990] fx47a770 /
+D [-1023,-1011] flat / E [-1027,-1024] lut / F -1028 fx46e940 /
+G ≤-1029 lut):
+
+| course | cmds | tris walked | backface | A mat | B flat | C–G |
+|--------|------|-------------|----------|-------|--------|-----|
+| 0 | 1040 | 258255 | 133185 | 114470 | 10600 | 0 |
+| 1 | 1012 | 252109 | 126700 | 115042 | 10367 | 0 |
+| 2 | 934  | 234988 | 121139 | 104576 | 9273  | 0 |
+| 3 | 934  | 234988 | 121139 | 104576 | 9273  | 0 |
+| 4 | 706  | 440191 | 235574 | 154707 | 49910 | 0 |
+
+All courses: `lookup_miss = invalid_geometry = overflow =
+elements_masked = 0`; every command resolved to the live object set.
+Real model geometry reaches ONLY the textured (A — `FUN_0046daac`)
+and flat (B — `FUN_00415260`) arms; neither effect arm nor either
+LUT arm is ever taken. Flat renders through the closed 19B.2A path;
+A is counted as `model_material_deferred_textured` (not drawn —
+`c0 18235 / c1 28362 / c2 19877 / c3 19877 / c4 100741` reached
+dispatch after trivial-reject/clip). Geometry submission is closed;
+full model presentation stays OPEN pending the `46daac` textured
+filler (next phase).

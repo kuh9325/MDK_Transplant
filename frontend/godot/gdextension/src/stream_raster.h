@@ -7,8 +7,10 @@
 //   tag     = the raw pen scalar (always <= -1029 on real ribbons)
 // The host owns: sel-0 projection, the 0ca00 clipper, the 0c860
 // material dispatch, and the scanline fillers — all writing palette
-// INDICES into the 600x360 IndexedFramebuffer. Model draws remain
-// deferred (Phase 19B.2B).
+// INDICES into the 600x360 IndexedFramebuffer. Phase 19B.2B1 added
+// the model-submit entries: projectVert (the 46b4f8 vertex fill the
+// submitter runs per element vertex) and drawTri (the 0ca00 + 0c860
+// contract for verts that arrive already projected and flagged).
 #pragma once
 
 #include <array>
@@ -76,6 +78,26 @@ public:
   // 0c860 dispatch -> filler, writing into fb in emission order.
   void draw(mdk::IndexedFramebuffer& fb, int pen, const float v9[9],
             std::uint32_t packedFlags, StreamRibbonDiag& diag) const;
+
+  // 19B.2B1 — FUN_0046b4f8 sel-0 vertex fill for the model
+  // submitter: v' = in x M (row-major 3x4, f64 intermediates rounded
+  // to f32 — the compose6aeb0/point6afe4 convention), the clip-flag
+  // pack {bit0 y'>z', bit1 y'<-z', bit2 x'>z', bit3 x'<-z', bit4
+  // z'<0.05}, then the sel-0 projected fill. The fill runs even on
+  // near-flagged verts; z'==0 leaves sx/sy at 0.
+  static void projectVert(const float m[12], const float in[3],
+                          StreamTriVert& v);
+
+  // The OBSERVED 0c860 compare chain — the dispatch branch for a raw
+  // pen scalar (single source for the submitter's material census).
+  static StreamTriBranch branchForPen(int pen);
+
+  // 19B.2B1 — the 0ca00 + 0c860 entry for a tri whose verts arrive
+  // already transformed, projected and flagged (the native ca00
+  // contract — no re-projection). Trivial-reject on ANDed flags,
+  // direct dispatch on or==0, else the five-pass clip + fan.
+  void drawTri(mdk::IndexedFramebuffer& fb, int pen,
+               const StreamTriVert v[3], StreamRibbonDiag& diag) const;
 
 private:
   // The 0x28-byte native octree node: center rgb + level, the leaf's

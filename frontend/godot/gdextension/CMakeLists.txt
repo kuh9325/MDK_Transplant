@@ -76,6 +76,20 @@ set_target_properties(mdkbridge PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY
         "${CMAKE_CURRENT_SOURCE_DIR}/../bin/${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 
+# ---------- native (non-Godot) stream census driver ----------
+# Phase 19B.2B1 — runs the real mode-5 StreamScene through the SAME
+# StreamPresenter/StreamRibbonRaster the GDExtension hosts, so the
+# kModelDraw material census (A..G reachability) and representative
+# frame shots are measurable without a Godot binary.
+add_executable(mdk_stream_census
+    src/stream_census.cpp
+    src/stream_presenter.cpp
+    src/stream_raster.cpp)
+target_include_directories(mdk_stream_census PRIVATE "${MDK_CORE_SRC}" src)
+target_link_libraries(mdk_stream_census PRIVATE mdk_core_frontend)
+target_compile_options(mdk_stream_census PRIVATE
+    -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
+
 # ---------- native (non-Godot) frontend tests ----------
 add_executable(mdk_frontend_tests
     "${MDK_REPO_ROOT}/tests/frontend/test_main.cpp"

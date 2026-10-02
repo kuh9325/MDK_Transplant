@@ -2962,6 +2962,16 @@ bool MdkBridge::campaignStreamEnter_(std::string& detail) {
     stream_.reset();
     return false;
   }
+  // 19B.2B1 — kModelDraw aux is a pool index; resolve it against the
+  // live scene pool (std::array storage is stable for the scene's
+  // lifetime; the lambda re-checks stream_ so a stale consume after
+  // teardown is a counted miss, never a deref of freed storage).
+  streamPresenter_.bindModelResolver(
+      [this](int i) -> const mdk::DynamicObject* {
+        if (!stream_ || i < 0 || i >= mdk::kStreamPoolSize)
+          return nullptr;
+        return &stream_->objectAt(i);
+      });
   // Synthetic 46c650 clock — the canonical harness' +33ms/frame feed
   // (host pacing is a later phase; this keeps draws deterministic).
   streamNowMs_ = 1000;
@@ -3113,7 +3123,46 @@ Dictionary MdkBridge::stream_diag() {
   out["hud_misses"] = int64_t(d.hudMisses);
   out["teletype_draws"] = int64_t(d.teletypeDraws);
   out["palette_sets"] = int64_t(d.paletteSets);
-  out["models_deferred"] = int64_t(d.modelsDeferred);
+  // 19B.2B1 — the kModelDraw submitter census: commands = events
+  // consumed; resolved = events that bound the object's live model
+  // set; lookup_miss = aux out of range / no element set / foreign
+  // set; class_rec0 = the 0x4edcc0 fuse-sentinel arm (no geometry);
+  // the A..G arms split the submitted tris by the 0c860 dispatch
+  // class. The deferred-textured/effect counts are the A/C/F arms.
+  out["model_commands"] = int64_t(d.model.commands);
+  out["model_resolved"] = int64_t(d.model.resolved);
+  out["model_lookup_miss"] = int64_t(d.model.lookupMiss);
+  out["model_class_rec0"] = int64_t(d.model.classRec0);
+  out["model_elements_walked"] = int64_t(d.model.elementsWalked);
+  out["model_elements_masked"] = int64_t(d.model.elementsMasked);
+  out["model_tris_walked"] = int64_t(d.model.trisWalked);
+  out["model_polys_backface"] = int64_t(d.model.polysBackface);
+  out["model_polys_overflow"] = int64_t(d.model.polysOverflow);
+  out["model_invalid_geometry"] = int64_t(d.model.invalidGeometry);
+  out["model_flushes"] = int64_t(d.model.flushes);
+  out["model_pixels"] = static_cast<int64_t>(d.model.raster.pixels);
+  out["model_fb_digest"] =
+      static_cast<int64_t>(d.model.fbDigest);
+  {
+    // A..G arm census — [material, flatB, fx47a770, flatD, lut1024,
+    // fx46e940, lut1029] over the submitted (winding-passed) tris.
+    Array cls;
+    for (int i = 0; i != 7; ++i) cls.push_back(int64_t(d.model.matCls[i]));
+    out["model_mat_census"] = cls;
+    Array br;
+    for (const auto& [id, n] : d.model.raster.branch) {
+      Dictionary e;
+      e["branch"] = streamTriBranchName(
+          static_cast<mdkbridge::StreamTriBranch>(id));
+      e["count"] = int64_t(n);
+      br.push_back(e);
+    }
+    out["model_branch"] = br;
+  }
+  out["model_clip_dropped"] = int64_t(d.model.raster.clipDropped);
+  out["model_deferred_textured"] = int64_t(d.model.matCls[0]);
+  out["model_deferred_fx47a770"] = int64_t(d.model.matCls[2]);
+  out["model_deferred_fx46e940"] = int64_t(d.model.matCls[5]);
   // 19B.2A — the kRibbonTri raster census: commands = events
   // consumed (== the native golden triangle census), rasterized =
   // triangles that reached a filler (fan members counted), clipped =

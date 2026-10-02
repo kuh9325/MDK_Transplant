@@ -7,9 +7,10 @@
 // HUD subrect blit (FUN_004185fc), the TELETYPE text draws
 // (FUN_00414d2c / FUN_0041518c), the terminal palette fill, and the
 // kPresent frame boundary. Phase 19B.2A added the indexed-triangle
-// raster backend (stream_raster.h) — kRibbonTri is drawn in-stream;
-// kModelDraw is still counted and deferred to Phase 19B.2B — no
-// mutation, no reordering.
+// raster backend (stream_raster.h) — kRibbonTri is drawn in-stream.
+// Phase 19B.2B1 added the kModelDraw submitter — geometry walk +
+// projection + deferred depth-sorted polygon drain (StreamModelDiag
+// below) — no mutation, no reordering of the event stream.
 //
 // Godot-free by design: the bridge owns the instance, consumes the
 // scene's event queue after each step, and palette-expands the
@@ -17,10 +18,12 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "core/framebuffer.h"
 #include "core/fti_font.h"
@@ -63,6 +66,44 @@ using StreamSpriteMissCensus =
 
 const char* streamSpriteResultName(StreamSpriteResult r);
 
+// Phase 19B.2B1 — the kModelDraw consumer (FUN_00455e24 ->
+// FUN_0040c3a0 on the 0x541500==1 deferred path, OBSERVED
+// p19a_asm5.txt / g1_poly.txt). Per event the model's element set is
+// walked in order (+0x2c8 element-disable mask applied), every
+// element's verts are transformed once through the event's composed
+// camProj-o-xform matrix into 6-float records (projectVert = the
+// 46b4f8 fill), and each 0x24-byte tri record contributes {i16 pen @
+// +0x06, u16 indices @ +0/2/4}: the winding predicate is the 2D
+// projected cross when no vert is near-flagged else the 3D plane-sign
+// triple product; passing tris PUSH into a per-batch deferred table.
+// The batch drains (qsort by z-sum key descending — OBSERVED sort
+// mode 0, bias global inert — then 0ca00+0c860 per tri) when the next
+// non-kModelDraw event arrives — exactly the native per-bucket order
+// (all model callbacks push, then FUN_0040c694 sorts+draws, then the
+// flag-1 sprite drain follows).
+struct StreamModelPoly {              // the pushed record's host form
+  float key;                          // z'-sum sort key (499f88==0)
+  int pen;                            // tri+0x06 i16 — dispatch scalar
+  StreamTriVert v[3];                 // projected/flagged verts
+};
+struct StreamModelDiag {
+  int commands = 0;        // kModelDraw events consumed
+  int resolved = 0;        // resolved to a live object element set
+  int lookupMiss = 0;      // aux out of range / no elements / foreign set
+  int classRec0 = 0;       // +0x0c == 0x4edcc0 fuse-sentinel arm
+  int elementsWalked = 0;  // elements surviving the elemMaskB gate
+  int elementsMasked = 0;  // elements skipped by elemMaskB
+  int trisWalked = 0;      // tri records visited
+  int polysBackface = 0;   // winding < 0 (incl. NaN) — never pushed
+  int polysOverflow = 0;   // pushed past the 0x1000 record bound
+  int invalidGeometry = 0; // index OOB / truncated record / NaN vert
+  int matCls[7] = {};      // submitted census, 0c860 arms A..G
+  int flushes = 0;         // batch drains (non-empty)
+  StreamRibbonDiag raster; // clip/fan/dispatch/pixel census
+  std::uint64_t fbDigest = 0;  // fold over fb after each
+                               // pixel-writing flush
+};
+
 // Presentation-side counters (all diagnostic — none of this feeds
 // back into the core). `terminalFill` stays -1 until kExitMode.
 struct StreamPresenterDiag {
@@ -80,7 +121,7 @@ struct StreamPresenterDiag {
   int hudMisses = 0;        //   unbound image / empty source
   int teletypeDraws = 0;    // kTeletypeDraw lines
   int paletteSets = 0;      // kPaletteSet DAC uploads applied
-  int modelsDeferred = 0;   // kModelDraw carried through (19B.2B)
+  StreamModelDiag model;    // kModelDraw submitter census (19B.2B1)
   StreamRibbonDiag ribbon;  // kRibbonTri raster census (19B.2A)
   int soundEvents = 0;      // kPlaySound/kStopSound (audio deferred)
   int terminalFills = 0;    // kExitMode palette fills
@@ -108,6 +149,13 @@ public:
   // for the mode-5 ribbon material ramp (native 0x4ed758; the DAC
   // surface is the faded copy and must NOT feed the LUT).
   void bindRibbonPalette(const std::uint8_t* palette768);
+  // 19B.2B1 — binds the kModelDraw aux (a StreamScene pool index) to
+  // the live object. The callable must return a borrowed pointer that
+  // stays valid across consume() calls (the bridge binds the scene's
+  // object pool — std::array storage, stable until teardown, and the
+  // resolver is cleared on reset()). nullptr unbinds.
+  void bindModelResolver(
+      std::function<const mdk::DynamicObject*(int)> fn);
   void reset();
 
   // One StreamEvent, in the core's emission order. `paletteDac` is
@@ -146,6 +194,15 @@ private:
                    std::uint8_t key, bool& drew);
   void drawTeletype(int renderer, int y, float scale,
                     const std::string& text);
+  // 19B.2B1 — FUN_00455e24/0040c3a0: resolve the object, walk the
+  // element set, transform verts, winding-test and push surviving
+  // tris into pendingPolys_.
+  void submitModel(const mdk::StreamEvent& ev);
+  // FUN_0040c694 — sort the pushed records by key descending and run
+  // each through the shared 0ca00+0c860 path. Called at the first
+  // non-kModelDraw event (the per-bucket boundary) and no-ops when
+  // the table is empty.
+  void flushModelPolys();
 
   mdk::IndexedFramebuffer fb_;            // 600x360, the 0x541650
                                           // surface
@@ -153,6 +210,9 @@ private:
   StreamRibbonRaster ribbon_;             // 19B.2A indexed tri raster
   std::unordered_map<int, mdk::IndexedImage> images_;
   std::optional<mdk::FtiFont> fontBig_, fontSml_;
+  std::function<const mdk::DynamicObject*(int)> modelResolver_;
+  std::vector<StreamModelPoly> pendingPolys_;  // the c3a0 push table
+  std::vector<StreamTriVert> modelVerts_;      // bc34 xform scratch
   StreamPresenterDiag diag_;
   bool framePending_ = false;
 };

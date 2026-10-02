@@ -497,10 +497,62 @@ void StreamRibbonRaster::fillFlat(mdk::IndexedFramebuffer& fb,
 }
 
 // ------------------------------------------------------------------
+// FUN_0046b4f8 — the model submitter's per-vertex fill (the same body
+// StreamScene::project6b4f8 ports for the core's own events): row-major
+// 3x4 transform, the flag pack's mov-arms, then the sel-0 fill.
+void StreamRibbonRaster::projectVert(const float m[12],
+                                     const float in[3],
+                                     StreamTriVert& v) {
+  v.x = static_cast<float>(
+      static_cast<double>(in[0]) * m[0] +
+      static_cast<double>(in[1]) * m[1] +
+      static_cast<double>(in[2]) * m[2] + static_cast<double>(m[3]));
+  v.y = static_cast<float>(
+      static_cast<double>(in[0]) * m[4] +
+      static_cast<double>(in[1]) * m[5] +
+      static_cast<double>(in[2]) * m[6] + static_cast<double>(m[7]));
+  v.z = static_cast<float>(
+      static_cast<double>(in[0]) * m[8] +
+      static_cast<double>(in[1]) * m[9] +
+      static_cast<double>(in[2]) * m[10] + static_cast<double>(m[11]));
+  // b559..b5da — {y'>z' -> 1; -z'<=y' -> 0; else 2}, then
+  // x'>z' -> |4 else x'<-z' -> |8 (the |8 arm is skipped once |4
+  // landed — the arms are mutually exclusive by construction).
+  std::uint32_t flags = 0;
+  if (v.y > v.z) flags = 1;
+  else if (-v.z <= v.y) flags = 0;
+  else flags = 2;
+  if (v.x > v.z) flags |= 4;
+  else if (v.x < -v.z) flags |= 8;
+  if (static_cast<double>(v.z) < 0.05) flags |= 0x10;
+  v.flags = flags;
+  v.sx = v.sy = 0.0f;
+  project(v);            // the fill runs whenever z' != 0
+}
+
+// ------------------------------------------------------------------
 // FUN_0040c860 — sort the three verts by sy ascending (OBSERVED
 // fcomp/ja order — strict swaps keep equal-key input order), then
 // the negative-pen family dispatch. eax/edx/v-ptr plumbing and the
 // 42fecc profiling counter are host plumbing, not modeled.
+
+// OBSERVED compare chain, in asm order:
+//   jns       -> material table (pen >= 0)
+//   >= -989   -> 415260 flat           [-989,-1]
+//   >= -1010  -> 47a770 effect         [-1010,-990]
+//   >  -1024  -> 415260 flat           [-1023,-1011]
+//   >= -1027  -> 412970, lut + (-1024-pen)*256   [-1027,-1024]
+//   == -1028  -> 46e940 effect
+//   else      -> 412970, lut + (-1029-pen)*256   <= -1029
+StreamTriBranch StreamRibbonRaster::branchForPen(int pen) {
+  if (pen >= 0) return StreamTriBranch::kMaterial;
+  if (pen >= -989) return StreamTriBranch::kFlat;
+  if (pen >= -1010) return StreamTriBranch::kFx47a770;
+  if (pen > -1024) return StreamTriBranch::kFlat;
+  if (pen >= -1027) return StreamTriBranch::kLut1024;
+  if (pen == -1028) return StreamTriBranch::kFx46e940;
+  return StreamTriBranch::kLut1029;
+}
 
 void StreamRibbonRaster::dispatch(mdk::IndexedFramebuffer& fb, int pen,
                                   const StreamTriVert in[3],
@@ -511,33 +563,10 @@ void StreamRibbonRaster::dispatch(mdk::IndexedFramebuffer& fb, int pen,
   if (v[1].sy > v[2].sy) std::swap(v[1], v[2]);
   if (v[0].sy > v[1].sy) std::swap(v[0], v[1]);
 
-  // OBSERVED compare chain, in asm order:
-  //   jns       -> material table (pen >= 0)
-  //   >= -989   -> 415260 flat           [-989,-1]
-  //   >= -1010  -> 47a770 effect         [-1010,-990]
-  //   >  -1024  -> 415260 flat           [-1023,-1011]
-  //   >= -1027  -> 412970, lut + (-1024-pen)*256   [-1027,-1024]
-  //   == -1028  -> 46e940 effect
-  //   else      -> 412970, lut + (-1029-pen)*256   <= -1029
-  StreamTriBranch br;
+  const StreamTriBranch br = branchForPen(pen);
   int lutRowIx = -1;
-  if (pen >= 0) {
-    br = StreamTriBranch::kMaterial;      // 4ce518 table -> 46daac
-  } else if (pen >= -989) {
-    br = StreamTriBranch::kFlat;
-  } else if (pen >= -1010) {
-    br = StreamTriBranch::kFx47a770;
-  } else if (pen > -1024) {
-    br = StreamTriBranch::kFlat;
-  } else if (pen >= -1027) {
-    br = StreamTriBranch::kLut1024;
-    lutRowIx = -1024 - pen;
-  } else if (pen == -1028) {
-    br = StreamTriBranch::kFx46e940;
-  } else {
-    br = StreamTriBranch::kLut1029;
-    lutRowIx = -1029 - pen;
-  }
+  if (br == StreamTriBranch::kLut1024) lutRowIx = -1024 - pen;
+  else if (br == StreamTriBranch::kLut1029) lutRowIx = -1029 - pen;
   ++diag.branch[static_cast<int>(br)];
 
   switch (br) {
@@ -571,7 +600,6 @@ void StreamRibbonRaster::dispatch(mdk::IndexedFramebuffer& fb, int pen,
 void StreamRibbonRaster::draw(mdk::IndexedFramebuffer& fb, int pen,
                               const float v9[9], std::uint32_t packedFlags,
                               StreamRibbonDiag& diag) const {
-  ++diag.commands;
   StreamTriVert v[3];
   for (int i = 0; i < 3; ++i) {
     v[i].x = v9[i * 3 + 0];
@@ -580,7 +608,17 @@ void StreamRibbonRaster::draw(mdk::IndexedFramebuffer& fb, int pen,
     v[i].flags = (packedFlags >> (i * 8)) & 0xff;
     project(v[i]);                       // the upstream 6b4f8 fill
   }
+  drawTri(fb, pen, v, diag);
+}
 
+// 19B.2B1 — the same 0ca00 + 0c860 tail for a tri that arrives
+// already projected and flagged (the model submit path; ca00's
+// contract takes view-space verts and packed flags, which is
+// exactly what projectVert produces).
+void StreamRibbonRaster::drawTri(mdk::IndexedFramebuffer& fb, int pen,
+                                 const StreamTriVert v[3],
+                                 StreamRibbonDiag& diag) const {
+  ++diag.commands;
   const std::uint32_t f0 = v[0].flags, f1 = v[1].flags, f2 = v[2].flags;
   if ((f0 & f1 & f2) != 0) return;       // trivial reject (never on
                                          // real data — core gates it)

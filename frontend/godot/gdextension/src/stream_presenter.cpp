@@ -5,6 +5,9 @@
 
 #include "stream_presenter.h"
 
+#include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstring>
 
 namespace mdkbridge {
@@ -25,6 +28,11 @@ void StreamPresenter::bindRibbonPalette(const std::uint8_t* pal768) {
   ribbon_.bindPalette(pal768);
 }
 
+void StreamPresenter::bindModelResolver(
+    std::function<const mdk::DynamicObject*(int)> fn) {
+  modelResolver_ = std::move(fn);
+}
+
 void StreamPresenter::reset() {
   fb_.clear(0);
   palette_ = mdk::Palette{};
@@ -32,8 +40,197 @@ void StreamPresenter::reset() {
   fontBig_.reset();
   fontSml_.reset();
   ribbon_.bindPalette(nullptr);
+  modelResolver_ = nullptr;
+  pendingPolys_.clear();
+  modelVerts_.clear();
   diag_ = StreamPresenterDiag{};
   framePending_ = false;
+}
+
+// ------------------------------------------------------------------
+// Phase 19B.2B1 — the mode-5 model submitter.
+//
+// OBSERVED chain (p19a_asm5.txt / g1_poly.txt):
+//   FUN_0042e100 record build — objects with +0x0c != 0 become flag-0
+//   records with callback FUN_00455e24. In mode 5 (0x541500 != 0)
+//   FUN_00409a00 calls the callback inline during the chain walk —
+//   FUN_00455e24 -> FUN_0040c3a0 — which PUSHES each winding-passing
+//   tri into the shared 0x10-byte record table; FUN_0040c694 then
+//   sorts the table by the mode-0 key (z'-sum, descending via the
+//   40bd2c i32 comparator) and calls FUN_0040ca00 -> dispatch.
+//
+// Per element (not masked by object +0x2c8 — mode-5 records carry
+// rec+0x2c == 0 so that is always the mask source):
+//   FUN_0040bc34 allocates a transformed-vert scratch -> elem +0x1c;
+//   FUN_0046b4f8 fills each vert (6-float record) through the event's
+//   composed camProj-o-xform 3x4.
+// Per tri (0x24-byte record: u16 idx @ +0/2/4, i16 pen @ +0x06,
+// float2 uv @ +0x08/+0x10/+0x18):
+//   flags-OR & 0x10 == 0 -> winding = the 2D projected cross
+//     (v2.sy-v0.sy)*(v1.sx-v0.sx) - (v2.sx-v0.sx)*(v1.sy-v0.sy)
+//   else -> winding = v1 . ((v1-v0) x (v2-v1))  (3D plane sign)
+//   winding >= 0 (NaN rejects) -> push {key=z0+z1+z2, pen, verts}.
+// ------------------------------------------------------------------
+namespace {
+
+// The 0c860 arm id (spec census A..G) for a raw pen scalar — same
+// compare chain as branchForPen, with the two flat arms split.
+int modelMatClass(int pen) {
+  switch (StreamRibbonRaster::branchForPen(pen)) {
+    case StreamTriBranch::kMaterial: return 0;      // A textured
+    case StreamTriBranch::kFlat: return pen >= -989 ? 1 : 3;  // B / D
+    case StreamTriBranch::kFx47a770: return 2;      // C
+    case StreamTriBranch::kLut1024: return 4;       // E
+    case StreamTriBranch::kFx46e940: return 5;      // F
+    default: return 6;                              // G lut <=-1029
+  }
+}
+
+bool vertFinite(const StreamTriVert& v) {
+  return std::isfinite(v.x) && std::isfinite(v.y) &&
+         std::isfinite(v.z) && std::isfinite(v.sx) &&
+         std::isfinite(v.sy);
+}
+
+} // namespace
+
+void StreamPresenter::submitModel(const mdk::StreamEvent& ev) {
+  auto& d = diag_.model;
+  ++d.commands;
+  const mdk::DynamicObject* o =
+      modelResolver_ ? modelResolver_(ev.aux) : nullptr;
+  if (!o || o->col.elements == nullptr) {
+    ++d.lookupMiss;
+    return;
+  }
+  if (o->col.elements == mdk::StreamScene::classRec0()) {
+    // The 0x4edcc0 class-table sentinel arm (fuse objects) — the
+    // port binds an empty set; there is no geometry to walk.
+    ++d.classRec0;
+    return;
+  }
+  // Resolve only the object's OWN live model set — spawn binds
+  // elemSet = model.elementSet() and animation mutates elemVerts in
+  // place, so the views here always see the current vertex state.
+  // A foreign +0x0c binding is a lookup failure class (unreachable
+  // on real data), not invalid geometry.
+  const mdk::CollisionElementSet& es = *o->col.elements;
+  const mdk::RuntimeModel& m = o->model;
+  if (&es != &o->elemSet || es.elems != m.elems.data() ||
+      m.elems.size() != m.elemVerts.size() ||
+      m.elems.size() != m.elemTris.size()) {
+    ++d.lookupMiss;
+    return;
+  }
+  ++d.resolved;
+
+  const std::uint32_t mask = o->col.elemMaskB;    // +0x2c8
+  const int ec = es.count < 0 ? 0 : es.count;
+  for (int e = 0; e < ec; ++e) {
+    // Native mask bit: 1 << (i & 0x1f) — index wraps mod 32.
+    if (((mask >> (e & 0x1f)) & 1u) != 0) {
+      ++d.elementsMasked;
+      continue;
+    }
+    ++d.elementsWalked;
+    if (static_cast<std::size_t>(e) >= m.elems.size()) {
+      ++d.invalidGeometry;          // count runs past the bound array
+      continue;
+    }
+    const mdk::CollisionElement& el = es.elems[e];
+    const std::vector<float>& lv = m.elemVerts[e];
+    const std::vector<std::uint8_t>& lt = m.elemTris[e];
+    int vc = static_cast<int>(lv.size() / 3);
+    const int tc = el.triCount < 0 ? 0 : el.triCount;
+    if (el.verts == nullptr && vc > 0) { ++d.invalidGeometry; vc = 0; }
+    if (static_cast<std::size_t>(tc) * 0x24 > lt.size() ||
+        (tc > 0 && el.tris == nullptr))
+      ++d.invalidGeometry;
+    const int triWalk = el.tris == nullptr ? 0 : std::min<int>(
+        tc, static_cast<int>(lt.size() / 0x24));
+    // 46b4f8 fill — transform every element vert once. el.verts
+    // aliases lv (rebind() keeps the +0x14 view on the owned vector),
+    // so this reads the live (possibly animated) vertex state.
+    modelVerts_.resize(static_cast<std::size_t>(vc));
+    for (int i = 0; i < vc; ++i)
+      StreamRibbonRaster::projectVert(ev.f, el.verts + i * 3,
+                                      modelVerts_[i]);
+    for (int t = 0; t < triWalk; ++t) {
+      ++d.trisWalked;
+      const std::uint8_t* tr = el.tris + t * 0x24;
+      const int i0 = tr[0] | tr[1] << 8;
+      const int i1 = tr[2] | tr[3] << 8;
+      const int i2 = tr[4] | tr[5] << 8;
+      const int pen =
+          static_cast<std::int16_t>(tr[6] | tr[7] << 8);
+      if (i0 >= vc || i1 >= vc || i2 >= vc) {
+        ++d.invalidGeometry;
+        continue;
+      }
+      const StreamTriVert& v0 = modelVerts_[i0];
+      const StreamTriVert& v1 = modelVerts_[i1];
+      const StreamTriVert& v2 = modelVerts_[i2];
+      if (!vertFinite(v0) || !vertFinite(v1) || !vertFinite(v2)) {
+        ++d.invalidGeometry;
+        continue;
+      }
+      const std::uint32_t orF = v0.flags | v1.flags | v2.flags;
+      float c;
+      if ((orF & 0x10) == 0) {
+        // No near flag — the 2D projected-winding cross.
+        c = (v2.sy - v0.sy) * (v1.sx - v0.sx) -
+            (v2.sx - v0.sx) * (v1.sy - v0.sy);
+      } else {
+        // Near-flagged — the 3D plane-sign triple product
+        // v1 . ((v1-v0) x (v2-v1)) (eye at view origin).
+        c = v1.z * ((v1.x - v0.x) * (v2.y - v1.y) -
+                    (v2.x - v1.x) * (v1.y - v0.y)) +
+            v1.x * ((v1.y - v0.y) * (v2.z - v1.z) -
+                    (v2.y - v1.y) * (v1.z - v0.z)) +
+            v1.y * ((v2.x - v1.x) * (v1.z - v0.z) -
+                    (v1.x - v0.x) * (v2.z - v1.z));
+      }
+      if (!(c >= 0.0f)) {             // backface / NaN — never pushed
+        ++d.polysBackface;
+        continue;
+      }
+      ++d.matCls[modelMatClass(pen)];
+      if (pendingPolys_.size() >= 0x1000) {
+        ++d.polysOverflow;            // the native 0x1000 record bound
+        continue;
+      }
+      StreamModelPoly p;
+      p.key = v0.z + v1.z + v2.z;     // 499f88==0: z'-sum key
+      p.pen = pen;
+      p.v[0] = v0; p.v[1] = v1; p.v[2] = v2;
+      pendingPolys_.push_back(p);
+    }
+  }
+}
+
+// FUN_0040c694 — qsort the pushed records by key descending (the
+// 40bd2c comparator returns keyB-keyA on the i32 bit patterns —
+// stable_sort keeps a deterministic order for exact ties), then
+// 0ca00 + 0c860 per record in sorted order.
+void StreamPresenter::flushModelPolys() {
+  auto& d = diag_.model;
+  if (pendingPolys_.empty()) return;
+  std::stable_sort(pendingPolys_.begin(), pendingPolys_.end(),
+                   [](const StreamModelPoly& a,
+                      const StreamModelPoly& b) {
+                     return std::bit_cast<std::int32_t>(a.key) >
+                            std::bit_cast<std::int32_t>(b.key);
+                   });
+  ++d.flushes;
+  const std::uint64_t px0 = d.raster.pixels;
+  for (const StreamModelPoly& p : pendingPolys_)
+    ribbon_.drawTri(fb_, p.pen, p.v, d.raster);
+  pendingPolys_.clear();
+  if (d.raster.pixels != px0)
+    d.fbDigest = d.fbDigest * 0x100000001b3ull ^
+                 mdk::fnv1a64(std::span<const std::byte>(
+                     reinterpret_cast<const std::byte*>(fb_.pixels()),
+                     fb_.pixelCount()));
 }
 
 // FUN_0042e684 tail (OBSERVED, p19a_e684.asm): the two-piece toroidal
@@ -221,6 +418,11 @@ void StreamPresenter::drawTeletype(int renderer, int y, float scale,
 
 void StreamPresenter::consume(const mdk::StreamEvent& ev,
                               const std::uint8_t* paletteDac) {
+  // 19B.2B1 — the kModelDraw submitter only PUSHES tris (the native
+  // chain walk); the first non-model event is the per-bucket drain
+  // boundary (FUN_0040c694 inside 09a00) — the sorted poly draw then
+  // precedes the bucket's sprite drain, exactly the native order.
+  if (ev.kind != mdk::StreamEvent::kModelDraw) flushModelPolys();
   switch (ev.kind) {
     case mdk::StreamEvent::kBackdropBlit: {
       ++diag_.backdropBlits;
@@ -287,7 +489,7 @@ void StreamPresenter::consume(const mdk::StreamEvent& ev,
       }
       break;
     case mdk::StreamEvent::kModelDraw:
-      ++diag_.modelsDeferred;   // 19B.2B — counted, not rasterized
+      submitModel(ev);
       break;
     case mdk::StreamEvent::kRibbonTri:
       // 19B.2A — the host raster chain (project -> clip -> 0c860

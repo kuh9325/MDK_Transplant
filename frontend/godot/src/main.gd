@@ -1998,12 +1998,12 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 
 
 func _run_smoke_stream(course: int) -> void:
-	# Headless mode-5 presentation smoke (Phase 19B.1 + 19B.2A).
-	# Drives the same step path _process uses; asserts the host-side
-	# contract: indexed composition counters, palette uploads, the
-	# natural kExitMode exit, the terminal fill byte, the deferred
-	# model census, and the ribbon raster census. kModelDraw raster
-	# remains Phase 19B.2B — models_deferred stays the assertion.
+	# Headless mode-5 presentation smoke (Phase 19B.1 + 19B.2A +
+	# 19B.2B1). Drives the same step path _process uses; asserts the
+	# host-side contract: indexed composition counters, palette
+	# uploads, the natural kExitMode exit, the terminal fill byte,
+	# the model-geometry submission census (lookup misses and invalid
+	# geometry must stay zero), and the ribbon raster census.
 	print("smoke(stream): course=%d" % course)
 	_check(int(bridge.get_mode()) == 5, "mode == 5 (stream)")
 	_check(bridge.stream_active(), "stream_active after load")
@@ -2079,8 +2079,25 @@ func _run_smoke_stream(course: int) -> void:
 	_check(int(d["palette_sets"]) > 0, "palette uploads")
 	# Real streams post no TELETYPE text (OBSERVED) — the count is
 	# reported, not asserted.
-	_check(int(d["models_deferred"]) > 0,
-		"model draws deferred (19B.2B)")
+	# 19B.2B1 — every kModelDraw resolves to the object's live model
+	# (or the classRec0 fuse arm); misses and malformed geometry are
+	# hard failures, the A..G census must cover every pushed tri.
+	_check(int(d["model_commands"]) > 0,
+		"model draw commands received")
+	_check(int(d["model_lookup_miss"]) == 0,
+		"no model resource misses")
+	_check(int(d["model_invalid_geometry"]) == 0,
+		"no invalid model geometry")
+	_check(int(d["model_resolved"]) + int(d["model_class_rec0"]) +
+		int(d["model_lookup_miss"]) == int(d["model_commands"]),
+		"model resolution census covers every command")
+	var mc: Array = d["model_mat_census"]
+	var mc_total := 0
+	for i in range(7):
+		mc_total += int(mc[i])
+	_check(mc_total + int(d["model_polys_backface"]) ==
+		int(d["model_tris_walked"]),
+		"model A..G census covers every submitted tri")
 	# 19B.2A — every kRibbonTri consumed is a command; the census must
 	# show rasterized tris and no unported material branch / LUT miss.
 	_check(int(d["ribbon_commands"]) > 0,
@@ -2126,11 +2143,28 @@ func _run_smoke_stream(course: int) -> void:
 		int(d["sprite_transparent"]),
 		int(d["hud_blits"]), int(d["hud_misses"]),
 		int(d["teletype_draws"]), int(d["palette_sets"]),
-		int(d["models_deferred"]), int(d["ribbon_commands"]),
+		int(d["model_commands"]), int(d["ribbon_commands"]),
 		int(d["sound_events"]), int(d["terminal_fill"]),
 		(fbh >> 32) & 0xffffffff, fbh & 0xffffffff,
 		(plh >> 32) & 0xffffffff, plh & 0xffffffff,
 		int(bridge.get_mode())])
+	# 19B.2B1 — model submission census + the A..G material arms.
+	var mdig := int(d["model_fb_digest"])
+	print(("    model: cmd=%d res=%d miss=%d rec0=%d elem=%d/%d " +
+		"tri=%d back=%d oob=%d flush=%d px=%d " +
+		"A..G=[%d,%d,%d,%d,%d,%d,%d] fbdig=%08x%08x") % [
+		int(d["model_commands"]), int(d["model_resolved"]),
+		int(d["model_lookup_miss"]), int(d["model_class_rec0"]),
+		int(d["model_elements_walked"]), int(d["model_elements_masked"]),
+		int(d["model_tris_walked"]), int(d["model_polys_backface"]),
+		int(d["model_invalid_geometry"]), int(d["model_flushes"]),
+		int(d["model_pixels"]),
+		int(mc[0]), int(mc[1]), int(mc[2]), int(mc[3]),
+		int(mc[4]), int(mc[5]), int(mc[6]),
+		(mdig >> 32) & 0xffffffff, mdig & 0xffffffff])
+	for e in d.get("model_branch", []):
+		print("      mbranch %s n=%d" % [
+			String(e["branch"]), int(e["count"])])
 	# 19B.2A ribbon raster census + material branch breakdown.
 	print(("    ribbon: cmd=%d rast=%d zero=%d clip=%d drop=%d " +
 		"unsup=%d lutmiss=%d px=%d") % [
