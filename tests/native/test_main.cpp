@@ -15,8 +15,10 @@
 #include "core/display_menu.h"
 #include "core/dti_structure.h"
 #include "core/dynamic_objects.h"
+#include "core/ending_cinematic.h"
 #include "core/enemy_runtime.h"
 #include "core/file_family.h"
+#include "core/flic_decoder.h"
 #include "core/framebuffer.h"
 #include "core/freefall_runtime.h"
 #include "core/freefall_scene.h"
@@ -28870,6 +28872,285 @@ void test_stream_ribbon() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19D — the FLIC decoder + the mode-8 ending pump.
+//
+// Synthetic AF12 files in the observed MDK12.FLC/MDKEND.FLC layout:
+//   u32 size @0, u16 magic 0xaf12 @4, u16 frames @6, u16 w @8, u16 h
+//   @10, u16 depth=8 @12, u16 flags @14, u32 speed @0x10, u32 stream
+//   offset @0x50; frame records {u32 size, u16 magic 0xf1fa, u16
+//   chunk-count, u8[8] pad} then chunks {u32 size, u16 type, payload}.
+// ---------------------------------------------------------------------------
+namespace {
+
+void flicW16(std::vector<std::uint8_t>& b, std::size_t o,
+             std::uint16_t v) {
+  b[o] = static_cast<std::uint8_t>(v & 0xff);
+  b[o + 1] = static_cast<std::uint8_t>(v >> 8);
+}
+
+void flicW32(std::vector<std::uint8_t>& b, std::size_t o,
+             std::uint32_t v) {
+  b[o] = static_cast<std::uint8_t>(v & 0xff);
+  b[o + 1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+  b[o + 2] = static_cast<std::uint8_t>((v >> 16) & 0xff);
+  b[o + 3] = static_cast<std::uint8_t>((v >> 24) & 0xff);
+}
+
+struct FlicBuilder {
+  std::vector<std::uint8_t> b;
+  FlicBuilder(int frames, int w, int h, std::uint32_t dataOff = 0x80) {
+    b.assign(0x80, 0);
+    flicW16(b, 4, 0xaf12);
+    flicW16(b, 6, static_cast<std::uint16_t>(frames));
+    flicW16(b, 8, static_cast<std::uint16_t>(w));
+    flicW16(b, 10, static_cast<std::uint16_t>(h));
+    flicW16(b, 12, 8);                    // depth
+    flicW16(b, 14, 3);                    // flags
+    flicW32(b, 0x10, 33);                 // ms
+    flicW32(b, 0x50, dataOff);
+  }
+  // A non-frame record (the 0xF100 prefix shape).
+  void prefix(std::uint16_t type, std::vector<std::uint8_t> body) {
+    const std::size_t o = b.size();
+    b.resize(o + 6 + body.size());
+    flicW32(b, o, static_cast<std::uint32_t>(6 + body.size()));
+    flicW16(b, o + 4, type);
+    std::memcpy(b.data() + o + 6, body.data(), body.size());
+  }
+  void beginFrame(std::uint16_t chunks) {
+    const std::size_t o = b.size();
+    b.resize(o + 16);
+    flicW32(b, o, 16);                    // patched by endFrame
+    flicW16(b, o + 4, 0xf1fa);
+    flicW16(b, o + 6, chunks);
+    frameAt = o;
+  }
+  void chunk(std::uint16_t type, std::vector<std::uint8_t> payload) {
+    const std::size_t o = b.size();
+    b.resize(o + 6 + payload.size());
+    flicW32(b, o, static_cast<std::uint32_t>(6 + payload.size()));
+    flicW16(b, o + 4, type);
+    std::memcpy(b.data() + o + 6, payload.data(), payload.size());
+  }
+  void endFrame() {
+    flicW32(b, frameAt,
+            static_cast<std::uint32_t>(b.size() - frameAt));
+  }
+  std::size_t frameAt = 0;
+};
+
+// One full-COLOR256 packet: u16 packets=1, {skip u8, count u8(0->
+// 256), 768 raw bytes}.
+std::vector<std::uint8_t> flicColor256() {
+  std::vector<std::uint8_t> p(2 + 2 + 768);
+  p[0] = 1; p[1] = 0;
+  p[2] = 0; p[3] = 0;                     // skip 0, count 0 -> 256
+  for (int i = 0; i != 768; ++i)
+    p[4 + i] = static_cast<std::uint8_t>(i & 0xff);
+  return p;
+}
+
+}  // namespace
+
+void test_flic_decoder() {
+  std::string err;
+  auto bytesOf = [](const std::vector<std::uint8_t>& v) {
+    return std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(v.data()), v.size());
+  };
+
+  // --- header validation ------------------------------------------------
+  {
+    FlicBuilder f(2, 4, 2);
+    flicW16(f.b, 4, 0x1234);              // bad magic
+    mdk::FlicDecoder d;
+    CHECK(!d.open(bytesOf(f.b), &err));
+    CHECK(err == "not FLIC (magic)");
+  }
+  {
+    mdk::FlicDecoder d;
+    std::vector<std::uint8_t> tiny(64, 0);
+    CHECK(!d.open(bytesOf(tiny), &err));
+  }
+
+  // --- COLOR256 + BRUN frame --------------------------------------------
+  {
+    err.clear();
+    FlicBuilder f(1, 4, 2);
+    f.beginFrame(2);
+    f.chunk(4, flicColor256());
+    // BRUN: line 0 = one +4 run of 7; line 1 = one -4 literal 9..12.
+    f.chunk(15, {1, 4, 7, 1, static_cast<std::uint8_t>(-4),
+                 9, 10, 11, 12});
+    f.endFrame();
+    mdk::FlicDecoder d;
+    CHECK(d.open(bytesOf(f.b), &err));
+    CHECK(d.width() == 4 && d.height() == 2);
+    CHECK(d.frameCount() == 1 && d.frameMs() == 33);
+    CHECK(d.nextFrame(&err) && err.empty());
+    const auto px = d.pixels();
+    CHECK(std::uint8_t(px[0]) == 7 && std::uint8_t(px[3]) == 7);
+    CHECK(std::uint8_t(px[4]) == 9 && std::uint8_t(px[7]) == 12);
+    CHECK(d.paletteDirty());
+    const auto& pal = d.palette();
+    CHECK(pal[0] == 0 && pal[1] == 1 && pal[2] == 2);
+    CHECK(pal[765] == 253 && pal[766] == 254 && pal[767] == 255);
+    CHECK(!d.nextFrame(&err));            // stream exhausted
+  }
+
+  // --- DELTA_FLC word-pair writes + the 0x8000 drop word ----------------
+  {
+    err.clear();
+    FlicBuilder f(2, 4, 2);
+    f.beginFrame(1);
+    f.chunk(15, {1, 4, 5, 1, 4, 6});      // BRUN: lines 5/6
+    f.endFrame();
+    f.beginFrame(1);
+    // 1 line-op: word 0x8000 dropped, then ops=1 pair; pair
+    // skip=1,count=1 -> two literal bytes 0xaa 0xbb at cols 1..2.
+    f.chunk(7, {1, 0, 0, 0x80, 1, 0, 1, 1, 0xaa, 0xbb});
+    f.endFrame();
+    mdk::FlicDecoder d;
+    CHECK(d.open(bytesOf(f.b), &err));
+    CHECK(d.nextFrame(&err));
+    CHECK(d.nextFrame(&err) && err.empty());
+    const auto px = d.pixels();
+    CHECK(std::uint8_t(px[0]) == 5 && std::uint8_t(px[1]) == 0xaa &&
+          std::uint8_t(px[2]) == 0xbb && std::uint8_t(px[3]) == 5);
+    CHECK(std::uint8_t(px[4]) == 6 && std::uint8_t(px[7]) == 6);
+  }
+
+  // --- DELTA run-pair (negative count replicates a u16) -----------------
+  {
+    err.clear();
+    FlicBuilder f(2, 8, 1);
+    f.beginFrame(1);
+    f.chunk(15, {1, static_cast<std::uint8_t>(-8),
+                 1, 2, 3, 4, 5, 6, 7, 8});
+    f.endFrame();
+    f.beginFrame(1);
+    // 1 line-op on line 0: ops=1; pair skip=2,count=-2 -> u16 0x0909
+    // replicated twice at cols 2..5.
+    f.chunk(7, {1, 0, 1, 0, 2,
+                static_cast<std::uint8_t>(-2), 9, 9});
+    f.endFrame();
+    mdk::FlicDecoder d;
+    CHECK(d.open(bytesOf(f.b), &err));
+    CHECK(d.nextFrame(&err) && d.nextFrame(&err));
+    const auto px = d.pixels();
+    CHECK(std::uint8_t(px[0]) == 1 && std::uint8_t(px[1]) == 2);
+    CHECK(std::uint8_t(px[2]) == 9 && std::uint8_t(px[5]) == 9);
+    CHECK(std::uint8_t(px[6]) == 7 && std::uint8_t(px[7]) == 8);
+  }
+
+  // --- the 0xF100 prefix record is skipped by size ----------------------
+  {
+    err.clear();
+    FlicBuilder f(1, 4, 1);
+    f.prefix(0xf100, {0xde, 0xad, 0xbe, 0xef});
+    f.beginFrame(1);
+    f.chunk(15, {1, 4, 0x5a});
+    f.endFrame();
+    mdk::FlicDecoder d;
+    CHECK(d.open(bytesOf(f.b), &err));
+    CHECK(d.nextFrame(&err) && err.empty());
+    CHECK(std::uint8_t(d.pixels()[0]) == 0x5a);
+  }
+
+  // --- 0xb COLOR writes count raw bytes — a count==0 packet writes
+  //       nothing (the OBSERVED FUN_00414550 quirk) ----------------------
+  {
+    err.clear();
+    FlicBuilder f(1, 4, 1);
+    f.beginFrame(2);
+    f.chunk(0xb, {1, 0, 0, 0});           // pkts=1, skip=0, count=0
+    f.chunk(15, {1, 4, 3});
+    f.endFrame();
+    mdk::FlicDecoder d;
+    CHECK(d.open(bytesOf(f.b), &err));
+    CHECK(d.nextFrame(&err) && err.empty());
+    CHECK(d.paletteDirty());              // chunk ran…
+    CHECK(d.palette()[0] == 0);           // …but wrote nothing
+  }
+}
+
+void test_ending_cinematic() {
+  std::string err;
+  // 316 empty frames — the MDKEND.FLC count; marks advance per
+  // presented frame so the whole script walks on empty content.
+  FlicBuilder f(316, 600, 360);
+  f.beginFrame(1);
+  f.chunk(4, flicColor256());
+  f.endFrame();
+  for (int i = 1; i != 316; ++i) {
+    f.beginFrame(0);
+    f.endFrame();
+  }
+  mdk::EndingCinematic c;
+  CHECK(c.open(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(f.b.data()), f.b.size()),
+      &err));
+  CHECK(err.empty());
+  CHECK(c.mark() == 0 && c.rampT() == 0.0);
+
+  // Sound marks by the OBSERVED table — (mark -> name, kind).
+  std::map<int, std::pair<std::string, int>> want = {
+      {0x01, {"DOGSHIP", mdk::EndingEvent::kPlayOnce}},
+      {0x81, {"DROP", mdk::EndingEvent::kPlayOnce}},
+      {0x85, {"FLYBY", mdk::EndingEvent::kPlayOnce}},
+      {0xba, {"EXPLODE1", mdk::EndingEvent::kPlayOnce}},
+      {0xbc, {"DOGSHIP", mdk::EndingEvent::kStop}},
+      {0xc2, {"ENDEXP", mdk::EndingEvent::kPlayOnce}},
+      {0xc4, {"EXPLODE1", mdk::EndingEvent::kPlayOnce}},
+  };
+  std::map<int, std::pair<std::string, int>> got;
+  int holdTicks = 0;
+  mdk::EndingStage st = mdk::EndingStage::kLoading;
+  int guard = 316 + 64;
+  while (guard-- > 0) {
+    const int m = c.mark();
+    st = c.step(1.0);
+    for (const mdk::EndingEvent& ev : c.drainEvents()) {
+      if (ev.kind == mdk::EndingEvent::kPaletteDirty) continue;
+      got[m] = {ev.name, static_cast<int>(ev.kind)};
+    }
+    if (st == mdk::EndingStage::kHolding) ++holdTicks;
+    if (st == mdk::EndingStage::kMveBoundary ||
+        st == mdk::EndingStage::kDone)
+      break;
+  }
+  CHECK(got == want);
+  // The 0xe9 hold: 0x1e armed, -=1 per tick -> 29 hold ticks then
+  // the frame presents (the 30th call falls through to decode).
+  CHECK(holdTicks == 29);
+  CHECK(st == mdk::EndingStage::kMveBoundary);
+  CHECK(c.step(1.0) == mdk::EndingStage::kDone);
+  CHECK(c.decoder().decoded() == 316);
+  // Ramp shape (HYPOTHESIS): 0 below 0xd2, 1.0 at 0xe9, back to 0 by
+  // 0x105 — sampled by re-running to each mark.
+  {
+    mdk::EndingCinematic c2;
+    CHECK(c2.open(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(f.b.data()), f.b.size()),
+        &err));
+    auto runTo = [&](int m) {
+      while (c2.mark() < m && c2.step(1.0) ==
+             mdk::EndingStage::kPlaying) {}
+    };
+    runTo(0xd1);
+    CHECK(c2.rampT() == 0.0);
+    runTo(0xe9);                          // hold may stall the mark
+    int guard2 = 40;
+    while (c2.mark() == 0xe9 &&
+           c2.step(1.0) == mdk::EndingStage::kHolding && guard2--)
+      {}
+    CHECK(c2.mark() == 0xea);
+    runTo(0x104);
+    CHECK(near(c2.rampT(), 0.0, 0.05));
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -28980,6 +29261,8 @@ int main() {
   test_stream_completion();
   test_stream_draw();
   test_stream_ribbon();
+  test_flic_decoder();
+  test_ending_cinematic();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

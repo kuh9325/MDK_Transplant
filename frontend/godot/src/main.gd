@@ -462,6 +462,7 @@ func _ready() -> void:
 	var ff_skill := int(_arg_value(args, "--skill", "0"))
 	var st_course := _arg_value(args, "--stream", "")
 	var cp_course := _arg_value(args, "--campaign", "")
+	var ending := "--ending" in args
 	frontend = "--frontend" in args
 	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
 	# digest runs use, so driven courses are cross-checkable.
@@ -493,6 +494,7 @@ func _ready() -> void:
 	# loads the level directly for iteration.
 	if interactive and not OS.has_feature("editor") and \
 			not freefall and not stream and not campaign and \
+			not ending and \
 			_arg_value(args, "--level", "").is_empty():
 		frontend = true
 
@@ -585,6 +587,25 @@ func _ready() -> void:
 	elif stream:
 		if not bridge.load_stream(stream_course, ff_skill, ff_seed):
 			printerr("MdkBridge.load_stream failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
+	elif ending:
+		# Phase 19D — the QA boot straight into the mode-8 ending.
+		# The frontend shell must exist (the FUN_0041d85c return at
+		# the boundary needs feShell_) but fe_active stays off — the
+		# standalone mode-8 presenter owns the frame.
+		var edirs := "user://saves_ending" if smoke else "user://saves"
+		edirs = ProjectSettings.globalize_path(edirs)
+		if smoke:
+			DirAccess.make_dir_recursive_absolute(edirs)
+		if not bridge.frontend_boot(edirs):
+			printerr("MdkBridge.frontend_boot failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
+		if not bridge.load_ending():
+			printerr("MdkBridge.load_ending failed: ",
 				bridge.get_last_error())
 			get_tree().quit(1)
 			return
@@ -2050,6 +2071,97 @@ func _apply_stream() -> void:
 	$StreamLayer.visible = true
 
 
+# --- Phase 19D — mode-8 ending cinematic presentation -----------------
+# One FLIC frame per paced ~33.3ms call into the bridge (the file's
+# speed field is the limiter window — the same policy as mode 5).
+# ending_frame() hands back the decoded surface pre-expanded through
+# the effective palette (FUN_0047b384's white ramp included).
+const END_STEP_MS := 1000.0 / 30.0
+var end_pace_ms := 0.0
+var end_pace_armed := false
+var end_img: Image = null
+var end_tex: ImageTexture = null
+var end_seq := -1
+var end_last_ramp := -1.0
+var end_players := {}          # FINISH.BNI name -> AudioStreamPlayer
+
+func _ending_pace_run(delta_ms: float) -> int:
+	if int(bridge.get_mode()) != 8:
+		end_pace_armed = false
+		return 0
+	if not end_pace_armed:
+		# First live tick — present frame 0 immediately (same
+		# dead-window skip as the stream pacer).
+		end_pace_armed = true
+		end_pace_ms = END_STEP_MS
+	end_pace_ms += delta_ms
+	var n := int(end_pace_ms / END_STEP_MS)
+	if n > STREAM_MAX_CATCHUP:
+		n = STREAM_MAX_CATCHUP
+		end_pace_ms = 0.0
+	else:
+		end_pace_ms -= n * END_STEP_MS
+	var ran := 0
+	while ran < n and int(bridge.get_mode()) == 8:
+		bridge.step_frame_input(END_STEP_MS, {})
+		ran += 1
+	return ran
+
+func _apply_ending() -> void:
+	var fr: Dictionary = bridge.ending_frame()
+	if fr.is_empty():
+		return
+	# Re-upload on a new decoded frame OR a ramp change (the 0xe9
+	# hold stalls seq while the palette blend may still move).
+	var seq := int(fr["seq"])
+	var ramp := float(fr["ramp"])
+	if seq == end_seq and ramp == end_last_ramp:
+		return
+	end_seq = seq
+	end_last_ramp = ramp
+	end_img = Image.create_from_data(int(fr["w"]), int(fr["h"]),
+		false, Image.FORMAT_RGBA8, fr["rgba"])
+	if end_tex == null:
+		end_tex = ImageTexture.create_from_image(end_img)
+	else:
+		end_tex.update(end_img)
+	var r: TextureRect = $EndingLayer/EndingRect
+	r.texture = end_tex
+	r.visible = true
+	$EndingLayer.visible = true
+
+func _ending_drain_audio() -> void:
+	for ev in bridge.ending_drain_audio():
+		var nm := String(ev.get("name", ""))
+		var op := String(ev.get("op", ""))
+		if op == "play" and nm != "" and ev.get("stream") != null:
+			var p: AudioStreamPlayer = end_players.get(nm)
+			if p == null:
+				p = AudioStreamPlayer.new()
+				p.name = "EndSnd_" + nm
+				$AudioRoot.add_child(p)
+				end_players[nm] = p
+			p.stream = ev["stream"]
+			p.volume_db = float(ev.get("vol", 0.0))
+			p.play()
+		elif op == "stop" and nm != "":
+			var q: AudioStreamPlayer = end_players.get(nm)
+			if q != null:
+				q.stop()
+
+func _ending_hide() -> void:
+	if $EndingLayer.visible:
+		$EndingLayer.visible = false
+		$EndingLayer/EndingRect.visible = false
+	for p in end_players.values():
+		p.stop()
+		p.queue_free()
+	end_players.clear()
+	end_pace_armed = false
+	end_seq = -1
+	end_last_ramp = -1.0
+
+
 func _update_ff_debug(ff: Dictionary) -> void:
 	if not $DebugUI.visible:
 		return
@@ -3009,7 +3121,8 @@ func _process(delta: float) -> void:
 			# stream_diag is a persistent census — safe to read post-exit.
 			var fpres := int(bridge.stream_diag().get("presented", 0))
 			print("frames: startup proof complete",
-				" mode=", fm, " stream_presented=", fpres)
+				" mode=", fm, " stream_presented=", fpres,
+				" ending=", bridge.ending_diag())
 			get_tree().quit(0)
 			return
 	var mode := int(bridge.get_mode())
@@ -3086,6 +3199,17 @@ func _process(delta: float) -> void:
 		# 19B.3B1 — the mode-5 voice commands drain on the same
 		# once-per-rendered-frame cadence as traversal.
 		_drain_audio_fx()
+		return
+	if mode == 8:
+		# Standalone mode 8 — the ending cinematic: paced FLIC pump,
+		# FINISH.BNI mark sounds, the white ramp; the MVE boundary
+		# edge exits to the frontend.
+		_fe_stop_songs()   # the traversal bank release is silent
+		if _ending_pace_run(delta * 1000.0) > 0:
+			_apply_ending()
+		_ending_drain_audio()
+		if int(bridge.get_mode()) != 8:
+			_ending_hide()
 		return
 	if stream_standalone:
 		# The mode-5 exit flipped the mode inside the step — upload
@@ -5276,6 +5400,7 @@ func _hide_gameplay_layers() -> void:
 	$ShotCamLayer.visible = false
 	$HudLayer.visible = false
 	$StreamLayer.visible = false
+	$EndingLayer.visible = false
 
 
 func _show_gameplay_layers() -> void:
@@ -5559,6 +5684,17 @@ func _frontend_frame(delta: float, mode: int) -> void:
 		# route needs its own.
 		_drain_audio_fx()
 		bridge.frontend_end_frame(delta * 1000.0)
+		return
+	# Mode 8 is runtime-owned — the bridge's stepEnding_ pumps the
+	# cinematic through the paced gate; a load failure takes the
+	# original's missing-file edge straight to the frontend.
+	if mode == 8:
+		if _ending_pace_run(delta * 1000.0) > 0:
+			_apply_ending()
+		_ending_drain_audio()
+		bridge.frontend_end_frame(delta * 1000.0)
+		if int(bridge.get_mode()) != 8:
+			_ending_hide()
 		return
 	fe_stage_hold -= 1
 	var done := fe_stage_hold <= 0 or \

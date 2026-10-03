@@ -270,6 +270,48 @@ pump) → `FUN_0041d85c` → frontend.
   out of Build-A core scope per the phase §22 stop rule; the core
   emits a stage-boundary event instead.
 
+### Mode-8 implementation status (Phase 19D)
+
+`src/core/flic_decoder.*` + `src/core/ending_cinematic.*` implement
+`FUN_00413c20`/`FUN_00414158`/`FUN_0047b0fc`/`FUN_0047b3f4` for the
+Build-A corpus. Verified against `MDK12.FLC` (82/82) and `MDKEND.FLC`
+(316/316) — every frame consumes its span exactly; decoded output
+visually correct (title card, station, moon sequence).
+
+- **BRUN packet sign** (handler `0x4145d8` uncaptured): EMPIRICAL —
+  positive count = replicate next byte, negative = literals; only
+  that direction consumes the corpus chunks exactly.
+- **Type 4 = COLOR256** (`0x4144b8` uncaptured): EMPIRICAL — the
+  count byte is an ENTRY count where 0→256 (the corpus chunk is
+  exactly `2+2+768` — one skip=0/count=0 packet + 768 bytes).
+- **Type 0xb = COLOR** (`FUN_00414550` OBSERVED): the count byte is
+  a RAW BYTE count — a count==0 packet writes nothing (the corpus'
+  type-4 chunks never route here; preserved verbatim).
+- **`0xF100` prefix record** (MDKEND only): OBSERVED — the stream
+  offset @0x50 lands on a non-`0xF1FA` record (2778 B); the walker
+  skips it by size. MDK12's stream starts directly at a frame.
+- **Mark script** (`FUN_0047b3f4` OBSERVED): mark = index of the
+  frame about to decode; `1`/`0x81`/`0x85`/`0xba`/`0xc4`/`0xc2`
+  play-once `DOGSHIP`/`DROP`/`FLYBY`/`EXPLODE1`/`ENDEXP`,
+  `0xbc` stops DOGSHIP; `0xd2` restores palette + clears hold;
+  `0xd2..0xe8` brighten ramp, `0xe9` arms the `0x1e` hold —
+  `0x49b6e8` is OBSERVED 1/tick → 30 limiter ticks (~1 s at 33 ms)
+  with decode+present skipped — then `0xea..0x104` ramp down.
+- **`FUN_0047b384` ramp shape: HYPOTHESIS** — white blend
+  0→1 over `0xd2..0xe9`, full white through the hold, 1→0 over
+  `0xea..0x104` (only the mark windows are observed; the function
+  body is uncaptured).
+- **Boundary**: when the FLIC exhausts (`FUN_004140f4` nonzero)
+  `FUN_0047b674` runs the MVE stage. The `.MVE` player is
+  unimplemented — the port takes the file-missing edge
+  (`FUN_0041b004` → 0 skips the whole player) straight to
+  `FUN_0041d85c` returning-frontend. `MDKBZK.MVE` (29.8 MB) remains
+  a later phase.
+- Godot: `--ending` boots mode 8 directly; `ending_frame()` expands
+  the indexed surface through the effective palette; the host paces
+  one pump per ~33.3 ms and plays FINISH.BNI sounds via dedicated
+  players.
+
 ## 12. Port contract
 
 - `CinematicRuntime` (new `src/core/stream_scene.*`) owns: path

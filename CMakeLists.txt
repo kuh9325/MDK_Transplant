@@ -39,7 +39,9 @@ add_library(mdk_core STATIC
   src/core/dti_structure.cpp
   src/core/dynamic_objects.cpp
   src/core/enemy_runtime.cpp
+  src/core/ending_cinematic.cpp
   src/core/file_family.cpp
+  src/core/flic_decoder.cpp
   src/core/framebuffer.cpp
   src/core/freefall_runtime.cpp
   src/core/freefall_scene.cpp

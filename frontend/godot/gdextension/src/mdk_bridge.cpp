@@ -20,6 +20,7 @@
 #include "core/bni_directory.h"
 #include "core/bni_image.h"
 #include "core/dti_structure.h"
+#include "core/ending_cinematic.h"
 #include "core/enemy_runtime.h"
 #include "core/frontend_transition.h"
 #include "core/fti_directory.h"
@@ -184,6 +185,17 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::stream_frame);
   ClassDB::bind_method(D_METHOD("stream_diag"),
                        &MdkBridge::stream_diag);
+  // Phase 19D — mode-8 ending cinematic.
+  ClassDB::bind_method(D_METHOD("load_ending"),
+                       &MdkBridge::load_ending);
+  ClassDB::bind_method(D_METHOD("ending_active"),
+                       &MdkBridge::ending_active);
+  ClassDB::bind_method(D_METHOD("ending_frame"),
+                       &MdkBridge::ending_frame);
+  ClassDB::bind_method(D_METHOD("ending_drain_audio"),
+                       &MdkBridge::ending_drain_audio);
+  ClassDB::bind_method(D_METHOD("ending_diag"),
+                       &MdkBridge::ending_diag);
   // Phase 18B.1 — frontend host services.
   ClassDB::bind_method(D_METHOD("frontend_boot", "save_dir"),
                        &MdkBridge::frontend_boot);
@@ -1347,6 +1359,7 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
   // runs traversal.
   if (mode_ == 2) return stepFreefall_(dt_ms, action_mask, input);
   if (mode_ == 5) return stepStream_(dt_ms, action_mask, input);
+  if (mode_ == 8) return stepEnding_(dt_ms, action_mask, input);
   if (!rt_) {
     setError_("no level loaded");
     return out;
@@ -1375,6 +1388,15 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
       (void)mdk::progressionAdvanceVictory(sess_);
     if (last_.takeoffDone && sess_.victoryPhase == 2)
       traversalStreamHandoff_();
+    if (last_.endingRequested && sess_.mode == 3) {
+      // FUN_0047b038 — script op 0x83 0x51 (or the ending cheat):
+      // 541492 = 8, 49bd40 = 1 — the first mode-8 frame runs the
+      // traversal teardown + FUN_0047b0fc load (stepEnding_'s head).
+      (void)mdk::progressionEnterCinematic(sess_);
+      mode_ = sess_.mode;                // 8
+      routeFrom_ = 3;
+      routeTo_ = mode_;
+    }
   }
 
   // The display set is core-driven every frame: portal swaps,
@@ -3488,6 +3510,251 @@ void MdkBridge::traversalStreamHandoff_() {
     setError_("campaign stream entry: " + detail);
 }
 
+// --- Phase 19D — mode-8 ending cinematic ---------------------------
+
+bool MdkBridge::endingEnter_() {
+  std::string err;
+  auto flc = root_->readFile("MISC/FLIC/MDKEND.FLC", 1 << 28, &err);
+  if (!flc) {
+    setError_("MISC/FLIC/MDKEND.FLC: " + err);
+    return false;
+  }
+  endingFlicBytes_ = std::move(*flc);
+  ending_ = std::make_unique<mdk::EndingCinematic>();
+  if (!ending_->open(
+          std::span<const std::byte>(endingFlicBytes_), &err)) {
+    setError_("MISC/FLIC/MDKEND.FLC: " + err);
+    ending_.reset();
+    endingFlicBytes_.clear();
+    return false;
+  }
+  // FUN_0047b0fc resolves the FINISH.BNI handles (DOGSHIP/DROP/
+  // FLYBY/EXPLODE1/ENDEXP). Missing bank = silent marks — the
+  // original's lookup fatals, but a host-missing bank should not
+  // kill the cinematic; the miss surfaces via ending_diag.
+  if (auto bni = root_->readFile("MISC/FINISH.BNI", 1 << 28, &err)) {
+    endingBniBytes_ = std::move(*bni);
+    endingBniDir_ = mdk::inspectBniDirectory(
+        std::span<const std::byte>(endingBniBytes_));
+  }
+  endingSndEntries_.clear();
+  endingSeq_ = 0;
+  endingMveBoundary_ = false;
+  mode_ = 8;
+  return true;
+}
+
+void MdkBridge::endingTeardown_() {
+  ending_.reset();
+  endingFlicBytes_.clear();
+  endingBniBytes_.clear();
+  endingBniDir_ = mdk::BniDirectory{};
+  endingSndEntries_.clear();
+}
+
+const MdkBridge::AudioEntry_* MdkBridge::endingSndEntry_(
+    const std::string& name) {
+  if (const auto it = endingSndEntries_.find(name);
+      it != endingSndEntries_.end()) {
+    return &it->second;
+  }
+  AudioEntry_ e;
+  if (const mdk::BniRecord* rec =
+          mdk::findBniRecord(endingBniDir_, name)) {
+    std::span<const std::byte> payload(
+        endingBniBytes_.data() + rec->payloadFileOffset,
+        static_cast<std::size_t>(rec->payloadEnd -
+                                 rec->payloadFileOffset));
+    auto riffAt = [](std::span<const std::byte> s, std::size_t i) {
+      return s.size() >= i + 4 && s[i] == std::byte('R') &&
+             s[i + 1] == std::byte('I') && s[i + 2] == std::byte('F') &&
+             s[i + 3] == std::byte('F');
+    };
+    if (!riffAt(payload, 0) && riffAt(payload, 4)) {
+      payload = payload.subspan(4);
+    }
+    mdk::SniWave wv;
+    std::string derr;
+    const mdk::SniWaveStatus st = mdk::decodeSniWave(payload, &wv,
+                                                   &derr);
+    if (st != mdk::SniWaveStatus::kOk) {
+      UtilityFunctions::printerr(
+          "MdkBridge: FINISH.BNI '", String(name.c_str()),
+          "' decode failed: ", mdk::sniWaveStatusName(st).data(),
+          " — ", derr.c_str());
+    } else {
+      e.def.volume = 0x7fff;
+      e.def.rateHz = wv.rateHz;
+      e.def.frames = static_cast<std::uint32_t>(wv.frames);
+      Ref<AudioStreamWAV> wav;
+      wav.instantiate();
+      wav->set_format(wv.bitsPerSample == 8
+                          ? AudioStreamWAV::FORMAT_8_BITS
+                          : AudioStreamWAV::FORMAT_16_BITS);
+      wav->set_stereo(false);
+      wav->set_mix_rate(wv.rateHz);
+      PackedByteArray data;
+      data.resize(static_cast<int64_t>(wv.pcm.size()));
+      std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+      wav->set_data(data);
+      e.stream = wav;
+      e.resolved = true;
+    }
+  }
+  const auto [it, inserted] =
+      endingSndEntries_.emplace(name, std::move(e));
+  return &it->second;
+}
+
+Dictionary MdkBridge::stepEnding_(double dt_ms, int64_t action_mask,
+                                  const Dictionary* input) {
+  (void)dt_ms;
+  (void)action_mask;
+  (void)input;
+  Dictionary out;
+  out["ok"] = true;
+  out["mode"] = mode_;
+  if (!ending_) {
+    // The 49bd40 arm — the mode-8 frame head runs the traversal
+    // teardown (session globals carry first, same writeback the
+    // mode-5 handoff performs) then FUN_0047b0fc's load.
+    if (rt_) {
+      sess_.health = rt_->fieldHealth;
+      sess_.rng = rt_->rngState;
+      sess_.ammo = rt_->ammo;
+      traversalTeardown_();
+    }
+    if (!endingEnter_()) {
+      // FUN_0047b674's iVar1==0 shape — a missing/unreadable FLIC
+      // skips the player straight to the FUN_0041d85c frontend
+      // return (the same route the MVE boundary takes).
+      (void)mdk::progressionStepCinematic(sess_, true);
+      endingTeardown_();
+      mode_ = sess_.mode;                // 0
+      if (feShell_) feShell_->enterFrontend(true);
+      out["mode"] = mode_;
+      out["sess_mode"] = sess_.mode;
+      out["ending_missing"] = true;
+      return out;
+    }
+  }
+  // One pump per caller-paced limiter tick (~33.3 ms — the file's
+  // speed field). tickDelta = 1: 0x49b6e8 reads 1 per tick OBSERVED.
+  const mdk::EndingStage st = ending_->step(1.0);
+  endingSeq_ = ending_->decoder().decoded();
+  out["stage"] = static_cast<int64_t>(st);
+  out["mark"] = static_cast<int64_t>(ending_->mark());
+  if (st == mdk::EndingStage::kMveBoundary) {
+    endingMveBoundary_ = true;
+    // FUN_0047b674's missing-file edge — the Interplay MVE stage is
+    // unimplemented — so the run continues to FUN_0041d85c (the
+    // returning frontend entry) exactly as the original does when
+    // MDKBZK.MVE fails to open.
+    (void)mdk::progressionStepCinematic(sess_, true);
+    endingTeardown_();
+    mode_ = sess_.mode;                        // 0
+    if (feShell_) feShell_->enterFrontend(true);
+    routeFrom_ = 8;
+    routeTo_ = 0;
+  }
+  out["mode"] = mode_;
+  out["sess_mode"] = sess_.mode;
+  out["seq"] = endingSeq_;
+  return out;
+}
+
+bool MdkBridge::load_ending() {
+  if (!root_) {
+    setError_("init() first");
+    return false;
+  }
+  sess_.mode = 3;   // the script VM's enclosing frame
+  const mdk::ProgressionError e =
+      mdk::progressionEnterCinematic(sess_);
+  if (e != mdk::ProgressionError::kOk) {
+    setError_(std::string("ending entry: ") +
+              mdk::progressionErrorName(e));
+    return false;
+  }
+  mode_ = sess_.mode;   // 8 — stepEnding_ materializes the run
+  return true;
+}
+
+Dictionary MdkBridge::ending_frame() {
+  Dictionary out;
+  if (!ending_ || ending_->decoder().decoded() == 0) return out;
+  const mdk::FlicDecoder& dec = ending_->decoder();
+  const int w = dec.width();
+  const int h = dec.height();
+  out["w"] = w;
+  out["h"] = h;
+  const auto pal = ending_->effectivePalette();
+  const std::span<const std::byte> px = dec.pixels();
+  PackedByteArray rgba;
+  rgba.resize(static_cast<int64_t>(w) * h * 4);
+  std::uint8_t* dst = rgba.ptrw();
+  for (int i = 0; i < w * h; ++i) {
+    const std::uint8_t c = static_cast<std::uint8_t>(px[i]);
+    dst[i * 4 + 0] = pal[c * 3 + 0];
+    dst[i * 4 + 1] = pal[c * 3 + 1];
+    dst[i * 4 + 2] = pal[c * 3 + 2];
+    dst[i * 4 + 3] = 255;
+  }
+  out["rgba"] = rgba;
+  out["seq"] = endingSeq_;
+  out["mark"] = static_cast<int64_t>(ending_->mark());
+  out["ramp"] = ending_->rampT();
+  out["mve_boundary"] = endingMveBoundary_;
+  return out;
+}
+
+Array MdkBridge::ending_drain_audio() {
+  Array out;
+  if (!ending_) return out;
+  for (const mdk::EndingEvent& ev : ending_->drainEvents()) {
+    Dictionary e;
+    switch (ev.kind) {
+      case mdk::EndingEvent::kPlayOnce: e["op"] = "play"; break;
+      case mdk::EndingEvent::kStop:     e["op"] = "stop"; break;
+      default: continue;   // kPaletteDirty — the frame path sees it
+    }
+    if (ev.name != nullptr) {
+      e["name"] = String(ev.name);
+      const AudioEntry_* en = endingSndEntry_(ev.name);
+      if (en && en->resolved && en->stream.is_valid()) {
+        e["stream"] = en->stream;
+        e["vol"] = double(mdk::traversalAudioVolDb(
+            mdk::traversalAudioScaledVol(en->def.volume,
+                                         audioSfxPct_)));
+      }
+    }
+    out.push_back(e);
+  }
+  return out;
+}
+
+Dictionary MdkBridge::ending_diag() {
+  Dictionary out;
+  out["active"] = ending_ != nullptr;
+  out["mve_boundary"] = endingMveBoundary_;
+  out["seq"] = endingSeq_;
+  if (ending_) {
+    out["mark"] = static_cast<int64_t>(ending_->mark());
+    out["decoded"] =
+        static_cast<int64_t>(ending_->decoder().decoded());
+    out["frames"] =
+        static_cast<int64_t>(ending_->decoder().frameCount());
+    out["ramp"] = ending_->rampT();
+  }
+  int resolved = 0;
+  for (const auto& [k, e] : endingSndEntries_)
+    if (e.resolved) ++resolved;
+  out["snd_resolved"] = resolved;
+  out["snd_missed"] =
+      static_cast<int64_t>(endingSndEntries_.size()) - resolved;
+  return out;
+}
+
 Dictionary MdkBridge::stream_frame() {
   Dictionary out;
   const mdkbridge::StreamPresenterDiag& d = streamPresenter_.diag();
@@ -3780,6 +4047,10 @@ void MdkBridge::shutdown() {
   streamWhiteSlot_ = -1;
   streamWhiteResolved_ = false;
   streamUnresolvedMats_ = 0;
+  // Phase 19D — the ending cinematic and its FINISH.BNI cache die
+  // with the session (the abort-yes table's FUN_0047b0d8 slot).
+  endingTeardown_();
+  endingMveBoundary_ = false;
   sess_ = mdk::ProgressionSession{};
   ffHandoffDone_ = false;
   ffHandoffRoute_ = -1;
@@ -4767,6 +5038,11 @@ Dictionary MdkBridge::frontend_progression_step(const Dictionary& input) {
     e = mdk::progressionStepMode7(sess_);
     break;
   case 8:
+    if (ending_) {
+      // A live EndingCinematic owns mode 8 — its kMveBoundary edge
+      // drives the transition (stepCore_ -> stepEnding_).
+      return out;
+    }
     e = mdk::progressionStepCinematic(sess_, stageDone);
     break;
   default:

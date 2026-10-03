@@ -51,6 +51,7 @@
 #include "core/bni_directory.h"
 #include "core/collision_query.h"
 #include "core/data_root.h"
+#include "core/ending_cinematic.h"
 #include "core/freefall_runtime.h"
 #include "core/freefall_scene.h"
 #include "core/frontend_host.h"
@@ -492,6 +493,21 @@ class MdkBridge : public RefCounted {
   // and the fb/palette FNV digests (pre-palette / 768B applied).
   Dictionary stream_diag();
 
+  // --- Phase 19D — mode-8 ending cinematic -------------------------
+  // QA/host entry — boots the FUN_0047b038 edge directly (sess_.mode
+  // 3 stands in for the enclosing traversal frame; the mode-8 head
+  // step then runs the teardown + FUN_0047b0fc load).
+  bool load_ending();
+  bool ending_active() const { return ending_ != nullptr; }
+  // The last decoded FLIC frame expanded through the effective
+  // palette (the FUN_0047b384 white ramp included) — {w,h,rgba,mark,
+  // seq,ramp}. seq = decoded count; re-upload only when it changes.
+  Dictionary ending_frame();
+  // The mark-table sound events — [{op:"play"|"stop", name, stream,
+  // vol}] — drained once per pump, in emission order.
+  Array ending_drain_audio();
+  Dictionary ending_diag();
+
  private:
   // One arena's complete presentation bundle — collision parse,
   // render data, palette-composed textures, ordered tris, and the
@@ -776,6 +792,29 @@ class MdkBridge : public RefCounted {
   mdk::TraversalAudioMixer audioMixer_;
   mdk::TraversalAudioListener audioListener_;
   double lastDtSec_ = 0.0;             // stepCore_'s dt — mixer playhead
+
+  // --- Phase 19D — mode-8 ending cinematic -------------------------
+  // FUN_0047b06c host: the MDKEND.FLC pump (one FUN_0047b3f4 tick
+  // per caller-paced ~33.3 ms window), the FINISH.BNI mark sounds,
+  // and the FUN_0047b674 MVE boundary edge — the .MVE player is a
+  // later phase, so the boundary takes the original's missing-file
+  // route straight to the FUN_0041d85c frontend return.
+  Dictionary stepEnding_(double dt_ms, int64_t action_mask,
+                         const Dictionary* input);
+  // FUN_0047b038's arm (49bd40): the first mode-8 frame runs the
+  // FUN_004371bc traversal teardown then FUN_0047b0fc's load —
+  // MDKEND.FLC bytes + FINISH.BNI handles.
+  bool endingEnter_();
+  void endingTeardown_();
+  const AudioEntry_* endingSndEntry_(const std::string& name);
+
+  std::unique_ptr<mdk::EndingCinematic> ending_;
+  std::vector<std::byte> endingFlicBytes_;    // decoder aliases it
+  std::vector<std::byte> endingBniBytes_;     // FINISH.BNI image
+  mdk::BniDirectory endingBniDir_{};
+  std::unordered_map<std::string, AudioEntry_> endingSndEntries_;
+  int64_t endingSeq_ = 0;                     // presented frames
+  bool endingMveBoundary_ = false;            // FUN_0047b674 reached
 
   // --- Phase 19B.3B1 — Mode-5 audio host -------------------------
   // The StreamScene's kPlaySound/kStopSound events translate into the
