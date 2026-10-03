@@ -882,3 +882,71 @@ and the draw takes the `+0x24==0` flat-`0xff` arm — the same
 OBSERVED miss behavior as the arena's OLYM_9 precedent. No
 index-record fallback fires on these courses (the `PEN_n` index
 records resolve but are never drawn).
+
+## 19. Phase 19B.3A — Mode-5 → Mode-6 loader / frontend route closure
+
+The real campaign handoff edge is closed: the mode-3 dispatcher tail
+(`0x401497`) now consumes the runtime's victory latches in the Godot
+bridge, runs the FUN_004371bc traversal teardown, and enters mode 5
+through `FUN_0042b270` — the same edge the native dispatcher runs
+when `0x49a030` surfaces, not a modeled seam.
+
+### Route matrix (real campaign transitions, `--campaign N` smoke)
+
+| course | mode-3 → 5 edge | stream exit | route | next |
+|--------|-----------------|-------------|-------|------|
+| 0 | 197f victory sequence | hero latch → mode 6 | loader → 4 pumps | mode 2 (levelId 0→1) |
+| 1 | 208f | hero latch → mode 6 | loader | mode 2 (levelId 1→2) |
+| 2 | 208f | hero latch → mode 6 | loader | mode 2 (levelId 2→3) |
+| 3 | 208f | hero latch → mode 6 | loader | mode 2 (levelId 3→4) |
+| 4 | 208f | hero latch → mode 7 | `541498 = 5` store (0x4015ef) | mode 3 (LEVEL5) |
+
+The mode-5 → mode-6 → mode-2 chain (courses 0–3) is the observed
+dispatcher tail: `FUN_0042c824` teardown → the tally-done step's
+`levelId < 4` arm → `FUN_00429200` sub-2 → the 2→4→1→3 sub-state
+walk → `levelId++` → the `id < 5` arm installs the freefall entry.
+
+Course 4 on the **real campaign route** exits to mode 7, not the
+standalone `--stream 4` death route: the standalone convention seeds
+a fresh `health=100`/rng and drains to the death latch, while the
+campaign handoff carries the traversal runtime's globals (`150`, the
+shared rand stream) so the hero latch wins. The `health ≤ 0 →
+mode 0` arm is still covered by the standalone `--stream 4` smoke
+and the core progression suite.
+
+### BONES.WHITE stale-bank oracle — RESOLVED (outcome A)
+
+Native ordering evidence: `FUN_004371bc` (the mode-3 tail's
+traversal teardown) calls `FUN_0041a548` — the bank-B `.MAT` free —
+before `FUN_0042b270` runs. The bridge audit observes the same
+state through the real transition: at every `FUN_0042b270` entry
+`rt_` is already null (`bank_b_bound=false`, `bank_a_records=55`),
+so no traversal `.MAT` survives into mode-5 model resolution.
+`BONES` name-table slot 2 (`WHITE`, pen 2) resolves NULL → the
+`+0x24==0` flat-`0xff` arm on courses 2/3 — matching the prior
+matlkup/census evidence. **No stale bank B exists; the standalone
+`load_stream` bind is faithful.**
+
+### Repeat entry/exit — verified in-session
+
+Courses 0/1/2 chain a second hop through the same session
+(freefall → traversal → END_LEVEL → mode 5 → mode 6):
+`mode5_enters=2`, `stream_teardowns=2`, `mode6_enters=2`,
+`bank_b_bound=false` on re-entry — no stale state across the
+handoff edge.
+
+### Bounded diagnostics added (`stream_diag`)
+
+`route_from`/`route_to`, `stream_teardowns`, `mode5_enters`,
+`mode6_enters`/`mode6_exits`, `stream_exit_frame`/`_reason`/
+`_health`, `bank_a_records`, `bank_b_bound`, `white_slot`,
+`white_resolved`, `unresolved_materials`. Session-scoped; reset in
+`shutdown()`. No core hash changes.
+
+`diagnostic_end_level` (test/QA only): writes the `0x540ebc = -1`
+END_LEVEL mailbox — the same store the script op performs — so
+bounded routes can arm the victory sequence without a scripted
+trigger object in the loaded arena.
+
+**MODE-5 → MODE-6 LOADER HANDOFF: CLOSED FOR BUILD_A**
+**BONES.WHITE STALE-BANK ORACLE: RESOLVED**

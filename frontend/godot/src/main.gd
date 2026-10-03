@@ -28,6 +28,11 @@ extends Node3D
 #   --stream N        mode-5 intermission course 0..4 instead of
 #                     --level (Phase 19B.1; indexed framebuffer +
 #                     palette presentation, model/ribbon deferred)
+#   --campaign N      real campaign handoff route for course 0..4
+#                     (Phase 19B.3A): traversal -> diagnostic END_LEVEL
+#                     -> mode 5 -> natural exit -> mode 6 loader ->
+#                     mode 2/0. Smoke-only; boots the frontend shell
+#                     but drives the steps itself.
 #   --skill N         difficulty 0..2 for --freefall/--stream
 #                     (default 0)
 #   --seed N          RNG seed for --freefall/--stream (default
@@ -294,14 +299,19 @@ func _ready() -> void:
 	var ff_course := _arg_value(args, "--freefall", "")
 	var ff_skill := int(_arg_value(args, "--skill", "0"))
 	var st_course := _arg_value(args, "--stream", "")
+	var cp_course := _arg_value(args, "--campaign", "")
 	frontend = "--frontend" in args
 	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
 	# digest runs use, so driven courses are cross-checkable.
 	var ff_seed := int(_arg_value(args, "--seed", "12648430"))
 	freefall = not ff_course.is_empty()
 	stream = not st_course.is_empty()
+	var campaign := not cp_course.is_empty()
+	var campaign_course := 0
 	if stream:
 		stream_course = int(st_course)
+	if campaign:
+		campaign_course = int(cp_course)
 	shot_path = _arg_value(args, "--screenshot", "")
 	stream_shot_dir = _arg_value(args, "--stream-shots", "")
 	if shot_path.is_relative_path() and not shot_path.is_empty():
@@ -371,6 +381,22 @@ func _ready() -> void:
 				bridge.get_last_error())
 			get_tree().quit(1)
 			return
+	elif campaign:
+		# Phase 19B.3A — the real campaign handoff route: traversal
+		# -> mode 5 -> mode 6 loader -> mode 2/3/0. The frontend
+		# shell must exist (the mode-6 pump and the mode-0 exit need
+		# feShell_) but fe_active stays false — the smoke drives
+		# step_frame_input + frontend_progression_step directly,
+		# the same calls _process/_frontend_frame make.
+		var cdir := "user://saves_smoke" if smoke else "user://saves"
+		cdir = ProjectSettings.globalize_path(cdir)
+		if smoke:
+			DirAccess.make_dir_recursive_absolute(cdir)
+		if not bridge.frontend_boot(cdir):
+			printerr("MdkBridge.frontend_boot failed: ",
+				bridge.get_last_error())
+			get_tree().quit(1)
+			return
 	elif stream:
 		if not bridge.load_stream(stream_course, ff_skill, ff_seed):
 			printerr("MdkBridge.load_stream failed: ",
@@ -424,14 +450,14 @@ func _ready() -> void:
 		# The frontend owns the screen; all gameplay layers stay
 		# hidden until a request lands a runtime mode.
 		_frontend_show()
-	elif not freefall and not stream:
+	elif not freefall and not stream and not campaign:
 		# One idle frame settles the deterministic spawn camera.
 		bridge.step_frame_input(0.0, {})
 	if freefall:
 		_apply_freefall()
 	elif stream:
 		_apply_stream()
-	elif not frontend:
+	elif not frontend and not campaign:
 		_apply_arena_snapshots()
 		_apply_object_snapshots()
 		_apply_player_snapshot()
@@ -456,6 +482,8 @@ func _ready() -> void:
 			_run_smoke_restore()
 		elif freefall:
 			_run_smoke_freefall(int(ff_course), ff_skill, ff_seed)
+		elif campaign:
+			_run_smoke_campaign(campaign_course)
 		elif stream:
 			_run_smoke_stream(stream_course)
 		elif level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
@@ -2213,6 +2241,247 @@ func _run_smoke_stream(course: int) -> void:
 		_stream_shot_dump(shot_dir, course, st_ckpt, st_last,
 			st_last_seq, int(d["presented"]))
 	print("smoke(stream): %d failure(s)" % failures)
+
+
+func _run_smoke_campaign(course: int) -> void:
+	# Phase 19B.3A — the real campaign handoff route for one course:
+	# load_level (the traversal the campaign lands on) -> the
+	# diagnostic END_LEVEL mailbox (the same store the script op
+	# writes) -> the mode-3 dispatcher tail (FUN_004371bc teardown +
+	# FUN_0042b270 entry) -> a natural StreamScene exit -> the
+	# dispatcher exit routes -> the mode-6 loader pump -> the next
+	# runtime. Layer ownership is checked at every edge, and the
+	# mode-5 material-bank audit is the BONES.WHITE stale-bank
+	# oracle (courses 2/3 carry the named slot).
+	print("smoke(campaign): course=%d" % course)
+	printerr("campaign%d: enter" % course)
+	# levelId -> TRAVERSE dir — the OBSERVED 0x4999e8 table
+	# ({7,6,3,4,8,5,2,1}; the loader advances levelId past the
+	# played course on the mode-6 exit).
+	var dirs := [7, 6, 3, 4, 8]
+	var dir: int = dirs[course]
+	var dti := "TRAVERSE/LEVEL%d/LEVEL%d.DTI" % [dir, dir]
+	_check(bridge.load_level(dti), "load_level %s" % dti)
+	if failures > 0:
+		return
+	_check(int(bridge.get_mode()) == 3, "mode == 3 (traversal)")
+	var el: Dictionary = bridge.diagnostic_end_level()
+	_check(bool(el.get("ok", false)), "END_LEVEL mailbox armed")
+	printerr("campaign%d: armed, stepping mode 3 -> 5" % course)
+
+	# The mode-3 dispatcher tail: the FUN_0040dde0 arm, the takeoff
+	# sequence, then the >300 white-out latches 0x49a030 and the
+	# tail consumes it — teardown + mode-5 entry in one step.
+	var res := {}
+	var frames := 0
+	while frames < 800:
+		res = bridge.step_frame_input(33.333, {"actions": 0})
+		frames += 1
+		if int(bridge.get_mode()) != 3:
+			break
+	printerr("campaign%d: mode 3 -> %d after %d frames" %
+		[course, int(bridge.get_mode()), frames])
+	_check(int(bridge.get_mode()) == 5,
+		"mode-3 dispatcher tail -> mode 5")
+	if int(bridge.get_mode()) != 5:
+		printerr("campaign: never reached mode 5 (frames=%d mode=%d)" %
+			[frames, int(bridge.get_mode())])
+		_check(false, "mode-3 dispatcher tail -> mode 5")
+		return
+	_check(bridge.stream_active(), "stream_active after handoff")
+	_apply_stream()
+	_check($StreamLayer.visible, "StreamLayer visible in mode 5")
+	_check(not $FrontendLayer/FrontendRect.visible,
+		"frontend hidden under mode 5")
+
+	# The mode-5 entry audit — the BONES.WHITE stale-bank oracle.
+	# bank_b_bound=false means the traversal arena's .MAT table did
+	# NOT survive the FUN_004371bc -> FUN_0042b270 edge (the oracle's
+	# outcome-A arm: no stale bank B exists to resolve WHITE).
+	var d0: Dictionary = bridge.stream_diag()
+	_check(int(d0["route_from"]) == 3 and int(d0["route_to"]) == 5,
+		"route edge 3->5 recorded")
+	_check(int(d0["mode5_enters"]) == 1, "mode-5 entered once")
+	_check(int(d0["bank_a_records"]) > 0,
+		"bank A bound (STREAM.MTI)")
+	_check(not bool(d0["bank_b_bound"]),
+		"no prior-mode bank survives mode-5 entry")
+	if course == 2 or course == 3:
+		_check(int(d0["white_slot"]) >= 0,
+			"BONES name table carries WHITE")
+		_check(not bool(d0["white_resolved"]),
+			"BONES.WHITE unresolved -> flat 0xff")
+		print("  oracle: white_slot=%d resolved=%s bankB=%s bankA=%d" %
+			[int(d0["white_slot"]), bool(d0["white_resolved"]),
+			bool(d0["bank_b_bound"]), int(d0["bank_a_records"])])
+
+	# Drive the StreamScene to its natural exit — the kExitMode
+	# consume inside stepCore_ runs the dispatcher tail (teardown +
+	# the tally-done progression step).
+	var exited := false
+	frames = 0
+	while frames < 2200:
+		res = bridge.step_frame_input(33.333, {"actions": 0})
+		frames += 1
+		if not bool(res.get("ok", true)):
+			_check(false, "stream step failed: %s" %
+				bridge.get_last_error())
+			return
+		if bool(res.get("exited", false)):
+			exited = true
+			break
+	printerr("campaign%d: stream exit after %d -> mode %d" %
+		[course, frames, int(bridge.get_mode())])
+	_check(exited, "stream reaches natural exit")
+	if not exited:
+		return
+	_apply_stream()   # the terminal fill frame presents once
+	var d: Dictionary = bridge.stream_diag()
+	_check(int(d["stream_teardowns"]) == 1,
+		"exactly one stream teardown")
+	_check(int(d["stream_exit_frame"]) > 0,
+		"terminal presented frame recorded")
+	_check(not bridge.stream_active(),
+		"stream inactive after teardown")
+
+	if course >= 4:
+		# The final course's exit is health-gated by the CARRIED
+		# session state: the standalone --stream convention seeds a
+		# fresh 100/rng and drains to the death latch -> mode 0, but
+		# the real campaign handoff carries the traversal runtime's
+		# globals (health 150, the shared rand stream) — the hero
+		# latch wins and the dispatcher writes 541498 = 5 -> mode 7
+		# (the OBSERVED 0x4015ef store). The death->0 arm is covered
+		# by the standalone --stream 4 smoke and the core suite.
+		_check(int(bridge.get_mode()) == 7,
+			"course-4 carried-health exit -> mode 7")
+		var pumps7 := 0
+		var pr7 := {}
+		while pumps7 < 8 and int(bridge.get_mode()) == 7:
+			pr7 = bridge.frontend_progression_step(
+				{"stage_done": true})
+			pumps7 += 1
+			if not bool(pr7.get("ok", true)):
+				_check(false, "mode-7 pump failed: %s" %
+					bridge.get_last_error())
+				return
+		_check(int(bridge.get_mode()) == 3,
+			"mode 7 -> mode 3 (LEVEL5 continuation)")
+		_check(int(pr7.get("level_id", -1)) == 5,
+			"mode-7 levelId == 5")
+		var d4: Dictionary = bridge.stream_diag()
+		_check(int(d4["route_from"]) == 7 and
+			int(d4["route_to"]) == 3,
+			"route edge 7->3 recorded")
+		# Layer ownership on the traversal re-entry: the stream
+		# layer must be down and the gameplay set live. One step
+		# settles the fresh runtime's view set before the apply.
+		if $StreamLayer.visible:
+			$StreamLayer.visible = false
+		_step_n({}, 1)
+		_check(not $StreamLayer.visible,
+			"StreamLayer hidden on mode-7 re-entry")
+		_check(not bridge.get_player_snapshot().is_empty(),
+			"traversal snapshot live on mode-7 re-entry")
+	else:
+		# Courses 0-3 exit alive -> mode 6 (the loader). The pump
+		# runs the sub-state machine (2 -> 4 -> 1 -> 3 -> exit); the
+		# exit installs the FALL3D_<levelId+1> freefall entry.
+		_check(int(d["stream_exit_reason"]) == 2,
+			"exit reason == hero latch")
+		_check(int(d["stream_exit_health"]) > 0,
+			"health carried positive")
+		_check(int(bridge.get_mode()) == 6, "exit -> mode 6")
+		_check(int(d["mode6_enters"]) == 1, "mode-6 entered once")
+		var pumps := 0
+		var pr := {}
+		while pumps < 12 and int(bridge.get_mode()) == 6:
+			pr = bridge.frontend_progression_step(
+				{"stage_done": true})
+			pumps += 1
+			if not bool(pr.get("ok", true)):
+				_check(false, "mode-6 pump failed: %s" %
+					bridge.get_last_error())
+				return
+		printerr("campaign%d: mode 6 -> %d in %d pumps" %
+			[course, int(bridge.get_mode()), pumps])
+		_check(int(bridge.get_mode()) == 2,
+			"loader exit -> mode 2 (freefall)")
+		_check(int(pr.get("level_id", -1)) == course + 1,
+			"loader advanced levelId -> %d" % (course + 1))
+		var d2: Dictionary = bridge.stream_diag()
+		_check(int(d2["mode6_exits"]) == 1, "mode-6 exited once")
+		_check(int(d2["route_from"]) == 6 and
+			int(d2["route_to"]) == 2,
+			"route edge 6->2 recorded")
+		# Layer handoff: the freefall presenter owns the screen; the
+		# terminal stream frame must not overlay it.
+		_apply_freefall()
+		_check($FreefallRoot.visible,
+			"FreefallRoot visible in mode 2")
+		_check(not $StreamLayer.visible,
+			"StreamLayer hidden exactly once after exit")
+		_check(not $FrontendLayer/FrontendRect.visible,
+			"frontend hidden under mode 2")
+
+		# Repeat entry/exit — continue the same campaign session:
+		# the freefall handoff lands the next traversal, the
+		# END_LEVEL mailbox arms again, and the second mode-5 entry
+		# must rebuild with no stale state (counters accumulate).
+		printerr("campaign%d: chaining freefall -> traversal" % course)
+		var chained := _campaign_chain_once(course + 1)
+		printerr("campaign%d: chain result %s" %
+			[course, str(chained)])
+		if chained:
+			var d3: Dictionary = bridge.stream_diag()
+			_check(int(d3["mode5_enters"]) == 2,
+				"second mode-5 entry in-session")
+			_check(int(d3["stream_teardowns"]) == 2,
+				"second teardown counted")
+			_check(int(d3["mode6_enters"]) == 2,
+				"second mode-6 entry in-session")
+			_check(not bool(d3["bank_b_bound"]),
+				"no stale bank on re-entry")
+		else:
+			print("  chain: freefall ended before traversal " +
+				"(repeat-entry skipped — death or course bound)")
+
+	var de: Dictionary = bridge.stream_diag()
+	print("  campaign%d: frames=%d mode=%d teardowns=%d " %
+		[course, frames, int(bridge.get_mode()),
+		int(de["stream_teardowns"])])
+	print("smoke(campaign): %d failure(s)" % failures)
+
+
+func _campaign_chain_once(next_course: int) -> bool:
+	# Continue the live campaign session one more hop: freefall ->
+	# traversal -> END_LEVEL -> mode 5 -> natural exit -> mode 6.
+	# Returns true when the second mode-5 entry+exit completed.
+	# next_course >= 4 death-routes out of the chain (mode 0), so
+	# only chains landing back on the loader count here.
+	if int(bridge.get_mode()) != 2 or next_course > 3:
+		return false
+	var res := {}
+	for i in 1600:
+		res = _step_n({}, 1)
+		if bool(res.get("done", false)):
+			break
+	if int(bridge.get_mode()) != 3:
+		return false   # the freefall death route ends the campaign
+	var el: Dictionary = bridge.diagnostic_end_level()
+	if not bool(el.get("ok", false)):
+		return false
+	for i in 800:
+		_step_n({}, 1)
+		if int(bridge.get_mode()) != 3:
+			break
+	if int(bridge.get_mode()) != 5 or not bridge.stream_active():
+		return false
+	for i in 2200:
+		res = bridge.step_frame_input(33.333, {"actions": 0})
+		if bool(res.get("exited", false)):
+			break
+	return int(bridge.get_mode()) == 6 or int(bridge.get_mode()) == 7
 
 
 func _stream_shot_dump(shot_dir: String, course: int, ckpt: Dictionary,

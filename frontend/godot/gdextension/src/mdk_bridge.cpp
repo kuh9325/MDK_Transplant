@@ -130,6 +130,9 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::diagnostic_kill);
   ClassDB::bind_method(D_METHOD("diagnostic_shockwave", "object_id"),
                        &MdkBridge::diagnostic_shockwave);
+  // Phase 19B.3A — the mode-3 -> 5 route: the END_LEVEL mailbox.
+  ClassDB::bind_method(D_METHOD("diagnostic_end_level"),
+                       &MdkBridge::diagnostic_end_level);
   // Phase 17A closeout — full save/restore.
   ClassDB::bind_method(D_METHOD("save_game_full"),
                        &MdkBridge::save_game_full);
@@ -1170,13 +1173,33 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
   last_ = mdk::stepTraversalRuntime(*rt_, raw, bindings_, timing_);
   hasFrame_ = true;
 
+  // Dispatcher mode-3 tail (0x401497): the runtime's victory latches
+  // map onto the session's staged model — endLevelRequest (the
+  // 540ebc=-1 consume -> FUN_0040dde0) is victoryPhase 1, da0
+  // (takeoffActive) advances 1 -> 2, and 49a030 (takeoffDone)
+  // advances 2 -> 3 before the FUN_004371bc teardown + FUN_0042b270
+  // mode-5 entry run. 541554 is the shared global — the session
+  // syncs the live value at each edge.
+  if (sess_.mode == 3 && rt_) {
+    if (last_.endLevelRequested && sess_.victoryPhase == 0) {
+      sess_.health = rt_->fieldHealth;
+      (void)mdk::progressionRequestTraversalEnd(sess_);
+    }
+    if (last_.takeoffActive && sess_.victoryPhase == 1)
+      (void)mdk::progressionAdvanceVictory(sess_);
+    if (last_.takeoffDone && sess_.victoryPhase == 2)
+      traversalStreamHandoff_();
+  }
+
   // The display set is core-driven every frame: portal swaps,
   // partner attach/detach, and corridor (geometry-less) arenas all
   // recompute here — the G1 single-arena desync is gone. A corridor
   // current arena yields no set of its own; the partner's geometry
   // stays up and the corridor's objects still present.
-  updateDisplaySet_();
-  refreshOrders_();
+  if (rt_) {
+    updateDisplaySet_();
+    refreshOrders_();
+  }
 
   out["frame"] = last_.frame;
   out["arena"] = last_.curArenaIndex;      // core arena
@@ -1192,7 +1215,9 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
   // Merged-control echo — the just-consumed GameplayInputFrame
   // (0x4ce block), for tests/QA that need to observe which semantic
   // action the raw input produced. Proven fields only.
-  const mdk::GameplayInputFrame& cf = rt_->prevFrame;
+  static const mdk::GameplayInputFrame kEmptyFrame{};
+  const mdk::GameplayInputFrame& cf =
+      rt_ ? rt_->prevFrame : kEmptyFrame;
   Dictionary inp;
   inp["fire"] = cf.fire != 0;
   inp["jump"] = cf.jump != 0;
@@ -1713,6 +1738,26 @@ Dictionary MdkBridge::diagnostic_shockwave(int64_t object_id) {
   if (!rt_->combatFx.empty()) {
     out["kind"] = int64_t(rt_->combatFx.back().kind);
   }
+  return out;
+}
+
+Dictionary MdkBridge::diagnostic_end_level() {
+  Dictionary out;
+  out["ok"] = false;
+  if (mode_ != 3 || !rt_) {
+    setError_("diagnostic_end_level: no live traversal session");
+    return out;
+  }
+  // 0x540ebc = -1 — the mailbox the END_LEVEL script op writes
+  // (traversal_script.cpp env.rt->pendingViewSnap). The next stepped
+  // frame's FUN_00436100 tail consumes it through FUN_0040dde0 —
+  // health floor + masterMoveGate + the victory latches — and the
+  // dispatcher tail then runs the real 49a030 edge (traversal
+  // teardown -> FUN_0042b270 mode 5). Bounded-test path only: the
+  // loaded arena's own trigger object does the same store when the
+  // script fires it in normal play.
+  rt_->pendingViewSnap = -1;
+  out["ok"] = true;
   return out;
 }
 
@@ -2950,6 +2995,38 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
       if (*mp) mdk::resolveModelMaterials(**mp, bank);
   }
 
+  // 19B.3A — the BONES.WHITE stale-bank oracle. The only bank-B
+  // material table that could exist at this point is the traversal
+  // arena's embedded .MAT inside rt_; FUN_004371bc (the mode-3
+  // dispatcher tail's traversalTeardown_) frees it before the
+  // FUN_0042b270 entry runs, so rt_ must already be null here.
+  // Anything else means a prior-mode bank survived the transition.
+  streamBankARecs_ = static_cast<int>(streamBankA_.size());
+  streamBankBBound_ = (rt_ != nullptr);
+  streamWhiteSlot_ = -1;
+  streamWhiteResolved_ = false;
+  streamUnresolvedMats_ = 0;
+  auto auditModel = [&](const std::optional<mdk::RuntimeModel>& m,
+                        bool bones) {
+    if (!m) return;
+    for (std::size_t i = 0; i < m->names.size(); ++i) {
+      if (i < m->materials.size() && m->materials[i] == nullptr)
+        ++streamUnresolvedMats_;
+      if (!bones) continue;
+      const std::string nm(m->names[i].name.data(),
+                           strnlen(m->names[i].name.data(), 12));
+      if (nm == "WHITE") {
+        streamWhiteSlot_ = static_cast<int>(i);
+        streamWhiteResolved_ =
+            i < m->materials.size() && m->materials[i] != nullptr;
+      }
+    }
+  };
+  auditModel(streamProtoKurt_, false);
+  auditModel(streamProtoBones_, true);
+  auditModel(streamProtoProf_, false);
+  auditModel(streamProtoEsc_, false);
+
   auto payloadPtr = [&](const char* name) -> const std::uint8_t* {
     const std::span<const std::byte> p =
         payload(bdir, streamBniBytes_, name);
@@ -3018,6 +3095,7 @@ bool MdkBridge::campaignStreamEnter_(std::string& detail) {
   timing_ = mdk::FrontendTimingState{};
   prevKeyLevel_ = {};
   mode_ = 5;
+  ++mode5Enters_;
   hasFrame_ = false;
   return true;
 }
@@ -3079,21 +3157,82 @@ void MdkBridge::streamHandoff_() {
     const mdk::StreamSnapshot s = stream_->snapshot();
     sess_.health = s.health;
     sess_.rng = stream_->rng();
+    // 19B.3A route audit — the terminal state handed to the tally
+    // step: the presented-frame seq, the completion tag, and the
+    // health writeback the <= 0 death gate reads.
+    streamExitFrame_ = static_cast<int64_t>(streamFrameSeq_);
+    streamExitReason_ = static_cast<int>(s.completionSrc) + 1;
+    streamExitHealth_ = s.health;
     stream_->teardown();
     stream_.reset();
+    ++streamTeardowns_;
   }
+  routeFrom_ = mode_;
   const mdk::ProgressionError e =
       mdk::progressionStepIntermission(sess_, true);
   if (e != mdk::ProgressionError::kOk)
     setError_(std::string("stream handoff: ") +
               std::string(mdk::progressionErrorName(e)));
   mode_ = sess_.mode;
+  routeTo_ = mode_;
+  if (sess_.mode == 6) ++mode6Enters_;
   if (sess_.mode == 0 && feShell_)
     // The dead-hero route lands the campaign's frontend exit — the
     // same fresh entry the progression pump's mode-0 arm runs
     // (returning=false; only the mode-8 tail passes nonzero).
     feShell_->enterFrontend(false);
   hasFrame_ = false;
+}
+
+void MdkBridge::traversalTeardown_() {
+  // FUN_004371bc — the traversal teardown: the runtime and every
+  // presentation structure derived from it die at the edge
+  // (objects, arenas, scripts, the bank-B MTO overlay table — the
+  // core free lives inside traversalRuntimeLoad's own teardown
+  // path; the bridge's mirrored display state dies with them). The
+  // session globals carry — 541554/ammo/inventory/rng/541498 have
+  // no writer in the teardown's call graph — and the frontend
+  // shell/save root are host-level and survive, matching the
+  // original's process-global lifetime.
+  rt_.reset();
+  objIds_ = mdkfront::MdkObjectIds{};
+  arenaSets_.clear();
+  arenaSetFailed_.clear();
+  arenaName_.clear();
+  displaySet_.clear();
+  arenaIndex_ = -1;
+  arenaLoaded_ = false;
+}
+
+void MdkBridge::traversalStreamHandoff_() {
+  // Dispatcher mode-3 tail (0x401497): 49a030 consumed + cleared,
+  // the fade globals arm (a presentation seam — StreamPresenter
+  // applies its own fades), FUN_004371bc teardown, then
+  // FUN_0042b270 — the mode-5 entry — which writes 541492 = 5.
+  // The progression session stages the same sequence: 2 -> 3 on
+  // the latch, teardown -> 5.
+  (void)mdk::progressionAdvanceVictory(sess_);          // 2 -> 3
+  const mdk::ProgressionError e =
+      mdk::progressionTraversalTeardown(sess_);          // -> mode 5
+  if (e != mdk::ProgressionError::kOk) {
+    setError_(std::string("traversal teardown: ") +
+              std::string(mdk::progressionErrorName(e)));
+    return;
+  }
+  // The shared-globals writeback — FUN_004371bc's teardown has no
+  // writer for health/ammo/rng/levelId because the original keeps
+  // them in one storage; the port's runtime owns its own copy, so
+  // the values the runtime mutated flow back to the session here
+  // (the same carry the freefall handoff performs).
+  sess_.health = rt_->fieldHealth;   // 541554 — the shared global
+  sess_.rng = rt_->rngState;
+  sess_.ammo = rt_->ammo;            // 54161f..33 — grants carry
+  routeFrom_ = mode_;              // 3
+  traversalTeardown_();
+  routeTo_ = 5;
+  std::string detail;
+  if (!campaignStreamEnter_(detail))
+    setError_("campaign stream entry: " + detail);
 }
 
 Dictionary MdkBridge::stream_frame() {
@@ -3256,6 +3395,25 @@ Dictionary MdkBridge::stream_diag() {
   out["terminal_fill"] = int64_t(d.terminalFill);
   out["fb_hash"] = static_cast<int64_t>(d.fbHash);       // bit-cast
   out["palette_hash"] = static_cast<int64_t>(d.paletteHash);
+  // 19B.3A — the route/lifetime audit: the last transition edge,
+  // the enter/exit counts (repeat-entry proof), the terminal state
+  // handed to the tally step, and the mode-5 material-bank bind —
+  // bank_b_bound=false means no traversal .MAT survived into the
+  // FUN_0042b270 entry (the BONES.WHITE stale-bank oracle).
+  out["route_from"] = int64_t(routeFrom_);
+  out["route_to"] = int64_t(routeTo_);
+  out["stream_teardowns"] = int64_t(streamTeardowns_);
+  out["mode5_enters"] = int64_t(mode5Enters_);
+  out["mode6_enters"] = int64_t(mode6Enters_);
+  out["mode6_exits"] = int64_t(mode6Exits_);
+  out["stream_exit_frame"] = streamExitFrame_;
+  out["stream_exit_reason"] = int64_t(streamExitReason_);
+  out["stream_exit_health"] = int64_t(streamExitHealth_);
+  out["bank_a_records"] = int64_t(streamBankARecs_);
+  out["bank_b_bound"] = streamBankBBound_;
+  out["white_slot"] = int64_t(streamWhiteSlot_);
+  out["white_resolved"] = streamWhiteResolved_;
+  out["unresolved_materials"] = int64_t(streamUnresolvedMats_);
   out["seq"] = static_cast<int64_t>(streamFrameSeq_);
   return out;
 }
@@ -3314,6 +3472,23 @@ void MdkBridge::shutdown() {
   streamBankA_.clear();
   streamNowMs_ = 0;
   streamFrameSeq_ = 0;
+  // 19B.3A — the route audit counters are session-scoped: they die
+  // with the session they measured (the repeat-entry proof reads
+  // them between entries of one session).
+  routeFrom_ = -1;
+  routeTo_ = -1;
+  streamTeardowns_ = 0;
+  mode5Enters_ = 0;
+  mode6Enters_ = 0;
+  mode6Exits_ = 0;
+  streamExitFrame_ = -1;
+  streamExitReason_ = -1;
+  streamExitHealth_ = -1;
+  streamBankARecs_ = 0;
+  streamBankBBound_ = false;
+  streamWhiteSlot_ = -1;
+  streamWhiteResolved_ = false;
+  streamUnresolvedMats_ = 0;
   sess_ = mdk::ProgressionSession{};
   ffHandoffDone_ = false;
   ffHandoffRoute_ = -1;
@@ -4176,6 +4351,12 @@ Dictionary MdkBridge::frontend_progression_step(const Dictionary& input) {
     feShell_->enterFrontend(prevMode == 8);
   }
   mode_ = sess_.mode;
+  // 19B.3A route audit — a completed pump edge (mode-6 loader exit,
+  // mode-7/8 tail). The runtime-presented modes' edges are counted
+  // in their own handoffs.
+  routeFrom_ = prevMode;
+  routeTo_ = mode_;
+  if (prevMode == 6 && mode_ != 6) ++mode6Exits_;
   out["mode"] = mode_;
   out["sess_mode"] = sess_.mode;
   out["level_id"] = sess_.levelId;

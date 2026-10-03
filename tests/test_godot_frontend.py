@@ -272,6 +272,82 @@ class GodotStreamSmoke(unittest.TestCase):
             "pal=9fa9e040e0eedf25"))
 
 
+def have_campaign_data():
+    data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
+    return (Path(data) / "STREAM" / "STREAM.BNI").exists() and \
+        (Path(data) / "FALL3D" / "FALL3D.BNI").exists() and \
+        all(have_level(d) for d in (3, 4, 5, 6, 7, 8))
+
+
+@unittest.skipUnless(*have_prereqs())
+class GodotCampaignSmoke(unittest.TestCase):
+    """Phase 19B.3A — real campaign handoff route smoke.
+
+    Drives the canonical launcher with --campaign N: the course's
+    traversal loads, the diagnostic END_LEVEL mailbox arms the
+    victory sequence (the same store the script op writes), and the
+    mode-3 dispatcher tail runs FUN_004371bc + FUN_0042b270 — a real
+    mode-3 -> 5 transition. The stream exits naturally, the mode-6
+    loader pump advances to the next freefall, and layer ownership
+    is checked at every edge. Courses 2/3 additionally gate the
+    BONES.WHITE stale-bank oracle (no traversal .MAT may survive
+    the teardown edge); course 4 covers the death -> mode-0 route.
+    """
+
+    def run_smoke(self, course):
+        return subprocess.run(
+            [str(RUN_SH), "--smoke", "--campaign", str(course)],
+            capture_output=True, text=True, timeout=1800)
+
+    def check_course(self, course, extra=()):
+        if not have_campaign_data():
+            self.skipTest("no STREAM/FALL3D/TRAVERSE data in data root")
+        proc = self.run_smoke(course)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("SCRIPT ERROR", out)
+        m = re.search(r"smoke\(campaign\): (\d+) failure", out)
+        self.assertIsNotNone(m, f"no smoke verdict in output:\n{out}")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"godot exited {proc.returncode}:\n{out}")
+        self.assertEqual(m.group(1), "0", f"smoke failures:\n{out}")
+        for pat in extra:
+            self.assertIn(pat, out)
+
+    def test_campaign_course0(self):
+        # Base route: traversal -> mode 5 -> mode 6 -> freefall
+        # (levelId advances 0 -> 1) + in-session repeat entry.
+        self.check_course(0, extra=(
+            "mode-3 dispatcher tail -> mode 5",
+            "exit -> mode 6",
+            "loader exit -> mode 2 (freefall)",
+            "loader advanced levelId -> 1"))
+
+    def test_campaign_course2(self):
+        # BONES.WHITE stale-bank oracle — the traversal .MAT must not
+        # survive the FUN_004371bc -> FUN_0042b270 edge.
+        self.check_course(2, extra=(
+            "oracle: white_slot=",
+            "resolved=false bankB=false",
+            "loader exit -> mode 2 (freefall)"))
+
+    def test_campaign_course3(self):
+        self.check_course(3, extra=(
+            "oracle: white_slot=",
+            "resolved=false bankB=false",
+            "loader exit -> mode 2 (freefall)"))
+
+    def test_campaign_course4(self):
+        # Final course on the REAL campaign route: the carried
+        # traversal globals (health 150, shared rand) keep the hero
+        # latch — exit -> mode 7 -> the LEVEL5 traversal
+        # continuation. The death->0 arm is the standalone
+        # --stream 4 convention (fresh 100/seed) plus the core suite.
+        self.check_course(4, extra=(
+            "course-4 carried-health exit -> mode 7",
+            "mode 7 -> mode 3 (LEVEL5 continuation)"))
+
+
 def have_level(num):
     data = os.environ.get("MDK_DATA_ROOT") or str(DEFAULT_DATA)
     d = f"LEVEL{num}"

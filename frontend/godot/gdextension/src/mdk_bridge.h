@@ -180,6 +180,14 @@ class MdkBridge : public RefCounted {
   // with the observed 2.0 scale arg. Emits a kDetonation event.
   // Test/QA path only.
   Dictionary diagnostic_shockwave(int64_t object_id);
+  // NATIVE DIAGNOSTIC — writes the END_LEVEL mailbox
+  // (rt.pendingViewSnap = -1), the same store the script op performs
+  // (traversal_script.cpp). The runtime's frame tail consumes it
+  // through the real FUN_0040dde0 arm and the dispatcher tail runs
+  // the victory/teardown edge verbatim — bounded tests need the
+  // route without a scripted trigger object in the loaded arena.
+  // Test/QA path only.
+  Dictionary diagnostic_end_level();
 
   // --- Phase 17A closeout — full save/restore -------------------
   // Serializes the live traversal session through the original
@@ -632,6 +640,17 @@ class MdkBridge : public RefCounted {
   // globals, teardown (FUN_0042c824), then the tally-done
   // progression step (health<=0 -> 0, levelId<4 -> 6, else 7).
   void streamHandoff_();
+  // Dispatcher mode-3 tail (0x401497): 49a030 consumed -> cleared,
+  // fades armed, FUN_004371bc traversal teardown, FUN_0042b270 ->
+  // mode 5. Runs when the runtime's takeoffDone latch surfaces
+  // (the real victory-sequence edge — not a modeled seam).
+  void traversalStreamHandoff_();
+  // FUN_004371bc — the traversal teardown: the runtime and every
+  // presentation structure derived from it die at the edge. The
+  // session globals carry (health/ammo/rng/levelId — synced before
+  // this runs); the frontend shell and save root are host-level and
+  // survive, matching the original's process-global lifetime.
+  void traversalTeardown_();
 
   std::unique_ptr<mdk::StreamScene> stream_;
   mdk::StreamAssets streamAssets_{};   // bound pointers alias the
@@ -656,6 +675,26 @@ class MdkBridge : public RefCounted {
   std::vector<mdk::ArenaRenderMaterial> streamBankA_;
   int streamNowMs_ = 0;          // synthetic 46c650 clock (ms)
   std::uint64_t streamFrameSeq_ = 0;   // presented-frame counter
+
+  // Phase 19B.3A — bounded route diagnostics. routeFrom_/routeTo_
+  // record the last mode-transition edge; the stream/mode-6 enter/
+  // exit counts prove one-shot ownership across repeat entries.
+  // The bank/white fields capture the mode-5 material-bank bind at
+  // entry — the BONES.WHITE stale-bank oracle's observable state.
+  int routeFrom_ = -1;               // previous mode on the edge
+  int routeTo_ = -1;                 // new mode on the edge
+  int streamTeardowns_ = 0;          // cumulative FUN_0042c824 runs
+  int mode5Enters_ = 0;              // cumulative mode-5 scene binds
+  int mode6Enters_ = 0;              // cumulative mode-6 entries
+  int mode6Exits_ = 0;               // cumulative mode-6 exits
+  int64_t streamExitFrame_ = -1;     // presented seq at kExitMode
+  int streamExitReason_ = -1;        // StreamCompletion tag +1..3
+  int streamExitHealth_ = -1;        // 541554 handed to the session
+  int streamBankARecs_ = 0;          // STREAM.MTI records bound
+  bool streamBankBBound_ = false;    // bank B armed at entry
+  int streamWhiteSlot_ = -1;         // BONES name-table "WHITE" slot
+  bool streamWhiteResolved_ = false; // that slot's material != null
+  int streamUnresolvedMats_ = 0;     // all-proto null slot count
 
   std::optional<mdk::DataRoot> root_;
   std::unique_ptr<mdk::TraversalRuntime> rt_;
