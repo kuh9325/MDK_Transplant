@@ -124,6 +124,49 @@ var fe_req_counts := {}        # request id -> count (diag/smoke)
 var fe_quit := false           # Quit request drained (app-owned)
 const FE_STAGE_HOLD := 45          # ~0.75s intermission placeholder
 
+# Phase 19C.1 — Mode-5 host pacing. The scene's own limiter
+# (FUN_0042fb68 -> 42fcd0) reads in.nowMs; its OBSERVED pace-wait arm
+# (0x5414ac) is dead — the original free-ran one sim step per
+# dispatcher tick (~30Hz on a period machine). This gate is the host
+# half of that contract: one sim step per ~33.3ms of monotonic wall
+# time, NOT one per display refresh (a 60Hz desktop otherwise runs
+# the tunnel at 2x). in.nowMs keeps its step-quantized +33 feed —
+# at this cadence it IS the monotonic source the limiter measures.
+# Catch-up is bounded at 4 — the limiter's own t1>4 resync bound —
+# with the excess dropped: a long stall skips presentation time
+# rather than spiraling. Deterministic harnesses bypass the gate by
+# driving step_frame_input directly (fixed 33.333ms), so goldens
+# are untouched.
+const STREAM_STEP_MS := 1000.0 / 30.0
+const STREAM_MAX_CATCHUP := 4
+var stream_pace_ms := 0.0
+var stream_pace_armed := false
+
+func _stream_pace_run(delta_ms: float) -> int:
+	# Steps the live StreamScene at the paced cadence; returns the
+	# number of sim steps actually run this display frame.
+	if not bridge.stream_active():
+		stream_pace_armed = false
+		return 0
+	if not stream_pace_armed:
+		# First live observation — present frame 0 immediately
+		# instead of holding a 33ms dead window at scene install.
+		stream_pace_armed = true
+		stream_pace_ms = STREAM_STEP_MS
+	stream_pace_ms += delta_ms
+	var n := int(stream_pace_ms / STREAM_STEP_MS)
+	if n > STREAM_MAX_CATCHUP:
+		n = STREAM_MAX_CATCHUP
+		stream_pace_ms = 0.0   # slow-frame policy: drop the backlog
+	else:
+		stream_pace_ms -= n * STREAM_STEP_MS
+	var ran := 0
+	while ran < n and bridge.stream_active():
+		bridge.step_frame_input(STREAM_STEP_MS,
+			{"actions": _input_mask()})
+		ran += 1
+	return ran
+
 # Phase 17A — traversal combat presentation state. mdk_core owns
 # every gameplay fact; these are view-side node/resource caches only.
 var combat_diag := false          # --combat-diag flag
@@ -2809,7 +2852,14 @@ func _process(delta: float) -> void:
 	if frames_left > 0:
 		frames_left -= 1
 		if frames_left == 0:
-			print("frames: startup proof complete")
+			# 19C.1 — the startup-proof line carries the mode/stream
+			# state so a bounded wall-clock run proves the paced
+			# step cadence (sim steps = presented stream frames).
+			var fm := int(bridge.get_mode())
+			# stream_diag is a persistent census — safe to read post-exit.
+			var fpres := int(bridge.stream_diag().get("presented", 0))
+			print("frames: startup proof complete",
+				" mode=", fm, " stream_presented=", fpres)
 			get_tree().quit(0)
 			return
 	var mode := int(bridge.get_mode())
@@ -2831,8 +2881,7 @@ func _process(delta: float) -> void:
 			_frontend_hide()
 		else:
 			pass
-	if shot_path.is_empty() and (mode == 2 or mode == 3 or
-			stream_standalone):
+	if shot_path.is_empty() and (mode == 2 or mode == 3):
 		# Screenshot mode keeps the exact frame-0 spawn pose.
 		var input := {
 			"actions": _input_mask(),
@@ -2863,6 +2912,12 @@ func _process(delta: float) -> void:
 		if freefall and mode != 2 and not ff_handoff_seen:
 			ff_handoff_seen = true
 			print("mdk-godot: freefall handoff -> mode %d" % mode)
+	elif shot_path.is_empty() and stream_standalone:
+		# Standalone mode 5: paced ~33.3ms steps (19C.1), not one per
+		# display refresh. The scene takes actions only (the roll/
+		# pitch steer axes); mouse deltas are unbound here.
+		if _stream_pace_run(delta * 1000.0) > 0:
+			mode = int(bridge.get_mode())
 	if mode == 2:
 		# Mode-2 freefall — the FUN_004109d8 model walk + the
 		# FUN_004123f4 fixed-orientation camera + 0x4edc04 fade.
@@ -2882,8 +2937,11 @@ func _process(delta: float) -> void:
 		# The mode-5 exit flipped the mode inside the step — upload
 		# the terminal-fill frame once, then idle (modes 6/7/8 have
 		# no standalone presenter; the frontend route owns them when
-		# a campaign drives the progression).
+		# a campaign drives the progression). The teardown tail's
+		# queued stops still need the drain — otherwise the WIND
+		# loop's player would keep sounding through the next mode.
 		_apply_stream()
+		_drain_audio_fx()
 	if mode == 0:
 		# Frontend route (post-death handoff or unload) — the mode-0
 		# shell is a documented seam; freeze the last frame.
@@ -5231,12 +5289,17 @@ func _frontend_frame(delta: float, mode: int) -> void:
 	#
 	# Mode 5 is the exception once the pump installs the live
 	# StreamScene (frontend_progression_step arms campaignStreamEnter_
-	# on first contact): the scene is stepped + presented here, one
-	# frame per tick, until its kExitMode drives the handoff.
+	# on first contact): the scene is stepped + presented here on the
+	# paced ~33.3ms cadence (19C.1), until its kExitMode drives the
+	# handoff.
 	if mode == 5 and bridge.stream_active():
-		bridge.step_frame_input(delta * 1000.0,
-			{"actions": _input_mask()})
-		_apply_stream()
+		if _stream_pace_run(delta * 1000.0) > 0:
+			_apply_stream()
+		# The voice commands drain once per rendered frame — the
+		# standalone mode-5 drain below is unreachable under
+		# fe_active (this branch returns first), so the frontend
+		# route needs its own.
+		_drain_audio_fx()
 		bridge.frontend_end_frame(delta * 1000.0)
 		return
 	fe_stage_hold -= 1

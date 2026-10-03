@@ -3218,8 +3218,12 @@ Dictionary MdkBridge::stepStream_(double dt_ms, int64_t action_mask,
     out["ok"] = false;
     return out;
   }
-  (void)dt_ms;   // pinned 1/30 — the golden harness' frame delta;
-                 // host pacing is a later phase
+  (void)dt_ms;   // pinned 1/30 — the sim's per-step frame delta.
+                 // Host pacing (19C.1) lives in the caller's step
+                 // cadence: interactive paths run one step per
+                 // ~33.3ms of wall time; deterministic harnesses
+                 // call this once per 33.333ms quanta. The limiter
+                 // sees in.nowMs — step-quantized +33 either way.
   // Host input fold (the FUN_00407f2c domain — digital +-180 on the
   // two steering axes; the runtime consumes the resolved axes).
   mdk::StreamInput in{};
