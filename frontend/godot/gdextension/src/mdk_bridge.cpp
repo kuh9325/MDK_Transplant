@@ -3,6 +3,8 @@
 
 #include "mdk_bridge.h"
 
+#include "mve_player.h"
+
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/shader.hpp>
 #include <godot_cpp/core/class_db.hpp>
@@ -194,6 +196,8 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::ending_frame);
   ClassDB::bind_method(D_METHOD("ending_drain_audio"),
                        &MdkBridge::ending_drain_audio);
+  ClassDB::bind_method(D_METHOD("ending_set_audio_clock", "sec"),
+                       &MdkBridge::ending_set_audio_clock);
   ClassDB::bind_method(D_METHOD("ending_diag"),
                        &MdkBridge::ending_diag);
   // Phase 18B.1 — frontend host services.
@@ -3550,6 +3554,15 @@ void MdkBridge::endingTeardown_() {
   endingBniBytes_.clear();
   endingBniDir_ = mdk::BniDirectory{};
   endingSndEntries_.clear();
+  mve_.reset();
+  mveIdx_.clear();
+  mvePendingIdx_.clear();
+  mveStage_ = false;
+  mveAudioPending_ = false;
+  mveEof_ = false;
+  mveFrameValid_ = false;
+  mvePendingValid_ = false;
+  mveClockLive_ = false;
 }
 
 const MdkBridge::AudioEntry_* MdkBridge::endingSndEntry_(
@@ -3606,15 +3619,69 @@ const MdkBridge::AudioEntry_* MdkBridge::endingSndEntry_(
   return &it->second;
 }
 
+// Phase 19E — FUN_0047b674's file-open edge: the Interplay MVE
+// library is substituted by the staged FFmpeg dylibs (mve_player.*).
+// Success arms the MVE stage; any failure takes the original's
+// iVar1==0 route straight to the frontend (result 3 = missing).
+bool MdkBridge::endingTryMve_() {
+#if MDK_WITH_MVE
+  std::string err;
+  const auto path = root_->resolve("MISC/FLIC/MDKBZK.MVE", &err);
+  if (!path) {
+    setError_("MISC/FLIC/MDKBZK.MVE: " + err);
+    return false;
+  }
+  auto p = std::make_unique<mdkbridge::MvePlayer>();
+  if (!p->open(path->string().c_str(), &err)) {
+    setError_("MISC/FLIC/MDKBZK.MVE: " + err);
+    return false;
+  }
+  mve_ = std::move(p);
+  mveStage_ = true;
+  mveAudioPending_ = true;
+  mveWallSec_ = 0.0;
+  mveClockSec_ = -1.0;
+  mveClockLive_ = false;
+  mveEof_ = false;
+  mveFrameValid_ = false;
+  mvePendingValid_ = false;
+  mveIdx_.clear();
+  mvePal_.fill(0);
+  mvePresented_ = 0;
+  mveDecodedQ_ = 0;
+  endingSeq_ = 0;   // MVE seq restarts — the FLIC count is its own
+  return true;
+#else
+  setError_("MDKBZK.MVE: bridge built without MVE support "
+            "(run frontend/godot/fetch_ffmpeg.sh)");
+  return false;
+#endif
+}
+
+// Shared end-of-cinematic tail — natural EOF and keypress abort take
+// the same post-movie route (FUN_0047d30a teardown -> FUN_00413b20),
+// the missing-file route is FUN_00408eb0; both converge on the
+// returning frontend entry.
+void MdkBridge::endingFinish_(int result, Dictionary* out) {
+  endingResult_ = result;
+  (void)mdk::progressionStepCinematic(sess_, true);
+  endingTeardown_();
+  mode_ = sess_.mode;                        // 0
+  if (feShell_) feShell_->enterFrontend(true);
+  routeFrom_ = 8;
+  routeTo_ = 0;
+  out->operator[]("mode") = mode_;
+  out->operator[]("sess_mode") = sess_.mode;
+  out->operator[]("ending_result") = result;
+}
+
 Dictionary MdkBridge::stepEnding_(double dt_ms, int64_t action_mask,
                                   const Dictionary* input) {
-  (void)dt_ms;
   (void)action_mask;
-  (void)input;
   Dictionary out;
   out["ok"] = true;
   out["mode"] = mode_;
-  if (!ending_) {
+  if (!ending_ && !mveStage_) {
     // The 49bd40 arm — the mode-8 frame head runs the traversal
     // teardown (session globals carry first, same writeback the
     // mode-5 handoff performs) then FUN_0047b0fc's load.
@@ -3638,6 +3705,89 @@ Dictionary MdkBridge::stepEnding_(double dt_ms, int64_t action_mask,
       return out;
     }
   }
+  if (mveStage_) {
+    // --- MVE stage (Phase 19E) -----------------------------------
+    // Clock: the soundtrack WAV's playback position while it's
+    // live (Godot feeds ending_set_audio_clock); accumulated step
+    // dt before start and after natural audio end.
+    mveWallSec_ += dt_ms / 1000.0;
+    const double clockMs =
+        (mveClockLive_ ? mveClockSec_ : mveWallSec_) * 1000.0;
+    // Abort: any fresh key edge kills the movie (the WndProc
+    // abort the FUN_0047b674 pump dispatches to). Held levels and
+    // mouse motion do not abort.
+    if (input) {
+      bool abort = false;
+      const Dictionary& d = *input;
+      if (d.has("confirm") && bool(d["confirm"])) abort = true;
+      if (d.has("cancel") && bool(d["cancel"])) abort = true;
+      if (d.has("typed") && int64_t(d["typed"]) != 0) abort = true;
+      if (d.has("raw_edges")) {
+        const PackedInt32Array raw = d["raw_edges"];
+        for (int i = 0; i < raw.size(); ++i)
+          if (raw[i] != 0) abort = true;
+      }
+      if (abort) {
+        endingFinish_(2, &out);
+        return out;
+      }
+    }
+    // Present loop — a decoded frame only becomes the surface when
+    // its pts is due; one pending frame may wait head-of-queue.
+    // Each commit updates the surface; surfaces superseded inside a
+    // tick count as decoded-not-presented (catch-up skip).
+    int commits = 0;
+    if (mvePendingValid_ && mvePendingPtsMs_ <= clockMs) {
+      mveIdx_.swap(mvePendingIdx_);
+      mvePal_ = mvePendingPal_;
+      mvePendingValid_ = false;
+      mveFrameValid_ = true;
+      ++commits;
+    }
+    while (!mvePendingValid_ && !mveEof_) {
+      std::vector<std::uint8_t> idx;
+      std::array<std::uint8_t, 768> pal = mvePal_;
+      double pts = -1.0;
+      std::string derr;
+      bool palDirty = false;
+      if (!mve_->nextVideoFrame(&idx, &pal, &palDirty, &pts, &derr)) {
+        mveEof_ = true;
+        if (!derr.empty()) setError_("mve decode: " + derr);
+        break;
+      }
+      if (pts <= clockMs) {
+        mveIdx_.swap(idx);
+        mvePal_ = pal;
+        mveFrameValid_ = true;
+        ++commits;
+      } else {
+        mvePendingIdx_.swap(idx);
+        mvePendingPal_ = pal;
+        mvePendingPtsMs_ = pts;
+        mvePendingValid_ = true;
+      }
+    }
+    if (commits > 0) {
+      ++mvePresented_;                    // the last commit shows
+      mveDecodedQ_ += commits - 1;        // superseded inside tick
+      endingSeq_ = mvePresented_ + mveDecodedQ_;
+    }
+    // End: video drained and the movie's own length (max of last
+    // frame pts and the soundtrack duration) has played out.
+    if (mveEof_ && mve_) {
+      const double endMs =
+          std::max(mve_->lastPtsMs(), mve_->audioDurationSec() * 1000.0);
+      if (clockMs >= endMs) {
+        endingFinish_(1, &out);
+        return out;
+      }
+    }
+    out["stage"] = int64_t(2);
+    out["seq"] = endingSeq_;
+    out["mode"] = mode_;
+    out["sess_mode"] = sess_.mode;
+    return out;
+  }
   // One pump per caller-paced limiter tick (~33.3 ms — the file's
   // speed field). tickDelta = 1: 0x49b6e8 reads 1 per tick OBSERVED.
   const mdk::EndingStage st = ending_->step(1.0);
@@ -3646,16 +3796,18 @@ Dictionary MdkBridge::stepEnding_(double dt_ms, int64_t action_mask,
   out["mark"] = static_cast<int64_t>(ending_->mark());
   if (st == mdk::EndingStage::kMveBoundary) {
     endingMveBoundary_ = true;
-    // FUN_0047b674's missing-file edge — the Interplay MVE stage is
-    // unimplemented — so the run continues to FUN_0041d85c (the
-    // returning frontend entry) exactly as the original does when
-    // MDKBZK.MVE fails to open.
-    (void)mdk::progressionStepCinematic(sess_, true);
-    endingTeardown_();
-    mode_ = sess_.mode;                        // 0
-    if (feShell_) feShell_->enterFrontend(true);
-    routeFrom_ = 8;
-    routeTo_ = 0;
+    if (endingTryMve_()) {
+      out["mve_open"] = true;
+      out["mode"] = mode_;
+      out["sess_mode"] = sess_.mode;
+      out["seq"] = endingSeq_;
+      return out;
+    }
+    // FUN_0047b674's missing-file edge — MDKBZK.MVE failed to open,
+    // so the run continues to FUN_0041d85c exactly as the original
+    // does when the player can't load the file.
+    endingFinish_(3, &out);
+    return out;
   }
   out["mode"] = mode_;
   out["sess_mode"] = sess_.mode;
@@ -3682,6 +3834,32 @@ bool MdkBridge::load_ending() {
 
 Dictionary MdkBridge::ending_frame() {
   Dictionary out;
+  if (mveStage_) {
+    if (!mveFrameValid_) return out;
+    const int w = mve_->width();
+    const int h = mve_->height();
+    out["w"] = w;
+    out["h"] = h;
+    // FUN_00489a50's 640x480 surface keeps the 432x320 movie
+    // aspect-preserved — the Godot side letterboxes on this flag.
+    out["keep_aspect"] = true;
+    out["mve"] = true;
+    PackedByteArray rgba;
+    rgba.resize(static_cast<int64_t>(w) * h * 4);
+    std::uint8_t* dst = rgba.ptrw();
+    for (int i = 0; i < w * h; ++i) {
+      const std::uint8_t c = mveIdx_[static_cast<std::size_t>(i)];
+      dst[i * 4 + 0] = mvePal_[c * 3 + 0];
+      dst[i * 4 + 1] = mvePal_[c * 3 + 1];
+      dst[i * 4 + 2] = mvePal_[c * 3 + 2];
+      dst[i * 4 + 3] = 255;
+    }
+    out["rgba"] = rgba;
+    out["seq"] = endingSeq_;
+    out["ramp"] = 0.0;
+    out["mve_boundary"] = true;
+    return out;
+  }
   if (!ending_ || ending_->decoder().decoded() == 0) return out;
   const mdk::FlicDecoder& dec = ending_->decoder();
   const int w = dec.width();
@@ -3710,34 +3888,92 @@ Dictionary MdkBridge::ending_frame() {
 
 Array MdkBridge::ending_drain_audio() {
   Array out;
-  if (!ending_) return out;
-  for (const mdk::EndingEvent& ev : ending_->drainEvents()) {
-    Dictionary e;
-    switch (ev.kind) {
-      case mdk::EndingEvent::kPlayOnce: e["op"] = "play"; break;
-      case mdk::EndingEvent::kStop:     e["op"] = "stop"; break;
-      default: continue;   // kPaletteDirty — the frame path sees it
-    }
-    if (ev.name != nullptr) {
-      e["name"] = String(ev.name);
-      const AudioEntry_* en = endingSndEntry_(ev.name);
-      if (en && en->resolved && en->stream.is_valid()) {
-        e["stream"] = en->stream;
-        e["vol"] = double(mdk::traversalAudioVolDb(
-            mdk::traversalAudioScaledVol(en->def.volume,
-                                         audioSfxPct_)));
+  if (ending_) {
+    for (const mdk::EndingEvent& ev : ending_->drainEvents()) {
+      Dictionary e;
+      switch (ev.kind) {
+        case mdk::EndingEvent::kPlayOnce: e["op"] = "play"; break;
+        case mdk::EndingEvent::kStop:     e["op"] = "stop"; break;
+        default: continue;   // kPaletteDirty — the frame path sees it
       }
+      if (ev.name != nullptr) {
+        e["name"] = String(ev.name);
+        const AudioEntry_* en = endingSndEntry_(ev.name);
+        if (en && en->resolved && en->stream.is_valid()) {
+          e["stream"] = en->stream;
+          e["vol"] = double(mdk::traversalAudioVolDb(
+              mdk::traversalAudioScaledVol(en->def.volume,
+                                           audioSfxPct_)));
+        }
+      }
+      out.push_back(e);
     }
+  }
+  // The MVE soundtrack emits once when the stage arms — one
+  // AudioStreamWAV carrying the whole decoded interplay_dpcm PCM.
+  if (mveStage_ && mveAudioPending_ && mve_) {
+    Ref<AudioStreamWAV> wav;
+    wav.instantiate();
+    wav->set_format(AudioStreamWAV::FORMAT_16_BITS);
+    wav->set_stereo(mve_->audioChannels() == 2);
+    wav->set_mix_rate(mve_->audioRate());
+    PackedByteArray data;
+    const std::vector<std::uint8_t>& pcm = mve_->audioPcm();
+    data.resize(static_cast<int64_t>(pcm.size()));
+    if (!pcm.empty()) std::memcpy(data.ptrw(), pcm.data(), pcm.size());
+    wav->set_data(data);
+    Dictionary e;
+    e["op"] = "mve_audio";
+    e["stream"] = wav;
+    e["dur"] = mve_->audioDurationSec();
+    e["vol"] = double(mdk::traversalAudioVolDb(
+        mdk::traversalAudioScaledVol(0x7fff, audioSfxPct_)));
     out.push_back(e);
+    mveAudioPending_ = false;
+  }
+  // Abort mid-movie silences the soundtrack (natural EOF does not —
+  // the WAV plays itself out under the post-movie route).
+  if (endingResult_ == 2) {
+    Dictionary e;
+    e["op"] = "mve_stop";
+    out.push_back(e);
+    endingResult_ = -2;   // emitted once — diag keeps the record
   }
   return out;
 }
 
+void MdkBridge::ending_set_audio_clock(double sec) {
+  if (sec < 0.0) {
+    mveClockLive_ = false;              // soundtrack ended/not live
+    return;
+  }
+  if (sec > mveClockSec_) mveClockSec_ = sec;   // monotonic
+  mveClockLive_ = true;
+}
+
 Dictionary MdkBridge::ending_diag() {
   Dictionary out;
-  out["active"] = ending_ != nullptr;
+  out["active"] = ending_ != nullptr || mveStage_;
   out["mve_boundary"] = endingMveBoundary_;
   out["seq"] = endingSeq_;
+  out["stage"] = mveStage_ ? 2 : (ending_ ? 1 : 0);
+  out["result"] = endingResult_ < 0 ? -endingResult_ : endingResult_;
+  if (mve_) {
+    out["mve_decoded"] = mve_->videoDecoded();
+    out["mve_frames"] = mve_->videoPackets();
+    out["mve_presented"] = mvePresented_;
+    out["mve_skipped"] = mveDecodedQ_;
+    out["mve_eof"] = mveEof_;
+    out["mve_w"] = mve_->width();
+    out["mve_h"] = mve_->height();
+    out["mve_last_pts_ms"] = mve_->lastPtsMs();
+    out["mve_clock_s"] = mveClockLive_ ? mveClockSec_ : mveWallSec_;
+    out["mve_clock_live"] = mveClockLive_;
+    out["mve_audio_s"] = mve_->audioDurationSec();
+    out["mve_audio_hz"] = mve_->audioRate();
+    out["mve_verr"] = mve_->videoDecodeErrors();
+    out["mve_aerr"] = mve_->audioDecodeErrors();
+  }
   if (ending_) {
     out["mark"] = static_cast<int64_t>(ending_->mark());
     out["decoded"] =

@@ -14,7 +14,9 @@
 # re-signed ad-hoc inside-out. Output layout:
 #   OUT.app/Contents/MacOS/MDK            arm64 executable
 #   OUT.app/Contents/Frameworks/libmdkbridge.dylib
+#   OUT.app/Contents/Frameworks/libav*.dylib   (Phase 19E, when staged)
 #   OUT.app/Contents/Resources/MDK.pck
+#   OUT.app/Contents/Resources/THIRD_PARTY_NOTICES.md
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -63,9 +65,27 @@ lipo -thin arm64 "$MAIN_EXE" -o "$MAIN_EXE.thin"
 mv "$MAIN_EXE.thin" "$MAIN_EXE"
 chmod +x "$MAIN_EXE"
 
-# Inside-out ad-hoc re-sign (lipo invalidated the exporter's sig).
-find "$OUT/Contents/Frameworks" -name "*.dylib" -exec \
-  codesign --sign - --force {} + 2>/dev/null || true
+# Phase 19E — the staged FFmpeg dylibs (fetch_ffmpeg.sh) join
+# libmdkbridge under Contents/Frameworks; @rpath/@loader_path
+# already resolve there, so no install-name surgery is needed.
+FW="$OUT/Contents/Frameworks"
+if ls "$SCRIPT_DIR"/bin/Darwin-arm64/libav*.dylib >/dev/null 2>&1; then
+  mkdir -p "$FW"
+  cp "$SCRIPT_DIR"/bin/Darwin-arm64/libav*.dylib "$FW/"
+fi
+# Third-party licensing travels with the bundle.
+for f in THIRD_PARTY_NOTICES.md COPYING.LGPLv2.1; do
+  [ -f "$SCRIPT_DIR/$f" ] && cp "$SCRIPT_DIR/$f" "$OUT/Contents/Resources/"
+done
+
+# Inside-out ad-hoc re-sign (lipo invalidated the exporter's sig) —
+# each dylib signed individually, then the bundle; --deep is used
+# only for the final --strict verification, never as a repair.
+if [ -d "$FW" ]; then
+  find "$FW" -name "*.dylib" | while read -r d; do
+    codesign --sign - --force "$d"
+  done
+fi
 codesign --sign - --force "$OUT"
 codesign --verify --deep --strict "$OUT"
 echo "export_macos.sh: signed + verified -> $OUT"

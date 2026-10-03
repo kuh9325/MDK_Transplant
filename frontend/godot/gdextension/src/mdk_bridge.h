@@ -70,6 +70,7 @@
 
 #include "frontend_presenter.h"
 #include "mdk_objid.h"
+#include "mve_player.h"
 #include "stream_audio.h"
 #include "stream_presenter.h"
 
@@ -498,14 +499,21 @@ class MdkBridge : public RefCounted {
   // 3 stands in for the enclosing traversal frame; the mode-8 head
   // step then runs the teardown + FUN_0047b0fc load).
   bool load_ending();
-  bool ending_active() const { return ending_ != nullptr; }
+  bool ending_active() const { return ending_ != nullptr || mveStage_; }
   // The last decoded FLIC frame expanded through the effective
   // palette (the FUN_0047b384 white ramp included) — {w,h,rgba,mark,
   // seq,ramp}. seq = decoded count; re-upload only when it changes.
   Dictionary ending_frame();
   // The mark-table sound events — [{op:"play"|"stop", name, stream,
-  // vol}] — drained once per pump, in emission order.
+  // vol}] — drained once per pump, in emission order. The MVE stage
+  // adds {op:"mve_audio", stream, vol} once at stage entry and
+  // {op:"mve_stop"} on abort.
   Array ending_drain_audio();
+  // Video/audio sync feedback — the Godot WAV player's
+  // get_playback_position() while the MVE soundtrack is playing.
+  // Clock is monotonic: a lower sample (e.g. 0 after natural end)
+  // never rewinds.
+  void ending_set_audio_clock(double sec);
   Dictionary ending_diag();
 
  private:
@@ -815,6 +823,32 @@ class MdkBridge : public RefCounted {
   std::unordered_map<std::string, AudioEntry_> endingSndEntries_;
   int64_t endingSeq_ = 0;                     // presented frames
   bool endingMveBoundary_ = false;            // FUN_0047b674 reached
+
+  // --- Phase 19E — the Interplay MVE stage -------------------------
+  // On the FLIC boundary FUN_0047b674 opens MDKBZK.MVE through the
+  // staged FFmpeg dylibs (mve_player.* — the only FFmpeg consumer).
+  // Video pumps pts-scheduled against the soundtrack WAV's playback
+  // position (fallback: accumulated step dt); every frame decodes in
+  // order (delta coding) while only frames due are re-uploaded.
+  std::unique_ptr<mdkbridge::MvePlayer> mve_;
+  std::vector<std::uint8_t> mveIdx_;          // current pal8 surface
+  std::array<std::uint8_t, 768> mvePal_{};    // last published DAC
+  bool mveFrameValid_ = false;
+  bool mveStage_ = false;                     // FLIC done, MVE pumping
+  bool mveAudioPending_ = false;              // one-shot WAV event
+  bool mveEof_ = false;                       // video decoder drained
+  double mveWallSec_ = 0.0;                   // fallback clock
+  double mveClockSec_ = -1.0;                 // audio-clock feedback
+  bool mveClockLive_ = false;                 // audio clock reporting
+  std::vector<std::uint8_t> mvePendingIdx_;   // decoded, pts not due
+  std::array<std::uint8_t, 768> mvePendingPal_{};
+  double mvePendingPtsMs_ = -1.0;
+  bool mvePendingValid_ = false;
+  int64_t mvePresented_ = 0;                  // displayed frames
+  int64_t mveDecodedQ_ = 0;                   // decoded-not-shown
+  int endingResult_ = 0;    // 0 none, 1 natural_eof, 2 abort, 3 missing
+  bool endingTryMve_();                       // boundary open attempt
+  void endingFinish_(int result, Dictionary* out);
 
   // --- Phase 19B.3B1 — Mode-5 audio host -------------------------
   // The StreamScene's kPlaySound/kStopSound events translate into the

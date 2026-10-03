@@ -463,6 +463,10 @@ func _ready() -> void:
 	var st_course := _arg_value(args, "--stream", "")
 	var cp_course := _arg_value(args, "--campaign", "")
 	var ending := "--ending" in args
+	end_abort_at = int(_arg_value(args, "--ending-abort", "-1"))
+	end_repeat = "--ending-repeat" in args
+	if end_abort_at >= 0 or end_repeat:
+		print("ending QA: abort_at=", end_abort_at, " repeat=", end_repeat)
 	frontend = "--frontend" in args
 	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
 	# digest runs use, so driven courses are cross-checkable.
@@ -710,7 +714,9 @@ func _ready() -> void:
 				"briefly).")
 			get_tree().quit(2)
 			return
-		shot_frames_left = 8  # let the pipeline settle first
+		# --shot-frames N defers the capture (e.g. past the mode-8
+		# FLIC into the MVE stage); default 8 settles the pipeline.
+		shot_frames_left = int(_arg_value(args, "--shot-frames", "8"))
 	if interactive and not frontend:
 		# The frontend needs the OS cursor for its hit-test mouse.
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -2084,6 +2090,11 @@ var end_tex: ImageTexture = null
 var end_seq := -1
 var end_last_ramp := -1.0
 var end_players := {}          # FINISH.BNI name -> AudioStreamPlayer
+var end_mve_player: AudioStreamPlayer = null   # 19E soundtrack
+var end_mve_live := false
+var end_abort_at := -1     # --ending-abort N (QA): edge at seq>=N
+var end_repeat := false    # --ending-repeat (QA): re-enter once
+var end_repeat_done := false
 
 func _ending_pace_run(delta_ms: float) -> int:
 	if int(bridge.get_mode()) != 8:
@@ -2101,10 +2112,22 @@ func _ending_pace_run(delta_ms: float) -> int:
 		end_pace_ms = 0.0
 	else:
 		end_pace_ms -= n * END_STEP_MS
+	# 19E — key edges feed the MVE-stage abort check (the FLIC stage
+	# ignores input); _fe_input() consumes this frame's edges.
+	var input := _fe_input()
+	# QA seam: while the threshold holds, every paced tick carries a
+	# raw key edge — a zero-step call can't silently eat the abort.
+	if end_abort_at >= 0 and \
+			int(bridge.ending_diag().get("stage", 0)) == 2 and \
+			int(bridge.ending_diag().get("seq", 0)) >= end_abort_at:
+		input["raw_edges"] = PackedInt32Array([1, 0, 0, 0])
 	var ran := 0
 	while ran < n and int(bridge.get_mode()) == 8:
-		bridge.step_frame_input(END_STEP_MS, {})
+		bridge.step_frame_input(END_STEP_MS, input)
+		input = {}       # edges are consumed once
 		ran += 1
+	if int(bridge.get_mode()) != 8:
+		end_abort_at = -1
 	return ran
 
 func _apply_ending() -> void:
@@ -2121,11 +2144,23 @@ func _apply_ending() -> void:
 	end_last_ramp = ramp
 	end_img = Image.create_from_data(int(fr["w"]), int(fr["h"]),
 		false, Image.FORMAT_RGBA8, fr["rgba"])
-	if end_tex == null:
+	# FLIC 600x360 -> MVE 432x320 crosses the boundary: update()
+	# requires identical size, so re-create on a shape change.
+	if end_tex == null or \
+			end_tex.get_width() != end_img.get_width() or \
+			end_tex.get_height() != end_img.get_height():
 		end_tex = ImageTexture.create_from_image(end_img)
 	else:
 		end_tex.update(end_img)
 	var r: TextureRect = $EndingLayer/EndingRect
+	# 19E — the MVE stage keeps the movie's authored aspect (the
+	# original's FUN_00489a50 allocates a 4:3 surface); FLIC keeps
+	# the original stretched presentation.
+	var aspect := TextureRect.STRETCH_KEEP_ASPECT_CENTERED \
+		if bool(fr.get("keep_aspect", false)) \
+		else TextureRect.STRETCH_SCALE
+	if r.stretch_mode != aspect:
+		r.stretch_mode = aspect
 	r.texture = end_tex
 	r.visible = true
 	$EndingLayer.visible = true
@@ -2148,6 +2183,31 @@ func _ending_drain_audio() -> void:
 			var q: AudioStreamPlayer = end_players.get(nm)
 			if q != null:
 				q.stop()
+		elif op == "mve_audio" and ev.get("stream") != null:
+			if end_mve_player == null:
+				end_mve_player = AudioStreamPlayer.new()
+				end_mve_player.name = "EndMve"
+				$AudioRoot.add_child(end_mve_player)
+			end_mve_player.stream = ev["stream"]
+			end_mve_player.volume_db = float(ev.get("vol", 0.0))
+			end_mve_player.play()
+			end_mve_live = true
+		elif op == "mve_stop":
+			if end_mve_player != null:
+				end_mve_player.stop()
+			end_mve_live = false
+	# The soundtrack's playback position is the movie clock —
+	# reported live while playing so the bridge can hold video pts
+	# sync against the hardware audio position.
+	if end_mve_player != null:
+		if end_mve_player.playing:
+			bridge.ending_set_audio_clock(
+				end_mve_player.get_playback_position())
+		elif end_mve_live:
+			# Natural end of the WAV — the bridge falls back to its
+			# own wall clock for the remaining video tail.
+			bridge.ending_set_audio_clock(-1.0)
+			end_mve_live = false
 
 func _ending_hide() -> void:
 	if $EndingLayer.visible:
@@ -2157,6 +2217,11 @@ func _ending_hide() -> void:
 		p.stop()
 		p.queue_free()
 	end_players.clear()
+	if end_mve_player != null:
+		end_mve_player.stop()
+		end_mve_player.queue_free()
+		end_mve_player = null
+	end_mve_live = false
 	end_pace_armed = false
 	end_seq = -1
 	end_last_ramp = -1.0
@@ -3108,7 +3173,8 @@ func _process(delta: float) -> void:
 				return
 			var err := img.save_png(shot_path)
 			print("screenshot -> ", shot_path, " err=", err,
-				" size=", img.get_width(), "x", img.get_height())
+				" size=", img.get_width(), "x", img.get_height(),
+				" ending=", bridge.ending_diag())
 			get_tree().quit(0 if err == OK else 1)
 			return
 	if frames_left > 0:
@@ -3202,14 +3268,21 @@ func _process(delta: float) -> void:
 		return
 	if mode == 8:
 		# Standalone mode 8 — the ending cinematic: paced FLIC pump,
-		# FINISH.BNI mark sounds, the white ramp; the MVE boundary
-		# edge exits to the frontend.
+		# FINISH.BNI mark sounds, the white ramp; the MVE stage then
+		# runs to natural EOF/abort and exits to the frontend.
 		_fe_stop_songs()   # the traversal bank release is silent
 		if _ending_pace_run(delta * 1000.0) > 0:
 			_apply_ending()
 		_ending_drain_audio()
 		if int(bridge.get_mode()) != 8:
 			_ending_hide()
+			# --ending-repeat (QA): re-enter the whole cinematic
+			# once — exercises teardown/re-entry hygiene.
+			if end_repeat and not end_repeat_done:
+				end_repeat_done = true
+				if not bridge.load_ending():
+					printerr("repeat load_ending: ",
+						bridge.get_last_error())
 		return
 	if stream_standalone:
 		# The mode-5 exit flipped the mode inside the step — upload

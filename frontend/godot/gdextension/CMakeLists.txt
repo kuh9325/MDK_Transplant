@@ -56,6 +56,20 @@ target_include_directories(mdk_core_frontend PUBLIC "${MDK_CORE_SRC}")
 target_compile_options(mdk_core_frontend PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
 
+# ---------- optional FFmpeg (Phase 19E — Interplay MVE) ----------
+# LGPL 2.1+ dynamically linked dylibs staged by ../fetch_ffmpeg.sh
+# into gdextension/third_party/ffmpeg/{include,lib}. Absent the
+# staging tree the bridge still builds — the MVE open then fails
+# and FUN_0047b674's original missing-file edge runs instead.
+set(MDK_FFMPEG_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg"
+    CACHE PATH "staged FFmpeg prefix (include/ + lib/)")
+set(MDK_WITH_MVE OFF)
+if(EXISTS "${MDK_FFMPEG_ROOT}/lib/libavformat.63.dylib" AND
+   EXISTS "${MDK_FFMPEG_ROOT}/include/libavformat/avformat.h")
+  set(MDK_WITH_MVE ON)
+endif()
+
 # ---------- mdk_bridge GDExtension ----------
 add_library(mdkbridge SHARED
     src/mdk_bridge.cpp
@@ -67,6 +81,21 @@ add_library(mdkbridge SHARED
     src/stream_presenter.cpp
     src/stream_raster.cpp
     src/stream_audio.cpp)
+if(MDK_WITH_MVE)
+  target_sources(mdkbridge PRIVATE src/mve_player.cpp)
+  target_include_directories(mdkbridge PRIVATE "${MDK_FFMPEG_ROOT}/include")
+  target_link_libraries(mdkbridge PRIVATE
+      "${MDK_FFMPEG_ROOT}/lib/libavformat.63.dylib"
+      "${MDK_FFMPEG_ROOT}/lib/libavcodec.63.dylib"
+      "${MDK_FFMPEG_ROOT}/lib/libavutil.61.dylib")
+  target_compile_definitions(mdkbridge PRIVATE MDK_WITH_MVE=1)
+  # @rpath install names resolve next to the dylib in dev
+  # (bin/Darwin-arm64/) and in Contents/Frameworks post-export;
+  # SKIP_BUILD_RPATH keeps the build-tree absolute path out of
+  # the shipped binary's LC_RPATH.
+  set_target_properties(mdkbridge PROPERTIES SKIP_BUILD_RPATH TRUE)
+  target_link_options(mdkbridge PRIVATE "-Wl,-rpath,@loader_path")
+endif()
 target_include_directories(mdkbridge PRIVATE "${MDK_CORE_SRC}" src)
 target_link_libraries(mdkbridge PRIVATE godot::cpp mdk_core_frontend)
 target_compile_options(mdkbridge PRIVATE
@@ -76,6 +105,24 @@ set_target_properties(mdkbridge PROPERTIES
     OUTPUT_NAME "mdkbridge"
     LIBRARY_OUTPUT_DIRECTORY
         "${CMAKE_CURRENT_SOURCE_DIR}/../bin/${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+
+# ---------- native (non-Godot) MVE probe ----------
+# Phase 19E — verifies MvePlayer against a real MDKBZK.MVE without
+# a Godot binary (frame/audio counts, pts, errors, PPM dumps).
+if(MDK_WITH_MVE)
+  add_executable(mve_probe src/mve_probe.cpp src/mve_player.cpp)
+  target_include_directories(mve_probe PRIVATE src
+      "${MDK_FFMPEG_ROOT}/include")
+  target_link_libraries(mve_probe PRIVATE
+      "${MDK_FFMPEG_ROOT}/lib/libavformat.63.dylib"
+      "${MDK_FFMPEG_ROOT}/lib/libavcodec.63.dylib"
+      "${MDK_FFMPEG_ROOT}/lib/libavutil.61.dylib")
+  set_target_properties(mve_probe PROPERTIES SKIP_BUILD_RPATH TRUE)
+  target_link_options(mve_probe PRIVATE "-Wl,-rpath,@loader_path")
+  set_target_properties(mve_probe PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY
+          "${CMAKE_CURRENT_SOURCE_DIR}/../bin/${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+endif()
 
 # ---------- native (non-Godot) stream census driver ----------
 # Phase 19B.2B1 — runs the real mode-5 StreamScene through the SAME

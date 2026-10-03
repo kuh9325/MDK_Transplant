@@ -20,6 +20,7 @@ out/
 frontend/godot/.godot/
 frontend/godot/bin/
 frontend/godot/gdextension/build/
+frontend/godot/gdextension/third_party/
 frontend/godot/**/*.uid
 
 # --- Directories reserved for user-supplied ORIGINAL MDK material ---
