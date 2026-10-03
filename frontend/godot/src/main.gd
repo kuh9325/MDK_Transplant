@@ -120,6 +120,7 @@ var fe_tex: ImageTexture = null
 # total_ms holds the record's nominal duration (0 when INTRO1A is
 # absent — the window then closes on the first tick).
 var fe_transition_ms := -1.0
+var smoke_save_dir := ""  # globalized --save-dir for smoke checks
 var fe_transition_total_ms := 0.0
 var fe_transition_acks := 0         # frontend_transition_complete calls
 var fe_stage_hold := 0         # intermission placeholder hold
@@ -551,7 +552,11 @@ func _ready() -> void:
 				save_dir = launch_dir.path_join(save_dir) \
 					.simplify_path()
 		save_dir = ProjectSettings.globalize_path(save_dir)
-		if smoke and not real_saves:
+		smoke_save_dir = save_dir
+		# --smoke-continue is the relaunch half of the two-process
+		# save->quit->load QA: boot on an existing save root, no wipe.
+		if smoke and not real_saves and \
+				not "--smoke-continue" in args:
 			DirAccess.make_dir_recursive_absolute(save_dir)
 			var da := DirAccess.open(save_dir)
 			if da != null:
@@ -679,6 +684,8 @@ func _ready() -> void:
 		if frontend:
 			if "--smoke-real-saves" in args:
 				_run_smoke_real_saves()
+			elif "--smoke-continue" in args:
+				_run_smoke_continue()
 			else:
 				_run_smoke_frontend()
 		elif "--save-restore" in args:
@@ -5907,6 +5914,62 @@ func _sys_pal_head() -> PackedByteArray:
 		data_root_path.path_join("MISC/MDKFONT.FTI"))
 	var rec := _fti_record(fti, "SYS_PAL")
 	return rec.slice(0, 192)
+
+
+func _run_smoke_continue() -> void:
+	# Two-process relaunch QA — run 2 of the save->quit->relaunch->
+	# load pair. Run 1 (--smoke --save-dir DIR) wiped DIR, wrote
+	# LASTGAME.SAV + named slots, and exited; this run boots on the
+	# same root WITHOUT the wipe, so the shell must observe the
+	# prior process's saves and route a real Continue request.
+	print("smoke(continue): relaunch-load")
+	_check(bridge.frontend_booted(), "R: frontend booted")
+	_check(not smoke_save_dir.is_empty() and
+		FileAccess.file_exists(smoke_save_dir.path_join(
+			"LASTGAME.SAV")),
+		"R: LASTGAME.SAV survived from the prior process")
+	var snap := _fe_smoke_step({}, 2)
+	_check(int(snap.get("mode", -1)) == 0, "R: mode == frontend")
+	_check(bool(snap.get("saves_exist", false)),
+		"R: relaunch sees saves_exist")
+	_check(int(snap.get("selection", -1)) == 0,
+		"R: Continue is the default selection")
+	_check(bridge.frontend_lastgame_exists(),
+		"R: LASTGAME probe true post-relaunch")
+	# The prior process's named slots enumerate through the real
+	# list path (sub_mode 1), then Esc back to root.
+	snap = _fe_press("next")
+	snap = _fe_press("next")
+	_check(int(snap.get("selection", -1)) == 2,
+		"R: Saved Game selectable post-relaunch")
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 1,
+		"R: save list opens post-relaunch")
+	var sl: Dictionary = snap.get("save_list", {})
+	_check(int(sl.get("count", 0)) >= 1,
+		"R: save enumeration survived relaunch")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"R: Esc exits the relaunched save list")
+	# Esc's root re-entry re-derives selection (0 with saves) —
+	# walk to Continue deterministically either way.
+	for i in 6:
+		if int(snap.get("selection", -1)) == 0:
+			break
+		snap = _fe_press("prev")
+	_check(int(snap.get("selection", -1)) == 0,
+		"R: Continue re-selected")
+	snap = _fe_press("confirm")
+	var mode := int(bridge.get_mode())
+	_check(mode == 0 or mode == 3 or mode == 6,
+		"R: Continue request routed (mode %d)" % mode)
+	# The original-data root stays read-only: the relaunch wrote
+	# nothing into <data>/SAVES.
+	_check(not FileAccess.file_exists(
+		data_root_path.path_join("SAVES/REL_SMOKE.SAV")),
+		"R: no writes into the data root")
+	print("smoke(continue): %d failure(s)" % failures)
+	get_tree().quit(1 if failures else 0)
 
 
 func _run_smoke_frontend() -> void:
