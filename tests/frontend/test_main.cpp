@@ -19,9 +19,11 @@
 
 #include "core/dynamic_objects.h"
 #include "core/stream_scene.h"
+#include "core/traversal_audio_mixer.h"
 #include "gif_decode.h"
 #include "mdk_math.h"
 #include "mdk_objid.h"
+#include "stream_audio.h"
 #include "stream_presenter.h"
 
 static int gChecks = 0, gFailures = 0;
@@ -1695,6 +1697,315 @@ int main() {
       CHECK(pres.palette().get(200).r == 0 &&
             pres.palette().get(200).g == 0 &&
             pres.palette().get(200).b == 0);
+    }
+  }
+
+  // ---- Phase 19B.3B1 — StreamAudioHost synthetic tests ------------
+  // Every fixture is synthetic: hand-built StreamEvent PODs (the
+  // same surface stepStream_ drains) + a table resolver in place of
+  // the bridge's BNI/SNI lookup. No proprietary data.
+  {
+    using mdk::StreamEvent;
+    using mdk::TraversalAudioCmdOp;
+    using mdk::TraversalAudioMixer;
+    using mdk::TraversalAudioSoundDef;
+    using mdkbridge::StreamAudioHost;
+    using mdkbridge::StreamSndReg;
+
+    // Synthetic registration table — the OBSERVED 02e2c args: vol
+    // 0x7fff everywhere, loop on WIND alone. Tags are the BNI
+    // directory indices the native slots bound.
+    auto bindTable = [](StreamAudioHost& h) {
+      h.bindSound(10, {"WIND", 0x7fff, true});
+      h.bindSound(11, {"HITSIDE", 0x7fff, false});
+      h.bindSound(12, {"RESCUE", 0x7fff, false});
+      h.bindSound(13, {"APPLE", 0x7fff, false});
+      for (int i = 0; i != 7; ++i) {
+        char nm[8];
+        std::snprintf(nm, sizeof nm, "HURT%d", i + 1);
+        h.bindSound(20 + i, {nm, 0x7fff, false});
+      }
+    };
+    // The resolver the bridge's streamAudioResolve_ mirrors: the
+    // def's vol/loop come from the registration, rate/frames are
+    // the decoded record's. Synthetic rates/frames.
+    auto mkRes = [](std::map<std::string, TraversalAudioSoundDef> t) {
+      return [t = std::move(t)](const std::string& n,
+                                TraversalAudioSoundDef& d) {
+        const auto it = t.find(n);
+        if (it == t.end()) return false;
+        d = it->second;
+        return true;
+      };
+    };
+    auto windDef = [] {
+      TraversalAudioSoundDef d;
+      d.volume = 0x7fff;
+      d.rateHz = 22050;
+      d.frames = 110162;
+      d.loop = true;
+      return d;
+    };
+    auto flatDef = [](int rate, std::uint32_t frames) {
+      TraversalAudioSoundDef d;
+      d.volume = 0x7fff;
+      d.rateHz = rate;
+      d.frames = frames;
+      d.loop = false;
+      return d;
+    };
+    auto mkSnd = [](StreamEvent::Kind k, int tag, int aux) {
+      StreamEvent e;
+      e.kind = k;
+      e.tag = tag;
+      e.aux = aux;
+      return e;
+    };
+    auto countOp = [](TraversalAudioMixer& m,
+                      TraversalAudioCmdOp op) {
+      int n = 0;
+      for (const auto& c : m.pending()) n += c.op == op;
+      return n;
+    };
+
+    // --- registration bind (streamAudioBindRegs) --------------------
+    {
+      // Synthetic BNI directory — 16-byte records, names padded to
+      // the 12-byte field; an interleaved non-sound record (BG) keeps
+      // the tag assignment honest.
+      mdk::BniDirectory dir;
+      const auto addRec = [&dir](const char* nm) {
+        mdk::BniRecord r;
+        r.nameHasTerminator = true;
+        for (std::size_t i = 0; nm[i] && i < r.nameField.size(); ++i)
+          r.nameField[i] = std::byte(nm[i]);
+        dir.records.push_back(r);
+      };
+      addRec("BG");       // tag 0 — not a sound
+      addRec("WIND");     // tag 1
+      addRec("HITSIDE");  // tag 2
+      addRec("RESCUE");   // tag 3
+      addRec("APPLE");    // tag 4
+      for (int i = 1; i != 8; ++i) {
+        char nm[8];
+        std::snprintf(nm, sizeof nm, "HURT%d", i);
+        addRec(nm);       // tags 5..11
+      }
+      StreamAudioHost h;
+      const int bound = mdkbridge::streamAudioBindRegs(h, dir);
+      CHECK(bound == 11);
+      const StreamSndReg* wind = h.soundReg(1);
+      CHECK(wind && wind->name == "WIND" && wind->loop &&
+            wind->volume == 0x7fff);
+      const StreamSndReg* hit = h.soundReg(2);
+      CHECK(hit && hit->name == "HITSIDE" && !hit->loop);
+      CHECK(h.soundReg(0) == nullptr);           // BG unregistered
+      CHECK(h.soundReg(11) &&
+            h.soundReg(11)->name == "HURT7");
+      CHECK(h.regForName("APPLE") == h.soundReg(4));
+      CHECK(h.regForName("TELETYPE") == nullptr);
+      // A missing record name binds nothing (bound stays 11 even
+      // when a twelfth name has no directory entry).
+      mdk::BniDirectory dir2 = dir;
+      dir2.records.erase(dir2.records.begin() + 4);  // drop APPLE
+      StreamAudioHost h2;
+      CHECK(mdkbridge::streamAudioBindRegs(h2, dir2) == 10);
+    }
+
+    // --- listener feed ----------------------------------------------
+    {
+      StreamAudioHost h;
+      // Origin + identity basis (world == view): the row-major 3x4
+      // copy is verbatim — the host must not recompute or transpose.
+      float ident[12] = {1, 0, 0, 0,
+                         0, 1, 0, 0,
+                         0, 0, 1, 0};
+      h.updateListener(ident, 1.0f);
+      const mdk::TraversalAudioListener& l = h.listener();
+      CHECK(l.m[0][0] == 1 && l.m[1][1] == 1 && l.m[2][2] == 1);
+      CHECK(l.m[0][3] == 0 && l.m[1][3] == 0 && l.m[2][3] == 0);
+      CHECK(l.zoom == 1.0f && l.frame == 1.0f && !l.mode3d);
+      CHECK(h.diag().listenerUpdates == 1);
+      // Moving camera — the next call overwrites all twelve fields.
+      float mv[12] = {0, -1, 0, 5,
+                      0, 0, -1, -2,
+                      -1, 0, 0, 40};
+      h.updateListener(mv, 1.25f);
+      for (int r = 0; r != 3; ++r)
+        for (int c = 0; c != 4; ++c)
+          CHECK(l.m[r][c] == mv[r * 4 + c]);
+      CHECK(l.frame == 1.25f);
+      CHECK(h.diag().listenerUpdates == 2);
+    }
+
+    // --- WIND loop lifecycle ----------------------------------------
+    {
+      StreamAudioHost h;
+      bindTable(h);
+      TraversalAudioMixer m;
+      auto res = mkRes({{"WIND", windDef()}});
+      // Init emits the WIND play once (aux=1 — the flat-spawn call
+      // form; restart is degenerate-identical with no live WIND).
+      h.consume(mkSnd(StreamEvent::kPlaySound, 10, 1), m, res);
+      CHECK(h.diag().events == 1 && h.diag().plays == 1 &&
+            h.diag().restartPlays == 1 && h.diag().loopPlays == 1);
+      CHECK(m.activeCount() == 1);
+      CHECK(countOp(m, TraversalAudioCmdOp::kStart) == 1);
+      // The start command carries the loop flag through the def.
+      bool loopCmd = false;
+      for (const auto& c : m.pending())
+        if (c.op == TraversalAudioCmdOp::kStart && c.name == "WIND")
+          loopCmd = c.loop;
+      CHECK(loopCmd);
+      // The loop never finishes on its own — many ticks, still live.
+      for (int i = 0; i != 400; ++i) m.tick(1.0 / 30.0, nullptr);
+      CHECK(m.activeCount() == 1 && m.nameActive("WIND"));
+      // Teardown: kStopSound on the record tag -> name-scoped stop.
+      h.consume(mkSnd(StreamEvent::kStopSound, 10, 0), m, res);
+      CHECK(h.diag().stops == 1);
+      CHECK(h.diag().stopNames.at("WIND") == 1);
+      CHECK(m.activeCount() == 0);
+      CHECK(countOp(m, TraversalAudioCmdOp::kStop) == 1);
+      // Stop on an already-dead name is a no-op (still counts).
+      h.consume(mkSnd(StreamEvent::kStopSound, 10, 0), m, res);
+      CHECK(h.diag().stops == 2 && m.activeCount() == 0);
+      // Re-entry: reset + a fresh play starts a fresh instance.
+      h.reset();
+      bindTable(h);
+      m.reset();
+      h.consume(mkSnd(StreamEvent::kPlaySound, 10, 1), m, res);
+      CHECK(m.activeCount() == 1 && m.nameActive("WIND"));
+    }
+
+    // --- one-shot: ensure vs restart --------------------------------
+    {
+      StreamAudioHost h;
+      bindTable(h);
+      TraversalAudioMixer m;
+      auto res = mkRes({{"HITSIDE", flatDef(15000, 8489)},
+                        {"APPLE", flatDef(16000, 6690)}});
+      // aux=0 -> ensure: a second ensure while live respawns nothing.
+      h.consume(mkSnd(StreamEvent::kPlaySound, 11, 0), m, res);
+      h.consume(mkSnd(StreamEvent::kPlaySound, 11, 0), m, res);
+      CHECK(h.diag().ensurePlays == 2);
+      CHECK(m.activeCount() == 1);
+      CHECK(countOp(m, TraversalAudioCmdOp::kStart) == 1);
+      // aux=1 -> restart: stops the live instance then respawns.
+      h.consume(mkSnd(StreamEvent::kPlaySound, 13, 1), m, res);
+      h.consume(mkSnd(StreamEvent::kPlaySound, 13, 1), m, res);
+      CHECK(h.diag().restartPlays == 2);
+      CHECK(m.nameActive("APPLE"));
+      CHECK(m.activeCount() == 2);   // HITSIDE + one APPLE
+      // Natural completion: the one-shot reaps at pcmFrames.
+      for (int i = 0; i != 60; ++i) m.tick(1.0 / 30.0, nullptr);
+      CHECK(!m.nameActive("HITSIDE"));  // 8489f @15000Hz ~ 19 ticks
+      CHECK(!m.nameActive("APPLE"));
+      CHECK(m.activeCount() == 0);
+    }
+
+    // --- positional marker (the 02160 name-bound arm) ----------------
+    {
+      StreamAudioHost h;
+      bindTable(h);
+      TraversalAudioMixer m;
+      auto res = mkRes({{"BOOM", flatDef(12000, 6000)}});
+      StreamEvent e = mkSnd(StreamEvent::kPlaySound, -1, 0x1000e);
+      e.name = "BOOM";
+      e.f[0] = 3.0f; e.f[1] = -1.0f; e.f[2] = 25.0f;
+      h.consume(e, m, res);
+      CHECK(h.diag().plays == 1 && h.diag().positional == 1);
+      CHECK(h.diag().playNames.at("BOOM") == 1);
+      CHECK(m.activeCount() == 1 && m.nameActive("BOOM"));
+      // mode&1==0 -> the spawn's effVol is 0 until the first updater
+      // push (the OBSERVED silent-start quirk); tick 1 clears the
+      // -1.0 prevDist sentinel without pushing, tick 2 pushes.
+      bool startSilent = false;
+      for (const auto& c : m.pending())
+        if (c.op == TraversalAudioCmdOp::kStart && c.name == "BOOM")
+          startSilent = (c.vol == 0);
+      CHECK(startSilent);
+      std::vector<mdk::TraversalAudioCmd> cmds;
+      m.drain(cmds);
+      m.tick(1.0 / 30.0, nullptr);   // sentinel tick — no push yet
+      m.drain(cmds);
+      bool earlyPush = false;
+      for (const auto& c : cmds)
+        earlyPush |= c.op == TraversalAudioCmdOp::kParams;
+      CHECK(!earlyPush);
+      m.tick(1.0 / 30.0, nullptr);   // the first pushed update
+      m.drain(cmds);
+      bool pushed = false;
+      for (const auto& c : cmds)
+        pushed |= c.op == TraversalAudioCmdOp::kParams &&
+                  c.name == "BOOM";
+      CHECK(pushed);
+    }
+
+    // --- diagnostics: unknown tag / resolve miss / non-audio ---------
+    {
+      StreamAudioHost h;
+      bindTable(h);
+      TraversalAudioMixer m;
+      auto res = mkRes({{"HITSIDE", flatDef(15000, 8489)}});
+      // Unregistered tag — counted, dropped, no mixer effect.
+      h.consume(mkSnd(StreamEvent::kPlaySound, 99, 0), m, res);
+      CHECK(h.diag().unknownTags == 1 && m.activeCount() == 0);
+      h.consume(mkSnd(StreamEvent::kStopSound, 99, 0), m, res);
+      CHECK(h.diag().unknownTags == 2);
+      // Registered tag whose record fails to resolve — a miss.
+      h.consume(mkSnd(StreamEvent::kPlaySound, 12, 0), m, res);
+      CHECK(h.diag().resolveMisses == 1);
+      CHECK(m.missingCount() == 1 && m.activeCount() == 0);
+      // A marker name with no record is also a resolve miss.
+      StreamEvent e = mkSnd(StreamEvent::kPlaySound, -1, 0x1000e);
+      e.name = "NOSUCH";
+      h.consume(e, m, res);
+      CHECK(h.diag().resolveMisses == 2 && m.missingCount() == 2);
+      // Non-audio events pass through uncounted.
+      h.consume(mkSnd(StreamEvent::kPresent, 0, 0), m, res);
+      h.consume(mkSnd(StreamEvent::kBackdropBlit, 0, 0), m, res);
+      CHECK(h.diag().events == 4);   // only the four sound events
+    }
+
+    // --- bank-free teardown (stopAll) --------------------------------
+    {
+      TraversalAudioMixer m;
+      auto res = mkRes({{"WIND", windDef()},
+                        {"HITSIDE", flatDef(15000, 8489)},
+                        {"APPLE", flatDef(16000, 6690)}});
+      StreamAudioHost h;
+      bindTable(h);
+      h.consume(mkSnd(StreamEvent::kPlaySound, 10, 1), m, res);
+      h.consume(mkSnd(StreamEvent::kPlaySound, 11, 0), m, res);
+      h.consume(mkSnd(StreamEvent::kPlaySound, 13, 1), m, res);
+      CHECK(m.activeCount() == 3);
+      m.stopAll();
+      CHECK(m.activeCount() == 0);
+      CHECK(countOp(m, TraversalAudioCmdOp::kStop) == 3);
+    }
+
+    // --- pool cap: the 63-voice hard limit ---------------------------
+    {
+      TraversalAudioMixer m;
+      auto res = mkRes({{"HITSIDE", flatDef(15000, 8489)}});
+      StreamAudioHost h;
+      bindTable(h);
+      // kPlayOnce-style flat spawns come through the marker arm or a
+      // restart; use distinct marker names so ensure/stop-by-name
+      // can't coalesce them — HITSIDE resolves for every name here.
+      TraversalAudioSoundDef def = flatDef(15000, 8489);
+      const auto anyRes = [&def](const std::string&,
+                                 TraversalAudioSoundDef& d) {
+        d = def;
+        return true;
+      };
+      for (int i = 0; i != 70; ++i) {
+        StreamEvent e = mkSnd(StreamEvent::kPlaySound, -1, 0x1000e);
+        e.name = "N" + std::to_string(i);
+        h.consume(e, m, anyRes);
+      }
+      CHECK(m.activeCount() == TraversalAudioMixer::kMaxVoices);
+      CHECK(m.poolExhaustedCount() == 70 - 63);
     }
   }
 

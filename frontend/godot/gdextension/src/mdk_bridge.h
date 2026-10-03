@@ -69,6 +69,7 @@
 
 #include "frontend_presenter.h"
 #include "mdk_objid.h"
+#include "stream_audio.h"
 #include "stream_presenter.h"
 
 namespace godot {
@@ -756,6 +757,23 @@ class MdkBridge : public RefCounted {
   mdk::TraversalAudioMixer audioMixer_;
   mdk::TraversalAudioListener audioListener_;
   double lastDtSec_ = 0.0;             // stepCore_'s dt — mixer playhead
+
+  // --- Phase 19B.3B1 — Mode-5 audio host -------------------------
+  // The StreamScene's kPlaySound/kStopSound events translate into the
+  // shared audioMixer_ through StreamAudioHost; resource resolution
+  // reads the STREAM.BNI registrations first (the mode-5 record
+  // binds) and falls through to the still-loaded SNI banks (the
+  // process-global sound list — marker names may be anything).
+  mdkbridge::StreamAudioHost streamAudio_;
+  mdk::BniDirectory streamBniDir_{};   // aliases streamBniBytes_
+  std::unordered_map<std::string, AudioEntry_> streamSndEntries_;
+  int streamAudioDecodeMisses_ = 0;    // BNI decode failures
+  const AudioEntry_* streamSndEntry_(const std::string& name);
+  bool streamAudioResolve_(const std::string& name,
+                           mdk::TraversalAudioSoundDef& def);
+  // Command drain's stream lookup — stream-registered names decode
+  // from STREAM.BNI; every other name is an SNI record.
+  const AudioEntry_* cmdAudioEntry_(const std::string& name);
 
   // --- Phase 18B.1 — frontend host ----------------------------------
   std::unique_ptr<mdk::FrontendHostServices> feHost_;

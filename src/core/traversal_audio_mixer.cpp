@@ -60,6 +60,13 @@ void TraversalAudioMixer::stopByName(const std::string& name) {
     if (voices_[i].live && voices_[i].name == name) stopVoice(i);
 }
 
+void TraversalAudioMixer::stopAll() {
+  // The sound-bank teardown: every live instance releases regardless
+  // of name or owner.
+  for (int i = 0; i < kMaxVoices; ++i)
+    if (voices_[i].live) stopVoice(i);
+}
+
 void TraversalAudioMixer::startVoice(int slot, const std::string& name,
                                      const TraversalAudioSoundDef& def) {
   Voice& v = voices_[slot];

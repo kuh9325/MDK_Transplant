@@ -251,25 +251,40 @@ class GodotStreamSmoke(unittest.TestCase):
         # the sprite outcome split: zero true misses; every non-drawn
         # sprite is a faithful FUN_00403a40 raster outcome on the
         # LIGHT debris image (zero-size >>8 collapse, full clip, or
-        # an all-pen-0 sampled footprint).
+        # an all-pen-0 sampled footprint). 19B.3B1 — the audio census:
+        # WIND singleton loop (1 play/1 stop), the ensure/restart
+        # split, the listener feed == the core's counted 026f8 seam,
+        # zero misses/drops/leaks.
         self.check_course(0, extra=(
             "fill=0xff",
             "exit handoff -> mode 6",
             "spr=6120 drawn=3047",
             "miss=0(res=0,meta=0) zsize=283 clip=1523 key=1267",
             "rib=139162",
-            "pal=02b99a68d9993a25"))
+            "pal=02b99a68d9993a25",
+            "audio0: ev=81 plays=80(ensure=79,restart=1,loop=1,pos=0)"
+            " stops=1 lstn=465 active=0 cap=0 miss=0/0/0"
+            " cmds=78 starts=39 stops=39 live=0 wind=1/1",
+            "asnd WIND plays=1 stops=1",
+            "asnd RESCUE plays=1 stops=0",
+            "asnd HITSIDE plays=39 stops=0"))
 
     def test_stream_course4(self):
         # Final course: the counter drains to the death latch ->
-        # black fill 0x00 -> mode 0 frontend route.
+        # black fill 0x00 -> mode 0 frontend route. The death route
+        # skips the rescue dock — RESCUE stays unplayed.
         self.check_course(4, extra=(
             "fill=0x00",
             "exit handoff -> mode 0",
             "spr=4764 drawn=3074",
             "miss=0(res=0,meta=0) zsize=111 clip=1291 key=288",
             "rib=97740",
-            "pal=9fa9e040e0eedf25"))
+            "pal=9fa9e040e0eedf25",
+            "audio4: ev=80 plays=79(ensure=78,restart=1,loop=1,pos=0)"
+            " stops=1 lstn=353 active=0 cap=0 miss=0/0/0"
+            " cmds=68 starts=34 stops=34 live=0 wind=1/1",
+            "asnd WIND plays=1 stops=1",
+            "asnd HITSIDE plays=39 stops=0"))
 
 
 def have_campaign_data():
@@ -316,12 +331,17 @@ class GodotCampaignSmoke(unittest.TestCase):
 
     def test_campaign_course0(self):
         # Base route: traversal -> mode 5 -> mode 6 -> freefall
-        # (levelId advances 0 -> 1) + in-session repeat entry.
+        # (levelId advances 0 -> 1) + in-session repeat entry. The
+        # audio census rides the real route — WIND singleton and a
+        # zero-miss drain under the carried session state.
         self.check_course(0, extra=(
             "mode-3 dispatcher tail -> mode 5",
             "exit -> mode 6",
             "loader exit -> mode 2 (freefall)",
-            "loader advanced levelId -> 1"))
+            "loader advanced levelId -> 1",
+            "miss=0/0/0",
+            "wind=1/1",
+            "asnd WIND plays=1 stops=1"))
 
     def test_campaign_course2(self):
         # BONES.WHITE stale-bank oracle — the traversal .MAT must not
@@ -329,13 +349,19 @@ class GodotCampaignSmoke(unittest.TestCase):
         self.check_course(2, extra=(
             "oracle: white_slot=",
             "resolved=false bankB=false",
-            "loader exit -> mode 2 (freefall)"))
+            "loader exit -> mode 2 (freefall)",
+            "miss=0/0/0",
+            "wind=1/1",
+            "asnd WIND plays=1 stops=1"))
 
     def test_campaign_course3(self):
         self.check_course(3, extra=(
             "oracle: white_slot=",
             "resolved=false bankB=false",
-            "loader exit -> mode 2 (freefall)"))
+            "loader exit -> mode 2 (freefall)",
+            "miss=0/0/0",
+            "wind=1/1",
+            "asnd WIND plays=1 stops=1"))
 
     def test_campaign_course4(self):
         # Final course on the REAL campaign route: the carried
@@ -345,7 +371,10 @@ class GodotCampaignSmoke(unittest.TestCase):
         # --stream 4 convention (fresh 100/seed) plus the core suite.
         self.check_course(4, extra=(
             "course-4 carried-health exit -> mode 7",
-            "mode 7 -> mode 3 (LEVEL5 continuation)"))
+            "mode 7 -> mode 3 (LEVEL5 continuation)",
+            "miss=0/0/0",
+            "wind=1/1",
+            "asnd WIND plays=1 stops=1"))
 
 
 def have_level(num):

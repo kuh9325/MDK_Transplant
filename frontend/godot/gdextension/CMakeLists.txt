@@ -65,7 +65,8 @@ add_library(mdkbridge SHARED
     src/object_presenter.cpp
     src/register_types.cpp
     src/stream_presenter.cpp
-    src/stream_raster.cpp)
+    src/stream_raster.cpp
+    src/stream_audio.cpp)
 target_include_directories(mdkbridge PRIVATE "${MDK_CORE_SRC}" src)
 target_link_libraries(mdkbridge PRIVATE godot::cpp mdk_core_frontend)
 target_compile_options(mdkbridge PRIVATE
@@ -84,7 +85,8 @@ set_target_properties(mdkbridge PROPERTIES
 add_executable(mdk_stream_census
     src/stream_census.cpp
     src/stream_presenter.cpp
-    src/stream_raster.cpp)
+    src/stream_raster.cpp
+    src/stream_audio.cpp)
 target_include_directories(mdk_stream_census PRIVATE "${MDK_CORE_SRC}" src)
 target_link_libraries(mdk_stream_census PRIVATE mdk_core_frontend)
 target_compile_options(mdk_stream_census PRIVATE
@@ -95,7 +97,8 @@ add_executable(mdk_frontend_tests
     "${MDK_REPO_ROOT}/tests/frontend/test_main.cpp"
     src/gif_decode.cpp
     src/stream_presenter.cpp
-    src/stream_raster.cpp)
+    src/stream_raster.cpp
+    src/stream_audio.cpp)
 target_include_directories(mdk_frontend_tests PRIVATE "${MDK_CORE_SRC}" src)
 target_link_libraries(mdk_frontend_tests PRIVATE mdk_core_frontend)
 target_compile_options(mdk_frontend_tests PRIVATE

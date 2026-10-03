@@ -89,6 +89,11 @@ public:
       std::function<bool(int ownerCat, const void* key, float pos[3])>;
 
   void reset();
+  // Bank-free teardown — release every live voice (FUN_004371bc and
+  // FUN_0042c824 kill the mode's sound bank: every still-playing
+  // instance dies there, not by name). Emits kStop per live voice so
+  // the host players stop before their nodes are reaped.
+  void stopAll();
   void setListener(const TraversalAudioListener& l) { listener_ = l; }
 
   // Apply one core event. Spawns/stops emit commands immediately.

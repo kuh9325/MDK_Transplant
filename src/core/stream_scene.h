@@ -500,6 +500,9 @@ public:
   // The ramped 768B the frame's fade stage hands the DAC upload
   // (FUN_0046d208) — the paletteDacHash snapshot field digests it.
   const std::uint8_t* paletteDac() const { return paletteDac_; }
+  // 0x540bb0 — the world->view matrix the per-frame FUN_004026f8
+  // listener feed copies verbatim (row-major 3x4).
+  const float* camView() const { return camView_; }
   std::uint32_t& rng() { return rng_; }
 
 private:

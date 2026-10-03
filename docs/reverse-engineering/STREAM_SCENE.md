@@ -68,7 +68,7 @@ a direct record census of `original/installed/STREAM/STREAM.BNI`,
 | `PAL` | 768 | palette tail (entries 64–255 from `[0xc0,0x300)`) |
 | `PLANET` | 16388 | sprite 128×128 (+4B), rescue backdrop decal |
 | `LIGHT` | 4100 | sprite 64×64 (+4B), debris image |
-| `WIND`,`HITSIDE`,`RESCUE`,`HURT1..7`,`APPLE` | various | RIFF WAVE — SFX (audio deferred) |
+| `WIND`,`HITSIDE`,`RESCUE`,`HURT1..7`,`APPLE` | various | RIFF WAVE — SFX (host playback: §20) |
 | `SC_BSTAT`,`SC_STAT`,`SNIP_TXT` | small | text/layout records (exact semantics TENTATIVE) |
 | `KURT`,`BONES`,`PROFSHIP`,`GUNTA`,`SWH150` | various | model protos (`FUN_00428400` parser — existing format) |
 | `KURTANIM`,`BONESANIM`,`GUNTANIM`,`SWHANM`,`FL_HVR`,`FL_WAVE` | various | `ObjectAnimView` records (existing format) |
@@ -775,7 +775,8 @@ sites observed live across the five courses (`hero` on c0–3,
 latches pre-empt on this input); (7) no unknown/unhandled native
 branch executed — every dispatch counter lands on a documented
 implemented body, all placeholder/overflow/error counters 0;
-(8) all remaining boundaries are host/presentation-only per §17;
+(8) all remaining boundaries are host/presentation-only per §17
+(the audio half closed in §20);
 (9) courses 0–4 deterministic end-to-end (byte-identical replay);
 (10) traversal six and freefall five canonicals unchanged
 (`25766a67ce50ea46`/`950219ddeae8b679`/`2379f7e90204e671`/
@@ -949,4 +950,100 @@ bounded routes can arm the victory sequence without a scripted
 trigger object in the loaded arena.
 
 **MODE-5 → MODE-6 LOADER HANDOFF: CLOSED FOR BUILD_A**
+
+## 20. Phase 19B.3B1 — Mode-5 audio host playback (OBSERVED asm + live census)
+
+The remaining host seam — audio — closes through the shared
+`TraversalAudioMixer` (the original's instance pool is
+process-global; there is no second mode-5 audio engine). A
+Godot-free `StreamAudioHost` (`stream_audio.{h,cpp}`) translates the
+scene's `kPlaySound`/`kStopSound` events into the mixer's op set and
+replays the counted `0x4026f8` listener seam; the bridge owns
+resource resolve/decode and the `AudioStreamPlayer` command drain —
+the same once-per-rendered-frame drain contract traversal uses.
+
+### Registration (OBSERVED — mode-5 init `0x42b3d8..0x42b586`)
+
+Eleven `FUN_004039c8(name,&rec)` + `FUN_00402e2c(name,rec,EBX,ECX)`
+pairs register the `STREAM.BNI` records into the sound table.
+`EBX=0x7fff` on every call (authored volume); `ECX` bit0 is the
+DS-loop flag — set **only for WIND** (`eda58`). Bound slot order:
+`eda58=WIND`, `eda5c=HITSIDE`, `eda7c=RESCUE`, `eda80=APPLE`,
+`eda60..eda78=HURT1..7`; the event tags are the `StreamAssets` BNI
+directory indices. BNI payloads are raw RIFF/WAVE (no flag/volume
+words — the defs come from these call args) and decode through the
+existing `SniWave` parser → `AudioStreamWAV` at native rate, mono,
+8/16-bit; loop points 0..frames only for WIND.
+
+### Play/stop mapping (OBSERVED call sites)
+
+| site | call | event | host op |
+|------|------|-------|---------|
+| init | `FUN_004022b8(eda58)` → `eda84` | WIND play, `aux=1` | `kRestart` — the loop lives on the registered record; restart is behaviorally identical to the flat spawn (once-per-init, no live WIND) |
+| `d87d` | `FUN_00402388(eda5c, EDX-res)` | HITSIDE, `aux=0` | `kEnsurePlaying` |
+| `d898` | `FUN_00402388(eda60+n, EDX-res)` | HURT1..7, `aux=0` | `kEnsurePlaying` |
+| `d22c` | `FUN_00402388(eda80, 1)` | APPLE, `aux=1` | `kRestart` |
+| `ca3x` | `FUN_00402388(eda7c, 0)` | RESCUE, `aux=0` | `kEnsurePlaying` |
+| anim `+0x140` arm | `FUN_00402160(0, snd, 0x1000e, &pos, 0, 0x7fff, 1.0, 50.0)` | marker play, `tag=-1`, name-bound, `aux=0x1000e` | name-keyed positional `kEnsurePlaying` (`mode=0x1000e`) |
+| teardown | `FUN_004020b4(eda84)` | `kStopSound`, WIND tag | name-scoped `kStop` |
+
+`aux==0` → `kEnsurePlaying`, `aux!=0` → `kRestart` mirrors the
+OBSERVED 02388 call-side flag. The positional marker arm preserves
+the mixer's silent-start quirk (`mode&1==0` → `effVol=0` at spawn;
+the first tick clears the `prevDist` sentinel, the second pushes
+params). Teardown additionally runs `mixer.stopAll()` —
+`FUN_0042c824`'s bank death releases every still-playing instance —
+and `FUN_004371bc` gets the same arm at the traversal edge.
+
+### Listener (OBSERVED — counted seam `0x4026f8`)
+
+The host copies `StreamScene::camView_` (the `0x540bb0` world→view
+snapshot, row-major 3×4) verbatim, `zoom=1.0` (`0x49ff58` byte1
+stays 1 through mode 5 — the byte1=2 sniper write is traversal
+scope-only), `mode3d=false`, `frame=` the `0x49b6f0` smoothed
+scalar pinned at its 1.0 steady state (host pacing deferred).
+Updates gate on the core's `seams().listener` increment — the
+early-exit step never reaches the frame's camera arm — so the host
+feed count equals the counted seam exactly.
+
+### TELETYPE / positional reachability (real-data census)
+
+`TELETYPE` is a `STATS.BNI` typing WAVE — a mode-6 briefing record,
+not a mode-5 sound: no `STREAM.BNI` record, no registration, no
+emission path. Nothing is manufactured. The `+0x140` anim marker
+arm and APPLE are bound but **unreached** on every deterministic
+route (`pos=0`, no APPLE plays); both are exercised synthetically
+in the unit tests.
+
+### Real-data audio census (BUILD_A, all courses natural exit)
+
+| course | ev | plays (ensure/restart/loop/pos) | stops | lstn | names |
+|--------|----|---------------------------------|-------|------|-------|
+| 0 | 81 | 80 (79/1/1/0) | 1 | 465 | HITSIDE 39, HURT1..7 3/4/4/8/8/5/7, RESCUE 1, WIND 1/1 |
+| 1 | 79 | 78 (77/1/1/0) | 1 | 451 | same split minus one HITSIDE pair |
+| 2 | 81 | 80 (79/1/1/0) | 1 | 412 | as c0 |
+| 3 | 81 | 80 (79/1/1/0) | 1 | 412 | as c0 |
+| 4 | 80 | 79 (78/1/1/0) | 1 | 353 | no RESCUE (death route skips the dock) |
+
+`lstn` == the core listener seam verbatim; WIND starts once and
+stops once per entry on every route (repeat entry: once per entry);
+`active=0` after teardown; unknown-tags/resolve-misses/
+decode-misses/pool-exhausted all 0; zero leaked Godot players.
+
+`stream_diag` gains the `snd_*` census keys (`snd_events`, play/stop
+splits, `snd_listener_updates`, `snd_active`, `snd_pool_exhausted`,
+the three miss counters, per-name play/stop counts). Session-scoped;
+reset with the stream state. No core hash changes — all five native
+goldens, six traversal and five freefall canonicals unchanged
+verbatim.
+
+Regression: `mdk_frontend_tests` 329/0 (52 new `StreamAudioHost`
+checks across nine groups — registration bind, listener copy, WIND
+singleton + name-scoped stop, re-entry, ensure-vs-restart, natural
+one-shot completion, positional silent-start, unknown-tag/miss
+diagnostics, non-audio passthrough), Godot smokes 16/16 (standalone
+c0/c4 pin the full census; campaign c0/2/3/4 assert the WIND
+lifecycle + zero-miss gates), `mdk_tests` 145872/0, CTest 2/2.
+
+**MODE-5 GODOT AUDIO PLAYBACK: CLOSED FOR BUILD_A**
 **BONES.WHITE STALE-BANK ORACLE: RESOLVED**

@@ -158,7 +158,8 @@ const AUDIO_VOICES := 63        # the original's pool cap (FUN_00402604)
 var audio_players := []         # [63] AudioStreamPlayer | null
 var audio_panners := []         # [63] AudioEffectPanner (bus effect)
 var audio_stats := {"cmds": 0, "starts": 0, "params": 0,
-	"stops": 0, "names": {}}   # --smoke/diag counters
+	"stops": 0, "names": {}, "starts_by_name": {},
+	"stops_by_name": {}}      # --smoke/diag counters
 
 # Phase 17B.2 — traversal HUD / view presentation state. The core
 # composes the 600x360 indexed framebuffer and owns every semantic;
@@ -1288,16 +1289,24 @@ func _build_audio_presenter() -> void:
 func _drain_audio_fx() -> void:
 	# The bridge applies the core event batch to its voice pool and
 	# ticks the updater once — this consumes the original's
-	# drain-once contract exactly like _drain_combat_fx.
-	if int(bridge.get_mode()) != 3:
-		# Freefall/frontend — a traversal voice can't exist outside
-		# mode 3; if one survived a mode flip, drop it.
-		for p in audio_players:
-			if p != null:
-				_reset_audio()
-				break
-		return
+	# drain-once contract exactly like _drain_combat_fx. Mode 5's
+	# event feed and sweep already ran inside the stream step; the
+	# drain itself is mode-agnostic (the pool is process-global) so
+	# the mode-5 teardown tail still delivers its stops after the
+	# mode flips.
 	var cmds: Array = bridge.drain_audio_fx()
+	if cmds.is_empty():
+		if int(bridge.get_mode()) != 3 and \
+				int(bridge.get_mode()) != 5:
+			# Freefall/frontend/progression — no owning mode can hold
+			# a live voice; if one survived a mode flip, drop its
+			# node (the census survives — _reset_audio's stat wipe
+			# is only for real reset boundaries).
+			for p in audio_players:
+				if p != null:
+					_free_audio_players()
+					break
+		return
 	for c in cmds:
 		audio_stats["cmds"] = int(audio_stats["cmds"]) + 1
 		var names: Dictionary = audio_stats["names"]
@@ -1322,6 +1331,9 @@ func _drain_audio_fx() -> void:
 					p.play()
 					audio_stats["starts"] = \
 						int(audio_stats["starts"]) + 1
+					var sbn: Dictionary = \
+						audio_stats["starts_by_name"]
+					sbn[nm] = int(sbn.get(nm, 0)) + 1
 			"params":
 				var p: AudioStreamPlayer = audio_players[id]
 				if p != null:
@@ -1337,13 +1349,62 @@ func _drain_audio_fx() -> void:
 					p.stop()
 					audio_stats["stops"] = \
 						int(audio_stats["stops"]) + 1
+					var tbn: Dictionary = \
+						audio_stats["stops_by_name"]
+					tbn[nm] = int(tbn.get(nm, 0)) + 1
 
 
-func _reset_audio() -> void:
-	# Restore/transition boundary — every live player belongs to the
-	# discarded timeline. The bridge-side pool is already reset; the
-	# GDScript side only stops and clears its nodes. Nothing audio
-	# is serialized or resurrected.
+func _audio_live_count() -> int:
+	# Players still presenting a stream (a stopped player remains a
+	# node until _reset_audio frees it — "active" means playing).
+	var n := 0
+	for p in audio_players:
+		if p != null and is_instance_valid(p) and p.playing:
+			n += 1
+	return n
+
+
+func _stream_audio_census(tag: String, d: Dictionary) -> void:
+	# 19B.3B1 — the mode-5 audio census: what the host consumed, the
+	# play/stop split, the listener feed, the miss counters the
+	# closure gate requires at zero, and the player-side truth.
+	var wind_start := int(
+		audio_stats["starts_by_name"].get("WIND", 0))
+	var wind_stop := int(
+		audio_stats["stops_by_name"].get("WIND", 0))
+	var live := _audio_live_count()
+	print(("  audio%s: ev=%d plays=%d(ensure=%d,restart=%d,loop=%d," +
+		"pos=%d) stops=%d lstn=%d active=%d cap=%d " +
+		"miss=%d/%d/%d cmds=%d starts=%d stops=%d live=%d " +
+		"wind=%d/%d") % [
+		tag,
+		int(d["snd_events"]), int(d["snd_plays"]),
+		int(d["snd_ensure_plays"]), int(d["snd_restart_plays"]),
+		int(d["snd_loop_plays"]), int(d["snd_positional"]),
+		int(d["snd_stops"]), int(d["snd_listener_updates"]),
+		int(d["snd_active"]), int(d["snd_pool_exhausted"]),
+		int(d["snd_unknown_tags"]), int(d["snd_resolve_misses"]),
+		int(d["snd_decode_misses"]),
+		int(audio_stats["cmds"]), int(audio_stats["starts"]),
+		int(audio_stats["stops"]), live, wind_start, wind_stop])
+	for e in d["snd_names"]:
+		print("    asnd %s plays=%d stops=%d" % [
+			String(e["name"]), int(e["plays"]), int(e["stops"])])
+	_check(int(d["snd_unknown_tags"]) == 0,
+		"audio: no unregistered sound tags")
+	_check(int(d["snd_resolve_misses"]) == 0,
+		"audio: no resource misses")
+	_check(int(d["snd_decode_misses"]) == 0,
+		"audio: no decode misses")
+	_check(int(d["snd_pool_exhausted"]) == 0,
+		"audio: no dropped voices (pool cap)")
+
+
+func _free_audio_players() -> void:
+	# Stop + free every player node — the transition sweep's half of
+	# _reset_audio. The census (audio_stats) survives: a mid-route
+	# mode flip frees stale nodes but must not erase the entry's own
+	# counters before the smoke reads them.
 	for i in audio_players.size():
 		var p: AudioStreamPlayer = audio_players[i]
 		if p != null and is_instance_valid(p):
@@ -1351,8 +1412,17 @@ func _reset_audio() -> void:
 			p.stream = null
 			audio_players[i] = null
 			p.free()
+
+
+func _reset_audio() -> void:
+	# Restore/transition boundary — every live player belongs to the
+	# discarded timeline. The bridge-side pool is already reset; the
+	# GDScript side only stops and clears its nodes. Nothing audio
+	# is serialized or resurrected.
+	_free_audio_players()
 	audio_stats = {"cmds": 0, "starts": 0, "params": 0,
-		"stops": 0, "names": {}}
+		"stops": 0, "names": {}, "starts_by_name": {},
+		"stops_by_name": {}}
 
 
 func _combat_diag_text() -> String:
@@ -2052,6 +2122,10 @@ func _run_smoke_stream(course: int) -> void:
 	while frames < 2200:
 		res = bridge.step_frame_input(33.333, {"actions": 0})
 		frames += 1
+		# 19B.3B1 — the voice commands drain once per step (the same
+		# cadence the live path's _process drain uses); on the exit
+		# step this also delivers the teardown tail's stops.
+		_drain_audio_fx()
 		if not bool(res.get("ok", true)):
 			_check(false, "stream step failed: %s" %
 				bridge.get_last_error())
@@ -2237,6 +2311,21 @@ func _run_smoke_stream(course: int) -> void:
 			e["cls"], int(e["tag"]), String(e["name"]),
 			int(e["src_w"]), int(e["src_h"]),
 			int(e["size_min"]), int(e["size_max"]), int(e["count"])])
+	# 19B.3B1 — the mode-5 audio census: the tail already drained on
+	# the exit-step pass; this second drain only runs the
+	# non-owning-mode sweep that frees the stopped player nodes.
+	_drain_audio_fx()
+	_stream_audio_census(str(course), d)
+	_check(int(d["snd_loop_plays"]) == 1,
+		"WIND loop play emitted exactly once")
+	_check(int(d["snd_stops"]) == 1,
+		"WIND stop emitted exactly once")
+	_check(int(audio_stats["starts_by_name"].get("WIND", 0)) == 1,
+		"WIND player started exactly once")
+	_check(int(audio_stats["stops_by_name"].get("WIND", 0)) == 1,
+		"WIND player stopped exactly once")
+	_check(_audio_live_count() == 0,
+		"no live players after teardown")
 	if not shot_dir.is_empty():
 		_stream_shot_dump(shot_dir, course, st_ckpt, st_last,
 			st_last_seq, int(d["presented"]))
@@ -2323,6 +2412,9 @@ func _run_smoke_campaign(course: int) -> void:
 	while frames < 2200:
 		res = bridge.step_frame_input(33.333, {"actions": 0})
 		frames += 1
+		# 19B.3B1 — the voice commands drain once per step; the
+		# exit-step pass also delivers the teardown tail's stops.
+		_drain_audio_fx()
 		if not bool(res.get("ok", true)):
 			_check(false, "stream step failed: %s" %
 				bridge.get_last_error())
@@ -2343,6 +2435,21 @@ func _run_smoke_campaign(course: int) -> void:
 		"terminal presented frame recorded")
 	_check(not bridge.stream_active(),
 		"stream inactive after teardown")
+	# 19B.3B1 — the audio census for this entry: the tail drained on
+	# the exit-step pass, so the WIND stop already landed; the extra
+	# drain runs the non-owning-mode node sweep.
+	_drain_audio_fx()
+	_stream_audio_census(str(course), d)
+	_check(int(d["snd_loop_plays"]) == 1,
+		"WIND loop play emitted exactly once")
+	_check(int(d["snd_stops"]) == 1,
+		"WIND stop emitted exactly once")
+	_check(int(audio_stats["starts_by_name"].get("WIND", 0)) == 1,
+		"WIND player started exactly once")
+	_check(int(audio_stats["stops_by_name"].get("WIND", 0)) == 1,
+		"WIND player stopped exactly once")
+	_check(_audio_live_count() == 0,
+		"no live players after teardown")
 
 	if course >= 4:
 		# The final course's exit is health-gated by the CARRIED
@@ -2442,6 +2549,23 @@ func _run_smoke_campaign(course: int) -> void:
 				"second mode-6 entry in-session")
 			_check(not bool(d3["bank_b_bound"]),
 				"no stale bank on re-entry")
+			# 19B.3B1 — repeat entry: a fresh WIND loop starts on the
+			# second entry's own census (the registration table and
+			# counters reset per entry; the player-side count is
+			# cumulative across both entries).
+			_drain_audio_fx()
+			_check(int(d3["snd_loop_plays"]) == 1,
+				"re-entry WIND loop play emitted once")
+			_check(int(d3["snd_stops"]) == 1,
+				"re-entry WIND stop emitted once")
+			_check(int(audio_stats["starts_by_name"].get(
+				"WIND", 0)) == 2,
+				"WIND player started once per entry")
+			_check(int(audio_stats["stops_by_name"].get(
+				"WIND", 0)) == 2,
+				"WIND player stopped once per entry")
+			_check(_audio_live_count() == 0,
+				"no live players after re-entry teardown")
 		else:
 			print("  chain: freefall ended before traversal " +
 				"(repeat-entry skipped — death or course bound)")
@@ -2479,6 +2603,8 @@ func _campaign_chain_once(next_course: int) -> bool:
 		return false
 	for i in 2200:
 		res = bridge.step_frame_input(33.333, {"actions": 0})
+		# 19B.3B1 — same per-step voice drain as the first entry.
+		_drain_audio_fx()
 		if bool(res.get("exited", false)):
 			break
 	return int(bridge.get_mode()) == 6 or int(bridge.get_mode()) == 7
@@ -2748,6 +2874,9 @@ func _process(delta: float) -> void:
 		# the frontend route _frontend_frame already presented.
 		if stream_standalone:
 			_apply_stream()
+		# 19B.3B1 — the mode-5 voice commands drain on the same
+		# once-per-rendered-frame cadence as traversal.
+		_drain_audio_fx()
 		return
 	if stream_standalone:
 		# The mode-5 exit flipped the mode inside the step — upload

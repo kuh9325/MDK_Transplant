@@ -17,6 +17,7 @@
 // HUD slot ids — plus the 19B.2B1 model resolver (the pool-index
 // aux the core emits in kModelDraw).
 
+#include "stream_audio.h"
 #include "stream_presenter.h"
 #include "stream_raster.h"
 
@@ -28,8 +29,10 @@
 #include "core/fti_font.h"
 #include "core/indexed_image.h"
 #include "core/mti_directory.h"
+#include "core/sni_wave.h"
 #include "core/stream_context.h"
 #include "core/stream_scene.h"
+#include "core/traversal_audio_mixer.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -151,6 +154,8 @@ struct BoundAssets {
   std::optional<mdk::RuntimeModel> protoKurt, protoBones, protoProf,
       protoEsc;
   std::vector<std::byte> bniBytes, ftiBytes, hudBytes;
+  mdk::BniDirectory bdir;          // aliases bniBytes (19B.3B1
+                                   // sound payloads + registrations)
   // 19B.2C — STREAM.MTI bytes + the decoded bank A; model material
   // tables point into bankA (pixels alias mtiBytes). bankANames is
   // parallel to bankA — the decoded record's 8-byte name for the
@@ -187,6 +192,7 @@ bool bindStreamAssets(const mdk::DataRoot& root, int course,
     err = "directory inspect failed";
     return false;
   }
+  out.bdir = bdir;
   auto tagOf = [&](const mdk::BniDirectory& d,
                    const char* name) -> int {
     const mdk::BniRecord* r = mdk::findBniRecord(d, name);
@@ -376,6 +382,43 @@ int runCourse(const mdk::DataRoot& root, int course, int skill,
                    : nullptr;
       });
 
+  // 19B.3B1 — the audio host half: the OBSERVED 039c8/02e2c
+  // registration table, the shared 63-voice pool, and a BNI-backed
+  // resolver mirroring the bridge's streamSndEntry_ (vol/loop from
+  // the registrations; rate/frames from decodeSniWave — memoized).
+  mdkbridge::StreamAudioHost audio;
+  mdkbridge::streamAudioBindRegs(audio, bnd.bdir);
+  mdk::TraversalAudioMixer mixer;
+  std::map<std::string, mdk::TraversalAudioSoundDef> sndDefs;
+  int sndDecodeMisses = 0;
+  const auto sndRes = [&](const std::string& name,
+                          mdk::TraversalAudioSoundDef& def) -> bool {
+    if (const auto it = sndDefs.find(name); it != sndDefs.end()) {
+      def = it->second;
+      return true;
+    }
+    const mdk::BniRecord* r = mdk::findBniRecord(bnd.bdir, name);
+    if (!r) return false;
+    mdk::SniWave wv;
+    if (mdk::decodeSniWave(
+            std::span<const std::byte>(
+                bnd.bniBytes.data() + r->payloadFileOffset,
+                static_cast<std::size_t>(r->payloadEnd -
+                                         r->payloadFileOffset)),
+            &wv, nullptr) != mdk::SniWaveStatus::kOk) {
+      ++sndDecodeMisses;
+      return false;
+    }
+    const mdkbridge::StreamSndReg* reg = audio.soundReg(
+        static_cast<int>(r - bnd.bdir.records.data()));
+    def.volume = reg ? reg->volume : 0x7fff;
+    def.loop = reg ? reg->loop : false;
+    def.rateHz = wv.rateHz;
+    def.frames = static_cast<std::uint32_t>(wv.frames);
+    sndDefs.emplace(name, def);
+    return true;
+  };
+
   mdk::StreamInput in{};
   in.nowMs = 1000;                       // the synthetic 46c650 clock
   int frames = 0;
@@ -398,13 +441,23 @@ int runCourse(const mdk::DataRoot& root, int course, int skill,
   };
   std::vector<Ckpt> ckpts;
   while (frames < 4000) {
+    const int listenerBefore = sc.seams().listener;
     sc.step(in, 1.0f / 30.0f);
     in.nowMs += 33;                             // ~30.3fps wall ms
     ++frames;
     const int fillsBefore = pr.diag().terminalFills;
-    for (const mdk::StreamEvent& ev : sc.events())
+    // 19B.3B1 — the 0x4026f8 host pass: camView_ listener feed
+    // (frame scalar pinned 1.0 — pacing deferred) gated on the
+    // core's seam count, event translate in emission order, then
+    // the sweep tick.
+    if (sc.seams().listener != listenerBefore)
+      audio.updateListener(sc.camView(), 1.0f);
+    for (const mdk::StreamEvent& ev : sc.events()) {
+      audio.consume(ev, mixer, sndRes);
       pr.consume(ev, sc.paletteDac());
+    }
     sc.clearEvents();
+    audio.tick(mixer, 1.0 / 30.0);
     if (pr.framePending()) {
       pr.clearFramePending();
       const int seq = pr.diag().presented;
@@ -425,6 +478,29 @@ int runCourse(const mdk::DataRoot& root, int course, int skill,
   }
   const auto& d = pr.diag();
   const mdk::StreamSnapshot s = sc.snapshot();
+  // 19B.3B1 — the teardown tail: FUN_004020b4(eda84) emits the WIND
+  // stop AFTER the last step drain; consume it, then the bank-free
+  // arm (FUN_0042c824) releases anything still playing.
+  sc.teardown();
+  for (const mdk::StreamEvent& ev : sc.events()) {
+    audio.consume(ev, mixer, sndRes);
+    pr.consume(ev, sc.paletteDac());
+  }
+  sc.clearEvents();
+  mixer.stopAll();
+  const mdkbridge::StreamAudioDiag& ad = audio.diag();
+  std::printf(
+      "  audio: ev=%d plays=%d(ensure=%d,restart=%d,loop=%d,pos=%d) "
+      "stops=%d lstn=%d active=%d cap=%d miss=%d/%d/%d\n",
+      ad.events, ad.plays, ad.ensurePlays, ad.restartPlays,
+      ad.loopPlays, ad.positional, ad.stops, ad.listenerUpdates,
+      mixer.activeCount(), mixer.poolExhaustedCount(),
+      ad.unknownTags, ad.resolveMisses, sndDecodeMisses);
+  for (const auto& [nm, n] : ad.playNames) {
+    const auto st = ad.stopNames.find(nm);
+    std::printf("    asnd %s plays=%d stops=%d\n", nm.c_str(), n,
+                st == ad.stopNames.end() ? 0 : st->second);
+  }
   std::printf(
       "course %d: frames=%d pres=%d exit=%d health=%d "
       "complete=%d fill=0x%02x\n",

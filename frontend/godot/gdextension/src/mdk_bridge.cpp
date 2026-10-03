@@ -490,6 +490,97 @@ bool MdkBridge::audioResolve_(const std::string& name,
   return true;
 }
 
+// 19B.3B1 — resolve + decode a STREAM.BNI sound record (memoized).
+// The BNI records carry raw RIFF/WAVE payloads with no flag/volume
+// words: the def's vol/loop come from the OBSERVED 02e2c
+// registration args (0x7fff everywhere; the DS-loop bit on WIND).
+// BNI-first is the registration-shadow order — the mode-5 binds are
+// what the slot-pointer play calls reach (for the one SNI-colliding
+// name, APPLE, the two records carry byte-identical PCM and the
+// same vol/flags — the order is unobservable).
+const MdkBridge::AudioEntry_* MdkBridge::streamSndEntry_(
+    const std::string& name) {
+  if (const auto it = streamSndEntries_.find(name);
+      it != streamSndEntries_.end()) {
+    return &it->second;
+  }
+  AudioEntry_ e;
+  const mdk::BniRecord* rec = mdk::findBniRecord(streamBniDir_, name);
+  if (rec) {
+    const std::span<const std::byte> riff(
+        streamBniBytes_.data() + rec->payloadFileOffset,
+        static_cast<std::size_t>(rec->payloadEnd -
+                                 rec->payloadFileOffset));
+    mdk::SniWave wv;
+    std::string derr;
+    const mdk::SniWaveStatus st =
+        mdk::decodeSniWave(riff, &wv, &derr);
+    if (st != mdk::SniWaveStatus::kOk) {
+      ++streamAudioDecodeMisses_;
+      UtilityFunctions::printerr(
+          "MdkBridge: stream wave '", String(name.c_str()),
+          "' decode failed: ", mdk::sniWaveStatusName(st).data(),
+          " — ", derr.c_str());
+    } else {
+      const mdkbridge::StreamSndReg* reg =
+          streamAudio_.soundReg(
+              static_cast<int>(rec - streamBniDir_.records.data()));
+      e.def.volume = reg ? reg->volume : 0x7fff;
+      e.def.loop = reg ? reg->loop : false;
+      e.def.rateHz = wv.rateHz;
+      e.def.frames = static_cast<std::uint32_t>(wv.frames);
+      Ref<AudioStreamWAV> wav;
+      wav.instantiate();
+      wav->set_format(wv.bitsPerSample == 8
+                          ? AudioStreamWAV::FORMAT_8_BITS
+                          : AudioStreamWAV::FORMAT_16_BITS);
+      wav->set_stereo(false);
+      wav->set_mix_rate(wv.rateHz);   // verbatim — no resampling
+      PackedByteArray data;
+      data.resize(static_cast<int64_t>(wv.pcm.size()));
+      std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+      wav->set_data(data);
+      if (e.def.loop) {
+        wav->set_loop_mode(AudioStreamWAV::LOOP_FORWARD);
+        wav->set_loop_begin(0);
+        wav->set_loop_end(static_cast<int64_t>(wv.frames));
+      }
+      e.stream = wav;
+      e.resolved = true;
+    }
+  }
+  const auto [it, inserted] =
+      streamSndEntries_.emplace(name, std::move(e));
+  return &it->second;
+}
+
+bool MdkBridge::streamAudioResolve_(
+    const std::string& name, mdk::TraversalAudioSoundDef& def) {
+  // The stream registrations first — the slot plays resolve through
+  // the mode-5 binds; then the still-loaded SNI banks (the original's
+  // process-global record list, which the marker names search too).
+  if (const AudioEntry_* e = streamSndEntry_(name); e && e->resolved) {
+    def = e->def;
+    return true;
+  }
+  return audioResolve_(name, def);
+}
+
+const MdkBridge::AudioEntry_* MdkBridge::cmdAudioEntry_(
+    const std::string& name) {
+  // The command drain's stream lookup: stream-registered names (and
+  // names already decoded from STREAM.BNI) come from the stream
+  // bank; everything else is an SNI record. The registration table
+  // lives until the next mode-5 entry, so the teardown tail still
+  // resolves stream names correctly after the scene dies.
+  if (streamAudio_.regForName(name) != nullptr)
+    return streamSndEntry_(name);
+  if (const auto it = streamSndEntries_.find(name);
+      it != streamSndEntries_.end() && it->second.resolved)
+    return &it->second;
+  return audioEntry_(name);
+}
+
 // 0x20000 live-pos refresh — the original dereferences inst+0x10 (the
 // owner position pointer). ownerKey IS that pointer in this process:
 // DynamicObject storage is stable (std::list + retained records), so
@@ -524,30 +615,36 @@ bool MdkBridge::audioOwnerPos_(int cat, const void* key,
 // scale), pan to the +-1 panner domain, pitch as freqHz/recRate.
 Array MdkBridge::drain_audio_fx() {
   Array out;
-  if (!rt_ || mode_ != 3) return out;
-  // Listener — the mixer copies the 0x540bb0 view snapshot
-  // (rt.camera.pose.basis), reads 0x540b58 (zoom), 0x49b6f0
-  // (smoothed frame scalar), and the global mode select (byte1 of
-  // 0x49ff58 — the scope paths write 2; 0x540ca0's nonzero phases
-  // are exactly those paths' mirror).
-  for (int r = 0; r < 3; ++r)
-    for (int c = 0; c < 4; ++c)
-      audioListener_.m[r][c] = rt_->camera.pose.basis[r][c];
-  audioListener_.zoom = rt_->camera.zoom;
-  audioListener_.frame = timing_.smoothed;
-  audioListener_.mode3d = (rt_->transitionPhase != 0);
-  audioMixer_.setListener(audioListener_);
+  if (mode_ == 3 && rt_) {
+    // Listener — the mixer copies the 0x540bb0 view snapshot
+    // (rt.camera.pose.basis), reads 0x540b58 (zoom), 0x49b6f0
+    // (smoothed frame scalar), and the global mode select (byte1 of
+    // 0x49ff58 — the scope paths write 2; 0x540ca0's nonzero phases
+    // are exactly those paths' mirror).
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        audioListener_.m[r][c] = rt_->camera.pose.basis[r][c];
+    audioListener_.zoom = rt_->camera.zoom;
+    audioListener_.frame = timing_.smoothed;
+    audioListener_.mode3d = (rt_->transitionPhase != 0);
+    audioMixer_.setListener(audioListener_);
 
-  const auto res = [this](const std::string& n,
-                          mdk::TraversalAudioSoundDef& d) {
-    return audioResolve_(n, d);
-  };
-  const auto posFn = [this](int cat, const void* key, float p[3]) {
-    return audioOwnerPos_(cat, key, p);
-  };
-  for (const auto& ev : rt_->audioFx) audioMixer_.applyEvent(ev, res);
-  rt_->audioFx.clear();
-  audioMixer_.tick(lastDtSec_, posFn);
+    const auto res = [this](const std::string& n,
+                            mdk::TraversalAudioSoundDef& d) {
+      return audioResolve_(n, d);
+    };
+    const auto posFn = [this](int cat, const void* key, float p[3]) {
+      return audioOwnerPos_(cat, key, p);
+    };
+    for (const auto& ev : rt_->audioFx)
+      audioMixer_.applyEvent(ev, res);
+    rt_->audioFx.clear();
+    audioMixer_.tick(lastDtSec_, posFn);
+  }
+  // Mode 5's listener/events/sweep already ran inside stepStream_
+  // at the pinned cadence; every other mode only drains the queued
+  // tail (the traversal/stream bank-teardown stops). The drain
+  // itself is mode-agnostic — the pool is process-global.
 
   std::vector<mdk::TraversalAudioCmd> cmds;
   audioMixer_.drain(cmds);
@@ -558,7 +655,7 @@ Array MdkBridge::drain_audio_fx() {
     switch (c.op) {
       case mdk::TraversalAudioCmdOp::kStart: {
         d["op"] = "start";
-        const AudioEntry_* e = audioEntry_(c.name);
+        const AudioEntry_* e = cmdAudioEntry_(c.name);
         if (e && e->stream.is_valid()) {
           d["stream"] = e->stream;
         }
@@ -2943,6 +3040,17 @@ bool MdkBridge::streamLoadAssets_(std::string& detail) {
     std::snprintf(nm, sizeof nm, "HURT%d", i + 1);
     a.sndHurt[i] = tagOf(bdir, nm);
   }
+  // 19B.3B1 — the eleven FUN_004039c8+02e2c sound registrations
+  // (0x2b3d8..0x2b578): authored vol 0x7fff everywhere, the DS-loop
+  // flag on WIND alone. The host's per-lifetime census and the
+  // name->entry cache reset with the registration table; the BNI
+  // directory stays bound for payload lookups until the next entry
+  // (the teardown tail still resolves names through it).
+  streamAudio_.reset();
+  mdkbridge::streamAudioBindRegs(streamAudio_, bdir);
+  streamBniDir_ = bdir;
+  streamSndEntries_.clear();
+  streamAudioDecodeMisses_ = 0;
 
   // Engine HUD table slots (0x49a828): 2 = SC_STAT, 7 = SNIP_TXT —
   // the OBSERVED native bindings; the tags are those slot ids.
@@ -3122,14 +3230,31 @@ Dictionary MdkBridge::stepStream_(double dt_ms, int64_t action_mask,
   in.nowMs = static_cast<std::uint32_t>(streamNowMs_);
   streamNowMs_ += 33;
 
+  const int listenerBefore = stream_->seams().listener;
   const bool running = stream_->step(in, 1.0f / 30.0f);
   // Event drain — order is the core's emission order (backdrop ->
   // sprites -> teletype -> HUD -> present; kExitMode may cut the
   // frame early). The scene's paletteDac is the live DAC surface the
   // upload events apply.
-  for (const mdk::StreamEvent& ev : stream_->events())
+  // 19B.3B1 — the audio half of the frame: the counted 0x4026f8
+  // seam's host side feeds camView_ (0x540bb0) + the limiter scalar
+  // (0x49b6f0 — pinned 1.0 while pacing is deferred) to the shared
+  // pool's listener — gated on the core's own seam count so the
+  // early-exit step, which never reaches the frame's camera arm,
+  // feeds nothing. The sound events translate in emission order,
+  // then the sweep ticks once at the pinned sim cadence.
+  if (stream_->seams().listener != listenerBefore)
+    streamAudio_.updateListener(stream_->camView(), timing_.smoothed);
+  const auto streamRes = [this](const std::string& n,
+                                mdk::TraversalAudioSoundDef& d) {
+    return streamAudioResolve_(n, d);
+  };
+  for (const mdk::StreamEvent& ev : stream_->events()) {
+    streamAudio_.consume(ev, audioMixer_, streamRes);
     streamPresenter_.consume(ev, stream_->paletteDac());
+  }
   stream_->clearEvents();
+  streamAudio_.tick(audioMixer_, 1.0 / 30.0);
 
   const bool frameReady = streamPresenter_.framePending();
   if (frameReady) {
@@ -3164,7 +3289,23 @@ void MdkBridge::streamHandoff_() {
     streamExitReason_ = static_cast<int>(s.completionSrc) + 1;
     streamExitHealth_ = s.health;
     stream_->teardown();
+    // 19B.3B1 — teardown emits the WIND stop (FUN_004020b4(eda84))
+    // into the event vector AFTER the step drain; consume the tail
+    // batch before the scene storage dies, then the bank-free arm:
+    // FUN_0042c824's sound-bank death releases every still-playing
+    // instance — the mixer's stops land in the same drain as the
+    // explicit WIND stop.
+    const auto tailRes = [this](const std::string& n,
+                                  mdk::TraversalAudioSoundDef& d) {
+      return streamAudioResolve_(n, d);
+    };
+    for (const mdk::StreamEvent& ev : stream_->events()) {
+      streamAudio_.consume(ev, audioMixer_, tailRes);
+      streamPresenter_.consume(ev, stream_->paletteDac());
+    }
+    stream_->clearEvents();
     stream_.reset();
+    audioMixer_.stopAll();
     ++streamTeardowns_;
   }
   routeFrom_ = mode_;
@@ -3196,6 +3337,11 @@ void MdkBridge::traversalTeardown_() {
   // original's process-global lifetime.
   rt_.reset();
   objIds_ = mdkfront::MdkObjectIds{};
+  // The traversal sound bank dies with the runtime — every live
+  // instance releases here (the bank-free teardown arm); the queued
+  // stops drain into the next frame's presenter pass alongside
+  // mode 5's own commands.
+  audioMixer_.stopAll();
   arenaSets_.clear();
   arenaSetFailed_.clear();
   arenaName_.clear();
@@ -3391,6 +3537,38 @@ Dictionary MdkBridge::stream_diag() {
     out["ribbon_branch"] = br;
   }
   out["sound_events"] = int64_t(d.soundEvents);
+  {
+    // 19B.3B1 — the mode-5 audio census: events consumed by the
+    // host (== sound_events once the teardown tail drains), the
+    // play/stop split by call form, the listener feed count (== the
+    // core's listener seam), and the miss/decode/drop counters the
+    // closure gate requires at zero.
+    const mdkbridge::StreamAudioDiag& ad = streamAudio_.diag();
+    out["snd_events"] = int64_t(ad.events);
+    out["snd_plays"] = int64_t(ad.plays);
+    out["snd_ensure_plays"] = int64_t(ad.ensurePlays);
+    out["snd_restart_plays"] = int64_t(ad.restartPlays);
+    out["snd_loop_plays"] = int64_t(ad.loopPlays);
+    out["snd_positional"] = int64_t(ad.positional);
+    out["snd_stops"] = int64_t(ad.stops);
+    out["snd_unknown_tags"] = int64_t(ad.unknownTags);
+    out["snd_resolve_misses"] = int64_t(ad.resolveMisses);
+    out["snd_decode_misses"] = int64_t(streamAudioDecodeMisses_);
+    out["snd_listener_updates"] = int64_t(ad.listenerUpdates);
+    out["snd_active"] = int64_t(audioMixer_.activeCount());
+    out["snd_pool_exhausted"] =
+        int64_t(audioMixer_.poolExhaustedCount());
+    Array names;
+    for (const auto& [nm, n] : ad.playNames) {
+      Dictionary e;
+      e["name"] = String(nm.c_str());
+      e["plays"] = int64_t(n);
+      const auto st = ad.stopNames.find(nm);
+      e["stops"] = int64_t(st == ad.stopNames.end() ? 0 : st->second);
+      names.push_back(e);
+    }
+    out["snd_names"] = names;
+  }
   out["terminal_fills"] = int64_t(d.terminalFills);
   out["terminal_fill"] = int64_t(d.terminalFill);
   out["fb_hash"] = static_cast<int64_t>(d.fbHash);       // bit-cast
@@ -3459,6 +3637,12 @@ void MdkBridge::shutdown() {
   // session (presenter state is host-side; reset with the mode).
   stream_.reset();
   streamPresenter_.reset();
+  // 19B.3B1 — the mode-5 audio registration table, resource cache,
+  // and BNI directory die with the session's buffers.
+  streamAudio_.reset();
+  streamBniDir_ = mdk::BniDirectory{};
+  streamSndEntries_.clear();
+  streamAudioDecodeMisses_ = 0;
   streamBniBytes_.clear();
   streamFtiBytes_.clear();
   streamHudBytes_.clear();
