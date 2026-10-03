@@ -5,7 +5,7 @@ config_version=5
 
 [application]
 
-config/name="MDK-Native (Godot frontend)"
+config/name="MDK"
 run/main_scene="res://main.tscn"
 config/features=PackedStringArray("4.7")
 
@@ -18,3 +18,7 @@ window/size/viewport_height=768
 
 ; Textures arrive palette-expanded; keep the default nearest-friendly
 ; configuration — the arena shader uses texelFetch regardless.
+
+; macOS arm64 export requires the ETC2/ASTC import option enabled
+; even though this project imports no textures.
+textures/vram_compression/import_etc2_astc=true
