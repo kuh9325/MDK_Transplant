@@ -16,7 +16,11 @@ extends Node3D
 #
 # CLI (after --):
 #   --data-path DIR   data root (default: MDK_DATA_ROOT env, else
-#                     <repo>/original/installed relative to res://)
+#                     the persisted user://config.cfg choice, else
+#                     ~/Library/Application Support/MDK/data, else
+#                     <repo>/original/installed relative to res://;
+#                     interactive launches with none of these show
+#                     a folder picker and persist the answer)
 #   --level RELDTI    default TRAVERSE/LEVEL3/LEVEL3.DTI
 #   --arena NAME      default HMO_1 ("" -> spawn arena)
 #   --start X Y Z     diagnostic re-anchor into --arena (native
@@ -314,6 +318,131 @@ func _check(cond: bool, label: String) -> void:
 		printerr("  FAIL ", label)
 
 
+# Phase 19C.2 — data-root discovery + the interactive picker. The
+# candidate order is: explicit override, persisted choice, the
+# per-user install dir, the dev-checkout fallback. An explicit
+# override is honored verbatim only while it still validates — a
+# stale one must fall through (otherwise a picked-and-persisted
+# choice could never win and the picker would loop forever).
+func _data_root_valid(dir: String) -> bool:
+	# The traversal level-3 payload is the marker every launch path
+	# needs; the same validity test as tests/test_godot_frontend.py.
+	return FileAccess.file_exists(
+		dir.path_join("TRAVERSE/LEVEL3/LEVEL3.DTI"))
+
+
+func _resolve_data_root(args: PackedStringArray) -> String:
+	var p := _arg_value(args, "--data-path",
+		OS.get_environment("MDK_DATA_ROOT"))
+	if not p.is_empty():
+		if p.is_relative_path():
+			# Godot chdir's into the project dir; resolve user paths
+			# against the launch directory ($PWD survives the chdir).
+			var launch_dir := OS.get_environment("PWD")
+			if not launch_dir.is_empty():
+				p = launch_dir.path_join(p).simplify_path()
+		if _data_root_valid(p):
+			return p
+		printerr("warning: --data-path/MDK_DATA_ROOT '", p,
+			"' fails the LEVEL3 marker check — falling through ",
+			"to discovery")
+	var cfg := ConfigFile.new()
+	if cfg.load("user://config.cfg") == OK:
+		var saved: String = cfg.get_value("paths", "data_root", "")
+		if not saved.is_empty() and _data_root_valid(saved):
+			return saved
+	# The per-user install dir — user:// maps to
+	# ~/Library/Application Support/MDK via the custom_user_dir
+	# settings in project.godot; data sits beside saves/ and
+	# config.cfg rather than inside either.
+	var support := OS.get_user_data_dir().path_join("data")
+	if _data_root_valid(support):
+		return support
+	# Dev checkout fallback — dead weight in an exported app (res://
+	# lives inside the bundle), so it just never validates there.
+	var repo := ProjectSettings.globalize_path(
+		"res://../../original/installed")
+	if _data_root_valid(repo):
+		return repo
+	return ""
+
+
+var _picker_label: Label = null
+var _picker_dialog: FileDialog = null
+
+func _show_data_picker() -> void:
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	var layer := CanvasLayer.new()
+	layer.layer = 100
+	layer.name = "DataPickerLayer"
+	add_child(layer)
+	var dim := ColorRect.new()
+	dim.color = Color(0.03, 0.04, 0.07, 1.0)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	layer.add_child(dim)
+	var panel := PanelContainer.new()
+	panel.set_anchors_preset(Control.PRESET_CENTER)
+	panel.position -= Vector2(300, 90)
+	panel.custom_minimum_size = Vector2(600, 0)
+	layer.add_child(panel)
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 14)
+	panel.add_child(vb)
+	var title := Label.new()
+	title.text = "MDK — original game data required"
+	title.add_theme_font_size_override("font_size", 20)
+	vb.add_child(title)
+	_picker_label = Label.new()
+	_picker_label.autowrap_mode = TextServer.AUTOWRAP_WORD
+	_picker_label.text = "Point MDK at the folder holding the " + \
+		"installed original data (it must contain " + \
+		"TRAVERSE/LEVEL3/LEVEL3.DTI).\n\nChecked already: " + \
+		OS.get_user_data_dir().path_join("data")
+	vb.add_child(_picker_label)
+	var hb := HBoxContainer.new()
+	hb.add_theme_constant_override("separation", 12)
+	vb.add_child(hb)
+	var choose := Button.new()
+	choose.text = "Choose folder…"
+	choose.pressed.connect(_on_data_picker_choose)
+	hb.add_child(choose)
+	var quitb := Button.new()
+	quitb.text = "Quit"
+	quitb.pressed.connect(func(): get_tree().quit(1))
+	hb.add_child(quitb)
+	_picker_dialog = FileDialog.new()
+	_picker_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	_picker_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	_picker_dialog.use_native_dialog = true
+	_picker_dialog.title = "Select the MDK data folder"
+	_picker_dialog.dir_selected.connect(_on_data_dir_picked)
+	layer.add_child(_picker_dialog)
+
+
+func _on_data_picker_choose() -> void:
+	if _picker_dialog == null:
+		return
+	_picker_dialog.popup_centered_ratio(0.6)
+
+
+func _on_data_dir_picked(dir: String) -> void:
+	if _data_root_valid(dir):
+		var cfg := ConfigFile.new()
+		cfg.load("user://config.cfg")
+		cfg.set_value("paths", "data_root", dir)
+		cfg.save("user://config.cfg")
+		# Reboot through the normal path: the persisted choice now
+		# resolves, and _ready runs the whole boot unchanged.
+		get_tree().reload_current_scene()
+		return
+	if _picker_label != null:
+		_picker_label.text = "\"" + dir + "\" does not look like " + \
+			"an MDK install — expected " + \
+			"TRAVERSE/LEVEL3/LEVEL3.DTI inside it.\n\n" + \
+			"Pick the folder that holds the game's TRAVERSE/, " + \
+			"FALL3D/ and MISC/ data directories."
+
+
 func _ready() -> void:
 	var args := OS.get_cmdline_user_args()
 	smoke = "--smoke" in args
@@ -324,18 +453,7 @@ func _ready() -> void:
 	# (MMB edge, then held LMB) so a real-renderer run exercises the
 	# combat presentation without a harness.
 	combat_demo = "--combat-demo" in args
-	var data_root := _arg_value(args, "--data-path",
-		OS.get_environment("MDK_DATA_ROOT"))
-	if data_root.is_empty():
-		data_root = ProjectSettings.globalize_path(
-			"res://../../original/installed")
-	elif data_root.is_relative_path():
-		# Godot chdir's into the project dir; resolve user paths
-		# against the launch directory ($PWD survives the chdir).
-		var launch_dir := OS.get_environment("PWD")
-		if not launch_dir.is_empty():
-			data_root = launch_dir.path_join(data_root).simplify_path()
-	data_root_path = data_root
+	data_root_path = _resolve_data_root(args)
 	var level := _arg_value(args, "--level", "TRAVERSE/LEVEL3/LEVEL3.DTI")
 	var arena := _arg_value(args, "--arena", "HMO_1")
 	var start := _arg_value(args, "--start", "")
@@ -369,6 +487,29 @@ func _ready() -> void:
 	frames_left = int(_arg_value(args, "--frames", "0"))
 	interactive = not smoke and shot_path.is_empty() and frames_left <= 0
 
+	# 19C.2 — the packaged build is the game: with no mode flag at
+	# all it lands on the frontend menu, not the LEVEL3 dev shortcut.
+	# The editor/dev binary is untouched — its flagless default still
+	# loads the level directly for iteration.
+	if interactive and not OS.has_feature("editor") and \
+			not freefall and not stream and not campaign and \
+			_arg_value(args, "--level", "").is_empty():
+		frontend = true
+
+	# 19C.2 — no usable data root: an interactive launch shows the
+	# folder picker and defers boot (the chosen dir is persisted to
+	# user://config.cfg and the scene reloads); non-interactive
+	# launches keep the hard error — a CI run must not block on UI.
+	if data_root_path.is_empty():
+		if interactive:
+			_show_data_picker()
+			return
+		printerr("no MDK data root — pass --data-path DIR, set ",
+			"MDK_DATA_ROOT, or install data under ",
+			OS.get_user_data_dir().path_join("data"))
+		get_tree().quit(1)
+		return
+
 	# Gate on the extension BEFORE touching it — game mode only
 	# discovers GDExtensions listed in .godot/extension_list.cfg
 	# (written by an editor scan or by build.sh/run.sh).
@@ -379,7 +520,7 @@ func _ready() -> void:
 		get_tree().quit(1)
 		return
 	bridge = ClassDB.instantiate("MdkBridge")
-	if not bridge.initialize(data_root):
+	if not bridge.initialize(data_root_path):
 		printerr("MdkBridge.initialize failed: ", bridge.get_last_error())
 		get_tree().quit(1)
 		return
@@ -532,7 +673,7 @@ func _ready() -> void:
 			_run_smoke_stream(stream_course)
 		elif level == "TRAVERSE/LEVEL3/LEVEL3.DTI" and \
 				arena == "HMO_1" and start.is_empty():
-			_run_smoke(data_root)
+			_run_smoke(data_root_path)
 		else:
 			_run_smoke_generic(level, arena)
 		get_tree().quit(0 if failures == 0 else 1)
@@ -1340,11 +1481,12 @@ func _drain_audio_fx() -> void:
 	var cmds: Array = bridge.drain_audio_fx()
 	if cmds.is_empty():
 		if int(bridge.get_mode()) != 3 and \
-				int(bridge.get_mode()) != 5:
-			# Freefall/frontend/progression — no owning mode can hold
-			# a live voice; if one survived a mode flip, drop its
-			# node (the census survives — _reset_audio's stat wipe
-			# is only for real reset boundaries).
+				int(bridge.get_mode()) != 5 and \
+				int(bridge.get_mode()) != 2:
+			# Frontend/progression/post-handoff — no non-owning mode
+			# can hold a live voice; if one survived a mode flip,
+			# drop its node (the census survives — _reset_audio's
+			# stat wipe is only for real reset boundaries).
 			for p in audio_players:
 				if p != null:
 					_free_audio_players()
@@ -2097,6 +2239,14 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 	_check(done, "freefall course completed")
 	print("  types seen: %s  player anims: %s  chute: %s" %
 		[seen_types.keys(), seen_anims.keys(), saw_chute])
+	# 19C.3 — the mode-2 audio pass: the run's kFfEvSound events fed
+	# the shared mixer; the completion frame's stopAll queued the
+	# bank-teardown tail. Drain once (the scripted smoke drives
+	# steps directly — _process never interleaves) and census.
+	_drain_audio_fx()
+	_check(int(audio_stats["starts"]) > 0,
+		"audio: freefall produced voice starts")
+	print("  audio names: %s" % str(audio_stats["names"].keys()))
 	_check(seen_types.has(0), "type-0 player enumerated")
 	_check(seen_anims.has(1), "KURTANIM bound during play")
 	var fend: Dictionary = bridge.get_freefall_snapshot()
@@ -2921,7 +3071,11 @@ func _process(delta: float) -> void:
 	if mode == 2:
 		# Mode-2 freefall — the FUN_004109d8 model walk + the
 		# FUN_004123f4 fixed-orientation camera + 0x4edc04 fade.
+		_fe_stop_songs()   # 19C.4 — the mode-2 bank load releases them
 		_apply_freefall()
+		# 19C.3 — the mode-2 sound commands drain on the same
+		# once-per-rendered-frame cadence as traversal/mode-5.
+		_drain_audio_fx()
 		return
 	if mode == 5:
 		# Standalone StreamScene — the step above may have run the
@@ -2951,6 +3105,7 @@ func _process(delta: float) -> void:
 		# on the standalone route.
 		return
 	# Mode 3 (traversal — reached directly or via the handoff).
+	_fe_stop_songs()   # 19C.4 — the traversal bank load's release
 	if $StreamLayer.visible:
 		$StreamLayer.visible = false
 	if $FreefallRoot.visible:
@@ -5159,8 +5314,105 @@ func _frontend_fx(f: int) -> void:
 		# FUN_00427e8c's arm-time capture — the bridge samples the
 		# live indexed frame into the staged THMB record.
 		bridge.frontend_capture_thumbnail()
-	# MenuSongStart / PauseSounds / ResumeSounds*: the music + SFX
-	# backend is a deferred seam — counted only.
+	elif f == FE_FX_MENU_SONG:
+		# FUN_0041d720 — the mode-0 entry restarts the MAINSONG
+		# ambient bed (DAT_00541492 == 0 in the front-end).
+		_fe_play_record("MAINSONG", true)
+	elif f == FE_FX_PAUSE_SOUNDS:
+		# FUN_00402510 — pause every live voice.
+		for p in audio_players:
+			if p != null:
+				p.stream_paused = true
+		for p in fe_audio_players.values():
+			if p != null:
+				p.stream_paused = true
+	elif f == FE_FX_RESUME_SOUNDS or f == FE_FX_RESUME_SOUNDS_ALT:
+		for p in audio_players:
+			if p != null:
+				p.stream_paused = false
+		for p in fe_audio_players.values():
+			if p != null:
+				p.stream_paused = false
+
+
+# --- Phase 19C.4 — frontend music host ------------------------------
+# MAINSONG (OPTIONS.BNI — the FUN_0041d720 ambient bed) and OPTSONG
+# (MDKSOUND.SNI music class) ride dedicated players; OPTBUTT is the
+# menu-activate blip. The sound menu's semantic events arrive via
+# bridge.frontend_drain_audio_events(); volumes mirror the live
+# DAT_00541308/0c globals through bridge.frontend_volumes().
+var fe_audio_players := {}   # record name -> AudioStreamPlayer
+var fe_audio_vol := {}       # record name -> 0..0x7fff base vol
+
+const FE_SND_AMBIENT_STOP := 0    # FUN_0041d774 — stop+release
+const FE_SND_SONG_START := 1      # FUN_00402388(OPTSONG, 0) ensure
+const FE_SND_BUTTON := 2          # FUN_00402388(OPTBUTT, 1) restart
+const FE_SND_VOL_APPLIED := 3     # FUN_004024c4 — push to live voices
+const FE_SND_SONG_STOP := 4       # FUN_0040210c(OPTSONG)
+const FE_SND_AMBIENT_START := 5   # FUN_0041d720 — MAINSONG restart
+
+func _fe_play_record(name: String, restart: bool) -> void:
+	var def: Dictionary = bridge.frontend_song_stream(name)
+	if def.is_empty():
+		return
+	var p: AudioStreamPlayer = fe_audio_players.get(name, null)
+	if p == null:
+		p = AudioStreamPlayer.new()
+		p.name = "FeSnd_" + name
+		add_child(p)
+		fe_audio_players[name] = p
+		fe_audio_vol[name] = int(def.get("vol", 0x7fff))
+	elif not restart and p.playing:
+		return   # FUN_00402388(h, 0) — play-if-not-playing
+	p.stream = def["stream"]
+	p.pitch_scale = 1.0
+	# OPTBUTT is the menu blip — the SFX slider domain; the songs
+	# take the music slider. (Host reading of the OBSERVED
+	# FUN_004024c4 push — both slider globals exist.)
+	var vols: Dictionary = bridge.frontend_volumes()
+	var pct: int = int(vols["sound_fx"]) if name == "OPTBUTT" \
+			else int(vols["sound_music"])
+	p.volume_db = float(bridge.audio_vol_db(
+		int(fe_audio_vol[name]), pct))
+	p.play()
+
+func _fe_stop_record(name: String) -> void:
+	var p: AudioStreamPlayer = fe_audio_players.get(name, null)
+	if p != null and p.playing:
+		p.stop()
+
+func _fe_apply_volumes() -> void:
+	# FUN_004024c4 — both slider globals push onto live voices.
+	var vols: Dictionary = bridge.frontend_volumes()
+	for name in fe_audio_players:
+		var p: AudioStreamPlayer = fe_audio_players[name]
+		if p != null and p.playing:
+			var pct: int = int(vols["sound_fx"]) if name == "OPTBUTT" \
+					else int(vols["sound_music"])
+			p.volume_db = float(bridge.audio_vol_db(
+				int(fe_audio_vol.get(name, 0x7fff)), pct))
+
+func _fe_stop_songs() -> void:
+	# The mode-2/3 bank load releases the frontend records — the
+	# ambient bed/menu song die at the gameplay boundary.
+	for p in fe_audio_players.values():
+		if p != null and p.playing:
+			p.stop()
+
+func _fe_audio_event(e: int) -> void:
+	match e:
+		FE_SND_AMBIENT_STOP:
+			_fe_stop_record("MAINSONG")
+		FE_SND_SONG_START:
+			_fe_play_record("OPTSONG", false)
+		FE_SND_BUTTON:
+			_fe_play_record("OPTBUTT", true)
+		FE_SND_VOL_APPLIED:
+			_fe_apply_volumes()
+		FE_SND_SONG_STOP:
+			_fe_stop_record("OPTSONG")
+		FE_SND_AMBIENT_START:
+			_fe_play_record("MAINSONG", true)
 
 
 # True when the input dictionary carries any key edge — the OBSERVED
@@ -5278,7 +5530,13 @@ func _frontend_frame(delta: float, mode: int) -> void:
 			_frontend_request(req)
 		for f in bridge.frontend_drain_fx():
 			_frontend_fx(int(f))
+		for e in bridge.frontend_drain_audio_events():
+			_fe_audio_event(int(e))
 		_frontend_present()
+		# Queued mixer commands (a teardown tail from freefall or
+		# mode 5 that landed on the frontend route) still deliver —
+		# the drain is mode-agnostic.
+		_drain_audio_fx()
 		bridge.frontend_end_frame(delta * 1000.0)
 		if fe_quit:
 			get_tree().quit(0)

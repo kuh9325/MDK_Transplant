@@ -242,6 +242,18 @@ class MdkBridge : public RefCounted {
   // {"request","name","header_only"}; fx as ints (mdk::FrontendFx).
   Array frontend_drain_requests();
   Array frontend_drain_fx();
+  // 19C.4 — the semantic audio queue (mdk::SoundAudioEvent as ints)
+  // and the frontend-scope record resolver: MAINSONG (OPTIONS.BNI)
+  // / OPTSONG / OPTBUTT (MDKSOUND.SNI music class) -> stream.
+  Array frontend_drain_audio_events();
+  // {"stream": AudioStreamWAV, "vol": 0..0x7fff, "loop": bool} —
+  // empty Dictionary on an unresolved/absent record.
+  Dictionary frontend_song_stream(const String& name);
+  // The live DAT_00541308/0c volumes — {"sound_fx","sound_music"}.
+  Dictionary frontend_volumes() const;
+  // Host helper: the FUN_0040202c master-scale + mB->dB transform —
+  // same math traversal_audio_dsp runs for mixer commands.
+  double audio_vol_db(int64_t vol, int64_t pct) const;
   // Host seams (the same functions the shell's seams call):
   bool frontend_lastgame_exists();
   Array frontend_enumerate_saves();
@@ -744,6 +756,13 @@ class MdkBridge : public RefCounted {
     Ref<AudioStreamWAV> stream;         // null on decode failure
   };
   void loadSoundBanks_();
+  // 19C.3 — mode-2 bank set: FALL3D.SNI (the course bank,
+  // FUN_0040ef28's sibling load) + the process-global MDKSOUND.
+  void loadFreefallSoundBanks_();
+  // Per-step translation: ff_->events' kFfEvSound batch -> the
+  // shared mixer; the grouped tags expand their sub-index into the
+  // slot-run name (K_HIT1..7, K_COLL1..2).
+  void freefallDrainAudio_();
   const AudioEntry_* audioEntry_(const std::string& name);
   bool audioResolve_(const std::string& name,
                      mdk::TraversalAudioSoundDef& def);
@@ -774,6 +793,20 @@ class MdkBridge : public RefCounted {
   // Command drain's stream lookup — stream-registered names decode
   // from STREAM.BNI; every other name is an SNI record.
   const AudioEntry_* cmdAudioEntry_(const std::string& name);
+
+  // --- Phase 19C.4 — frontend music/audio seam --------------------
+  // OPTIONS.BNI's MAINSONG is the FUN_0041d720 ambient bed the
+  // mode-0 entry restarts; MDKSOUND.SNI's music-class records
+  // (OPTSONG/OPTBUTT — field0x0c bit1) are out of the SFX pool's
+  // scope, so they resolve on this frontend-lifetime bank set.
+  void loadFeAudioBanks_();
+  const AudioEntry_* feAudioEntry_(const std::string& name);
+  std::deque<std::vector<std::byte>> feAudioBankStore_;
+  std::vector<AudioBank_> feAudioBanks_;
+  std::vector<std::byte> feOptBniBytes_;
+  mdk::BniDirectory feOptBniDir_{};
+  std::unordered_map<std::string, AudioEntry_> feAudioEntries_;
+  int feAudioDecodeMisses_ = 0;
 
   // --- Phase 18B.1 — frontend host ----------------------------------
   std::unique_ptr<mdk::FrontendHostServices> feHost_;
@@ -812,7 +845,10 @@ class MdkBridge : public RefCounted {
   // FUN_0040202c's SFX master (0x541308) — the SoundFX menu scalar;
   // the frontend never parses the user's MDK.CFG, so the OBSERVED
   // factory default (70 — frontend_settings' @0x49b0fc table).
+  // frontend_update resyncs both from the live flow globals
+  // (DAT_00541308/0c) — the sound menu mutates them in place.
   int audioSfxPct_ = 70;
+  int audioMusicPct_ = 100;   // DAT_0054130c factory default
 
   std::string lastError_;
 };

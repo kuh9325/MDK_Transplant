@@ -29,6 +29,7 @@
 #include "core/mto_directory.h"
 #include "core/save_full_restore.h"
 #include "core/save_full_write.h"
+#include "core/sound_menu.h"
 #include "core/stream_context.h"
 #include "core/thmb_capture.h"
 
@@ -200,6 +201,14 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::frontend_drain_requests);
   ClassDB::bind_method(D_METHOD("frontend_drain_fx"),
                        &MdkBridge::frontend_drain_fx);
+  ClassDB::bind_method(D_METHOD("frontend_drain_audio_events"),
+                       &MdkBridge::frontend_drain_audio_events);
+  ClassDB::bind_method(D_METHOD("frontend_song_stream", "name"),
+                       &MdkBridge::frontend_song_stream);
+  ClassDB::bind_method(D_METHOD("frontend_volumes"),
+                       &MdkBridge::frontend_volumes);
+  ClassDB::bind_method(D_METHOD("audio_vol_db", "vol", "pct"),
+                       &MdkBridge::audio_vol_db);
   ClassDB::bind_method(D_METHOD("frontend_lastgame_exists"),
                        &MdkBridge::frontend_lastgame_exists);
   ClassDB::bind_method(D_METHOD("frontend_enumerate_saves"),
@@ -488,6 +497,86 @@ bool MdkBridge::audioResolve_(const std::string& name,
   if (!e || !e->resolved) return false;
   def = e->def;
   return true;
+}
+
+// 19C.3 — the mode-2 bank set: the FALL3D course bank (FUN_0040ef28
+// binds FALL3D.BNI; the SNI sits beside it as the mode's sound
+// bank) then the process-global MDKSOUND — the same shadow order
+// loadSoundBanks_ uses for traversal (level-scope first, global
+// last; zero cross-bank name collisions in the corpus).
+void MdkBridge::loadFreefallSoundBanks_() {
+  audioBanks_.clear();
+  audioBankStore_.clear();
+  audioEntries_.clear();
+  audioMixer_.reset();
+  if (!ff_) return;
+  for (const char* rel : {"FALL3D/FALL3D.SNI", "MISC/MDKSOUND.SNI"}) {
+    std::string err;
+    auto bytes = root_->readFile(rel, 1 << 28, &err);
+    if (!bytes) continue;   // absent bank -> resolves report missing
+    audioBankStore_.push_back(std::move(*bytes));
+    AudioBank_ b;
+    b.bytes = std::span<const std::byte>(audioBankStore_.back());
+    b.dir = mdk::inspectSniDirectory(b.bytes);
+    audioBanks_.push_back(b);
+  }
+}
+
+// The 0x4edc3c..98 slot block (OBSERVED name table): tag ->
+// FALL3D.SNI record name. The two tail entries are the rand groups —
+// 0x4edc60's 7-slot run (K_HIT1..7) and 0x4edc80's pair (K_COLL1/2)
+// — the event's b carries the picked index, not a play mode.
+void MdkBridge::freefallDrainAudio_() {
+  if (!ff_) return;
+  static const char* const names[] = {
+      /* kFfSndRStart  */ "R_START",
+      /* kFfSndRMove   */ "R_MOVE",
+      /* kFfSndMPass   */ "M_PASS",
+      /* kFfSndMLnch   */ "M_LNCH",
+      /* kFfSndChute   */ "P_CHUTE",
+      /* kFfSndPColl   */ "P_COLL",
+      /* kFfSndPFall   */ "P_FALL",
+      /* kFfSndKHit0   */ "K_HIT1",
+      /* kFfSndKHit1   */ "K_HIT2",
+      /* kFfSndKSeen   */ "K_SEEN",
+      /* kFfSndKFinish */ "K_FINISH",
+      /* kFfSndBones   */ "BONES",
+  };
+  const auto res = [this](const std::string& n,
+                          mdk::TraversalAudioSoundDef& d) {
+    return audioResolve_(n, d);
+  };
+  const auto ownerPos = [](int, const void*, float[3]) {
+    return false;   // mode 2 emits no positional voices
+  };
+  for (const mdk::FreefallEvent& ev : ff_->events) {
+    if (ev.kind != mdk::kFfEvSound) continue;
+    char buf[16];
+    const char* nm = nullptr;
+    mdk::TraversalAudioEvent tae;
+    tae.op = ev.b != 0 ? mdk::TraversalAudioOp::kRestart
+                       : mdk::TraversalAudioOp::kEnsurePlaying;
+    if (ev.a == mdk::kFfSndExplode) {
+      std::snprintf(buf, sizeof buf, "K_HIT%d",
+                    (ev.b % 7) + 1);
+      nm = buf;
+      tae.op = mdk::TraversalAudioOp::kEnsurePlaying;
+    } else if (ev.a == mdk::kFfSndKColl) {
+      std::snprintf(buf, sizeof buf, "K_COLL%d",
+                    (ev.b % 2) + 1);
+      nm = buf;
+      tae.op = mdk::TraversalAudioOp::kEnsurePlaying;
+    } else if (ev.a >= 0 &&
+               ev.a < int(std::size(names))) {
+      nm = names[ev.a];
+    }
+    if (nm == nullptr) continue;
+    tae.name = nm;
+    audioMixer_.applyEvent(tae, res);
+  }
+  // The FUN_004026f8 pass on the mode-2 cadence — playhead reap
+  // exactly like traversal/stream.
+  audioMixer_.tick(timing_.deltaSec, ownerPos);
 }
 
 // 19B.3B1 — resolve + decode a STREAM.BNI sound record (memoized).
@@ -2431,6 +2520,9 @@ bool MdkBridge::load_freefall(int64_t course, int64_t skill,
   ffTex_.clear();
   mode_ = 2;
   hasFrame_ = false;
+  // 19C.3 — the mode-2 sound bank set; the event drain runs per
+  // step in stepFreefall_.
+  loadFreefallSoundBanks_();
   return true;
 }
 
@@ -2478,7 +2570,18 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   // step consumed (objectAnimTickDt's rate*animRate*dtSec ==
   // frameUnits for the rate-1.0 records).
   mdk::freefallSceneStep(*ffScene_, *ff_, timing_.deltaSec);
-  if (done && !ffHandoffDone_) freefallHandoff_();
+  // 19C.3 — this frame's kFfEvSound batch into the shared voice
+  // pool + the per-step mixer pass (events self-clear at the next
+  // step, so the drain runs here, drain-once).
+  freefallDrainAudio_();
+  if (done && !ffHandoffDone_) {
+    // FUN_0040fa68 — the freefall bank dies at the edge: every live
+    // voice releases before the handoff path rebuilds. The queued
+    // stops drain on the host's next audio pass (the traversal
+    // route's bank reload frees the nodes via the GDScript sweep).
+    audioMixer_.stopAll();
+    freefallHandoff_();
+  }
 
   out["mode"] = mode_;
   out["done"] = done;
@@ -3719,6 +3822,10 @@ bool MdkBridge::frontend_boot(const String& save_dir) {
     return false;
   }
   feResLoaded_ = true;
+  // 19C.4 — the frontend-lifetime audio bank set (MAINSONG +
+  // the music-class SNI records) rides the boot: the per-mode SFX
+  // banks turn over on boundaries; these stay.
+  loadFeAudioBanks_();
   return true;
 }
 
@@ -3857,6 +3964,10 @@ Dictionary MdkBridge::frontend_update(const Dictionary& input) {
           sess_.victoryPhase != 0,
       xStrike);
   feShell_->update(frontendInput_(input));
+  // DAT_00541308/0c are process-global — the sound menu mutates
+  // them in place, so the mixer/song scalars resync every frame.
+  audioSfxPct_ = feShell_->flow().soundFx();
+  audioMusicPct_ = feShell_->flow().soundMusic();
   return frontendSnapshot_();
 }
 
@@ -3893,6 +4004,163 @@ Array MdkBridge::frontend_drain_fx() {
     out.push_back(int64_t(f));
   }
   return out;
+}
+
+// 19C.4 — the frontend-lifetime bank set: OPTIONS.BNI (MAINSONG —
+// the FUN_0041d720 ambient bed) + MDKSOUND.SNI's music-class
+// records (OPTSONG/OPTBUTT). Absent records resolve as misses —
+// decode/lookup diagnostics print; the host simply stays silent.
+void MdkBridge::loadFeAudioBanks_() {
+  feAudioBankStore_.clear();
+  feAudioBanks_.clear();
+  feAudioEntries_.clear();
+  feOptBniBytes_.clear();
+  feOptBniDir_ = mdk::BniDirectory{};
+  feAudioDecodeMisses_ = 0;
+  std::string err;
+  if (auto bytes = root_->readFile("MISC/OPTIONS.BNI", 1 << 28, &err)) {
+    feOptBniBytes_ = std::move(*bytes);
+    feOptBniDir_ = mdk::inspectBniDirectory(
+        std::span<const std::byte>(feOptBniBytes_));
+  }
+  if (auto bytes =
+          root_->readFile("MISC/MDKSOUND.SNI", 1 << 28, &err)) {
+    feAudioBankStore_.push_back(std::move(*bytes));
+    AudioBank_ b;
+    b.bytes = std::span<const std::byte>(feAudioBankStore_.back());
+    b.dir = mdk::inspectSniDirectory(b.bytes);
+    feAudioBanks_.push_back(b);
+  }
+}
+
+// Resolve + decode a frontend song/button record (memoized).
+// BNI first — MAINSONG's payload carries the OBSERVED 4-byte record
+// tag (fe ff fe 00) before RIFF; the SNI walk intentionally has NO
+// flags&0x2 gate (these ARE the music-class records — OPTSONG's
+// field0x0c low word is 0x3: DS-loop + music).
+const MdkBridge::AudioEntry_* MdkBridge::feAudioEntry_(
+    const std::string& name) {
+  if (const auto it = feAudioEntries_.find(name);
+      it != feAudioEntries_.end()) {
+    return &it->second;
+  }
+  AudioEntry_ e;
+  std::span<const std::byte> payload;
+  int flags = 0;
+  std::uint32_t volume = 0x7fff;
+  if (const mdk::BniRecord* rec =
+          mdk::findBniRecord(feOptBniDir_, name)) {
+    payload = std::span<const std::byte>(
+        feOptBniBytes_.data() + rec->payloadFileOffset,
+        static_cast<std::size_t>(rec->payloadEnd -
+                                 rec->payloadFileOffset));
+    // OBSERVED record-tag belt: payloadFileOffset already skips the
+    // fe ff fe 00 tag, but tolerate a tag-inclusive span too.
+    auto riffAt = [](std::span<const std::byte> s, std::size_t i) {
+      return s.size() >= i + 4 && s[i] == std::byte('R') &&
+             s[i + 1] == std::byte('I') && s[i + 2] == std::byte('F') &&
+             s[i + 3] == std::byte('F');
+    };
+    if (!riffAt(payload, 0) && riffAt(payload, 4)) {
+      payload = payload.subspan(4);
+    }
+    e.def.loop = true;   // MAINSONG is the ambient bed — FUN_0041d720
+  } else {
+    for (const AudioBank_& b : feAudioBanks_) {
+      if (b.dir.status != mdk::SniDirectoryStatus::kOk) continue;
+      const mdk::SniEntry* rec = nullptr;
+      for (const mdk::SniEntry& en : b.dir.entries) {
+        if (!en.isSentinel() && en.name() == name) {
+          rec = &en;
+          break;
+        }
+      }
+      if (!rec) continue;
+      const std::uint64_t off = rec->payloadFileOffset();
+      const std::uint64_t end = rec->payloadFileEnd();
+      if (off >= end || end > b.bytes.size()) break;
+      payload = b.bytes.subspan(static_cast<std::size_t>(off),
+                                static_cast<std::size_t>(end - off));
+      const std::uint32_t fld = rec->fieldAt0x0C;
+      flags = static_cast<int>(fld & 0xffffu);
+      volume = (fld >> 16) & 0xffffu;
+      e.def.loop = (flags & 0x1) != 0;
+      break;
+    }
+  }
+  if (!payload.empty()) {
+    mdk::SniWave wv;
+    std::string derr;
+    const mdk::SniWaveStatus st =
+        mdk::decodeSniWave(payload, &wv, &derr);
+    if (st != mdk::SniWaveStatus::kOk) {
+      ++feAudioDecodeMisses_;
+      UtilityFunctions::printerr(
+          "MdkBridge: frontend wave '", String(name.c_str()),
+          "' decode failed: ", mdk::sniWaveStatusName(st).data(),
+          " — ", derr.c_str());
+    } else {
+      e.def.volume = static_cast<int>(volume);
+      e.def.rateHz = wv.rateHz;
+      e.def.frames = static_cast<std::uint32_t>(wv.frames);
+      Ref<AudioStreamWAV> wav;
+      wav.instantiate();
+      wav->set_format(wv.bitsPerSample == 8
+                          ? AudioStreamWAV::FORMAT_8_BITS
+                          : AudioStreamWAV::FORMAT_16_BITS);
+      wav->set_stereo(false);
+      wav->set_mix_rate(wv.rateHz);
+      PackedByteArray data;
+      data.resize(static_cast<int64_t>(wv.pcm.size()));
+      std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+      wav->set_data(data);
+      if (e.def.loop) {
+        wav->set_loop_mode(AudioStreamWAV::LOOP_FORWARD);
+        wav->set_loop_begin(0);
+        wav->set_loop_end(static_cast<int64_t>(wv.frames));
+      }
+      e.stream = wav;
+      e.resolved = true;
+    }
+  }
+  const auto [it, inserted] =
+      feAudioEntries_.emplace(name, std::move(e));
+  return &it->second;
+}
+
+Dictionary MdkBridge::frontend_song_stream(const String& name) {
+  Dictionary out;
+  const AudioEntry_* e =
+      feAudioEntry_(std::string(name.utf8().get_data()));
+  if (e && e->resolved) {
+    out["stream"] = e->stream;
+    out["vol"] = int64_t(e->def.volume);
+    out["loop"] = e->def.loop;
+  }
+  return out;
+}
+
+Array MdkBridge::frontend_drain_audio_events() {
+  Array out;
+  if (!feShell_) return out;
+  for (const mdk::SoundAudioEvent e :
+       feShell_->flow().drainAudioEvents()) {
+    out.push_back(int64_t(e));
+  }
+  return out;
+}
+
+Dictionary MdkBridge::frontend_volumes() const {
+  Dictionary out;
+  out["sound_fx"] = audioSfxPct_;
+  out["sound_music"] = audioMusicPct_;
+  return out;
+}
+
+double MdkBridge::audio_vol_db(int64_t vol, int64_t pct) const {
+  return double(mdk::traversalAudioVolDb(
+      mdk::traversalAudioScaledVol(static_cast<int>(vol),
+                                   static_cast<int>(pct))));
 }
 
 Dictionary MdkBridge::frontendSnapshot_() const {
@@ -4398,6 +4666,9 @@ bool MdkBridge::campaignFreefallEnter_(std::string& detail) {
   ffTex_.clear();
   mode_ = 2;
   hasFrame_ = false;
+  // 19C.3 — same bank set as load_freefall (the campaign entry is
+  // the mode-6 exit's FALL3D_<levelId> arm).
+  loadFreefallSoundBanks_();
   return true;
 }
 
