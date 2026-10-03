@@ -91,7 +91,13 @@ codesign --verify --deep --strict "$OUT"
 echo "export_macos.sh: signed + verified -> $OUT"
 
 if [ "$MAKE_ZIP" -eq 1 ]; then
+  # --norsrc/--noextattr keep macOS system xattrs (provenance,
+  # FinderInfo) OUT of the archive — otherwise unzip materializes
+  # `._*` AppleDouble files inside the bundle and strict codesign
+  # verification fails on the extracted copy. The ad-hoc seal does
+  # not cover xattrs, so nothing signed is lost.
   (cd "$(dirname "$OUT")" && ditto -c -k --keepParent \
+    --norsrc --noextattr \
     "$(basename "$OUT")" "$(basename "$OUT" .app).zip")
   echo "export_macos.sh: zip -> $OUT.zip"
 fi
