@@ -40,7 +40,9 @@ namespace mdk {
 
 struct SniWave {
   int rateHz = 0;        // fmt nSamplesPerSec — kept verbatim
-  int channels = 0;      // observed corpus is mono (1)
+  int channels = 0;      // 1 or 2 (the flags&3 zone/music records in
+                         // LEVEL<n>O.SNI include stereo — OBSERVED
+                         // SIREN 2ch 32kHz, SWIND 2ch 16kHz)
   int bitsPerSample = 0; // 8 or 16
   int blockAlign = 0;    // fmt nBlockAlign (frames = pcm/blockAlign)
   std::vector<std::uint8_t> pcm;   // data chunk bytes, verbatim

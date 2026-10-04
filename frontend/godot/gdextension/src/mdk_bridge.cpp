@@ -425,6 +425,16 @@ void MdkBridge::loadSoundBanks_() {
     b.dir = mdk::inspectSniDirectory(b.bytes);
     audioBanks_.push_back(b);
   }
+  // LEVEL<n>O.SNI — the level's ambient/music stream bank: carries
+  // the flags&3 records the arena CMI structures name for zone
+  // ambience. Level-scoped like the S bank — it joins the first-match
+  // walk right behind it.
+  if (!rt_->level.sniOBytes.empty()) {
+    AudioBank_ b;
+    b.bytes = std::span<const std::byte>(rt_->level.sniOBytes);
+    b.dir = mdk::inspectSniDirectory(b.bytes);
+    audioBanks_.push_back(b);
+  }
   for (const char* rel : {"TRAVERSE/TRAVERSE.SNI",
                          "MISC/MDKSOUND.SNI"}) {
     std::string err;
@@ -443,10 +453,11 @@ void MdkBridge::loadSoundBanks_() {
 // records drive the FUN_0041d774 song path). Returns the stable map
 // entry — nullptr only for a truly absent name.
 const MdkBridge::AudioEntry_* MdkBridge::audioEntry_(
-    const std::string& name) {
+    const std::string& name, bool allowMusicClass) {
   if (const auto it = audioEntries_.find(name);
       it != audioEntries_.end()) {
-    return &it->second;
+    if (it->second.resolved || !allowMusicClass) return &it->second;
+    audioEntries_.erase(it);   // gated-out entry — retry unlocked
   }
   AudioEntry_ e;
   for (const AudioBank_& b : audioBanks_) {
@@ -461,7 +472,10 @@ const MdkBridge::AudioEntry_* MdkBridge::audioEntry_(
     if (!rec) continue;
     const std::uint32_t fld = rec->fieldAt0x0C;
     const int flags = static_cast<int>(fld & 0xffffu);
-    if (flags & 0x2) break;    // music-class — out of SFX scope
+    // music-class — out of SFX scope UNLESS the caller is the
+    // zone-ambient path: the FUN_00431cf4 fader drives exactly these
+    // flags&3 looped records through the instance pool.
+    if ((flags & 0x2) && !allowMusicClass) break;
     const std::uint64_t off = rec->payloadFileOffset();
     const std::uint64_t end = rec->payloadFileEnd();
     if (off >= end || end > b.bytes.size()) break;
@@ -487,7 +501,7 @@ const MdkBridge::AudioEntry_* MdkBridge::audioEntry_(
     wav->set_format(wv.bitsPerSample == 8
                         ? AudioStreamWAV::FORMAT_8_BITS
                         : AudioStreamWAV::FORMAT_16_BITS);
-    wav->set_stereo(false);
+    wav->set_stereo(wv.channels == 2);
     wav->set_mix_rate(wv.rateHz);   // verbatim — no resampling
     PackedByteArray data;
     data.resize(static_cast<int64_t>(wv.pcm.size()));
@@ -508,8 +522,9 @@ const MdkBridge::AudioEntry_* MdkBridge::audioEntry_(
 }
 
 bool MdkBridge::audioResolve_(const std::string& name,
-                              mdk::TraversalAudioSoundDef& def) {
-  const AudioEntry_* e = audioEntry_(name);
+                              mdk::TraversalAudioSoundDef& def,
+                              bool allowMusicClass) {
+  const AudioEntry_* e = audioEntry_(name, allowMusicClass);
   if (!e || !e->resolved) return false;
   def = e->def;
   return true;
@@ -683,7 +698,10 @@ const MdkBridge::AudioEntry_* MdkBridge::cmdAudioEntry_(
   if (const auto it = streamSndEntries_.find(name);
       it != streamSndEntries_.end() && it->second.resolved)
     return &it->second;
-  return audioEntry_(name);
+  // Music-class allowed: the only kStart commands reaching here for
+  // flags&2/3 records are the zone-ambient spawns (non-zone events
+  // fail the gated resolve before ever queueing a command).
+  return audioEntry_(name, /*allowMusicClass=*/true);
 }
 
 // 0x20000 live-pos refresh — the original dereferences inst+0x10 (the
@@ -734,15 +752,26 @@ Array MdkBridge::drain_audio_fx() {
     audioListener_.mode3d = (rt_->transitionPhase != 0);
     audioMixer_.setListener(audioListener_);
 
+    // Zone-ambient events resolve the flags&3 music-class records the
+    // arena CMI structures name — the original fader drives them
+    // through the same instance pool.
     const auto res = [this](const std::string& n,
-                            mdk::TraversalAudioSoundDef& d) {
-      return audioResolve_(n, d);
+                            mdk::TraversalAudioSoundDef& d,
+                            bool allowMusicClass) {
+      return audioResolve_(n, d, allowMusicClass);
     };
     const auto posFn = [this](int cat, const void* key, float p[3]) {
       return audioOwnerPos_(cat, key, p);
     };
-    for (const auto& ev : rt_->audioFx)
-      audioMixer_.applyEvent(ev, res);
+    for (const auto& ev : rt_->audioFx) {
+      const bool zone =
+          ev.owner == mdk::TraversalAudioOwner::kZone;
+      audioMixer_.applyEvent(
+          ev, [zone, &res](const std::string& n,
+                           mdk::TraversalAudioSoundDef& d) {
+            return res(n, d, zone);
+          });
+    }
     rt_->audioFx.clear();
     audioMixer_.tick(lastDtSec_, posFn);
   }

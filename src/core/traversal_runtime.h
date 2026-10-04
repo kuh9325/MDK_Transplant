@@ -166,6 +166,11 @@ struct TraversalLevel {
   // K_FSLIDE, K_SLIDE, K_SLIP, K_SURF, K_SURFJ). OBSERVED caller:
   // 0x4339c5 (the traversal loader loads "%s\\LEVEL%d\\LEVEL%ds.sni").
   std::vector<std::byte> sniBytes;
+  // LEVEL<n>O.SNI — the per-level object/ambient sound bank. Its
+  // flags&3 records are the zone-ambient/music streams the arena's
+  // CMI table-3 structure names (OBSERVED: CORRIDOR/H1../SIREN-class
+  // names in LEVEL3O.SNI, SWIND/BOND-class in LEVEL4O.SNI).
+  std::vector<std::byte> sniOBytes;
   // STREAM/STREAM.BNI — the stream-context bank loaded by
   // FUN_0042b270 (the traversal/gameplay init). Holds the built-in
   // class records the static slot map binds: slot 1 "KURT" is the
@@ -737,12 +742,26 @@ struct TraversalRuntime {
   float animE44 = 0.0f;           // 0x540e44 — slide vector X
   float animE48 = 0.0f;           // 0x540e48 — slide vector Y
   float ambientFades[3] = {};     // 0x540d18/0x540d24/0x540d28 — live
-                                  // ambient-sound fade accumulators;
-                                  // restored, no port consumer yet
-                                  // (audio seam)
+                                  // ambient-sound fade accumulators:
+                                  // [0] fade-in (+0x80 -> 0x7fff),
+                                  // [1] fade-out (-0x100 -> stop),
+                                  // [2] frameStep-decayed timer
   std::int32_t ambientChan[6] = {}; // 0x540d70..0x540d87 — two 12-byte
                                   // ambient-sound channel records;
                                   // restored raw (audio seam)
+  // Zone-ambient pair state — the FUN_00431e50 (resolve) /
+  // FUN_00431cf4 (crossfade) / FUN_00431fbc (teardown) seam. The
+  // original tracks record pointers; the port tracks the resolved
+  // record NAMES (identical semantics: a slot is active iff its name
+  // resolved to a bank record — zoneInRec/zoneOutRec are the "pointer
+  // != 0" flags). zoneIn[2] is the 0x54c620/0x624 pending pair the
+  // resolver arms from the current arena's CMI table-3 structure
+  // head {lenstr A, lenstr B}; zoneOut[2] is the pair being faded
+  // out and stopped.
+  std::string zoneIn[2];
+  bool zoneInRec[2] = {};
+  std::string zoneOut[2];
+  bool zoneOutRec[2] = {};
   int fieldDa0 = 0;               // 0x540da0 — scripted transition gate
   int fieldDa4 = 0;               // 0x540da4 — post-tick decay target
   int fieldEb8 = 0;               // 0x540eb8 — death-fade mode byte
@@ -1022,5 +1041,11 @@ TraversalFrameResult stepTraversalRuntime(
     TraversalRuntime& rt, const RawGameplayInput& raw,
     const GameplayInputBindings& bindings,
     const FrontendTimingState& timing);
+
+// The zone-ambient pass — FUN_00431e50's per-frame resolve of the
+// current arena's CMI table-3 ambient pair, then FUN_00431cf4's
+// crossfade driver. Called once per traversal frame inside
+// stepTraversalRuntime; exposed for direct unit testing.
+void traversalZoneAudioTick(TraversalRuntime& rt, int frameStep);
 
 } // namespace mdk

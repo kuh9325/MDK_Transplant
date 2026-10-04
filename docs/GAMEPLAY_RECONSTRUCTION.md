@@ -6913,11 +6913,26 @@ BUTBRAKE) is a rate-update seam, presentation-only; anim-marker
 `mode&0x80` -> `FUN_004022b8`/`FUN_00402388` per `mode&3` (one-shot /
 restart / ensure), `mode&4` also binds `+0x15c`.
 
-Zone ambience: `FUN_00431e50` resolves the level's two zone names into
+Zone ambience (IMPLEMENTED — `traversalZoneAudioTick`):
+`FUN_00431e50` resolves the level's two zone names into
 `0x54c620/0x624`; `FUN_00431cf4` crossfades via per-instance volume
-(`FUN_00402698`); `FUN_00431fbc` cleans up on teardown. Port state:
-`ambientFades`/`ambientChan` are already persisted in full saves —
-ambient loops are PERSISTED/DERIVED state, event history is TRANSIENT.
+(`FUN_00402698`); `FUN_00431fbc` cleans up on teardown. The ambient
+pair lives in each arena's CMI table-3 record structure head —
+`{u8len strA, u8len strB, u32}` — OBSERVED across LEVEL3..LEVEL8
+(`strA` is always `""`/`"NONE"`; `strB` names a flags=3 looped RIFF
+record in `LEVEL<n>O.SNI`, or `CORRIDOR` in `LEVEL<n>S.SNI`). The
+port re-resolves the current arena's pair each frame
+(`traversalZoneAudioTick`, end of `stepTraversalRuntime`): a changed
+pair rotates the old pair to the outgoing slots (`zoneOut`), arms
+the new pair (`zoneIn`, `kEnsurePlaying`), and drives the
+corroborated fade math — in `+0x80`/frame to `0x7fff`
+(`kSetVolume`, record-scoped), out `−0x100`/frame to `kStop`.
+Slot resolution mirrors the record-pointer semantics exactly: a
+name found in no level bank (`AMB_DRIP`/`H9WATER` in LEVEL3)
+stays a silent slot. `ambientFades`/`ambientChan` remain persisted
+in full saves — ambient loops are PERSISTED/DERIVED state, event
+history is TRANSIENT. Stereo SNI records (SIREN 32kHz/SWIND 16kHz
+2ch PCM, OBSERVED) decode verbatim.
 
 OUT OF SCOPE (classified, not implemented): frontend/menu sounds,
 music, OS driver emulation, broad unused-name catalog. Freefall keeps
@@ -7038,10 +7053,11 @@ updater + pool semantics); CTest 1/1; pytest 25/25; all six 60f
 traversal digests + five freefall digests EXACT. Deferred: the
 Dummy-driver exit teardown leaves ~20 finished-playback objects in
 AudioServer's list (engine artifact — the real CoreAudio driver reaps
-them; verified clean on `--frames`); zone-ambient crossfade
-(`FUN_00431cf4`), `ambientFades`/`ambientChan` behavior, and all
-music-class/frontend audio remain for a later ambience/music phase —
-never reachable from traversal SFX playback.
+them; verified clean on `--frames`); `ambientChan` record internals
+remain opaque (persisted raw); frontend music is now implemented
+separately (MAINSONG/OPTSONG/OPTBUTT host). Zone-ambient crossfade
+(`FUN_00431cf4`) has since been implemented — see the implemented
+paragraph above.
 
 **TRAVERSAL SFX PLAYBACK: CLOSED FOR BUILD_A**
 

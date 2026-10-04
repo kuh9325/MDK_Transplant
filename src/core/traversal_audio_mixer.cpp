@@ -180,9 +180,30 @@ void TraversalAudioMixer::applyEvent(const TraversalAudioEvent& ev,
     }
 
     case TraversalAudioOp::kSetVolume: {
-      // FUN_00402698 — per-instance volume write. Stream seam: no
-      // ported callsite emits this yet; apply to the owner-bound
-      // voice's effective volume and push it.
+      // FUN_00402698 — per-instance volume write.
+      // Zone-ambient events are record-scoped: FUN_00431cf4's fader
+      // finds each live instance OF THE RECORD (FUN_00402658) and
+      // applies the accumulator to it — owner slots never participate.
+      if (ev.owner == TraversalAudioOwner::kZone && !ev.ownerKey) {
+        for (int i = 0; i < kMaxVoices; ++i) {
+          Voice& v = voices_[i];
+          if (!v.live || v.name != ev.name) continue;
+          v.dsp.effVol = ev.volume;
+          TraversalAudioCmd c;
+          c.op = TraversalAudioCmdOp::kParams;
+          c.handle = i;
+          c.name = v.name;
+          c.vol = v.dsp.effVol;
+          c.pan = v.dsp.pan;
+          c.freqHz = v.dsp.freqHz;
+          c.rateHz = v.rateHz;
+          c.loop = v.loop;
+          cmds_.push_back(c);
+        }
+        return;
+      }
+      // Owner-bound path — apply to the owner-bound voice's effective
+      // volume and push it.
       const auto it = ownerVoices_.find(
           {static_cast<int>(ev.owner), ev.ownerKey});
       if (it == ownerVoices_.end() || !voices_[it->second].live)

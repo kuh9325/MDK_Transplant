@@ -787,9 +787,11 @@ class MdkBridge : public RefCounted {
   // shared mixer; the grouped tags expand their sub-index into the
   // slot-run name (K_HIT1..7, K_COLL1..2).
   void freefallDrainAudio_();
-  const AudioEntry_* audioEntry_(const std::string& name);
+  const AudioEntry_* audioEntry_(const std::string& name,
+                                 bool allowMusicClass = false);
   bool audioResolve_(const std::string& name,
-                     mdk::TraversalAudioSoundDef& def);
+                     mdk::TraversalAudioSoundDef& def,
+                     bool allowMusicClass = false);
   // 0x20000 live-pos refresh — ownerKey is a real DynamicObject* (or
   // the kPlayer tag) in THIS process; scanned across arena storage.
   bool audioOwnerPos_(int cat, const void* key, float pos[3]);

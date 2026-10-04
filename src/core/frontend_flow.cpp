@@ -28,6 +28,12 @@ void FrontendFlowController::update(const FrontendMenuInput& in) {
     display_->update(in);
   } else if (screen_ == FrontendScreen::Sound) {
     sound_->update(in);
+    // DAT_00541308/0c are process-global — the child's row-0/1
+    // slider mutations are visible to every same-frame reader
+    // (the OBSERVED FUN_004024c4 push consumes them immediately),
+    // not only to the exit path's write-back.
+    soundFx_ = sound_->soundFx();
+    soundMusic_ = sound_->soundMusic();
   } else if (screen_ == FrontendScreen::Mouse) {
     mouse_->update(in);
   } else if (screen_ == FrontendScreen::Keyboard) {

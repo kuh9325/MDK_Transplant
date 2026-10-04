@@ -146,6 +146,12 @@ const STREAM_STEP_MS := 1000.0 / 30.0
 const STREAM_MAX_CATCHUP := 4
 var stream_pace_ms := 0.0
 var stream_pace_armed := false
+# --pace-trace: bounded wall-clock evidence for the mode-5 limiter —
+# sim steps vs monotonic elapsed + presented frames, once per second.
+var pace_trace := false
+var pace_wall0 := -1
+var pace_last_log := -1
+var pace_steps := 0
 
 func _stream_pace_run(delta_ms: float) -> int:
 	# Steps the live StreamScene at the paced cadence; returns the
@@ -170,6 +176,19 @@ func _stream_pace_run(delta_ms: float) -> int:
 		bridge.step_frame_input(STREAM_STEP_MS,
 			{"actions": _input_mask()})
 		ran += 1
+	pace_steps += ran
+	if pace_trace and bridge.stream_active():
+		var wall := Time.get_ticks_msec()
+		if pace_wall0 < 0:
+			pace_wall0 = wall
+			pace_last_log = wall
+		elif wall - pace_last_log >= 1000:
+			var el := wall - pace_wall0
+			var fr: Dictionary = bridge.stream_frame()
+			print("pace: wall=%dms steps=%d rate=%.2f presented=%s" %
+				[el, pace_steps, pace_steps * 1000.0 / el,
+				str(fr.get("seq", "?"))])
+			pace_last_log = wall
 	return ran
 
 # Phase 17A — traversal combat presentation state. mdk_core owns
@@ -466,6 +485,7 @@ func _ready() -> void:
 	var ending := "--ending" in args
 	end_abort_at = int(_arg_value(args, "--ending-abort", "-1"))
 	end_repeat = "--ending-repeat" in args
+	pace_trace = "--pace-trace" in args
 	if end_abort_at >= 0 or end_repeat:
 		print("ending QA: abort_at=", end_abort_at, " repeat=", end_repeat)
 	frontend = "--frontend" in args
@@ -3253,7 +3273,12 @@ func _process(delta: float) -> void:
 		# display refresh. The scene takes actions only (the roll/
 		# pitch steer axes); mouse deltas are unbound here.
 		if _stream_pace_run(delta * 1000.0) > 0:
-			mode = int(bridge.get_mode())
+			var m2 := int(bridge.get_mode())
+			if m2 != mode and pace_trace:
+				print("pace: handoff mode %d -> %d at steps=%d wall=%dms" %
+					[mode, m2, pace_steps,
+					Time.get_ticks_msec() - max(pace_wall0, 0)])
+			mode = m2
 	if mode == 2:
 		# Mode-2 freefall — the FUN_004109d8 model walk + the
 		# FUN_004123f4 fixed-orientation camera + 0x4edc04 fade.
@@ -4571,7 +4596,9 @@ func _run_smoke(data_root: String) -> void:
 		int(audio_stats["starts"]), int(audio_stats["params"]),
 		int(audio_stats["stops"])])
 	print("smoke(audio): names=%s" % str(audio_stats["names"]))
-	_check(int(ast["banks"]) == 3,
+	# Bank set: LEVEL<n>S + LEVEL<n>O + TRAVERSE + MDKSOUND — the
+	# O bank joined with the zone-ambient port (flags&3 records).
+	_check(int(ast["banks"]) == 4,
 		"audio: level+traverse+global banks bound")
 	_check(int(ast["resolved"]) > 0, "audio: records resolved+decoded")
 	_check(int(audio_stats["starts"]) > 0,
@@ -4585,6 +4612,12 @@ func _run_smoke(data_root: String) -> void:
 	_check(int(ast["pool_exhausted"]) == 0,
 		"audio: 63-pool never exhausted on this path")
 	_check(int(ast["active"]) <= 63, "audio: pool bound respected")
+	# Zone ambience — the arena CMI pair armed its flags&3 looped
+	# record on this route (HMO_1 -> "H1", HMO_3 -> "H3" in the
+	# LEVEL3 bank set) and the fader pushed per-frame volumes.
+	_check(audio_stats["names"].has("H1") or
+		audio_stats["names"].has("H3"),
+		"audio: zone-ambient record armed")
 	# Players actually instantiated under AudioRoot (bounded).
 	var live_players := 0
 	for p in audio_players:
@@ -4617,17 +4650,19 @@ func _run_smoke(data_root: String) -> void:
 	_check(not $BezelLayer/BezelRect.visible and
 		not $ScopeLayer/ScopeRect.visible,
 		"transition: no stale bezel/scope post-reload")
-	# Audio seam — the reload reset the bridge-side pool: no voice or
-	# stream survives into the fresh session, and the presenter
-	# dropped its players.
+	# Audio seam — the reload reset the bridge-side pool: no voice
+	# from the OLD session survives. The fresh runtime's zone-
+	# ambient pair legitimately re-arms inside the first steps (the
+	# original's resolver re-establishes it on the new current
+	# arena) — anything beyond the two zone slots would be stale.
 	var ast2: Dictionary = bridge.get_audio_stats()
-	_check(int(ast2["active"]) == 0,
+	_check(int(ast2["active"]) <= 2,
 		"audio: pool cleared across level reload")
 	live_players = 0
 	for p in audio_players:
 		if p != null:
 			live_players += 1
-	_check(live_players == 0,
+	_check(live_players <= 2,
 		"audio: presenter players cleared across reload")
 
 	print("smoke: %d failure(s)" % failures)
@@ -4974,7 +5009,8 @@ func _run_combat_exercise(tag: String) -> void:
 		int(astc["active"])] +
 		" starts=%d names=%s" %
 		[int(audio_stats["starts"]), str(audio_stats["names"])])
-	_check(int(astc["banks"]) == 3,
+	# LEVEL<n>S + LEVEL<n>O (zone ambience) + TRAVERSE + MDKSOUND.
+	_check(int(astc["banks"]) == 4,
 		"combat(%s): audio banks bound" % tag)
 	_check(audio_stats["names"].has("SNIPERSHOT"),
 		"combat(%s): SNIPERSHOT decoded+played" % tag)
@@ -5809,6 +5845,11 @@ func _fe_smoke_step(input: Dictionary, n: int = 1) -> Dictionary:
 			_frontend_request(req)
 		for f in bridge.frontend_drain_fx():
 			_frontend_fx(int(f))
+		# Match _frontend_frame's consumer order: the song/button
+		# event queue drains every stepped frame, else Sound-screen
+		# SongStart/OPTBUTT events pool up and never reach a player.
+		for e in bridge.frontend_drain_audio_events():
+			_fe_audio_event(int(e))
 		bridge.frontend_frame(fe_transition_ms)
 		bridge.frontend_end_frame(33.333)
 	fe_sub = int(snap.get("sub_mode", 0)) if not snap.is_empty() else 0
@@ -6053,6 +6094,97 @@ func _run_smoke_frontend() -> void:
 	snap = _fe_press("cancel")
 	_check(int(snap.get("sub_mode", -1)) == 0,
 		"F: Esc exits save list")
+
+	# --- A2. music host playback evidence --------------------------
+	# fx emission alone proves the event fired — this block checks
+	# the PLAYED side: stream resolution, live AudioStreamPlayer,
+	# advancing playback position, volume push, and the stop/restart
+	# teardown around the Sound screen.
+	var song_def: Dictionary = bridge.frontend_song_stream("MAINSONG")
+	_check(not song_def.is_empty() and song_def.get("stream") != null,
+		"A2: MAINSONG stream resolved (OPTIONS.BNI decode)")
+	var mp: AudioStreamPlayer = fe_audio_players.get("MAINSONG", null)
+	_check(mp != null and mp.playing,
+		"A2: MAINSONG player live after ambient-start")
+	if mp != null:
+		var pos0: float = mp.get_playback_position()
+		var advanced := false
+		# Bounded real-time mix window — the Dummy driver can take a
+		# few frames to start reporting a moving position.
+		for _i in range(10):
+			OS.delay_msec(60)
+			if mp.get_playback_position() > pos0:
+				advanced = true
+				break
+		_check(advanced,
+			"A2: MAINSONG playback position advancing")
+	_check(int(bridge.frontend_volumes().get("sound_music", -1)) >= 0,
+		"A2: live volume globals readable")
+
+	# --- A3. Sound screen: OPTSONG swap + OPTBUTT + volume push ----
+	# Root -> Options (sel 3) -> Sound row (1). Entry stops the
+	# ambient bed and starts OPTSONG (FUN_0042322c).
+	snap = _fe_press("next")
+	snap = _fe_press("next")                   # 1 -> 3 (Options)
+	snap = _fe_press("confirm")
+	_check(int(snap.get("sub_mode", -1)) == 11,
+		"A3: options sub for sound entry")
+	snap = _fe_press("next")                   # 8 -> 0
+	snap = _fe_press("next")                   # 0 -> 1 (Sound row)
+	snap = _fe_press("confirm")
+	_check(String(snap.get("screen", "")) == "sound",
+		"A3: Sound screen entered")
+	var opt_def: Dictionary = bridge.frontend_song_stream("OPTSONG")
+	_check(not opt_def.is_empty() and opt_def.get("stream") != null,
+		"A3: OPTSONG stream resolved (MDKSOUND.SNI decode)")
+	var op: AudioStreamPlayer = fe_audio_players.get("OPTSONG", null)
+	_check(op != null and op.playing,
+		"A3: OPTSONG player live in sound screen")
+	if mp != null:
+		_check(not mp.playing,
+			"A3: ambient MAINSONG stopped on sound entry")
+	# Entry selection is row 0 (SoundFX); next -> row 1 (SoundMusic),
+	# then one LEFT query fires OPTBUTT + lowers the music slider
+	# + pushes VolumesApplied onto the live OPTSONG voice.
+	var db0 := 0.0
+	if op != null:
+		db0 = op.volume_db
+	var mus0 := int(bridge.frontend_volumes().get("sound_music", -1))
+	snap = _fe_press("next")                   # row 0 -> 1
+	var bp: AudioStreamPlayer = fe_audio_players.get("OPTBUTT", null)
+	snap = _fe_press("left")
+	bp = fe_audio_players.get("OPTBUTT", null)
+	_check(bp != null and bp.stream != null,
+		"A3: OPTBUTT player ran on the nav query")
+	if op != null:
+		_check(op.playing,
+			"A3: OPTSONG still live through volume push")
+		_check(op.volume_db < db0 or mus0 <= 0,
+			"A3: LEFT query pushed a lower music volume onto OPTSONG")
+	var mus1 := int(bridge.frontend_volumes().get("sound_music", -1))
+	_check(mus1 <= mus0 and (mus1 < mus0 or mus0 <= 0),
+		"A3: music slider global moved")
+	# Esc -> SongStop + AmbientSongStart: OPTSONG dies, MAINSONG
+	# restarts, then Esc leaves options to the root.
+	snap = _fe_press("cancel")
+	snap = _fe_press("cancel")
+	_check(int(snap.get("sub_mode", -1)) == 0,
+		"A3: Esc twice returns to root")
+	if op != null:
+		_check(not op.playing,
+			"A3: OPTSONG stopped on sound-screen exit")
+	if mp != null:
+		_check(mp.playing,
+			"A3: MAINSONG restarted on sound-screen exit")
+	# The root controller stays alive under the options screen —
+	# it resumes at the Options row, not the fresh-entry New Game
+	# the following sections expect. Walk back deterministically.
+	for i in 8:
+		if int(snap.get("selection", -1)) == 1:
+			break
+		snap = _fe_press("prev")
+	_check(int(snap.get("selection", -1)) == 1,
+		"A3: root selection restored to New Game")
 
 	# --- H. save-name entry (F2 gate is traversal-only; the arm
 	#        through the shell's autosave path is the testable one) -

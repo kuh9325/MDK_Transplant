@@ -25,6 +25,7 @@
 #include "core/player_projectiles.h"
 #include "core/player_reticle.h"
 #include "core/player_sniper.h"
+#include "core/sni_directory.h"
 
 namespace mdk {
 namespace {
@@ -76,6 +77,164 @@ bool cmiTable3Has(const CmiDirectory& cmi, const std::string& name) {
     if (rec.name() == name) return true;
   return false;
 }
+
+// ---------------------------------------------------------------------------
+// Zone ambience — FUN_00431e50 (resolve) / FUN_00431cf4 (crossfade) /
+// FUN_00431fbc (teardown-on-unload).
+//
+// EVIDENCE:
+//   Data — every arena's CMI table-3 structure (record value +4 into
+//     the image's data region) begins {u8len strA, u8len strB, u32}:
+//     OBSERVED across LEVEL3..LEVEL8 — strA is always "" or "NONE",
+//     strB is the arena's ambient name (CORRIDOR, H1..H10, SWIND, BOND,
+//     AMB_DRIP, H9WATER, SIREN, TRACKn, ...). strB resolves to a
+//     flags&3 looped RIFF record in LEVEL<n>O.SNI (CORRIDOR in
+//     LEVEL<n>S.SNI). Names that resolve nowhere (AMB_DRIP, H9WATER
+//     in LEVEL3) leave the slot silent — record-ptr == 0 semantics.
+//   Caller — in FUN_00433d40's per-frame arena pass, FUN_00431e50
+//     runs for the CURRENT arena (in_EAX == DAT_00540c48) and
+//     FUN_00431fbc for each spawned (+0x44&2) arena that is not the
+//     just-departed one (DAT_00540d6c); FUN_00431fbc's own body calls
+//     the table-3 name lookup (FUN_0045849c @0x431fd0, xref OBSERVED).
+//   Fader — FUN_00431cf4 CODE-CORROBORATED: while an incoming pair
+//     is armed and DAT_00540d18 != 0x7fff it adds 0x80 (clamped) and
+//     applies it per record via FUN_00402658 (find instance by
+//     record) + FUN_00402698 (set volume); while an outgoing pair is
+//     armed it subtracts 0x100, stopping both records via
+//     FUN_0040210c at <= 0; DAT_00540d28/0x540d2c count down by the
+//     global frameStep (DAT_0049b6e8).
+//   UNKNOWN — the resolver/teardown bodies themselves (never
+//     decompiled); modeled as: current-arena pair re-resolved each
+//     frame, a changed pair rotates the whole old pair to the
+//     outgoing slots and arms the new pair at fade 0 (the fade-in
+//     accumulator transfers to fade-out so a mid-fade departure
+//     continues from its current level — HYPOTHESIS detail).
+// ---------------------------------------------------------------------------
+
+// Length-prefixed string field inside a table-3 structure head:
+// {u8 len-incl-NUL, chars, NUL}. Empty (len <= 1) and "NONE" are the
+// corpus sentinels for a silent slot (OBSERVED — "NONE" resolves in
+// no bank).
+bool cmiAmbientStringAt(std::span<const std::byte> img, std::size_t* p,
+                        std::string* out) {
+  if (*p >= img.size()) return false;
+  const std::size_t len = static_cast<std::uint8_t>(img[*p]);
+  if (len == 0 || *p + 1 + len > img.size()) return false;
+  // len includes the NUL terminator; chars are [p+1, p+1+len-1).
+  out->assign(reinterpret_cast<const char*>(img.data() + *p + 1),
+              len - 1);
+  *p += 1 + len;
+  return true;
+}
+
+bool zoneNameSentinel(const std::string& n) {
+  return n.empty() || n == "NONE";
+}
+
+// A slot's "record pointer": nonzero iff the name resolves to a
+// record in either level sound bank (the original's FUN_00402fe8
+// first-match walk — level banks first; zone names in the corpus
+// resolve only into LEVEL<n>O.SNI / LEVEL<n>S.SNI).
+bool zoneRecordExists(const TraversalRuntime& rt,
+                      const std::string& name) {
+  if (zoneNameSentinel(name)) return false;
+  for (const std::vector<std::byte>* bank :
+       {&rt.level.sniBytes, &rt.level.sniOBytes}) {
+    if (bank->empty()) continue;
+    const SniDirectory dir =
+        inspectSniDirectory(std::span<const std::byte>(*bank));
+    if (dir.status != SniDirectoryStatus::kOk) continue;
+    for (const SniEntry& e : dir.entries)
+      if (e.name() == name) return true;
+  }
+  return false;
+}
+
+} // namespace
+
+// (declared in traversal_runtime.h — mdk:: scope, exported for tests)
+void traversalZoneAudioTick(TraversalRuntime& rt, int frameStep) {
+  // ---- FUN_00431e50 — resolve the current arena's pair ------------
+  std::string pending[2];
+  if (rt.cur && rt.level.cmi.tables.size() >= 4) {
+    for (const CmiRecord& rec : rt.level.cmi.tables[3].records) {
+      if (rec.name() != rt.cur->name) continue;
+      // Structure head at value+4: {lenstr A, lenstr B, u32, ...}.
+      std::size_t p =
+          static_cast<std::size_t>(rec.value) + 4;
+      std::span<const std::byte> img(rt.level.cmiBytes);
+      if (p < img.size()) {
+        cmiAmbientStringAt(img, &p, &pending[0]);
+        cmiAmbientStringAt(img, &p, &pending[1]);
+      }
+      break;
+    }
+  }
+
+  // Pair change -> whole-pair rotation (the original copies the two
+  // record pointers to the outgoing slots verbatim). The fade-in
+  // accumulator transfers to fade-out so a pair interrupted mid-fade
+  // departs from its live level.
+  if (pending[0] != rt.zoneIn[0] || pending[1] != rt.zoneIn[1]) {
+    rt.zoneOut[0] = rt.zoneIn[0];
+    rt.zoneOut[1] = rt.zoneIn[1];
+    rt.zoneOutRec[0] = rt.zoneInRec[0];
+    rt.zoneOutRec[1] = rt.zoneInRec[1];
+    rt.ambientFades[1] = rt.ambientFades[0];
+    rt.zoneIn[0] = pending[0];
+    rt.zoneIn[1] = pending[1];
+    rt.ambientFades[0] = 0.0f;
+    for (int i = 0; i < 2; ++i) {
+      rt.zoneInRec[i] = zoneRecordExists(rt, rt.zoneIn[i]);
+      if (!rt.zoneInRec[i]) continue;
+      TraversalAudioEvent& ev = traversalAudioEmit(
+          rt, TraversalAudioOp::kEnsurePlaying, rt.zoneIn[i]);
+      ev.owner = TraversalAudioOwner::kZone;
+    }
+  }
+
+  // ---- FUN_00431cf4 — the crossfade driver ------------------------
+  if ((rt.zoneInRec[0] || rt.zoneInRec[1]) &&
+      rt.ambientFades[0] < 0x7fff) {
+    rt.ambientFades[0] += 0x80;
+    if (rt.ambientFades[0] > 0x7fff) rt.ambientFades[0] = 0x7fff;
+    const int vol = static_cast<int>(rt.ambientFades[0]);
+    for (int i = 0; i < 2; ++i) {
+      if (!rt.zoneInRec[i]) continue;
+      TraversalAudioEvent& ev = traversalAudioEmit(
+          rt, TraversalAudioOp::kSetVolume, rt.zoneIn[i]);
+      ev.owner = TraversalAudioOwner::kZone;
+      ev.volume = vol;
+    }
+  }
+  if (rt.zoneOutRec[0] || rt.zoneOutRec[1]) {
+    rt.ambientFades[1] -= 0x100;
+    if (rt.ambientFades[1] < 0) {
+      for (int i = 0; i < 2; ++i) {
+        if (!rt.zoneOutRec[i]) continue;
+        TraversalAudioEvent& ev = traversalAudioEmit(
+            rt, TraversalAudioOp::kStop, rt.zoneOut[i]);
+        ev.owner = TraversalAudioOwner::kZone;
+      }
+      rt.zoneOut[0].clear();
+      rt.zoneOut[1].clear();
+      rt.zoneOutRec[0] = rt.zoneOutRec[1] = false;
+    } else {
+      const int vol = static_cast<int>(rt.ambientFades[1]);
+      for (int i = 0; i < 2; ++i) {
+        if (!rt.zoneOutRec[i]) continue;
+        TraversalAudioEvent& ev = traversalAudioEmit(
+            rt, TraversalAudioOp::kSetVolume, rt.zoneOut[i]);
+        ev.owner = TraversalAudioOwner::kZone;
+        ev.volume = vol;
+      }
+    }
+  }
+  if (rt.ambientFades[2] > 0) rt.ambientFades[2] -= frameStep;
+  if (rt.fieldD2c > 0) rt.fieldD2c -= frameStep;
+}
+
+namespace {
 
 // FUN_00456808 — CMI table-0 "%s$%s_%u" per-object script lookup:
 // the record value is the script's code offset within the image
@@ -878,6 +1037,13 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
         (dot == std::string::npos) ? dtiPath : dtiPath.substr(0, dot);
     auto sni = root.readFile(stem + "S.SNI", kMaxDataFileBytes, detail);
     if (sni) rt.level.sniBytes = std::move(*sni);
+    // LEVEL<n>O.SNI — the level's ambient/music stream bank
+    // ("LEVEL3O.SNI" etc.): holds the flags&3 looped records the
+    // arena CMI structures name for zone ambience. Non-fatal like
+    // the S bank — fixture trees without it leave zone names
+    // unresolved (record-ptr == 0 semantics).
+    auto sniO = root.readFile(stem + "O.SNI", kMaxDataFileBytes, detail);
+    if (sniO) rt.level.sniOBytes = std::move(*sniO);
   }
 
   // 0x541498 — the level id (OBSERVED write: the 0x427904 mode/level
@@ -2174,6 +2340,13 @@ TraversalFrameResult stepTraversalRuntime(
       }
     }
   }
+
+  // FUN_00431e50 + FUN_00431cf4 — the zone-ambient resolve/crossfade
+  // pass: the original calls them from the per-frame arena pass and
+  // the frame's sound housekeeping respectively; both collapse into
+  // this end-of-frame tick (events ride rt.audioFx like every other
+  // audio callsite).
+  traversalZoneAudioTick(rt, timing.frameStep);
 
   ++rt.frameCounter;
 

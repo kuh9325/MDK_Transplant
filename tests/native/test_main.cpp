@@ -24315,10 +24315,13 @@ void test_sni_wave() {
     notRiff.buf[0] = std::byte{'X'};
     CHECK(decodeSniWave(notRiff.buf, &out) == SniWaveStatus::kNotWave);
 
-    // Stereo — outside the reachable corpus.
+    // Stereo — now reachable: the flags&3 zone/music records in
+    // LEVEL<n>O.SNI include 2-channel PCM (OBSERVED SIREN 32kHz,
+    // SWIND 16kHz). Accepted verbatim.
     auto stereo = SyntheticWave::build(1, 2, 8000, 8, {1, 2, 3, 4});
-    CHECK(decodeSniWave(stereo.buf, &out) ==
-          SniWaveStatus::kUnsupportedChannels);
+    CHECK(decodeSniWave(stereo.buf, &out) == SniWaveStatus::kOk);
+    CHECK(out.channels == 2);
+    CHECK(out.frames == 2);
 
     // 24-bit — outside the reachable corpus.
     auto wide = SyntheticWave::build(1, 1, 8000, 24, {1, 2, 3});
@@ -24880,9 +24883,200 @@ void test_traversal_audio_mixer() {
                            &obj));
     CHECK(drained(m).empty());           // pending cmds cleared too
   }
+
+  // -- zone kSetVolume: record-scoped (FUN_00402658 + FUN_00402698) ---
+  // The zone-ambient fader applies its accumulator to every live
+  // instance OF THE RECORD — owner slots never participate.
+  {
+    TraversalAudioMixer m;
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "CORRIDOR"),
+                 kFakeRes);
+    m.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "CORRIDOR"),
+                 kFakeRes);   // ensure is idempotent — still one voice
+    drained(m);
+    TraversalAudioEvent v = mkEv(TraversalAudioOp::kSetVolume,
+                                 "CORRIDOR");
+    v.owner = TraversalAudioOwner::kZone;
+    v.volume = 0x4000;
+    m.applyEvent(v, kFakeRes);
+    const auto c = drained(m);
+    CHECK(countCmd(c, TraversalAudioCmdOp::kParams) == 1);
+    CHECK(c[0].vol == 0x4000 && c[0].name == "CORRIDOR");
+    // A zone write to a non-live name reaches nothing.
+    TraversalAudioEvent v2 = mkEv(TraversalAudioOp::kSetVolume,
+                                  "OTHER");
+    v2.owner = TraversalAudioOwner::kZone;
+    v2.volume = 0x100;
+    m.applyEvent(v2, kFakeRes);
+    CHECK(drained(m).empty());
+    // An ownerless non-zone write still hits nothing (unchanged path).
+    TraversalAudioEvent v3 = mkEv(TraversalAudioOp::kSetVolume,
+                                  "CORRIDOR");
+    v3.volume = 1;
+    m.applyEvent(v3, kFakeRes);
+    CHECK(drained(m).empty());
+  }
 }
 
-// ---- Phase 18B.2B — presentation-format decoders ------------------
+// Zone ambience — FUN_00431e50 (resolve) + FUN_00431cf4 (crossfade).
+// The tick reads the current arena's CMI table-3 record structure head
+// {lenstr A, lenstr B, u32} and drives fades through rt.audioFx.
+void test_traversal_zone_ambience() {
+  using mdk::CmiRecord;
+  using mdk::TraversalArena;
+  using mdk::TraversalAudioOp;
+  using mdk::TraversalAudioOwner;
+  using mdk::TraversalRuntime;
+
+  const auto cmiRec = [](const char* name, std::uint32_t value) {
+    CmiRecord r;
+    for (const char* p = name; *p; ++p)
+      r.nameBytes.push_back(static_cast<std::byte>(*p));
+    r.nameLength = static_cast<std::uint8_t>(r.nameBytes.size());
+    r.value = value;
+    return r;
+  };
+  const auto putLenStr = [](mdk::TraversalRuntime& rt, std::size_t off,
+                            const char* s) {
+    const std::size_t n = std::strlen(s);
+    rt.level.cmiBytes[off] = static_cast<std::byte>(n + 1);
+    std::memcpy(rt.level.cmiBytes.data() + off + 1, s, n + 1);
+  };
+  const auto mkArena = [](mdk::TraversalRuntime& rt, const char* name) {
+    auto a = std::make_unique<TraversalArena>();
+    a->name = name;
+    rt.arenas.push_back(std::move(a));
+    return rt.arenas.back().get();
+  };
+  const auto countOp = [](const mdk::TraversalRuntime& rt,
+                          TraversalAudioOp op) {
+    int n = 0;
+    for (const auto& e : rt.audioFx) n += (e.op == op) ? 1 : 0;
+    return n;
+  };
+
+  // -- resolve + fade-in: pair armed on first tick, +0x80/frame ------
+  {
+    TraversalRuntime rt;
+    rt.level.cmi.tables.resize(4);
+    rt.level.cmiBytes.assign(0x100, std::byte{0});
+    // ARENA_A structure @file 0x40 (record value 0x3c): {"NONE","WINDY"}
+    putLenStr(rt, 0x40, "NONE");
+    putLenStr(rt, 0x46, "WINDY");
+    rt.level.cmi.tables[3].records.push_back(cmiRec("ARENA_A", 0x3c));
+    auto sni = SyntheticSni::build("LVO.SND", {{"WINDY", 3, 64}});
+    rt.level.sniOBytes = sni.buf;
+    rt.cur = mkArena(rt, "ARENA_A");
+
+    mdk::traversalZoneAudioTick(rt, 1);
+    CHECK(rt.zoneIn[0] == "NONE" && rt.zoneIn[1] == "WINDY");
+    CHECK(!rt.zoneInRec[0] && rt.zoneInRec[1]);  // NONE is a sentinel
+    CHECK(rt.ambientFades[0] == 0x80);
+    CHECK(rt.audioFx.size() == 2);               // ensure + setvol
+    CHECK(rt.audioFx[0].op == TraversalAudioOp::kEnsurePlaying &&
+          rt.audioFx[0].name == "WINDY" &&
+          rt.audioFx[0].owner == TraversalAudioOwner::kZone);
+    CHECK(rt.audioFx[1].op == TraversalAudioOp::kSetVolume &&
+          rt.audioFx[1].volume == 0x80);
+
+    // Same pair next frame: no re-arm, just the fade step.
+    rt.audioFx.clear();
+    mdk::traversalZoneAudioTick(rt, 1);
+    CHECK(rt.audioFx.size() == 1);
+    CHECK(rt.audioFx[0].op == TraversalAudioOp::kSetVolume &&
+          rt.audioFx[0].volume == 0x100);
+
+    // Saturate at 0x7fff: 0x80*256 = 0x8000 -> clamped on tick 256.
+    for (int i = 0; i < 254; ++i) mdk::traversalZoneAudioTick(rt, 1);
+    CHECK(rt.ambientFades[0] == 0x7fff);
+    rt.audioFx.clear();
+    mdk::traversalZoneAudioTick(rt, 1);          // saturated — silent
+    CHECK(rt.audioFx.empty());
+    CHECK(rt.ambientFades[0] == 0x7fff);
+  }
+
+  // -- crossfade: arena change rotates the pair, -0x100 -> stop ------
+  {
+    TraversalRuntime rt;
+    rt.level.cmi.tables.resize(4);
+    rt.level.cmiBytes.assign(0x200, std::byte{0});
+    putLenStr(rt, 0x40, "NONE");
+    putLenStr(rt, 0x46, "WINDY");
+    putLenStr(rt, 0x80, "NONE");
+    putLenStr(rt, 0x86, "BOND");
+    rt.level.cmi.tables[3].records.push_back(cmiRec("ARENA_A", 0x3c));
+    rt.level.cmi.tables[3].records.push_back(cmiRec("ARENA_B", 0x7c));
+    auto sni = SyntheticSni::build(
+        "LVO.SND", {{"WINDY", 3, 64}, {"BOND", 3, 64}});
+    rt.level.sniOBytes = sni.buf;
+    TraversalArena* a = mkArena(rt, "ARENA_A");
+    TraversalArena* b = mkArena(rt, "ARENA_B");
+    rt.cur = a;
+
+    // Arm A and saturate its fade.
+    mdk::traversalZoneAudioTick(rt, 1);
+    rt.ambientFades[0] = 0x7fff;
+
+    // Swap to B -> WINDY departs on the outgoing side, BOND arms.
+    rt.cur = b;
+    rt.audioFx.clear();
+    mdk::traversalZoneAudioTick(rt, 1);
+    CHECK(rt.zoneIn[1] == "BOND" && rt.zoneInRec[1]);
+    CHECK(rt.zoneOut[1] == "WINDY" && rt.zoneOutRec[1]);
+    CHECK(rt.ambientFades[0] == 0x80);           // fresh fade-in
+    CHECK(rt.ambientFades[1] == 0x7fff - 0x100); // transferred level,
+                                               // one decay step done
+    // ensure(BOND) + setvol(BOND,0x80) + setvol(WINDY,0x7eff)
+    CHECK(rt.audioFx.size() == 3);
+    CHECK(countOp(rt, TraversalAudioOp::kEnsurePlaying) == 1);
+    CHECK(countOp(rt, TraversalAudioOp::kSetVolume) == 2);
+
+    // 126 more ticks burn the outgoing fade to 0xff; the next stops.
+    for (int i = 0; i < 126; ++i) mdk::traversalZoneAudioTick(rt, 1);
+    rt.audioFx.clear();
+    mdk::traversalZoneAudioTick(rt, 1);          // d24 < 0 -> stop
+    CHECK(countOp(rt, TraversalAudioOp::kStop) == 1);
+    bool stoppedWindy = false;
+    for (const auto& e : rt.audioFx)
+      if (e.op == TraversalAudioOp::kStop && e.name == "WINDY")
+        stoppedWindy = true;
+    CHECK(stoppedWindy);
+    CHECK(rt.zoneOut[1].empty() && !rt.zoneOutRec[1]);
+    // BOND keeps fading in undisturbed.
+    CHECK(rt.zoneIn[1] == "BOND" && rt.zoneInRec[1]);
+  }
+
+  // -- unresolved names are silent slots (record-ptr == 0) -----------
+  {
+    TraversalRuntime rt;
+    rt.level.cmi.tables.resize(4);
+    rt.level.cmiBytes.assign(0x80, std::byte{0});
+    putLenStr(rt, 0x40, "NONE");
+    putLenStr(rt, 0x46, "GHOST");   // not in any bank
+    rt.level.cmi.tables[3].records.push_back(cmiRec("ARENA_A", 0x3c));
+    auto sni = SyntheticSni::build("LVO.SND", {{"WINDY", 3, 64}});
+    rt.level.sniOBytes = sni.buf;
+    rt.cur = mkArena(rt, "ARENA_A");
+
+    mdk::traversalZoneAudioTick(rt, 1);
+    CHECK(rt.zoneIn[1] == "GHOST" && !rt.zoneInRec[1]);
+    CHECK(rt.audioFx.empty());                  // nothing emitted
+    CHECK(rt.ambientFades[0] == 0.0f);          // fade gate stays shut
+  }
+
+  // -- all-sentinel pair: no events, no fades -------------------------
+  {
+    TraversalRuntime rt;
+    rt.level.cmi.tables.resize(4);
+    rt.level.cmiBytes.assign(0x80, std::byte{0});
+    putLenStr(rt, 0x40, "NONE");
+    putLenStr(rt, 0x46, "NONE");
+    rt.level.cmi.tables[3].records.push_back(cmiRec("ARENA_A", 0x3c));
+    rt.cur = mkArena(rt, "ARENA_A");
+    mdk::traversalZoneAudioTick(rt, 1);
+    CHECK(rt.audioFx.empty() && rt.ambientFades[0] == 0.0f);
+  }
+}
 
 void test_lbb_image() {
   // OBSERVED layout (FUN_004258a0): 768-byte palette, u16le w/h,
@@ -29245,6 +29439,7 @@ int main() {
   test_sni_wave();
   test_traversal_audio_dsp();
   test_traversal_audio_mixer();
+  test_traversal_zone_ambience();
   test_lbb_image();
   test_thmb_capture();
   test_frontend_transition();

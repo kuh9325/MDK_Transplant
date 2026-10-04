@@ -94,8 +94,8 @@ SniWaveStatus decodeSniWave(std::span<const std::byte> riff,
     fail(detail, "non-PCM wave tag");
     return SniWaveStatus::kBadFormat;
   }
-  if (channels != 1) {
-    fail(detail, "non-mono wave");
+  if (channels != 1 && channels != 2) {
+    fail(detail, "non-mono/stereo wave");
     return SniWaveStatus::kUnsupportedChannels;
   }
   if (bits != 8 && bits != 16) {
