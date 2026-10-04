@@ -88,6 +88,11 @@ var chute_demo := false       # --chute-demo: hold jump from frame 2
                               # (the sustain->K_CHUTE evidence path)
 var step_shot := false        # --step: keep stepping under --screenshot
                               # (for deep-frame freefall/traversal probes)
+var ff_steer := false         # --ff-steer: scripted weave via real
+                              # key events (production poll path)
+var ff_trace := false         # --ff-trace: hp/missile-distance log
+var _ff_held := {}            # synthetic key state for --ff-steer
+var _ff_jink := 0             # committed jink keycode (0 = none)
 var demo_frame := 0
 
 # Phase 16C — mode-2 freefall presentation state. All gameplay lives
@@ -484,6 +489,8 @@ func _ready() -> void:
 	combat_demo = "--combat-demo" in args
 	chute_demo = "--chute-demo" in args
 	step_shot = "--step" in args
+	ff_steer = "--ff-steer" in args
+	ff_trace = "--ff-trace" in args
 	data_root_path = _resolve_data_root(args)
 	var level := _arg_value(args, "--level", "TRAVERSE/LEVEL3/LEVEL3.DTI")
 	var arena := _arg_value(args, "--arena", "HMO_1")
@@ -1970,6 +1977,133 @@ func _ff_input() -> Dictionary:
 	return d
 
 
+func _inject_key(keycode: int, pressed: bool) -> void:
+	# One synthetic device event: the polled keycode AND the physical
+	# code are set, matching real hardware events — _ff_input polls
+	# is_key_pressed, _gameplay_keys polls is_physical_key_pressed.
+	var ev := InputEventKey.new()
+	ev.keycode = keycode
+	ev.physical_keycode = keycode
+	ev.pressed = pressed
+	Input.parse_input_event(ev)
+
+
+func _ff_steer_inject(frame: int) -> void:
+	# Reactive dodge, the way a player would steer: the nearest
+	# inbound missile's lateral bearing decides the jink — move
+	# PERPENDICULAR to it once the missile closes (the homing blend
+	# vel*0.8+dir*0.2 can't re-track a 90-degree break at short
+	# range); keep drifting far out so the lead never settles.
+	var want := {}
+	var s: Dictionary = bridge.get_freefall_snapshot()
+	if s.has("player"):
+		var p: Vector3 = s["player"]["pos_mdk"]
+		var bd := -1.0
+		var bo := Vector2.ZERO
+		var have := false
+		for o in bridge.get_freefall_object_snapshots():
+			if int(o["type"]) != 1 or not o["alive"]:
+				continue
+			var m: Vector3 = o["pos_mdk"]
+			var dz := m.z - p.z
+			# Any live missile is a threat — they spawn ~5000 below
+			# and slingshot up. Nearest-to-intercept = largest dz
+			# still below the pass line (-5).
+			if not have or dz > bd:
+				bd = dz
+				bo = Vector2(m.x - p.x, m.y - p.y)
+				have = true
+		if have and bd > -800.0 and bd < 0.0:
+			# Final approach (~4s of closure at the un-throttled
+			# 250-vs-66 closing rate): oscillate PERPENDICULAR to
+			# the missile's lateral bearing on a fixed cadence —
+			# ~40 process-frames ≈ 33u legs, too fast for the
+			# vel*0.8+dir*0.2 blend to re-track, too short to pin
+			# on a clamp. Leads are only +-7.5 (wanderScale 7.5-c),
+			# so a moving target is a missed target.
+			var leg := int(frame / 40) % 2 == 0
+			if abs(bo.x) > abs(bo.y):
+				want[KEY_UP if leg else KEY_DOWN] = true
+			else:
+				want[KEY_LEFT if leg else KEY_RIGHT] = true
+		elif have:
+			_ff_jink = 0
+			# Serpentine sweep — missiles spawn far below (z~0 vs the
+			# player's ~5000) and the z-throttle slingshots them up
+			# through the dz window in a few frames, so a REACTIVE
+			# jink has no room; instead hold long diagonal runs at
+			# the 117 u/s cap on both axes (~150/~100 process-frames
+			# per direction = full-field sweeps) so the homing
+			# intercept point never settles on the player.
+			want[KEY_LEFT] = (frame % 300) < 150
+			want[KEY_RIGHT] = not want[KEY_LEFT]
+			want[KEY_UP] = (frame % 200) < 100
+			want[KEY_DOWN] = not want[KEY_UP]
+		else:
+			# No inbound missile — release everything.
+			_ff_jink = 0
+	for k in [KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN]:
+		var held: bool = _ff_held.get(k, false)
+		if want.get(k, false) and not held:
+			_inject_key(k, true)
+			_ff_held[k] = true
+		elif held and not want.get(k, false):
+			_inject_key(k, false)
+			_ff_held[k] = false
+
+
+var _ff_trace_prev_hp := -1
+var _ff_trace_n := 0
+var _ff_pickup_chute := {}
+
+func _ff_trace_tick() -> void:
+	# hp + nearest missile lateral separation, ~1 Hz sim cadence.
+	_ff_trace_n += 1
+	var s: Dictionary = bridge.get_freefall_snapshot()
+	if s.is_empty() or not s.has("player"):
+		return
+	var p: Vector3 = s["player"]["pos_mdk"]
+	var n := 0
+	var mind := -1.0
+	for o in bridge.get_freefall_object_snapshots():
+		if not o["alive"]:
+			continue
+		if int(o["type"]) == 4:
+			# Pickup chute lifecycle — deploy edge + glide verification.
+			var slot := int(o["pool_slot"]) if o.has("pool_slot") else int(o.get("slot", -1))
+			var ch := bool(o["chute"])
+			if ch and not _ff_pickup_chute.has(slot):
+				_ff_pickup_chute[slot] = true
+				var v: Vector3 = o["vel_mdk"]
+				print("ff-trace CHUTE deploy slot=%d vz=%.1f timer=%d" %
+					[slot, v.z, int(o["timer"])])
+			elif ch and _ff_trace_n % 60 == 0:
+				var v2: Vector3 = o["vel_mdk"]
+				print("ff-trace CHUTE glide slot=%d vz=%.1f" % [slot, v2.z])
+			continue
+		if int(o["type"]) != 1:
+			continue
+		n += 1
+		var m: Vector3 = o["pos_mdk"]
+		var dz := m.z - p.z
+		if dz < -5.0 or dz > 600.0:
+			continue   # passed or not yet inbound
+		var lat := Vector2(m.x - p.x, m.y - p.y).length()
+		if mind < 0.0 or lat < mind:
+			mind = lat
+	var hp := int(s["health"])
+	var t := float(s["timeline"]) / 60.0
+	if _ff_trace_prev_hp < 0:
+		_ff_trace_prev_hp = hp
+	elif hp != _ff_trace_prev_hp:
+		print("ff-trace t=%.2f hp %d->%d HIT msl=%d" %
+			[t, _ff_trace_prev_hp, hp, n])
+		_ff_trace_prev_hp = hp
+	if _ff_trace_n % 60 == 0 or (mind >= 0.0 and mind < 30.0):
+		print("ff-trace t=%.2f hp=%d msl=%d mind_xy=%.1f pos=%.1f,%.1f" %
+			[t, hp, n, mind, p.x, p.y])
+
+
 # Physical keys the gameplay path polls every frame — every keycode
 # _fe_internal_code can translate (the FUN_0046b688 device bitmap
 # domain). Held state is polled, not event-latched, so window-focus
@@ -3390,7 +3524,18 @@ func _process(delta: float) -> void:
 		mouse_dx = 0
 		mouse_dy = 0
 		mouse_dz = 0
+		if ff_steer and mode == 2:
+			# --ff-steer: corkscrew weave through REAL key events —
+			# parse_input_event sets the polled device state, so the
+			# production _ff_input() -> direction booleans -> core
+			# fold path carries the steering (not a dict shortcut).
+			demo_frame += 1
+			_ff_steer_inject(demo_frame)
 		input.merge(_ff_input(), true)
+		if ff_trace:
+			var _k: PackedInt32Array = input["keys"]
+			if not _k.is_empty():
+				print("ff-trace keys=%s ff=%s" % [_k, input])
 		if combat_demo and mode == 3:
 			# MMB edge at frame 4 scopes in; LMB holds from frame 10
 			# — the cadence decay runs while scoped, then the shot
@@ -3418,6 +3563,8 @@ func _process(delta: float) -> void:
 		# (Traversal sessions are always mode != 2; only a session
 		# that STARTED in mode 2 logs the transition.)
 		mode = int(bridge.get_mode())
+		if ff_trace and mode == 2:
+			_ff_trace_tick()
 		if freefall and mode != 2 and not ff_handoff_seen:
 			ff_handoff_seen = true
 			print("mdk-godot: freefall handoff -> mode %d" % mode)
