@@ -1977,6 +1977,22 @@ func _ff_input() -> Dictionary:
 	return d
 
 
+func _ff_away_key(bo: Vector2) -> int:
+	# Direction that runs AWAY from the bearing's dominant axis —
+	# crossing the missile's track at the largest angle.
+	if abs(bo.x) > abs(bo.y):
+		return KEY_DOWN if bo.y > 0.0 else KEY_UP
+	return KEY_LEFT if bo.x > 0.0 else KEY_RIGHT
+
+
+func _ff_flip_key(k: int) -> int:
+	match k:
+		KEY_LEFT: return KEY_RIGHT
+		KEY_RIGHT: return KEY_LEFT
+		KEY_UP: return KEY_DOWN
+		_: return KEY_UP
+
+
 func _inject_key(keycode: int, pressed: bool) -> void:
 	# One synthetic device event: the polled keycode AND the physical
 	# code are set, matching real hardware events — _ff_input polls
@@ -2013,32 +2029,15 @@ func _ff_steer_inject(frame: int) -> void:
 				bd = dz
 				bo = Vector2(m.x - p.x, m.y - p.y)
 				have = true
-		if have and bd > -800.0 and bd < 0.0:
-			# Final approach (~4s of closure at the un-throttled
-			# 250-vs-66 closing rate): oscillate PERPENDICULAR to
-			# the missile's lateral bearing on a fixed cadence —
-			# ~40 process-frames ≈ 33u legs, too fast for the
-			# vel*0.8+dir*0.2 blend to re-track, too short to pin
-			# on a clamp. Leads are only +-7.5 (wanderScale 7.5-c),
-			# so a moving target is a missed target.
-			var leg := int(frame / 40) % 2 == 0
-			if abs(bo.x) > abs(bo.y):
-				want[KEY_UP if leg else KEY_DOWN] = true
-			else:
-				want[KEY_LEFT if leg else KEY_RIGHT] = true
-		elif have:
-			_ff_jink = 0
-			# Serpentine sweep — missiles spawn far below (z~0 vs the
-			# player's ~5000) and the z-throttle slingshots them up
-			# through the dz window in a few frames, so a REACTIVE
-			# jink has no room; instead hold long diagonal runs at
-			# the 117 u/s cap on both axes (~150/~100 process-frames
-			# per direction = full-field sweeps) so the homing
-			# intercept point never settles on the player.
-			want[KEY_LEFT] = (frame % 300) < 150
-			want[KEY_RIGHT] = not want[KEY_LEFT]
-			want[KEY_UP] = (frame % 200) < 100
-			want[KEY_DOWN] = not want[KEY_UP]
+		if have:
+			# Hold the perpendicular run through the intercept —
+			# accelChannel sign-reversal RESETS velocity to the
+			# ~12 increment, so reversing inside the lethal window
+			# would stop the player dead. Sustained ~117 u/s
+			# laterally is the only motion the homing blend
+			# (vel*0.8+dir*0.2) cannot match while z-closing.
+			var away := _ff_away_key(bo)
+			want[away] = true
 		else:
 			# No inbound missile — release everything.
 			_ff_jink = 0
