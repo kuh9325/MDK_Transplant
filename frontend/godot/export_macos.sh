@@ -59,8 +59,12 @@ rm -rf "$OUT"
 mv "$SRC_APP" "$OUT"
 
 # Thin to arm64 — the GDExtension only ships arm64, so the x86_64
-# half could never run anyway.
-MAIN_EXE="$OUT/Contents/MacOS/MDK"
+# half could never run anyway. The exe name follows
+# application/config/name at export time (playtest builds set a
+# unique name), so read it from the bundle rather than hardcoding.
+EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" \
+  "$OUT/Contents/Info.plist")
+MAIN_EXE="$OUT/Contents/MacOS/$EXE_NAME"
 lipo -thin arm64 "$MAIN_EXE" -o "$MAIN_EXE.thin"
 mv "$MAIN_EXE.thin" "$MAIN_EXE"
 chmod +x "$MAIN_EXE"
