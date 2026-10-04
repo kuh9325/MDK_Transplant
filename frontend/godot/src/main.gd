@@ -1985,14 +1985,6 @@ func _ff_away_key(bo: Vector2) -> int:
 	return KEY_LEFT if bo.x > 0.0 else KEY_RIGHT
 
 
-func _ff_flip_key(k: int) -> int:
-	match k:
-		KEY_LEFT: return KEY_RIGHT
-		KEY_RIGHT: return KEY_LEFT
-		KEY_UP: return KEY_DOWN
-		_: return KEY_UP
-
-
 func _inject_key(keycode: int, pressed: bool) -> void:
 	# One synthetic device event: the polled keycode AND the physical
 	# code are set, matching real hardware events — _ff_input polls
