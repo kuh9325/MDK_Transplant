@@ -2,14 +2,15 @@
 //
 // DynamicObject models parse through the proven FUN_00428400
 // geometry record: per-element local f32 triples + 0x24-byte
-// triangle records whose ONLY established field is u16 v[3] at +0
-// (docs/GAMEPLAY_RECONSTRUCTION.md §42-49). The remaining record
-// bytes — material index / UV semantics — are NOT evidenced for
-// model records (the proven interior layout belongs to arena
-// region-C polys), so this presenter emits geometry only: one
-// indexed surface per element carrying the verbatim local verts
-// (P-converted) and triangle indices. GDScript assigns the
-// deterministic debug materials — see docs/GODOT_FRONTEND.md.
+// triangle records (docs/GAMEPLAY_RECONSTRUCTION.md §42-49). The
+// record's material index (s16 @+6) and pixel-space UV pairs
+// (f32[3][2] @+8) are evidenced on the FALL3D family which shares
+// the traversal record — CORROBORATED for traversal models, and
+// consistent with the documented model +0x10 material-pointer table
+// the parse fills via FUN_0041a694 (matlkup, one slot per name-table
+// record). Surfaces are grouped one per (element, material index)
+// so GDScript can bind each group's resolved material; a material
+// that fails the bank lookup takes the original's flat-0xff arm.
 //
 // `surfaceElems` aligns mesh surface index -> element index so the
 // caller can hide surfaces the core's element-disable mask masks
@@ -34,10 +35,15 @@
 namespace godot {
 
 struct ObjectGeometry {
-  Ref<ArrayMesh> mesh;             // one surface per element w/ tris
+  Ref<ArrayMesh> mesh;             // one surface per (elem,mat) group
   PackedInt32Array surfaceElems;   // surface -> element index
+  PackedInt32Array surfaceMatIdx;  // surface -> raw s16 at tri+6
+  PackedStringArray surfaceMats;   // surface -> name-table string
+                                   //   ("" for negative/OOB index)
+  PackedInt32Array surfacePenIdx;  // surface -> palette index for
+                                   //   raw-negative tris, else -1
   PackedStringArray elemNames;     // all elements (size = elem count)
-  int64_t vertCount = 0;           // total local verts
+  int64_t vertCount = 0;           // expanded output verts
   int64_t triCount = 0;            // total parsed tris
   std::uint64_t geomKey = 0;
 };
@@ -45,9 +51,9 @@ struct ObjectGeometry {
 // Identity digest over the model's immutable geometry content.
 std::uint64_t objectGeomKey(const mdk::RuntimeModel& m);
 
-// Build the indexed per-element mesh. Malformed triangle indices
-// (>= element vert count) are dropped individually — the core's
-// hardening contract — never fatal.
+// Build the per-(element, material) mesh. Malformed triangle
+// indices (>= element vert count) are clamped individually — the
+// core's hardening contract — never fatal.
 ObjectGeometry objectGeometryFromModel(const mdk::RuntimeModel& m);
 
 // Phase 16C — freefall model geometry. FALL3D records share the

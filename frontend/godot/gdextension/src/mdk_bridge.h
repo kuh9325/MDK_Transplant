@@ -127,6 +127,13 @@ class MdkBridge : public RefCounted {
   // MDK.CFG carries no overrides): mouse axis letters, scales, and
   // per-button action masks, for QA/debug display.
   Dictionary get_input_config() const;
+  // QA seam — pokes the shell flow's live 29-dword keyboard block
+  // (the Keyboard screen's own store; see
+  // FrontendFlowController::setKeyGlobalForDebug). syncBindings_
+  // mirrors it into the gameplay bindings on the next step, so
+  // tests can prove a configured binding reaches the fold without
+  // navigating the menu UI.
+  bool qa_set_key_global(int64_t index, int64_t code);
   // BSP-order digest for the PRIMARY displayed arena — kept for
   // compatibility; prefer get_display_digest() (covers set changes).
   int64_t get_arena_order_digest();
@@ -158,9 +165,21 @@ class MdkBridge : public RefCounted {
   // address — stable across frames and arena transfers.
   Array get_object_snapshots();
   // Immutable local model geometry for one snapshot id: mesh (one
-  // surface per element), surface_elems, elem_names, vert/tri/
-  // element counts, geom_key. Empty dict for a stale/unknown id.
+  // surface per (element, material index) group), surface_elems,
+  // surface_matidx/surface_mats/surface_pen (the tri-record s16 @+6
+  // fold), elem_names, vert/tri/element counts, geom_key. Empty
+  // dict for a stale/unknown id.
   Dictionary get_object_geometry(int64_t object_id);
+  // Resolved material for one geometry surface. `name` is the
+  // model name-table entry the surface's tri records selected
+  // (matlkup order: shared level MTI bank A, then the object's
+  // arena embedded .MAT bank B); `pen` >= 0 short-circuits to a
+  // flat palette color (negative material index). oid <= 0 resolves
+  // in the current display set — the shot/named-model path.
+  // Returns {valid, key, palette_index|tex,w,h,frames,
+  // palette_color, no_draw}; empty when unresolvable.
+  Dictionary get_object_material(int64_t object_id,
+                                 const String& name, int64_t pen);
   // NATIVE DIAGNOSTIC — wraps traversalRuntimeDiagnosticStart:
   // re-anchors the player at pos_mdk/yaw inside arena_index.
   // Test/QA path only; not original behavior.
@@ -613,6 +632,15 @@ class MdkBridge : public RefCounted {
   // composed palette, else the level fallback (the same rule
   // refreshKurtPalette_ and get_active_palette use).
   const std::uint8_t* activePalette_() const;
+  // Palette-expands frame 0 of a resolved model material's indexed
+  // pixel span into an ImageTexture (index 0 -> alpha 0 — the same
+  // convention freefallTexture_ applies to this record family).
+  // Cached by the get_object_material key (arena set : name : pen)
+  // — the palette is per-set state.
+  Ref<ImageTexture> objectTexture_(const String& key,
+                                   const mdk::ArenaRenderMaterial& m,
+                                   const std::uint8_t* pal);
+  std::unordered_map<std::string, Ref<ImageTexture>> objTexCache_;
   // Persistent expand targets — one Image + one ImageTexture each
   // for the HUD overlay and the SNIPERS1 bezel, re-uploaded only
   // when (contentDigest, paletteKey) changes. Bounded: 2 textures.
@@ -737,6 +765,13 @@ class MdkBridge : public RefCounted {
   std::unique_ptr<mdk::TraversalRuntime> rt_;
   mdk::FrontendTimingState timing_;
   mdk::GameplayInputBindings bindings_;
+  // Mirrors the shell flow's live settings tables (keyGlobals_,
+  // mouse W set) into bindings_ — the Keyboard/Mouse screens mutate
+  // that block in place, and the persist overlays it. Called once
+  // per step so configured bindings (including post-boot rebinds)
+  // actually reach the input fold; before this the bridge held a
+  // frozen factory copy and no bind change ever took effect.
+  void syncBindings_();
   mdk::TraversalFrameResult last_;
   bool hasFrame_ = false;
   // Previous frame's keyLevel — the original's keyEdge is

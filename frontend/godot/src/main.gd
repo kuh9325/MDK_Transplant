@@ -55,11 +55,15 @@ extends Node3D
 #                     (requires a real renderer — not --headless)
 #   --frames N        run N process frames then quit (startup proof)
 #
-# Keys: WASD move, Q/E strafe, A/D turn, R/F look up/down, Space
-# jump, Shift turbo, F1 collision wire toggle, F2 dynamic-object
-# debug toggle (AABB wires + name/id/arena tags), F3 debug text.
-# Interactive runs capture the mouse; Esc releases the capture once,
-# then quits. Mouse deltas/buttons are forwarded to the core raw-
+# Keys: the factory binding block (keyboard_menu.h defaults) —
+# arrows move+turn, LAlt jump, LCtrl fire, Space sniper, X sidestep,
+# LShift turbo, Caps set-turbo, A/Z look+zoom, number row = weapons.
+# The in-game Keyboard screen rebinds all of it. F1 collision wire,
+# F2 dynamic-object debug (AABB wires + name/id/arena tags), F3
+# debug text. Interactive runs capture the mouse; Esc releases the
+# capture once, then quits. Held physical keys are translated to the
+# original's internal code domain (the FUN_0046b688 bitmap) and sent
+# as "keys" each frame; mouse deltas/buttons go through the raw
 # input path — the configured W-set mapping (axes "ABG", scales
 # 16/16/50, button masks 1/4/2/0) lives entirely in mdk_core.
 
@@ -80,6 +84,10 @@ var proxy_debug := false      # F4 — legacy capsule/wire proxy
 var last_kurt := {}           # last applied kurt snapshot (diag)
 var combat_demo := false      # --combat-demo: scripted scoped-fire
                               # input under the real renderer
+var chute_demo := false       # --chute-demo: hold jump from frame 2
+                              # (the sustain->K_CHUTE evidence path)
+var step_shot := false        # --step: keep stepping under --screenshot
+                              # (for deep-frame freefall/traversal probes)
 var demo_frame := 0
 
 # Phase 16C — mode-2 freefall presentation state. All gameplay lives
@@ -174,7 +182,7 @@ func _stream_pace_run(delta_ms: float) -> int:
 	var ran := 0
 	while ran < n and bridge.stream_active():
 		bridge.step_frame_input(STREAM_STEP_MS,
-			{"actions": _input_mask()})
+			{"actions": _input_mask(), "keys": _gameplay_keys()})
 		ran += 1
 	pace_steps += ran
 	if pace_trace and bridge.stream_active():
@@ -288,8 +296,9 @@ var obj_wire_mat: StandardMaterial3D
 # Dynamic-object presentation caches — geometry keyed by the core
 # geom_key digest (immutable local geometry may be shared when the
 # digest proves identity), materials keyed by element name.
-var geom_cache := {}        # geom_key -> [{elem:int, mesh:ArrayMesh}]
-var elem_mats := {}         # elem name -> StandardMaterial3D
+var geom_cache := {}        # geom_key -> [{elem,mesh,mat,pen}]
+var elem_mats := {}         # elem name -> StandardMaterial3D (fallback)
+var obj_mats := {}          # "o:<oid>|<name>|<pen>" -> StandardMaterial3D
 var obj_wires := {}         # object id -> MeshInstance3D (AABB wire)
 var obj_tags := {}          # object id -> Label3D
 
@@ -473,6 +482,8 @@ func _ready() -> void:
 	# (MMB edge, then held LMB) so a real-renderer run exercises the
 	# combat presentation without a harness.
 	combat_demo = "--combat-demo" in args
+	chute_demo = "--chute-demo" in args
+	step_shot = "--step" in args
 	data_root_path = _resolve_data_root(args)
 	var level := _arg_value(args, "--level", "TRAVERSE/LEVEL3/LEVEL3.DTI")
 	var arena := _arg_value(args, "--arena", "HMO_1")
@@ -717,6 +728,11 @@ func _ready() -> void:
 				get_tree().quit(2)
 				return
 			_run_smoke_restore()
+		elif "--smoke-input" in args:
+			# Live-input regression — real InputEvents -> the same
+			# dict _process builds -> the configured-binding fold.
+			# Runs on the default LEVEL3/HMO_1 load.
+			_run_smoke_input()
 		elif freefall:
 			_run_smoke_freefall(int(ff_course), ff_skill, ff_seed)
 		elif campaign:
@@ -761,9 +777,13 @@ func _ready() -> void:
 			"(mode-5 intermission; Esc quits)") %
 			[stream_course, ff_skill, ff_seed])
 	else:
-		print(("mdk-godot: arena=%s arenas=%d  (WASD/QE move+strafe, " +
-			"AD turn, RF look, Space jump, mouse=captured, F1 " +
-			"collision, F2 object debug, Esc release/quit)") %
+		# Factory bindings (the original defaults — the in-game
+		# Keyboard screen rebinds them): arrows move+turn, LAlt jump,
+		# LCtrl fire, Space sniper scope, A/Z look+zoom, X sidestep,
+		# LShift turbo; LMB fire / RMB jump / MMB sniper.
+		print(("mdk-godot: arena=%s arenas=%d  (arrows move, " +
+			"LAlt jump, LCtrl fire, Space sniper, LMB/RMB fire/" +
+			"jump, MMB sniper; Esc release/quit)") %
 			[arena, bridge.get_arena_names().size()])
 
 
@@ -859,23 +879,29 @@ func _apply_arena_snapshots() -> void:
 
 
 func _split_elem_meshes(src: ArrayMesh,
-		surface_elems: PackedInt32Array) -> Array:
-	# One single-surface mesh per element — lets the element-disable
-	# mask toggle visibility per element.
+		surface_elems: PackedInt32Array,
+		surface_mats: PackedStringArray,
+		surface_pen: PackedInt32Array) -> Array:
+	# One single-surface mesh per (element, material-index) group —
+	# the element-disable mask toggles visibility per element (the
+	# "elem" meta), while each surface binds its own resolved
+	# material (the model tri record's s16 @+6 -> matlkup name).
 	var out := []
 	for s in src.get_surface_count():
 		var arrays: Array = src.surface_get_arrays(s)
 		var m := ArrayMesh.new()
 		m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-		out.append({"elem": int(surface_elems[s]), "mesh": m})
+		out.append({"elem": int(surface_elems[s]), "mesh": m,
+			"mat": String(surface_mats[s]) if s < surface_mats.size() else "",
+			"pen": int(surface_pen[s]) if s < surface_pen.size() else -1})
 	return out
 
 
 func _elem_material(elem_name: String) -> StandardMaterial3D:
-	# Deterministic per-element debug material — the model triangle
-	# record's material/UV fields are NOT evidenced, so objects
-	# render unshaded in stable element-name colors. Documented
-	# fidelity seam (docs/GODOT_FRONTEND.md §materials).
+	# Deterministic per-element debug material — retained ONLY as
+	# the last-resort fallback when the bridge cannot resolve a
+	# surface at all (stale id, missing banks). Real surfaces go
+	# through _object_material (matlkup-resolved textures/pens).
 	var key := elem_name if not elem_name.is_empty() else "<anon>"
 	if elem_mats.has(key):
 		return elem_mats[key]
@@ -890,11 +916,55 @@ func _elem_material(elem_name: String) -> StandardMaterial3D:
 	return m
 
 
+func _object_material(oid: int, mat_name: String, pen: int,
+		fallback: String) -> StandardMaterial3D:
+	# Surface material for one (element, material-index) group —
+	# the traversal sibling of _ff_material. oid <= 0 resolves the
+	# level-model context (shots/named geometry) in the current
+	# display set. Materials cache per (oid, name, pen); the bridge
+	# dedupes the underlying ImageTextures per arena set.
+	var ck := "o:%d|%s|%d" % [oid, mat_name, pen]
+	if obj_mats.has(ck):
+		return obj_mats[ck]
+	var d: Dictionary = bridge.get_object_material(oid, mat_name, pen)
+	if d.is_empty() or not bool(d.get("valid", false)):
+		var fb := _elem_material(fallback)
+		obj_mats[ck] = fb
+		return fb
+	if int(d.get("palette_index", -1)) >= 0:
+		# Flat pen / index record — the color is the palette entry.
+		# palette_index >= 256 = the no-draw slot (NONE).
+		if bool(d.get("no_draw", false)):
+			var nd := _ff_no_draw_material()
+			obj_mats[ck] = nd
+			return nd
+		var pm := StandardMaterial3D.new()
+		pm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		pm.cull_mode = BaseMaterial3D.CULL_DISABLED
+		pm.albedo_color = d.get("palette_color", Color(1, 1, 1))
+		obj_mats[ck] = pm
+		return pm
+	# Texture record — pixel-space UVs are normalized by uv1_scale.
+	# Nearest filter: the software rasterizer texel-fetches.
+	var tm := StandardMaterial3D.new()
+	tm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	tm.cull_mode = BaseMaterial3D.CULL_DISABLED
+	tm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	tm.albedo_texture = d["tex"]
+	var tw := float(d.get("w", 0))
+	var th := float(d.get("h", 0))
+	if tw > 0.0 and th > 0.0:
+		tm.uv1_scale = Vector3(1.0 / tw, 1.0 / th, 1.0)
+	obj_mats[ck] = tm
+	return tm
+
+
 func _object_geom_meshes(g: Dictionary) -> Array:
 	var key := int(g["geom_key"])
 	if geom_cache.has(key):
 		return geom_cache[key]
-	var split := _split_elem_meshes(g["mesh"], g["surface_elems"])
+	var split := _split_elem_meshes(g["mesh"], g["surface_elems"],
+		g["surface_mats"], g["surface_pen"])
 	geom_cache[key] = split
 	return split
 
@@ -925,7 +995,8 @@ func _apply_object_snapshots() -> void:
 					var mi := MeshInstance3D.new()
 					mi.name = "E%d" % int(sm["elem"])
 					mi.mesh = sm["mesh"]
-					mi.material_override = _elem_material(
+					mi.material_override = _object_material(
+						oid, String(sm["mat"]), int(sm["pen"]),
 						names[int(sm["elem"])])
 					mi.set_meta("elem", int(sm["elem"]))
 					node.add_child(mi)
@@ -1154,10 +1225,17 @@ func _build_combat_presenter() -> void:
 		cam.far = 20000.0
 		vp.add_child(cam)
 		$ShotCamRoot.add_child(vp)
+		# A camera inside a SubViewport is NOT auto-picked — without
+		# current the viewport never renders and the bound
+		# ViewportTexture shows the unrendered checkerboard. Must be
+		# set once the subtree is in the scene tree.
+		cam.current = true
 		shot_vps.append(vp)
 		shot_cams.append(cam)
-		var vt := ViewportTexture.new()
-		vt.viewport_path = vp.get_path()
+		# viewport.get_texture() binds the render-target RID directly —
+		# a hand-made ViewportTexture with viewport_path never resolves
+		# outside the editor and shows the checkerboard placeholder.
+		var vt := vp.get_texture()
 		var win := TextureRect.new()
 		win.name = "ShotWin_%d" % i
 		win.texture = vt
@@ -1337,7 +1415,9 @@ func _spawn_remnant(ev: Dictionary) -> void:
 	for sm in ent["meshes"]:
 		var mi := MeshInstance3D.new()
 		mi.mesh = sm["mesh"]
-		mi.material_override = _elem_material(String(sm["name"]))
+		mi.material_override = _object_material(
+			0, String(sm["mat"]), int(sm["pen"]),
+			String(sm["name"]))
 		n.add_child(mi)
 	$FxRoot.add_child(n)
 	remnants.append(n)
@@ -1345,8 +1425,9 @@ func _spawn_remnant(ev: Dictionary) -> void:
 
 
 func _load_geom_entry(g: Dictionary) -> Dictionary:
-	# Normalize a get_*_geometry dict into {key, meshes:[{mesh,name}]}
-	# for per-element material naming (same convention as objects).
+	# Normalize a get_*_geometry dict into {key, meshes:[{mesh,name,
+	# mat,pen}]} for per-surface material binding (same convention
+	# as objects).
 	if g.is_empty():
 		return {"key": -1, "meshes": []}
 	var meshes := []
@@ -1356,7 +1437,8 @@ func _load_geom_entry(g: Dictionary) -> Dictionary:
 		var ei := int(sm["elem"])
 		if ei >= 0 and ei < names.size():
 			nm = names[ei]
-		meshes.append({"mesh": sm["mesh"], "name": nm})
+		meshes.append({"mesh": sm["mesh"], "name": nm,
+			"mat": String(sm["mat"]), "pen": int(sm["pen"])})
 	return {"key": int(g["geom_key"]), "meshes": meshes}
 
 
@@ -1397,7 +1479,8 @@ func _apply_shot_snapshots() -> void:
 				for sm in ent["meshes"]:
 					var mi := MeshInstance3D.new()
 					mi.mesh = sm["mesh"]
-					mi.material_override = _elem_material(
+					mi.material_override = _object_material(
+						0, String(sm["mat"]), int(sm["pen"]),
 						String(sm["name"]))
 					node.add_child(mi)
 				node.set_meta("geom_key", gkey)
@@ -1728,6 +1811,7 @@ func _reset_presentation_for_restore() -> void:
 	last_display_digest = -1
 	geom_cache.clear()
 	elem_mats.clear()
+	obj_mats.clear()
 	# Phase 17B.2 — HUD/view surfaces presented the discarded
 	# runtime; they rebuild from the first post-restore snapshot.
 	_hide_hud()
@@ -1776,9 +1860,12 @@ func _build_hud_presenter() -> void:
 	scope_cam.far = 20000.0
 	scope_vp.add_child(scope_cam)
 	$ShotCamRoot.add_child(scope_vp)
-	var vt := ViewportTexture.new()
-	vt.viewport_path = scope_vp.get_path()
-	sr.texture = vt
+	scope_cam.current = true   # same contract as the shot cams —
+	                           # no current -> never-rendered texture
+	# Same binding contract as the shot windows — get_texture(), not a
+	# ViewportTexture.new() + viewport_path (that path never resolves
+	# at runtime and the rect shows the checkerboard placeholder).
+	sr.texture = scope_vp.get_texture()
 
 
 func _hide_hud() -> void:
@@ -1867,17 +1954,59 @@ func _apply_hud_snapshot() -> void:
 func _ff_input() -> Dictionary:
 	# Mode-2 direction channels — the dict booleans land directly on
 	# FreefallInput (the same fold FUN_00407e50 gives the bound
-	# direction keys: left=-X right=+X up=+Y down=-Y).
-	return {
-		"left": Input.is_key_pressed(KEY_LEFT) or
-			Input.is_key_pressed(KEY_A),
-		"right": Input.is_key_pressed(KEY_RIGHT) or
-			Input.is_key_pressed(KEY_D),
-		"up": Input.is_key_pressed(KEY_UP) or
-			Input.is_key_pressed(KEY_W),
-		"down": Input.is_key_pressed(KEY_DOWN) or
-			Input.is_key_pressed(KEY_S),
-	}
+	# direction keys: left=-X right=+X up=+Y down=-Y). Only TRUE
+	# entries are emitted — the dict overrides the bound-key held()
+	# state in stepFreefall_, so a false would mask a real bound-key
+	# press that _gameplay_keys() already delivered.
+	var d := {}
+	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A):
+		d["left"] = true
+	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D):
+		d["right"] = true
+	if Input.is_key_pressed(KEY_UP) or Input.is_key_pressed(KEY_W):
+		d["up"] = true
+	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S):
+		d["down"] = true
+	return d
+
+
+# Physical keys the gameplay path polls every frame — every keycode
+# _fe_internal_code can translate (the FUN_0046b688 device bitmap
+# domain). Held state is polled, not event-latched, so window-focus
+# transitions can't strand a key.
+const _KEY_POLLED := [
+	KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I, KEY_O,
+	KEY_P, KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K,
+	KEY_L, KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M,
+	KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
+	KEY_0, KEY_ENTER, KEY_KP_ENTER, KEY_ESCAPE, KEY_BACKSPACE,
+	KEY_TAB, KEY_SPACE, KEY_MINUS, KEY_EQUAL, KEY_BRACKETLEFT,
+	KEY_BRACKETRIGHT, KEY_BACKSLASH, KEY_SEMICOLON, KEY_APOSTROPHE,
+	KEY_QUOTELEFT, KEY_COMMA, KEY_PERIOD, KEY_SLASH, KEY_CAPSLOCK,
+	KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8,
+	KEY_F9, KEY_F10, KEY_F11, KEY_F12, KEY_PRINT, KEY_SCROLLLOCK,
+	KEY_PAUSE, KEY_INSERT, KEY_HOME, KEY_PAGEUP, KEY_DELETE,
+	KEY_END, KEY_PAGEDOWN, KEY_RIGHT, KEY_LEFT, KEY_DOWN, KEY_UP,
+	KEY_NUMLOCK, KEY_KP_DIVIDE, KEY_KP_MULTIPLY, KEY_KP_SUBTRACT,
+	KEY_KP_ADD, KEY_KP_1, KEY_KP_2, KEY_KP_3, KEY_KP_4, KEY_KP_5,
+	KEY_KP_6, KEY_KP_7, KEY_KP_8, KEY_KP_9, KEY_KP_0, KEY_KP_PERIOD,
+	KEY_CTRL, KEY_SHIFT, KEY_ALT, KEY_META,
+]
+
+
+func _gameplay_keys() -> PackedInt32Array:
+	# Held physical keys -> the original's internal key codes (the
+	# same domain the keyboard-capture menu writes into bindings).
+	# This is the ONLY live keyboard path: KeySniper, KeyJump, the
+	# item/weapon/zoom rows and every rebind resolve through the
+	# configured table — nothing is hard-coded past the device map.
+	var out := PackedInt32Array()
+	for k in _KEY_POLLED:
+		if Input.is_physical_key_pressed(k) or Input.is_key_pressed(k):
+			var c := _fe_internal_code(k)
+			if c >= 0:
+				out.append(c)
+	return out
 
 
 func _ff_pen_color(idx: int) -> Color:
@@ -3237,10 +3366,22 @@ func _process(delta: float) -> void:
 			_frontend_hide()
 		else:
 			pass
-	if shot_path.is_empty() and (mode == 2 or mode == 3):
-		# Screenshot mode keeps the exact frame-0 spawn pose.
+	if (shot_path.is_empty() or combat_demo or chute_demo \
+			or step_shot) and (mode == 2 or mode == 3):
+		# Screenshot mode keeps the exact frame-0 spawn pose — UNLESS
+		# a scripted-input demo flag is set (combat/chute demos step
+		# the runtime deliberately; plain --screenshot still freezes).
+		#
+		# Keyboard goes through "keys" — held physical codes in the
+		# original's internal domain. buildRawInput_ turns them into
+		# keyLevel + keyEdge, then the configured binding table
+		# (KeyJump/KeySniper/KeyFire/items/zoom/...) resolves the
+		# semantics — the same path the keyboard menu rebinds. The
+		# QA "actions" mask is left empty here: its hard-coded
+		# WASD/Space aliases conflicted with the real bindings (Space
+		# is KeySniper in the defaults, not jump).
 		var input := {
-			"actions": _input_mask(),
+			"keys": _gameplay_keys(),
 			"mouse_dx": mouse_dx,
 			"mouse_dy": mouse_dy,
 			"mouse_dz": mouse_dz,
@@ -3259,6 +3400,18 @@ func _process(delta: float) -> void:
 				input["mouse_buttons"] = 4
 			elif demo_frame >= 10:
 				input["mouse_buttons"] = 1
+		elif chute_demo and mode == 3:
+			# LAlt (internal 0x38) press at frame 15 — after the spawn
+			# settle, so the jump edge lands on a grounded frame —
+			# held through the descent: airCharge seeds on the way
+			# down, the sustain event selects K_CHUTE then K_CHUTEC —
+			# the original's chute contract on the real input path.
+			demo_frame += 1
+			if demo_frame >= 15:
+				var k: PackedInt32Array = input["keys"]
+				if not k.has(0x38):
+					k.append(0x38)
+				input["keys"] = k
 		bridge.step_frame_input(delta * 1000.0, input)
 		# The freefall->traversal handoff can flip the mode inside the
 		# step — re-read so the apply path follows the live runtime.
@@ -3982,8 +4135,11 @@ func _run_smoke(data_root: String) -> void:
 		if not g.is_empty():
 			_check(int(g["elem_count"]) == 25,
 				"geometry elem_count == 25")
-			_check(int(g["vert_count"]) == int(o["vert_count"]) and
-				int(g["tri_count"]) == int(o["tri_count"]),
+			# vert_count is the EXPANDED per-tri output (tris*3 —
+			# shared verts duplicate across material groups);
+			# tri_count still equals the snapshot's model count.
+			_check(int(g["tri_count"]) == int(o["tri_count"]) and
+				int(g["vert_count"]) == int(o["tri_count"]) * 3,
 				"geometry counts == snapshot counts")
 			_check(int(g["geom_key"]) == int(o["geom_key"]),
 				"geom_key == snapshot key")
@@ -3991,9 +4147,10 @@ func _run_smoke(data_root: String) -> void:
 			_check(gm != null and gm.get_surface_count() ==
 				PackedInt32Array(g["surface_elems"]).size(),
 				"mesh surfaces == surface_elems")
-			print("first_model=%s elems=%d verts=%d tris=%d" % [
+			print("first_model=%s elems=%d verts=%d tris=%d (src %d/%d)" % [
 				String(g["model"]), int(g["elem_count"]),
-				int(g["vert_count"]), int(g["tri_count"])])
+				int(g["vert_count"]), int(g["tri_count"]),
+				int(o["vert_count"]), int(o["tri_count"])])
 		# Presentation node mirrors the snapshot transform.
 		_apply_object_snapshots()
 		var onode := $DynamicObjectRoot.get_node_or_null(
@@ -4666,6 +4823,162 @@ func _run_smoke(data_root: String) -> void:
 		"audio: presenter players cleared across reload")
 
 	print("smoke: %d failure(s)" % failures)
+
+
+func _smoke_inject_key(physical: int, pressed: bool) -> void:
+	# Real InputEventKey through Input.parse_input_event — the same
+	# event the OS delivers for a physical key. Both keycode and
+	# physical_keycode are set (hardware events carry both): the
+	# keycode side feeds _ff_input's is_key_pressed aliases, the
+	# physical side feeds _gameplay_keys. flush_buffered_events
+	# makes the held state visible to the polled Input API inside
+	# this synchronous smoke.
+	var ev := InputEventKey.new()
+	ev.physical_keycode = physical
+	ev.keycode = physical
+	ev.pressed = pressed
+	Input.parse_input_event(ev)
+	Input.flush_buffered_events()
+
+
+func _smoke_live_step() -> Dictionary:
+	# The exact dict _process() builds for modes 2/3 — the regression
+	# that was missing: a real key event must reach the fold.
+	var inp := {
+		"keys": _gameplay_keys(),
+		"mouse_dx": 0, "mouse_dy": 0, "mouse_dz": 0,
+		"mouse_buttons": _mouse_button_bits(),
+	}
+	inp.merge(_ff_input(), true)
+	return bridge.step_frame_input(1000.0 / 30.0, inp)
+
+
+func _run_smoke_input() -> void:
+	# Live-input regression — the six-defect repair: before the fix,
+	# _process never sent "keys", so every configured binding
+	# (Space=KeySniper, LAlt=KeyJump, LCtrl=KeyFire, arrows, items,
+	# zoom, weapons, turbo) was dead in ordinary play. These checks
+	# drive REAL InputEvents through the same poll the live frame
+	# uses, and observe the fold's echo fields on the step result.
+	var cdir := ProjectSettings.globalize_path("user://saves_input")
+	DirAccess.make_dir_recursive_absolute(cdir)
+	_check(bridge.frontend_boot(cdir),
+		"input: frontend_boot (live binding table)")
+	_reset_audio()
+	bridge.step_frame_input(0.0, {})
+
+	# --- A. Space -> KeySniper edge -> scope ------------------------
+	_smoke_inject_key(KEY_SPACE, true)
+	_check(_gameplay_keys().has(57),
+		"input: held space maps to internal 57")
+	var r: Dictionary = _smoke_live_step()
+	_check(bool(r["input"]["sniper_pulse"]),
+		"input: space edge -> sniperPulse")
+	r = _smoke_live_step()
+	_check(not bool(r["input"]["sniper_pulse"]),
+		"input: held space -> single pulse, no repeat")
+	var scoped := false
+	for i in 8:
+		_smoke_live_step()
+		if bool(bridge.get_hud_snapshot().get("sniper_view", false)):
+			scoped = true
+			break
+	_check(scoped, "input: sniper_view armed after space pulse")
+	_smoke_inject_key(KEY_SPACE, false)
+
+	# --- B. Rebind: KeySniper (global 7) -> 'E' (internal 18) -------
+	_check(bridge.qa_set_key_global(7, 18),
+		"input: rebind snipe slot -> E")
+	_smoke_live_step()   # syncBindings_ mirrors the new table
+	_smoke_inject_key(KEY_SPACE, true)
+	r = _smoke_live_step()
+	_check(not bool(r["input"]["sniper_pulse"]),
+		"input: space dead after rebind")
+	_smoke_inject_key(KEY_SPACE, false)
+	_smoke_inject_key(KEY_E, true)
+	r = _smoke_live_step()
+	_check(bool(r["input"]["sniper_pulse"]),
+		"input: E edge -> sniperPulse (rebind honored)")
+	_smoke_inject_key(KEY_E, false)
+	# The pulse toggled scope off — verify the view followed.
+	scoped = true
+	for i in 8:
+		_smoke_live_step()
+		if not bool(bridge.get_hud_snapshot().get("sniper_view",
+				false)):
+			scoped = false
+			break
+	_check(not scoped, "input: sniper_view cleared after E pulse")
+	_check(bridge.qa_set_key_global(7, 57),
+		"input: restore factory snipe")
+	_smoke_live_step()
+
+	# --- C. LAlt -> KeyJump level -> airborne -----------------------
+	_smoke_inject_key(KEY_ALT, true)
+	r = _smoke_live_step()
+	_check(bool(r["input"]["jump"]), "input: LAlt -> jump level")
+	var airborne := false
+	for i in 30:
+		r = _smoke_live_step()
+		if not bool(r["grounded"]):
+			airborne = true
+			break
+	_check(airborne, "input: held LAlt -> Kurt airborne")
+	_smoke_inject_key(KEY_ALT, false)
+	for i in 3:
+		_smoke_live_step()
+
+	# --- D. LCtrl -> fire level -------------------------------------
+	_smoke_inject_key(KEY_CTRL, true)
+	r = _smoke_live_step()
+	_check(bool(r["input"]["fire"]), "input: LCtrl -> fire level")
+	_smoke_inject_key(KEY_CTRL, false)
+	_smoke_live_step()
+
+	# --- E. Arrows -> turn/move axes (KeyLeft=105 / KeyUp=103) ------
+	_smoke_inject_key(KEY_LEFT, true)
+	r = _smoke_live_step()
+	_check(float(r["input"]["turn_axis"]) < 0.0,
+		"input: left arrow -> turnAxis < 0")
+	_smoke_inject_key(KEY_LEFT, false)
+	_smoke_inject_key(KEY_UP, true)
+	r = _smoke_live_step()
+	_check(float(r["input"]["move_digital"]) < 0.0,
+		"input: up arrow -> moveDigital < 0 (fwd)")
+	_smoke_inject_key(KEY_UP, false)
+	_smoke_live_step()
+
+	# --- F. MMB -> sniper via the mouse-button mask (bit2 -> 4) ----
+	var mev := InputEventMouseButton.new()
+	mev.button_index = MOUSE_BUTTON_MIDDLE
+	mev.pressed = true
+	Input.parse_input_event(mev)
+	Input.flush_buffered_events()
+	r = _smoke_live_step()
+	_check(bool(r["input"]["sniper_pulse"]),
+		"input: MMB edge -> sniperPulse (mouse mask)")
+	var mrel := InputEventMouseButton.new()
+	mrel.button_index = MOUSE_BUTTON_MIDDLE
+	mrel.pressed = false
+	Input.parse_input_event(mrel)
+	Input.flush_buffered_events()
+	_smoke_live_step()
+
+	# --- G. Mode-2 freefall: bound arrows steer via "keys" ----------
+	# (Space-held ending is irrelevant — mode 2 consumes directions.)
+	_check(bridge.load_freefall(0, 1, 12648430),
+		"input: freefall load")
+	_smoke_inject_key(KEY_LEFT, true)
+	r = _smoke_live_step()
+	_check(bool(r["input"]["left"]),
+		"input: bound left arrow -> freefall left")
+	_smoke_inject_key(KEY_LEFT, false)
+	_smoke_inject_key(KEY_A, true)
+	r = _smoke_live_step()
+	_check(bool(r["input"]["left"]),
+		"input: 'A' alias -> freefall left (dict)")
+	_smoke_inject_key(KEY_A, false)
+	_smoke_live_step()
 
 
 func _run_smoke_generic(level: String, arena: String) -> void:

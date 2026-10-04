@@ -16815,6 +16815,53 @@ void test_player_look() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 5C/0x540cbc — the sustain dispatch needs the ONE original
+// event-channel/priority global shared between FUN_00466740 and the
+// dispatcher. Regression: the port kept them as separate fields
+// (eventPriority vs vert.eventIdle), so the sustain path's ==7->0
+// reset never reached the latch and cac could never leave 0x2be for
+// 0x2bd — jump-hold glides never ran the chute animation branch.
+// ---------------------------------------------------------------------------
+void test_traversal_chute_dispatch() {
+  using namespace mdk;
+  CollisionFixture f = makeFloorArena();   // flat floor at z=10
+
+  TraversalRuntime rt;
+  TraversalArena* a = travArenaAdd(rt, "TEST");
+  a->dyn.col.verts = f.verts.data();
+  a->dyn.col.polys = f.polys.data();
+  a->dyn.col.nodes = f.nodes.data();
+  a->dyn.col.deepFloorZ = -1000.0f;
+  rt.cur = a;
+  rt.cs.arena = &a->dyn.col;
+  rt.cs.queryEnabled = 1;
+  rt.cs.arenaValid = 1;
+  rt.cs.objectDataLoaded = 1;
+  rt.cs.pos[2] = 12.0f;
+  rt.cs.entryPos[2] = 12.0f;
+  rt.fieldHealth = 100;
+  const GameplayInputBindings bindings;
+  const FrontendTimingState timing;
+  RawGameplayInput jump{};
+  jump.keyLevel[56 >> 5] |= 1u << (56 & 31);   // KeyJump held
+
+  // Settle on the floor, then hold jump through the whole arc. The
+  // anim-layer descent tick (vertVel <= 0 inside 0x2be) seeds
+  // airCharge, the sustain event 0x2bd posts at type 7, and — with
+  // the alias intact — the channel reset lets the dispatcher move
+  // cac to 0x2bd (K_CHUTE) on the same frame it first fires.
+  int sustainFrame = -1;
+  bool sawJump = false;
+  for (int i = 0; i < 120; ++i) {
+    stepTraversalRuntime(rt, jump, bindings, timing);
+    if (rt.locoState == 0x2be || rt.locoState == 0x2bf) sawJump = true;
+    if (rt.locoState == 0x2bd && sustainFrame < 0) sustainFrame = i;
+  }
+  CHECK(sawJump);
+  CHECK(sustainFrame >= 0);          // 0x2bd dispatch reached
+  CHECK(rt.vert.jumpSustain == 1 || sustainFrame >= 0);
+}
+// ---------------------------------------------------------------------------
 // Phase 5K — normal traversal camera pose and view matrix.
 // FUN_004301e0 tail (position branches, basis, M1/M2 pair, view
 // config) + FUN_00431100 (overhead). Expected values are computed
@@ -29406,6 +29453,7 @@ int main() {
   test_mover_runtime();
   test_object_animation();
   test_player_look();
+  test_traversal_chute_dispatch();
   test_player_camera();
   test_camera_obstruction();
   test_camera_nudge();

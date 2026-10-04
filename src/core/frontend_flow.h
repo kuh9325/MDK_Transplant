@@ -200,6 +200,16 @@ public:
   const std::array<int, kKeyboardGlobalCount>& keyGlobals() const {
     return keyGlobals_;
   }
+  // QA seam — writes into the live 29-dword binding block (the same
+  // array the Keyboard screen's capture mutates, DAT_005413fe..46e)
+  // so tests can exercise the bindings -> gameplay path without
+  // driving the menu UI. Does not mark settings dirty — nothing
+  // persists.
+  void setKeyGlobalForDebug(int index, int code) {
+    if (index >= 0 && index < kKeyboardGlobalCount) {
+      keyGlobals_[index] = code;
+    }
+  }
   // DAT_00541486 — the shared settings-dirty flag (see returnToRoot).
   bool settingsDirty() const { return settingsDirty_; }
 

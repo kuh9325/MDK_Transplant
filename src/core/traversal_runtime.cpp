@@ -1475,9 +1475,16 @@ TraversalFrameResult stepTraversalRuntime(
         // sweep + aim + zoom), then the FUN_00469b98 weapon-select seam.
         // The gravity frame / applied Z / lateral move are surfaced so the
         // out-diagnostics match the normal branch's reporting.
+        // 0x540cbc alias — the dispatcher's eventPriority IS the jump
+        // machine's eventIdle (one global in the original; the save
+        // loader maps save +0xc0 into both fields). Pull the live latch
+        // in, push the machine's writes back out — same contract as the
+        // normal branch's vertical block below.
+        rt.vert.eventIdle = rt.eventPriority;
         const PlayerVerticalEnvironment sEnv = makeVertEnv(false);
         sniperCoreUpdate(rt, raw, bindings, rt.prevFrame, sEnv,
                          timing.smoothed, &vf, &appliedZ, &positionChanged);
+        rt.eventPriority = rt.vert.eventIdle;
         playerWeaponSelect(rt, rt.prevFrame);   // FUN_00469b98
       }
     } else {
@@ -1537,6 +1544,14 @@ TraversalFrameResult stepTraversalRuntime(
       rt.vert.posX = rt.cs.pos[0];
       rt.vert.posY = rt.cs.pos[1];
       rt.vert.posZ = rt.cs.pos[2];
+      // 0x540cbc alias — eventPriority (the dispatcher latch) and
+      // vert.eventIdle (the jump machine's channel counter) are ONE
+      // global in the original. Pull the latch in so FUN_00466740's
+      // gate sees the dispatch writes, then push the machine's
+      // writes (sustain/landing ==7->0 resets, incl. the ones inside
+      // the collision apply) back out before the dispatcher consumes
+      // them this frame.
+      rt.vert.eventIdle = rt.eventPriority;
       vf = integratePlayerVertical(vertEnv, rt.motion, rt.vert);
       if (vf.collisionIssued) {
         const CollisionPoly* vContact = playerVerticalApplyCollision(
@@ -1544,6 +1559,7 @@ TraversalFrameResult stepTraversalRuntime(
         if (vContact) rt.lastContactPoly = vContact;
       }
       playerVerticalPostStep(vertEnv, rt.vert);
+      rt.eventPriority = rt.vert.eventIdle;
       rt.vert.posX = rt.cs.pos[0];
       rt.vert.posY = rt.cs.pos[1];
       rt.vert.posZ = rt.cs.pos[2];

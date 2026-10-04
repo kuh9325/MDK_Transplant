@@ -2009,6 +2009,43 @@ int main() {
     }
   }
 
+  // ---- PCM8 host-boundary conversion (pcmForGodotWav) --------------
+  // RIFF PCM8 is unsigned-biased (0x80 silence); Godot FORMAT_8_BITS
+  // wants signed. The bridge converts exactly once at the WAV pack —
+  // verify the mapping and the no-op paths.
+  {
+    mdk::SniWave wv8{};
+    wv8.bitsPerSample = 8;
+    wv8.channels = 1;
+    wv8.rateHz = 11025;
+    // Full-range steps: silence, quarter-scale, rails.
+    wv8.pcm = {0x80, 0x00, 0x7f, 0xff, 0x81, 0x40, 0xc0};
+    const auto out8 = mdkbridge::pcmForGodotWav(wv8);
+    CHECK(out8.size() == wv8.pcm.size());
+    CHECK(out8[0] == 0x00);  // 0x80 silence -> signed 0
+    CHECK(out8[1] == 0x80);  // 0x00 -> -128
+    CHECK(out8[2] == 0xff);  // 0x7f -> -1
+    CHECK(out8[3] == 0x7f);  // 0xff -> +127
+    CHECK(out8[4] == 0x01);  // 0x81 -> +1
+    CHECK(out8[5] == 0xc0);  // 0x40 -> -64
+    CHECK(out8[6] == 0x40);  // 0xc0 -> +64
+    // The source stays verbatim — the parser contract is untouched.
+    CHECK(wv8.pcm[0] == 0x80);
+
+    mdk::SniWave wv16{};
+    wv16.bitsPerSample = 16;
+    wv16.channels = 2;
+    wv16.rateHz = 22050;
+    wv16.pcm = {0x00, 0x00, 0xff, 0x7f, 0x00, 0x80, 0x34, 0x12};
+    const auto out16 = mdkbridge::pcmForGodotWav(wv16);
+    CHECK(out16 == wv16.pcm);  // PCM16 is already signed LE — verbatim
+
+    // Empty payload stays empty; non-8/16 widths pass through.
+    mdk::SniWave wv0{};
+    wv0.bitsPerSample = 8;
+    CHECK(mdkbridge::pcmForGodotWav(wv0).empty());
+  }
+
   if (gFailures == 0) {
     std::printf("%d checks, 0 failures\n", gChecks);
     return 0;

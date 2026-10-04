@@ -136,4 +136,13 @@ int streamAudioBindRegs(StreamAudioHost& host,
   return bound;
 }
 
+std::vector<std::uint8_t> pcmForGodotWav(const mdk::SniWave& wv) {
+  std::vector<std::uint8_t> out = wv.pcm;
+  if (wv.bitsPerSample == 8) {
+    // RIFF PCM8 unsigned -> signed byte: s = u - 128 == u ^ 0x80.
+    for (auto& b : out) b ^= 0x80;
+  }
+  return out;
+}
+
 } // namespace mdkbridge

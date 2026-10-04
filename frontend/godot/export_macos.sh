@@ -86,7 +86,16 @@ if [ -d "$FW" ]; then
     codesign --sign - --force "$d"
   done
 fi
-codesign --sign - --force "$OUT"
+# Strip macOS-stamped xattrs (Finder re-writes com.apple.FinderInfo
+# on Desktop-visible bundles — a race — so retry the clear+sign).
+i=0
+while :; do
+  xattr -cr "$OUT" 2>/dev/null || true
+  codesign --sign - --force "$OUT" && break
+  i=$((i + 1))
+  [ "$i" -ge 3 ] && { echo "export_macos.sh: bundle sign failed" >&2; exit 1; }
+  sleep 1
+done
 codesign --verify --deep --strict "$OUT"
 echo "export_macos.sh: signed + verified -> $OUT"
 

@@ -62,6 +62,7 @@
 #define MDK_BRIDGE_STREAM_AUDIO_H
 
 #include "core/bni_directory.h"
+#include "core/sni_wave.h"
 #include "core/stream_scene.h"
 #include "core/traversal_audio.h"
 #include "core/traversal_audio_mixer.h"
@@ -69,6 +70,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace mdkbridge {
 
@@ -144,6 +146,21 @@ private:
 // count (11 on the canonical bank).
 int streamAudioBindRegs(StreamAudioHost& host,
                         const mdk::BniDirectory& bdir);
+
+// Godot host-boundary PCM conversion.
+//
+// SniWave::pcm holds the source data chunk VERBATIM (the parser
+// contract — sni_wave.h). RIFF PCM8 is unsigned-biased (0x80 is
+// silence); Godot's AudioStreamWAV FORMAT_8_BITS interprets its
+// data buffer as SIGNED 8-bit, so a verbatim copy injects a -128
+// DC offset — every crossing wraps and the output crackles.
+// FORMAT_16_BITS wants signed LE, which is already what RIFF PCM16
+// carries — verbatim is correct there.
+//
+// This helper performs the single conversion at the one boundary
+// that needs it: XOR 0x80 per byte iff bitsPerSample == 8. All
+// other payloads pass through unchanged.
+std::vector<std::uint8_t> pcmForGodotWav(const mdk::SniWave& wv);
 
 } // namespace mdkbridge
 

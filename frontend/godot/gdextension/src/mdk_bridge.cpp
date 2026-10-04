@@ -98,6 +98,8 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::get_collision_snapshot);
   ClassDB::bind_method(D_METHOD("get_input_config"),
                        &MdkBridge::get_input_config);
+  ClassDB::bind_method(D_METHOD("qa_set_key_global", "index", "code"),
+                       &MdkBridge::qa_set_key_global);
   ClassDB::bind_method(D_METHOD("get_arena_order_digest"),
                        &MdkBridge::get_arena_order_digest);
   ClassDB::bind_method(D_METHOD("get_arena_render_snapshot"),
@@ -124,6 +126,9 @@ void MdkBridge::_bind_methods() {
   ClassDB::bind_method(
       D_METHOD("get_object_geometry", "object_id"),
       &MdkBridge::get_object_geometry);
+  ClassDB::bind_method(
+      D_METHOD("get_object_material", "object_id", "name", "pen"),
+      &MdkBridge::get_object_material);
   ClassDB::bind_method(
       D_METHOD("diagnostic_start", "arena_index", "pos_mdk",
                "yaw_deg"),
@@ -503,9 +508,15 @@ const MdkBridge::AudioEntry_* MdkBridge::audioEntry_(
                         : AudioStreamWAV::FORMAT_16_BITS);
     wav->set_stereo(wv.channels == 2);
     wav->set_mix_rate(wv.rateHz);   // verbatim — no resampling
+    // RIFF PCM8 is unsigned-biased; FORMAT_8_BITS wants
+    // signed. One conversion here at the host boundary
+    // (pcmForGodotWav) — wv.pcm stays verbatim, PCM16
+    // passes through untouched.
+    const std::vector<std::uint8_t> pcm =
+        mdkbridge::pcmForGodotWav(wv);
     PackedByteArray data;
-    data.resize(static_cast<int64_t>(wv.pcm.size()));
-    std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+    data.resize(static_cast<int64_t>(pcm.size()));
+    std::memcpy(data.ptrw(), pcm.data(), pcm.size());
     wav->set_data(data);
     if (e.def.loop) {
       wav->set_loop_mode(AudioStreamWAV::LOOP_FORWARD);
@@ -656,9 +667,15 @@ const MdkBridge::AudioEntry_* MdkBridge::streamSndEntry_(
                           : AudioStreamWAV::FORMAT_16_BITS);
       wav->set_stereo(false);
       wav->set_mix_rate(wv.rateHz);   // verbatim — no resampling
+      // RIFF PCM8 is unsigned-biased; FORMAT_8_BITS wants
+      // signed. One conversion here at the host boundary
+      // (pcmForGodotWav) — wv.pcm stays verbatim, PCM16
+      // passes through untouched.
+      const std::vector<std::uint8_t> pcm =
+          mdkbridge::pcmForGodotWav(wv);
       PackedByteArray data;
-      data.resize(static_cast<int64_t>(wv.pcm.size()));
-      std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+      data.resize(static_cast<int64_t>(pcm.size()));
+      std::memcpy(data.ptrw(), pcm.data(), pcm.size());
       wav->set_data(data);
       if (e.def.loop) {
         wav->set_loop_mode(AudioStreamWAV::LOOP_FORWARD);
@@ -1076,6 +1093,17 @@ Dictionary MdkBridge::get_kurt_snapshot() {
   return out;
 }
 
+void MdkBridge::syncBindings_() {
+  if (!feShell_) return;
+  const mdk::FrontendFlowController& f = feShell_->flow();
+  bindings_.keys = f.keyGlobals();
+  bindings_.mouseOn = f.mouseOn();
+  bindings_.mouseAxesMap = f.mouseAxesMap();
+  bindings_.mouseButtMask = f.mouseButtMap();
+  bindings_.mouseScale = f.mouseScales();
+  bindings_.mouseYReversedBits = f.mouseYReversedBits();
+}
+
 // QA action mask + raw input dictionary -> RawGameplayInput (the
 // shared keyboard/mouse fold — mode-independent device state; the
 // per-mode readers consume the channels they own).
@@ -1390,6 +1418,7 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
   // Mode routing (0x541492): mode 2 runs the freefall core, mode 5
   // the StreamScene, mode 3 (and the standalone load_level path)
   // runs traversal.
+  syncBindings_();   // live flow table -> gameplay bindings
   if (mode_ == 2) return stepFreefall_(dt_ms, action_mask, input);
   if (mode_ == 5) return stepStream_(dt_ms, action_mask, input);
   if (mode_ == 8) return stepEnding_(dt_ms, action_mask, input);
@@ -1579,6 +1608,20 @@ Dictionary MdkBridge::get_input_config() const {
   out["mouse_button_masks"] = masks;
   out["joy_on"] = bindings_.joyOn;
   return out;
+}
+
+bool MdkBridge::qa_set_key_global(int64_t index, int64_t code) {
+  if (!feShell_) {
+    setError_("qa_set_key_global: frontend_boot() first");
+    return false;
+  }
+  if (index < 0 || index >= mdk::kKeyboardGlobalCount) {
+    setError_("qa_set_key_global: index out of range");
+    return false;
+  }
+  feShell_->flow().setKeyGlobalForDebug(static_cast<int>(index),
+                                      static_cast<int>(code));
+  return true;
 }
 
 int64_t MdkBridge::get_arena_order_digest() {
@@ -1881,6 +1924,9 @@ Dictionary MdkBridge::get_object_geometry(int64_t object_id) {
   const ObjectGeometry g = objectGeometryFromModel(o.model);
   out["mesh"] = g.mesh;
   out["surface_elems"] = g.surfaceElems;
+  out["surface_matidx"] = g.surfaceMatIdx;
+  out["surface_mats"] = g.surfaceMats;
+  out["surface_pen"] = g.surfacePenIdx;
   out["elem_names"] = g.elemNames;
   out["vert_count"] = g.vertCount;
   out["tri_count"] = g.triCount;
@@ -1888,6 +1934,147 @@ Dictionary MdkBridge::get_object_geometry(int64_t object_id) {
   out["geom_key"] = int64_t(g.geomKey);
   out["model"] = String(o.model.modelName().c_str());
   return out;
+}
+
+// Resolve one surface material for a traversal object (oid > 0) or
+// a level-model surface (oid <= 0 — shot/named geometry resolved in
+// the current display context). The tri record's s16 @+6 selects
+// the model name-table slot; negative values bypass it as a flat
+// palette pen ((-mi) & 0xff, surfaced through `pen`). Name lookup
+// follows matlkup order (FUN_0041a694): shared level MTI bank A
+// first, then the arena's embedded .MAT bank B. A miss draws flat
+// pen 0xff — the dispatcher's NULL-material arm (OBSERVED
+// FUN_0040c860 @0x40c9da for the same dispatch family).
+Dictionary MdkBridge::get_object_material(int64_t object_id,
+                                          const String& name,
+                                          int64_t pen) {
+  Dictionary out;
+  if (!rt_) return out;
+
+  // Pick the material context. For a live object the bank pair is
+  // its own arena's set (the embedded .MAT is arena-local); for
+  // oid <= 0 the current display set stands in (level models have
+  // no home arena). Corridors have no render block — bank A still
+  // resolves through any built set since every set decodes the same
+  // shared LEVELnS.MTI bytes.
+  int setIdx = -1;
+  if (object_id > 0) {
+    const void* p = objIds_.find(std::uint64_t(object_id));
+    if (p == nullptr) return out;   // stale/unknown id
+    const auto& o = *static_cast<const mdk::DynamicObject*>(p);
+    setIdx = indexOfArena_(o.arena);
+  }
+  const ArenaSet* set = nullptr;
+  if (setIdx >= 0) {
+    if (auto it = arenaSets_.find(setIdx); it != arenaSets_.end()) {
+      set = it->second.get();
+    }
+  }
+  if (set == nullptr && arenaIndex_ >= 0) {
+    if (auto it = arenaSets_.find(arenaIndex_);
+        it != arenaSets_.end()) {
+      set = it->second.get();
+    }
+  }
+  const std::uint8_t* pal =
+      set ? set->palette.data() : activePalette_();
+
+  const std::string nm = std::string(name.utf8().get_data());
+  char keybuf[160];
+  std::snprintf(keybuf, sizeof keybuf, "%d:%s:%lld",
+                set ? set->index : -1, nm.c_str(),
+                static_cast<long long>(pen));
+  const String key = String(keybuf);
+  out["key"] = key;
+
+  // Negative material index — a flat palette pen; the name table is
+  // bypassed entirely. (The effect-class negatives stay folded to
+  // pens here — their TRUE drawers are UNKNOWN; documented seam.)
+  if (pen >= 0) {
+    out["valid"] = true;
+    out["palette_index"] = pen;
+    if (pen < 256) {
+      const std::uint8_t* c = pal + pen * 3;
+      out["palette_color"] =
+          Color(c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f);
+    }
+    return out;
+  }
+
+  // matlkup — bank A (shared level MTI) first, then bank B.
+  const mdk::ArenaRenderMaterial* mat = nullptr;
+  if (set != nullptr && !nm.empty()) {
+    for (const auto& r : set->rd.bankA) {
+      if (r.name == nm) { mat = &r; break; }
+    }
+    if (mat == nullptr) {
+      for (const auto& r : set->rd.bankB) {
+        if (r.name == nm) { mat = &r; break; }
+      }
+    }
+  }
+  if (mat == nullptr || mat->pixels.empty()) {
+    // NULL record / index record / empty span — the flat arm. Index
+    // records carry their palette index at +0x0c (param0c), the
+    // same field freefall reads for GREY*/PEN_*/NONE names.
+    const int idx =
+        (mat != nullptr && mat->isIndexRecord)
+            ? static_cast<int>(mat->param0c)
+            : 0xff;
+    out["valid"] = true;
+    out["palette_index"] = int64_t(idx);
+    if (idx >= 0 && idx < 256) {
+      const std::uint8_t* c = pal + std::size_t(idx) * 3;
+      out["palette_color"] =
+          Color(c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f);
+    }
+    out["no_draw"] = idx >= 256;
+    return out;
+  }
+
+  out["valid"] = true;
+  out["palette_index"] = int64_t(-1);
+  out["w"] = int64_t(mat->width);
+  out["h"] = int64_t(mat->height);
+  out["frames"] = int64_t(mat->frameCount);
+  out["tex"] = objectTexture_(key, *mat, pal);
+  return out;
+}
+
+Ref<ImageTexture> MdkBridge::objectTexture_(
+    const String& key, const mdk::ArenaRenderMaterial& m,
+    const std::uint8_t* pal) {
+  Ref<ImageTexture> tex;
+  if (m.pixels.empty() || m.width <= 0 || m.height <= 0) return tex;
+  const std::string ck = std::string(key.utf8().get_data());
+  if (auto it = objTexCache_.find(ck); it != objTexCache_.end()) {
+    return it->second;
+  }
+  // Frame 0 of the indexed strip — animated materials (EXPLODE
+  // family, frameCount > 1) hold frame*(w*h) slices; the original
+  // advances the frame per anim state (deferred — a presentation
+  // seam shared with the freefall path).
+  const std::size_t npix =
+      std::size_t(m.width) * std::size_t(m.height);
+  PackedByteArray px;
+  px.resize(static_cast<int64_t>(npix) * 4);
+  std::uint8_t* dst = px.ptrw();
+  for (std::size_t i = 0; i < npix; ++i) {
+    const std::uint8_t v = m.pixels[i];
+    if (v == 0) {
+      dst[i * 4 + 3] = 0;      // index 0 = transparent
+      continue;
+    }
+    dst[i * 4 + 0] = pal[v * 3 + 0];
+    dst[i * 4 + 1] = pal[v * 3 + 1];
+    dst[i * 4 + 2] = pal[v * 3 + 2];
+    dst[i * 4 + 3] = 255;
+  }
+  Ref<Image> img = Image::create_from_data(
+      m.width, m.height, false, Image::FORMAT_RGBA8, px);
+  tex = ImageTexture::create_from_image(img);
+  objTexCache_[ck] = tex;
+  return tex;
 }
 
 Dictionary MdkBridge::diagnostic_start(int64_t arena_index,
@@ -2081,6 +2268,7 @@ Dictionary MdkBridge::restore_save(const PackedByteArray& bytes) {
   // restored cur/partner.
   objIds_ = mdkfront::MdkObjectIds{};
   arenaSets_.clear();
+  objTexCache_.clear();
   arenaSetFailed_.clear();
   displaySet_.clear();
   arenaIndex_ = -1;
@@ -2257,6 +2445,9 @@ Dictionary MdkBridge::get_shot_geometry(int64_t class_idx) {
   const ObjectGeometry g = objectGeometryFromModel(*m);
   out["mesh"] = g.mesh;
   out["surface_elems"] = g.surfaceElems;
+  out["surface_matidx"] = g.surfaceMatIdx;
+  out["surface_mats"] = g.surfaceMats;
+  out["surface_pen"] = g.surfacePenIdx;
   out["elem_names"] = g.elemNames;
   out["vert_count"] = g.vertCount;
   out["tri_count"] = g.triCount;
@@ -2275,6 +2466,9 @@ Dictionary MdkBridge::get_named_geometry(const String& name) {
   const ObjectGeometry g = objectGeometryFromModel(*m);
   out["mesh"] = g.mesh;
   out["surface_elems"] = g.surfaceElems;
+  out["surface_matidx"] = g.surfaceMatIdx;
+  out["surface_mats"] = g.surfaceMats;
+  out["surface_pen"] = g.surfacePenIdx;
   out["elem_names"] = g.elemNames;
   out["vert_count"] = g.vertCount;
   out["tri_count"] = g.triCount;
@@ -3383,12 +3577,23 @@ Dictionary MdkBridge::stepStream_(double dt_ms, int64_t action_mask,
                  // call this once per 33.333ms quanta. The limiter
                  // sees in.nowMs — step-quantized +33 either way.
   // Host input fold (the FUN_00407f2c domain — digital +-180 on the
-  // two steering axes; the runtime consumes the resolved axes).
+  // two steering axes; the runtime consumes the resolved axes). The
+  // live "keys" list lands here through the configured binding table
+  // (KeyLeft/Right steer axis0, KeyLookUp/Down steer axis1 — the
+  // same slots traversal binds); the QA actions mask stays as an
+  // alias for harness dicts.
+  const mdk::RawGameplayInput raw = buildRawInput_(action_mask, input);
+  const auto heldKey = [&](int slot) -> bool {
+    const int gi = mdk::kKeyboardSlotToGlobal[slot];
+    const int code = bindings_.keys[gi];
+    return code > 0 && code < mdk::kGameplayKeyCount &&
+           ((raw.keyLevel[code >> 5] >> (code & 31)) & 1u) != 0;
+  };
   mdk::StreamInput in{};
-  if (action_mask & kActTurnLeft) in.axis0 = -180.0f;
-  if (action_mask & kActTurnRight) in.axis0 = 180.0f;
-  if (action_mask & kActLookUp) in.axis1 = 180.0f;
-  if (action_mask & kActLookDown) in.axis1 = -180.0f;
+  if ((action_mask & kActTurnLeft) || heldKey(0)) in.axis0 = -180.0f;
+  if ((action_mask & kActTurnRight) || heldKey(1)) in.axis0 = 180.0f;
+  if ((action_mask & kActLookUp) || heldKey(10)) in.axis1 = 180.0f;
+  if ((action_mask & kActLookDown) || heldKey(11)) in.axis1 = -180.0f;
   in.nowMs = static_cast<std::uint32_t>(streamNowMs_);
   streamNowMs_ += 33;
 
@@ -3505,6 +3710,7 @@ void MdkBridge::traversalTeardown_() {
   // mode 5's own commands.
   audioMixer_.stopAll();
   arenaSets_.clear();
+  objTexCache_.clear();
   arenaSetFailed_.clear();
   arenaName_.clear();
   displaySet_.clear();
@@ -3635,9 +3841,15 @@ const MdkBridge::AudioEntry_* MdkBridge::endingSndEntry_(
                           : AudioStreamWAV::FORMAT_16_BITS);
       wav->set_stereo(false);
       wav->set_mix_rate(wv.rateHz);
+      // RIFF PCM8 is unsigned-biased; FORMAT_8_BITS wants
+      // signed. One conversion here at the host boundary
+      // (pcmForGodotWav) — wv.pcm stays verbatim, PCM16
+      // passes through untouched.
+      const std::vector<std::uint8_t> pcm =
+          mdkbridge::pcmForGodotWav(wv);
       PackedByteArray data;
-      data.resize(static_cast<int64_t>(wv.pcm.size()));
-      std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+      data.resize(static_cast<int64_t>(pcm.size()));
+      std::memcpy(data.ptrw(), pcm.data(), pcm.size());
       wav->set_data(data);
       e.stream = wav;
       e.resolved = true;
@@ -4240,6 +4452,7 @@ void MdkBridge::shutdown() {
   arenaIndex_ = -1;
   arenaName_.clear();
   arenaSets_.clear();
+  objTexCache_.clear();
   arenaSetFailed_.clear();
   displaySet_.clear();
   objIds_ = mdkfront::MdkObjectIds{};
@@ -4646,9 +4859,15 @@ const MdkBridge::AudioEntry_* MdkBridge::feAudioEntry_(
                           : AudioStreamWAV::FORMAT_16_BITS);
       wav->set_stereo(false);
       wav->set_mix_rate(wv.rateHz);
+      // RIFF PCM8 is unsigned-biased; FORMAT_8_BITS wants
+      // signed. One conversion here at the host boundary
+      // (pcmForGodotWav) — wv.pcm stays verbatim, PCM16
+      // passes through untouched.
+      const std::vector<std::uint8_t> pcm =
+          mdkbridge::pcmForGodotWav(wv);
       PackedByteArray data;
-      data.resize(static_cast<int64_t>(wv.pcm.size()));
-      std::memcpy(data.ptrw(), wv.pcm.data(), wv.pcm.size());
+      data.resize(static_cast<int64_t>(pcm.size()));
+      std::memcpy(data.ptrw(), pcm.data(), pcm.size());
       wav->set_data(data);
       if (e.def.loop) {
         wav->set_loop_mode(AudioStreamWAV::LOOP_FORWARD);
@@ -4967,6 +5186,7 @@ bool MdkBridge::frontendLoadSaveFile_(const std::string& stem,
       prevKeyLevel_ = {};
       objIds_ = mdkfront::MdkObjectIds{};
       arenaSets_.clear();
+      objTexCache_.clear();
       arenaSetFailed_.clear();
       displaySet_.clear();
       arenaIndex_ = -1;
@@ -5014,6 +5234,7 @@ bool MdkBridge::frontendLoadSaveFile_(const std::string& stem,
   ffHandoffDetail_.clear();
   objIds_ = mdkfront::MdkObjectIds{};
   arenaSets_.clear();
+  objTexCache_.clear();
   arenaSetFailed_.clear();
   displaySet_.clear();
   arenaIndex_ = -1;
@@ -5234,6 +5455,7 @@ bool MdkBridge::campaignTraversalEnter_(std::string& detail) {
   ffHandoffDetail_.clear();
   objIds_ = mdkfront::MdkObjectIds{};
   arenaSets_.clear();
+  objTexCache_.clear();
   arenaSetFailed_.clear();
   displaySet_.clear();
   arenaIndex_ = -1;
