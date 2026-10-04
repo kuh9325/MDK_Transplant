@@ -237,6 +237,14 @@ struct FreefallObject {
   float yaw = 0;             // +0x4c
   float scale = 0;           // +0x58
   int32_t fx = 0;            // +0x60 trail FX presence (seam)
+  // +0xac..0xd4 — the object basis the render walk consumes
+  // (work matrix M_obj = cam * +0xac). Row-major 3x3, columns are the
+  // model axes: for missiles FUN_0041139c rewrites it every tick as
+  // {norm(vel x prevCol2), norm(vel), col0 x vel} — the nose axis is
+  // column 1; spawn seeds the identity so prevCol2 starts as +Z.
+  float basis[9] = {1, 0, 0,
+                    0, 1, 0,
+                    0, 0, 1};
   float animAcc = 0;         // +0xdc anim accumulator
   float animRate = 0;        // +0xe0
   int16_t animFrame = 0;     // +0xe4

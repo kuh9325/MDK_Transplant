@@ -163,6 +163,26 @@ struct FreefallScene {
   // basis the render walk consumes. `bound` tracks the active-list
   // membership exactly (an object leaves the list -> unbound).
   struct Twin {
+    // +0x60 — the trail record (FUN_0042eaa8 freelist alloc +
+    // FUN_0042eadc init). `anchorPts` are the model-space points the
+    // spawn-time FUN_0042eb3c scan selects (the extreme-x entries of
+    // the model's +0x20 point table — implemented over the model's
+    // element vertex pools, the only point-table-shaped data the
+    // record format carries; HYPOTHESIS on the table identity).
+    // Each feed (FUN_0042ecc4) transforms the anchors by the object
+    // basis into the next ring slot; slot pt[anchors] = pt[0] closes
+    // the section. The draw walk consumes the ring (FUN_0042ee74).
+    static constexpr int kTrailCap = 32;      // FUN_0042eadc cap arg
+    static constexpr int kTrailPts = 4;       // vec3s per slot
+    struct Trail {
+      float pts[kTrailCap][kTrailPts][3]{};
+      int count = 0;          // +0x10 slots fed
+      int cursor = 0;         // +0x1c ring write cursor
+      int anchors = 0;        // +0x18 anchor count (<=3)
+      float anchorPts[3][3]{};
+    };
+    Trail trail;
+
     DynamicObject obj;
     bool bound = false;
     int modelSlot = -1;
@@ -171,6 +191,15 @@ struct FreefallScene {
     int animTag = -1;
   };
   std::array<Twin, 399> twins;
+
+  // LEVEL%d — the 1024x1024 indexed minecrawler surface the backdrop
+  // pass (FUN_00412530) scroll-samples through POD%d strips and the
+  // FUN_0046d780 span blitter before the object walk. The pixels
+  // span aliases mtiBytes; palette-expanded at upload by the bridge.
+  std::span<const std::uint8_t> backdropPixels;
+  int backdropW = 0;
+  int backdropH = 0;
+  bool backdropOk = false;
 
   // Lazily resolved materials by name-table string ("CB3", "PEN_16",
   // ...); materialMiss caches names that resolve to nothing. The
@@ -214,6 +243,11 @@ void freefallSceneStep(FreefallScene& s, const FreefallRuntime& rt,
 // unbound/unmodeled — radar objects, unresolved pickups).
 const FreefallScene::Twin* freefallSceneTwin(const FreefallScene& s,
                                              int poolIdx);
+
+// The bound twin's trail ring (nullptr when unbound or no anchors
+// were scanned — non-FX objects never run FUN_0042eb3c).
+const FreefallScene::Twin::Trail* freefallSceneTrail(
+    const FreefallScene& s, int poolIdx);
 
 // The CHUTE attachment prototype — the pickup's second kind-2 entry
 // renders this model under the SAME object basis (FUN_004109d8 emits

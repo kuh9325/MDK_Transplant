@@ -82,6 +82,36 @@ const RuntimeModel* protoForSlot(FreefallScene& s, int slot) {
   return &s.protos.emplace(slot, std::move(*m)).first->second;
 }
 
+// FUN_0042eb3c — the spawn-time anchor scan over the model's +0x20
+// point table: the first call stores the table's minimum-x and
+// maximum-x entries as anchors +0x24/+0x28 (a later call can add a
+// third anchor by proximity, but the missile spawn calls it once —
+// 0x411657 — so FX objects carry two). The table is implemented as
+// the pooled element verts: the record format's only {count, vec3
+// array} point table (HYPOTHESIS — see header note).
+void scanTrailAnchors(const RuntimeModel& proto,
+                      FreefallScene::Twin::Trail* tr) {
+  tr->anchors = 0;
+  float xmin = 0.0f, xmax = 0.0f;
+  const float* lo = nullptr;
+  const float* hi = nullptr;
+  for (const auto& verts : proto.elemVerts) {
+    for (std::size_t i = 0; i + 2 < verts.size(); i += 3) {
+      const float* v = &verts[i];
+      if (lo == nullptr || v[0] < xmin) { xmin = v[0]; lo = v; }
+      if (hi == nullptr || v[0] > xmax) { xmax = v[0]; hi = v; }
+    }
+  }
+  if (lo == nullptr) return;
+  tr->anchorPts[0][0] = lo[0];
+  tr->anchorPts[0][1] = lo[1];
+  tr->anchorPts[0][2] = lo[2];
+  tr->anchorPts[1][0] = hi[0];
+  tr->anchorPts[1][1] = hi[1];
+  tr->anchorPts[1][2] = hi[2];
+  tr->anchors = 2;
+}
+
 void bindTwin(FreefallScene& s, int slot, const FreefallObject& o,
               FreefallScene::Twin* t) {
   const RuntimeModel* proto = protoForSlot(s, slot);
@@ -94,6 +124,8 @@ void bindTwin(FreefallScene& s, int slot, const FreefallObject& o,
   t->type = o.type;
   t->pickupRec = o.pickupRec;
   t->animTag = -1;   // forces the anim rebind below
+  t->trail = FreefallScene::Twin::Trail{};
+  if (o.fx != 0) scanTrailAnchors(*proto, &t->trail);
 
   DynamicObject& d = t->obj;
   d.model = deepCopyModel(*proto);
@@ -231,6 +263,31 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
     }
   }
 
+  // LEVEL%d — the minecrawler surface image the backdrop pass
+  // (FUN_00412530) scroll-samples before the object walk. The MTI
+  // payload record is {u16 w, u16 h, u8 pixels[w*h]} — the same
+  // envelope arenaRenderMaterialDecode parses.
+  out->backdropOk = false;
+  {
+    char lvl[16];
+    std::snprintf(lvl, sizeof lvl, "LEVEL%d", course + 1);
+    for (const MtiEntry& e : out->mti.entries) {
+      if (e.isIndexRecord() || e.name() != lvl) continue;
+      ArenaRenderMaterial am;
+      if (arenaRenderMaterialDecode(
+              std::span<const std::byte>(out->mtiBytes),
+              e.payloadFileOffset(), e.fieldAt0x08, e.fieldAt0x0C,
+              e.fieldAt0x10, e.nameField, &am) &&
+          !am.pixels.empty()) {
+        out->backdropPixels = am.pixels;
+        out->backdropW = static_cast<int>(am.width);
+        out->backdropH = static_cast<int>(am.height);
+        out->backdropOk = true;
+      }
+      break;
+    }
+  }
+
   // FALLPU_<course+1> — 12-byte {name[8], u32} records terminated by
   // a NUL first name byte (OBSERVED FUN_0040ef28 count loop; same
   // parse as mdk-inspect's inspectReadFallpu).
@@ -291,8 +348,41 @@ void freefallSceneStep(FreefallScene& s, const FreefallRuntime& rt,
     d.bankDeg = o.roll;
     d.yawDeg = o.yaw;
     d.col.scale = o.scale;
-    buildObjectMatrix(0.0f, o.roll, o.yaw, o.scale, d.pos,
-                      d.col.xform, d.col.origin);
+    if (o.type == 1) {
+      // Missiles: the +0xac velocity-tracking basis written by
+      // FUN_0041139c in missileTick is the authoritative orientation
+      // (the kind-2 draw consumes it verbatim via the work matrix);
+      // only the scale is baked on top.
+      for (int k = 0; k < 9; ++k) {
+        d.col.xform[k] = o.basis[k] * o.scale;
+      }
+      d.col.origin[0] = o.px;
+      d.col.origin[1] = o.py;
+      d.col.origin[2] = o.pz;
+      // FUN_0042ecc4 — the trail feed: the model-space anchors are
+      // transformed by the (unscaled) object basis into the next
+      // ring slot; the closing point mirrors anchor 0, so a
+      // two-anchor slot reads {lo, hi, lo}.
+      FreefallScene::Twin::Trail& tr = t.trail;
+      if (o.fx != 0 && tr.anchors > 0) {
+        float* dst = tr.pts[tr.cursor][0];
+        const float pos[3] = {o.px, o.py, o.pz};
+        for (int a = 0; a < tr.anchors; ++a) {
+          const float* p = tr.anchorPts[a];
+          for (int r = 0; r < 3; ++r) {
+            dst[a * 3 + r] =
+                o.basis[r * 3] * p[0] + o.basis[r * 3 + 1] * p[1] +
+                o.basis[r * 3 + 2] * p[2] + pos[r];
+          }
+        }
+        for (int c = 0; c < 3; ++c) dst[tr.anchors * 3 + c] = dst[c];
+        tr.cursor = (tr.cursor + 1) % FreefallScene::Twin::kTrailCap;
+        if (tr.count < FreefallScene::Twin::kTrailCap) ++tr.count;
+      }
+    } else {
+      buildObjectMatrix(0.0f, o.roll, o.yaw, o.scale, d.pos,
+                        d.col.xform, d.col.origin);
+    }
     // Anim-handle switch (KURT -> KURT_HIT, restore, bones): rebind
     // the record span and mirror the accumulator family — the spawn/
     // hit sites write acc=-1/frame=-1 as the driver's start state.
@@ -360,6 +450,13 @@ const FreefallScene::Twin* freefallSceneTwin(const FreefallScene& s,
   }
   const FreefallScene::Twin& t = s.twins[std::size_t(poolIdx)];
   return t.bound ? &t : nullptr;
+}
+
+const FreefallScene::Twin::Trail* freefallSceneTrail(
+    const FreefallScene& s, int poolIdx) {
+  const FreefallScene::Twin* t = freefallSceneTwin(s, poolIdx);
+  if (t == nullptr || t->trail.anchors == 0) return nullptr;
+  return &t->trail;
 }
 
 const RuntimeModel* freefallSceneChuteModel(FreefallScene& s) {

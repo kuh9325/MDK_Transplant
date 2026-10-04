@@ -484,6 +484,7 @@ class MdkBridge : public RefCounted {
   // basis, own mesh). Empty dict for an unbound slot.
   Dictionary get_freefall_object_geometry(int64_t pool_slot,
                                           int64_t part);
+  Dictionary get_freefall_backdrop();
   // One FALL3D material by name-table string: palette-expanded
   // ImageTexture + {w, h, frames} for payload records; a flat
   // `palette_color` (and `palette_index`) for index/pen records;

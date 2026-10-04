@@ -180,6 +180,8 @@ void MdkBridge::_bind_methods() {
   ClassDB::bind_method(
       D_METHOD("get_freefall_object_geometry", "pool_slot", "part"),
       &MdkBridge::get_freefall_object_geometry);
+  ClassDB::bind_method(D_METHOD("get_freefall_backdrop"),
+                       &MdkBridge::get_freefall_backdrop);
   ClassDB::bind_method(D_METHOD("get_freefall_material", "name"),
                        &MdkBridge::get_freefall_material);
   // Phase 19B.1 — mode-5 StreamScene presentation.
@@ -3041,6 +3043,54 @@ Array MdkBridge::get_freefall_object_snapshots() {
     // renders stay documented seams).
     d["trail_fx"] = int64_t(o.fx);
     d["explode_flag"] = int64_t(o.explodeFlag);
+    // +0xac — the object basis the kind-2 draw consumes (missiles
+    // carry the FUN_0041139c velocity-tracking basis; other objects
+    // keep the euler-built one). Emitted raw for pose diagnostics.
+    d["basis_mdk"] = PackedFloat32Array{
+        o.basis[0], o.basis[1], o.basis[2],
+        o.basis[3], o.basis[4], o.basis[5],
+        o.basis[6], o.basis[7], o.basis[8]};
+    // Kind-4 — the trail ribbon (FUN_0042ee74 over the +0x60 ring).
+    // Emitted as Godot-space edge pairs (spine, tapered edge) per
+    // ring slot, newest first, plus the per-slot taper factor — the
+    // original's age ramp {1.0,1.25,1.2,1.1,1.05,1.0} for slots
+    // under 6 frames, then 1-(age-6)/(cap-6) linear decay. The
+    // presenter draws consecutive pairs as a quad strip.
+    if (const mdk::FreefallScene::Twin::Trail* tr =
+            mdk::freefallSceneTrail(*ffScene_, i)) {
+      if (tr->count > 1) {
+        constexpr float kHeadRamp[6] =
+            {1.0f, 1.25f, 1.2f, 1.1f, 1.05f, 1.0f};
+        constexpr int cap = mdk::FreefallScene::Twin::kTrailCap;
+        PackedVector3Array edges;
+        PackedFloat32Array shade;
+        edges.resize(tr->count * 2);
+        shade.resize(tr->count);
+        for (int j = 0; j < tr->count; ++j) {
+          const int k = (tr->cursor - 1 - j + cap) % cap;
+          const float t =
+              j < 6 ? kHeadRamp[j]
+                  : std::max(0.0f, 1.0f - float(j - 6) / float(cap - 6));
+          const float* l = tr->pts[k][0];
+          const float* r = tr->pts[k][1];
+          const mdkfront::Vec3 gl =
+              mdkfront::mdkVecToGodot(l[0], l[1], l[2]);
+          edges[j * 2] = Vector3(gl.x, gl.y, gl.z);
+          const mdkfront::Vec3 gr = mdkfront::mdkVecToGodot(
+              l[0] + (r[0] - l[0]) * t,
+              l[1] + (r[1] - l[1]) * t,
+              l[2] + (r[2] - l[2]) * t);
+          edges[j * 2 + 1] = Vector3(gr.x, gr.y, gr.z);
+          shade[j] = t;
+        }
+        Dictionary td;
+        td["edges"] = edges;
+        td["shade"] = shade;
+        td["count"] = int64_t(tr->count);
+        td["anchors"] = int64_t(tr->anchors);
+        d["trail"] = td;
+      }
+    }
     // +0x306 — the chute attachment entry (second kind-2 under the
     // same object basis; its geometry comes from part 1).
     d["chute"] = o.chute != 0;
@@ -3076,6 +3126,24 @@ Array MdkBridge::get_freefall_object_snapshots() {
     }
     out.push_back(d);
   }
+  return out;
+}
+
+// LEVEL%d — the indexed minecrawler surface image bound at 0x4edc24
+// for the FUN_00412530 backdrop pass. One-shot upload: the presenter
+// expands the pixels through the FALLP palette and builds the
+// approach ground texture. Returns {} without a scene/record.
+Dictionary MdkBridge::get_freefall_backdrop() {
+  Dictionary out;
+  if (!ffScene_ || !ffScene_->backdropOk) return out;
+  out["w"] = int64_t(ffScene_->backdropW);
+  out["h"] = int64_t(ffScene_->backdropH);
+  PackedByteArray px;
+  px.resize(static_cast<int64_t>(ffScene_->backdropPixels.size()));
+  std::memcpy(px.ptrw(), ffScene_->backdropPixels.data(),
+              ffScene_->backdropPixels.size());
+  out["pixels"] = px;
+  out["course"] = int64_t(ffScene_->course);
   return out;
 }
 

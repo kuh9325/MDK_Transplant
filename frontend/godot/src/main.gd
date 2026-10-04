@@ -91,6 +91,9 @@ var step_shot := false        # --step: keep stepping under --screenshot
 var ff_steer := false         # --ff-steer: scripted weave via real
                               # key events (production poll path)
 var ff_trace := false         # --ff-trace: hp/missile-distance log
+var ff_shot_pass := false     # --ff-shot-pass: --screenshot waits for a close missile approach
+var _shot_pass_lo := -160.0   # --shot-pass-window LO HI: dz trigger window
+var _shot_pass_hi := -25.0
 var _ff_held := {}            # synthetic key state for --ff-steer
 var _ff_jink := 0             # committed jink keycode (0 = none)
 var demo_frame := 0
@@ -101,6 +104,8 @@ var freefall := false        # --freefall launcher flag
 var ff_materials := {}       # "m:<name>" / "pen:<n>" -> StandardMaterial3D
 var ff_palette := PackedByteArray()  # FALLP_<c+1> bytes (768)
 var ff_handoff_seen := false # printed the mode transition once
+var ff_ground: MeshInstance3D = null  # LEVEL%d minecrawler backdrop
+var ff_trail_mat: StandardMaterial3D = null
 
 # Phase 19B.1 — mode-5 intermission presentation. The StreamScene
 # core owns simulation; the bridge owns the indexed framebuffer.
@@ -491,6 +496,13 @@ func _ready() -> void:
 	step_shot = "--step" in args
 	ff_steer = "--ff-steer" in args
 	ff_trace = "--ff-trace" in args
+	ff_shot_pass = "--ff-shot-pass" in args
+	var spw := _arg_value(args, "--shot-pass-window", "")
+	if not spw.is_empty():
+		var parts := spw.split(",")
+		if parts.size() == 2:
+			_shot_pass_lo = float(parts[0])
+			_shot_pass_hi = float(parts[1])
 	data_root_path = _resolve_data_root(args)
 	var level := _arg_value(args, "--level", "TRAVERSE/LEVEL3/LEVEL3.DTI")
 	var arena := _arg_value(args, "--arena", "HMO_1")
@@ -766,7 +778,11 @@ func _ready() -> void:
 			return
 		# --shot-frames N defers the capture (e.g. past the mode-8
 		# FLIC into the MVE stage); default 8 settles the pipeline.
-		shot_frames_left = int(_arg_value(args, "--shot-frames", "8"))
+		# --ff-shot-pass instead arms the trigger: the countdown is
+		# set to 1 by _apply_freefall when an inbound missile crosses
+		# the close window, so the capture lands on the visible pass.
+		shot_frames_left = -1 if ff_shot_pass else \
+			int(_arg_value(args, "--shot-frames", "8"))
 	if interactive and not frontend:
 		# The frontend needs the OS cursor for its hit-test mouse.
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -2077,9 +2093,25 @@ func _ff_trace_tick() -> void:
 		n += 1
 		var m: Vector3 = o["pos_mdk"]
 		var dz := m.z - p.z
+		var lat := Vector2(m.x - p.x, m.y - p.y).length()
+		var trn := 0
+		if o.has("trail"):
+			trn = int(o["trail"].get("count", 0))
+		var b: PackedFloat32Array = o["basis_mdk"]
+		var v: Vector3 = o["vel_mdk"]
+		var align := 0.0
+		if b.size() >= 9 and v.length() > 0.001:
+			# Row-major 3x3: column 1 (the missile's nose, local +Y)
+			# sits at indices 1,4,7 and must equal norm(vel).
+			align = Vector3(b[1], b[4], b[7]).normalized().dot(v.normalized())
+		if _ff_trace_n % 15 == 0 or (dz > -60.0 and dz < 60.0):
+			print("ff-msl t=%.2f rel=%.0f,%.0f,%.0f vel=%.0f,%.0f,%.0f col1=%.2f,%.2f,%.2f align=%.2f trl=%d" %
+				[float(s["timeline"]) / 60.0, m.x - p.x, m.y - p.y, dz,
+				 v.x, v.y, v.z, b[1] if b.size() >= 9 else 0.0,
+				 b[4] if b.size() >= 9 else 0.0, b[7] if b.size() >= 9 else 0.0,
+				 align, trn])
 		if dz < -5.0 or dz > 600.0:
 			continue   # passed or not yet inbound
-		var lat := Vector2(m.x - p.x, m.y - p.y).length()
 		if mind < 0.0 or lat < mind:
 			mind = lat
 	var hp := int(s["health"])
@@ -2239,6 +2271,130 @@ func _ff_bind_mesh(mi: MeshInstance3D, g: Dictionary) -> void:
 	mi.mesh = mesh
 
 
+# LEVEL%d — the minecrawler surface behind the approach. The
+# original's FUN_00412530 is a mode-7-style scroll-sample of the
+# 1024x1024 indexed source through POD%d strips; the port presents
+# the same source image as the ground plane at MDK z=0 (Godot y=0 —
+# the missiles' spawn level below the player) so the camera's own
+# perspective produces the row-parallax scroll. Indexed pixels are
+# expanded through FALLP_<c+1> exactly like the material bank.
+# HYPOTHESIS — texel density: the original's span blitter samples
+# ~64 texels per screen width; 10 units/texel reads comparably at
+# the approach depths.
+const FF_GROUND_SIZE := 30000.0
+const FF_GROUND_TEXEL_UNITS := 10.0
+
+func _ff_ground_plane() -> void:
+	var d: Dictionary = bridge.get_freefall_backdrop()
+	if d.is_empty():
+		return
+	var w := int(d["w"])
+	var h := int(d["h"])
+	var px: PackedByteArray = d["pixels"]
+	if w <= 0 or h <= 0 or px.size() < w * h or \
+			ff_palette.size() != 768:
+		return
+	var rgba := PackedByteArray()
+	rgba.resize(w * h * 4)
+	for i in w * h:
+		var c := int(px[i]) * 3
+		rgba[i * 4] = ff_palette[c]
+		rgba[i * 4 + 1] = ff_palette[c + 1]
+		rgba[i * 4 + 2] = ff_palette[c + 2]
+		rgba[i * 4 + 3] = 255
+	var img := Image.create_from_data(w, h, false, Image.FORMAT_RGBA8,
+		rgba)
+	var tex := ImageTexture.create_from_image(img)
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	mat.set_flag(BaseMaterial3D.FLAG_USE_TEXTURE_REPEAT, true)
+	mat.albedo_texture = tex
+	# The original draws the POD strip through brightness-LUT rows
+	# (0x4edc34) — the far surface reads markedly darker than the
+	# raw indices (DOS captures show a deep-red hull). Exact row
+	# curve is unresolved; a flat dim approximates it.
+	mat.albedo_color = Color(0.60, 0.55, 0.58, 1.0)
+	var rep: float = FF_GROUND_SIZE / \
+		(FF_GROUND_TEXEL_UNITS * float(w))
+	mat.uv1_scale = Vector3(rep, rep, 1.0)
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(FF_GROUND_SIZE, FF_GROUND_SIZE)
+	pm.material = mat
+	ff_ground = MeshInstance3D.new()
+	ff_ground.name = "FfGround"
+	ff_ground.mesh = pm
+	# MDK z=0 plane -> Godot y=0; PlaneMesh faces +Y already (the
+	# player/camera descend toward it from +Z_mdk = +Y_godot).
+	$FreefallRoot.add_child(ff_ground)
+	$FreefallRoot.move_child(ff_ground, 0)
+
+
+func _ff_trail_material() -> StandardMaterial3D:
+	if ff_trail_mat == null:
+		var m := StandardMaterial3D.new()
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		m.vertex_color_use_as_albedo = true
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		# Pen -1054 indexes a palette LUT row (FUN_00412970 fill);
+		# the row's exact ramp is unresolved — near-white smoke with
+		# the age taper mapped onto alpha is the approximation.
+		m.albedo_color = Color(0.92, 0.92, 0.94, 1.0)
+		ff_trail_mat = m
+	return ff_trail_mat
+
+
+func _ff_apply_trail(node: Node3D, o: Dictionary) -> void:
+	# Kind-4 — the bridge emits per-slot (spine, tapered-edge) pairs;
+	# consecutive pairs form the ribbon quads (FUN_0042ee74).
+	var tr: Dictionary = o.get("trail", {})
+	var mi: MeshInstance3D = node.get_node_or_null("Trail")
+	if tr.is_empty() or int(tr.get("count", 0)) < 2:
+		if mi != null:
+			mi.visible = false
+		return
+	if mi == null:
+		mi = MeshInstance3D.new()
+		mi.name = "Trail"
+		mi.material_override = _ff_trail_material()
+		mi.mesh = ImmediateMesh.new()
+		node.add_child(mi)
+		# Edges are already world-space; top_level preserves the
+		# inherited parent transform, so force it back to identity
+		# or the ribbon gets the missile pose applied twice.
+		mi.top_level = true
+		mi.global_transform = Transform3D.IDENTITY
+	mi.visible = true
+	var mesh: ImmediateMesh = mi.mesh
+	var edges: PackedVector3Array = tr["edges"]
+	var shade: PackedFloat32Array = tr["shade"]
+	var n: int = min(int(tr["count"]), edges.size() / 2)
+	mesh.clear_surfaces()
+	if n < 2:
+		return
+	mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	for j in n - 1:
+		var l0: Vector3 = edges[j * 2]
+		var r0: Vector3 = edges[j * 2 + 1]
+		var l1: Vector3 = edges[j * 2 + 2]
+		var r1: Vector3 = edges[j * 2 + 3]
+		var a0: float = clamp(shade[j], 0.0, 1.0)
+		var a1: float = clamp(shade[j + 1], 0.0, 1.0)
+		mesh.surface_set_color(Color(1, 1, 1, a0))
+		mesh.surface_add_vertex(l0)
+		mesh.surface_add_vertex(r0)
+		mesh.surface_set_color(Color(1, 1, 1, a1))
+		mesh.surface_add_vertex(l1)
+		mesh.surface_set_color(Color(1, 1, 1, a0))
+		mesh.surface_add_vertex(r0)
+		mesh.surface_set_color(Color(1, 1, 1, a1))
+		mesh.surface_add_vertex(r1)
+		mesh.surface_add_vertex(l1)
+	mesh.surface_end()
+
+
 func _apply_freefall() -> void:
 	var ff: Dictionary = bridge.get_freefall_snapshot()
 	if ff.is_empty():
@@ -2250,13 +2406,19 @@ func _apply_freefall() -> void:
 		$StreamLayer.visible = false
 	if ff_palette.is_empty() and bool(ff.get("palette_ok", false)):
 		ff_palette = ff["palette"]
+	# FUN_00412530 — the minecrawler backdrop needs the palette for
+	# the indexed->RGBA expansion; build the ground plane once.
+	if ff_ground == null and ff_palette.size() == 768:
+		_ff_ground_plane()
 
 	# FUN_004123f4's camera — fixed orientation (right=+X, down=-Y,
 	# back=+Z semantic rows) at cameraPos, fov from scaleY at the
-	# 600x360 projection divisors.
+	# 600x360 projection divisors. Far covers the LEVEL%d ground
+	# plane's full extent (FF_GROUND_SIZE diagonal ~42k at z=0).
 	var ct: Transform3D = ff["camera"]
 	$Camera3D.global_transform = ct
 	$Camera3D.fov = float(ff["fov_deg"])
+	$Camera3D.far = 50000.0
 
 	# 0x4edc04 — palette-bright factor applied at upload: <1 dims to
 	# black (fade), >1 saturates (damage flash / missile-bump).
@@ -2307,6 +2469,8 @@ func _apply_freefall() -> void:
 				node.set_meta("geom_key", gkey)
 			# Core-authoritative world basis — +0xac verbatim.
 			node.transform = o["transform"]
+		# Kind-4 — the missile trail ring (world-space edges).
+		_ff_apply_trail(node, o)
 		# +0x306 — the chute attachment: a second kind-2 entry under
 		# the object's own basis while the flag is set.
 		var chute: MeshInstance3D = node.get_node_or_null("Chute")
@@ -2330,6 +2494,23 @@ func _apply_freefall() -> void:
 		var slot := int(child.name.trim_prefix("FFObj_"))
 		if not live.has(slot):
 			child.queue_free()
+
+	# --ff-shot-pass trigger: an inbound missile inside the close
+	# window (still below, lateral-near) arms the screenshot for the
+	# next _process — the visible-pass acceptance capture.
+	if ff_shot_pass and shot_frames_left == -1 and ff.has("player"):
+		var pp: Vector3 = ff["player"]["pos_mdk"]
+		for o in snaps:
+			if not o["alive"] or int(o["type"]) != 1:
+				continue
+			var mp: Vector3 = o["pos_mdk"]
+			var dz := mp.z - pp.z
+			var lat := Vector2(mp.x - pp.x, mp.y - pp.y).length()
+			var dmin := float(_shot_pass_lo)
+			var dmax := float(_shot_pass_hi)
+			if dz > dmin and dz < dmax and lat < 45.0:
+				shot_frames_left = 1
+				break
 
 	_update_ff_debug(ff)
 

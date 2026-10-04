@@ -225,6 +225,12 @@ void spawnMissile(FreefallRuntime& rt) {
   o.tz = 0.0f;                                        // +0x128
   o.fx = 1;                                           // +0x60 trail seam
   o.subTimer = 0;
+  // +0xac..0xd4 — the spawn's identity basis (memset 0x30 then the
+  // +0xd4->+0xc0->+0xac diagonal writes at 0x4115a7-0x4115c3; an
+  // explicit init because pooled records keep stale fields).
+  o.basis[0] = 1.0f; o.basis[1] = 0.0f; o.basis[2] = 0.0f;
+  o.basis[3] = 0.0f; o.basis[4] = 1.0f; o.basis[5] = 0.0f;
+  o.basis[6] = 0.0f; o.basis[7] = 0.0f; o.basis[8] = 1.0f;
   emitSound(rt, kFfSndMLnch);
 }
 
@@ -377,6 +383,40 @@ void playerTick(FreefallRuntime& rt, FreefallObject& o,
 }
 
 // Type 1 — FUN_00410e9c.
+// FUN_0041139c — the velocity-tracking basis write at obj+0xac that
+// runs every missile tick after the position integrate/z-throttle
+// (call site 0x410f66). Column 1 = norm(vel): the missile model's
+// long axis is local +Y (OBSERVED MISSILE elem bbox ~[-12.4,11.6]
+// on Y), so the nose follows the flight direction. Column 0 =
+// norm(vel x upRef) where upRef is the PREVIOUS frame's column 2 —
+// the banking history term; column 2 = col0 x vel. Spawn's identity
+// basis makes the first upRef +Z, matching the call site's default
+// 0x49a700 = (0,0,1). Normalize is skipped on a zero cross (the
+// original's |c|^2 != 1 && > 0 guard leaves the column zeroed).
+void missileHeadingBasis(FreefallObject& o) {
+  const float up[3] = {o.basis[2], o.basis[5], o.basis[8]};
+  float v[3] = {o.vx, o.vy, o.vz};
+  const float vlen2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+  if (vlen2 != 1.0f && vlen2 > 0.0f) {
+    const float inv = 1.0f / std::sqrt(static_cast<double>(vlen2));
+    v[0] *= inv; v[1] *= inv; v[2] *= inv;
+  }
+  float c0[3] = {v[1] * up[2] - v[2] * up[1],
+                 v[2] * up[0] - v[0] * up[2],
+                 v[0] * up[1] - v[1] * up[0]};
+  const float c0len2 = c0[0] * c0[0] + c0[1] * c0[1] + c0[2] * c0[2];
+  if (c0len2 != 1.0f && c0len2 > 0.0f) {
+    const float inv = 1.0f / std::sqrt(static_cast<double>(c0len2));
+    c0[0] *= inv; c0[1] *= inv; c0[2] *= inv;
+  }
+  const float c2[3] = {c0[1] * v[2] - c0[2] * v[1],
+                       c0[2] * v[0] - c0[0] * v[2],
+                       c0[0] * v[1] - c0[1] * v[0]};
+  o.basis[0] = c0[0]; o.basis[3] = c0[1]; o.basis[6] = c0[2];
+  o.basis[1] = v[0];  o.basis[4] = v[1];  o.basis[7] = v[2];
+  o.basis[2] = c2[0]; o.basis[5] = c2[1]; o.basis[8] = c2[2];
+}
+
 void missileTick(FreefallRuntime& rt, FreefallObject& o,
                  float frameUnits, float dtSec, int frameStep) {
   (void)frameUnits;
@@ -390,6 +430,12 @@ void missileTick(FreefallRuntime& rt, FreefallObject& o,
   if (pl && o.pz < pl->pz * kMissileThrottle) {
     o.pz += o.vz * kMissileBoost * dtSec;  // z-throttle catch-up
   }
+  // +0xac basis translation = pos, then the FUN_0041139c heading
+  // update + trail feed (call sites 0x410f66/0x410f77) — both run
+  // unconditionally every tick, before the collision window and the
+  // launch/pass dispatch. The feed itself is a presentation seam:
+  // freefallSceneStep samples the same basis into the twin's ring.
+  missileHeadingBasis(o);
 
   if (pl && rt.timeline < kCollideSecs) {
     // FUN_0045c230 — segment prevPos->pos vs the player AABB.
