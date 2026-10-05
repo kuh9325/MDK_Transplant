@@ -1453,6 +1453,34 @@ Dictionary MdkBridge::stepCore_(double dt_ms, int64_t action_mask,
   last_ = mdk::stepTraversalRuntime(*rt_, raw, bindings_, timing_);
   hasFrame_ = true;
 
+  // Dispatcher mode-3 death tail: 541554 is the shared global — the
+  // session reads the live runtime value each frame. Phase 14B's
+  // pump (progressionStepDeath) gates itself on health==0 / god flag,
+  // stages the 0x540dac fade, and past 255 arms the LASTGAME record,
+  // which commits through SaveStore::writeLastgame (FUN_00427ed4)
+  // before the FUN_004371bc teardown + FUN_0041d85c frontend return.
+  if (sess_.mode == 3 && rt_) {
+    sess_.health = rt_->fieldHealth;
+    const mdk::ProgressionError de =
+        mdk::progressionStepDeath(sess_, timing_.deltaSec);
+    if (de == mdk::ProgressionError::kOk) {
+      if (sess_.lastgameArmed && feHost_) {
+        mdk::SaveWriteInput wi;
+        wi.modeField = sess_.lastgame.modeField;
+        wi.levelId = sess_.lastgame.levelId;
+        wi.health = sess_.lastgame.health;
+        wi.deathCount = sess_.lastgame.deathCount;
+        wi.field54163b = sess_.lastgame.field54163b;
+        (void)feHost_->saves().writeLastgame(wi);
+      }
+      routeFrom_ = mode_;                 // 3
+      traversalTeardown_();
+      mode_ = sess_.mode;                 // 0
+      routeTo_ = mode_;
+      if (feShell_) feShell_->enterFrontend(true);
+    }
+  }
+
   // Dispatcher mode-3 tail (0x401497): the runtime's victory latches
   // map onto the session's staged model — endLevelRequest (the
   // 540ebc=-1 consume -> FUN_0040dde0) is victoryPhase 1, da0
@@ -6000,6 +6028,10 @@ Array MdkBridge::frontend_dispatch_requests() {
     switch (req) {
     case mdk::FrontendRequest::Quit:
       // DAT_0054148e — the process quit belongs to the app.
+      // 0x401174: a clean exit deletes SAVES\LASTGAME.SAV — the
+      // checkpoint's lifetime ends here, not at teardown.
+      if (feHost_) (void)feHost_->saves().deleteLastgame();
+      mdk::progressionDeleteCheckpoint(sess_);
       r["handled"] = false;
       r["ok"] = false;
       r["owner"] = "app";

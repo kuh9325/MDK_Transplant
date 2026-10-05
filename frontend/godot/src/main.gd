@@ -708,6 +708,26 @@ func _ready() -> void:
 			printerr("MdkBridge.load_arena failed: ", bridge.get_last_error())
 			get_tree().quit(1)
 			return
+		# The traversal death route (LASTGAME.SAV write + mode-0
+		# frontend entry) needs the host services even on a bare
+		# --level run. fe_active stays false — the shell is dormant
+		# until the route enters it. Save root: --save-dir, else the
+		# same user:// convention the campaign branch uses; boot
+		# failure is a warning, not a launch blocker (dev path).
+		var tdir := _arg_value(args, "--save-dir",
+			"user://saves_smoke" if smoke else "user://saves")
+		tdir = ProjectSettings.globalize_path(tdir)
+		if smoke:
+			DirAccess.make_dir_recursive_absolute(tdir)
+			var tda := DirAccess.open(tdir)
+			if tda != null:
+				for tf in tda.get_files():
+					if tf.get_extension() == "SAV":
+						tda.remove(tf)
+			smoke_save_dir = tdir
+		if not bridge.frontend_boot(tdir):
+			printerr("frontend_boot (death route) failed: ",
+				bridge.get_last_error())
 	if not frontend and not freefall and not stream and \
 			not start.is_empty():
 		# NATIVE DIAGNOSTIC — re-anchor into --arena at the given MDK
@@ -5681,11 +5701,94 @@ func _run_smoke(data_root: String) -> void:
 	_check(live_players > 0 and live_players <= AUDIO_VOICES,
 		"audio: presenter players bounded (%d)" % live_players)
 
+	# ---- Phase 14B: traversal death -> LASTGAME -> frontend ----
+	# The 0x540dac fade (lrint(dt*100) per stepped frame) crosses
+	# 255 after ~86 frames; the checks above ran ~80, so a bounded
+	# wait drains the tail through the real route: LASTGAME.SAV
+	# header-only commit -> teardown -> mode 0.
+	var lastgame_path := smoke_save_dir.path_join("LASTGAME.SAV")
+	var routed := false
+	for i in 60:
+		if int(bridge.get_mode()) == 0:
+			routed = true
+			break
+		_step_n({}, 1)
+	_check(routed, "death route: fade released to mode 0")
+	_check(FileAccess.file_exists(lastgame_path),
+		"death route: LASTGAME.SAV committed")
+	if bridge.frontend_booted():
+		# The returning frontend entry gates Continue on the file.
+		# Its entry transition (TransitionArmed fx) arms on the first
+		# drained frame and eats one edge as a skip-ack — drain it
+		# before nav/confirm reach the shell.
+		_fe_smoke_step({}, 1)
+		# INTRO1A runs a 300-tick (10s) timeline — ~300 steps at 33ms.
+		var tguard := 0
+		while fe_transition_ms >= 0.0 and tguard < 320:
+			_fe_smoke_step({}, 1)
+			tguard += 1
+		var fs0 := _fe_smoke_step({}, 2)
+		_check(int(fs0.get("saves_exist", -1)) == 1,
+			"death route: Continue enabled by LASTGAME")
+		# Land on selection 0 (Continue) before confirming.
+		for i in 8:
+			if int(_fe_smoke_step({}, 1).get("selection", -1)) == 0:
+				break
+			if int(_fe_press("prev").get("selection", -1)) == 0:
+				break
+		_fe_press("confirm")   # selection 0 == Continue
+		_check(int(bridge.get_mode()) == 3,
+			"death route: Continue -> fresh traversal (mode 3)")
+		_step_n({}, 1)   # first live frame binds the HUD
+		var hps: Dictionary = bridge.get_hud_snapshot()
+		_check(int(hps.get("health", -1)) == 100,
+			"death route: Continue restores health 100")
+		# Reentrant route: a second death re-arms the fade, rewrites
+		# the checkpoint, and lands the clean-quit delete (0x401174).
+		# Only meaningful if the continue landed a live runtime.
+		if int(bridge.get_mode()) == 3:
+			_step_n({}, 4)
+			bridge.diagnostic_damage(500)
+		var routed2 := false
+		for i in 140:
+			if int(bridge.get_mode()) == 0:
+				routed2 = true
+				break
+			_step_n({}, 1)
+		_check(routed2, "death route: second fade -> mode 0")
+		_check(FileAccess.file_exists(lastgame_path),
+			"death route: LASTGAME.SAV re-committed")
+		# The second mode-0 entry re-arms the INTRO1A window — drain
+		# it before navigating.
+		_fe_smoke_step({}, 1)
+		var tguard2 := 0
+		while fe_transition_ms >= 0.0 and tguard2 < 320:
+			_fe_smoke_step({}, 1)
+			tguard2 += 1
+		# Root -> Quit (bottom of the saves-present menu): the
+		# dispatch's quit edge deletes the checkpoint.
+		var qsel := -1
+		for i in 8:
+			var qsnap := _fe_smoke_step({}, 1)
+			qsel = int(qsnap.get("selection", -1))
+			if qsel == 4:
+				break
+			qsnap = _fe_press("next")
+			qsel = int(qsnap.get("selection", -1))
+			if qsel == 4:
+				break
+		_check(qsel == 4, "death route: Quit item reachable")
+		_fe_press("confirm")
+		_check(not FileAccess.file_exists(lastgame_path),
+			"death route: clean Quit deletes LASTGAME.SAV")
+
 	# ---- Phase 17B.2: level transition ----
 	# shutdown() drops the HUD/bezel cache; a reload must rebuild
 	# every surface from the fresh runtime — nothing stale survives.
+	# The runtime may be torn down if the death-route QA ran; the
+	# reload re-enters traversal regardless.
 	var hpre: Dictionary = bridge.get_hud_snapshot()
-	var tex_pre = hpre["tex"]
+	var tex_pre = hpre.get("tex")
 	_check(bridge.load_level("TRAVERSE/LEVEL3/LEVEL3.DTI"),
 		"transition: LEVEL3 reload")
 	_reset_audio()
