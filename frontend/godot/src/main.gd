@@ -532,7 +532,7 @@ func _ready() -> void:
 	var start := _arg_value(args, "--start", "")
 	var start_yaw := float(_arg_value(args, "--start-yaw", "0"))
 	var ff_course := _arg_value(args, "--freefall", "")
-	var ff_skill := int(_arg_value(args, "--skill", "0"))
+	ff_skill = int(_arg_value(args, "--skill", "0"))
 	var st_course := _arg_value(args, "--stream", "")
 	var cp_course := _arg_value(args, "--campaign", "")
 	var ending := "--ending" in args
@@ -544,8 +544,10 @@ func _ready() -> void:
 	frontend = "--frontend" in args
 	# 0xC0FFEE — the same default mdk-inspect's --freefall-runtime
 	# digest runs use, so driven courses are cross-checkable.
-	var ff_seed := int(_arg_value(args, "--seed", "12648430"))
+	ff_seed = int(_arg_value(args, "--seed", "12648430"))
 	freefall = not ff_course.is_empty()
+	if freefall:
+		ff_course_id = int(ff_course)
 	stream = not st_course.is_empty()
 	var campaign := not cp_course.is_empty()
 	var campaign_course := 0
@@ -2094,7 +2096,20 @@ var _ff_trace_prev_hp := -1
 var _ff_trace_prev_locks := -1
 var _ff_trace_prev_rearms := -1
 var _ff_trace_n := 0
+var _ff_trace_hdr_done := false
 var _ff_pickup_chute := {}
+var ff_course_id := 0
+var ff_skill := 0
+var ff_seed := 12648430
+
+# Build identity for trace headers — the producing commit when the
+# launcher exports it (MDK_BUILD env), else the app version string.
+func _ff_build_id() -> String:
+	var b := OS.get_environment("MDK_BUILD")
+	if not b.is_empty():
+		return b
+	return str(ProjectSettings.get_setting(
+		"application/config/version", "dev"))
 
 func _ff_trace_tick() -> void:
 	# hp + nearest missile lateral separation, ~1 Hz sim cadence.
@@ -2103,13 +2118,25 @@ func _ff_trace_tick() -> void:
 	if s.is_empty() or not s.has("player"):
 		return
 	var p: Vector3 = s["player"]["pos_mdk"]
-	var t := float(s["timeline"])   # already seconds (dtSec accumulator)
+	# Units: sim seconds (dtSec accumulator), wall seconds,
+	# sim tick (mode-2 steps), rendered frame, all pos in MDK units.
+	var t := float(s["timeline"])
+	var tw := Time.get_ticks_msec() / 1000.0
+	var tick := _ff_steps
+	var rframe := Engine.get_process_frames()
+	if not _ff_trace_hdr_done:
+		_ff_trace_hdr_done = true
+		print("ff-trace-hdr build=%s course=%d skill=%d seed=%s wall0=%.2f" %
+			[_ff_build_id(), ff_course_id, ff_skill,
+			 "%08x" % ff_seed, tw])
 	var n := 0
 	var mind := -1.0
+	var radar_submitted := false
 	for o in bridge.get_freefall_object_snapshots():
 		if not o["alive"]:
 			continue
-		if int(o["type"]) == 4:
+		var ty := int(o["type"])
+		if ty == 4:
 			# Pickup chute lifecycle — deploy edge + glide verification.
 			var slot := int(o["pool_slot"]) if o.has("pool_slot") else int(o.get("slot", -1))
 			var ch := bool(o["chute"])
@@ -2122,7 +2149,31 @@ func _ff_trace_tick() -> void:
 				var v2: Vector3 = o["vel_mdk"]
 				print("ff-trace CHUTE glide slot=%d vz=%.1f" % [slot, v2.z])
 			continue
-		if int(o["type"]) != 1:
+		if ty == 3 and o.has("beam_mdk"):
+			# Type-3 radar — the lock test is the 2D distance² on the
+			# scan plane (beam tx/ty vs player xy), threshold 15² = 225.
+			# beam_mdk = tx/ty/tz; aux_mdk = aux0/aux1 (wander target)
+			# + aux2 (scan plane z). MDK units, same frame as the test.
+			var bm: Vector3 = o["beam_mdk"]
+			var ax: Vector3 = o["aux_mdk"]
+			var d2 := Vector2(bm.x - p.x, bm.y - p.y).length_squared()
+			var phase := "scan"
+			if bm.z < ax.z - 1.0:
+				phase = "rise"
+			elif int(o["timer"]) < 0:
+				phase = "sink"
+			var twn := int(s.get("radar_twin", 0)) > 0
+			var verts := int(s.get("radar_verts", 0))
+			if twn and verts > 0:
+				radar_submitted = true
+			if _ff_trace_n % 20 == 0 or d2 < 225.0:
+				print("ff-radar t=%.2f w=%.2f tk=%d f=%d ph=%s beam=(%.1f,%.1f,%.1f) plane_z=%.1f tgt=(%.1f,%.1f) pl=(%.1f,%.1f,%.1f) d2=%.0f th=225 sub=%d" %
+					[t, tw, tick, rframe, phase,
+					 bm.x, bm.y, bm.z, ax.z, ax.x, ax.y,
+					 p.x, p.y, p.z, d2,
+					 1 if radar_submitted else 0])
+			continue
+		if ty != 1:
 			continue
 		n += 1
 		var m: Vector3 = o["pos_mdk"]
@@ -2159,15 +2210,6 @@ func _ff_trace_tick() -> void:
 				 v.x, v.y, v.z, b[1] if b.size() >= 9 else 0.0,
 				 b[4] if b.size() >= 9 else 0.0, b[7] if b.size() >= 9 else 0.0,
 				 align, nose_align, trn, npens, int(o.get("flare", 0))])
-		if int(o["type"]) == 3 and o.has("beam_mdk"):
-			# Type-3 radar — beam point on the scan plane vs the
-			# player xy the lock test consumes (225 sq dist).
-			var bm: Vector3 = o["beam_mdk"]
-			var bd := Vector2(bm.x - p.x, bm.y - p.y).length()
-			if _ff_trace_n % 30 == 0 or bd < 20.0:
-				print("ff-radar t=%.2f beam=%.1f,%.1f,%.1f d_xy=%.1f aux=%.1f,%.1f,%.1f" %
-					[t, bm.x, bm.y, bm.z, bd,
-					 o["aux_mdk"].x, o["aux_mdk"].y, o["aux_mdk"].z])
 		if dz < -5.0 or dz > 600.0:
 			continue   # passed or not yet inbound
 		if mind < 0.0 or lat < mind:
@@ -2179,33 +2221,35 @@ func _ff_trace_tick() -> void:
 	var rearms := int(s.get("radar_rearms", 0))
 	if locks != _ff_trace_prev_locks:
 		if _ff_trace_prev_locks >= 0:
-			print("ff-radar t=%.2f LOCK #%d waves=%d budget=%d" %
-				[t, locks, int(s.get("waves_armed", 0)),
+			print("ff-radar t=%.2f w=%.2f tk=%d LOCK #%d waves=%d budget=%d" %
+				[t, tw, tick, locks, int(s.get("waves_armed", 0)),
 				 int(s.get("missile_budget", 0))])
 	if rearms != _ff_trace_prev_rearms:
 		if _ff_trace_prev_rearms >= 0:
-			print("ff-radar t=%.2f REARM #%d timer=%d" %
-				[t, rearms, int(s.get("radar_timer", 0))])
+			print("ff-radar t=%.2f w=%.2f tk=%d REARM #%d timer=%d" %
+				[t, tw, tick, rearms, int(s.get("radar_timer", 0))])
 	_ff_trace_prev_locks = locks
 	_ff_trace_prev_rearms = rearms
 	if _ff_trace_n % 60 == 0:
-		print("ff-radar t=%.2f active=%d twin=%d verts=%d timer=%d budget=%d spawns=%d" %
-			[t, int(s.get("radar_active", 0)),
+		var keys: PackedInt32Array = _gameplay_keys()
+		print("ff-radar t=%.2f w=%.2f tk=%d active=%d twin=%d verts=%d timer=%d budget=%d spawns=%d keys=%s" %
+			[t, tw, tick, int(s.get("radar_active", 0)),
 			 int(s.get("radar_twin", 0)),
 			 int(s.get("radar_verts", 0)),
 			 int(s.get("radar_timer", 0)),
 			 int(s.get("missile_budget", 0)),
-			 int(s.get("missiles_spawned", 0))])
+			 int(s.get("missiles_spawned", 0)),
+			 str(keys)])
 	var hp := int(s["health"])
 	if _ff_trace_prev_hp < 0:
 		_ff_trace_prev_hp = hp
 	elif hp != _ff_trace_prev_hp:
-		print("ff-trace t=%.2f hp %d->%d HIT msl=%d" %
-			[t, _ff_trace_prev_hp, hp, n])
+		print("ff-trace t=%.2f w=%.2f tk=%d hp %d->%d HIT msl=%d" %
+			[t, tw, tick, _ff_trace_prev_hp, hp, n])
 		_ff_trace_prev_hp = hp
 	if _ff_trace_n % 60 == 0 or (mind >= 0.0 and mind < 30.0):
-		print("ff-trace t=%.2f hp=%d msl=%d mind_xy=%.1f pos=%.1f,%.1f" %
-			[t, hp, n, mind, p.x, p.y])
+		print("ff-trace t=%.2f w=%.2f tk=%d hp=%d msl=%d mind_xy=%.1f pos=%.1f,%.1f" %
+			[t, tw, tick, hp, n, mind, p.x, p.y])
 
 
 # Physical keys the gameplay path polls every frame — every keycode
