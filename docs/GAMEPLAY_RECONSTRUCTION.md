@@ -4377,6 +4377,40 @@ a state digest. Real-data smoke (course 0, skill 0): radar spawn at
 0.6 s → lock ~2.6 s → missile wave (M_LNCH) → 3 hits ×4 dmg →
 pickup pops (P_FALL/CHUTE) → exit fade → completion at `t>33`.
 
+**§5 causal-loop checks via normal input** (`test_freefall_causal`,
+OBSERVED on the port; no `rt` field pokes after init/intro — only
+`FreefallInput` flags and the real `frontendTimingUpdate` outputs):
+
+- **Lock gate.** Every `radarLocks` increment coincides with a live
+  type-3 marker within `dist ≤ 15` of the player that same step and
+  `timer=-1` latched — 0 violations across 3 seeds × 900 frames.
+  `wavesArmed` tracks `radarLocks` 1:1 (granted in the same arm).
+- **No-lock arm.** With no marker in proximity, `missileBudget`,
+  `missileTimer`, and `wavesArmed` never move — the whole
+  downstream chain is gated on the ≤15 proximity check.
+- **lock→budget→launch→rearm.** An idle player is locked
+  (~2–5 s), `budget += waveSize+(rand&1)` grants 2–3, the first
+  `spawnMissile` fires exactly one `frameStep` later, each launch
+  decrements budget to 0 (timer then stops), the marker sinks and
+  re-arms `radarTimer = radarDelay+(rand&0x3f)`, a new marker
+  spawns, and a second lock follows inside 30 s.
+- **Input cannot prevent locks.** Because FUN_004119ec's wander
+  pool always contains the player's own position (a live type-0
+  candidate) plus ≤3 random field points, every steering pattern
+  measured — square weaves, diagonal holds, fast zigzags — still
+  locks (1–3× per 30 s). Evasion delays but cannot zero the gate.
+- **Cadence (30/60/120 Hz, real `frontendTimingUpdate`).** The
+  machine's compensation yields `frameStep=1` at all rates with
+  `smoothed` centering on ~1.006 / ~0.53 / ~0.29 (integer-ms
+  `rawDelta` quantization, never exactly 1/0.5/0.25). The player
+  trajectory is cadence-invariant (same weave endpoint; accel
+  channels scale with `frameUnits`, positions integrate `dtSec`),
+  while the frame-domain timers tick per rendered frame — so
+  `radarReArms` scale with render rate (measured 6 → 12 → 21
+  cycles in 30 real s). The causal loop itself completes at every
+  cadence; lock→spawn stays one `frameStep`. This is the decoded
+  machine's own semantics, not a port deviation.
+
 **Deferred seams (never emulated):** all sounds (event tags only),
 palette/fade uploads, zoom-sprite frames (index state kept), the
 `+0x60` trail FX ring, model basis matrices, `FUN_00418688` keymap

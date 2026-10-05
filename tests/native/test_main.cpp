@@ -24,6 +24,7 @@
 #include "core/freefall_scene.h"
 #include "core/frontend_flow.h"
 #include "core/frontend_host.h"
+#include "core/frontend_machines.h"
 #include "core/frontend_menu.h"
 #include "core/frontend_settings.h"
 #include "core/frontend_shell.h"
@@ -21367,6 +21368,181 @@ void test_freefall_freelist() {
   CHECK(m->pz != 0.0f);
 }
 
+void test_freefall_causal() {
+  // §5 — the detection->wave->rearm loop driven through the NORMAL
+  // input surface only (FreefallInput flags + frontendTimingUpdate's
+  // real outputs — no rt field pokes after init/intro).
+
+  // --- (a) lock gate: the OBSERVED trigger is marker-player
+  // proximity <= 15 (kLockDistSq=225). Assert on three seeds that
+  // every lock step coincides with a live type-3 within 15 (the
+  // post-step tx/ty is the position the tick's check consumed —
+  // the walk updates tx/ty immediately before testing proximity,
+  // and the player ticks first each frame). wavesArmed is granted
+  // in the same lock arm, so it must track locks 1:1.
+  for (std::uint32_t seed : {5150u, 1u, 12345u}) {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), seed);
+    ffRunIntro(rt);
+    int violations = 0;
+    int prevLocks = rt.radarLocks;
+    for (int f = 0; f < 900; ++f) {
+      ffStep(rt, {});
+      FreefallObject* r = ffFirstOfType(rt, 3);
+      FreefallObject* p = ffPlayer(rt);
+      if (rt.radarLocks > prevLocks) {
+        ++prevLocks;  // count the event, then verify its gate
+        float d = 1e9f;
+        if (r && p) {
+          const float dx = p->px - r->tx, dy = p->py - r->ty;
+          d = std::sqrt(dx * dx + dy * dy);
+        }
+        if (!r || d > 15.0f || r->timer >= 0) ++violations;
+      }
+      CHECK(rt.wavesArmed == rt.radarLocks);
+    }
+    CHECK(violations == 0);
+  }
+
+  // --- (b) idle player: the full chain completes through input
+  // alone. The marker's wander pool always contains the player's
+  // own pos (FUN_004119ec type-0 candidate), so locks are
+  // inevitable; chain: lock -> budget += wave+rand1 -> missileTimer
+  // -> spawn/budget-- per launch -> marker sinks -> z<=0 rearm ->
+  // radarDelay timer -> next marker -> second cycle.
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 12345);
+    ffRunIntro(rt);
+    float tLock = -1, tSpawn = -1, tRearm = -1;
+    int spawns = 0, maxBudget = 0, prevM = 0;
+    bool budgetZeroedAfterGrant = false, secondRadar = false;
+    for (int f = 0; f < 30 * 30 && !rt.finished; ++f) {
+      const int budgetBefore = rt.missileBudget;
+      ffStep(rt, {});
+      if (rt.radarLocks > 0 && tLock < 0) tLock = rt.timeline;
+      const int m = ffCountType(rt, 1);
+      if (m > prevM) {
+        spawns += m - prevM;
+        if (tSpawn < 0) tSpawn = rt.timeline;
+      }
+      prevM = m;
+      if (rt.missileBudget > maxBudget) maxBudget = rt.missileBudget;
+      if (budgetBefore > 0 && rt.missileBudget == 0)
+        budgetZeroedAfterGrant = true;
+      if (rt.radarReArms > 0 && tRearm < 0) tRearm = rt.timeline;
+      // A recycled record may inherit timer<0 and insta-sink (the
+      // spawner never writes timer — OBSERVED stale-field quirk);
+      // any live type-3 after the first rearm means the cycle went
+      // around, and locks>=2 below proves a WORKING one did.
+      if (tRearm >= 0 && ffFirstOfType(rt, 3) != nullptr)
+        secondRadar = true;
+    }
+    CHECK(tLock > 0);
+    CHECK(maxBudget >= 2 && maxBudget <= 3);  // wave 2 + (rand&1)
+    CHECK(tSpawn > tLock);                    // launch follows lock
+    CHECK(tSpawn - tLock < 0.1f);             // missileTimer=1 -> 1 step
+    CHECK(spawns >= maxBudget);               // budget drains into spawns
+    CHECK(budgetZeroedAfterGrant);            // timer stops at budget 0
+    CHECK(tRearm > tLock);                    // marker sinks then rearms
+    CHECK(secondRadar);                       // radarTimer -> next marker
+    CHECK(rt.radarLocks >= 2);                // the loop repeats
+  }
+
+  // --- (c) no dodging the gate: a scripted weave still locks —
+  // the wander pool holds the player's pos, so input can only
+  // delay the lock, never prevent it (OBSERVED loop behavior).
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 5150);
+    ffRunIntro(rt);
+    for (int f = 0; f < 30 * 30 && !rt.finished; ++f) {
+      FreefallInput in{};
+      const int leg = (f / 15) & 3;  // 0.5s weave legs at 30Hz
+      in.right = (leg == 0); in.down = (leg == 1);
+      in.left = (leg == 2);  in.up = (leg == 3);
+      ffStep(rt, in);
+    }
+    CHECK(rt.radarLocks >= 1);
+    CHECK(rt.wavesArmed == rt.radarLocks);
+    CHECK(rt.radarReArms >= 1);
+  }
+
+  // --- (d) cadence: feed each render rate the REAL timing machine
+  // (frontendTimingUpdate at 1000/hz ms per rendered frame). The
+  // machine's own compensation yields frameStep=1 with
+  // smoothed -> {1.0, 0.5, 0.25} at 30/60/120 Hz: accel-channel
+  // velocity (frameUnits-domain) and pos integrate (dtSec-domain)
+  // keep the player trajectory ~cadence-invariant, while the
+  // frame-domain timers (radar/missile/pickup) tick per rendered
+  // frame — more causal cycles per real second at higher rates.
+  {
+    float posX[3], posY[3], sm[3];
+    int locks[3], reArms[3], spawns[3];
+    for (int ci = 0; ci < 3; ++ci) {
+      const int hz = (ci == 0) ? 30 : (ci == 1) ? 60 : 120;
+      FreefallRuntime rt;
+      mdk::FrontendTimingState tm;
+      mdk::freefallInit(rt, ffCourse(0, 0), 5150);
+      while (rt.introCountdown > 0) {
+        mdk::frontendTimingUpdate(tm, 33.333);
+        mdk::freefallStep(rt, {}, tm.frameStep, tm.smoothed,
+                          tm.deltaSec);
+      }
+      const double ms = 1000.0 / hz;
+      // 3s square weave — measure the cadence-invariant anchor.
+      for (int f = 0; f < hz * 3; ++f) {
+        mdk::frontendTimingUpdate(tm, ms);
+        FreefallInput in{};
+        const int leg = static_cast<int>((f * ms / 1000.0) / 0.5) & 3;
+        in.right = (leg == 0); in.down = (leg == 1);
+        in.left = (leg == 2);  in.up = (leg == 3);
+        mdk::freefallStep(rt, in, tm.frameStep, tm.smoothed,
+                          tm.deltaSec);
+      }
+      FreefallObject* p = ffPlayer(rt);
+      posX[ci] = p->px; posY[ci] = p->py; sm[ci] = tm.smoothed;
+      // continue idle to 30 real seconds for the causal tallies
+      int prevM = 0;
+      locks[ci] = 0; reArms[ci] = 0; spawns[ci] = 0;
+      for (int f = 0; f < hz * 30 && !rt.finished; ++f) {
+        mdk::frontendTimingUpdate(tm, ms);
+        mdk::freefallStep(rt, {}, tm.frameStep, tm.smoothed,
+                          tm.deltaSec);
+        const int m = ffCountType(rt, 1);
+        if (m > prevM) spawns[ci] += m - prevM;
+        prevM = m;
+        locks[ci] = rt.radarLocks;
+        reArms[ci] = rt.radarReArms;
+      }
+    }
+    // Timing machine outputs per the decoded compensation
+    // (measured ranges over 33s of rendered frames per rate; the
+    // integer-ms domain makes rawDelta alternate, so `smoothed`
+    // centers on but never exactly hits the ideal 1/0.5/0.25):
+    //   30 Hz -> ~1.006   60 Hz -> ~0.53   120 Hz -> ~0.29.
+    CHECK(sm[0] > 0.9f && sm[0] < 1.1f);
+    CHECK(sm[1] > 0.4f && sm[1] < 0.7f);
+    CHECK(sm[2] > 0.15f && sm[2] < 0.45f);
+    CHECK(sm[0] > sm[1] && sm[1] > sm[2]);
+    // Player path: x lands on the field clamp at every rate (the
+    // weave's right leg saturates the accel channel) — the same
+    // endpoint proves cadence-invariance of the trajectory.
+    CHECK(near(posX[0], posX[1], 1e-3) && near(posX[1], posX[2], 1e-3));
+    CHECK(near(posY[0], posY[1], 1.0) && near(posY[1], posY[2], 1.0));
+    // The causal loop completes at every cadence.
+    for (int ci = 0; ci < 3; ++ci) {
+      CHECK(locks[ci] >= 1);
+      CHECK(spawns[ci] >= 1);
+      CHECK(reArms[ci] >= 1);
+    }
+    // Frame-domain signature: radarDelay ticks per rendered frame,
+    // so higher render rates cycle the marker more often per real
+    // second (OBSERVED machine semantics, not a port defect).
+    CHECK(reArms[2] > reArms[0]);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 16C — freefall presentation scene (freefall_scene.h): FALL3D
 // record load, roster/proto decode, twin anim sync, material resolve.
@@ -30685,6 +30861,7 @@ int main() {
   test_freefall_completion_death();
   test_freefall_determinism();
   test_freefall_freelist();
+  test_freefall_causal();
   test_freefall_scene();
   test_freefall_backdrop();
   test_freefall_zoom_format();
