@@ -306,6 +306,14 @@ struct FreefallRuntime {
   int32_t missileDelay = 0;      // 0x4edc1c
   int32_t radarDelay = 0;        // 0x4edc20
 
+  // Diagnostic counters — presentation-neutral tallies of the
+  // detection->wave->rearm causal loop (no original analog; zeroed
+  // by freefallInit like the rest of the record block).
+  int32_t radarLocks = 0;        // lock events (timer -1 + K_SEEN)
+  int32_t radarReArms = 0;       // despawn -> radarTimer re-arms
+  int32_t wavesArmed = 0;        // missileBudget grants from locks
+  int32_t missilesSpawned = 0;   // spawnMissile calls
+
   float zoomRate = -66.6667f;    // 0x4edbfc
   float camZ = 0;                // 0x4ce6a4
   float camX = 0, camY = 0;      // 0x4ce69c/0x4ce6a0

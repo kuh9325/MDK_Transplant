@@ -243,13 +243,15 @@ buffer, `dst = lutRow[dstPx]` destination remap):
 pen-0 transparent scaled blit) at the projected pos, gated z' > 0.
 
 Scale (OBSERVED `0x410c37-0x410c4c`): the handler computes
-`scale = trunc(viewW * 3.0 / (z' * zoom))` = `trunc(750/z')`
+`scale = trunc(viewW * 32.0 / (z' * zoom))` = `trunc(8000/z')`
 (viewW 600, zoom 2.4), then `0x403a40` emits
 `outPx = srcPx * scale >> 8` per axis. The `0x494d30` constant is
-the exe's .rodata double **3.0** (`fmul qword`) — an earlier
-"runtime-patched" note read it as a zeroed dword and was wrong.
-Effective: the marker shows only inside z' < ~750/srcPx*256
-(PICK 64x64 -> visible for z' < 375; 1-5 px at typical distances).
+the exe's .rodata double **32.0** (`fmul qword` — bytes
+`00 00 00 00 00 00 40 40`; a dword-only read sees 0, and 3.0
+would encode `00..00 08 40`). The next qword `0x494d38` = -1e-5
+is the kind-1 sort bias.
+Effective: PICK 64x64 -> outW = 64*scale>>8 — first visible pixel
+at z' <= 2000, ~16px at z' = 500, full 64px at z' ~= 31.
 It is the pickup marker visual — not a missile radar. Missile
 approach warning in mode 2 = the kind-5 FLARE + the trail; there is
 no separate radar ring on missiles.

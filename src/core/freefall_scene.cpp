@@ -55,11 +55,65 @@ std::span<const std::uint8_t> bniPayload(const FreefallScene& s,
 // leading flag word (the original passes it as the EDX arg), so the
 // record is re-headed with the roster flag for the shared
 // parseGeometryRecord.
+// FUN_00411f48 — the RADAR wedge is built in code, not loaded: one
+// element named "RADAR", 25 verts (apex + 4 hex rings, regenerated
+// every radarTick) and 46 tris seeded from 46 dwords at 0x40edd0 —
+// {u8 v0,v1,v2, u8 penByte} -> i16 pen -(penByte)-0x405. All
+// remaining record fields zero (the original's FUN_0047d20a fill).
+RuntimeModel makeRadarModel() {
+  static constexpr std::uint8_t kFaces[46][4] = {
+      {0, 2, 1, 0},  {0, 3, 2, 0},  {0, 4, 3, 0},  {0, 5, 4, 0},
+      {0, 6, 5, 0},  {0, 1, 6, 0},
+      {1, 8, 7, 1},  {1, 2, 8, 1},  {2, 9, 8, 1},  {2, 3, 9, 1},
+      {3, 10, 9, 1}, {3, 4, 10, 1}, {4, 11, 10, 1},{4, 5, 11, 1},
+      {5, 12, 11, 1},{5, 6, 12, 1}, {6, 7, 12, 1}, {6, 1, 7, 1},
+      {7, 14, 13, 2}, {7, 8, 14, 2}, {8, 15, 14, 2}, {8, 9, 15, 2},
+      {9, 16, 15, 2}, {9, 10, 16, 2},{10, 17, 16, 2},{10, 11, 17, 2},
+      {11, 18, 17, 2},{11, 12, 18, 2},{12, 13, 18, 2},{12, 7, 13, 2},
+      {13, 20, 19, 3},{13, 14, 20, 3},{14, 21, 20, 3},{14, 15, 21, 3},
+      {15, 22, 21, 3},{15, 16, 22, 3},{16, 23, 22, 3},{16, 17, 23, 3},
+      {17, 24, 23, 3},{17, 18, 24, 3},{18, 19, 24, 3},{18, 13, 19, 3},
+      {24, 19, 21, 4},{21, 22, 24, 4},{23, 24, 22, 4},{19, 20, 21, 4},
+  };
+  RuntimeModel m;
+  m.flag = 1;   // named-element form (the original's element is named)
+  RuntimeModel::NameRec nr{};
+  const char* nm = "RADAR";
+  std::memcpy(nr.name.data(), nm, 6);
+  m.names.push_back(nr);
+  m.materials.push_back(nullptr);
+  m.elems.resize(1);
+  m.elemNames.resize(1);
+  m.elemField2.resize(1);
+  std::memcpy(m.elemNames[0].data(), nm, 6);
+  m.elemVerts.resize(1);
+  m.elemTris.resize(1);
+  m.elemVerts[0].assign(25 * 3, 0.0f);
+  auto& tris = m.elemTris[0];
+  tris.resize(46 * 0x24, 0);
+  for (int t = 0; t < 46; ++t) {
+    std::uint8_t* rec = tris.data() + t * 0x24;
+    for (int k = 0; k < 3; ++k) {
+      const std::uint16_t v = kFaces[t][k];
+      std::memcpy(rec + k * 2, &v, 2);
+    }
+    const std::int16_t pen =
+        static_cast<std::int16_t>(-kFaces[t][3] - 0x405);
+    std::memcpy(rec + 6, &pen, 2);
+  }
+  m.elems[0].triCount = 46;
+  m.rebind();
+  return m;
+}
+
 const RuntimeModel* protoForSlot(FreefallScene& s, int slot) {
   if (auto it = s.protos.find(slot); it != s.protos.end()) {
     return &it->second;
   }
   if (s.protoFailed.count(slot)) return nullptr;
+  if (slot == 2) {   // radar wedge — FUN_00411f48's code-built model
+    return &s.protos.emplace(slot, makeRadarModel()).first->second;
+  }
   const FreefallModelRecord* rec = rosterBySlot(slot);
   const BniRecord* r =
       rec ? findBniRecord(s.bni, rec->name) : nullptr;
@@ -111,6 +165,47 @@ void scanTrailAnchors(const RuntimeModel& proto,
   tr->anchorPts[1][1] = hi[1];
   tr->anchorPts[1][2] = hi[2];
   tr->anchors = 2;
+}
+
+// FUN_00411aac tail (vert half) — apex v0 = model origin, then 4 hex
+// rings (0x49a70c trig: cos at +0, sin at +4 — sin is 0.866 not
+// 0.8660254) whose model-space centers converge on the beam point
+// T = (tx-pos.x, ty-pos.y, tz) by rate s = 0x494ec8 (double 0.5,
+// read as float): rings 1-3 = s(1+s+..+s^i-1)·T, ring 4 resets to
+// exactly (T, L). Radius L = 10*tz/aux2 (0x494eb8 in the rise/sink
+// arm; the wander arm's flat 10.0 is the same value at tz == aux2).
+void radarWedgeVerts(const FreefallObject& o,
+                     std::vector<float>& verts) {
+  if (verts.size() < 25 * 3) return;
+  static constexpr float kTrig[6][2] = {
+      {0.5f, 0.8659999966621399f},  {1.0f, 0.0f},
+      {0.5f, -0.8659999966621399f}, {-0.5f, -0.8659999966621399f},
+      {-1.0f, 0.0f},                {-0.5f, 0.8659999966621399f},
+  };
+  constexpr float kVertScale = 0.5f;   // 0x494ec8
+  const float tx = o.tx - o.px;
+  const float ty = o.ty - o.py;
+  const float tz = o.tz;
+  const float l0 = (o.aux2 != 0.0f) ? 10.0f * o.tz / o.aux2 : 10.0f;
+  verts[0] = verts[1] = verts[2] = 0.0f;
+  float cx = 0.0f, cy = 0.0f, cz = 0.0f, L = 0.0f;
+  float* w = verts.data() + 3;
+  for (int ring = 1; ring <= 4; ++ring) {
+    if (ring == 4) {
+      cx = tx; cy = ty; cz = tz; L = l0;
+    } else {
+      cx = (cx + tx) * kVertScale;
+      cy = (cy + ty) * kVertScale;
+      cz = (cz + tz) * kVertScale;
+      L = (L + l0) * kVertScale;
+    }
+    for (int k = 0; k < 6; ++k) {
+      w[0] = cx + L * kTrig[k][0];
+      w[1] = cy + L * kTrig[k][1];
+      w[2] = cz;
+      w += 3;
+    }
+  }
 }
 
 void bindTwin(FreefallScene& s, int slot, const FreefallObject& o,
@@ -172,7 +267,7 @@ int freefallObjectModelSlot(const FreefallRuntime& rt,
     case kFfModelChute: return 4;
     case kFfModelBones: return 5;
     case kFfModelBang: return 24;      // EXPLODE record
-    case kFfModelRadar: return -1;     // kind-1 sprite seam, no record
+    case kFfModelRadar: return 2;      // 0x4eddd0 wedge — built in code
     default: break;
   }
   if (o.model >= kFfModelPickup) {
@@ -956,6 +1051,12 @@ void freefallSceneStep(FreefallScene& s, const FreefallRuntime& rt,
     } else {
       buildObjectMatrix(0.0f, o.roll, o.yaw, o.scale, d.pos,
                         d.col.xform, d.col.origin);
+      // FUN_00411aac tail — the radar wedge's ring verts regenerate
+      // every tick from the beam state (model-space, relative to the
+      // origin the tick tail wrote into +0x10/+0x14).
+      if (o.type == 3 && !d.model.elemVerts.empty()) {
+        radarWedgeVerts(o, d.model.elemVerts[0]);
+      }
     }
     // Anim-handle switch (KURT -> KURT_HIT, restore, bones): rebind
     // the record span and mirror the accumulator family — the spawn/

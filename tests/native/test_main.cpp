@@ -21537,7 +21537,7 @@ void test_freefall_scene() {
     FreefallObject m{}; m.model = mdk::kFfModelMissile;
     CHECK(mdk::freefallObjectModelSlot(rt, m) == 3);
     FreefallObject r{}; r.model = mdk::kFfModelRadar;
-    CHECK(mdk::freefallObjectModelSlot(rt, r) == -1);  // sprite seam
+    CHECK(mdk::freefallObjectModelSlot(rt, r) == 2);  // 0x4eddd0 wedge
     FreefallObject p{}; p.model = mdk::kFfModelPickup; p.pickupRec = 0;
     CHECK(mdk::freefallObjectModelSlot(rt, p) == 0x0f);  // "SW_H25"
     FreefallObject b{}; b.model = mdk::kFfModelBang;
@@ -22069,6 +22069,100 @@ void test_freefall_backdrop() {
   CHECK(near(tr->pts[tr->read][0][2], 34.0, 1e-5));
   const int newest = (tr->read + 31) & 31;
   CHECK(near(tr->pts[newest][0][2], 158.0, 1e-5));
+
+  // -- RADAR wedge (FUN_00411f48 template + FUN_00411aac tail) ------
+  // Inject a type-3 object deep below the scan plane — the tick
+  // takes the deterministic rise arm (no wander/lock randomness);
+  // its tail anchors pos to -4x the view camera and the scene step
+  // regenerates the 25 wedge verts. The beam state below is the
+  // POST-tick state the oracle recomputes from.
+  FreefallObject& ra = rt.pool[7];
+  ra.type = 3;
+  ra.model = mdk::kFfModelRadar;
+  ra.alive = 1;
+  ra.scale = 1.0f;
+  ra.tx = ra.ty = 0.0f;
+  ra.tz = -2000.0f;
+  ra.aux0 = ra.aux1 = 0.0f;
+  ra.aux2 = -500.0f;           // overwritten to pl.pz-3 by the tick
+  ra.next = -1;
+  rt.pool[0].next = 7;   // player -> radar (drops the missile)
+  {
+    // The tick tail runs through freefallStep — the object walk is
+    // gated on the intro countdown, so clear it first. One step
+    // writes pos = -4*(pl*0.85) then the scene step regenerates.
+    rt.introCountdown = 0;
+    const FreefallObject& pl = rt.pool[0];
+    ffStep(rt, {});
+    CHECK(ra.alive == 1);
+    CHECK(near(ra.px, -pl.px * 0.85f * 4.0f, 1e-4));
+    CHECK(near(ra.py, -pl.py * 0.85f * 4.0f, 1e-4));
+    CHECK(ra.pz == 0.0f);
+    mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+    const mdk::FreefallScene::Twin* tw = mdk::freefallSceneTwin(s, 7);
+    CHECK(tw != nullptr && tw->modelSlot == 2);
+    if (tw != nullptr) {
+      const auto& ev = tw->obj.model.elemVerts[0];
+      const auto& et = tw->obj.model.elemTris[0];
+      CHECK(tw->obj.model.modelName() == "RADAR");
+      CHECK(ev.size() == 75);
+      CHECK(et.size() == 46 * 0x24);
+      // Face seeds verbatim: {v0,v1,v2} u16s, i16 pen at +6.
+      auto tri = [&](int t, int k) {
+        std::uint16_t v;
+        std::memcpy(&v, et.data() + t * 0x24 + k * 2, 2);
+        return v;
+      };
+      auto pen = [&](int t) {
+        std::int16_t p;
+        std::memcpy(&p, et.data() + t * 0x24 + 6, 2);
+        return p;
+      };
+      CHECK(tri(0, 0) == 0 && tri(0, 1) == 2 && tri(0, 2) == 1);
+      CHECK(pen(0) == -1029);
+      CHECK(tri(17, 0) == 6 && tri(17, 1) == 1 && tri(17, 2) == 7);
+      CHECK(pen(17) == -1030);
+      CHECK(tri(41, 0) == 18 && tri(41, 1) == 13 && tri(41, 2) == 19);
+      CHECK(pen(41) == -1032);
+      CHECK(tri(45, 0) == 19 && tri(45, 1) == 20 && tri(45, 2) == 21);
+      CHECK(pen(45) == -1033);
+      // Independent oracle — the ring math recomputed from scratch
+      // (different code path than radarWedgeVerts): centers and
+      // radii are the geometric series s(1+s+..+s^i-1) at s=0.5
+      // = {0.5, 0.75, 0.875} then EXACT beam T on the last ring.
+      // T is model-space: beam - pos. L = 10*tz/aux2.
+      const double px = ra.px, py = ra.py;
+      const double T[3] = {ra.tx - px, ra.ty - py, ra.tz};
+      const double L =
+          ra.aux2 != 0.0f ? 10.0 * ra.tz / ra.aux2 : 10.0;
+      // The beam state after the step is whatever radarTick left —
+      // recompute expected verts from the POST-step object state.
+      const double coeff[4] = {0.5, 0.75, 0.875, 1.0};
+      const double sin6[6] = {0.8659999966621399, 0.0,
+                              -0.8659999966621399, -0.8659999966621399,
+                              0.0, 0.8659999966621399};
+      const double cos6[6] = {0.5, 1.0, 0.5, -0.5, -1.0, -0.5};
+      CHECK(ev[0] == 0.0f && ev[1] == 0.0f && ev[2] == 0.0f);
+      int mism = 0;
+      for (int ring = 0; ring < 4; ++ring) {
+        const double R = L * coeff[ring];
+        for (int k = 0; k < 6; ++k) {
+          const int vi = 1 + ring * 6 + k;
+          const double ex = T[0] * coeff[ring] + R * cos6[k];
+          const double ey = T[1] * coeff[ring] + R * sin6[k];
+          const double ez = T[2] * coeff[ring];
+          if (!near(ev[vi * 3], float(ex), 1e-3) ||
+              !near(ev[vi * 3 + 1], float(ey), 1e-3) ||
+              !near(ev[vi * 3 + 2], float(ez), 1e-3)) ++mism;
+        }
+      }
+      CHECK(mism == 0);
+      // Twin origin = the object pos the tick tail wrote.
+      CHECK(near(tw->obj.col.origin[0], px, 1e-4) &&
+            near(tw->obj.col.origin[1], py, 1e-4) &&
+            tw->obj.col.origin[2] == 0.0f);
+    }
+  }
 
   fs::remove_all(tmp);
 }

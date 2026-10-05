@@ -72,6 +72,7 @@ constexpr float kLockFlashMin = 0.75f;
 constexpr int16_t kWanderRetarget = 30;         // imm 0x1e
 constexpr float kWanderX = 58.8235294f;         // 0x494ea0/0x494e48
 constexpr float kWanderY = 35.2941176f;         // 0x494eb0/0x494e58
+constexpr float kRadarCamScale = 4.0f;          // 0x494ec0 (float)
 constexpr float kIntroScale = 1.0f / 150.0f;    // 0x494c98
 constexpr float kFadeScale = 1.0f / 60.0f;      // 0x494c9c
 constexpr float kSpawnArcX0 = -30.0f;           // 0x494cb8
@@ -206,6 +207,7 @@ void spawnBones(FreefallRuntime& rt) {
 void spawnMissile(FreefallRuntime& rt) {
   const int idx = allocObj(rt);
   if (idx < 0) return;
+  ++rt.missilesSpawned;
   FreefallObject& o = rt.pool[idx];
   o.model = kFfModelMissile;
   o.type = 1;
@@ -543,83 +545,97 @@ void radarTick(FreefallRuntime& rt, FreefallObject& o,
   (void)frameUnits;
   const FreefallObject* pl = player(rt);
   o.aux2 = (pl ? pl->pz : 0.0f) + kRadarPlaneOff;  // +0x24 plane
-  if (o.timer < 0) {
-    // sink phase — despawn below z 0, re-arm the radar timer.
-    o.tz -= kRadarSink * dtSec;
-    if (o.tz <= 0.0f) {
-      rt.radarTimer = rt.radarDelay +
-                      static_cast<int>(enemyRandNext(rt.rng) & 0x3f);
-      freeObj(rt, objIndex(rt, o));
+  // FUN_00411aac shape: (tz < plane || timer < 0) is ONE arm —
+  // sink on timer<0, rise otherwise — whose despawn is the only
+  // early out. Both rise and sink keep projecting the beam point.
+  if (o.tz < o.aux2 || o.timer < 0) {
+    if (o.timer < 0) {
+      o.tz -= kRadarSink * dtSec;
+      if (o.tz <= 0.0f) {
+        rt.radarTimer = rt.radarDelay +
+                        static_cast<int>(enemyRandNext(rt.rng) & 0x3f);
+        ++rt.radarReArms;
+        freeObj(rt, objIndex(rt, o));
+        return;
+      }
+    } else {
+      o.tz += kRadarRise * dtSec;
     }
-    return;
-  }
-  if (o.tz < o.aux2) {
-    o.tz += kRadarRise * dtSec;
     if (o.tz <= o.aux2) {
-      // still rising: projected marker pos follows the wander target.
+      // rising or sinking: projected marker pos follows the target.
       if (o.aux2 != 0.0f) {
         o.tx = o.aux0 * o.tz / o.aux2;
         o.ty = o.aux1 * o.tz / o.aux2;
       }
-      return;
+    } else {
+      // reached the plane — snap + fresh random wander target.
+      o.tx = o.aux0;
+      o.ty = o.aux1;
+      o.tz = o.aux2;
+      o.aux0 = (static_cast<int>(enemyRandNext(rt.rng)) - 0x4000) *
+               kWanderX * kRandUnit;
+      o.aux1 = (static_cast<int>(enemyRandNext(rt.rng)) - 0x4000) *
+               kWanderY * kRandUnit;
     }
-    // reached the plane — snap + fresh random wander target.
-    o.tx = o.aux0;
-    o.ty = o.aux1;
+  } else {
     o.tz = o.aux2;
-    o.aux0 = (static_cast<int>(enemyRandNext(rt.rng)) - 0x4000) *
-             kWanderX * kRandUnit;
-    o.aux1 = (static_cast<int>(enemyRandNext(rt.rng)) - 0x4000) *
-             kWanderY * kRandUnit;
-    return;
-  }
-  o.tz = o.aux2;
-  const float dx = o.aux0 - o.tx;
-  const float dy = o.aux1 - o.ty;
-  const float distSq = dx * dx + dy * dy;
-  float ddx = 0.0f, ddy = 0.0f;
-  if (distSq != 0.0f) {
-    const float s = rt.radarSpeed / std::sqrt(distSq);
-    ddx = dx * s;
-    ddy = dy * s;
-  }
-  o.vx = o.vx * kRadarBlend1 + ddx * kRadarBlend2;
-  o.vy = o.vy * kRadarBlend1 + ddy * kRadarBlend2;
-  o.prevx = o.aux0;
-  o.prevy = o.aux1;
-  o.prevz = o.aux2;
-  o.tx += o.vx * dtSec;
-  o.ty += o.vy * dtSec;
-  o.timer = static_cast<int16_t>(o.timer + frameStep);  // counts UP
-  const bool nearWander =
-      std::fabs(o.tx - o.aux0) < kWanderBox &&
-      std::fabs(o.ty - o.aux1) < kWanderBox;
-  if (nearWander || o.timer > kWanderRetarget) {
-    emitSound(rt, kFfSndRMove, 1);
-    o.timer = 0;
-    o.tx = o.aux0;
-    o.ty = o.aux1;
-    o.tz = o.aux2;
-    radarRetarget(rt, o);
-  }
-  // player proximity — the lock.
-  if (pl) {
-    const float pdx = pl->px - o.tx;
-    const float pdy = pl->py - o.ty;
-    if (pdx * pdx + pdy * pdy < kLockDistSq) {
-      o.aux0 = o.tx;
-      o.aux1 = o.ty;
-      o.aux2 = o.tz;
-      o.timer = -1;
-      rt.fadeRate = kFlashHit;           // 0x40400000 — flash rate 3.0
-      rt.fadeTarget += kLockFlash;
-      if (rt.fadeTarget < kLockFlashMin) rt.fadeTarget = kLockFlashMin;
-      rt.missileBudget += rt.waveSize +
-                          static_cast<int>(enemyRandNext(rt.rng) & 1);
-      rt.missileTimer = 1;
-      emitSound(rt, kFfSndKSeen, 0);
+    const float dx = o.aux0 - o.tx;
+    const float dy = o.aux1 - o.ty;
+    const float distSq = dx * dx + dy * dy;
+    float ddx = 0.0f, ddy = 0.0f;
+    if (distSq != 0.0f) {
+      const float s = rt.radarSpeed / std::sqrt(distSq);
+      ddx = dx * s;
+      ddy = dy * s;
+    }
+    o.vx = o.vx * kRadarBlend1 + ddx * kRadarBlend2;
+    o.vy = o.vy * kRadarBlend1 + ddy * kRadarBlend2;
+    o.prevx = o.aux0;
+    o.prevy = o.aux1;
+    o.prevz = o.aux2;
+    o.tx += o.vx * dtSec;
+    o.ty += o.vy * dtSec;
+    o.timer = static_cast<int16_t>(o.timer + frameStep);  // counts UP
+    const bool nearWander =
+        std::fabs(o.tx - o.aux0) < kWanderBox &&
+        std::fabs(o.ty - o.aux1) < kWanderBox;
+    if (nearWander || o.timer > kWanderRetarget) {
+      emitSound(rt, kFfSndRMove, 1);
+      o.timer = 0;
+      o.tx = o.aux0;
+      o.ty = o.aux1;
+      o.tz = o.aux2;
+      radarRetarget(rt, o);
+    }
+    // player proximity — the lock.
+    if (pl) {
+      const float pdx = pl->px - o.tx;
+      const float pdy = pl->py - o.ty;
+      if (pdx * pdx + pdy * pdy < kLockDistSq) {
+        o.aux0 = o.tx;
+        o.aux1 = o.ty;
+        o.aux2 = o.tz;
+        o.timer = -1;
+        rt.fadeRate = kFlashHit;         // 0x40400000 — flash rate 3.0
+        rt.fadeTarget += kLockFlash;
+        if (rt.fadeTarget < kLockFlashMin) rt.fadeTarget = kLockFlashMin;
+        rt.missileBudget += rt.waveSize +
+                            static_cast<int>(enemyRandNext(rt.rng) & 1);
+        rt.missileTimer = 1;
+        ++rt.radarLocks;
+        ++rt.wavesArmed;
+        emitSound(rt, kFfSndKSeen, 0);
+      }
     }
   }
+  // FUN_00411aac tail — runs on every live path (rise, wander, sink):
+  // re-anchor the object to the wedge base at -4x the view camera
+  // (0x540b28/2c x 0x494ec0). The original reads the driver's
+  // current-frame camera; rt.cameraPos refreshes at step end, so
+  // recompute the same value the step will store (camX = px*0.85).
+  o.px = -(pl ? pl->px : 0.0f) * kCamFactor * kRadarCamScale;
+  o.py = -(pl ? pl->py : 0.0f) * kCamFactor * kRadarCamScale;
+  o.pz = 0.0f;
 }
 
 // Type 4 — FUN_00411710.

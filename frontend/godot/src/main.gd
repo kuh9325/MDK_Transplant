@@ -516,6 +516,12 @@ func _ready() -> void:
 	fe_run = "--fe-run" in args
 	ff_dump_dir = _arg_value(args, "--ff-dump-dir", "")
 	ff_dump_every = maxi(1, int(_arg_value(args, "--ff-dump-every", "1")))
+	if not ff_dump_dir.is_empty():
+		# The arg is a host path — resolve against the OS cwd and
+		# create it so a missing dir can't silently drop captures.
+		if not ff_dump_dir.is_absolute_path():
+			ff_dump_dir = OS.get_environment("PWD") + "/" + ff_dump_dir
+		DirAccess.make_dir_recursive_absolute(ff_dump_dir)
 	var spw := _arg_value(args, "--shot-pass-window", "")
 	if not spw.is_empty():
 		var parts := spw.split(",")
@@ -2080,6 +2086,8 @@ func _ff_steer_inject(frame: int) -> void:
 
 
 var _ff_trace_prev_hp := -1
+var _ff_trace_prev_locks := -1
+var _ff_trace_prev_rearms := -1
 var _ff_trace_n := 0
 var _ff_pickup_chute := {}
 
@@ -2090,6 +2098,7 @@ func _ff_trace_tick() -> void:
 	if s.is_empty() or not s.has("player"):
 		return
 	var p: Vector3 = s["player"]["pos_mdk"]
+	var t := float(s["timeline"]) / 60.0
 	var n := 0
 	var mind := -1.0
 	for o in bridge.get_freefall_object_snapshots():
@@ -2145,12 +2154,44 @@ func _ff_trace_tick() -> void:
 				 v.x, v.y, v.z, b[1] if b.size() >= 9 else 0.0,
 				 b[4] if b.size() >= 9 else 0.0, b[7] if b.size() >= 9 else 0.0,
 				 align, nose_align, trn, npens, int(o.get("flare", 0))])
+		if int(o["type"]) == 3 and o.has("beam_mdk"):
+			# Type-3 radar — beam point on the scan plane vs the
+			# player xy the lock test consumes (225 sq dist).
+			var bm: Vector3 = o["beam_mdk"]
+			var bd := Vector2(bm.x - p.x, bm.y - p.y).length()
+			if _ff_trace_n % 30 == 0 or bd < 20.0:
+				print("ff-radar t=%.2f beam=%.1f,%.1f,%.1f d_xy=%.1f aux=%.1f,%.1f,%.1f" %
+					[t, bm.x, bm.y, bm.z, bd,
+					 o["aux_mdk"].x, o["aux_mdk"].y, o["aux_mdk"].z])
 		if dz < -5.0 or dz > 600.0:
 			continue   # passed or not yet inbound
 		if mind < 0.0 or lat < mind:
 			mind = lat
+	# Causal-loop transitions — lock -> wave armed -> missiles ->
+	# sink -> re-arm. Printed only on change so a quiet scan and an
+	# absent radar read differently in the log.
+	var locks := int(s.get("radar_locks", 0))
+	var rearms := int(s.get("radar_rearms", 0))
+	if locks != _ff_trace_prev_locks:
+		if _ff_trace_prev_locks >= 0:
+			print("ff-radar t=%.2f LOCK #%d waves=%d budget=%d" %
+				[t, locks, int(s.get("waves_armed", 0)),
+				 int(s.get("missile_budget", 0))])
+	if rearms != _ff_trace_prev_rearms:
+		if _ff_trace_prev_rearms >= 0:
+			print("ff-radar t=%.2f REARM #%d timer=%d" %
+				[t, rearms, int(s.get("radar_timer", 0))])
+	_ff_trace_prev_locks = locks
+	_ff_trace_prev_rearms = rearms
+	if _ff_trace_n % 60 == 0:
+		print("ff-radar t=%.2f active=%d twin=%d verts=%d timer=%d budget=%d spawns=%d" %
+			[t, int(s.get("radar_active", 0)),
+			 int(s.get("radar_twin", 0)),
+			 int(s.get("radar_verts", 0)),
+			 int(s.get("radar_timer", 0)),
+			 int(s.get("missile_budget", 0)),
+			 int(s.get("missiles_spawned", 0))])
 	var hp := int(s["health"])
-	var t := float(s["timeline"]) / 60.0
 	if _ff_trace_prev_hp < 0:
 		_ff_trace_prev_hp = hp
 	elif hp != _ff_trace_prev_hp:
@@ -2293,13 +2334,44 @@ func _ff_material(mat_name: String, pen: int) -> StandardMaterial3D:
 	return tm
 
 
+func _ff_lut_material(row: int) -> StandardMaterial3D:
+	# FUN_0040c860 negative-pen class mi < -1028: dst = lut[row][dst]
+	# (bank 0, strength 90/256) — a veil, not a flat fill. The Godot
+	# approximation blends toward keyColors[row] at the bank alpha,
+	# the same contract the indexed compositor applies exactly to
+	# the trail pass.
+	var pk := "lut:%d" % row
+	if ff_materials.has(pk):
+		return ff_materials[pk]
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_DISABLED
+	var r := clampi(row, 0, 63)
+	var c := Color.BLACK
+	if ff_key_colors.size() >= (r + 1) * 3:
+		c = Color(ff_key_colors[r * 3] / 255.0,
+			ff_key_colors[r * 3 + 1] / 255.0,
+			ff_key_colors[r * 3 + 2] / 255.0)
+	m.albedo_color = Color(c.r, c.g, c.b, 90.0 / 256.0)
+	ff_materials[pk] = m
+	return m
+
+
 func _ff_bind_mesh(mi: MeshInstance3D, g: Dictionary) -> void:
 	# The bridge mesh carries one surface per (element, material
 	# index) group — materialize each through the shared bank.
 	var mesh: ArrayMesh = g["mesh"]
 	var names: PackedStringArray = g["surface_mats"]
 	var pens: PackedInt32Array = g["surface_pen"]
+	var midx: PackedInt32Array = g.get("surface_mat_idx",
+		PackedInt32Array())
 	for s in mesh.get_surface_count():
+		var raw_mi := int(midx[s]) if s < midx.size() else 0
+		if raw_mi < -1028:
+			mesh.surface_set_material(s, _ff_lut_material(-1029 - raw_mi))
+			continue
 		var nm := String(names[s]) if s < names.size() else ""
 		var pn := int(pens[s]) if s < pens.size() else -1
 		mesh.surface_set_material(s, _ff_material(nm, pn))
@@ -2463,11 +2535,12 @@ func _ff_apply_flare(node: Node3D, o: Dictionary) -> void:
 
 # Kind-1 — the +0x10c marker: the PICK sprite through 0x46d680's
 # center-pos scaled blit (OBSERVED 0x410bf2):
-#   scale = trunc(viewW*3.0 / (z'*zoom)) = trunc(750/z')   [z' = camZ - pz,
+#   scale = trunc(viewW*32.0 / (z'*zoom)) = trunc(8000/z')  [z' = camZ - pz,
 #           the raw M2 row2 (0,0,-1) view depth; gate z' > 0]
 #   outPx = srcPx * scale >> 8                            [0x403a40]
-# The constant sits in the exe image as double 3.0 at 0x494d30 —
-# fmul QWORD, not the zeroed dword the earlier static read saw.
+# The constant sits in the exe image as double 32.0 at 0x494d30 —
+# fmul QWORD reads all 8 bytes (00..00 40 40 = 32.0; the dword-only
+# view reads 0, and 3.0 would encode 00..00 08 40).
 # Presented as a billboard quad sized so it projects to outPx
 # pixels — same world-per-pixel convention the FLARE quad uses.
 func _ff_apply_marker(node: Node3D, o: Dictionary, ff: Dictionary) -> void:
@@ -2481,7 +2554,7 @@ func _ff_apply_marker(node: Node3D, o: Dictionary, ff: Dictionary) -> void:
 	var ox := 0
 	var oy := 0
 	if shown:
-		sc = int(750.0 / zp)          # trunc(600*3.0/(z'*2.4))
+		sc = int(8000.0 / zp)         # trunc(600*32.0/(z'*2.4))
 		ox = (ff_pick_wh.x * sc) >> 8
 		oy = (ff_pick_wh.y * sc) >> 8
 		shown = ox > 0 and oy > 0

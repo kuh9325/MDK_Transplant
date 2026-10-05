@@ -2938,6 +2938,32 @@ Dictionary MdkBridge::get_freefall_snapshot() {
   out["fade_rate"] = double(f.fadeRate);
   out["palette_cycle"] = double(f.palette);
   out["radar_timer"] = int64_t(f.radarTimer);
+  // The detection->wave->rearm causal loop, counted at its
+  // callsites (diagnostic counters — no gameplay effect).
+  out["radar_locks"] = int64_t(f.radarLocks);
+  out["radar_rearms"] = int64_t(f.radarReArms);
+  out["waves_armed"] = int64_t(f.wavesArmed);
+  out["missiles_spawned"] = int64_t(f.missilesSpawned);
+  {
+    // radar_active = live type-3 objects; radar_twin = bound
+    // twins (the wedge draw submits when the twin binds);
+    // radar_verts = the regenerated ring vert count.
+    int active = 0, twins = 0, verts = 0;
+    for (int i = f.listHead; i >= 0; i = f.pool[std::size_t(i)].next) {
+      if (f.pool[std::size_t(i)].type != 3) continue;
+      ++active;
+      const mdk::FreefallScene::Twin* t =
+          mdk::freefallSceneTwin(*ffScene_, i);
+      if (t == nullptr || !t->bound) continue;
+      ++twins;
+      if (!t->obj.model.elemVerts.empty()) {
+        verts += int(t->obj.model.elemVerts[0].size() / 3);
+      }
+    }
+    out["radar_active"] = int64_t(active);
+    out["radar_twin"] = int64_t(twins);
+    out["radar_verts"] = int64_t(verts);
+  }
   out["pickup_timer"] = int64_t(f.pickupTimer);
   out["missile_timer"] = int64_t(f.missileTimer);
   out["missile_budget"] = int64_t(f.missileBudget);
@@ -3058,6 +3084,11 @@ Array MdkBridge::get_freefall_object_snapshots() {
     d["timer"] = int64_t(o.timer);
     d["sub_timer"] = int64_t(o.subTimer);
     d["pickup_rec"] = int64_t(o.pickupRec);
+    // Type-3 radar — +0x120 beam point on the scan plane and the
+    // +0x1c wander target / +0x24 plane. These are the fields the
+    // lock test consumes (player-vs-beam 2D distance, 225 sq).
+    d["beam_mdk"] = Vector3(o.tx, o.ty, o.tz);
+    d["aux_mdk"] = Vector3(o.aux0, o.aux1, o.aux2);
     // Kind-5 — the launch FLARE (FUN_004109d8 case 5 gate +0x108).
     // subTimer ramps 0->8 while the +0x11c launch timer runs and
     // decays after; the draw selects LUT row 10+count (+srcPx) and
