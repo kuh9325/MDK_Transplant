@@ -256,7 +256,47 @@ It is the pickup marker visual — not a missile radar. Missile
 approach warning in mode 2 = the kind-5 FLARE + the trail; there is
 no separate radar ring on missiles.
 
-## 7. Remaining seams / open items
+## 7. FALL_T1 opening teletype (OBSERVED, implemented)
+
+`FUN_0040ef28` (freefall init) at `0x40f60a` gates on `levelId == 0`
+(course 0 only — skill does not gate) and posts
+`FUN_0041cad0("FALL_T1", EDX=flags 1, [stk]=rate 3.0f)`. The name at
+`0x494be4` resolves through `MISC/MDKFONT.FTI` to the single-line
+record `Avoid the RADAR!\0` — no `\n` split, so the queue's consume
+arm produces `lines=1`, drawn at `y=0x78`.
+
+The mode-2 draw block services the engine-global teletype queue
+(`FUN_0041cb44`, documented in STREAM_SCENE §15) once per frame, so
+the entry runs its full lifecycle during the descent:
+
+- **consume** — `charTimer = 3.0`, `holdTimer = 0`, flags 1.
+- **slide-in** (flags&1, hold<0.5) — `holdTimer += dt30` to 0.5,
+  drawn scaled at `hold*2` through renderer 1 (`FUN_0041518c`,
+  centered FONTBIG): ~15 frames.
+- **steady hold** — `charTimer -= dt30` from 3.0, drawn through
+  renderer 0 (`FUN_00414d2c` — centered FONTBIG, FONTSML on
+  600px-width overflow): ~90 frames.
+- **page-out** — `charTimer == 0`, `holdTimer -= dt30` to 0, same
+  scaled geometry in reverse: ~15 frames.
+
+Port: `FreefallRuntime::teletypePost` records the post (name/flags/
+rate — the runtime does not own the FTI resolver). The Godot bridge
+arms a single-entry subset of `FUN_0041cb44` at freefall entry
+(`MdkBridge::ffTtEnter_`, called from both `load_freefall` and the
+campaign handoff), services it once per `stepFreefall_` frame
+(`ffTtService_`), and presents the transparent indexed strip as an
+RGBA overlay (`ff_teletype_frame`) — the same FONTBIG/FONTSML
+renderers the mode-5 stream presenter uses, with `SYS_PAL`'s head
+as the text palette. Verified live on the campaign route: the
+scaled slide-in is visible on freefall entry, the full-size hold
+runs ~3 s centered at y=0x78, and the strip pages out ~4 s in —
+course>0 runs post nothing (native test asserts the gate and the
+exact name/flags/rate).
+
+Note the resolve-miss path (`0x41cb25`): a missing record posts
+nothing silently — kept as a no-op rather than an error.
+
+## 8. Remaining seams / open items
 
 - Trail depth ordering — the veil composites into `backdropFrame`,
   so it always sits behind the 3D bodies; the original depth-sorts

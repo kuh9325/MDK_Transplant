@@ -898,6 +898,9 @@ void freefallInit(FreefallRuntime& rt, const FreefallCourseData& data,
   }
   rt.freeHead = 0;
   rt.listHead = -1;
+
+  // 0x40f60a: course 0 only — FUN_0041cad0("FALL_T1", 1, 3.0f).
+  if (c == 0) rt.teletypePost = {"FALL_T1", 1u, 3.0f};
 }
 
 bool freefallStep(FreefallRuntime& rt, const FreefallInput& input,

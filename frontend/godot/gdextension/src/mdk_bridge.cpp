@@ -205,6 +205,10 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::mode6_frame);
   ClassDB::bind_method(D_METHOD("mode6_diag"),
                        &MdkBridge::mode6_diag);
+  ClassDB::bind_method(D_METHOD("ff_teletype_frame"),
+                       &MdkBridge::ff_teletype_frame);
+  ClassDB::bind_method(D_METHOD("ff_teletype_diag"),
+                       &MdkBridge::ff_teletype_diag);
   // Phase 19D — mode-8 ending cinematic.
   ClassDB::bind_method(D_METHOD("load_ending"),
                        &MdkBridge::load_ending);
@@ -2785,6 +2789,15 @@ bool MdkBridge::load_freefall(int64_t course, int64_t skill,
   // 19C.3 — the mode-2 sound bank set; the event drain runs per
   // step in stepFreefall_.
   loadFreefallSoundBanks_();
+  // FUN_0040ef28 tail — course 0 posts FALL_T1; arm the service
+  // (resolve-miss on a course-0 run is a silent no-op per 0x41cb25).
+  {
+    std::string detail2;
+    if (!ffTtEnter_(detail2)) {
+      setError_("freefall teletype: " + detail2);
+      return false;
+    }
+  }
   return true;
 }
 
@@ -2852,6 +2865,9 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   // pool + the per-step mixer pass (events self-clear at the next
   // step, so the drain runs here, drain-once).
   freefallDrainAudio_();
+  // FUN_0041cb44 — the mode-2 draw block's teletype service; the
+  // FALL_T1 entry slides/holds/pages out through it.
+  ffTtService_();
   if (done && !ffHandoffDone_) {
     // FUN_0040fa68 — the freefall bank dies at the edge: every live
     // voice releases before the handoff path rebuilds. The queued
@@ -3965,6 +3981,216 @@ Dictionary MdkBridge::mode6_diag() {
   out["skip"] = briefing_->skipLatch();
   out["hurry"] = briefing_->hurryLatch();
   out["presented"] = int64_t(briefingFrameSeq_);
+  return out;
+}
+
+// --- Freefall teletype (FALL_T1 post + FUN_0041cb44 subset) --------
+// The mode-2 draw block services the engine-global queue once per
+// frame; this subset covers the single pending FALL_T1 entry —
+// consume -> slide-in (holdTimer 0->0.5) -> steady hold (charTimer
+// rate->0) -> page-out (holdTimer 0.5->0) -> idle. Constants are the
+// OBSERVED ones: dt30 = 0x3d088889 (the 0x49b6f4 step), y = 0x78
+// (1-line), line-2 offsets 0x69/0x87, slide scale = hold*2, steady
+// renderer 0 (FONTBIG-center / FONTSML-overflow), slide/page
+// renderer 1 (scaled FONTBIG).
+
+bool MdkBridge::ffTtEnter_(std::string& detail) {
+  ffTtFontBig_.reset();
+  ffTtFontSml_.reset();
+  ffTtLines_ = 0;
+  ffTtLine_[0].clear();
+  ffTtLine_[1].clear();
+  ffTtChar_ = ffTtHold_ = 0.0f;
+  ffTtFlags_ = 0;
+  ffTtPending_ = false;
+  ffTtActive_ = false;
+  ffTtFrameSeq_ = 0;
+  ffTtFb_.pixels();  // keep storage alive
+  std::fill(ffTtFb_.pixels(), ffTtFb_.pixels() + ffTtFb_.pixelCount(),
+            0);
+  for (int i = 0; i < 256; ++i)
+    ffTtPal_.set(i, {0, 0, 0, 0});   // fully transparent base
+  if (!ff_ || !ff_->teletypePost) return true;  // course > 0: none
+
+  // FUN_0041cad0's FTI resolve (FUN_00414890) + the renderer fonts —
+  // MISC/MDKFONT.FTI carries FALL_T1, FONTBIG, FONTSML and SYS_PAL.
+  std::string err;
+  auto fti = root_->readFile("MISC/MDKFONT.FTI", 1 << 28, &err);
+  if (!fti) {
+    detail = "MISC/MDKFONT.FTI: " + err;
+    return false;
+  }
+  const auto fdir = mdk::inspectFtiDirectory(
+      std::span<const std::byte>(fti->data(), fti->size()));
+  auto decodeFont = [&](const char* name)
+      -> std::optional<mdk::FtiFont> {
+    const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, name);
+    if (!r) return std::nullopt;
+    return mdk::decodeFtiFont(
+        std::span<const std::byte>(
+            fti->data() + r->payloadFileOffset,
+            static_cast<std::size_t>(r->payloadEnd -
+                                     r->payloadFileOffset)),
+        &err);
+  };
+  ffTtFontBig_ = decodeFont("FONTBIG");
+  ffTtFontSml_ = decodeFont("FONTSML");
+  if (const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, "SYS_PAL")) {
+    const auto n = static_cast<std::size_t>(r->payloadEnd -
+                                          r->payloadFileOffset);
+    std::memcpy(ffTtSysHead_.data(),
+                fti->data() + r->payloadFileOffset,
+                std::min<std::size_t>(n, 768));
+  }
+  // Palette: index 0 stays transparent (the strip clear); the text
+  // indices take the resident head (glyphs index <= 62).
+  for (int i = 1; i < 64; ++i)
+    ffTtPal_.set(i, {ffTtSysHead_[i * 3 + 0], ffTtSysHead_[i * 3 + 1],
+                     ffTtSysHead_[i * 3 + 2], 255});
+
+  const mdk::FtiRecord* r =
+      mdk::findFtiRecord(fdir, ff_->teletypePost->name);
+  if (!r) {
+    // The resolve-miss path (0x41cb25): post fails silently — no
+    // queue entry ever lands.
+    return true;
+  }
+  const char* p = reinterpret_cast<const char*>(
+      fti->data() + r->payloadFileOffset);
+  const std::size_t n = static_cast<std::size_t>(r->payloadEnd -
+                                               r->payloadFileOffset);
+  // The consume pass splits at the literal "\n" escape into up to
+  // two lines (the queue's 36-col buffers — the shipped record is a
+  // single short line).
+  std::string text(p, strnlen(p, n));
+  std::size_t nl = text.find("\\n");
+  ffTtLine_[0] = nl == std::string::npos ? text : text.substr(0, nl);
+  ffTtLine_[1] = nl == std::string::npos ? "" : text.substr(nl + 2);
+  ffTtLines_ = ffTtLine_[1].empty() ? 1 : 2;
+  ffTtFlags_ = ff_->teletypePost->flags;
+  ffTtChar_ = ff_->teletypePost->rate;
+  ffTtHold_ = 0.0f;
+  ffTtPending_ = false;
+  ffTtActive_ = true;
+  return true;
+}
+
+void MdkBridge::ffTtDraw_(int renderer, int line, int y, float scale) {
+  if (line < 0 || line >= ffTtLines_) return;
+  const std::string& text = ffTtLine_[line];
+  if (text.empty() || !ffTtFontBig_ || !ffTtFontSml_) return;
+  const int fw = ffTtFb_.width();
+  if (renderer == 0) {
+    // FUN_00414d2c — centered FONTBIG, FONTSML when its measure
+    // overflows the 600px frame (FUN_00414f1c).
+    const int wBig = mdk::measureFtiText(
+        *ffTtFontBig_, text, mdk::kFtiFontBigMissingAdvance);
+    if (wBig >= fw) {
+      const int w = mdk::measureFtiText(
+          *ffTtFontSml_, text, mdk::kFtiFontSmlMissingAdvance);
+      mdk::drawFtiText(*ffTtFontSml_, text, ffTtFb_, (fw - w) / 2, y,
+                       mdk::kFtiFontSmlMissingAdvance);
+    } else {
+      mdk::drawFtiText(*ffTtFontBig_, text, ffTtFb_, (fw - wBig) / 2,
+                       y, mdk::kFtiFontBigMissingAdvance);
+    }
+  } else {
+    // FUN_0041518c — centered FONTBIG scaled.
+    const int w = mdk::measureFtiText(
+        *ffTtFontBig_, text, mdk::kFtiFontBigMissingAdvance);
+    const int x = static_cast<int>(
+        (fw - w * static_cast<double>(scale)) * 0.5);
+    mdk::drawFtiTextScaled(*ffTtFontBig_, text, ffTtFb_, x, y, scale,
+                           mdk::kFtiFontBigMissingAdvance);
+  }
+}
+
+void MdkBridge::ffTtService_() {
+  if (!ffTtActive_) return;
+  constexpr float kDt30 = 0.03333553f;  // 0x3d088889 — 0x49b6f4 step
+  // DrawEnable = the frame-due flag — always 1 on the presented path.
+  std::fill(ffTtFb_.pixels(), ffTtFb_.pixels() + ffTtFb_.pixelCount(),
+            0);
+  ++ffTtFrameSeq_;
+  const auto zero = [](float v) { return !(v > 0) && !(v < 0); };
+  const auto eq = [](float v, float c) { return !(v > c) && !(v < c); };
+  const bool oneLine = ffTtLines_ == 1;
+
+  if (zero(ffTtChar_)) {
+    if (!zero(ffTtHold_)) {
+      // ---- page-out (0x41cdba) -----------------------------------
+      const float s2 = ffTtHold_ * 2.0f;
+      if (oneLine) {
+        ffTtDraw_(1, 0, 0x78, s2);
+      } else {
+        const float t = s2 * 15.0f;
+        ffTtDraw_(1, 0, int(std::lround(120.0f - t)), s2);
+        ffTtDraw_(1, 1, int(std::lround(t + 120.0f)), s2);
+      }
+      float h = ffTtHold_ - kDt30;
+      ffTtHold_ = h < 0.0f ? 0.0f : h;
+      if (zero(ffTtHold_)) ffTtActive_ = false;   // idle
+    } else {
+      ffTtActive_ = false;                        // nothing pending
+    }
+  } else if ((ffTtFlags_ & 1u) && !eq(ffTtHold_, 0.5f)) {
+    // ---- slide-in (0x41cc1a) -------------------------------------
+    const float s2 = ffTtHold_ * 2.0f;
+    if (oneLine) {
+      ffTtDraw_(1, 0, 0x78, s2);
+    } else {
+      const float t = s2 * 15.0f;
+      ffTtDraw_(1, 0, int(std::lround(120.0f - t)), s2);
+      ffTtDraw_(1, 1, int(std::lround(t + 120.0f)), s2);
+    }
+    float h = kDt30 + ffTtHold_;
+    ffTtHold_ = h > 0.5f ? 0.5f : h;
+  } else {
+    // ---- steady hold (0x41cb8e) ----------------------------------
+    if (oneLine) {
+      ffTtDraw_(0, 0, 0x78, 0.0f);
+    } else {
+      ffTtDraw_(0, 0, 0x69, 0.0f);
+      ffTtDraw_(0, 1, 0x87, 0.0f);
+    }
+    // localRate = dt30 (queue drained — the pending-work x2 arm is
+    // empty here).
+    float t = ffTtChar_ - kDt30;
+    ffTtChar_ = t < 0.0f ? 0.0f : t;
+  }
+}
+
+Dictionary MdkBridge::ff_teletype_frame() {
+  Dictionary out;
+  if (!ffTtActive_ || ffTtFrameSeq_ == 0) return out;
+  out["w"] = ffTtFb_.width();
+  out["h"] = ffTtFb_.height();
+  PackedByteArray rgba;
+  rgba.resize(static_cast<int64_t>(ffTtFb_.pixelCount()) * 4);
+  std::uint8_t* dst = rgba.ptrw();
+  for (std::size_t i = 0; i < ffTtFb_.pixelCount(); ++i) {
+    const mdk::Palette::Color c = ffTtPal_.get(ffTtFb_.pixels()[i]);
+    dst[i * 4 + 0] = c.r;
+    dst[i * 4 + 1] = c.g;
+    dst[i * 4 + 2] = c.b;
+    dst[i * 4 + 3] = c.a;
+  }
+  out["rgba"] = rgba;
+  out["seq"] = static_cast<int64_t>(ffTtFrameSeq_);
+  return out;
+}
+
+Dictionary MdkBridge::ff_teletype_diag() const {
+  Dictionary out;
+  out["posted"] = ff_ && ff_->teletypePost.has_value();
+  out["active"] = ffTtActive_;
+  out["char_timer"] = ffTtChar_;
+  out["hold_timer"] = ffTtHold_;
+  out["flags"] = int64_t(ffTtFlags_);
+  out["lines"] = ffTtLines_;
+  out["line0"] = String(ffTtLine_[0].c_str());
+  out["line1"] = String(ffTtLine_[1].c_str());
+  out["presented"] = int64_t(ffTtFrameSeq_);
   return out;
 }
 
@@ -5834,6 +6060,13 @@ bool MdkBridge::campaignFreefallEnter_(std::string& detail) {
   // 19C.3 — same bank set as load_freefall (the campaign entry is
   // the mode-6 exit's FALL3D_<levelId> arm).
   loadFreefallSoundBanks_();
+  {
+    std::string detail2;
+    if (!ffTtEnter_(detail2)) {
+      detail = "freefall teletype: " + detail2;
+      return false;
+    }
+  }
   return true;
 }
 

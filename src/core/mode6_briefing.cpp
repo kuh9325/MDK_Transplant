@@ -185,7 +185,7 @@ walk: {
         *dst = '\0'; ++dst;
         if (s != 0) { s = 2; break; }
         drawLine_(fb, buf0, buf0, x, penY, flag != 0);
-        if (hadNum) x = (int)num;
+        x = hadNum ? (int)num : 0;   // 0x42aeaa: no number -> x=0
         flag = 0;
         dst = buf0; buf0[0] = '\0';
         break;
@@ -224,12 +224,15 @@ walk: {
   if (n > 0) goto head;
   if (flag == 0) goto head;
   if (s == 0) {
-    // Split (0x42afcc): buf1 = prefix + cursor; lookahead appends at
-    // the cursor slot (overwritten by the first lookahead char).
+    // Split (0x42afcc): buf0 = prefix + cursor + NUL — the draw
+    // string stays terminated. buf1 = the prefix copied over; the
+    // lookahead appends at len (the measure string has NO cursor —
+    // its slot is overwritten by the first lookahead char or the
+    // next commit's NUL).
     const long len = dst - buf0;
     std::memcpy(buf1, buf0, (std::size_t)len);
-    buf1[len] = static_cast<char>(cursorChar);
-    buf1[len + 1] = '\0';
+    buf0[len] = static_cast<char>(cursorChar);
+    buf0[len + 1] = '\0';
     s = 1;
     dst = buf1 + len;
     goto head;
@@ -243,7 +246,9 @@ tail:
     *dst = static_cast<char>(cursorChar);
     dst[1] = '\0';
   }
-  drawLine_(fb, buf0, buf1, x, penY, true);
+  // 0x42ad47: flag!=0 pushes 1 (centered via buf1); flag==0 pushes 0
+  // (drawn flush at x — a line never opened by '\c').
+  drawLine_(fb, buf0, buf1, x, penY, flag != 0);
   return 0;
 }
 

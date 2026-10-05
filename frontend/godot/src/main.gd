@@ -110,6 +110,8 @@ var ff_handoff_seen := false # printed the mode transition once
 var _ff_steps := 0            # mode-2 sim steps this session
 var _ff_wall0 := 0            # wall-clock anchor for the descent
 var fe_run := false          # --fe-run: confirm once -> production New Game route
+var fe_brief_natural := false  # --fe-brief-natural: unforced briefing pace
+var _mode6_hold_n := 0         # post-page hold counter for the above
 var _fe_run_done := false
 var _ff_backdrop_warned := 0 # one-shot NOT-READY resource report
 var ff_backdrop: MeshInstance3D = null  # camera-locked backdrop quad
@@ -512,6 +514,10 @@ func _ready() -> void:
 	ff_trace = "--ff-trace" in args
 	ff_shot_pass = "--ff-shot-pass" in args
 	fe_run = "--fe-run" in args
+	# --fe-brief-natural: with --fe-run, mode 6 runs the natural
+	# input path — no forced keys: 15c/s typing, the post-page
+	# bf04 hold (30 visible hold frames), then one pulsed key.
+	fe_brief_natural = "--fe-brief-natural" in args
 	ff_dump_dir = _arg_value(args, "--ff-dump-dir", "")
 	ff_dump_every = maxi(1, int(_arg_value(args, "--ff-dump-every", "1")))
 	if not ff_dump_dir.is_empty():
@@ -2932,6 +2938,37 @@ func _mode6_hide() -> void:
 		$BriefingLayer.visible = false
 
 
+# --- Freefall teletype (FALL_T1) -------------------------------------
+# bridge.ff_teletype_frame() returns the FUN_0041cb44 service draw —
+# the FONTSML/FONTBIG lines on a transparent strip, expanded through
+# the resident SYS_PAL head. Overlay contract matches the briefing
+# presenter (full-rect, alpha-composited over the 3D descent).
+var tt_img: Image = null
+var tt_tex: ImageTexture = null
+
+func _apply_ff_teletype() -> void:
+	var fr: Dictionary = bridge.ff_teletype_frame()
+	if fr.is_empty():
+		_tt_hide()
+		return
+	var w := int(fr["w"])
+	var h := int(fr["h"])
+	tt_img = Image.create_from_data(w, h, false, Image.FORMAT_RGBA8,
+		fr["rgba"])
+	if tt_tex == null:
+		tt_tex = ImageTexture.create_from_image(tt_img)
+	else:
+		tt_tex.update(tt_img)
+	var r: TextureRect = $TtLayer/TtRect
+	r.texture = tt_tex
+	r.visible = true
+	$TtLayer.visible = true
+
+func _tt_hide() -> void:
+	if $TtLayer.visible:
+		$TtLayer.visible = false
+
+
 # --- Phase 19D — mode-8 ending cinematic presentation -----------------
 # One FLIC frame per paced ~33.3ms call into the bridge (the file's
 # speed field is the limiter window — the same policy as mode 5).
@@ -4223,6 +4260,8 @@ func _process(delta: float) -> void:
 		# FUN_004123f4 fixed-orientation camera + 0x4edc04 fade.
 		_fe_stop_songs()   # 19C.4 — the mode-2 bank load releases them
 		_apply_freefall()
+		# FUN_0041cb44 — the FALL_T1 teletype strip (course 0).
+		_apply_ff_teletype()
 		# 19C.3 — the mode-2 sound commands drain on the same
 		# once-per-rendered-frame cadence as traversal/mode-5.
 		_drain_audio_fx()
@@ -4231,6 +4270,7 @@ func _process(delta: float) -> void:
 		# The mode-2 backdrop quad is a camera child — gate it off
 		# the moment any other mode's presenter takes over.
 		ff_backdrop.visible = false
+	_tt_hide()   # the FALL_T1 strip dies with the freefall mode
 	if mode == 5:
 		# Standalone StreamScene — the step above may have run the
 		# exit handoff; the terminal fill frame still uploads. Under
@@ -6943,12 +6983,21 @@ func _frontend_frame(delta: float, mode: int) -> void:
 			bool(input.get("next", false)) or \
 			bool(input.get("left", false)) or \
 			bool(input.get("right", false))
-		if fe_run:
+		if fe_run and not fe_brief_natural:
 			# --fe-run: a held key is a legal original path (hurry
 			# rate + the post-page exit gate) — keeps the scripted
 			# route moving through the briefing.
 			bi["any_key"] = true
 			bi["hurry"] = true
+		elif fe_run and fe_brief_natural:
+			# Natural pace: the machine types at 15c/s with no
+			# keys. After typing_done, hold 30 frames (visible
+			# bf04-gate proof) then pulse one key to exit.
+			var d6: Dictionary = bridge.mode6_diag()
+			if bool(d6.get("typing_done", false)):
+				_mode6_hold_n += 1
+				if _mode6_hold_n >= 30:
+					bi["any_key"] = true
 		var res6: Dictionary = bridge.frontend_progression_step(bi)
 		if not bool(res6.get("ok", true)):
 			printerr("mode-6 briefing: ", bridge.get_last_error())

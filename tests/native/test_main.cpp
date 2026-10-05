@@ -20967,6 +20967,27 @@ void test_freefall_init() {
         CHECK(rt.bonesCourse == (c >= 4));
       }
   }
+  // 0x40f60a — course 0 only: freefallInit posts the FALL_T1
+  // teletype entry through FUN_0041cad0("FALL_T1", flags=1, rate=3.0f).
+  // The runtime records the post; the host's service consumes it.
+  {
+    FreefallRuntime rt;
+    mdk::freefallInit(rt, ffCourse(0, 0), 1);
+    CHECK(rt.teletypePost.has_value());
+    CHECK(rt.teletypePost && rt.teletypePost->name &&
+          std::string(rt.teletypePost->name) == "FALL_T1");
+    CHECK(rt.teletypePost && rt.teletypePost->flags == 1u);
+    CHECK(rt.teletypePost && near(rt.teletypePost->rate, 3.0));
+    for (int c = 1; c < 5; ++c) {
+      FreefallRuntime rt2;
+      mdk::freefallInit(rt2, ffCourse(c, 0), 1);
+      CHECK(!rt2.teletypePost.has_value());
+    }
+    // Skill doesn't gate the post — only the course id.
+    FreefallRuntime rt3;
+    mdk::freefallInit(rt3, ffCourse(0, 2), 1);
+    CHECK(rt3.teletypePost.has_value());
+  }
 }
 
 void test_freefall_intro() {
@@ -30365,7 +30386,7 @@ void test_mode6_briefing() {
   a.font = &font;
   a.sysHead = sysHead;
   a.mapRecord = mapRec;
-  a.briefText = briefChars("\\cXXXX\nXXXXX");
+  a.briefText = briefChars("\\cXXXX\\nXXXXX");
 
   // Caller-owned output surfaces (bridge pattern).
   mdk::IndexedFramebuffer fb{600, 360};
@@ -30494,6 +30515,26 @@ void test_mode6_briefing() {
     while (!b.typingDone() && guard--) b.step(in, fb, pal);
     CHECK(b.typingDone());
     CHECK(countIndex(9) == 2 * 4 * 7);
+  }
+
+  // --- regression (0x42afcc): the split writes cursor+NUL into
+  //     buf0 — a mid-typed '\c' line must never draw the previous
+  //     line's stale tail ("X_" prefix, not "X_XXXXXXXX") ---
+  {
+    Mode6BriefingAssets a5 = a;
+    a5.briefText = briefChars("\\cXXXXXXXXXX\\n\\cXX");
+    Mode6Briefing b;
+    b.enter(0, a5);
+    int guard = 400;
+    while (!b.typingDone() && guard--) {
+      b.step(in, fb, pal);
+      // Line1 commits 10 X = 280 idx-9 pixels. Line2 mid-type draws
+      // buf0 = prefix + cursor: at most 2 X = 56. Stale-tail would
+      // push the frame to 19 X = 532.
+      CHECK(countIndex(9) <= (10 + 2) * 4 * 7);
+    }
+    CHECK(b.typingDone());
+    CHECK(countIndex(9) == 12 * 4 * 7);
   }
 
   // --- missing map record: zeroed background, page still runs ---

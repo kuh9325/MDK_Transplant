@@ -764,6 +764,31 @@ class MdkBridge : public RefCounted {
   int streamNowMs_ = 0;          // synthetic 46c650 clock (ms)
   std::uint64_t streamFrameSeq_ = 0;   // presented-frame counter
 
+  // --- Freefall teletype (FALL_T1) ---------------------------------
+  // FUN_0040ef28's tail posts FALL_T1 through FUN_0041cad0 on course
+  // 0; the runtime records the post and this block runs the
+  // FUN_0041cb44 per-frame service subset for it (single pending
+  // entry — mode 2 has no second poster, OBSERVED). Draws the lines
+  // through the same FONTSML/FONTBIG renderers the stream presenter
+  // uses, into a transparent indexed strip Godot overlays.
+  bool ffTtEnter_(std::string& detail);
+  void ffTtDraw_(int renderer, int line, int y, float scale);
+  void ffTtService_();
+  Dictionary ff_teletype_frame();
+  Dictionary ff_teletype_diag() const;
+  std::optional<mdk::FtiFont> ffTtFontBig_, ffTtFontSml_;
+  mdk::IndexedFramebuffer ffTtFb_{600, 360};
+  mdk::Palette ffTtPal_{};
+  std::array<std::uint8_t, 768> ffTtSysHead_{};
+  std::string ffTtLine_[2];
+  int ffTtLines_ = 0;
+  float ffTtChar_ = 0.0f;          // charTimer (0x5414e0 semantics)
+  float ffTtHold_ = 0.0f;          // holdTimer (0x5414e4)
+  std::uint32_t ffTtFlags_ = 0;    // entryFlags
+  bool ffTtPending_ = false;       // post recorded, not yet consumed
+  bool ffTtActive_ = false;        // service has visible work
+  std::uint64_t ffTtFrameSeq_ = 0;
+
   // --- Phase 19E — mode-6 briefing host ---------------------------
   // Lives only while sess_.loaderSub == 3; created on first pump of
   // that sub-state, reset at the exit edge. Owning buffers hold the

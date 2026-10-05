@@ -126,6 +126,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace mdk {
@@ -333,6 +334,18 @@ struct FreefallRuntime {
   int32_t freeHead = -1;                   // 0x540ed0 freelist
   int32_t listHead = -1;                   // 0x4edaec (player anchor)
   int32_t bonesIdx = -1;                   // 0x4edaf0
+
+  // FUN_0040ef28 tail (0x40f60a): levelId==0 posts FALL_T1 through
+  // FUN_0041cad0 — OBSERVED args EDX=1 (slide-in flag), stack
+  // f32=0x40400000 (rate 3.0). The teletype queue is engine-global;
+  // the runtime records the post and the host services it per frame
+  // (FUN_0041cb44 runs inside the mode-2 draw block).
+  struct TeletypePost {
+    const char* name;
+    std::uint32_t flags;
+    float rate;
+  };
+  std::optional<TeletypePost> teletypePost;
 
   std::vector<FreefallEvent> events;
 };
