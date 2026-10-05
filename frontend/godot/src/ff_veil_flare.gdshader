@@ -1,8 +1,11 @@
 shader_type spatial;
 // Kind-5 launch FLARE — 0x46d6d1: texel 0 transparent, else
 // dst = lut[6 + count + srcPx][dst] where srcPx is the FLARE4 texel
-// index (0..8). Same rgb565 index recovery as ff_veil.gdshader; the
-// row rides on the source texel instead of a uniform.
+// index (0..8). Same rgb565 index recovery as ff_veil.gdshader (NOT
+// proven lossless — palette-key collisions keep whichever index was
+// written last; the §4B audit tracks whether any collision changes
+// a used row's output); the row rides on the source texel instead
+// of a uniform.
 // No depth_draw mode — the transparent pass depth-tests against the
 // opaque buffer (the 10u camera-offset handles the front-of-body
 // layering; anything nearer still occludes it, per the depth seam).

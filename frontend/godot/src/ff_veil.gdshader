@@ -1,8 +1,12 @@
 shader_type spatial;
 // FUN_00412970/FUN_0040c860 veil — dst = lut[row][dst] applied to the
-// already-composited screen pixels. dst is always a palette-exact
-// color (unshaded, nearest-filtered presentation), so the rgb565
-// lookup recovers its index losslessly; lut_tex then applies the
+// already-composited screen pixels. The rgb565 lookup is NOT proven
+// lossless: 256 palette entries map into 65536 keys, later entries
+// overwrite earlier same-key entries, and uninitialized keys read 0.
+// Recovery is exact only where the sampled screen color is
+// palette-exact (unshaded, nearest-filtered presentation) AND every
+// colliding index yields an equivalent LUT output — the §4B audit
+// tracks both conditions per course palette. lut_tex then applies the
 // remap and pal_tex resolves the result. Depth-tested like ordinary
 // geometry, so veil sections composite at their own depth instead of
 // sitting under every body (the indexed-compositor seam this replaces).

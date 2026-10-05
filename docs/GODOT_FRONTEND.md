@@ -517,10 +517,14 @@ death fade elapsed) reports the frontend mode 0 without touching
 traversal state. No freefall gameplay state lives in GDScript; the
 runtime stays authoritative.
 
-Deferred presentation seams (surfaced as state only): the kind-1
-radar marker sprite, the kind-3 BANG frame-block overlay (the
-EXPLODE model mesh still renders), the missile trail/launch glow
-(kinds 4/5), the `ZOOM%04d` intro sprite sequence, and all sounds.
+Deferred presentation seams (surfaced as state only): the kind-3
+BANG frame-block overlay (the EXPLODE model mesh still renders),
+the `ZOOM%04d` intro sprite sequence, and palette cycling (the
+0.5·frameUnits accumulator surfaces as `palette_cycle` but is not
+applied to the presented palette). Presented: the procedural
+`FUN_00411f48` type-3 RADAR wedge, the kind-4 missile trail and
+kind-5 launch glow (screen-reading LUT veils), and the sound bank
+set (the `kFfEvSound` drain).
 
 ## Arena transitions + display set (G3)
 
@@ -714,7 +718,7 @@ original data are absent.
 ```sh
 # frontend native tests (pure math, no engine):
 cd frontend/godot/gdextension && cmake --build build --target mdk_frontend_tests
-./build/mdk_frontend_tests            # 60 checks
+./build/mdk_frontend_tests            # 340 checks (was 60 — stale)
 
 # headless in-engine smoke (canonical launcher path):
 MDK_GODOT_BIN=/path/to/Godot python3 -m pytest tests/test_godot_frontend.py

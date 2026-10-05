@@ -2007,9 +2007,14 @@ func _apply_hud_snapshot() -> void:
 # — everything below only mirrors copy-safe snapshots into nodes.
 #
 # Deferred seams (never presented — documented, not emulated):
-#   kind-1 radar sprite (+0x10c), kind-3 BANG frame-block overlay
-#   (+0x110), kind-4 trail (+0x60), kind-5 launch glow (+0x108),
-#   ZOOM intro sprites, palette cycling, and all sounds.
+#   kind-3 BANG frame-block overlay (+0x110 explodeFlag — the
+#   EXPLODE model mesh renders), the ZOOM%04d intro sprite sequence
+#   (zoomFrame surfaced as state), and palette cycling (the
+#   0.5·frameUnits accumulator surfaces as palette_cycle but is not
+#   applied to the presented palette). Presented elsewhere in this
+#   file: the procedural FUN_00411f48 type-3 RADAR wedge, kind-4
+#   trails + kind-5 launch glow (screen-reading LUT veils), and the
+#   19C.3 sound bank set (freefallDrainAudio_).
 # ---------------------------------------------------------------------------
 
 
