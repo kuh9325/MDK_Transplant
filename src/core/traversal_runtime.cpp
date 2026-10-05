@@ -1210,6 +1210,8 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
 TraversalLoadError traversalRuntimeDiagnosticStart(
     TraversalRuntime& rt, int arenaIndex, const float pos[3],
     float yawDeg, std::string* detail) {
+  rt.spherePhase = 0;   // a diagnostic start is not the fresh-entry
+                        // path — cancel the armed sphere segment
   if (arenaIndex < 0 ||
       static_cast<std::size_t>(arenaIndex) >= rt.arenas.size()) {
     if (detail)
