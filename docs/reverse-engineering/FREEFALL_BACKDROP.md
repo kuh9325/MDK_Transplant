@@ -322,8 +322,18 @@ commit message was wrong, and this note supersedes it without
 rewriting the pushed history. Current flags are kept — they produce
 the observed-correct result: trail/flare = transparent pass
 (depth-tested, no write); wedge = `depth_test_disabled` +
-`depth_draw_never`, priority 1 (painter-last, matching its z'≈0
-object key).
+`depth_draw_never`, priority 1.
+
+**Correction (§4C):** the earlier "painter-last, matching its z'≈0
+object key" parenthetical was wrong. The radar object sits at
+`pz = 0` (the scan plane the camera descends toward), so its
+draw-entry key is the SMALLEST mdk z — the wedge is the FARTHEST
+draw in the sorted walk, not the last. Its veil tris composite over
+the already-drawn backdrop and get overwritten by every nearer
+surface. The priority-1/depth-test-disabled presentation is still
+correct: the §4C chain mask + depth gate reproduces the painter
+semantics exactly (buried wedge elements are skipped), and the
+untested fragment is required so the remap reaches backdrop px.
 
 ## 9. rgb565 inverse-lookup audit (§4B, OBSERVED on real palettes)
 
@@ -372,11 +382,85 @@ now compares the snapshot's palette each frame and drops every
 palette-derived cache on change; per-frame-rebuilt paths (backdrop
 RGBA, `bdf["lut"]`) already tracked the live course.
 
-## 10. Remaining seams / open items
+## 10. Serial veil ordering (§4C, OBSERVED mechanism + correction)
+
+`screen_texture` snapshots the opaque pass only — a veil shader
+reading it can never see an earlier veil's output, so a px under K
+veils got K-1 lost remaps (`lut[r2][p]` instead of
+`lut[r2][lut[r1][p]]`). Exhaustive LUT-level measurement: ~86% of
+all (r1, r2, p) triples differ, max RGB dist² ~50k — not subtle.
+
+**Draw-order correction (supersedes the §8 note's claim).** The
+sorted draw walk keys entries by mdk `obj.z` ascending = far->near
+(CORROBORATED: the kind-5 flare's `obj.z + 10.0` key lands just
+nearer than its body, the kind-1 marker's `obj.z - 1e-5` just
+farther). The radar wedge's key is `pz = 0` — the SMALLEST z, the
+FARTHEST draw — its tris composite over the backdrop and are
+overwritten by every nearer surface. Not painter-last.
+
+**Mechanism.** `freefallSceneVeilMask` (core) rasterizes each
+frame's ordered veil ops — trail sections (per-section mdk-z key),
+kind-5 flare quads (`obj.z + 10.0`, per-srcPx rows, texel 0
+transparent), wedge tris (`obj.z`) — through the same folded-view
+projection into a per-px record buffer: 8 ordered `{row, z'}`
+slots, packed RGBAH and uploaded each frame (`mask_tex`). Every
+veil shader walks the chain in order and applies each element iff
+`z'_elem < z'_winner` (`hint_depth_texture`, linearized) — painter
+semantics: an element behind the winning opaque surface was
+overwritten, not remapped. `screen_texture` supplies the chain's
+BASE index — the winning surface below every veil — via the §4B
+inverse map, exact on palette-exact pixels.
+
+Correctness properties — three cases per fragment:
+- (a) Records exist, ≥1 passes the gate: `L_k[...L_1[p]]` replays
+  in painter order, including trail-over-trail, flare-over-trail,
+  and the wedge's own ring-on-ring overlaps. Every covering veil
+  quad recomputes the full chain from the opaque base, so
+  overlapping quad coverage writes the identical result —
+  idempotent, no double-application.
+- (b) Records exist but every element fails the gate (a nearer
+  body won): the fragment writes the winner's own color back —
+  an identity write — so a buried veil cannot tint the body.
+  This is the dominant real-world case: the wedge cone spans a
+  third of the screen and bodies fly through it constantly.
+- (c) No records (CPU-vs-GPU rasterization edge px): the quad's
+  own single remap as the coverage fallback.
+
+Live diagnostics (`ff-veil` trace, OBSERVED, full campaign):
+`ops` = veil ops (46 wedge tris + up to ~62 trail sections +
+flares), `elems`/`covered`/`multi` = per-px records. The wedge's
+rings project inside each other, so `multi ≈ covered` on nearly
+every cone px — serial composition is exercised ~100% of the
+time, not a corner case. `overflow` held 0 for ~95% of ticks
+then spiked to 328-692 during a dense near-camera trail cluster
+(cov ≤556 px, multi ≤532) — the 8-slot cap dropped the farthest
+trail sections on those px only.
+
+Residual seams:
+- Record cap 8/px (nearest records win on overflow; `overflow`
+  counter exposed in `ff_veil_mask`; first nonzero live readings
+  logged at dense trail clusters, magnitude above).
+- The CPU rasterizer's coverage can differ from the GPU's by an
+  edge px — the own-row fallback absorbs it.
+- The mask stores the painter *key* order, not a hypothetical
+  per-px z' order (they coincide for the veil classes here).
+- Half-float z' quantizes to ~4 units at the far end — two veil
+  elements within one quantization step can swap gate order
+  (degenerate-depth only).
+
+Native test (`test_freefall_scene` §4C block): missile trail +
+radar wedge + kind-5 flare on a real FALL3D scene — records carry
+frustum z', wedge records sort FIRST at every shared px, multi-
+element px exist (`multi > 0`).
+
+## 11. Remaining seams / open items
 
 - Trail depth ordering — the veil composites into `backdropFrame`,
   so it always sits behind the 3D bodies; the original depth-sorts
   trail sections inside the object walk (§4 boundary caveat).
+  The Godot presentation path solves this for the display frame
+  (depth-tested veils + the §4C chain mask); the caveat applies
+  only to the native/headless compositor.
 - `0x46e940` (pen -1028) — textured/shaded triangle fill path in
   the negative-pen dispatch; no current trail section reaches it.
 - Windowed-path letterbox (`0x541548 != 0`, `0x49b578`) — not

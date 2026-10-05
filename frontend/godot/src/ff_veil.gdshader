@@ -10,8 +10,14 @@ shader_type spatial;
 // remap and pal_tex resolves the result. Depth-tested like ordinary
 // geometry, so veil sections composite at their own depth instead of
 // sitting under every body (the indexed-compositor seam this replaces).
-// Residual seam: screen_texture holds only the opaque pass — veil
-// pixels under an earlier veil apply one remap, not the serial chain.
+// §4C serial ordering: screen_texture holds only the opaque pass, so
+// it supplies the chain's BASE index (the winning surface under every
+// veil) but never an earlier veil's output. mask_tex records, per px,
+// the ordered {row,z'} elements the veil ops cover (trail sections,
+// flare, wedge — painter far->near). The fragment replays them in
+// order gated by the winning opaque depth: element i applies iff
+// z'_i < z'_winner (a buried element was overwritten, not remapped).
+// Px with no records fall back to this quad's own single remap.
 // No depth_draw mode: ALPHA puts the surface in the transparent pass,
 // which depth-tests against the opaque buffer without writing — the
 // overlap contract (veil sections composite at their own depth).
@@ -21,6 +27,8 @@ uniform sampler2D screen_tex : hint_screen_texture, filter_nearest;
 uniform sampler2D idx_tex : filter_nearest, repeat_disable; // 256x256 R8: rgb565 -> index
 uniform sampler2D lut_tex : filter_nearest, repeat_disable; // 256x64 R8: index -> remapped
 uniform sampler2D pal_tex : filter_nearest, repeat_disable; // 256x1 RGB8: index -> color
+uniform sampler2D mask_tex : filter_nearest, repeat_disable; // 2400x360 RGBAH: 8 {row,z'} per px
+uniform sampler2D depth_tex : hint_depth_texture, filter_nearest;
 uniform float lut_row = 0.0;
 uniform bool row_from_color = false;   // trail: per-tri row via vertex COLOR.r
 
@@ -30,10 +38,42 @@ void fragment() {
 	int k = ((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3);
 	float ix = texelFetch(idx_tex, ivec2(k & 255, k >> 8), 0).r;
 	float row = row_from_color ? floor(COLOR.r * 255.0 + 0.5) : lut_row;
-	float ni = texelFetch(lut_tex,
-		ivec2(int(ix * 255.0 + 0.5), int(row)), 0).r;
+	// Winning opaque depth for the painter gate.
+	float d_raw = texture(depth_tex, SCREEN_UV).r;
+	vec3 ndc = vec3(SCREEN_UV * 2.0 - 1.0, d_raw);
+	vec4 vp = INV_PROJECTION_MATRIX * vec4(ndc, 1.0);
+	float win_z = -vp.z / vp.w;
+	// Replay the ordered records. Three cases: (a) records exist and
+	// at least one passes the gate -> serial chain; (b) records exist
+	// but every element is buried under the winner -> the winner's
+	// own color stands (no remap — a covered veil does not tint);
+	// (c) no records -> CPU/GPU coverage mismatch, keep the quad's
+	// own single remap.
+	ivec2 mp = clamp(ivec2(SCREEN_UV * vec2(600.0, 360.0)),
+		ivec2(0), ivec2(599, 359));
+	bool any_rec = false;
+	for (int j = 0; j < 4; ++j) {
+		vec4 rec = texelFetch(mask_tex,
+			ivec2(mp.x * 4 + j, mp.y), 0);
+		if (rec.x >= 0.0) {
+			any_rec = true;
+			if (rec.y < win_z)
+				ix = texelFetch(lut_tex, ivec2(
+					int(ix * 255.0 + 0.5), int(rec.x)), 0).r;
+		}
+		if (rec.z >= 0.0) {
+			any_rec = true;
+			if (rec.w < win_z)
+				ix = texelFetch(lut_tex, ivec2(
+					int(ix * 255.0 + 0.5), int(rec.z)), 0).r;
+		}
+	}
+	if (!any_rec) {
+		ix = texelFetch(lut_tex,
+			ivec2(int(ix * 255.0 + 0.5), int(row)), 0).r;
+	}
 	vec3 rgb = texture(pal_tex,
-		vec2((floor(ni * 255.0 + 0.5) + 0.5) / 256.0, 0.5)).rgb;
+		vec2((floor(ix * 255.0 + 0.5) + 0.5) / 256.0, 0.5)).rgb;
 	ALBEDO = rgb;
 	ALPHA = 1.0;
 }

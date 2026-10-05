@@ -410,6 +410,49 @@ FreefallBackdropStatus freefallSceneBackdropStatus(
 void freefallSceneTrailComposite(FreefallScene& s,
                                  float camX, float camY, float camZ);
 
+// §4C — the serial veil-ordering target. The original's veil ops
+// (trail sections, kind-5 flare, the radar wedge's negative-pen
+// tris) all perform dst = lut[row][dst] IN DRAW ORDER on the shared
+// indexed framebuffer, so a px under K veils receives the serial
+// chain L_k[...L_1[p]] — not K independent single remaps. The Godot
+// screen_texture path snapshots only the opaque pass, so a veil
+// shader can never see an earlier veil's output there. This mask
+// retains, per px, the ordered list of {row, z'} records the veil
+// ops would apply; the frontend shaders replay the chain with a
+// depth gate against the winning opaque surface (painter semantics:
+// an element behind a body was overwritten by it, so a buried
+// element must not remap).
+struct VeilMask {
+  static constexpr int kW = 600;
+  static constexpr int kH = 360;
+  static constexpr int kK = 8;    // per-px record cap
+  struct Rec {
+    std::uint8_t row = 0;
+    float z = 0.0f;               // z' = camZ - pz (view depth)
+  };
+  // recs[px*kK + k]; counts[px] = valid records (0..kK); overflow =
+  // elements dropped past the cap (nearest records win).
+  std::vector<Rec> recs;
+  std::vector<std::uint8_t> counts;
+  int ops = 0;
+  int elems = 0;
+  int overflow = 0;
+  void clear() {
+    recs.assign(std::size_t(kW) * kH * kK, Rec{});
+    counts.assign(std::size_t(kW) * kH, 0);
+    ops = elems = overflow = 0;
+  }
+};
+
+// Emit the ordered veil records for this frame — trail sections,
+// kind-5 flare quads, radar-wedge tris — sorted by the draw-entry
+// key (mdk z ascending = far->near painter order; flare keyed
+// obj.z + 10.0 OBSERVED, wedge z'~=0 sorts last) and rasterized
+// through the same folded-view projection the compositor uses.
+void freefallSceneVeilMask(FreefallScene& s, const FreefallRuntime& rt,
+                           float camX, float camY, float camZ,
+                           VeilMask& out);
+
 // The CHUTE attachment prototype — the pickup's second kind-2 entry
 // renders this model under the SAME object basis (FUN_004109d8 emits
 // it at +0x306 without a separate transform). Binds slot 4 lazily.

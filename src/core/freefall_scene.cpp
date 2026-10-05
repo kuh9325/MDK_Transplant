@@ -853,16 +853,19 @@ FreefallBackdropStatus freefallSceneBackdropStatus(
   return st;
 }
 
-void freefallSceneTrailComposite(FreefallScene& s,
-                               float camX, float camY, float camZ) {
-  if (!s.lutOk || s.lut.size() < 384 * 256 ||
-      s.backdropFrame.size() < 600 * 360) {
-    return;
-  }
-  // The mode-2 folded view — same constants get_freefall_snapshot
-  // builds the Godot camera from. Original view record (0x46b4f8
-  // input): right = +X, down = -Y, +viewdir = -Z_mdk (the raw M2
-  // row2); scaleX/Y folded into x'/y' rows.
+namespace {
+
+// The mode-2 folded view — same constants get_freefall_snapshot
+// builds the Godot camera from. Original view record (0x46b4f8
+// input): right = +X, down = -Y, +viewdir = -Z_mdk (the raw M2
+// row2); scaleX/Y folded into x'/y' rows.
+struct M2Pt {
+  float x, y;
+  float z;     // z' = camZ - pz (the projection divisor; view depth)
+  bool on;
+};
+M2Pt m2Project(float px, float py, float pz,
+               float camX, float camY, float camZ) {
   constexpr float kZoom = 2.4f;          // 0x540b58 boot value
   constexpr float kScaleX = 1.0f / (kZoom * 0.5f);
   constexpr float kScaleY = 1.0f / (kZoom * 0.3f);
@@ -870,14 +873,79 @@ void freefallSceneTrailComposite(FreefallScene& s,
   constexpr float kYDiv = 360.0f * 0.5011f;
   constexpr float kBias = 0.05f;
   constexpr float kNear = 0.05f;
-  struct Pt { float x, y; bool on; };
-  auto project = [&](float px, float py, float pz) -> Pt {
-    const float zp = camZ - pz;
-    if (zp <= kNear) return {0.0f, 0.0f, false};
-    const float xp = kScaleX * (px - camX);
-    const float yp = kScaleY * (camY - py);
-    return {static_cast<float>((xp + zp) / zp * kXDiv + kBias),
-            static_cast<float>((yp + zp) / zp * kYDiv + kBias), true};
+  const float zp = camZ - pz;
+  if (zp <= kNear) return {0.0f, 0.0f, 0.0f, false};
+  const float xp = kScaleX * (px - camX);
+  const float yp = kScaleY * (camY - py);
+  return {static_cast<float>((xp + zp) / zp * kXDiv + kBias),
+          static_cast<float>((yp + zp) / zp * kYDiv + kBias), zp, true};
+}
+
+// Fill one projected triangle, calling sink(x, y, z') per covered
+// px. Degenerate (line) quads still mark their edge segments, like
+// the original's cap/edge coverage.
+template <typename Sink>
+void m2FillTri(const M2Pt& a, const M2Pt& b, const M2Pt& c,
+               Sink&& sink) {
+  const int minX = std::max(0, static_cast<int>(
+      std::floor(std::min({a.x, b.x, c.x}))));
+  const int maxX = std::min(599, static_cast<int>(
+      std::ceil(std::max({a.x, b.x, c.x}))));
+  const int minY = std::max(0, static_cast<int>(
+      std::floor(std::min({a.y, b.y, c.y}))));
+  const int maxY = std::min(359, static_cast<int>(
+      std::ceil(std::max({a.y, b.y, c.y}))));
+  if (minX > maxX || minY > maxY) return;
+  const auto edge = [](const M2Pt& u, const M2Pt& v, float x, float y) {
+    return (x - u.x) * (v.y - u.y) - (y - u.y) * (v.x - u.x);
+  };
+  const float area = edge(a, b, c.x, c.y);
+  if (std::fabs(area) < 1e-9f) {
+    const float zm = (a.z + b.z + c.z) / 3.0f;
+    auto plot = [&](float x0, float y0, float x1, float y1) {
+      const int steps = std::max(1, static_cast<int>(std::ceil(
+          std::max(std::fabs(x1 - x0), std::fabs(y1 - y0)) * 2)));
+      for (int k = 0; k <= steps; ++k) {
+        const int xx = static_cast<int>(x0 + (x1 - x0) * k / steps);
+        const int yy = static_cast<int>(y0 + (y1 - y0) * k / steps);
+        if (xx >= 0 && xx < 600 && yy >= 0 && yy < 360) {
+          sink(xx, yy, zm);
+        }
+      }
+    };
+    plot(a.x, a.y, b.x, b.y);
+    plot(b.x, b.y, c.x, c.y);
+    return;
+  }
+  const float s = area > 0 ? 1.0f : -1.0f;
+  for (int yy = minY; yy <= maxY; ++yy) {
+    for (int xx = minX; xx <= maxX; ++xx) {
+      const float fx = xx + 0.5f;
+      const float fy = yy + 0.5f;
+      const float e0 = edge(a, b, fx, fy) * s;
+      const float e1 = edge(b, c, fx, fy) * s;
+      const float e2 = edge(c, a, fx, fy) * s;
+      if (e0 < 0.0f || e1 < 0.0f || e2 < 0.0f) continue;
+      // Perspective-correct view depth: 1/z' is affine in screen
+      // space, so interpolate the reciprocals then invert.
+      const float iz = (e1 / a.z + e2 / b.z + e0 / c.z) /
+                       std::fabs(area);
+      sink(xx, yy, iz > 1e-9f ? 1.0f / iz : 1e9f);
+    }
+  }
+}
+
+} // namespace
+
+void freefallSceneTrailComposite(FreefallScene& s,
+                               float camX, float camY, float camZ) {
+  if (!s.lutOk || s.lut.size() < 384 * 256 ||
+      s.backdropFrame.size() < 600 * 360) {
+    return;
+  }
+  using Pt = M2Pt;
+  auto project = [&](float px, float py, float pz) {
+    return m2Project(px, py, pz, camX, camY, camZ);
   };
 
   constexpr float kHeadRamp[6] =
@@ -889,52 +957,10 @@ void freefallSceneTrailComposite(FreefallScene& s,
   // One triangle of the screen-space quad, dst = lut[row*256+dst].
   auto fillTri = [&](const Pt& a, const Pt& b, const Pt& c, int row) {
     const std::uint8_t* lr = lut + std::size_t(row) * 256;
-    const int minX = std::max(0, static_cast<int>(
-        std::floor(std::min({a.x, b.x, c.x}))));
-    const int maxX = std::min(599, static_cast<int>(
-        std::ceil(std::max({a.x, b.x, c.x}))));
-    const int minY = std::max(0, static_cast<int>(
-        std::floor(std::min({a.y, b.y, c.y}))));
-    const int maxY = std::min(359, static_cast<int>(
-        std::ceil(std::max({a.y, b.y, c.y}))));
-    if (minX > maxX || minY > maxY) return;
-    const auto edge = [](const Pt& u, const Pt& v, float x, float y) {
-      return (x - u.x) * (v.y - u.y) - (y - u.y) * (v.x - u.x);
-    };
-    const float area = edge(a, b, c.x, c.y);
-    if (std::fabs(area) < 1e-9f) {
-      // Degenerate (line) quad — draw the edge segments so thin
-      // tails still mark, like the original's cap/edge coverage.
-      auto plot = [&](float x0, float y0, float x1, float y1) {
-        const int steps = std::max(1, static_cast<int>(std::ceil(
-            std::max(std::fabs(x1 - x0), std::fabs(y1 - y0)) * 2)));
-        for (int k = 0; k <= steps; ++k) {
-          const int xx = static_cast<int>(x0 + (x1 - x0) * k / steps);
-          const int yy = static_cast<int>(y0 + (y1 - y0) * k / steps);
-          if (xx >= 0 && xx < 600 && yy >= 0 && yy < 360) {
-            std::uint8_t* d = fb + yy * 600 + xx;
-            *d = lr[*d];
-          }
-        }
-      };
-      plot(a.x, a.y, b.x, b.y);
-      plot(b.x, b.y, c.x, c.y);
-      return;
-    }
-    const float s = area > 0 ? 1.0f : -1.0f;
-    for (int yy = minY; yy <= maxY; ++yy) {
-      for (int xx = minX; xx <= maxX; ++xx) {
-        const float fx = xx + 0.5f;
-        const float fy = yy + 0.5f;
-        if (edge(a, b, fx, fy) * s < 0.0f ||
-            edge(b, c, fx, fy) * s < 0.0f ||
-            edge(c, a, fx, fy) * s < 0.0f) {
-          continue;
-        }
-        std::uint8_t* d = fb + yy * 600 + xx;
-        *d = lr[*d];
-      }
-    }
+    m2FillTri(a, b, c, [&](int xx, int yy, float) {
+      std::uint8_t* d = fb + yy * 600 + xx;
+      *d = lr[*d];
+    });
   };
 
   for (const FreefallScene::Twin& t : s.twins) {
@@ -982,6 +1008,228 @@ void freefallSceneTrailComposite(FreefallScene& s,
       prevL = pl;
       prevR = pr;
     }
+  }
+}
+
+namespace {
+
+// One veil op projected into the folded view, ready to rasterize
+// into the VeilMask. `src == nullptr` -> fixed `row`; else per-px
+// row = rowBase + srcPx over the screen rect (kind-5 flare — srcPx 0
+// is transparent and marks nothing).
+struct MaskOp {
+  M2Pt v[4];
+  int n = 0;
+  float key = 0.0f;              // draw-entry key (mdk z, far->near)
+  int row = -1;
+  const std::uint8_t* src = nullptr;
+  int srcW = 0, srcH = 0;
+  int rowBase = 0;
+  float rx = 0, ry = 0, rw = 0, rh = 0;
+  float zFlat = 0.0f;            // textured quads carry one depth
+};
+
+void maskAppend(VeilMask& out, int x, int y, int row, float z) {
+  const std::size_t px = std::size_t(y) * VeilMask::kW + x;
+  std::uint8_t& n = out.counts[px];
+  VeilMask::Rec* r = out.recs.data() + px * VeilMask::kK;
+  if (n < VeilMask::kK) {
+    r[n].row = static_cast<std::uint8_t>(row);
+    r[n].z = z;
+    ++n;
+  } else {
+    // Past the cap the NEAREST records win — drop the farthest and
+    // keep the chain's top end (records arrive far->near).
+    std::memmove(r, r + 1, (VeilMask::kK - 1) * sizeof(VeilMask::Rec));
+    r[VeilMask::kK - 1].row = static_cast<std::uint8_t>(row);
+    r[VeilMask::kK - 1].z = z;
+    ++out.overflow;
+  }
+  ++out.elems;
+}
+
+void maskRasterOp(VeilMask& out, const MaskOp& op) {
+  if (op.src != nullptr) {
+    const int x0 = std::max(0, static_cast<int>(std::floor(op.rx)));
+    const int y0 = std::max(0, static_cast<int>(std::floor(op.ry)));
+    const int x1 = std::min(599, static_cast<int>(std::ceil(
+        op.rx + op.rw)));
+    const int y1 = std::min(359, static_cast<int>(std::ceil(
+        op.ry + op.rh)));
+    for (int y = y0; y < y1; ++y) {
+      for (int x = x0; x < x1; ++x) {
+        const int sx = static_cast<int>(
+            (x - op.rx) * op.srcW / op.rw);
+        const int sy = static_cast<int>(
+            (y - op.ry) * op.srcH / op.rh);
+        const int sp = op.src[std::size_t(sy) * op.srcW + sx];
+        if (sp == 0) continue;   // texel 0 — the transparent blit skips
+        maskAppend(out, x, y, op.rowBase + sp, op.zFlat);
+      }
+    }
+    return;
+  }
+  auto sink = [&](int x, int y, float z) {
+    maskAppend(out, x, y, op.row, z);
+  };
+  m2FillTri(op.v[0], op.v[1], op.v[2], sink);
+  if (op.n == 4) m2FillTri(op.v[0], op.v[2], op.v[3], sink);
+}
+
+} // namespace
+
+void freefallSceneVeilMask(FreefallScene& s, const FreefallRuntime& rt,
+                           float camX, float camY, float camZ,
+                           VeilMask& out) {
+  out.clear();
+  std::vector<MaskOp> ops;
+
+  constexpr float kHeadRamp[6] =
+      {1.0f, 1.25f, 1.2f, 1.1f, 1.05f, 1.0f};   // 0x49b634
+  constexpr int cap = FreefallScene::Twin::kTrailCap;
+
+  // Kind-4 trail sections — the same oldest->newest ring walk and
+  // taper the indexed compositor uses; sort key = the section's own
+  // mdk z (the original sorts sections at their own depth).
+  for (const FreefallScene::Twin& t : s.twins) {
+    const FreefallScene::Twin::Trail& tr = t.trail;
+    if (!t.bound || tr.count < 2 || tr.anchors < 2) continue;
+    M2Pt prevL{0, 0, 0, false}, prevR{0, 0, 0, false};
+    float prevZ = 0.0f;
+    for (int sw = 0; sw < tr.count; ++sw) {
+      const int k = (tr.read + sw) & (cap - 1);
+      const int age = tr.count - 1 - sw;
+      const float tt =
+          age < 6 ? kHeadRamp[age]
+                  : std::max(0.0f, 1.0f - float(age - 6) /
+                                          float(cap - 6));
+      const float* l = tr.pts[k][0];
+      const float* r = tr.pts[k][1];
+      const float cx = (l[0] + r[0]) * 0.5f;
+      const float cy = (l[1] + r[1]) * 0.5f;
+      const float cz = (l[2] + r[2]) * 0.5f;
+      const M2Pt pl = m2Project(cx + (l[0] - cx) * tt,
+                                cy + (l[1] - cy) * tt,
+                                cz + (l[2] - cz) * tt,
+                                camX, camY, camZ);
+      const M2Pt pr = m2Project(cx + (r[0] - cx) * tt,
+                                cy + (r[1] - cy) * tt,
+                                cz + (r[2] - cz) * tt,
+                                camX, camY, camZ);
+      const float mz = (l[2] + r[2]) * 0.5f;
+      if (sw > 0 && prevL.on && prevR.on && pl.on && pr.on) {
+        const int pen = freefallTrailSectionPen(tr.count, sw);
+        if (pen < -1028) {
+          const int row = -1029 - pen;
+          if (row >= 0 && row < 64) {
+            MaskOp op{};
+            op.v[0] = prevL; op.v[1] = prevR;
+            op.v[2] = pr;    op.v[3] = pl;
+            op.n = 4;
+            op.key = (prevZ + mz) * 0.5f;
+            op.row = row;
+            ops.push_back(op);
+          }
+        }
+      }
+      prevL = pl;
+      prevR = pr;
+      prevZ = mz;
+    }
+  }
+
+  for (int i = rt.listHead; i >= 0; i = rt.pool[i].next) {
+    if (i >= 399) break;   // same corrupt-link bound the walk uses
+    const FreefallObject& o = rt.pool[std::size_t(i)];
+
+    // Kind-5 launch flare — FUN_004109d8 emits it keyed obj.z + 10.0
+    // for every +0x108 != 0; 0x46d6d1 renders FLARE4 64x64 at scale
+    // 0x80 -> a 32x32 quad at the projected pos, per-srcPx row.
+    if (o.alive && o.subTimer > 0 && !s.flare4.px.empty()) {
+      // The presented quad rides 10u camera-ward (the sort key's
+      // +10 bias reproduced as a small offset).
+      const M2Pt c = m2Project(o.px, o.py, o.pz + 10.0f,
+                               camX, camY, camZ);
+      if (c.on) {
+        MaskOp op{};
+        op.n = 0;
+        op.key = o.pz + 10.0f;   // OBSERVED 0x410dfb draw-entry key
+        op.src = s.flare4.px.data();
+        op.srcW = s.flare4.w;
+        op.srcH = s.flare4.h;
+        op.rowBase = 6 + std::min(o.subTimer, 8);
+        const float ow = float(op.srcW * 0x80 >> 8);   // 0x46d6d1
+        const float oh = float(op.srcH * 0x80 >> 8);
+        op.rx = c.x - ow * 0.5f;
+        op.ry = c.y - oh * 0.5f;
+        op.rw = ow;
+        op.rh = oh;
+        op.zFlat = c.z;
+        ops.push_back(op);
+      }
+    }
+
+    // The radar wedge — FUN_00411f48's code-built model (slot 2):
+    // negative pens -0x405..-0x409 -> rows 0..4 through the same
+    // dst = lut[row][dst] op. Sorts last (the type-3 object sits at
+    // z' ~= 0); the model verts are object-space under +0xac.
+    if (o.type == 3) {
+      const FreefallScene::Twin* t =
+          freefallSceneTwin(s, i);
+      if (t && t->bound && t->obj.model.elemVerts.size() == 1 &&
+          t->obj.model.elemVerts[0].size() >= 25 * 3 &&
+          !t->obj.model.elemTris.empty()) {
+        const float* mv = t->obj.model.elemVerts[0].data();
+        const std::uint8_t* tris = t->obj.model.elemTris[0].data();
+        const int triCount = t->obj.model.elems[0].triCount;
+        for (int ti = 0; ti < triCount; ++ti) {
+          const std::uint8_t* rec = tris + std::size_t(ti) * 0x24;
+          std::uint16_t vi[3];
+          std::int16_t pen;
+          for (int k = 0; k < 3; ++k) {
+            std::memcpy(&vi[k], rec + k * 2, 2);
+          }
+          std::memcpy(&pen, rec + 6, 2);
+          if (pen >= -1028) continue;
+          const int row = -1029 - pen;
+          if (row < 0 || row >= 64) continue;
+          MaskOp op{};
+          bool on = true;
+          // The presented transform is the twin's collision matrix —
+          // mdkTransformToGodot(tw.col.xform, tw.col.origin) is what
+          // the Godot mesh node carries.
+          const float* xf = t->obj.col.xform;
+          const float* og = t->obj.col.origin;
+          for (int k = 0; k < 3; ++k) {
+            const float* lv = mv + std::size_t(vi[k]) * 3;
+            const float wx = xf[0] * lv[0] + xf[1] * lv[1] +
+                             xf[2] * lv[2] + og[0];
+            const float wy = xf[3] * lv[0] + xf[4] * lv[1] +
+                             xf[5] * lv[2] + og[1];
+            const float wz = xf[6] * lv[0] + xf[7] * lv[1] +
+                             xf[8] * lv[2] + og[2];
+            op.v[k] = m2Project(wx, wy, wz, camX, camY, camZ);
+            on = on && op.v[k].on;
+          }
+          if (!on) continue;
+          op.n = 3;
+          op.key = o.pz;
+          op.row = row;
+          ops.push_back(op);
+        }
+      }
+    }
+  }
+
+  // Painter order — draw-entry key ascending (far->near), matching
+  // the OBSERVED obj.z / obj.z + 10.0 key semantics.
+  std::stable_sort(ops.begin(), ops.end(),
+                   [](const MaskOp& a, const MaskOp& b) {
+                     return a.key < b.key;
+                   });
+  out.ops = static_cast<int>(ops.size());
+  for (const MaskOp& op : ops) {
+    maskRasterOp(out, op);
   }
 }
 

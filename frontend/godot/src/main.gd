@@ -2251,6 +2251,12 @@ func _ff_trace_tick() -> void:
 			 int(s.get("missile_budget", 0)),
 			 int(s.get("missiles_spawned", 0)),
 			 str(keys)])
+		print("ff-veil tk=%d ops=%d elems=%d cov=%d multi=%d ovf=%d" %
+			[tick, int(ff_mask_diag.get("ops", -1)),
+			 int(ff_mask_diag.get("elems", -1)),
+			 int(ff_mask_diag.get("covered", -1)),
+			 int(ff_mask_diag.get("multi", -1)),
+			 int(ff_mask_diag.get("overflow", -1))])
 	var hp := int(s["health"])
 	if _ff_trace_prev_hp < 0:
 		_ff_trace_prev_hp = hp
@@ -2518,6 +2524,13 @@ var ff_veil_top_shader: Shader = null
 var ff_veil_flare_shader: Shader = null
 var ff_veil_mats := {}                # row -> ShaderMaterial (top)
 var ff_flare_idx_tex: ImageTexture = null  # FLARE4 raw indices
+# §4C — the serial veil-ordering target: per-px ordered {row,z'}
+# records for every veil op this frame (RGBAH, 4 texels/px = 8
+# records). The veil shaders replay the chain gated by the winning
+# opaque depth instead of a single screen_texture remap.
+var ff_mask_img: Image = null         # 2400x360 RGBAH
+var ff_mask_tex: ImageTexture = null
+var ff_mask_diag := {}                # ops/elems/overflow for traces
 
 
 func _ff_veil_setup(bdf: Dictionary) -> void:
@@ -2555,7 +2568,37 @@ func _ff_veil_params(m: ShaderMaterial) -> ShaderMaterial:
 	m.set_shader_parameter("idx_tex", ff_idx_tex)
 	m.set_shader_parameter("lut_tex", ff_lut_tex)
 	m.set_shader_parameter("pal_tex", ff_pal_tex)
+	m.set_shader_parameter("mask_tex", ff_mask_tex)
 	return m
+
+
+# §4C — per-frame mask upload. The bridge rasterizes this frame's
+# ordered veil ops (trail sections, kind-5 flare, radar wedge tris)
+# into per-px {row,z'} records; the shader walks them so a px under
+# K veils gets the serial chain L_k[...L_1[p]], gated by the opaque
+# depth winner (a buried element was overwritten, not remapped).
+func _ff_mask_update() -> void:
+	var m: Dictionary = bridge.ff_veil_mask()
+	if m.is_empty():
+		return
+	ff_mask_diag = {
+		"ops": m.get("ops", 0),
+		"elems": m.get("elems", 0),
+		"overflow": m.get("overflow", 0),
+		"covered": m.get("covered", 0),
+		"multi": m.get("multi", 0),
+	}
+	ff_mask_img = Image.create_from_data(int(m["w"]), int(m["h"]),
+		false, Image.FORMAT_RGBAH, m["data"])
+	if ff_mask_tex == null:
+		ff_mask_tex = ImageTexture.create_from_image(ff_mask_img)
+		# Materials created before the first upload hold a null
+		# mask_tex — rebuild them once it exists.
+		ff_veil_mats.clear()
+		ff_flare_veil_mats.clear()
+		ff_materials.clear()   # lut: wedge entries ride the mask too
+	else:
+		ff_mask_tex.update(ff_mask_img)
 
 
 func _ff_veil_trail_mat() -> ShaderMaterial:
@@ -2803,6 +2846,8 @@ func _apply_freefall() -> void:
 	_ff_backdrop_frame(ff)
 	if ff_flare_px.is_empty() or ff_pick_tex == null:
 		_ff_sprites_load()
+	# §4C — this frame's ordered veil records for the serial chain.
+	_ff_mask_update()
 
 	# 0x4edc04 — palette-bright factor applied at upload: <1 dims to
 	# black (fade), >1 saturates (damage flash / missile-bump).

@@ -209,6 +209,8 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::ff_teletype_frame);
   ClassDB::bind_method(D_METHOD("ff_teletype_diag"),
                        &MdkBridge::ff_teletype_diag);
+  ClassDB::bind_method(D_METHOD("ff_veil_mask"),
+                       &MdkBridge::ff_veil_mask);
   // Phase 19D — mode-8 ending cinematic.
   ClassDB::bind_method(D_METHOD("load_ending"),
                        &MdkBridge::load_ending);
@@ -2861,6 +2863,17 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   // sections composite at their own depth instead of baking under
   // every body. freefallSceneTrailComposite remains the native
   // (headless/test) compositor.
+  //
+  // §4C — the serial chain. screen_texture snapshots only the opaque
+  // pass, so a veil shader reading it sees the surface BELOW every
+  // veil, never an earlier veil's output: overlapping veils need
+  // L2[L1[p]] and get L2[p] (~86% of (r1,r2,p) triples differ at
+  // LUT level). The mask retains the ordered {row,z'} records each
+  // veil op covers; the shaders replay them gated by the winning
+  // opaque depth (a buried element was overwritten, not remapped).
+  mdk::freefallSceneVeilMask(*ffScene_, *ff_,
+                           ff_->cameraPos[0], ff_->cameraPos[1],
+                           ff_->cameraPos[2], ffVeilMask_);
   // 19C.3 — this frame's kFfEvSound batch into the shared voice
   // pool + the per-step mixer pass (events self-clear at the next
   // step, so the drain runs here, drain-once).
@@ -4191,6 +4204,67 @@ Dictionary MdkBridge::ff_teletype_diag() const {
   out["line0"] = String(ffTtLine_[0].c_str());
   out["line1"] = String(ffTtLine_[1].c_str());
   out["presented"] = int64_t(ffTtFrameSeq_);
+  return out;
+}
+
+namespace {
+// IEEE-754 binary16 (round-to-nearest via the standard bit trick —
+// enough for row ints and z' values up to ~5300).
+std::uint16_t f32ToF16(float f) {
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  const std::uint32_t sign = (u >> 16) & 0x8000u;
+  const int exp = int((u >> 23) & 0xff) - 127 + 15;
+  std::uint32_t man = u & 0x7fffffu;
+  if (exp <= 0) return std::uint16_t(sign);           // underflow -> 0
+  if (exp >= 31) return std::uint16_t(sign | 0x7bffu); // clamp to max
+  return std::uint16_t(sign | (std::uint32_t(exp) << 10) |
+                       (man >> 13));
+}
+} // namespace
+
+// §4C — pack the VeilMask for the Godot upload: Image FORMAT_RGBAH,
+// width 600*4, height 360; px column x carries its 8 records as 4
+// texels {row0,z0, row1,z1} in R,G then B,A. Empty slots read -1.0.
+Dictionary MdkBridge::ff_veil_mask() {
+  Dictionary out;
+  constexpr int kK = mdk::VeilMask::kK;
+  constexpr int kTexPerPx = kK / 2;
+  constexpr int kW = mdk::VeilMask::kW * kTexPerPx;
+  constexpr int kH = mdk::VeilMask::kH;
+  if (ffVeilMaskBytes_.size() !=
+      int64_t(kW) * kH * 8) {
+    ffVeilMaskBytes_.resize(int64_t(kW) * kH * 8);
+  }
+  std::uint16_t* dst =
+      reinterpret_cast<std::uint16_t*>(ffVeilMaskBytes_.ptrw());
+  const int pxCount = mdk::VeilMask::kW * kH;
+  for (int px = 0; px < pxCount; ++px) {
+    const int n = std::min<int>(ffVeilMask_.counts[px], kK);
+    const mdk::VeilMask::Rec* recs =
+        ffVeilMask_.recs.data() + std::size_t(px) * kK;
+    std::uint16_t* t = dst + std::size_t(px) * kK * 2;
+    for (int k = 0; k < kK; ++k) {
+      const float row =
+          k < n ? float(recs[k].row) : -1.0f;
+      const float z = k < n ? recs[k].z : 0.0f;
+      t[k * 2 + 0] = f32ToF16(row);
+      t[k * 2 + 1] = f32ToF16(z);
+    }
+  }
+  out["w"] = kW;
+  out["h"] = kH;
+  out["data"] = ffVeilMaskBytes_;
+  out["ops"] = int64_t(ffVeilMask_.ops);
+  out["elems"] = int64_t(ffVeilMask_.elems);
+  out["overflow"] = int64_t(ffVeilMask_.overflow);
+  int covered = 0, multi = 0;
+  for (int px = 0; px < pxCount; ++px) {
+    if (ffVeilMask_.counts[px] >= 1) ++covered;
+    if (ffVeilMask_.counts[px] >= 2) ++multi;
+  }
+  out["covered"] = int64_t(covered);
+  out["multi"] = int64_t(multi);
   return out;
 }
 

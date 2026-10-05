@@ -22186,6 +22186,56 @@ void test_freefall_backdrop() {
     }
   }
 
+  // -- §4C serial veil-ordering mask ----------------------------------
+  // Re-link the missile (list: player -> radar -> missile) and step
+  // so its twin rebinds + the trail ring refills (leaving the list
+  // unbound it). Its kind-5 flare also emits via +0x108.
+  rt.pool[7].next = 5;
+  rt.pool[5].next = -1;
+  m.subTimer = 4;                    // +0x108 launch-ramp mid-value
+  for (int i = 0; i < 4; ++i)
+    mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  mdk::VeilMask vm;
+  mdk::freefallSceneVeilMask(s, rt, 0.0f, 0.0f, 5280.0f, vm);
+  CHECK(vm.ops > 0);
+  CHECK(vm.elems > 0);
+  // Coverage sanity — records land on-screen, z' inside the frustum.
+  int covered = 0, multi = 0;
+  int sawTrail = 0, sawWedge = 0, sawFlare = 0;
+  int wedgeFirst = 0, wedgeNotFirst = 0;
+  for (int px = 0; px < mdk::VeilMask::kW * mdk::VeilMask::kH; ++px) {
+    const int n = vm.counts[std::size_t(px)];
+    if (n == 0) continue;
+    ++covered;
+    if (n >= 2) ++multi;
+    const mdk::VeilMask::Rec* r =
+        vm.recs.data() + std::size_t(px) * mdk::VeilMask::kK;
+    for (int k = 0; k < n; ++k) {
+      CHECK(r[k].z > 0.0f && r[k].z < 50000.0f);
+      if (r[k].row >= 25 && r[k].row <= 36) ++sawTrail;
+      else if (r[k].row <= 4) ++sawWedge;
+      else if (r[k].row >= 10 && r[k].row <= 18) ++sawFlare;
+    }
+    // Painter order is ascending mdk-z (far->near): the wedge sits
+    // at pz=0 — the SMALLEST key, the farthest draw — so any px
+    // carrying a wedge record has it at the START of the chain.
+    // Nearer veils (trail pz~30-190, flare m.pz+10) remap over it.
+    bool hasWedge = false;
+    for (int k = 0; k < n; ++k) if (r[k].row <= 4) hasWedge = true;
+    if (hasWedge) {
+      if (r[0].row <= 4) ++wedgeFirst; else ++wedgeNotFirst;
+    }
+  }
+  CHECK(covered > 0);
+  CHECK(sawTrail > 0);
+  CHECK(sawWedge > 0);
+  CHECK(sawFlare > 0);   // kind-5 quad emitted for +0x108 = 4
+  // The wedge is the farthest element at every shared px.
+  CHECK(wedgeFirst > 0);
+  CHECK(wedgeNotFirst == 0);
+  // Serial chains actually form — the whole point of the mask.
+  CHECK(multi > 0);
+
   fs::remove_all(tmp);
 }
 

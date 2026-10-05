@@ -789,6 +789,13 @@ class MdkBridge : public RefCounted {
   bool ffTtActive_ = false;        // service has visible work
   std::uint64_t ffTtFrameSeq_ = 0;
 
+  // --- §4C — serial veil-ordering mask ----------------------------
+  // Built per freefall step from the current twins + runtime pool
+  // (freefallSceneVeilMask); packed to RGBAH halves for upload.
+  Dictionary ff_veil_mask();
+  mdk::VeilMask ffVeilMask_;
+  PackedByteArray ffVeilMaskBytes_;
+
   // --- Phase 19E — mode-6 briefing host ---------------------------
   // Lives only while sess_.loaderSub == 3; created on first pump of
   // that sub-state, reset at the exit edge. Owning buffers hold the
