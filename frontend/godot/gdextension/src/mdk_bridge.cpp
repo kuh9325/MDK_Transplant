@@ -2834,12 +2834,13 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
                                  ff_->cameraPos[1], ff_->cameraPos[2],
                                  timing_.deltaSec);
   // The trail veil — FUN_00412970/FUN_0040c860's indexed op
-  // (dst = lut[row*256 + dst]) composited into the 600x360 frame
-  // before upload, in the same order the original's object walk
-  // runs it: after the backdrop pass, under the still-3D bodies.
-  mdk::freefallSceneTrailComposite(*ffScene_, ff_->cameraPos[0],
-                                   ff_->cameraPos[1],
-                                   ff_->cameraPos[2]);
+  // (dst = lut[row*256 + dst]) is presented by the Godot-side
+  // veil pass: per-object trail meshes (world-space edges already
+  // shipped in the object snapshot) depth-test against the 3D
+  // bodies and apply the exact LUT remap via screen_texture, so
+  // sections composite at their own depth instead of baking under
+  // every body. freefallSceneTrailComposite remains the native
+  // (headless/test) compositor.
   // 19C.3 — this frame's kFfEvSound batch into the shared voice
   // pool + the per-step mixer pass (events self-clear at the next
   // step, so the drain runs here, drain-once).
@@ -3289,6 +3290,16 @@ Dictionary MdkBridge::get_freefall_backdrop_frame() {
   keys.resize(64 * 3);
   std::memcpy(keys.ptrw(), ffScene_->keyColors.data(), 64 * 3);
   out["key_colors"] = keys;
+  // The raw remap table itself — veil materials sample it as a
+  // 256x64 R8 texture (texel x = dst index, y = row) to reproduce
+  // dst = lut[row*256 + dst] on the GPU. First 64 rows = bank 0,
+  // which is the bank every mode-2 veil pen references.
+  if (ffScene_->lut.size() >= 64 * 256) {
+    PackedByteArray lt;
+    lt.resize(64 * 256);
+    std::memcpy(lt.ptrw(), ffScene_->lut.data(), 64 * 256);
+    out["lut"] = lt;
+  }
   // Required-resource readiness — a rejected ZOOM record or missing
   // LEVEL/POD must never ride through as a valid all-black frame.
   // `ready` is the acceptance gate; the per-field flags name the

@@ -118,10 +118,8 @@ var ff_backdrop_tex: ImageTexture = null
 var ff_key_colors := PackedByteArray()  # 64x3 LUT keyframe ramp
 var ff_flare_px := PackedByteArray()    # FLARE4 indexed pixels
 var ff_flare_wh := Vector2i.ZERO
-var ff_flare_tex := {}                  # count 1..8 -> ImageTexture
 var ff_pick_tex: ImageTexture = null    # kind-1 PICK sprite
 var ff_pick_wh := Vector2i.ZERO         # PICK src dims (for 0x46d680 scale)
-const FF_VEIL_ALPHA := 90.0 / 256.0     # bank-0 LUT strength
 
 # Phase 19B.1 — mode-5 intermission presentation. The StreamScene
 # core owns simulation; the bridge owns the indexed framebuffer.
@@ -2334,27 +2332,20 @@ func _ff_material(mat_name: String, pen: int) -> StandardMaterial3D:
 	return tm
 
 
-func _ff_lut_material(row: int) -> StandardMaterial3D:
+func _ff_lut_material(row: int) -> ShaderMaterial:
 	# FUN_0040c860 negative-pen class mi < -1028: dst = lut[row][dst]
-	# (bank 0, strength 90/256) — a veil, not a flat fill. The Godot
-	# approximation blends toward keyColors[row] at the bank alpha,
-	# the same contract the indexed compositor applies exactly to
-	# the trail pass.
+	# — presented through the painter-last veil shader (the wedge's
+	# object key sorts z' ~= 0, so the original composites it over
+	# every already-drawn pixel: no depth test, top priority).
 	var pk := "lut:%d" % row
 	if ff_materials.has(pk):
 		return ff_materials[pk]
-	var m := StandardMaterial3D.new()
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.cull_mode = BaseMaterial3D.CULL_DISABLED
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_DISABLED
-	var r := clampi(row, 0, 63)
-	var c := Color.BLACK
-	if ff_key_colors.size() >= (r + 1) * 3:
-		c = Color(ff_key_colors[r * 3] / 255.0,
-			ff_key_colors[r * 3 + 1] / 255.0,
-			ff_key_colors[r * 3 + 2] / 255.0)
-	m.albedo_color = Color(c.r, c.g, c.b, 90.0 / 256.0)
+	var m := ShaderMaterial.new()
+	m.shader = ff_veil_top_shader if ff_veil_top_shader != null \
+		else ff_veil_shader
+	_ff_veil_params(m)
+	m.set_shader_parameter("lut_row", clampi(row, 0, 63))
+	m.render_priority = 1     # above trail/flare veils (priority 0)
 	ff_materials[pk] = m
 	return m
 
@@ -2427,6 +2418,7 @@ func _ff_backdrop_frame(ff: Dictionary) -> void:
 		return
 	if ff_key_colors.is_empty():
 		ff_key_colors = bdf["key_colors"]
+	_ff_veil_setup(bdf)
 	var w := int(bdf["w"])
 	var h := int(bdf["h"])
 	ff_backdrop_img = Image.create_from_data(w, h, false,
@@ -2448,56 +2440,152 @@ func _ff_backdrop_frame(ff: Dictionary) -> void:
 	ff_backdrop.visible = true
 
 
-# Kind-4 — the missile trail is composited in index space by the
-# core's freefallSceneTrailComposite (dst = lut[row*256 + dst] per
-# FUN_00412970/FUN_0040c860) into the backdrop frame BEFORE upload —
-# the exact indexed destination remap, not a color/alpha overlay.
-# The Godot-side ribbon (ImmediateMesh + keyColors@90/256) was the
-# approximation it replaces; o["trail"] still feeds --ff-trace
-# diagnostics (ring count / pen stream).
+# Kind-4 — the missile trail veil is a world-space ImmediateMesh of
+# section quads (o["trail"].edges/pens, the same world anchors the
+# native compositor consumes) presented through ff_veil.gdshader —
+# dst = lut[row][dst] on the already-drawn screen pixels, depth-
+# tested against the 3D bodies. That replaces BOTH the key-color
+# ribbon approximation and the under-all-bodies backdrop bake; the
+# compositor stays in core for the headless path + tests.
+
+var ff_idx_tex: ImageTexture = null   # 256x256 rgb565 -> index
+var ff_lut_tex: ImageTexture = null   # 256x64 index -> remapped
+var ff_pal_tex: ImageTexture = null   # 256x1 index -> RGB
+var ff_veil_shader: Shader = null
+var ff_veil_top_shader: Shader = null
+var ff_veil_flare_shader: Shader = null
+var ff_veil_mats := {}                # row -> ShaderMaterial (top)
+var ff_flare_idx_tex: ImageTexture = null  # FLARE4 raw indices
+
+
+func _ff_veil_setup(bdf: Dictionary) -> void:
+	if ff_veil_shader == null:
+		ff_veil_shader = load("res://src/ff_veil.gdshader")
+		ff_veil_top_shader = load("res://src/ff_veil_top.gdshader")
+		ff_veil_flare_shader = load("res://src/ff_veil_flare.gdshader")
+	if ff_pal_tex != null or ff_palette.is_empty():
+		return
+	# One-time LUT/lookup upload (fixed for the course): pal_tex
+	# resolves index->RGB, idx_tex inverts exact palette colors
+	# back to their index, lut_tex is the remap table itself.
+	var pal_img := Image.create(256, 1, false, Image.FORMAT_RGB8)
+	for i in 256:
+		pal_img.set_pixel(i, 0, Color(ff_palette[i * 3] / 255.0,
+			ff_palette[i * 3 + 1] / 255.0,
+			ff_palette[i * 3 + 2] / 255.0))
+	ff_pal_tex = ImageTexture.create_from_image(pal_img)
+	var idx_img := Image.create(256, 256, false, Image.FORMAT_R8)
+	for i in 256:
+		var r: int = ff_palette[i * 3]
+		var g: int = ff_palette[i * 3 + 1]
+		var b: int = ff_palette[i * 3 + 2]
+		var k: int = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+		idx_img.set_pixel(k & 255, k >> 8, Color(i / 255.0, 0, 0))
+	ff_idx_tex = ImageTexture.create_from_image(idx_img)
+	var lut: PackedByteArray = bdf.get("lut", PackedByteArray())
+	if lut.size() >= 64 * 256:
+		var lut_img := Image.create_from_data(256, 64, false,
+			Image.FORMAT_R8, lut)
+		ff_lut_tex = ImageTexture.create_from_image(lut_img)
+
+
+func _ff_veil_params(m: ShaderMaterial) -> ShaderMaterial:
+	m.set_shader_parameter("idx_tex", ff_idx_tex)
+	m.set_shader_parameter("lut_tex", ff_lut_tex)
+	m.set_shader_parameter("pal_tex", ff_pal_tex)
+	return m
+
+
+func _ff_veil_trail_mat() -> ShaderMaterial:
+	if not ff_veil_mats.has("trail"):
+		var m := ShaderMaterial.new()
+		m.shader = ff_veil_shader
+		_ff_veil_params(m)
+		m.set_shader_parameter("row_from_color", true)
+		m.render_priority = 0
+		ff_veil_mats["trail"] = m
+	return ff_veil_mats["trail"]
+
+
+# Kind-4 trail ribbon — edges are Godot-world pairs per ring slot
+# (oldest->newest, taper already applied); each section s pairs
+# slots s-1,s and carries pen -> LUT row (-1029 - pen).
+func _ff_apply_trail(node: Node3D, o: Dictionary) -> void:
+	var mi: MeshInstance3D = node.get_node_or_null("Trail")
+	var t: Dictionary = o.get("trail", {})
+	var edges: PackedVector3Array = t.get("edges", PackedVector3Array())
+	var pens: PackedInt32Array = t.get("pens", PackedInt32Array())
+	var nsec: int = min(pens.size(), int(t.get("count", 0)) - 1)
+	if nsec < 1 or edges.size() < (nsec + 1) * 2 or \
+			ff_lut_tex == null or not bool(o.get("presented", false)):
+		if mi != null:
+			mi.visible = false
+		return
+	if mi == null:
+		mi = MeshInstance3D.new()
+		mi.name = "Trail"
+		mi.mesh = ImmediateMesh.new()
+		mi.top_level = true
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		node.add_child(mi)
+	var im := mi.mesh as ImmediateMesh
+	im.clear_surfaces()
+	im.surface_begin(Mesh.PRIMITIVE_TRIANGLES, _ff_veil_trail_mat())
+	for s in nsec:
+		var pen := int(pens[s])
+		if pen >= -1028:
+			continue      # -1028 textured cap — no veil op in mode 2
+		var row := -1029 - pen
+		if row < 0 or row > 63:
+			continue
+		var col := Color(row / 255.0, 0.0, 0.0)
+		var a0: Vector3 = edges[s * 2]
+		var b0: Vector3 = edges[s * 2 + 1]
+		var a1: Vector3 = edges[s * 2 + 2]
+		var b1: Vector3 = edges[s * 2 + 3]
+		im.surface_set_color(col)
+		im.surface_add_vertex(a0)
+		im.surface_set_color(col)
+		im.surface_add_vertex(b0)
+		im.surface_set_color(col)
+		im.surface_add_vertex(b1)
+		im.surface_set_color(col)
+		im.surface_add_vertex(a0)
+		im.surface_set_color(col)
+		im.surface_add_vertex(b1)
+		im.surface_set_color(col)
+		im.surface_add_vertex(a1)
+	im.surface_end()
+	mi.visible = true
 
 
 # Kind-5 — the launch FLARE. FLARE4's pixels (0..8) index the LUT
 # at row 6 + obj+0x108 + srcPx (OBSERVED 0x410dfb-0x410e10: the blit
 # LUT arg = 0x4edc34+0x600 + count<<8; 0x46d6d1: px0 transparent,
-# else dst = lut[row][dst]); each count 1..8 pre-bakes a texture of
-# that row's keyframe colors at the bank-0 veil alpha.
-func _ff_flare_texture(count: int) -> ImageTexture:
+# else dst = lut[row][dst]) — presented by ff_veil_flare.gdshader:
+# the source texel rides the row term, the sampled dst rides the
+# remap, so the presented pixels ARE the indexed operation rather
+# than a pre-baked key-color billboard.
+var ff_flare_veil_mats := {}
+
+func _ff_flare_veil_mat(count: int) -> ShaderMaterial:
 	var key: int = clampi(count, 1, 8)
-	if ff_flare_tex.has(key):
-		return ff_flare_tex[key]
-	var w := ff_flare_wh.x
-	var h := ff_flare_wh.y
-	var rgba := PackedByteArray()
-	rgba.resize(w * h * 4)
-	for i in w * h:
-		var px := int(ff_flare_px[i])
-		if px == 0:
-			rgba[i * 4 + 3] = 0
-			continue
-		var row: int = clampi(6 + key + px, 0, 63)
-		var c := 0
-		if ff_key_colors.size() >= 192:
-			c = row * 3
-			rgba[i * 4] = ff_key_colors[c]
-			rgba[i * 4 + 1] = ff_key_colors[c + 1]
-			rgba[i * 4 + 2] = ff_key_colors[c + 2]
-		else:
-			rgba[i * 4] = 216
-			rgba[i * 4 + 1] = 222
-			rgba[i * 4 + 2] = 230
-		rgba[i * 4 + 3] = int(255.0 * FF_VEIL_ALPHA)
-	var img := Image.create_from_data(w, h, false,
-		Image.FORMAT_RGBA8, rgba)
-	var tex := ImageTexture.create_from_image(img)
-	ff_flare_tex[key] = tex
-	return tex
+	if ff_flare_veil_mats.has(key):
+		return ff_flare_veil_mats[key]
+	var m := ShaderMaterial.new()
+	m.shader = ff_veil_flare_shader
+	_ff_veil_params(m)
+	m.set_shader_parameter("src_tex", ff_flare_idx_tex)
+	m.set_shader_parameter("base_row", 6.0 + float(key))
+	m.render_priority = 0
+	ff_flare_veil_mats[key] = m
+	return m
 
 
 func _ff_apply_flare(node: Node3D, o: Dictionary) -> void:
 	var fl := int(o.get("flare", 0))
 	var mi: MeshInstance3D = node.get_node_or_null("Flare")
-	if fl <= 0 or ff_flare_px.is_empty() or \
+	if fl <= 0 or ff_flare_idx_tex == null or \
 			not bool(o.get("presented", false)):
 		if mi != null:
 			mi.visible = false
@@ -2505,19 +2593,11 @@ func _ff_apply_flare(node: Node3D, o: Dictionary) -> void:
 	if mi == null:
 		mi = MeshInstance3D.new()
 		mi.name = "Flare"
-		var qm := QuadMesh.new()
-		var m := StandardMaterial3D.new()
-		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-		m.cull_mode = BaseMaterial3D.CULL_DISABLED
-		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
-		m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
-		qm.material = m
-		mi.mesh = qm
+		mi.mesh = QuadMesh.new()
 		mi.top_level = true
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		node.add_child(mi)
-	(mi.mesh.material as StandardMaterial3D).albedo_texture = \
-		_ff_flare_texture(fl)
+	(mi.mesh as QuadMesh).material = _ff_flare_veil_mat(fl)
 	# 0x46d6d1's scale arg 0x80 -> 32x32 SCREEN px at the projected
 	# pos (src 64x64 * 0x80 >> 8); convert to world units at the
 	# missile's depth. The draw sorts at z+10 — a small camera-
@@ -2530,6 +2610,7 @@ func _ff_apply_flare(node: Node3D, o: Dictionary) -> void:
 	var s := 32.0 * wpp
 	(mi.mesh as QuadMesh).size = Vector2(s, s)
 	mi.global_position = wp + (cam - wp).normalized() * 10.0
+	mi.look_at(cam)   # billboard — the veil shader has no billboard mode
 	mi.visible = true
 
 
@@ -2592,6 +2673,10 @@ func _ff_sprites_load() -> void:
 		var s: Dictionary = d["flare4"]
 		ff_flare_wh = Vector2i(int(s["w"]), int(s["h"]))
 		ff_flare_px = s["pixels"]
+		# Raw-index upload for the veil shader's srcPx row term.
+		var fimg := Image.create_from_data(ff_flare_wh.x,
+			ff_flare_wh.y, false, Image.FORMAT_R8, ff_flare_px)
+		ff_flare_idx_tex = ImageTexture.create_from_image(fimg)
 	if d.has("pick") and ff_pick_tex == null:
 		var s: Dictionary = d["pick"]
 		var w := int(s["w"])
@@ -2691,8 +2776,9 @@ func _apply_freefall() -> void:
 				node.set_meta("geom_key", gkey)
 			# Core-authoritative world basis — +0xac verbatim.
 			node.transform = o["transform"]
-		# Kind-4 — the trail veil is baked into the backdrop frame
-		# (freefallSceneTrailComposite), not a 3D ribbon.
+		# Kind-4 — the trail veil ribbon (world-space sections,
+		# dst = lut[row][dst] at real depth).
+		_ff_apply_trail(node, o)
 		# Kind-5 — the launch FLARE4 veil quad (obj+0x108 gate).
 		_ff_apply_flare(node, o)
 		# Kind-1 — the +0x10c PICK marker (pickups).
@@ -3079,6 +3165,31 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 	var f3: Dictionary = bridge.get_freefall_snapshot()
 	_check(float(f3["fade"]) >= 0.0, "fade in range")
 
+	# Veil path — the LUT/lookup textures the veil shaders read
+	# must exist, and a live type-3 radar must bind a surfaced
+	# mesh whose material carries the veil shader.
+	_check(ff_idx_tex != null and ff_lut_tex != null and
+		ff_pal_tex != null, "veil lookup textures bound")
+	for o in bridge.get_freefall_object_snapshots():
+		if int(o["type"]) != 3 or not o["alive"]:
+			continue
+		var rslot := int(o["pool_slot"])
+		var rnode := $FreefallRoot.get_node_or_null(
+			"FFObj_%d" % rslot)
+		if rnode == null:
+			continue
+		var rbody: MeshInstance3D = rnode.get_node("Body")
+		_check(rbody.mesh != null and
+			rbody.mesh.get_surface_count() > 0,
+			"radar twin presents a surfaced mesh")
+		if rbody.mesh != null and \
+				rbody.mesh.get_surface_count() > 0:
+			var rm := rbody.mesh.surface_get_material(0)
+			_check(rm != null and rm is ShaderMaterial and
+				(rm as ShaderMaterial).shader == ff_veil_top_shader,
+				"radar wedge rides the painter-last veil shader")
+		break
+
 	# Completion handoff — run the course out. The exit branch is
 	# health-gated (OBSERVED 0x541554): >0 -> traversal (mode 3), <=0
 	# -> the death fade ends into the frontend route (mode 0). Which
@@ -3089,6 +3200,7 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 	var seen_types := {}
 	var seen_anims := {}
 	var saw_chute := false
+	var saw_trail_mesh := false
 	for i in 1400:
 		var r: Dictionary = _step_n({}, 1)
 		for o in bridge.get_freefall_object_snapshots():
@@ -3097,10 +3209,21 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 				seen_anims[int(o["anim_handle"])] = true
 			if bool(o.get("chute", false)):
 				saw_chute = true
+		if i % 20 == 0 and not saw_trail_mesh:
+			_apply_freefall()
+			for child in $FreefallRoot.get_children():
+				var tm: MeshInstance3D = \
+					child.get_node_or_null("Trail")
+				if tm != null and tm.visible and \
+						tm.mesh != null and \
+						tm.mesh.get_surface_count() > 0:
+					saw_trail_mesh = true
 		if bool(r.get("done", false)):
 			done = true
 			route = int(r.get("handoff_route", -1))
 			break
+	_check(saw_trail_mesh,
+		"kind-4 trail veil mesh presented during the run")
 	_check(done, "freefall course completed")
 	print("  types seen: %s  player anims: %s  chute: %s" %
 		[seen_types.keys(), seen_anims.keys(), saw_chute])
