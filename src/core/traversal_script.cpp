@@ -2999,6 +2999,137 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x1d: {                              // CreateChain (0x43f9aa)
+      // {u8 count, lstr class, u32 scOff}. OBSERVED: FUN_00454794
+      // scans the 80-entry class table (0x4edcc0) for `class`; a miss
+      // prints "CreateChain %s not found" (0x497a14) and exits the
+      // pass. The +0x68 list walk keeps the max +0x146 (chain index)
+      // among named objects with +0x138 == self, then `count`
+      // FUN_0045cffc children spawn onto the arena list — +0x04 =
+      // class idx, +0x0c = the 0x88 record copy, +0x1c/+0x10/+0x180 =
+      // self pos, +0x60 = arena, FUN_004566f0 init, +0x11c = 7,
+      // +0x11e = 0x1e (the chain subtype — members find siblings by
+      // leader+index), +0x138 = self, +0x146 = remaining+max+1
+      // descending, +0x108 = scOff. LEVEL3 HMO_1$XE (+1b77) spawns
+      // its four XG gun pods this way (scOff d8a/e7b/f62/1061).
+      const std::uint8_t count = r.u8();
+      const std::string cls = r.str();
+      const std::uint32_t scOff = r.u32();
+      if (!r.ok) { v.fail("createchain"); return; }
+      if (env.rt == nullptr || obj.arena == nullptr) return;
+      TraversalRuntime& rt = *env.rt;
+      const int enemyIdx = rt.level.enemies.indexOf(cls);
+      if (enemyIdx < 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "CreateChain %s not found",
+                      cls.c_str());
+        v.fail(msg);
+        return;
+      }
+      int maxGen = -1;
+      for (auto& up : obj.arena->storage) {
+        DynamicObject& o = *up;
+        if (!o.col.named || o.field138 != &obj) continue;
+        const int g = static_cast<std::int16_t>(o.spawnId);
+        if (g > maxGen) maxGen = g;
+      }
+      for (int i = 0; i < count; ++i) {
+        DynamicObject& o = obj.arena->allocFront();  // FUN_0045cffc
+        o.scriptClass = cls;
+        o.scriptOff = scOff;
+        o.enemyIndex = static_cast<std::uint16_t>(enemyIdx); // +0x04
+        if (env.modelFor) {                          // +0x0c record
+          if (const RuntimeModel* src =
+                  env.modelFor(enemyIdx, env.modelCtx))
+            o.model = deepCopyModel(*src);
+        }
+        for (int k = 0; k < 3; ++k) o.field1c[k] = obj.pos[k];
+        o.setPosition(obj.pos[0], obj.pos[1], obj.pos[2]);
+        for (int k = 0; k < 3; ++k) o.prevPos[k] = obj.pos[k];
+        initObjectDefaults(o);                  // FUN_004566f0
+        o.syncCollisionView();
+        if (obj.arena->owner != nullptr) {
+          const std::string key = obj.arena->owner->name + "$" + cls;
+          const std::uint32_t initOff =
+              cmiObjectScriptOffset(rt.level.cmi, key);
+          if (initOff != 0) {
+            TraversalScriptResult ir =
+                traversalObjectInitScript(env, o, initOff);
+            rt.scriptInsnTotal += ir.instructions;
+          }
+        }
+        o.syncCollisionView();
+        rebuildObjectTransform(o);              // FUN_0045612c
+        o.behaviorByte = 7;                     // +0x11c
+        o.field11e = 0x1e;                      // +0x11e chain subtype
+        o.field138 = &obj;                      // +0x138 leader
+        o.spawnId = static_cast<std::uint16_t>(
+            (count - 1 - i) + maxGen + 1);      // +0x146 chain idx
+        if (scOff != 0 && !env.image.empty()) { // +0x108 script pc
+          const std::uint64_t fo =
+              static_cast<std::uint64_t>(env.imageBase) + scOff;
+          if (fo < env.image.size()) o.field108 = env.image.data() + fo;
+        }
+        ++env.seamsSpawned;
+      }
+      return;
+    }
+    case 0x22: {                              // leaderless link (0x43fe82)
+      // {linkage}. cond: +0x138 == 0 (no chain leader). The XG pods
+      // created by CreateChain carry +0x138 = the spawner — this is
+      // the "am I attached" gate (LEVEL3 HMO_1 XG_BOD +1c6b).
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("leaderless"); return; }
+      const bool cond = (obj.field138 == nullptr);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0x31: {                              // releaseChain (0x447042)
+      // {u8 n, linkage}. OBSERVED: n iterations — scan +0x68 for the
+      // max +0x146 member with named && +0x60 == self's arena &&
+      // +0x138 == self && +0x11e == 0x1e (the chain subtype); found
+      // -> detach it (+0x138 = 0, +0x11e = 0); miss -> apply the
+      // linkage. The loop always completes n iterations (a linkage
+      // redirect mid-loop still detaches the remaining members
+      // before the interpreter continues at the new pc). XE +1bf3
+      // releases one pod and gotos on empty (the drain gate).
+      const std::uint8_t n = r.u8();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("relchain"); return; }
+      for (int i = 0; i < n; ++i) {
+        DynamicObject* best = nullptr;
+        int bestGen = -1;
+        if (obj.arena != nullptr) {
+          for (auto& up : obj.arena->storage) {
+            DynamicObject& o = *up;
+            if (!o.col.named || o.arena != obj.arena ||
+                o.field138 != &obj || o.field11e != 0x1e) continue;
+            const int g = static_cast<std::int16_t>(o.spawnId);
+            if (g > bestGen) { bestGen = g; best = &o; }
+          }
+        }
+        if (best != nullptr) {
+          best->field138 = nullptr;
+          best->field11e = 0;
+          continue;
+        }
+        switch (L.mode) {
+        case 0xfe: v.doCall(L.a); break;
+        case 0xfc: v.doCall(L.a); break;
+        case 0x0c: v.doGoto(L.a); break;
+        case 0xfd: v.doReturn(); break;
+        default: break;
+        }
+      }
+      return;
+    }
     case 0x9c: {                              // spawn at ref-point (0x449fae)
       // {u8 refIdx, lstr class, u32 scOff}. OBSERVED: same
       // FUN_00454af8 arm as op-0x56 — the position is the object's
@@ -5120,7 +5251,9 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xd0: return "sl";                      // elemMask link {lstr, linkage}
   case 0xf8: return "bf";                      // knockback {u8,f32} + mode tail
   case 0x21: return "wl";                      // pathLink {u32, linkage}
+  case 0x22: return "l";                       // leaderless {linkage}
   case 0x30: return "fl"; case 0xbe: return "bs";
+  case 0x31: return "bl";                      // releaseChain {u8, linkage}
   case 0x60: return "ffffl";
   case 0x67: return "ffffffl";
   case 0x62: case 0xa8: return "bb";
@@ -5130,6 +5263,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x95: return "ffffwssw";
   case 0x56: case 0xa1: case 0x71: return "fffsw";
   case 0x9c: return "bsw";                      // spawnRef {u8,lstr,u32}
+  case 0x1d: return "bsw";                      // createChain {u8,lstr,u32}
   case 0x77: return "skl"; case 0xd3: return "";
   case 0x50: return "fff";                     // velRotAdd
   case 0xe6: return "ffffwsw";
@@ -5196,7 +5330,9 @@ const char* opcodeName(std::uint8_t op) {
   case 0xeb: return "camFace";  case 0x5e: return "wpick";
   case 0xe7: return "idleLink"; case 0xe8: return "fxLink";
   case 0x15: return "pathIdx"; case 0x16: return "markLink";
-  case 0x2a: return "namedLink"; case 0x55: return "xformSnap";
+  case 0x1d: return "createChain"; case 0x22: return "ldrlessL";
+  case 0x31: return "relChain";   case 0x2a: return "namedLink";
+  case 0x55: return "xformSnap";
   case 0x9a: return "animWait"; case 0xf2: return "orbitBlk";
   case 0x30: return "periodLink"; case 0xbe: return "recEnable";
   case 0x41: return "setVar";
