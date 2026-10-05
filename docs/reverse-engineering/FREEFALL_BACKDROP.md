@@ -453,7 +453,49 @@ radar wedge + kind-5 flare on a real FALL3D scene — records carry
 frustum z', wedge records sort FIRST at every shared px, multi-
 element px exist (`multi > 0`).
 
-## 11. Remaining seams / open items
+## 11.5 Original-build oracle comparison (OBSERVED, dosbox-x)
+
+The legally owned DOS install (`original/installed/MDKDOS.EXE`,
+DOS/4GW) was run under dosbox-x 2026.08.31 on this machine
+(`sbbase=240` per MDK.CFG, `cycles=60000`, svga_s3). Frames were
+captured from the live window; they live outside Git under
+`original/evidence-dosbox/`.
+
+- **Main menu** — New Game / Saved Game / Options / Quit over the
+  vortex, identical to the shipped structure.
+- **Mode-6 briefing** — `!!!Newsflash!!!` header + BRIEF1 body
+  ("A huge City Minecrawler is / headed straight for / the coastal
+  town of / Laguna Beach, USA") types character-by-character;
+  a mid-type frame shows the trailing `_` cursor block and
+  glyphs landing at their final positions (lookahead-measured
+  centered lines — shorter lines sit indented); a completed page
+  holds until a key exits. Matches the §3 contract end-to-end.
+- **Post-briefing hold** — after the briefing exits, the game
+  sits on a black screen in the same video mode for minutes
+  (~30-40% CPU, FALL3D_1.MTI open) and does not respond to
+  injected keys (Enter, Space, Esc, letters) or uncaptured
+  clicks. A captured-mouse click (after Ctrl+F10) released it
+  into the fall within ~4 s (OBSERVED trigger; whether the gate
+  is specifically a mouse-button check, or a key gate that only
+  sees captured-mode input, is HYPOTHESIS). The briefing's own
+  post-completion hold, by contrast, released on a plain Space
+  keypress — consistent with the decoded bf04 key gate.
+- **Freefall** — Kurt falls head-first through the rocky canyon;
+  the pod/drone rides above; the circular HUD gauge sits
+  bottom-right; thin white trail wisps are visible.
+- **Radar wedge** — rendered as a translucent olive-pale cone
+  fanning wide-left from the red/silver radar drone at its apex;
+  canyon rocks remain visible THROUGH it (veil tint-map, not an
+  opaque surface) and Kurt below the cone edge stays untinted.
+  Directly confirms §4C's model: the wedge is a see-through LUT
+  veil over the backdrop, gated under nearer bodies.
+- **Landing** — the fall ends into the skull "Loading" screen
+  with a green progress bar, then traversal.
+- **Not captured**: the FALL_T1 "Avoid the RADAR!" strip (the
+  fall's first seconds preceded the capture window), an explicit
+  lock flash, and a second wedge cycle.
+
+## 12. Remaining seams / open items
 
 - Trail depth ordering — the veil composites into `backdropFrame`,
   so it always sits behind the 3D bodies; the original depth-sorts
