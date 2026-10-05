@@ -1108,8 +1108,15 @@ func _apply_camera_snapshot() -> void:
 	var cam: Dictionary = bridge.get_camera_snapshot()
 	if cam.is_empty():
 		return
+	# Mode-boundary frames can carry a not-yet-stepped pose (zeroed
+	# scale -> singular basis, out-of-range fov). Applying it spams
+	# invert/set_fov errors — the next stepped frame is correct.
+	var fov := float(cam["fov_deg"])
+	if absf(cam["transform"].basis.determinant()) < 1e-9 or \
+			fov <= 1.0 or fov >= 179.0:
+		return
 	$Camera3D.global_transform = cam["transform"]
-	$Camera3D.fov = cam["fov_deg"]
+	$Camera3D.fov = fov
 
 
 func _apply_player_snapshot() -> void:
@@ -2096,7 +2103,7 @@ func _ff_trace_tick() -> void:
 	if s.is_empty() or not s.has("player"):
 		return
 	var p: Vector3 = s["player"]["pos_mdk"]
-	var t := float(s["timeline"]) / 60.0
+	var t := float(s["timeline"])   # already seconds (dtSec accumulator)
 	var n := 0
 	var mind := -1.0
 	for o in bridge.get_freefall_object_snapshots():
@@ -2148,7 +2155,7 @@ func _ff_trace_tick() -> void:
 			if o.has("trail") and o["trail"].has("pens"):
 				npens = int(o["trail"]["pens"].size())
 			print("ff-msl t=%.2f rel=%.0f,%.0f,%.0f vel=%.0f,%.0f,%.0f col1=%.2f,%.2f,%.2f align=%.2f nose=%.2f trl=%d pens=%d fl=%d" %
-				[float(s["timeline"]) / 60.0, m.x - p.x, m.y - p.y, dz,
+				[float(s["timeline"]), m.x - p.x, m.y - p.y, dz,
 				 v.x, v.y, v.z, b[1] if b.size() >= 9 else 0.0,
 				 b[4] if b.size() >= 9 else 0.0, b[7] if b.size() >= 9 else 0.0,
 				 align, nose_align, trn, npens, int(o.get("flare", 0))])
@@ -6778,9 +6785,12 @@ func _frontend_frame(delta: float, mode: int) -> void:
 	var input := _fe_input()
 	# --fe-run: a single confirm on the real input path (fresh-entry
 	# selection is New Game) — every later transition is production.
+	# The entry transition eats the first edge as a skip-ack, so the
+	# press waits for its window to close.
 	if fe_run and not _fe_run_done:
-		_fe_run_done = true
-		input["confirm"] = true
+		if fe_transition_ms < 0.0:
+			_fe_run_done = true
+			input["confirm"] = true
 	if mode == 0:
 		var snap: Dictionary = bridge.frontend_update(
 			_fe_transition_input(input, delta * 1000.0))
