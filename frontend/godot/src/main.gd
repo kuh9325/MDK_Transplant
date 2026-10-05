@@ -107,6 +107,10 @@ var freefall := false        # --freefall launcher flag
 var ff_materials := {}       # "m:<name>" / "pen:<n>" -> StandardMaterial3D
 var ff_palette := PackedByteArray()  # FALLP_<c+1> bytes (768)
 var ff_handoff_seen := false # printed the mode transition once
+var _ff_steps := 0            # mode-2 sim steps this session
+var _ff_wall0 := 0            # wall-clock anchor for the descent
+var fe_run := false          # --fe-run: confirm once -> production New Game route
+var _fe_run_done := false
 var _ff_backdrop_warned := 0 # one-shot NOT-READY resource report
 var ff_backdrop: MeshInstance3D = null  # camera-locked backdrop quad
 var ff_backdrop_img: Image = null
@@ -509,6 +513,7 @@ func _ready() -> void:
 	ff_steer = "--ff-steer" in args
 	ff_trace = "--ff-trace" in args
 	ff_shot_pass = "--ff-shot-pass" in args
+	fe_run = "--fe-run" in args
 	ff_dump_dir = _arg_value(args, "--ff-dump-dir", "")
 	ff_dump_every = maxi(1, int(_arg_value(args, "--ff-dump-every", "1")))
 	var spw := _arg_value(args, "--shot-pass-window", "")
@@ -806,6 +811,7 @@ func _ready() -> void:
 			"Esc cancel/back, F1 help, F2 save, F3 saves, " +
 			"F10 abort, F12 options)")
 	elif freefall:
+		_ff_wall0 = Time.get_ticks_msec()
 		print(("mdk-godot: FREEFALL course=%d skill=%d seed=%08x  " +
 			"(arrows/WASD steer, F3 debug, Esc release/quit)") %
 			[int(ff_course), ff_skill, ff_seed])
@@ -3893,11 +3899,28 @@ func _process(delta: float) -> void:
 		# (Traversal sessions are always mode != 2; only a session
 		# that STARTED in mode 2 logs the transition.)
 		mode = int(bridge.get_mode())
+		if mode == 2:
+			if _ff_steps == 0:
+				_ff_wall0 = Time.get_ticks_msec()
+			_ff_steps += 1
 		if ff_trace and mode == 2:
 			_ff_trace_tick()
-		if freefall and mode != 2 and not ff_handoff_seen:
-			ff_handoff_seen = true
-			print("mdk-godot: freefall handoff -> mode %d" % mode)
+		if (freefall or fe_run or frontend) and mode != 2 and \
+				not ff_handoff_seen:
+			var fs: Dictionary = bridge.get_freefall_snapshot()
+			# Live runs gate on _ff_steps; the smoke route steps
+			# through _step_n instead — its done/dead phase is the
+			# equivalent proof the mode-2 frame ran to the edge.
+			if _ff_steps > 0 or int(fs.get("phase", -1)) >= 2:
+				ff_handoff_seen = true
+				print("mdk-godot: freefall handoff -> mode %d " %
+					mode +
+					"steps=%d wall=%dms phase=%s hp=%s died=%s" %
+					[_ff_steps,
+					 Time.get_ticks_msec() - _ff_wall0,
+					 str(fs.get("phase", -1)),
+					 str(fs.get("health", -1)),
+					 str(fs.get("died", "?"))])
 	elif shot_path.is_empty() and stream_standalone:
 		# Standalone mode 5: paced ~33.3ms steps (19C.1), not one per
 		# display refresh. The scene takes actions only (the roll/
@@ -6557,6 +6580,11 @@ func _frontend_present() -> void:
 # drain, transition ack, present, end_frame — the phase §2 loop.
 func _frontend_frame(delta: float, mode: int) -> void:
 	var input := _fe_input()
+	# --fe-run: a single confirm on the real input path (fresh-entry
+	# selection is New Game) — every later transition is production.
+	if fe_run and not _fe_run_done:
+		_fe_run_done = true
+		input["confirm"] = true
 	if mode == 0:
 		var snap: Dictionary = bridge.frontend_update(
 			_fe_transition_input(input, delta * 1000.0))
