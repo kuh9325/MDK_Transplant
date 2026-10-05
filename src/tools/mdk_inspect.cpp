@@ -1969,6 +1969,7 @@ int main(int argc, char** argv) {
   std::optional<std::uint32_t> scriptDisasmOff;
   std::vector<HitSpec> hitSpecs;
   std::vector<PDamageSpec> pdmgSpecs;
+  std::vector<int> itemUseFrames;
   std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
@@ -2128,6 +2129,12 @@ int main(int argc, char** argv) {
       d.amount = std::atoi(spec.substr(0, at).c_str());
       d.frame = std::atoi(spec.c_str() + at + 1);
       pdmgSpecs.push_back(d);
+    } else if (!std::strcmp(a, "--itemuse")) {
+      // P0-C: inject the itemUse key edge (binding slot 26 = code 28)
+      // on the given frame — the real 0x4ce774 edge path.
+      const char* v = value(a);
+      if (!v) return usage();
+      itemUseFrames.push_back(std::atoi(v));
     } else if (!std::strcmp(a, "--boss")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -3803,9 +3810,47 @@ int main(int argc, char** argv) {
           std::getenv("MDK_COL_PROFILE_FRAME") != nullptr;
       const mdk::CollisionProfile colPrev =
           colProfFrame ? mdk::collisionProfile() : mdk::CollisionProfile{};
+      auto raw = rawFor(phase);
+      for (const int iu : itemUseFrames)
+        if (iu == f) raw.keyEdge[0] |= (1u << 28);   // kSlotItemUse
       const auto out =
-          mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
+          mdk::stepTraversalRuntime(rt, raw, bindings, timing);
       ++framesRun;
+      for (const int iu : itemUseFrames)
+        if (iu == f || iu + 1 == f || iu + 10 == f) {
+          const char* itemName = "-";
+          std::string census;
+          for (const auto& ap : rt.arenas)
+            for (const auto& up : ap->dyn.storage) {
+            const mdk::DynamicObject& fo = *up;
+            if (fo.enemyIndex >= rt.level.enemies.entries.size())
+              continue;
+            const char* nm =
+                rt.level.enemies.entries[fo.enemyIndex].name.c_str();
+            if (!census.empty()) census += ',';
+            census += nm;
+            census += '/';
+            census += std::to_string(fo.field30a);
+            if (nm[0] == 'S' && nm[1] == 'W' && fo.field30a >= 1 &&
+                fo.field30a <= 9) {
+              itemName = nm;
+            }
+            }
+          const int chg = (rt.inventorySel >= 0 && rt.inventorySel < 5)
+                              ? rt.inventory[rt.inventorySel].charges
+                              : -1;
+          std::printf(
+              "      iu   f=%03d inv=%d sel=%d chg=%d loco=%03x ev=%d/%d "
+              "use=%d spawn=%d objs=%zu item=%s td=%d die=%d\n",
+              f, rt.inventoryCount, rt.inventorySel, chg,
+              (unsigned)rt.locoState, (int)rt.eventType,
+              (int)rt.eventMag, rt.seams.itemUseCalls,
+              rt.seams.itemSpawnCalls, rt.cur->dyn.storage.size(),
+              itemName, rt.seams.objectTeardownCalls,
+              rt.seams.objectDeathCalls);
+          if (!census.empty() && census.size() < 400)
+            std::printf("      iuc  [%s]\n", census.c_str());
+        }
       // Drain the frame's audio events (drain-once semantics) into the
       // diagnostic census before any consumer could.
       if (!rt.audioFx.empty()) {

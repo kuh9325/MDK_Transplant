@@ -1591,9 +1591,9 @@ TraversalFrameResult stepTraversalRuntime(
       }
 
       if (!scripted) {
-        // FUN_00465228 tail — itemUse (ce774) seam, then the sniper
-        // entry, then the normal-fire latch (a deferred seam).
-        if (rt.prevFrame.itemUse != 0) ++rt.seams.itemUseCalls;
+        // FUN_00465228 tail — the itemUse (ce774) edge, then the
+        // sniper entry, then the normal-fire latch (a deferred seam).
+        if (rt.prevFrame.itemUse != 0) traversalItemUseEdge(rt);
         if (rt.prevFrame.sniperPulse != 0 && rt.eventPriority < 8 &&
             rt.eventType < 8) {
           // eligibility: c6c == 0 -> free; else vertVel == +-0 &&

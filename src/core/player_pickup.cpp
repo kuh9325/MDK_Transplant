@@ -191,7 +191,156 @@ void pickupGrant(TraversalRuntime& rt, int id) {
   if (id != 9 && id != 11) collectNotify(rt);
 }
 
+// ---------------------------------------------------------------------------
+// P0-C — item use. FUN_00465228's 0x4ce774 edge tail (0x465675..0x465996)
+// plus the two FUN_0046a190 call sites (the edge's airborne path and
+// FUN_00461954's K_SPWEP frame-8 trigger).
+//
+// OBSERVED semantics (MDK95.EXE BUILD_A disasm):
+//
+//   Edge dispatch (0x465675): 0x4ce774 != 0 ->
+//       0x540e60 (cmdObj60) != 0 -> FUN_00459d28: clears the object's
+//           +0x118 latch when >= 0. cmdObj60 is written by cmdBody2 —
+//           the thrown SW_INTER/WMIB spin loop — so a second itemUse
+//           press DETONATES a live WMIB early (remote-detonate).
+//       0x540e60 == 0 -> the inventory gate at 0x4658ef:
+//           0x541610 (inv count) == 0            -> return
+//           slot[0x541614].id == 6             -> return (SW_GATT is
+//               feed-ammo only — no thrown form)
+//           0x540e54 (cmdFlag54) != 0          -> ids 1/8/9 only
+//           |0x540c78|==0 AND 0x540c54&1       -> grounded & still:
+//               posts event 0x54cb08=0x325 / 0x54cb00=8 — the
+//               dispatcher then enters locoState 0x325 (K_SPWEP) and
+//               the ANIM frame-8 crossing calls FUN_0046a190
+//               (anim-timed throw, OBSERVED 0x462e5d..0x462e67).
+//           else locoState must be one of 0x2bd/0x2be/0x2bf
+//               (K_CHUTE/K_JUMP/K_RJMP — airborne only) ->
+//               0x541558 = 0x3c, FUN_0046a190 now.
+//
+//   FUN_0046a190 — the thrown-item spawn:
+//       scan 0x49bbc4 (identity 1..9) for slot.id -> 0x49bba0 name ->
+//       FUN_00454794 = EnemyTable::indexOf; JG — idx must be > 0.
+//       allocFront (FUN_0045cffc) on the current arena; +0x0c = the
+//       FUN_00403720 deep-copied model (fallback: table base — the
+//       port leaves the model empty, no analogue); +0x04 = idx.
+//       pos = player pos, z += 4.0 (0x498d38); +0x1c anchor and
+//       +0x180.. prevPos = pos; +0x60 = current arena.
+//       FUN_004566f0 init; +0x30e = 150; +0x44 = 0; +0x58 = 0.1f;
+//       dword+0x148 |= 0x818a6 (+0x148|=0xa6, +0x149|=0x18 — the
+//       enemy-dispatch bit — +0x14a|=0x08); +0x30a = slot.id — the
+//       item id doubles as the command id: the thrown object runs
+//       cmdBody<id> (DUMMY=1, INTER=2, TWIST=3, THUMP=4, KEY=7,
+//       SEAL=8, SBONE=9 — the ported cmd bodies ARE the item
+//       behaviors; id5 SW_HBOMB arms cmdDetonate58 instead).
+//       +0x4c = 0x540c2c yaw; FUN_00437f98 -> +0x28 = cos*25,
+//       +0x2c = sin*25 (0x498d40); +0x30 = 0 when chute else 15.0.
+//       id==5: +0x28/+0x2c *= 3.0 (0x498d48).
+//       id==1 (DUMMY): +0xe0=0, +0x118=-1, +0xe4=-1, +0xdc=0,
+//           +0x114 = 0x54c6a0 (the image-resident decoy record — the
+//           port has no analogue; animRec stays nullptr, the same
+//           convention cmdBody1's 0x54c6ac re-arm already uses).
+//       id==8/9: +0x30e = 750.
+//       FUN_0045612c rebuild; 0x541558 = 0x3c; slot.charges -= 1;
+//       == 0 -> FUN_0046a3d8 (inventoryRemove) on 0x541614.
+// ---------------------------------------------------------------------------
+
+// FUN_0046a190 — spawn the selected inventory item as a thrown
+// object in the current arena.
+void itemUseSpawn(TraversalRuntime& rt) {
+  if (rt.inventoryCount == 0 || rt.cur == nullptr) return;
+  if (rt.inventorySel < 0 || rt.inventorySel >= 5) return;
+  InventoryRecord& slot = rt.inventory[rt.inventorySel];
+  const int id = slot.id;
+  const char* name = (id >= 1 && id <= 9) ? kItemNames[id - 1] : nullptr;
+  if (name == nullptr) return;
+  const int eidx = rt.level.enemies.indexOf(name);  // FUN_00454794
+  if (eidx <= 0) return;                            // JG — strictly > 0
+
+  DynamicObject& o = rt.cur->dyn.allocFront();      // FUN_0045cffc
+  if (const RuntimeModel* m = traversalModelFor(eidx, &rt.level))
+    o.model = deepCopyModel(*m);                    // FUN_00403720
+  o.enemyIndex = static_cast<std::uint16_t>(eidx);  // +0x04
+  o.setPosition(rt.cs.pos[0], rt.cs.pos[1],
+                rt.cs.pos[2] + 4.0f);               // C(0x498d38)
+  o.field1c[0] = o.pos[0];                          // +0x1c..+0x24 = pos
+  o.field1c[1] = o.pos[1];
+  o.field1c[2] = o.pos[2];
+  o.prevPos[0] = o.pos[0];                          // +0x180.. = pos
+  o.prevPos[1] = o.pos[1];
+  o.prevPos[2] = o.pos[2];
+  initObjectCollision(o);                           // FUN_004566f0
+  o.field30e = 0x96;                                // 150-tick life
+  o.field44 = 0.0f;
+  o.col.scale = 0.1f;                               // 0x3dcccccd
+  o.col.flags148 = static_cast<std::uint16_t>(o.col.flags148 | 0x18a6);
+  o.col.flags149 = static_cast<std::uint8_t>(o.col.flags148 >> 8);
+  o.col.flags14a |= 0x08;                           // dword |0x818a6
+  o.field30a = static_cast<std::uint32_t>(id);      // +0x30a cmd = id
+  o.yawDeg = rt.motion.yawDeg;                      // +0x4c = 0x540c2c
+  float s = 0.0f, c = 0.0f;
+  sincosDeg(rt.motion.yawDeg, &s, &c);              // FUN_00437f98
+  o.field28 = c * 25.0f;                            // +0x28 — C(0x498d40)
+  o.field2c = s * 25.0f;                            // +0x2c
+  o.field30 = (rt.locoState == 0x2bd) ? 0.0f : 15.0f; // 0x41700000
+  if (id == 5) {                                    // SW_HBOMB throws
+    o.field28 *= 3.0f;                              //   3x — C(0x498d48)
+    o.field2c *= 3.0f;
+  }
+  if (id == 1) {                                  // DUMMY anim arm —
+    o.animRate = 0.0f;                            // +0xe0 = 0
+    o.animLatch = -1;                             // +0x118 = 0xffff
+    o.animFrame = -1;                             // +0xe4 = 0xffff
+    o.animAcc = 0.0f;                             // +0xdc = 0
+    o.animRec = nullptr;                          // +0x114 = 0x54c6a0
+    ++rt.seams.itemAnimRecSeams;                  //   (image record —
+                                                //   unresolved seam)
+  }
+  if (id == 8 || id == 9) o.field30e = 0x2ee;      // 750 — SEAL/SBONE
+  rebuildObjectTransform(o);                      // FUN_0045612c
+  rt.invHudTimer = 0x3c;                          // 60
+  if (--slot.charges == 0) inventoryRemove(rt, rt.inventorySel);
+  ++rt.seams.itemSpawnCalls;
+}
+
 } // namespace
+
+// The 0x4ce774 edge consumer — FUN_00465228 tail 0x465675.
+void traversalItemUseEdge(TraversalRuntime& rt) {
+  ++rt.seams.itemUseCalls;
+  if (rt.cmdObj60 != nullptr) {
+    // FUN_00459d28 — a live cmd-2 (INTER/WMIB) object: clearing its
+    // +0x118 latch makes the next anim-done check detonate it.
+    if (rt.cmdObj60->animLatch >= 0) rt.cmdObj60->animLatch = -1;
+    return;
+  }
+  // 0x4658ef — the inventory activation gate.
+  if (rt.inventoryCount == 0) return;
+  if (rt.inventorySel < 0 || rt.inventorySel >= 5) return;
+  const int id = rt.inventory[rt.inventorySel].id;
+  if (id == 6) return;                            // SW_GATT unusable
+  if (rt.cmdFlag54 != 0 && id != 1 && id != 8 && id != 9) return;
+  if (rt.vert.vertVel == 0.0f && (rt.vert.contactFlags & 1) != 0) {
+    // Grounded & still — post event 0x325/8 (0x54cb08/0x54cb00): the
+    // dispatcher enters locoState 0x325 (K_SPWEP) and the anim
+    // frame-8 crossing spawns the item instead (anim-timed throw).
+    rt.eventMag = 0x325;
+    rt.eventType = 8;
+    return;
+  }
+  if (rt.locoState != 0x2bd && rt.locoState != 0x2be &&
+      rt.locoState != 0x2bf)
+    return;                                     // airborne states only
+  rt.invHudTimer = 0x3c;                        // 0x541558 = 60
+  itemUseSpawn(rt);                             // FUN_0046a190
+}
+
+// FUN_00461954's K_SPWEP (locoState 0x325) frame-8 trigger —
+// 0x462e5d..0x462e67: invHudTimer = 60 is set by the caller, then
+// FUN_0046a190 fires the anim-timed throw.
+void traversalItemUseAnimTrigger(TraversalRuntime& rt) {
+  ++rt.seams.animActionCalls;
+  itemUseSpawn(rt);
+}
 
 void traversalPickupCollect(TraversalRuntime& rt) {
   if (rt.cur == nullptr) return;

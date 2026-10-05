@@ -267,7 +267,11 @@ struct TraversalSeams {
   int sniperFireCalls = 0;        // FUN_0045f138 projectile spawn
   int animEventCalls = 0;         // FUN_00469668 anim-event seam
   int hudIndicatorCalls = 0;      // FUN_004696d8 dispatch-tail HUD scan
-  int itemUseCalls = 0;           // FUN_00459d28 item activation
+  int itemUseCalls = 0;           // the 0x4ce774 item-use edge
+                                // (FUN_00465228 tail 0x465675)
+  int itemSpawnCalls = 0;         // FUN_0046a190 thrown-item spawns
+  int itemAnimRecSeams = 0;       // id1 DUMMY +0x114 record —
+                                // 0x54c6a0 image pointer unresolved
   int reticleSpawnCalls = 0;      // FUN_0046153c + FUN_00454794 +
                                 // FUN_00454af8 + FUN_0045612c +
                                 // FUN_00402fe8 + FUN_00402160
@@ -281,8 +285,9 @@ struct TraversalSeams {
                                   // land, tumble, scope — audio seam)
   int animDiagCalls = 0;          // FUN_00408eb0 "Unknown Damp
                                   // Animation" — unhandled locoState
-  int animActionCalls = 0;        // FUN_0046a190 — the 0x325 frame-8
-                                  // interact trigger (gameplay seam)
+  int animActionCalls = 0;        // FUN_00461954 locoState-0x325
+                                  // (K_SPWEP) frame-8 trigger —
+                                  // now fires FUN_0046a190 for real
   int reticleBlockCalls = 0;      // FUN_004372d4 — the anim tail's
                                   // reticle-aux draw-entry update
   int mountUpdateCalls = 0;       // FUN_00467ac4/FUN_00467ed0 class 1/2

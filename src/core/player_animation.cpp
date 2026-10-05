@@ -12,6 +12,7 @@
 #include "core/binary_reader.h"
 #include "core/bni_directory.h"
 #include "core/enemy_runtime.h" // enemyRandBelow = FUN_00401ed4
+#include "core/player_pickup.h"
 #include "core/sni_directory.h"
 #include "core/traversal_runtime.h"
 
@@ -767,7 +768,7 @@ void playerAnimTick(TraversalRuntime& rt,
         rt.animFrame += step;
         if (playerAnimFrameCrossed(8, 1, shadow, rt.animFrame)) {
           rt.invHudTimer = 60;
-          ++rt.seams.animActionCalls;    // FUN_0046a190 interact
+          traversalItemUseAnimTrigger(rt);   // FUN_0046a190 (0x462e67)
         }
         const int last = static_cast<int>(recCount(t.spewP)) - 1;
         if (last <= rt.animFrame) {

@@ -28,4 +28,19 @@ struct TraversalRuntime;
 // item path is the only outcome that lets the scan continue.
 void traversalPickupCollect(TraversalRuntime& rt);
 
+// ---------------------------------------------------------------------------
+// P0-C — item use (FUN_00465228 tail + FUN_0046a190; see the cpp for
+// the full evidence map).
+// ---------------------------------------------------------------------------
+
+// The 0x4ce774 item-use edge (0x465675): cmdObj60 live -> FUN_00459d28
+// clears the spinning INTER/WMIB's anim latch (remote detonate); else
+// the 0x4658ef inventory gate — grounded+still posts event 0x325/8
+// (the K_SPWEP anim-timed throw), airborne 0x2bd/2be/2bf spawns now.
+void traversalItemUseEdge(TraversalRuntime& rt);
+
+// FUN_00461954's locoState-0x325 (K_SPWEP) frame-8 trigger — the
+// anim-timed item throw (0x462e67 -> FUN_0046a190).
+void traversalItemUseAnimTrigger(TraversalRuntime& rt);
+
 } // namespace mdk

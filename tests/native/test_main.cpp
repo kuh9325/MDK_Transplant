@@ -13317,6 +13317,248 @@ void test_player_pickup() {
   }
 }
 
+// Phase P0-C — item use (core/player_pickup.cpp). The 0x4ce774 edge:
+// cmdObj60 -> clear its +0x118 latch (WMIB remote detonate); else the
+// 0x4658ef gate — grounded+still posts event 0x325/8 (the K_SPWEP
+// anim-timed throw), airborne 0x2bd/2be/2bf -> FUN_0046a190 spawns
+// the thrown object with field30a = item id (cmdBody<id>).
+namespace {
+
+// Arms a runtime with arena "A" + one inventory slot; returns the
+// enemy-table index of `itemName` (a filler entry keeps eidx > 0 —
+// FUN_0046a190's JG rejects index 0).
+int iuSetup(mdk::TraversalRuntime& rt, const char* itemName, int id,
+            int charges) {
+  rt.cur = travArenaAdd(rt, "A");
+  pkEntry(rt, "FILLER");
+  const int eidx = pkEntry(rt, itemName);
+  rt.inventory[0].id = id;
+  rt.inventory[0].charges = charges;
+  rt.inventoryCount = 1;
+  rt.inventorySel = 0;
+  rt.cs.pos[0] = 10.f; rt.cs.pos[1] = 20.f; rt.cs.pos[2] = 30.f;
+  rt.motion.yawDeg = 90.0f;                     // sin=1 cos=0 throw dir
+  return eidx;
+}
+
+// The airborne path: vertVel nonzero + a {2bd,2be,2bf} locoState.
+void iuAirborne(mdk::TraversalRuntime& rt, int loco) {
+  rt.vert.vertVel = 5.0f;
+  rt.vert.contactFlags = 0;
+  rt.locoState = loco;
+}
+
+} // namespace
+
+void test_player_item_use() {
+  using mdk::TraversalRuntime;
+
+  // ---- airborne throw (K_JUMP): immediate FUN_0046a190 spawn ----
+  {
+    TraversalRuntime rt;
+    const int eidx = iuSetup(rt, "SW_TWIST", 3, 2);
+    iuAirborne(rt, 0x2be);
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.seams.itemUseCalls == 1);
+    CHECK(rt.seams.itemSpawnCalls == 1);
+    CHECK(rt.inventoryCount == 1);
+    CHECK(rt.inventory[0].charges == 1);       // 2 -> 1
+    CHECK(rt.invHudTimer == 0x3c);
+    CHECK(rt.cur->dyn.storage.size() == 1);
+    mdk::DynamicObject& o = *rt.cur->dyn.storage.front();
+    CHECK(o.enemyIndex == eidx);               // +0x04
+    CHECK(o.field30a == 3);                    // +0x30a = item id = cmd
+    CHECK(o.field30e == 0x96);                 // 150
+    CHECK(o.field44 == 0.0f);
+    CHECK(o.col.scale == 0.1f);
+    CHECK((o.col.flags148 & 0x18a6) == 0x18a6);// +0x148/+0x149
+    CHECK((o.col.flags14a & 0x08) != 0);       // dword |0x818a6
+    CHECK(o.pos[0] == 10.f && o.pos[1] == 20.f && o.pos[2] == 34.f);
+    CHECK(o.prevPos[2] == 34.f);               // +0x180.. = pos
+    CHECK(o.field1c[2] == 34.f);               // +0x1c anchor
+    CHECK(o.yawDeg == 90.0f);
+    CHECK(o.field30 == 15.0f);                 // 0x41700000 toss
+    // yaw=90: cos~0, sin=1 -> vel.x~0, vel.y=25 (C(0x498d40))
+    CHECK(o.field28 < 0.01f && o.field28 > -0.01f);
+    CHECK(o.field2c == 25.0f);
+  }
+
+  // ---- chute state (0x2bd): +0x30 vel.z = 0 (the glide drop) ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_THUMP", 4, 1);
+    iuAirborne(rt, 0x2bd);
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.seams.itemSpawnCalls == 1);
+    mdk::DynamicObject& o = *rt.cur->dyn.storage.front();
+    CHECK(o.field30 == 0.0f);                  // no vertical toss
+    CHECK(o.field30a == 4);
+    CHECK(rt.inventoryCount == 0);             // last charge removed
+    CHECK(rt.inventory[0].charges == 0);
+  }
+
+  // ---- cmdObj60 branch: FUN_00459d28 clears +0x118 (WMIB remote
+  // detonate) — no spawn, no charge consumed ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_INTER", 2, 1);
+    iuAirborne(rt, 0x2be);
+    mdk::DynamicObject& live = rt.cur->dyn.allocFront();
+    live.animLatch = 0;                        // cmdBody2's spin word
+    rt.cmdObj60 = &live;
+    mdk::traversalItemUseEdge(rt);
+    CHECK(live.animLatch == -1);               // +0x118 = 0xffff
+    CHECK(rt.seams.itemSpawnCalls == 0);
+    CHECK(rt.inventory[0].charges == 1);       // untouched
+    // a second edge while latched negative is a no-op
+    mdk::traversalItemUseEdge(rt);
+    CHECK(live.animLatch == -1);
+  }
+
+  // ---- id 6 (SW_GATT) can never be thrown ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_GATT", 6, 200);
+    iuAirborne(rt, 0x2be);
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.seams.itemSpawnCalls == 0);
+    CHECK(rt.cur->dyn.storage.empty());
+    CHECK(rt.inventory[0].charges == 200);
+  }
+
+  // ---- cmdFlag54 gate: only ids {1,8,9} activate while a command
+  // is running (0x465956..0x465963) ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_INTER", 2, 1);
+    iuAirborne(rt, 0x2be);
+    rt.cmdFlag54 = 1;
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.seams.itemSpawnCalls == 0);
+    // ...but SW_DUMMY (id1) passes the same gate
+    TraversalRuntime rt2;
+    iuSetup(rt2, "SW_DUMMY", 1, 1);
+    iuAirborne(rt2, 0x2bd);
+    rt2.cmdFlag54 = 1;
+    mdk::traversalItemUseEdge(rt2);
+    CHECK(rt2.seams.itemSpawnCalls == 1);
+  }
+
+  // ---- grounded + still: event 0x325/8 (the K_SPWEP anim path),
+  // no immediate spawn ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_TWIST", 3, 1);
+    rt.vert.vertVel = 0.0f;
+    rt.vert.contactFlags = 1;                  // grounded
+    rt.locoState = 0x259;                      // standing-ish
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.eventMag == 0x325);               // 0x54cb08
+    CHECK(rt.eventType == 8);                  // 0x54cb00
+    CHECK(rt.seams.itemSpawnCalls == 0);
+    CHECK(rt.inventory[0].charges == 1);
+  }
+
+  // ---- airborne but wrong locoState: rejected ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_TWIST", 3, 1);
+    rt.vert.vertVel = 5.0f;
+    rt.vert.contactFlags = 0;
+    rt.locoState = 0x259;                      // not in {2bd,2be,2bf}
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.seams.itemSpawnCalls == 0);
+    CHECK(rt.inventory[0].charges == 1);
+  }
+
+  // ---- HBOMB (id5): horizontal throw x3 (C(0x498d48)) ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_HBOMB", 5, 3);
+    iuAirborne(rt, 0x2bf);
+    mdk::traversalItemUseEdge(rt);
+    mdk::DynamicObject& o = *rt.cur->dyn.storage.front();
+    CHECK(o.field30a == 5);
+    CHECK(o.field2c == 75.0f);                 // 25*3 on the sin axis
+    CHECK(o.field30 == 15.0f);
+  }
+
+  // ---- SEAL/SBONE (id8/9): +0x30e = 750 ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_SEAL", 8, 1);
+    iuAirborne(rt, 0x2be);
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.cur->dyn.storage.front()->field30e == 0x2ee);
+    TraversalRuntime rt2;
+    iuSetup(rt2, "SW_SBONE", 9, 1);
+    iuAirborne(rt2, 0x2be);
+    mdk::traversalItemUseEdge(rt2);
+    CHECK(rt2.cur->dyn.storage.front()->field30e == 0x2ee);
+  }
+
+  // ---- DUMMY (id1): the decoy anim arm — +0x118/-1 etc, +0x114
+  // record unresolved in the port (counted seam) ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_DUMMY", 1, 1);
+    iuAirborne(rt, 0x2be);
+    mdk::traversalItemUseEdge(rt);
+    mdk::DynamicObject& o = *rt.cur->dyn.storage.front();
+    CHECK(o.field30a == 1);
+    CHECK(o.animRate == 0.0f);                 // +0xe0 = 0
+    CHECK(o.animLatch == -1);                  // +0x118 = 0xffff
+    CHECK(o.animFrame == -1);                  // +0xe4 = 0xffff
+    CHECK(o.animAcc == 0.0f);                  // +0xdc = 0
+    CHECK(o.animRec == nullptr);               // 0x54c6a0 — seam
+    CHECK(rt.seams.itemAnimRecSeams == 1);
+  }
+
+  // ---- the K_SPWEP frame-8 anim trigger spawns the same way ----
+  {
+    TraversalRuntime rt;
+    iuSetup(rt, "SW_INTER", 2, 1);
+    mdk::traversalItemUseAnimTrigger(rt);
+    CHECK(rt.seams.animActionCalls == 1);
+    CHECK(rt.seams.itemSpawnCalls == 1);
+    CHECK(rt.cur->dyn.storage.front()->field30a == 2);
+    CHECK(rt.inventoryCount == 0);             // last charge consumed
+  }
+
+  // ---- charge decrement removes the slot at 0 — middle-slot remove
+  // shifts (FUN_0046a3d8) ----
+  {
+    TraversalRuntime rt;
+    rt.cur = travArenaAdd(rt, "A");
+    pkEntry(rt, "FILLER");
+    pkEntry(rt, "SW_INTER");
+    pkEntry(rt, "SW_KEY");
+    rt.inventory[0].id = 7; rt.inventory[0].charges = 1;
+    rt.inventory[1].id = 2; rt.inventory[1].charges = 4;
+    rt.inventoryCount = 2;
+    rt.inventorySel = 0;                       // using the KEY slot
+    iuAirborne(rt, 0x2be);
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.inventoryCount == 1);             // slot 0 removed
+    CHECK(rt.inventory[0].id == 2);            // INTER shifted down
+    CHECK(rt.inventory[0].charges == 4);
+  }
+
+  // ---- name-miss: no enemy-table entry -> no spawn (JG gate) ----
+  {
+    TraversalRuntime rt;
+    rt.cur = travArenaAdd(rt, "A");
+    rt.inventory[0].id = 3;
+    rt.inventory[0].charges = 1;
+    rt.inventoryCount = 1;
+    rt.inventorySel = 0;
+    iuAirborne(rt, 0x2be);
+    mdk::traversalItemUseEdge(rt);
+    CHECK(rt.seams.itemSpawnCalls == 0);
+    CHECK(rt.inventory[0].charges == 1);
+  }
+}
+
 void test_traversal_deep_floor() {
   // +0x44e = the arena geometry AABB minZ (OBSERVED FUN_004320d0 —
   // folded from +0x24/+0x0c via lea ecx,[eax+0x446] + register-
@@ -31124,6 +31366,7 @@ int main() {
   test_traversal_portal_test();
   test_traversal_trigger_scan();
   test_player_pickup();
+  test_player_item_use();
   test_traversal_deep_floor();
   test_traversal_element_bind();
   test_traversal_script();
