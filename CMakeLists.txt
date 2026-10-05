@@ -72,6 +72,7 @@ add_library(mdk_core STATIC
   src/core/player_fire.cpp
   src/core/player_look.cpp
   src/core/player_motion.cpp
+  src/core/player_pickup.cpp
   src/core/player_projectiles.cpp
   src/core/player_reticle.cpp
   src/core/player_sniper.cpp

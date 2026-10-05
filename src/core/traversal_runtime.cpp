@@ -22,6 +22,7 @@
 #include "core/object_animation.h"
 #include "core/object_path.h"
 #include "core/player_fire.h"
+#include "core/player_pickup.h"
 #include "core/player_projectiles.h"
 #include "core/player_reticle.h"
 #include "core/player_sniper.h"
@@ -1650,8 +1651,12 @@ TraversalFrameResult stepTraversalRuntime(
         if (rt.fieldEb8 < 1) rt.fieldEb8 = 1;
       }
     }
-    ++rt.seams.hudIndicatorCalls;  // FUN_004696d8 (0x46382c) — HUD
-                                 // indicator-object scan seam
+    ++rt.seams.hudIndicatorCalls;  // FUN_004696d8 (0x46382c) — the
+                                 // pickup collector call site; the
+                                 // call is unconditional in the
+                                 // original (it runs even while the
+                                 // death tail above is active)
+    traversalPickupCollect(rt);    // FUN_004696d8
 
     // Dispatcher tail (OBSERVED 0x463831..0x463f4a): with no latched
     // event and no post this frame, the idle restore runs the 0x540d00

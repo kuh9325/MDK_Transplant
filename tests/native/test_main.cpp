@@ -46,6 +46,7 @@
 #include "core/player_camera.h"
 #include "core/player_fire.h"
 #include "core/player_motion.h"
+#include "core/player_pickup.h"
 #include "core/player_projectiles.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
@@ -13022,6 +13023,298 @@ void test_traversal_trigger_scan() {
   const int t1 = rt.seams.type1Triggers, t3 = rt.seams.type3Prefetches;
   mdk::traversalTriggerScan(rt);
   CHECK(rt.seams.type1Triggers == t1 && rt.seams.type3Prefetches == t3);
+}
+
+// Phase P0-B — FUN_004696d8 (core/player_pickup.cpp). The original
+// sweeps the segment prevPos->pos against each mover's +0x198 AABB
+// expanded by (-1,-1,-5)/(+1,+1,+1), name-dispatches the +0x0c
+// record's byte-0 (the table-1 ENTRY name — entries[enemyIndex].name,
+// NOT the geometry's own name-table), then arms the +0x14a&4 carry.
+namespace {
+
+// A live mover object whose +0x198 world AABB is a 1-unit box at pos.
+mdk::DynamicObject& pkSpawn(mdk::TraversalArena& a, int enemyIdx,
+                            float x, float y, float z) {
+  mdk::DynamicObject& o = a.dyn.allocFront();
+  o.col.named = true;
+  o.col.flags14a = 0x20;
+  o.enemyIndex = static_cast<std::uint16_t>(enemyIdx);
+  o.setPosition(x, y, z);
+  for (int i = 0; i < 3; ++i) {
+    o.col.aabb[i] = o.pos[i] - 0.5f;
+    o.col.aabb[3 + i] = o.pos[i] + 0.5f;
+  }
+  return o;
+}
+
+int pkEntry(mdk::TraversalRuntime& rt, const char* name) {
+  mdk::EnemyTable::Entry e;
+  e.name = name;
+  rt.level.enemies.entries.push_back(e);
+  return static_cast<int>(rt.level.enemies.entries.size()) - 1;
+}
+
+int pkAudioCount(mdk::TraversalRuntime& rt, const char* name) {
+  int n = 0;
+  for (const auto& ev : rt.audioFx)
+    if (ev.name == name && ev.op == mdk::TraversalAudioOp::kRestart)
+      ++n;
+  return n;
+}
+
+} // namespace
+
+void test_player_pickup() {
+  using mdk::TraversalRuntime;
+
+  // ---- item path: SW_GATT (item id 6) -> slot + 200 carry rounds --
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    rt.difficulty = 1;                                   // normal row
+    const int gatt = pkEntry(rt, "SW_GATT");
+    mdk::DynamicObject& o = pkSpawn(*a, gatt, 10.f, 10.f, 10.f);
+    o.moverChild = &a->dyn.allocFront();                 // +0x312 child
+    o.moverChild->col.named = true;
+    rt.cs.pos[0] = 10.f; rt.cs.pos[1] = 10.f; rt.cs.pos[2] = 10.f;
+    rt.cs.entryPos[0] = 10.f; rt.cs.entryPos[1] = 10.f;
+    rt.cs.entryPos[2] = 10.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.inventoryCount == 1);
+    CHECK(rt.inventory[0].id == 6);
+    CHECK(rt.inventory[0].charges == 1);
+    CHECK(rt.inventorySel == 0);
+    CHECK(rt.invHudTimer == 0x3c);
+    CHECK(rt.ammo[0] == 200);                // normal-difficulty row
+    CHECK(rt.seams.hudMsgPosts == 1);
+    CHECK(rt.seams.pickupCollects == 1);
+    CHECK(pkAudioCount(rt, "COLLECT") == 1);
+    CHECK((o.col.flags14a & 4) != 0);        // carry bit armed
+    CHECK((o.col.flags149 & 0x10) != 0);     // -> enemyCommandDispatch
+    CHECK(o.field30e == 30);                 // 30-tick countdown
+    CHECK(o.field1c[0] == 10.f && o.field1c[2] == 10.f);
+    CHECK(o.moverChild == nullptr);          // +0x312 child torn down
+    CHECK(rt.seams.objectTeardownCalls == 1);
+
+    // A second SW_GATT stacks the rounds without a new slot
+    // (0x469885 stack path — ammo[0] += row, no slot insert).
+    mdk::DynamicObject& o2 = pkSpawn(*a, gatt, 10.f, 10.f, 10.f);
+    rt.audioFx.clear();
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.inventoryCount == 1);
+    CHECK(rt.ammo[0] == 400);
+    CHECK(pkAudioCount(rt, "COLLECT") == 1);
+    CHECK((o2.col.flags14a & 4) != 0);
+  }
+
+  // ---- pickup path: SW_BONES (id 4) — the name-source proof. Its
+  // geometry record's own name-table is "BONEHEAD"; the collect must
+  // read the table-1 entry name "SW_BONES" (entries[enemyIndex]).
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int bones = pkEntry(rt, "SW_BONES");
+    mdk::DynamicObject& o = pkSpawn(*a, bones, 5.f, 5.f, 5.f);
+    mdk::RuntimeModel::NameRec nr;
+    std::memcpy(nr.name.data(), "BONEHEAD", 9);
+    o.model.names.push_back(nr);             // model name decoy
+    rt.cs.pos[0] = 5.f; rt.cs.pos[1] = 5.f; rt.cs.pos[2] = 5.f;
+    rt.cs.entryPos[0] = 5.f; rt.cs.entryPos[1] = 5.f;
+    rt.cs.entryPos[2] = 5.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.ammo[5] == 1);                  // 0x541623[4] += 1
+    CHECK(rt.wpnSel1 == 4);                  // 0x541619 = RAW id (the
+                                             // original's off-by-one:
+                                             // grant hits pool id+1)
+    CHECK(rt.seams.hudMsgPosts == 1);        // id 4 posts (9/11 don't)
+    CHECK(pkAudioCount(rt, "BONES") == 1);   // id4's own record
+    CHECK(pkAudioCount(rt, "COLLECT") == 1); // mode-3 fallthrough quirk
+    CHECK((o.col.flags14a & 4) != 0);
+  }
+
+  // ---- health path: SW_H01 (id 9) — +1 gated by hp<100, no notify
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int h01 = pkEntry(rt, "SW_H01");
+    rt.fieldHealth = 90;
+    mdk::DynamicObject& o = pkSpawn(*a, h01, 2.f, 2.f, 2.f);
+    rt.cs.pos[0] = 2.f; rt.cs.pos[1] = 2.f; rt.cs.pos[2] = 2.f;
+    rt.cs.entryPos[0] = 2.f; rt.cs.entryPos[1] = 2.f;
+    rt.cs.entryPos[2] = 2.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.fieldHealth == 91);
+    CHECK(pkAudioCount(rt, "APPLE") == 1);
+    CHECK(rt.seams.hudMsgPosts == 0);        // id 9 posts nothing
+    CHECK((o.col.flags14a & 4) != 0);
+  }
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int h01 = pkEntry(rt, "SW_H01");
+    rt.fieldHealth = 150;                    // full-health latch
+    mdk::DynamicObject& o = pkSpawn(*a, h01, 2.f, 2.f, 2.f);
+    rt.cs.pos[0] = 2.f; rt.cs.pos[1] = 2.f; rt.cs.pos[2] = 2.f;
+    rt.cs.entryPos[0] = 2.f; rt.cs.entryPos[1] = 2.f;
+    rt.cs.entryPos[2] = 2.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.fieldHealth == 150);            // guard held, still consumed
+    CHECK(pkAudioCount(rt, "APPLE") == 1);
+    CHECK((o.col.flags14a & 4) != 0);
+  }
+
+  // ---- item sfx select: SW_INTER (id 2) plays WMIB not COLLECT ---
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int inter = pkEntry(rt, "SW_INTER");
+    pkSpawn(*a, inter, 1.f, 1.f, 1.f);
+    rt.cs.pos[0] = 1.f; rt.cs.pos[1] = 1.f; rt.cs.pos[2] = 1.f;
+    rt.cs.entryPos[0] = 1.f; rt.cs.entryPos[1] = 1.f;
+    rt.cs.entryPos[2] = 1.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.inventoryCount == 1 && rt.inventory[0].id == 2);
+    CHECK(pkAudioCount(rt, "WMIB") == 1);
+    CHECK(pkAudioCount(rt, "COLLECT") == 0);
+  }
+
+  // ---- SW_HBOMB (id 5) charges follow the difficulty row ---------
+  {
+    for (int d = 0; d < 3; ++d) {
+      TraversalRuntime rt;
+      mdk::TraversalArena* a = travArenaAdd(rt, "A");
+      rt.cur = a;
+      rt.difficulty = d;
+      const int hb = pkEntry(rt, "SW_HBOMB");
+      pkSpawn(*a, hb, 0.f, 0.f, 0.f);
+      rt.cs.pos[0] = 0.f; rt.cs.pos[1] = 0.f; rt.cs.pos[2] = 0.f;
+      rt.cs.entryPos[0] = 0.f; rt.cs.entryPos[1] = 0.f;
+      rt.cs.entryPos[2] = 0.f;
+      mdk::traversalPickupCollect(rt);
+      CHECK(rt.inventoryCount == 1);
+      CHECK(rt.inventory[0].charges == (d == 0 ? 5 : d == 1 ? 3 : 1));
+    }
+  }
+
+  // ---- unknown-name quirk: a contacted mover that names neither
+  // table ENDS the whole frame's scan (0x4697f1 exhaustion -> return).
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int unk = pkEntry(rt, "MROQ");     // names neither table
+    const int bones = pkEntry(rt, "SW_BONES");
+    pkSpawn(*a, bones, 9.f, 9.f, 9.f);       // inserted first -> list tail
+    pkSpawn(*a, unk, 1.f, 1.f, 1.f);         // list head -> scanned first
+    rt.cs.pos[0] = 5.f; rt.cs.pos[1] = 5.f; rt.cs.pos[2] = 5.f;
+    rt.cs.entryPos[0] = 5.f; rt.cs.entryPos[1] = 5.f;
+    rt.cs.entryPos[2] = 5.f;
+    // The swept segment crosses BOTH boxes — the head object (MROQ)
+    // exhausts the tables and the scan returns before SW_BONES.
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.ammo[5] == 0);                  // never reached
+    CHECK(rt.seams.pickupCollects == 0);
+  }
+
+  // ---- full inventory: the item stays, scanning continues --------
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int hb = pkEntry(rt, "SW_HBOMB");
+    const int bones = pkEntry(rt, "SW_BONES");
+    const int fillIds[5] = {1, 2, 3, 4, 6};  // no id5 — stack can't hit
+    for (int i = 0; i < 5; ++i) {
+      rt.inventory[i].id = fillIds[i];
+      rt.inventory[i].charges = 1;
+    }
+    rt.inventoryCount = 5;
+    mdk::DynamicObject& pk = pkSpawn(*a, bones, 4.f, 4.f, 4.f);
+    mdk::DynamicObject& it = pkSpawn(*a, hb, 4.f, 4.f, 4.f);
+    rt.cs.pos[0] = 4.f; rt.cs.pos[1] = 4.f; rt.cs.pos[2] = 4.f;
+    rt.cs.entryPos[0] = 4.f; rt.cs.entryPos[1] = 4.f;
+    rt.cs.entryPos[2] = 4.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.inventoryCount == 5);           // no room — item survives
+    CHECK((it.col.flags14a & 4) == 0);
+    CHECK(rt.ammo[5] == 1);                  // the pickup still collects
+    CHECK((pk.col.flags14a & 4) != 0);
+  }
+
+  // ---- eligibility gates: unnamed / not-mover / already-collected /
+  // dead objects are skipped without touching state.
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int bones = pkEntry(rt, "SW_BONES");
+    mdk::DynamicObject& no1 = pkSpawn(*a, bones, 0.f, 0.f, 0.f);
+    no1.col.named = false;                       // +0x06 == 0
+    mdk::DynamicObject& no2 = pkSpawn(*a, bones, 0.f, 0.f, 0.f);
+    no2.col.flags14a = 0x00;                     // not a mover
+    mdk::DynamicObject& no3 = pkSpawn(*a, bones, 0.f, 0.f, 0.f);
+    no3.col.flags148 |= 0x10;                    // dead (+0x148&0x10)
+    mdk::DynamicObject& no4 = pkSpawn(*a, bones, 0.f, 0.f, 0.f);
+    no4.col.flags14a |= 0x24;                    // mover but carried
+    rt.cs.pos[0] = 0.f; rt.cs.pos[1] = 0.f; rt.cs.pos[2] = 0.f;
+    rt.cs.entryPos[0] = 0.f; rt.cs.entryPos[1] = 0.f;
+    rt.cs.entryPos[2] = 0.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.ammo[5] == 0);
+    CHECK(rt.seams.pickupCollects == 0);
+  }
+
+  // ---- expanded-AABB edge: the Z window reaches -5 below the
+  // object's own box (jump-up-into / fall-onto reach).
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int bones = pkEntry(rt, "SW_BONES");
+    mdk::DynamicObject& o = pkSpawn(*a, bones, 0.f, 0.f, 10.f);
+    // Player at z=5: inside obj-aabb.min-5 (=9.5-5=4.5) but 4.5 below
+    // the object's own box — collect must still fire.
+    rt.cs.pos[0] = 0.f; rt.cs.pos[1] = 0.f; rt.cs.pos[2] = 5.f;
+    rt.cs.entryPos[0] = 0.f; rt.cs.entryPos[1] = 0.f;
+    rt.cs.entryPos[2] = 5.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.ammo[5] == 1);
+    CHECK((o.col.flags14a & 4) != 0);
+  }
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int bones = pkEntry(rt, "SW_BONES");
+    mdk::DynamicObject& o = pkSpawn(*a, bones, 0.f, 0.f, 10.f);
+    // At z=4: just below the expanded min (4.5) — no collect.
+    rt.cs.pos[0] = 0.f; rt.cs.pos[1] = 0.f; rt.cs.pos[2] = 4.f;
+    rt.cs.entryPos[0] = 0.f; rt.cs.entryPos[1] = 0.f;
+    rt.cs.entryPos[2] = 4.f;
+    mdk::traversalPickupCollect(rt);
+    CHECK(rt.ammo[5] == 0);
+    CHECK((o.col.flags14a & 4) == 0);
+  }
+
+  // ---- swept segment: entryPos outside, pos inside (the segment
+  // spans the box) collects even when only an endpoint region matches
+  {
+    TraversalRuntime rt;
+    mdk::TraversalArena* a = travArenaAdd(rt, "A");
+    rt.cur = a;
+    const int bones = pkEntry(rt, "SW_BONES");
+    pkSpawn(*a, bones, 0.f, 0.f, 0.f);
+    rt.cs.entryPos[0] = 0.f; rt.cs.entryPos[1] = 0.f;
+    rt.cs.entryPos[2] = 8.f;                  // above (in -5 Z window)
+    rt.cs.pos[0] = 0.f; rt.cs.pos[1] = 0.f; rt.cs.pos[2] = -10.f;
+    mdk::traversalPickupCollect(rt);          // segment spans the box
+    CHECK(rt.ammo[5] == 1);
+  }
 }
 
 void test_traversal_deep_floor() {
@@ -30830,6 +31123,7 @@ int main() {
   test_traversal_connect_pairing();
   test_traversal_portal_test();
   test_traversal_trigger_scan();
+  test_player_pickup();
   test_traversal_deep_floor();
   test_traversal_element_bind();
   test_traversal_script();

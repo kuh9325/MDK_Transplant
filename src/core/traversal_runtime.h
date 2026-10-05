@@ -369,6 +369,13 @@ struct TraversalSeams {
                                   // remap on the selected inventory
                                   // cell (46x46 interior — the border
                                   // box itself IS drawn)
+  int ewjSpawnCalls = 0;          // FUN_0046aa30 — the SW_EWJ
+                                  // marker-object spawn inside the
+                                  // pickup grant (id 10); unported —
+                                  // no Level-3 SW_EWJ exists to
+                                  // verify against
+  int pickupCollects = 0;         // FUN_004696d8 collects granted
+                                  // (pickup + item paths)
 };
 
 struct TraversalFrameResult {

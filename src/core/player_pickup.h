@@ -1,0 +1,31 @@
+// player_pickup.h — the FUN_004696d8 traversal pickup collector
+// (Phase P0-B). The per-frame player-vs-pickup contact scan that
+// grants ammo/health/inventory and arms the carry-away despawn.
+//
+// OBSERVED (MDK95.EXE BUILD_A, Ghidra decompile + raw disasm):
+//   FUN_004696d8 @ 0x4696d8 — the collector body.
+//   Call site @0x46382c inside FUN_00463608 — unconditional, every
+//   frame, even while dying (the 0x541510/0x541554 death tail above
+//   it does not skip the call).
+//   FUN_0046a790 @ 0x46a790 — the 12-id pickup grant switch.
+//   FUN_0046a500 @ 0x46a500 — the inventory-item grant (the same
+//   body is inlined in FUN_004696d8 for the SW_DUMMY*-table hits).
+//   FUN_0045cc2c @ 0x45cc2c — swept-segment AABB test.
+//   FUN_0045828c @ 0x45828c — child teardown (objectTeardownNow).
+//   FUN_004599e8 @ 0x4599e8 — the carry/fly-away the despawn marks
+//   route to (cmdBodyCarry, gated +0x149&0x10 -> +0x14a&4).
+#pragma once
+
+namespace mdk {
+
+struct TraversalRuntime;
+
+// FUN_004696d8 — scan the current arena's +0x68 object list once;
+// the first touched mover matching the pickup/item name tables is
+// granted + despawn-armed and the function returns (one collect per
+// frame). A touched mover naming neither table ALSO returns — the
+// whole frame's scan ends (OBSERVED quirk). A full inventory on the
+// item path is the only outcome that lets the scan continue.
+void traversalPickupCollect(TraversalRuntime& rt);
+
+} // namespace mdk
