@@ -26,6 +26,7 @@
 #include "core/player_projectiles.h"
 #include "core/player_reticle.h"
 #include "core/player_sniper.h"
+#include "core/player_sphere.h"
 #include "core/sni_directory.h"
 
 namespace mdk {
@@ -1188,6 +1189,14 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
   rt.cs.playerBox[4] = pos[1] + 1.25f;
   rt.cs.playerBox[5] = pos[2] + 4.25f;
 
+  // Level-3 scripted sphere ride — armed only on the fresh natural
+  // load (the OBSERVED ~0.7 s automatic entry; the original's analog
+  // is the level-entry scripted-sequence arm — CORROBORATED
+  // MDK95.EXE). Save-suppressed and diagnostic starts are not the
+  // fresh-entry path and leave it off.
+  if ((flags & kTraversalLoadSuppressSpawn) == 0)
+    playerSphereArm(rt, spawnArena);
+
   // Initial-arena stream + spawn-once (the loader's warm attach).
   // kTraversalLoadSuppressSpawn mirrors FUN_004346e8(param=2): the
   // save-load path leaves every arena's object list empty for the
@@ -1401,6 +1410,14 @@ TraversalFrameResult stepTraversalRuntime(
     // event clears, branch dispatch, prevFrame commit, and every
     // tail below are all skipped on this path.
     takeoffFlightStep(rt, *cur, timing);
+  } else if (playerSphereStep(rt, raw, bindings, rt.prevFrame,
+                              timing)) {
+    // The scripted Level-3 sphere segment owns this frame (phase 2
+    // ride). Phase 1 is the on-foot entry window — playerSphereStep
+    // returns false there and the normal dispatch runs unchanged.
+    // The segment still consumes the merge: commit the N+1 hand-off
+    // exactly as the normal path does.
+    rt.prevFrame = nextFrame;
   } else {
     // OBSERVED dispatch head (0x463638): the pending-event slots
     // 0x54cb00/0x54cb08 are cleared every frame; the current event
@@ -2433,6 +2450,7 @@ TraversalFrameResult stepTraversalRuntime(
   out.portalCandidate = portalCand;
   out.endLevelRequested = rt.endLevelRequest != 0;
   out.takeoffActive = rt.fieldDa0 != 0;
+  out.sphereRideActive = rt.spherePhase == 2;
   out.takeoffDone = rt.takeoffDone != 0;
   out.endingRequested = rt.endingRequest != 0;
   out.eventTimer = rt.eventTimer;

@@ -76,6 +76,7 @@ add_library(mdk_core STATIC
   src/core/player_projectiles.cpp
   src/core/player_reticle.cpp
   src/core/player_sniper.cpp
+  src/core/player_sphere.cpp
   src/core/player_surface.cpp
   src/core/player_vertical.cpp
   src/core/progression_runtime.cpp

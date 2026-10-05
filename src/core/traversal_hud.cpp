@@ -680,6 +680,26 @@ void traversalHudCompose(TraversalRuntime& rt) {
     }
   }
 
+  // --- Level-3 scripted sphere ride (player_sphere.h): the center
+  //     reticle + right-edge ammunition ladder "x N" — OBSERVED
+  //     (SPHERE_ENTRY.md section 2). The porthole mask itself is the
+  //     pod's cockpit geometry (frontend presentation; X_STRIKB is a
+  //     separate model/anim decode). Ladder position HYPOTHESIS —
+  //     right-edge mid per the video. Distinct from the sniper scope
+  //     and the class-4 object mount.
+  if (rt.spherePhase == 2) {
+    centered(hud.cross, 0, hudRintf(rt.motion.moveVel),
+             hudRintf(rt.motion.strafeVel));
+    if (hud.fontBigOk) {
+      char buf[16];
+      std::snprintf(buf, sizeof buf, "x %d", rt.bombs);
+      const int w = measureFtiText(hud.fontBig, buf,
+                                   kFtiFontBigMissingAdvance);
+      drawFtiText(hud.fontBig, buf, fb, kHudScreenW - w - 8,
+                  kHudBombTargY, kFtiFontBigMissingAdvance);
+    }
+  }
+
   // --- FUN_0046911c — mounted reticle. Caller gate (0x436f37):
   //     excludeObj != 0 && byte[0x540e72] & 4 == mountClass & 0x40000.
   //     Inner gate: suppress when object +0x14b bit2 set. ------------

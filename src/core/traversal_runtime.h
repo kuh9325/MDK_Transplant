@@ -448,6 +448,10 @@ struct TraversalFrameResult {
   bool takeoffActive = false;        // rt.fieldDa0 — the dispatch ran
                                      // the FUN_0040e958 scripted
                                      // takeoff short-circuit this frame
+  bool sphereRideActive = false;     // rt.spherePhase == 2 — the L3
+                                     // scripted sphere ride owned the
+                                     // dispatch this frame
+                                     // (player_sphere.h)
   bool takeoffDone = false;          // rt.takeoffDone — 0x49a030 latched
                                      // (whiteout counter passed 300)
   bool endingRequested = false;      // rt.endingRequest (op 0x83 0x51
@@ -603,6 +607,17 @@ struct TraversalRuntime {
                                      // mode-dispatch exit (0x401497)
   std::uint32_t scriptFlagsMirror = 0; // 0x54163f — 0x540d98 mirror
                                        // at arm
+
+  // --- Level-3 scripted sphere ride --------------------------------
+  // Evidence map in player_sphere.h. Armed at fresh level-3 entry by
+  // playerSphereArm (the ae0a0-mode segment's analog). Phase 1 is the
+  // on-foot entry window — the ~0.7 s OBSERVED delay elapses while
+  // normal traversal runs; phase 2 is the masked ride consuming the
+  // dispatch until the scripted dismount.
+  int spherePhase = 0;          // 0 off; 1 entry window; 2 ride
+  float sphereTimer = 0.0f;     // phase-1 delay clock (seconds)
+  float sphereDist = 0.0f;      // arc distance along the ride path
+
   bool vertEnable = true;         // 0x540c6c — vertical master gate;
                                   // set at traversal init. Read by the
                                   // sniper abort/entry gates and fed

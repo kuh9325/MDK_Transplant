@@ -1970,6 +1970,8 @@ int main(int argc, char** argv) {
   std::vector<HitSpec> hitSpecs;
   std::vector<PDamageSpec> pdmgSpecs;
   std::vector<int> itemUseFrames;
+  struct HoldSpec { int key; int first; int last; };
+  std::vector<HoldSpec> holdSpecs;
   std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
@@ -2135,6 +2137,21 @@ int main(int argc, char** argv) {
       const char* v = value(a);
       if (!v) return usage();
       itemUseFrames.push_back(std::atoi(v));
+    } else if (!std::strcmp(a, "--hold")) {
+      // QA enabler: hold raw key CODE level-high for frames A..B.
+      const char* v = value(a);
+      if (!v) return usage();
+      const std::string spec(v);
+      const size_t at = spec.find('@'), dash = spec.find('-', at + 1);
+      if (at == std::string::npos || dash == std::string::npos) {
+        std::fprintf(stderr, "--hold wants KEY@A-B\n");
+        return usage();
+      }
+      HoldSpec h;
+      h.key = std::atoi(spec.substr(0, at).c_str());
+      h.first = std::atoi(spec.substr(at + 1, dash - at - 1).c_str());
+      h.last = std::atoi(spec.c_str() + dash + 1);
+      holdSpecs.push_back(h);
     } else if (!std::strcmp(a, "--boss")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -2737,12 +2754,22 @@ int main(int argc, char** argv) {
     // completion latch after the restore.
     bool sawEndLevel = false;
     bool sawEnding = false;
+    // MDK_IDLE_INPUT=1 — QA-only opt-out of the scripted phase
+    // schedule (genuinely idle frames; needed to test spawn-adjacent
+    // scripted triggers the default schedule walks the player off).
+    const bool idleInput = std::getenv("MDK_IDLE_INPUT") != nullptr;
     for (int f = 0; f < travFrames; ++f) {
-      const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
+      const int phase =
+          idleInput ? 0
+                    : f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
       bool elemShotFired = false;
       fireCombatHits(rt, hitSpecs, elemShotFired);
+      auto raw = rawFor(phase);
+      for (const auto& h : holdSpecs)
+        if (f >= h.first && f <= h.last)
+          raw.keyLevel[h.key >> 5] |= 1u << (h.key & 31);
       const auto out =
-          mdk::stepTraversalRuntime(rt, rawFor(phase), bindings, timing);
+          mdk::stepTraversalRuntime(rt, raw, bindings, timing);
       sawEndLevel = sawEndLevel || out.endLevelRequested;
       sawEnding = sawEnding || out.endingRequested;
       std::printf("f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "
@@ -3791,8 +3818,14 @@ int main(int argc, char** argv) {
     std::size_t audioOps[9] = {};
     std::size_t audioTotal = 0;
     std::vector<mdk::TraversalAudioEvent> audioLog;
+    // MDK_IDLE_INPUT=1 — QA-only opt-out of the scripted phase
+    // schedule (genuinely idle frames; needed to test spawn-adjacent
+    // scripted triggers the default schedule walks the player off).
+    const bool idleInput = std::getenv("MDK_IDLE_INPUT") != nullptr;
     for (int f = 0; f < travFrames; ++f) {
-      const int phase = f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
+      const int phase =
+          idleInput ? 0
+                    : f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
       // Phase 15A — combat harness: each pending --hit injects ONE
       // shot into a free pool slot, aimed through the named
       // object/element. The pool's own collision + damage tail
@@ -3811,6 +3844,9 @@ int main(int argc, char** argv) {
       const mdk::CollisionProfile colPrev =
           colProfFrame ? mdk::collisionProfile() : mdk::CollisionProfile{};
       auto raw = rawFor(phase);
+      for (const auto& h : holdSpecs)
+        if (f >= h.first && f <= h.last)
+          raw.keyLevel[h.key >> 5] |= 1u << (h.key & 31);
       for (const int iu : itemUseFrames)
         if (iu == f) raw.keyEdge[0] |= (1u << 28);   // kSlotItemUse
       const auto out =
@@ -4022,11 +4058,17 @@ int main(int argc, char** argv) {
       // Phase 16A — the player-animation identity fields:
       // st=locoState (hex) af=animFrame at=K_table[frameIdx]
       // (FUN_00461954's selected sprite) dr=draw gate.
+      char sphBuf[48] = "";
+      if (rt.spherePhase != 0) {
+        std::snprintf(sphBuf, sizeof sphBuf, " sph=%d am=%d d=%.1f",
+                      rt.spherePhase, rt.bombs,
+                      (double)rt.sphereDist);
+      }
       std::printf(
           "f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "
           "mv=%5.2f sv=%5.2f vv=%6.2f gnd=%d ctc=%08x sld=%d ev=%d/%d "
           "st=%03x af=%d at=%s[%d]%s "
-          "cam=(%8.2f,%8.2f,%8.2f)%s%s\n",
+          "cam=(%8.2f,%8.2f,%8.2f)%s%s%s\n",
           out.frame, out.curArenaIndex, out.partnerArenaIndex,
           (double)out.pos[0], (double)out.pos[1], (double)out.pos[2],
           (double)out.yawDeg, (double)out.moveVel,
@@ -4040,7 +4082,7 @@ int main(int argc, char** argv) {
           (double)out.camera.pos[0], (double)out.camera.pos[1],
           (double)out.camera.pos[2],
           out.overheadViewActive ? " OVH" : "",
-          out.viewOnPartner ? " VP" : "");
+          out.viewOnPartner ? " VP" : "", sphBuf);
       // Phase 16B.1 — authentic damage probes: the producer lands at
       // end-of-frame (post-dispatch), exactly where the in-level
       // enemy/projectile passes call it; the next frame's dispatch
