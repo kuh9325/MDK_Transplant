@@ -164,8 +164,8 @@ Consumers seen in mode 2 (all bank 0):
 ```
 backdrop:      row 12 + shade(1..8)  -> rows 13-20
 kind-5 FLARE:  row 6 + count(0..8) + srcPx(0..8) -> rows 6-22
-trail head -1054: row 25
-trail tail -1024..-1027: rows 0..3
+trail body -1054:    row 25
+trail head -1058..-1065: rows 29-36
 ```
 
 ## 3. Negative pen dispatch (FUN_0040c860, OBSERVED)
@@ -197,13 +197,24 @@ buffer, `dst = lutRow[dstPx]` destination remap):
   — the tail's widest points, X span ~5.336.
 - `FUN_0042ecc4` feed per tick: basis-transformed anchor points into
   the ring slot; slot pt[anchors] = pt[0] (closes the section).
-- Draw `FUN_0042ee74`: consecutive ring slots -> section quads.
-  Pens: newest sections -1054 (LUT row 25 veil); for a full 32-ring
-  the oldest 8 sections (secIdx >= count-8) get pen
-  `-1029 + count - secIdx` = -1021..-1028 -> flat 253/254/255, LUT
-  rows 0..3, and the textured-fill cap.
-  Young taper `0x49b634`: {1.0,1.25,1.2,1.1,1.05,1.0} for slots<6,
-  then `1-(age-6)/(cap-6)` toward the missile pos.
+- Draw `FUN_0042ee74`: consecutive ring slots OLDEST->NEWEST from
+  the +0x20 read cursor -> section quads, composited into the
+  indexed framebuffer via `FUN_00412970`'s `dst = lut[row][dst]`.
+  Section s pairs walked slots s-1,s. Pens (OBSERVED 0x42f096,
+  `pen = 0xfffffbfb - ((0x26 + s - 1) - count)`):
+  the NEWEST eight sections (s >= count-8) get `count-s-1066`
+  = -1058..-1065 -> LUT rows 29-36; every older section gets -1054
+  -> LUT row 25. The earlier "-1021..-1028 oldest-section" note was
+  wrong — disproven by the 0x42f096 accumulator decode.
+  Young taper `0x49b634`: edge anchors spread toward the slot
+  centroid by t = {1.0,1.25,1.2,1.1,1.05,1.0} for the six NEWEST
+  slots (walked-age 0..5), then `1-(age-6)/(cap-6)` decay.
+- Port: `freefallSceneTrailComposite` bakes the veil into
+  `backdropFrame` after the backdrop pass (same relative order as
+  the original's object walk). Boundary caveat: the composite is
+  behind ALL 3D bodies — the original sorts trail sections at
+  their own depth, so a veil passing in FRONT of a farther body
+  would still hide under it (rare; trails sit below the camera).
 
 ## 5. Kind-5 launch FLARE (OBSERVED)
 
@@ -228,15 +239,28 @@ buffer, `dst = lutRow[dstPx]` destination remap):
 
 `obj+0x10c != 0` emits kind 1 keyed `obj.z - 1e-5` -> handler
 `0x410bf2`: PICK sprite (records bound via name `PICK` at 0x494ab4 ->
-0x4edb60/64/68/6c) scaled `projZ`-based through `0x46d680` at the
-projected pos. It is the pickup marker visual — not a missile radar.
-Missile approach warning in mode 2 = the kind-5 FLARE + the trail;
-there is no separate radar ring on missiles.
+0x4edb60/64/68/6c) through `0x403a40 -> 0x46d680` (center-pos,
+pen-0 transparent scaled blit) at the projected pos, gated z' > 0.
+
+Scale (OBSERVED `0x410c37-0x410c4c`): the handler computes
+`scale = trunc(viewW * 3.0 / (z' * zoom))` = `trunc(750/z')`
+(viewW 600, zoom 2.4), then `0x403a40` emits
+`outPx = srcPx * scale >> 8` per axis. The `0x494d30` constant is
+the exe's .rodata double **3.0** (`fmul qword`) — an earlier
+"runtime-patched" note read it as a zeroed dword and was wrong.
+Effective: the marker shows only inside z' < ~750/srcPx*256
+(PICK 64x64 -> visible for z' < 375; 1-5 px at typical distances).
+It is the pickup marker visual — not a missile radar. Missile
+approach warning in mode 2 = the kind-5 FLARE + the trail; there is
+no separate radar ring on missiles.
 
 ## 7. Remaining seams / open items
 
-- `0x46e940` (pen -1028 tail cap) — textured/shaded triangle fill;
-  exact shading source not yet decoded (single oldest section).
+- Trail depth ordering — the veil composites into `backdropFrame`,
+  so it always sits behind the 3D bodies; the original depth-sorts
+  trail sections inside the object walk (§4 boundary caveat).
+- `0x46e940` (pen -1028) — textured/shaded triangle fill path in
+  the negative-pen dispatch; no current trail section reaches it.
 - Windowed-path letterbox (`0x541548 != 0`, `0x49b578`) — not
   exercised by the 600x360 presentation; documented, not ported.
 - The keyframe color ramp is exe data; reproduced as constants.

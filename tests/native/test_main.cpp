@@ -22074,6 +22074,431 @@ void test_freefall_backdrop() {
 }
 
 // ---------------------------------------------------------------------------
+// ZOOM record format — INDEPENDENT fixture. The byte stream below is
+// hand-declared with its expected rows; nothing in this test reuses
+// the production row walk (freefallZoomParseTable is a black box
+// under test here). Verified real contract (FALL3D.BNI): u32 size-4
+// prefix, then 180 rows of {u32 a, u8 sa[a*4], u32 b, u32 c,
+// u8 sc[c*4]}, each row summing to exactly 150 quads.
+// ---------------------------------------------------------------------------
+
+void test_freefall_zoom_format() {
+  using mdk::freefallZoomParseTable;
+  using Row = mdk::FreefallScene::BackdropSpanRow;
+
+  auto u32le = [](std::vector<std::uint8_t>& v, std::uint32_t x) {
+    v.push_back(std::uint8_t(x & 0xff));
+    v.push_back(std::uint8_t((x >> 8) & 0xff));
+    v.push_back(std::uint8_t((x >> 16) & 0xff));
+    v.push_back(std::uint8_t((x >> 24) & 0xff));
+  };
+  struct Recipe {
+    std::uint32_t a, b, c;
+    std::uint8_t sa, sc;
+  };
+  auto emit = [&](std::vector<std::uint8_t>& v, const Recipe& r) {
+    u32le(v, r.a);
+    for (std::uint32_t i = 0; i < r.a * 4; ++i) v.push_back(r.sa);
+    u32le(v, r.b);
+    u32le(v, r.c);
+    for (std::uint32_t i = 0; i < r.c * 4; ++i) v.push_back(r.sc);
+  };
+
+  // -- valid table ---------------------------------------------------
+  // Four row recipes cycle through the 180 rows; covers all-shaded,
+  // all-raw, half/half, and the three-phase mix.
+  const Recipe kRec[4] = {
+      {150u, 0u, 0u, 0x11, 0x00},
+      {0u, 150u, 0u, 0x00, 0x00},
+      {75u, 75u, 0u, 0x22, 0x00},
+      {50u, 50u, 50u, 0x33, 0x44},
+  };
+  std::vector<std::uint8_t> rec;
+  u32le(rec, 0);                     // size-4 prefix (patched below)
+  for (int r = 0; r < 180; ++r) emit(rec, kRec[r & 3]);
+  const std::uint32_t sz = static_cast<std::uint32_t>(rec.size() - 4);
+  rec[0] = std::uint8_t(sz & 0xff);
+  rec[1] = std::uint8_t((sz >> 8) & 0xff);
+  rec[2] = std::uint8_t((sz >> 16) & 0xff);
+  rec[3] = std::uint8_t((sz >> 24) & 0xff);
+
+  std::vector<Row> rows;
+  CHECK(freefallZoomParseTable(rec, &rows));
+  CHECK(rows.size() == 180u);
+  for (int r = 0; r < 180; ++r) {
+    const Recipe& e = kRec[r & 3];
+    CHECK(rows[std::size_t(r)].a == e.a);
+    CHECK(rows[std::size_t(r)].b == e.b);
+    CHECK(rows[std::size_t(r)].c == e.c);
+    CHECK(rows[std::size_t(r)].sa.size() == e.a * 4);
+    CHECK(rows[std::size_t(r)].sc.size() == e.c * 4);
+    for (std::uint32_t i = 0; i < e.a * 4; ++i)
+      CHECK(rows[std::size_t(r)].sa[i] == e.sa);
+    for (std::uint32_t i = 0; i < e.c * 4; ++i)
+      CHECK(rows[std::size_t(r)].sc[i] == e.sc);
+  }
+
+  // -- the +8 offset bug is caught -----------------------------------
+  // The old loader skipped EIGHT bytes, treating row 0's cntA as a
+  // padding word. Proof both directions:
+  //   (a) a record that CARRIES a bogus second header word fails —
+  //       the +4 parse reads it as cntA and desyncs;
+  //   (b) the correct parse reads row 0 verbatim (asserted above —
+  //       under a +8 read, byte 4..7's cntA would land as shade data
+  //       and the sa bytes would become the count; 0x11 bytes ->
+  //       cntA = 0x11111111 -> instant bounds failure).
+  {
+    std::vector<std::uint8_t> padded;
+    u32le(padded, sz);              // real size-4
+    u32le(padded, 0);               // the phantom second header word
+    for (int r = 0; r < 180; ++r) emit(padded, kRec[r & 3]);
+    std::vector<Row> bad;
+    CHECK(!freefallZoomParseTable(padded, &bad));
+    CHECK(bad.empty());
+  }
+  // And the parse must start at +4 — record 0's cntA sits at byte 4.
+  // A stream whose row 0 a=2 has shades {3,3,3,3, 5,5,5,5}: the +8
+  // read would take 0x05050505 as cntA. Asserted fields above hold
+  // ONLY under the +4 read; make it explicit with a tiny table:
+  {
+    std::vector<std::uint8_t> t;
+    u32le(t, 0);                    // prefix
+    // 179 normal rows first, then a crafted row 0 LAST is wrong —
+    // rows are sequential; build: prefix, ROW0 special, 179 normal.
+    t.clear();
+    u32le(t, 0);
+    // Row 0: a=2, sa = {1,2,3,4,5,6,7,8}, b=148, c=0.
+    u32le(t, 2u);
+    for (int i = 1; i <= 8; ++i) t.push_back(std::uint8_t(i));
+    u32le(t, 148u);
+    u32le(t, 0u);
+    for (int r = 1; r < 180; ++r) emit(t, {150u, 0u, 0u, 0x00, 0x00});
+    const std::uint32_t tsz = static_cast<std::uint32_t>(t.size() - 4);
+    t[0] = std::uint8_t(tsz & 0xff);
+    t[1] = std::uint8_t((tsz >> 8) & 0xff);
+    t[2] = std::uint8_t((tsz >> 16) & 0xff);
+    t[3] = std::uint8_t((tsz >> 24) & 0xff);
+    std::vector<Row> rr;
+    CHECK(freefallZoomParseTable(t, &rr));
+    CHECK(rr.size() == 180u);
+    CHECK(rr[0].a == 2u && rr[0].b == 148u && rr[0].c == 0u);
+    CHECK(rr[0].sa.size() == 8u);
+    for (int i = 0; i < 8; ++i)
+      CHECK(rr[0].sa[std::size_t(i)] == std::uint8_t(i + 1));
+    // Under +8, rr[0].a would have been 0x06050403 — the byte-exact
+    // assertions above are the regression proof.
+  }
+
+  // -- malformed / truncated ------------------------------------------
+  auto expectReject = [&](std::vector<std::uint8_t> v,
+                          const char* why) {
+    std::vector<Row> bad;
+    bad.push_back(Row{});           // pre-fill: reject must clear
+    if (freefallZoomParseTable(v, &bad)) {
+      printf("  accepted malformed table: %s\n", why);
+      CHECK(false);
+    }
+    CHECK(bad.empty());
+  };
+  // Truncated mid-row (cut inside row 7's shade run).
+  expectReject(std::vector<std::uint8_t>(rec.begin(),
+                                         rec.begin() + 700),
+               "mid-row truncation");
+  // Only 179 rows.
+  {
+    std::vector<std::uint8_t> t;
+    u32le(t, 0);
+    for (int r = 0; r < 179; ++r) emit(t, {150u, 0u, 0u, 0x00, 0x00});
+    expectReject(t, "179 rows only");
+  }
+  // Row sum 149 (short) and 151 (overflow).
+  {
+    std::vector<std::uint8_t> t;
+    u32le(t, 0);
+    emit(t, {149u, 0u, 0u, 0x00, 0x00});
+    for (int r = 1; r < 180; ++r) emit(t, {150u, 0u, 0u, 0x00, 0x00});
+    expectReject(t, "row sum 149");
+  }
+  {
+    std::vector<std::uint8_t> t;
+    u32le(t, 0);
+    emit(t, {100u, 0u, 51u, 0x00, 0x00});
+    for (int r = 1; r < 180; ++r) emit(t, {150u, 0u, 0u, 0x00, 0x00});
+    expectReject(t, "row sum 151");
+  }
+  // Trailing garbage after the last row (p must land exactly on end).
+  {
+    std::vector<std::uint8_t> t = rec;
+    t.push_back(0xaa);
+    expectReject(t, "trailing byte");
+  }
+  // Prefix too short / empty.
+  expectReject({0x01, 0x02}, "shorter than the prefix");
+  expectReject({}, "empty record");
+  // cntA beyond the record end.
+  {
+    std::vector<std::uint8_t> t;
+    u32le(t, 0);
+    u32le(t, 140u);                 // a=140 -> needs 560 shade bytes
+    for (int i = 0; i < 100; ++i) t.push_back(0x00);
+    expectReject(t, "cntA overruns record");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The trail veil — freefallSceneTrailComposite's indexed compositor.
+// The expected frame is produced by an INDEPENDENT coverage model:
+// the same documented contract (projection, taper, pen->row, the
+// dst = lut[row][dst] op) re-derived here; boundary pixels within
+// 0.6px of a quad edge are left unasserted (rasterization is free to
+// split those either way).
+// ---------------------------------------------------------------------------
+
+void test_freefall_trail_composite() {
+  using mdk::FreefallScene;
+  using mdk::freefallSceneTrailComposite;
+
+  FreefallScene s;
+  s.lut.assign(384 * 256, 0);
+  // Distinguishing transform: dst' = (dst + 7*row) & 0xff — each
+  // row's remap is uniquely readable (and non-identity on every
+  // background index).
+  for (int r = 0; r < 384; ++r)
+    for (int c = 0; c < 256; ++c)
+      s.lut[std::size_t(r) * 256 + c] =
+          std::uint8_t((c + 7 * r) & 0xff);
+  s.lutOk = true;
+  s.backdropFrame.assign(600 * 360, 0);
+  for (std::size_t i = 0; i < s.backdropFrame.size(); ++i)
+    s.backdropFrame[i] = std::uint8_t(i & 0xff);   // varied background
+
+  auto& t = s.twins[7];
+  t.bound = true;
+  auto& tr = t.trail;
+  tr.anchors = 2;
+  // Ring: count=14, read cursor at slot 30 (mod-32 wrap exercised).
+  // Walk-oldest slot s sits at px = -160 + 22*s, anchor pair
+  // (px-4,-2,z) / (px+4,+2,z); the two OLDEST slots (s=0,1) sit at
+  // pz=5200 > camZ — behind the near bound — so sections touching
+  // them must not draw.
+  tr.count = 14;
+  tr.read = 30;
+  const float camX = 0.0f, camY = 0.0f, camZ = 5000.0f;
+  for (int i = 0; i < tr.count; ++i) {
+    const int k = (tr.read + i) & 31;
+    const float px = -160.0f + 22.0f * i;
+    const float pz = (i < 2) ? 5200.0f : 4500.0f;
+    tr.pts[k][0][0] = px - 4.0f; tr.pts[k][0][1] = -2.0f;
+    tr.pts[k][0][2] = pz;
+    tr.pts[k][1][0] = px + 4.0f; tr.pts[k][1][1] = 2.0f;
+    tr.pts[k][1][2] = pz;
+  }
+
+  // -- independent coverage model ------------------------------------
+  // Re-derives the documented contract (projection, taper, walk
+  // order, pen->row, dst = lut[row][dst]) and rasterizes the quads
+  // with the same e>=0 half-edge rule the contract specifies, so the
+  // expected frame is computable pixel-for-pixel. FP determinism is
+  // relied on: identical formula, identical inputs.
+  constexpr float kScaleX = 1.0f / (2.4f * 0.5f);
+  constexpr float kScaleY = 1.0f / (2.4f * 0.3f);
+  constexpr float kXDiv = 600.0f * 0.4999f;
+  constexpr float kYDiv = 360.0f * 0.5011f;
+  constexpr float kBias = 0.05f;
+  constexpr float kNear = 0.05f;
+  constexpr float kHeadRamp[6] =
+      {1.0f, 1.25f, 1.2f, 1.1f, 1.05f, 1.0f};
+  struct P2 { float x, y; bool on; };
+  auto proj = [&](float px, float py, float pz) -> P2 {
+    const float zp = camZ - pz;
+    if (zp <= kNear) return {0, 0, false};
+    const float xp = kScaleX * (px - camX);
+    const float yp = kScaleY * (camY - py);
+    return {float((xp + zp) / zp * kXDiv + kBias),
+            float((yp + zp) / zp * kYDiv + kBias), true};
+  };
+  std::vector<std::uint8_t> expect = s.backdropFrame;
+  auto edge = [](const P2& u, const P2& v, float x, float y) {
+    return (x - u.x) * (v.y - u.y) - (y - u.y) * (v.x - u.x);
+  };
+  P2 pl{0, 0, false}, pr{0, 0, false};
+  int sectionsDrawn = 0;
+  for (int sw = 0; sw < tr.count; ++sw) {
+    const int k = (tr.read + sw) & 31;
+    const int age = tr.count - 1 - sw;
+    const float tt =
+        age < 6 ? kHeadRamp[age]
+                : std::max(0.0f, 1.0f - float(age - 6) /
+                                        float(32 - 6));
+    const float* l = tr.pts[k][0];
+    const float* r = tr.pts[k][1];
+    const float cx = (l[0] + r[0]) * 0.5f;
+    const float cy = (l[1] + r[1]) * 0.5f;
+    const float cz = (l[2] + r[2]) * 0.5f;
+    const P2 ql = proj(cx + (l[0] - cx) * tt, cy + (l[1] - cy) * tt,
+                       cz + (l[2] - cz) * tt);
+    const P2 qr = proj(cx + (r[0] - cx) * tt, cy + (r[1] - cy) * tt,
+                       cz + (r[2] - cz) * tt);
+    if (sw > 0 && pl.on && pr.on && ql.on && qr.on) {
+      const int pen = mdk::freefallTrailSectionPen(tr.count, sw);
+      const int row = pen < -1028 ? -1029 - pen : -1;
+      if (row >= 0) {
+        ++sectionsDrawn;
+        const P2 tri[2][3] = {{pl, pr, qr}, {pl, qr, ql}};
+        for (const auto& t3 : tri) {
+          const float area = edge(t3[0], t3[1], t3[2].x, t3[2].y);
+          if (std::fabs(area) < 1e-9f) continue;
+          const float sgn = area > 0 ? 1.0f : -1.0f;
+          const int minX = std::max(0, int(std::floor(
+              std::min({t3[0].x, t3[1].x, t3[2].x}))));
+          const int maxX = std::min(599, int(std::ceil(
+              std::max({t3[0].x, t3[1].x, t3[2].x}))));
+          const int minY = std::max(0, int(std::floor(
+              std::min({t3[0].y, t3[1].y, t3[2].y}))));
+          const int maxY = std::min(359, int(std::ceil(
+              std::max({t3[0].y, t3[1].y, t3[2].y}))));
+          for (int yy = minY; yy <= maxY; ++yy) {
+            for (int xx = minX; xx <= maxX; ++xx) {
+              const float fx = xx + 0.5f;
+              const float fy = yy + 0.5f;
+              if (edge(t3[0], t3[1], fx, fy) * sgn < 0.0f ||
+                  edge(t3[1], t3[2], fx, fy) * sgn < 0.0f ||
+                  edge(t3[2], t3[0], fx, fy) * sgn < 0.0f) {
+                continue;
+              }
+              std::size_t i = std::size_t(yy) * 600 + xx;
+              expect[i] = s.lut[std::size_t(row) * 256 + expect[i]];
+            }
+          }
+        }
+      }
+    }
+    pl = ql;
+    pr = qr;
+  }
+  // 13 sections walked; slots 0/1 sit behind camZ so sections 1,2
+  // (touching them) skip -> 11 drawn.
+  CHECK(sectionsDrawn == 11);
+
+  freefallSceneTrailComposite(s, camX, camY, camZ);
+
+  int covered = 0, mismatched = 0;
+  for (std::size_t i = 0; i < expect.size(); ++i) {
+    if (expect[i] != std::uint8_t(i & 0xff)) ++covered;
+    if (s.backdropFrame[i] != expect[i]) {
+      if (mismatched < 4) {
+        printf("  trail-mismatch @%zu: got %02x want %02x\n", i,
+               s.backdropFrame[i], expect[i]);
+      }
+      ++mismatched;
+    }
+  }
+  CHECK(mismatched == 0);
+  CHECK(covered > 200);            // a real ribbon, not a degenerate
+
+  // -- near-plane skip ------------------------------------------------
+  // Sections 1,2 touched the behind-camera slots — verify nothing
+  // marked in the far-left band they would have covered.
+  {
+    bool any = false;
+    for (int yy = 0; yy < 360 && !any; ++yy)
+      for (int xx = 0; xx < 60 && !any; ++xx)
+        if (s.backdropFrame[std::size_t(yy) * 600 + xx] !=
+            std::uint8_t((std::size_t(yy) * 600 + xx) & 0xff))
+          any = true;
+    CHECK(!any);
+  }
+
+  // -- lutOk=false is a clean no-op -----------------------------------
+  {
+    FreefallScene s2;
+    s2.backdropFrame.assign(600 * 360, 0x55);
+    s2.lutOk = false;
+    freefallSceneTrailComposite(s2, camX, camY, camZ);
+    CHECK(s2.backdropFrame[0] == 0x55 &&
+          s2.backdropFrame.back() == 0x55);
+  }
+
+  // -- pen -> row routing ---------------------------------------------
+  // count=4 ring: EVERY section is "newest" (count-8 = -4 < 1), so
+  // pens are 4-s-1066 = -1063/-1064/-1065 -> rows 34/35/36; the
+  // -1054 body pen only appears when count > 9 (asserted for the
+  // count-32 case in test_freefall_backdrop). LUT here is (c + row).
+  {
+    FreefallScene s3;
+    s3.lut.assign(384 * 256, 0);
+    for (int r = 0; r < 384; ++r)
+      for (int c = 0; c < 256; ++c)
+        s3.lut[std::size_t(r) * 256 + c] =
+            std::uint8_t((c + r) & 0xff);
+    s3.lutOk = true;
+    s3.backdropFrame.assign(600 * 360, 0x20);
+    auto& t3 = s3.twins[2];
+    t3.bound = true;
+    auto& tr3 = t3.trail;
+    tr3.anchors = 2;
+    tr3.count = 4;
+    tr3.read = 0;
+    // Widely spaced in x so sections don't overlap: projected px
+    // spacing ~ 0.833*70/500*299.94 ~ 35 px between slot centers.
+    for (int i = 0; i < 4; ++i) {
+      const float px = -105.0f + 70.0f * i;
+      tr3.pts[i][0][0] = px - 8.0f; tr3.pts[i][0][1] = -3.0f;
+      tr3.pts[i][0][2] = 4500.0f;
+      tr3.pts[i][1][0] = px + 8.0f; tr3.pts[i][1][1] = 3.0f;
+      tr3.pts[i][1][2] = 4500.0f;
+    }
+    freefallSceneTrailComposite(s3, camX, camY, camZ);
+    // Section 2 (pen 4-2-1066 = -1064, row 35): quad spans slots
+    // 1..2 — px -35..35 at z'=500 -> sx ~ 300.
+    const std::uint8_t c2 = s3.backdropFrame[180 * 600 + 300];
+    CHECK(c2 == std::uint8_t(0x20 + 35));
+    // Section 3 (pen -1065, row 36): slots 2..3 -> px 35..105 —
+    // center ~ (sx of px 70) = 341.9... probe x=342, y=180.
+    const std::uint8_t c3 = s3.backdropFrame[180 * 600 + 342];
+    CHECK(c3 == std::uint8_t(0x20 + 36));
+    // Section 1 (pen -1063, row 34): slots 0..1 — px -105..-35,
+    // center sx ~ (px -70 projected) ~ 265.
+    const std::uint8_t c1 = s3.backdropFrame[180 * 600 + 265];
+    CHECK(c1 == std::uint8_t(0x20 + 34));
+    // Far right of the ribbon: untouched.
+    CHECK(s3.backdropFrame[180 * 600 + 500] == 0x20);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// freefallSceneBackdropStatus — required-resource readiness. The
+// acceptance path reads `ready` + per-field flags, so a rejected
+// table names itself instead of producing a valid-looking black
+// frame.
+// ---------------------------------------------------------------------------
+
+void test_freefall_backdrop_status() {
+  mdk::FreefallScene s;
+  auto st = mdk::freefallSceneBackdropStatus(s);
+  CHECK(!st.ready && st.zoom == 0 && st.zoomMask == 0);
+  CHECK(!st.level && !st.pod && !st.lut && !st.palette);
+  CHECK(!st.flare4 && !st.pick);
+
+  // Partial: 15 of 16 tables parsed — ready must stay false and the
+  // mask must name the hole (the original binds all 16).
+  s.backdropOk = true;
+  s.lutOk = true;
+  std::vector<std::uint8_t> pod(64 * 1024, 1);
+  s.podPixels = pod;
+  s.zoomCount = 15;
+  for (int z = 0; z < 15; ++z) s.zoomOk[std::size_t(z)] = true;
+  st = mdk::freefallSceneBackdropStatus(s);
+  CHECK(!st.ready);
+  CHECK(st.zoom == 15 && st.zoomMask == 0x7fff);
+
+  s.zoomOk[15] = true;
+  s.zoomCount = 16;
+  st = mdk::freefallSceneBackdropStatus(s);
+  CHECK(st.ready && st.zoomMask == 0xffff);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 13B — freefall→traversal handoff coordinator.
 // ---------------------------------------------------------------------------
 
@@ -29878,6 +30303,9 @@ int main() {
   test_freefall_freelist();
   test_freefall_scene();
   test_freefall_backdrop();
+  test_freefall_zoom_format();
+  test_freefall_trail_composite();
+  test_freefall_backdrop_status();
   test_progression_handoff();
   test_progression_campaign();
   test_save_game();

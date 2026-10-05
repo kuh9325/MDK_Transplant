@@ -229,6 +229,10 @@ struct FreefallScene {
     std::uint32_t a = 0, b = 0, c = 0;
   };
   std::array<std::vector<BackdropSpanRow>, 16> zoomRows;
+  // Per-table parse validity — the 0x4edbf0 counter hits every table
+  // every 16 calls, so a single rejected record must not ride through
+  // as an empty (black) cycle. `zoomCount` counts the OK tables.
+  std::array<bool, 16> zoomOk{};
   int zoomCount = 0;
 
   // L%d_C000%d — the 8 pod-column chunk sprites drawn through
@@ -337,6 +341,22 @@ const FreefallScene::Twin::Trail* freefallSceneTrail(
 // count.
 int freefallTrailSectionPen(int count, int section);
 
+// One ZOOM%04d record -> parsed span rows (OBSERVED resource parse;
+// FUN_0046d780's three-phase row read). Record payload:
+//   {u32 size-4 prefix, then 180 rows of
+//    {u32 cntA, u8 shadesA[cntA*4], u32 cntB, u32 cntC,
+//     u8 shadesC[cntC*4]}}
+// The word AFTER the 4-byte prefix is row 0's cntA — there is no
+// second padding word (a +8 read desyncs the whole walk; the bug
+// that produced the all-black packaged backdrop). Validity: every
+// row's (cntA+cntB+cntC) covers EXACTLY 150 quads / 600 px, exactly
+// 180 rows parse, and the record is consumed to its last byte.
+// `rec` is the full record INCLUDING the prefix. Returns false on
+// any malformed/truncated/over-long layout and clears `rows`.
+bool freefallZoomParseTable(
+    std::span<const std::uint8_t> rec,
+    std::vector<FreefallScene::BackdropSpanRow>* rows);
+
 // FUN_00412530 — one backdrop frame. Integrates the scroll state
 // (0x4edc00 += 1/30 per rendered frame ~= seconds of descent —
 // dt-scaled here; 0x4edb5c chunk cycle +0.5/frame ~= 15/s;
@@ -352,6 +372,43 @@ int freefallTrailSectionPen(int count, int section);
 void freefallSceneBackdropStep(FreefallScene& s,
                                float camX, float camY, float camZ,
                                float dtSec = 1.0f / 30.0f);
+
+// Resource readiness for the backdrop path — every required record
+// resolved, not "the frame buffer exists". A rejected ZOOM table is
+// a hard miss (the original binds all 16 unconditionally), never a
+// silently-black backdrop.
+struct FreefallBackdropStatus {
+  bool palette = false;
+  bool level = false;      // LEVEL%d decoded
+  bool pod = false;        // POD%d decoded
+  bool lut = false;
+  int chunks = 0;          // L%d_C000%d decoded count (of 8)
+  int zoom = 0;            // ZOOM%04d parsed count (of 16)
+  int zoomMask = 0;        // per-table bitfield (bit z = ZOOM%04d ok)
+  bool flare4 = false;
+  bool pick = false;
+  bool ready = false;      // level && pod && lut && zoom == 16
+};
+FreefallBackdropStatus freefallSceneBackdropStatus(
+    const FreefallScene& s);
+
+// FUN_00412970 + FUN_0040c860's negative-pen dispatch — the trail's
+// indexed compositor. Walks each bound twin's trail ring OLDEST->
+// NEWEST (from the +0x20 read cursor), applies the OBSERVED head ramp
+// {1.0,1.25,1.2,1.1,1.05,1.0} + linear decay taper to each slot's
+// two world-space anchors, projects the tapered edge points through
+// the mode-2 folded view (x' = scaleX*(px-cx), y' = scaleY*(cy-py),
+// z' = cz-pz; sx = (x'+z')/z'*W*0.4999 + 0.05, sy likewise at
+// H*0.5011 — the same divisors the snapshot camera is built from),
+// and fills each section quad with the pen's OBSERVED operation:
+//   dst = lut[row*256 + dst]   (row = -1029 - pen for pens < -1028:
+//   -1054 -> 25, -1058..-1065 -> 29..36)
+// — the indexed destination remap, NOT an alpha overlay. Runs after
+// freefallSceneBackdropStep so trails composite over the backdrop +
+// chunk pass in original draw order. z' <= 0.05 sections clip like
+// the projector's near bound.
+void freefallSceneTrailComposite(FreefallScene& s,
+                                 float camX, float camY, float camZ);
 
 // The CHUTE attachment prototype — the pickup's second kind-2 entry
 // renders this model under the SAME object basis (FUN_004109d8 emits

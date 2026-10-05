@@ -92,6 +92,9 @@ var ff_steer := false         # --ff-steer: scripted weave via real
                               # key events (production poll path)
 var ff_trace := false         # --ff-trace: hp/missile-distance log
 var ff_shot_pass := false     # --ff-shot-pass: --screenshot waits for a close missile approach
+var ff_dump_dir := ""         # --ff-dump-dir: consecutive-frame dump (game output only)
+var ff_dump_every := 1        # --ff-dump-every N: capture every Nth rendered frame
+var _ff_dump_count := 0
 var _shot_pass_lo := -160.0   # --shot-pass-window LO HI: dz trigger window
 var _shot_pass_hi := -25.0
 var _ff_held := {}            # synthetic key state for --ff-steer
@@ -104,7 +107,7 @@ var freefall := false        # --freefall launcher flag
 var ff_materials := {}       # "m:<name>" / "pen:<n>" -> StandardMaterial3D
 var ff_palette := PackedByteArray()  # FALLP_<c+1> bytes (768)
 var ff_handoff_seen := false # printed the mode transition once
-var ff_trail_mat: StandardMaterial3D = null
+var _ff_backdrop_warned := 0 # one-shot NOT-READY resource report
 var ff_backdrop: MeshInstance3D = null  # camera-locked backdrop quad
 var ff_backdrop_img: Image = null
 var ff_backdrop_tex: ImageTexture = null
@@ -113,6 +116,7 @@ var ff_flare_px := PackedByteArray()    # FLARE4 indexed pixels
 var ff_flare_wh := Vector2i.ZERO
 var ff_flare_tex := {}                  # count 1..8 -> ImageTexture
 var ff_pick_tex: ImageTexture = null    # kind-1 PICK sprite
+var ff_pick_wh := Vector2i.ZERO         # PICK src dims (for 0x46d680 scale)
 const FF_VEIL_ALPHA := 90.0 / 256.0     # bank-0 LUT strength
 
 # Phase 19B.1 — mode-5 intermission presentation. The StreamScene
@@ -505,6 +509,8 @@ func _ready() -> void:
 	ff_steer = "--ff-steer" in args
 	ff_trace = "--ff-trace" in args
 	ff_shot_pass = "--ff-shot-pass" in args
+	ff_dump_dir = _arg_value(args, "--ff-dump-dir", "")
+	ff_dump_every = maxi(1, int(_arg_value(args, "--ff-dump-every", "1")))
 	var spw := _arg_value(args, "--shot-pass-window", "")
 	if not spw.is_empty():
 		var parts := spw.split(",")
@@ -2321,6 +2327,26 @@ func _ff_backdrop_frame(ff: Dictionary) -> void:
 	var bdf: Dictionary = bridge.get_freefall_backdrop_frame()
 	if bdf.is_empty():
 		return
+	# Required-resource readiness — a rejected ZOOM table or missing
+	# LEVEL/POD must never pass as a valid all-black backdrop.
+	if not bool(bdf.get("ready", false)):
+		if _ff_backdrop_warned == 0:
+			_ff_backdrop_warned += 1
+			print("ff-backdrop NOT READY zoom=%s/16 mask=%s " %
+					[bdf.get("zoom_count", -1),
+					 bdf.get("zoom_mask", -1)] +
+					"level=%s pod=%s lut=%s pal=%s chunks=%s " %
+					[bdf.get("res_level", false),
+					 bdf.get("res_pod", false),
+					 bdf.get("res_lut", false),
+					 bdf.get("res_palette", false),
+					 bdf.get("res_chunks", -1)] +
+					"flare4=%s pick=%s" %
+					[bdf.get("res_flare4", false),
+					 bdf.get("res_pick", false)])
+		if ff_backdrop != null:
+			ff_backdrop.visible = false
+		return
 	if ff_key_colors.is_empty():
 		ff_key_colors = bdf["key_colors"]
 	var w := int(bdf["w"])
@@ -2344,107 +2370,13 @@ func _ff_backdrop_frame(ff: Dictionary) -> void:
 	ff_backdrop.visible = true
 
 
-# The veil color a dst = LUT[row][dst] remap converges toward —
-# the keyframe ramp color, blended at the bank-0 strength
-# (90/256; OBSERVED FUN_00406d84 row build + 0x42b8c0 init).
-func _ff_veil_color(row: int) -> Color:
-	row = clampi(row, 0, 63)
-	if ff_key_colors.size() >= 192:
-		return Color(ff_key_colors[row * 3] / 255.0,
-			ff_key_colors[row * 3 + 1] / 255.0,
-			ff_key_colors[row * 3 + 2] / 255.0, FF_VEIL_ALPHA)
-	return Color(0.85, 0.87, 0.9, FF_VEIL_ALPHA)
-
-
-func _ff_flat_pen_color(idx: int) -> Color:
-	idx = clampi(idx, 0, 255)
-	if ff_palette.size() == 768:
-		return Color(ff_palette[idx * 3] / 255.0,
-			ff_palette[idx * 3 + 1] / 255.0,
-			ff_palette[idx * 3 + 2] / 255.0, 1.0)
-	return Color(0.9, 0.9, 0.9, 1.0)
-
-
-# Pen -> draw class (OBSERVED FUN_0040c860): < -1028 = LUT row
-# (-1029-pen); -1027..-1024 = LUT rows 0..3; -1028 = the textured
-# fill (unresolved shading — approximated as the brightest LUT
-# veil); -1023..-1011 = flat palette colors 255..243; -1010..-990 =
-# the 0x47a770 family (approximated like -1028); -255..-1 = flat
-# -pen & 0xff. Mode-2 trails emit only the LUT classes.
-func _ff_trail_pen_color(pen: int) -> Color:
-	if pen < -1028:
-		return _ff_veil_color(-1029 - pen)
-	if pen >= -1027 and pen <= -1024:
-		return _ff_veil_color(-1024 - pen)
-	if pen >= -1023 and pen <= -1011:
-		return _ff_flat_pen_color((-pen) & 0xff)
-	if pen < 0:
-		if pen == -1028 or (pen >= -1010 and pen <= -990):
-			return _ff_veil_color(0)   # HYPOTHESIS fallback rows
-		return _ff_flat_pen_color((-pen) & 0xff)
-	return _ff_flat_pen_color(pen & 0xff)
-
-
-func _ff_trail_material() -> StandardMaterial3D:
-	if ff_trail_mat == null:
-		var m := StandardMaterial3D.new()
-		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-		m.cull_mode = BaseMaterial3D.CULL_DISABLED
-		m.vertex_color_use_as_albedo = true
-		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		# The original fills the ribbon through the pen->LUT row
-		# remap — a destination veil, not a smoke overlay; the per-
-		# section vertex colors carry the pen's veil color/alpha.
-		m.albedo_color = Color(1.0, 1.0, 1.0, 1.0)
-		ff_trail_mat = m
-	return ff_trail_mat
-
-
-func _ff_apply_trail(node: Node3D, o: Dictionary) -> void:
-	# Kind-4 — the bridge emits per-slot edge pairs in the original
-	# draw order (oldest -> newest from the +0x20 read cursor);
-	# section s pairs slots s-1,s and carries pen `pens[s-1]`.
-	var tr: Dictionary = o.get("trail", {})
-	var mi: MeshInstance3D = node.get_node_or_null("Trail")
-	if tr.is_empty() or int(tr.get("count", 0)) < 2:
-		if mi != null:
-			mi.visible = false
-		return
-	if mi == null:
-		mi = MeshInstance3D.new()
-		mi.name = "Trail"
-		mi.material_override = _ff_trail_material()
-		mi.mesh = ImmediateMesh.new()
-		node.add_child(mi)
-		# Edges are already world-space; top_level preserves the
-		# inherited parent transform, so force it back to identity
-		# or the ribbon gets the missile pose applied twice.
-		mi.top_level = true
-		mi.global_transform = Transform3D.IDENTITY
-	mi.visible = true
-	var mesh: ImmediateMesh = mi.mesh
-	var edges: PackedVector3Array = tr["edges"]
-	var pens: PackedInt32Array = tr.get("pens", PackedInt32Array())
-	var n: int = min(int(tr["count"]), edges.size() / 2)
-	mesh.clear_surfaces()
-	if n < 2:
-		return
-	mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
-	for j in n - 1:
-		var l0: Vector3 = edges[j * 2]
-		var r0: Vector3 = edges[j * 2 + 1]
-		var l1: Vector3 = edges[j * 2 + 2]
-		var r1: Vector3 = edges[j * 2 + 3]
-		var c: Color = _ff_trail_pen_color(
-			int(pens[j]) if j < pens.size() else -1054)
-		mesh.surface_set_color(c)
-		mesh.surface_add_vertex(l0)
-		mesh.surface_add_vertex(r0)
-		mesh.surface_add_vertex(l1)
-		mesh.surface_add_vertex(r0)
-		mesh.surface_add_vertex(r1)
-		mesh.surface_add_vertex(l1)
-	mesh.surface_end()
+# Kind-4 — the missile trail is composited in index space by the
+# core's freefallSceneTrailComposite (dst = lut[row*256 + dst] per
+# FUN_00412970/FUN_0040c860) into the backdrop frame BEFORE upload —
+# the exact indexed destination remap, not a color/alpha overlay.
+# The Godot-side ribbon (ImmediateMesh + keyColors@90/256) was the
+# approximation it replaces; o["trail"] still feeds --ff-trace
+# diagnostics (ring count / pen stream).
 
 
 # Kind-5 — the launch FLARE. FLARE4's pixels (0..8) index the LUT
@@ -2523,15 +2455,31 @@ func _ff_apply_flare(node: Node3D, o: Dictionary) -> void:
 	mi.visible = true
 
 
-# Kind-1 — the +0x10c marker: the PICK sprite drawn scaled at the
-# object's projected pos (OBSERVED 0x410bf2 -> 0x46d680). The exact
-# screen-scale constant (0x494d30) is runtime-patched in BUILD_A —
-# the port presents a world-space disc at the object position;
-# footprint size HYPOTHESIS (~ the pickup's visible span).
-func _ff_apply_marker(node: Node3D, o: Dictionary) -> void:
+# Kind-1 — the +0x10c marker: the PICK sprite through 0x46d680's
+# center-pos scaled blit (OBSERVED 0x410bf2):
+#   scale = trunc(viewW*3.0 / (z'*zoom)) = trunc(750/z')   [z' = camZ - pz,
+#           the raw M2 row2 (0,0,-1) view depth; gate z' > 0]
+#   outPx = srcPx * scale >> 8                            [0x403a40]
+# The constant sits in the exe image as double 3.0 at 0x494d30 —
+# fmul QWORD, not the zeroed dword the earlier static read saw.
+# Presented as a billboard quad sized so it projects to outPx
+# pixels — same world-per-pixel convention the FLARE quad uses.
+func _ff_apply_marker(node: Node3D, o: Dictionary, ff: Dictionary) -> void:
 	var mi: MeshInstance3D = node.get_node_or_null("Marker")
-	if not bool(o.get("marker", false)) or ff_pick_tex == null or \
-			not bool(o.get("presented", false)):
+	var pm: Vector3 = o.get("pos_mdk", Vector3.ZERO)
+	var zp := float(ff["camera_pos_mdk"].z) - pm.z
+	var shown := bool(o.get("marker", false)) and \
+		ff_pick_tex != null and bool(o.get("presented", false)) and \
+		zp > 0.0 and ff_pick_wh.x > 0
+	var sc := 0
+	var ox := 0
+	var oy := 0
+	if shown:
+		sc = int(750.0 / zp)          # trunc(600*3.0/(z'*2.4))
+		ox = (ff_pick_wh.x * sc) >> 8
+		oy = (ff_pick_wh.y * sc) >> 8
+		shown = ox > 0 and oy > 0
+	if not shown:
 		if mi != null:
 			mi.visible = false
 		return
@@ -2550,8 +2498,12 @@ func _ff_apply_marker(node: Node3D, o: Dictionary) -> void:
 		mi.mesh = qm
 		mi.top_level = true
 		node.add_child(mi)
-	(mi.mesh as QuadMesh).size = Vector2(40.0, 40.0)
-	mi.global_position = node.transform.origin
+	var wp: Vector3 = node.transform.origin
+	var dist: float = $Camera3D.global_position.distance_to(wp)
+	var wpp: float = 2.0 * dist * tan(deg_to_rad($Camera3D.fov) * 0.5) \
+		/ 360.0
+	(mi.mesh as QuadMesh).size = Vector2(ox * wpp, oy * wpp)
+	mi.global_position = wp
 	mi.visible = true
 
 
@@ -2565,6 +2517,7 @@ func _ff_sprites_load() -> void:
 		var s: Dictionary = d["pick"]
 		var w := int(s["w"])
 		var h := int(s["h"])
+		ff_pick_wh = Vector2i(w, h)
 		var px: PackedByteArray = s["pixels"]
 		var rgba := PackedByteArray()
 		rgba.resize(w * h * 4)
@@ -2659,12 +2612,12 @@ func _apply_freefall() -> void:
 				node.set_meta("geom_key", gkey)
 			# Core-authoritative world basis — +0xac verbatim.
 			node.transform = o["transform"]
-		# Kind-4 — the missile trail ring (world-space edges).
-		_ff_apply_trail(node, o)
+		# Kind-4 — the trail veil is baked into the backdrop frame
+		# (freefallSceneTrailComposite), not a 3D ribbon.
 		# Kind-5 — the launch FLARE4 veil quad (obj+0x108 gate).
 		_ff_apply_flare(node, o)
 		# Kind-1 — the +0x10c PICK marker (pickups).
-		_ff_apply_marker(node, o)
+		_ff_apply_marker(node, o, ff)
 		# +0x306 — the chute attachment: a second kind-2 entry under
 		# the object's own basis while the flag is set.
 		var chute: MeshInstance3D = node.get_node_or_null("Chute")
@@ -3812,6 +3765,17 @@ func _process(delta: float) -> void:
 		# Extension missing — _ready already quit(1); quit() still
 		# pumps one more iteration before the engine exits.
 		return
+	# --ff-dump-dir DIR + --ff-dump-every N: consecutive-frame game-
+	# output capture (viewport texture only — no OS window pixels).
+	if not ff_dump_dir.is_empty():
+		if _ff_dump_count % ff_dump_every == 0:
+			var vt := get_viewport().get_texture()
+			if vt != null:
+				var img := vt.get_image()
+				if img != null and not img.is_empty():
+					img.save_png(ff_dump_dir +
+						"/f%06d.png" % _ff_dump_count)
+		_ff_dump_count += 1
 	if shot_frames_left > 0:
 		shot_frames_left -= 1
 		if shot_frames_left == 0:

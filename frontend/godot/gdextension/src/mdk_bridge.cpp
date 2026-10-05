@@ -2833,6 +2833,13 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   mdk::freefallSceneBackdropStep(*ffScene_, ff_->cameraPos[0],
                                  ff_->cameraPos[1], ff_->cameraPos[2],
                                  timing_.deltaSec);
+  // The trail veil — FUN_00412970/FUN_0040c860's indexed op
+  // (dst = lut[row*256 + dst]) composited into the 600x360 frame
+  // before upload, in the same order the original's object walk
+  // runs it: after the backdrop pass, under the still-3D bodies.
+  mdk::freefallSceneTrailComposite(*ffScene_, ff_->cameraPos[0],
+                                   ff_->cameraPos[1],
+                                   ff_->cameraPos[2]);
   // 19C.3 — this frame's kFfEvSound batch into the shared voice
   // pool + the per-step mixer pass (events self-clear at the next
   // step, so the drain runs here, drain-once).
@@ -3244,13 +3251,29 @@ Dictionary MdkBridge::get_freefall_backdrop_frame() {
   out["chunk_y"] = double(dg.chunkY);
   out["chunk_w"] = double(dg.chunkW);
   out["chunk_h"] = double(dg.chunkH);
-  // The LUT's 64 keyframe row colors — what a dst=LUT[row][src]
-  // remap converges toward. The presenter approximates the veil as
-  // an alpha blend toward these (strength 90/256 for bank 0).
+  // The LUT's 64 keyframe row colors — kept for the kind-5 FLARE4
+  // texture expansion (the trail veil is now composited exactly in
+  // index space before upload).
   PackedByteArray keys;
   keys.resize(64 * 3);
   std::memcpy(keys.ptrw(), ffScene_->keyColors.data(), 64 * 3);
   out["key_colors"] = keys;
+  // Required-resource readiness — a rejected ZOOM record or missing
+  // LEVEL/POD must never ride through as a valid all-black frame.
+  // `ready` is the acceptance gate; the per-field flags name the
+  // failure for diagnostics.
+  const mdk::FreefallBackdropStatus st =
+      mdk::freefallSceneBackdropStatus(*ffScene_);
+  out["ready"] = st.ready;
+  out["res_palette"] = st.palette;
+  out["res_level"] = st.level;
+  out["res_pod"] = st.pod;
+  out["res_lut"] = st.lut;
+  out["res_chunks"] = int64_t(st.chunks);
+  out["zoom_count"] = int64_t(st.zoom);
+  out["zoom_mask"] = int64_t(st.zoomMask);
+  out["res_flare4"] = st.flare4;
+  out["res_pick"] = st.pick;
   return out;
 }
 

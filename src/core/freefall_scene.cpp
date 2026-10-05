@@ -339,50 +339,24 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
     }
   }
 
-  // ZOOM%4.4d — the 16 span tables (0x4edbb0[16]). Record payload:
-  // {u32 size-4, rows} where each of the 180 rows is
-  // {u32 cntA, u8 shadesA[cntA*4], u32 cntB, u32 cntC,
-  //  u8 shadesC[cntC*4]} and (cntA+cntB+cntC)*4 = 600 pixels
-  // (OBSERVED resource parse; FUN_0046d780's three-phase row read;
-  // all 16 tables consume the record exactly and every row sums to
-  // 150 quads — verified against FALL3D.BNI).
+  // ZOOM%4.4d — the 16 span tables (0x4edbb0[16]).
   out->zoomCount = 0;
+  out->zoomOk.fill(false);
   for (int z = 0; z < 16; ++z) {
     char zn[16];
     std::snprintf(zn, sizeof zn, "ZOOM%4.4d", z);
     const BniRecord* r = findBniRecord(out->bni, zn);
+    auto& rows = out->zoomRows[std::size_t(z)];
+    rows.clear();
     if (!r) continue;
     const auto* base =
         reinterpret_cast<const std::uint8_t*>(out->bniBytes.data());
-    const std::uint8_t* p = base + r->payloadFileOffset + 4;
-    const std::uint8_t* end = base + r->payloadEnd;
-    auto& rows = out->zoomRows[std::size_t(z)];
-    rows.clear();
-    bool ok = true;
-    for (int row = 0; row < 180 && p < end; ++row) {
-      FreefallScene::BackdropSpanRow sr;
-      auto rd32 = [&p, end]() -> std::uint32_t {
-        if (p + 4 > end) return 0;
-        std::uint32_t v;
-        std::memcpy(&v, p, 4);
-        p += 4;
-        return v;
-      };
-      sr.a = rd32();
-      if (sr.a > 150 || p + sr.a * 4 > end) { ok = false; break; }
-      sr.sa.assign(p, p + sr.a * 4);
-      p += sr.a * 4;
-      sr.b = rd32();
-      sr.c = rd32();
-      if (sr.a + sr.b + sr.c > 150 || p + sr.c * 4 > end) {
-        ok = false;
-        break;
-      }
-      sr.sc.assign(p, p + sr.c * 4);
-      p += sr.c * 4;
-      rows.push_back(std::move(sr));
-    }
-    if (ok && !rows.empty()) out->zoomCount = z + 1;
+    const std::span<const std::uint8_t> rec(
+        base + r->payloadFileOffset,
+        base + r->payloadEnd);
+    if (!freefallZoomParseTable(rec, &rows)) continue;
+    out->zoomOk[std::size_t(z)] = true;
+    ++out->zoomCount;
   }
 
   // FLARE4 / PICK — BNI sprite records {u16 w, u16 h, u8 px[w*h]}.
@@ -525,12 +499,60 @@ int freefallTrailSectionPen(int count, int section) {
   return section >= count - 8 ? count - section - 1066 : -1054;
 }
 
+bool freefallZoomParseTable(
+    std::span<const std::uint8_t> rec,
+    std::vector<FreefallScene::BackdropSpanRow>* rows) {
+  rows->clear();
+  const std::uint8_t* p = rec.data() + 4;   // the u32 size-4 prefix
+  const std::uint8_t* const end =
+      rec.data() + rec.size();
+  if (rec.size() < 4) return false;
+  bool ok = true;
+  for (int row = 0; row < 180 && p < end; ++row) {
+    FreefallScene::BackdropSpanRow sr;
+    auto rd32 = [&p, end]() -> std::uint32_t {
+      if (p + 4 > end) return 0;
+      std::uint32_t v;
+      std::memcpy(&v, p, 4);
+      p += 4;
+      return v;
+    };
+    sr.a = rd32();
+    if (sr.a > 150 || p + sr.a * 4 > end) { ok = false; break; }
+    sr.sa.assign(p, p + sr.a * 4);
+    p += sr.a * 4;
+    sr.b = rd32();
+    sr.c = rd32();
+    // Every real row covers EXACTLY 150 quads / 600 px — a short row
+    // is just as malformed as an overflowing one (verified: all 180
+    // rows x 16 tables in FALL3D.BNI sum exactly 150).
+    if (sr.a + sr.b + sr.c != 150 || p + sr.c * 4 > end) {
+      ok = false;
+      break;
+    }
+    sr.sc.assign(p, p + sr.c * 4);
+    p += sr.c * 4;
+    rows->push_back(std::move(sr));
+  }
+  // The table is only valid when all 180 rows parsed and the record
+  // was consumed to its last byte — a desynced walk must fail, not
+  // ride through as a black cycle.
+  if (!ok || rows->size() != 180 || p != end) {
+    rows->clear();
+    return false;
+  }
+  return true;
+}
+
 void freefallSceneBackdropStep(FreefallScene& s,
                                float camX, float camY, float camZ,
                                float dtSec) {
   auto& dg = s.backdropDiag;
   dg = FreefallScene::BackdropDiag{};
-  if (!s.backdropOk || s.zoomCount == 0 || !s.lutOk ||
+  // A rejected/absent ZOOM table is a hard miss — the original binds
+  // all 16 unconditionally, so anything less than a full set must not
+  // ride through as a valid all-black frame.
+  if (!s.backdropOk || s.zoomCount != 16 || !s.lutOk ||
       s.backdropFrame.size() < 600 * 360) {
     return;
   }
@@ -714,6 +736,156 @@ void freefallSceneBackdropStep(FreefallScene& s,
           }
         }
       }
+    }
+  }
+}
+
+FreefallBackdropStatus freefallSceneBackdropStatus(
+    const FreefallScene& s) {
+  FreefallBackdropStatus st;
+  st.palette = s.paletteOk;
+  st.level = s.backdropOk;
+  st.pod = !s.podPixels.empty();
+  st.lut = s.lutOk;
+  st.chunks = s.chunkCount;
+  st.zoom = s.zoomCount;
+  for (int z = 0; z < 16; ++z) {
+    if (s.zoomOk[std::size_t(z)]) st.zoomMask |= 1 << z;
+  }
+  st.flare4 = !s.flare4.px.empty();
+  st.pick = !s.pick.px.empty();
+  st.ready = st.level && st.pod && st.lut && st.zoom == 16;
+  return st;
+}
+
+void freefallSceneTrailComposite(FreefallScene& s,
+                               float camX, float camY, float camZ) {
+  if (!s.lutOk || s.lut.size() < 384 * 256 ||
+      s.backdropFrame.size() < 600 * 360) {
+    return;
+  }
+  // The mode-2 folded view — same constants get_freefall_snapshot
+  // builds the Godot camera from. Original view record (0x46b4f8
+  // input): right = +X, down = -Y, +viewdir = -Z_mdk (the raw M2
+  // row2); scaleX/Y folded into x'/y' rows.
+  constexpr float kZoom = 2.4f;          // 0x540b58 boot value
+  constexpr float kScaleX = 1.0f / (kZoom * 0.5f);
+  constexpr float kScaleY = 1.0f / (kZoom * 0.3f);
+  constexpr float kXDiv = 600.0f * 0.4999f;
+  constexpr float kYDiv = 360.0f * 0.5011f;
+  constexpr float kBias = 0.05f;
+  constexpr float kNear = 0.05f;
+  struct Pt { float x, y; bool on; };
+  auto project = [&](float px, float py, float pz) -> Pt {
+    const float zp = camZ - pz;
+    if (zp <= kNear) return {0.0f, 0.0f, false};
+    const float xp = kScaleX * (px - camX);
+    const float yp = kScaleY * (camY - py);
+    return {static_cast<float>((xp + zp) / zp * kXDiv + kBias),
+            static_cast<float>((yp + zp) / zp * kYDiv + kBias), true};
+  };
+
+  constexpr float kHeadRamp[6] =
+      {1.0f, 1.25f, 1.2f, 1.1f, 1.05f, 1.0f};   // 0x49b634
+  constexpr int cap = FreefallScene::Twin::kTrailCap;
+  std::uint8_t* fb = s.backdropFrame.data();
+  const std::uint8_t* lut = s.lut.data();
+
+  // One triangle of the screen-space quad, dst = lut[row*256+dst].
+  auto fillTri = [&](const Pt& a, const Pt& b, const Pt& c, int row) {
+    const std::uint8_t* lr = lut + std::size_t(row) * 256;
+    const int minX = std::max(0, static_cast<int>(
+        std::floor(std::min({a.x, b.x, c.x}))));
+    const int maxX = std::min(599, static_cast<int>(
+        std::ceil(std::max({a.x, b.x, c.x}))));
+    const int minY = std::max(0, static_cast<int>(
+        std::floor(std::min({a.y, b.y, c.y}))));
+    const int maxY = std::min(359, static_cast<int>(
+        std::ceil(std::max({a.y, b.y, c.y}))));
+    if (minX > maxX || minY > maxY) return;
+    const auto edge = [](const Pt& u, const Pt& v, float x, float y) {
+      return (x - u.x) * (v.y - u.y) - (y - u.y) * (v.x - u.x);
+    };
+    const float area = edge(a, b, c.x, c.y);
+    if (std::fabs(area) < 1e-9f) {
+      // Degenerate (line) quad — draw the edge segments so thin
+      // tails still mark, like the original's cap/edge coverage.
+      auto plot = [&](float x0, float y0, float x1, float y1) {
+        const int steps = std::max(1, static_cast<int>(std::ceil(
+            std::max(std::fabs(x1 - x0), std::fabs(y1 - y0)) * 2)));
+        for (int k = 0; k <= steps; ++k) {
+          const int xx = static_cast<int>(x0 + (x1 - x0) * k / steps);
+          const int yy = static_cast<int>(y0 + (y1 - y0) * k / steps);
+          if (xx >= 0 && xx < 600 && yy >= 0 && yy < 360) {
+            std::uint8_t* d = fb + yy * 600 + xx;
+            *d = lr[*d];
+          }
+        }
+      };
+      plot(a.x, a.y, b.x, b.y);
+      plot(b.x, b.y, c.x, c.y);
+      return;
+    }
+    const float s = area > 0 ? 1.0f : -1.0f;
+    for (int yy = minY; yy <= maxY; ++yy) {
+      for (int xx = minX; xx <= maxX; ++xx) {
+        const float fx = xx + 0.5f;
+        const float fy = yy + 0.5f;
+        if (edge(a, b, fx, fy) * s < 0.0f ||
+            edge(b, c, fx, fy) * s < 0.0f ||
+            edge(c, a, fx, fy) * s < 0.0f) {
+          continue;
+        }
+        std::uint8_t* d = fb + yy * 600 + xx;
+        *d = lr[*d];
+      }
+    }
+  };
+
+  for (const FreefallScene::Twin& t : s.twins) {
+    const FreefallScene::Twin::Trail& tr = t.trail;
+    if (!t.bound || tr.count < 2 || tr.anchors < 2) continue;
+    // Walked oldest->newest from the +0x20 read cursor; per-slot the
+    // drawn edge tapers toward the centroid with t = headRamp[age]
+    // for the newest six then the linear decay (OBSERVED
+    // FUN_0042ee74's factor walk).
+    Pt prevL{0, 0, false}, prevR{0, 0, false};
+    for (int sw = 0; sw < tr.count; ++sw) {
+      const int k = (tr.read + sw) & (cap - 1);
+      const int age = tr.count - 1 - sw;
+      const float tt =
+          age < 6 ? kHeadRamp[age]
+                  : std::max(0.0f, 1.0f - float(age - 6) /
+                                          float(cap - 6));
+      const float* l = tr.pts[k][0];
+      const float* r = tr.pts[k][1];
+      const float cx = (l[0] + r[0]) * 0.5f;
+      const float cy = (l[1] + r[1]) * 0.5f;
+      const float cz = (l[2] + r[2]) * 0.5f;
+      const Pt pl = project(cx + (l[0] - cx) * tt,
+                            cy + (l[1] - cy) * tt,
+                            cz + (l[2] - cz) * tt);
+      const Pt pr = project(cx + (r[0] - cx) * tt,
+                            cy + (r[1] - cy) * tt,
+                            cz + (r[2] - cz) * tt);
+      if (sw > 0 && prevL.on && prevR.on && pl.on && pr.on) {
+        // Section quad {prevL, prevR, pr, pl}; the pen is per
+        // SECTION (walk index sw pairing slots sw-1, sw).
+        const int pen = freefallTrailSectionPen(tr.count, sw);
+        if (pen < -1028) {
+          const int row = -1029 - pen;   // -1054->25, -1058..-1065->29..36
+          if (row >= 0 && std::size_t(row) * 256 + 255 < s.lut.size()) {
+            fillTri(prevL, prevR, pr, row);
+            fillTri(prevL, pr, pl, row);
+          }
+        }
+        // pen == -1028 (the textured tail cap) and pens
+        // -1027..-1024 / -1023..-1011 (flat rows / palette) do not
+        // appear in mode-2 trails: the observed walk emits only
+        // -1054 and -1058..-1065 — those map to LUT veil rows.
+      }
+      prevL = pl;
+      prevR = pr;
     }
   }
 }
