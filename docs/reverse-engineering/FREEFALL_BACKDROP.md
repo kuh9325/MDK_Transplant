@@ -80,9 +80,12 @@ with (cntA+cntB+cntC)*4 == 600 pixels.
 Phase A/C pixels are LUT-remapped per-pixel shade byte; phase B raw.
 ```
 
-Verified parses: ZOOM0000, ZOOM0007, ZOOM0015 — all end exactly at
-record end; shade bytes range 1..8. 16 tables cycled one per frame =
-temporal dither of the shade pattern.
+Verified parses: all 16 ZOOM0000-0015 — each is exactly 180 rows,
+every row sums cntA+cntB+cntC == 150 quads, and the walk consumes the
+record to the last byte (the u32 after `size-4` is row 0's cntA == 150
+for the all-shaded top row — NOT a second header field). Shade bytes
+range 1..8. 16 tables cycled one per frame = temporal dither of the
+shade pattern.
 
 ### POD -> LEVEL seam wedge (OBSERVED)
 

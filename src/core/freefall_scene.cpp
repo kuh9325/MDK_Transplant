@@ -340,10 +340,12 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
   }
 
   // ZOOM%4.4d — the 16 span tables (0x4edbb0[16]). Record payload:
-  // {u32 size-4, u32 zero, rows} where each of the 180 rows is
+  // {u32 size-4, rows} where each of the 180 rows is
   // {u32 cntA, u8 shadesA[cntA*4], u32 cntB, u32 cntC,
   //  u8 shadesC[cntC*4]} and (cntA+cntB+cntC)*4 = 600 pixels
-  // (OBSERVED resource parse; FUN_0046d780's three-phase row read).
+  // (OBSERVED resource parse; FUN_0046d780's three-phase row read;
+  // all 16 tables consume the record exactly and every row sums to
+  // 150 quads — verified against FALL3D.BNI).
   out->zoomCount = 0;
   for (int z = 0; z < 16; ++z) {
     char zn[16];
@@ -352,7 +354,7 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
     if (!r) continue;
     const auto* base =
         reinterpret_cast<const std::uint8_t*>(out->bniBytes.data());
-    const std::uint8_t* p = base + r->payloadFileOffset + 8;
+    const std::uint8_t* p = base + r->payloadFileOffset + 4;
     const std::uint8_t* end = base + r->payloadEnd;
     auto& rows = out->zoomRows[std::size_t(z)];
     rows.clear();

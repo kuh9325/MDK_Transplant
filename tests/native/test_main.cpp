@@ -21695,8 +21695,9 @@ std::vector<std::uint8_t> ffSpriteRec(int w, int h, F px) {
   return rec;
 }
 
-// One ZOOM%04d span table: {u32 size-4, u32 0, 180 rows} where each
-// row is {u32 a, u8 sa[a*4], u32 b, u32 c, u8 sc[c*4]}.
+// One ZOOM%04d span table: {u32 size-4, 180 rows} where each row is
+// {u32 a, u8 sa[a*4], u32 b, u32 c, u8 sc[c*4]} — the OBSERVED real
+// record has no second header field (row 0's cntA sits at +4).
 std::vector<std::uint8_t> ffZoomRec(std::uint32_t a, std::uint8_t shade,
                                     std::uint32_t b, std::uint32_t c,
                                     std::uint8_t shadeC) {
@@ -21705,7 +21706,7 @@ std::vector<std::uint8_t> ffZoomRec(std::uint32_t a, std::uint8_t shade,
     for (int k = 0; k < 4; ++k)
       rec.push_back(std::uint8_t((v >> (k * 8)) & 0xff));
   };
-  w32(0); w32(0);    // header (size-4 field is ignored by the parse)
+  w32(0);            // size-4 field (patched below; ignored by parse)
   for (int r = 0; r < 180; ++r) {
     w32(a);
     for (std::uint32_t i = 0; i < a * 4; ++i) rec.push_back(shade);
