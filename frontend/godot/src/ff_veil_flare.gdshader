@@ -3,7 +3,10 @@ shader_type spatial;
 // dst = lut[6 + count + srcPx][dst] where srcPx is the FLARE4 texel
 // index (0..8). Same rgb565 index recovery as ff_veil.gdshader; the
 // row rides on the source texel instead of a uniform.
-render_mode unshaded, cull_disabled, depth_draw_never, fog_disabled;
+// No depth_draw mode — the transparent pass depth-tests against the
+// opaque buffer (the 10u camera-offset handles the front-of-body
+// layering; anything nearer still occludes it, per the depth seam).
+render_mode unshaded, cull_disabled, fog_disabled;
 
 uniform sampler2D screen_tex : hint_screen_texture, filter_nearest;
 uniform sampler2D src_tex : filter_nearest, repeat_disable; // R8 FLARE4 indices

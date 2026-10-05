@@ -3225,6 +3225,15 @@ func _run_smoke_freefall(course: int, skill: int, seed: int) -> void:
 						tm.mesh != null and \
 						tm.mesh.get_surface_count() > 0:
 					saw_trail_mesh = true
+					# The overlap contract: the trail binds the
+					# depth-tested veil shader (the top/painter-last
+					# variant is the radar wedge's alone).
+					var sm := tm.get_active_material(0) as ShaderMaterial
+					_check(sm != null and \
+							sm.shader == ff_veil_shader,
+						"trail veil uses the depth-tested shader")
+					_check(tm.top_level,
+						"trail veil in world space (real depth)")
 		if bool(r.get("done", false)):
 			done = true
 			route = int(r.get("handoff_route", -1))

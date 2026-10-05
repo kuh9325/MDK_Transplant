@@ -8,7 +8,10 @@ shader_type spatial;
 // sitting under every body (the indexed-compositor seam this replaces).
 // Residual seam: screen_texture holds only the opaque pass — veil
 // pixels under an earlier veil apply one remap, not the serial chain.
-render_mode unshaded, cull_disabled, depth_draw_never, fog_disabled;
+// No depth_draw mode: ALPHA puts the surface in the transparent pass,
+// which depth-tests against the opaque buffer without writing — the
+// overlap contract (veil sections composite at their own depth).
+render_mode unshaded, cull_disabled, fog_disabled;
 
 uniform sampler2D screen_tex : hint_screen_texture, filter_nearest;
 uniform sampler2D idx_tex : filter_nearest, repeat_disable; // 256x256 R8: rgb565 -> index
