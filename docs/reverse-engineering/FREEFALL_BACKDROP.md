@@ -296,7 +296,83 @@ exact name/flags/rate).
 Note the resolve-miss path (`0x41cb25`): a missing record posts
 nothing silently — kept as a no-op rather than an error.
 
-## 8. Remaining seams / open items
+## 8. Depth-flag semantics probe (§4A, OBSERVED on the shipping build)
+
+The `e5a4487` commit message claimed `depth_draw_never` had disabled
+the depth test entirely. A minimal overlap scene on the exact shipped
+backend (Godot `4.7.2.stable.official.ed1daf0bf`, Metal 4.0 Forward+)
+disproves that — probe scene preserved at
+`analysis-private/depth_probe/`:
+
+| quad | render_mode | result |
+|------|-------------|--------|
+| A (behind occluder) | `depth_draw_never` + `ALPHA=1.0` | 0 px — occluded |
+| B (behind occluder) | `depth_test_disabled` + `depth_draw_never` | 676 px — draws over |
+| C (behind occluder) | ALPHA transparent, no depth flags | 0 px — occluded |
+
+`depth_draw_never` disables depth **writes** only; the test stays on
+(matches the Godot docs). `depth_test_disabled` is the separate flag
+that drops the test. For an `ALPHA`-writing shader both e8cc920 and
+e5a4487 land in the transparent pass — depth-tested, never writing —
+so the e5a4487 render_mode edit was functionally neutral on this
+backend. The currently-presented overlap (trail/flare sections
+occluding behind nearer bodies, `depth_overlap_f000460.png`) is the
+correct contract either way; the causal attribution in the old
+commit message was wrong, and this note supersedes it without
+rewriting the pushed history. Current flags are kept — they produce
+the observed-correct result: trail/flare = transparent pass
+(depth-tested, no write); wedge = `depth_test_disabled` +
+`depth_draw_never`, priority 1 (painter-last, matching its z'≈0
+object key).
+
+## 9. rgb565 inverse-lookup audit (§4B, OBSERVED on real palettes)
+
+The veil shaders recover the source index via a 65536-entry rgb565
+map built from the 256-entry FALLP_<c+1> palette — later entries
+overwrite earlier same-key entries, uninitialized keys read 0.
+Audit over all five course palettes and all 64 bank-0 LUT rows
+(only bank 0 is uploaded to `lut_tex`):
+
+| palette | keys init | collision groups | identical-RGB | different-RGB | LUT-divergent losers |
+|---------|-----------|------------------|---------------|---------------|----------------------|
+| FALLP1  | 252       | 3                | 3             | 0             | 0                    |
+| FALLP2  | 247       | 3                | 3             | 0             | 0                    |
+| FALLP3  | 249       | 3                | 3             | 0             | 0                    |
+| FALLP4  | 252       | 3                | 3             | 0             | 0                    |
+| FALLP5  | 246       | 3                | 3             | 0             | 0                    |
+
+Every collision is a duplicate-color palette entry — no two
+different-RGB entries share a key, and no collision changes any
+used row's output. So the recovery is **exact for palette-exact
+screen colors** on all five courses (measured, not assumed — the
+earlier "lossless" wording needed this scope).
+
+Non-palette-pixel reachability (what could hit the ~65284
+uninitialized keys → index 0): all scene materials are unshaded
+with nearest filtering; the project runs no MSAA (default); the
+sRGB→linear→sRGB round-trip on this backend preserves the 8-bit
+palette values byte-exact; fade is a `FadeLayer` CanvasLayer the
+`screen_texture` never contains (veils read the unfaded 3D pixels —
+correct); the FALL_T1/HUD overlays are CanvasLayers too. Veil
+output itself is never sampled (screen_texture is the pre-
+transparent-pass snapshot — see §10). Remaining theoretical source:
+a non-palette color produced by edge resolve/tonemap — none
+configured.
+
+**Cache invalidation fix (real bug found).** `ff_palette` was
+loaded once and never invalidated; `ff_pal_tex`/`ff_idx_tex`/
+`ff_lut_tex`, the `lut:`/`pen:`/`m:` material caches, the
+trail/flare veil materials, and the PICK sprite texture all held
+the first course's palette forever. The five palettes differ by
+123-128 entries each — through FALLP1's map, ~119 of FALLP2's
+colors hit uninitialized keys (→ index 0 → `lut[row][0]`) plus 2-4
+wrong-index hits. Every campaign continuation (course≥1 freefall)
+would have presented visibly wrong veil colors. `_apply_freefall`
+now compares the snapshot's palette each frame and drops every
+palette-derived cache on change; per-frame-rebuilt paths (backdrop
+RGBA, `bdf["lut"]`) already tracked the live course.
+
+## 10. Remaining seams / open items
 
 - Trail depth ordering — the veil composites into `backdropFrame`,
   so it always sits behind the 3D bodies; the original depth-sorts

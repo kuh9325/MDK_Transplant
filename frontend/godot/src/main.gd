@@ -2770,8 +2770,23 @@ func _apply_freefall() -> void:
 	# A prior mode-5 frame never overlaps the freefall view.
 	if $StreamLayer.visible:
 		$StreamLayer.visible = false
-	if ff_palette.is_empty() and bool(ff.get("palette_ok", false)):
-		ff_palette = ff["palette"]
+	# Course-change invalidation (§4B): FALLP_<c+1> differs between
+	# courses (123-128 of 256 entries), so every palette-derived cache
+	# must rebuild when the snapshot's palette changes — the inverse
+	# rgb565 map, the pal/lut textures, the row-keyed veil materials
+	# (they hold the OLD texture objects), and the palette-expanded
+	# PICK sprite. Stale entries would map ~119 colors to index 0.
+	var pal_now: PackedByteArray = ff.get("palette", PackedByteArray())
+	if bool(ff.get("palette_ok", false)) and pal_now.size() == 768 and \
+			(ff_palette.is_empty() or ff_palette != pal_now):
+		ff_palette = pal_now
+		ff_pal_tex = null
+		ff_idx_tex = null
+		ff_lut_tex = null
+		ff_veil_mats.clear()
+		ff_flare_veil_mats.clear()
+		ff_materials.clear()   # pen:/m:/lut: entries are palette-derived
+		ff_pick_tex = null
 
 	# FUN_004123f4's camera — fixed orientation (right=+X, down=-Y,
 	# back=+Z semantic rows) at cameraPos, fov from scaleY at the
