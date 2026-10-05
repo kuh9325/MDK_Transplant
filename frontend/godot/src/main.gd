@@ -3875,7 +3875,10 @@ func _run_smoke_campaign(course: int) -> void:
 		_check(int(d["mode6_enters"]) == 1, "mode-6 entered once")
 		var pumps := 0
 		var pr := {}
-		while pumps < 12 and int(bridge.get_mode()) == 6:
+		# The real briefing machine owns mode 6 now (19E): stage_done
+		# rides its esc/skip arm — fade-in ~15f + page fill + exit
+		# key + fade-out ~15f ≈ 31 pumps, not the placeholder's 1.
+		while pumps < 60 and int(bridge.get_mode()) == 6:
 			pr = bridge.frontend_progression_step(
 				{"stage_done": true})
 			pumps += 1

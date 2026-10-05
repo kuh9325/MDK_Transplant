@@ -2769,6 +2769,9 @@ bool MdkBridge::load_freefall(int64_t course, int64_t skill,
   // model-slot anims-table entry (+0xc >> 16) is an undecoded seam
   // (mdk-inspect's digest runs use the same default).
   mdk::freefallInit(*ff_, data, std::uint32_t(seed));
+  // Size the §4C mask before any ff_veil_mask() call — the first
+  // step hasn't run yet but the host may already ask for it.
+  ffVeilMask_.clear();
 
   // The orchestrator globals: levelId IS the freefall course (541498
   // selects both FALL3D_<c+1> and the traversal 0x4999e8 table); the
@@ -4232,13 +4235,18 @@ Dictionary MdkBridge::ff_veil_mask() {
   constexpr int kTexPerPx = kK / 2;
   constexpr int kW = mdk::VeilMask::kW * kTexPerPx;
   constexpr int kH = mdk::VeilMask::kH;
+  const int pxCount = mdk::VeilMask::kW * mdk::VeilMask::kH;
+  // Never built (load_freefall ran, first step hasn't): emit an
+  // all-empty mask rather than touching unallocated storage.
+  if (int(ffVeilMask_.counts.size()) != pxCount) {
+    ffVeilMask_.clear();
+  }
   if (ffVeilMaskBytes_.size() !=
       int64_t(kW) * kH * 8) {
     ffVeilMaskBytes_.resize(int64_t(kW) * kH * 8);
   }
   std::uint16_t* dst =
       reinterpret_cast<std::uint16_t*>(ffVeilMaskBytes_.ptrw());
-  const int pxCount = mdk::VeilMask::kW * kH;
   for (int px = 0; px < pxCount; ++px) {
     const int n = std::min<int>(ffVeilMask_.counts[px], kK);
     const mdk::VeilMask::Rec* recs =
@@ -6123,6 +6131,7 @@ bool MdkBridge::campaignFreefallEnter_(std::string& detail) {
   data.skill = sess_.skill;
   data.pickups = ffScene_->pickups;
   mdk::freefallInit(*ff_, data, sess_.rng);
+  ffVeilMask_.clear();   // sized before any ff_veil_mask() call
   timing_ = mdk::FrontendTimingState{};
   prevKeyLevel_ = {};
   ffHandoffDone_ = false;
@@ -6255,10 +6264,16 @@ Dictionary MdkBridge::frontend_progression_step(const Dictionary& input) {
       mdk::Mode6BriefingInput bi;
       bi.dtSec = timing_.deltaSec;
       bi.frameStep = timing_.frameStep;
-      bi.esc = bool(input.get("esc", false));
+      // The host's "stage complete" edge maps onto the briefing's
+      // own skip arm: esc latches the type-skip (instant page fill)
+      // and also counts as the exit key at the hold gate — the
+      // briefing's real proceed-fast path. `confirm` is a genuine
+      // key press (anyKey); neither forces the machine's state.
+      bi.esc = bool(input.get("esc", false)) || stageDone;
       bi.hurryA = bool(input.get("hurry", false));
       bi.hurryB = bool(input.get("hurry", false));
-      bi.anyKey = bool(input.get("any_key", false));
+      bi.anyKey = bool(input.get("any_key", false)) ||
+                  bool(input.get("confirm", false));
       const bool done6 = briefing_->step(bi, briefingFb_, briefingPal_);
       ++briefingFrameSeq_;
       e = mdk::progressionStepLoader(sess_, done6);
