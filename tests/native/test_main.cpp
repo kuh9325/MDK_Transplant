@@ -21673,6 +21673,406 @@ void test_freefall_scene() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 16D — FUN_00412530 backdrop + trail ring + pen map (synthetic).
+// LEVEL/POD/chunk records are MTI image payloads {u16 w,u16 h,px};
+// ZOOM/FLARE4/PICK are BNI records. The ZOOM row shape {a, sa[a*4],
+// b, c, sc[c*4]} and the sampler's three-phase read are OBSERVED in
+// FUN_0046d780; the pen map in FUN_0040c860; the seam wedge in
+// FUN_00412530's 0x4125f7 region (see FREEFALL_BACKDROP.md).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+template <typename F>
+std::vector<std::uint8_t> ffSpriteRec(int w, int h, F px) {
+  std::vector<std::uint8_t> rec;
+  rec.push_back(std::uint8_t(w & 0xff));
+  rec.push_back(std::uint8_t((w >> 8) & 0xff));
+  rec.push_back(std::uint8_t(h & 0xff));
+  rec.push_back(std::uint8_t((h >> 8) & 0xff));
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) rec.push_back(px(x, y));
+  return rec;
+}
+
+// One ZOOM%04d span table: {u32 size-4, u32 0, 180 rows} where each
+// row is {u32 a, u8 sa[a*4], u32 b, u32 c, u8 sc[c*4]}.
+std::vector<std::uint8_t> ffZoomRec(std::uint32_t a, std::uint8_t shade,
+                                    std::uint32_t b, std::uint32_t c,
+                                    std::uint8_t shadeC) {
+  std::vector<std::uint8_t> rec;
+  auto w32 = [&rec](std::uint32_t v) {
+    for (int k = 0; k < 4; ++k)
+      rec.push_back(std::uint8_t((v >> (k * 8)) & 0xff));
+  };
+  w32(0); w32(0);    // header (size-4 field is ignored by the parse)
+  for (int r = 0; r < 180; ++r) {
+    w32(a);
+    for (std::uint32_t i = 0; i < a * 4; ++i) rec.push_back(shade);
+    w32(b);
+    w32(c);
+    for (std::uint32_t i = 0; i < c * 4; ++i) rec.push_back(shadeC);
+  }
+  const std::uint32_t sz = static_cast<std::uint32_t>(rec.size() - 4);
+  for (int k = 0; k < 4; ++k)
+    rec[k] = std::uint8_t((sz >> (k * 8)) & 0xff);
+  return rec;
+}
+
+// The expected LEVEL texel at output (x, spanRow) for a backdrop
+// step whose camera gave perspective step `p` and texel origin
+// (uStart, vStart) — a re-derivation of the OBSERVED 16.16 walk in
+// FUN_0046d780: texel += pInt + carry(uFrac += pFrac) per px, and
+// texelRow += (pInt + vCarry) * 1024 per span row.
+std::uint8_t ffBackdropTexel(const mdk::FreefallScene& s,
+                             double p, double uStart, double vStart,
+                             int x, int spanRow) {
+  const std::int64_t uQ = static_cast<std::int64_t>(uStart * 65536.0);
+  const std::int64_t vQ = static_cast<std::int64_t>(vStart * 65536.0);
+  const std::int64_t pQ = static_cast<std::int64_t>(p * 65536.0);
+  const std::uint32_t pFrac = static_cast<std::uint32_t>(pQ) << 16;
+  const std::int64_t pInt = pQ >> 16;
+  std::int64_t t = (uQ >> 16) + (vQ >> 16) * 1024;
+  std::uint32_t vf = static_cast<std::uint32_t>(vQ) << 16;
+  for (int r = 0; r < spanRow; ++r) {
+    const std::uint32_t nf = vf + pFrac;
+    t += pInt * 1024 + (nf < vf ? 1024 : 0);
+    vf = nf;
+  }
+  std::uint32_t f = static_cast<std::uint32_t>(uQ) << 16;
+  for (int i = 0; i < x; ++i) {
+    const std::uint32_t nf = f + pFrac;
+    t += pInt + (nf < f ? 1 : 0);
+    f = nf;
+  }
+  return s.backdropWork[std::size_t(t) & 0xFFFFF];
+}
+
+} // namespace
+
+void test_freefall_backdrop() {
+  namespace fs = std::filesystem;
+  const fs::path tmp = fs::temp_directory_path() / "mdk_test_ffbd";
+  fs::remove_all(tmp);
+  fs::create_directories(tmp / "FALL3D");
+
+  // -- resources -------------------------------------------------------------
+  // MISSILE with an X-spread element so the min/max-X anchor scan
+  // binds two DISTINCT verts (the OBSERVED verts 11/12 role).
+  const auto missile = ffGeoRecord(0x83, {"MISSILE"},
+      {{"M1", {-2.0f, -12.0f, 0.0f, 3.0f, -12.0f, 0.0f,
+               0.0f, 14.0f, 0.0f}, {0, 1, 2}}});
+  std::vector<std::uint8_t> pal(768);
+  for (int i = 0; i < 768; ++i)
+    pal[std::size_t(i)] = static_cast<std::uint8_t>(i);
+
+  // LEVEL1: a never-zero gradient (pad-0 detection stays possible);
+  // POD1: a high-nibble-tagged strip; FLARE4/PICK: small sprites.
+  auto lvl = ffSpriteRec(1024, 1024,
+      [](int x, int y) { return std::uint8_t(((x + (y << 4)) & 0x7f) | 1); });
+  auto pod = ffSpriteRec(64, 1024,
+      [](int x, int y) { return std::uint8_t(0x80 | (y & 0x3f)); });
+  auto fl4 = ffSpriteRec(64, 64, [](int x, int y) {
+      return std::uint8_t((x + y) % 9); });
+  auto pck = ffSpriteRec(64, 64, [](int x, int y) {
+      return std::uint8_t((x * 7 + y) & 0xff); });
+  // ZOOM0000: all-shaded rows (a=150 -> 600 px, shade byte 1).
+  // ZOOM0005: raw-copy rows (b=150) — proves the texel walk without
+  // the LUT remap so the source indices are directly observable.
+  auto z0 = ffZoomRec(150, 1, 0, 0, 0);
+  auto z5 = ffZoomRec(0, 0, 150, 0, 0);
+  auto z7 = ffZoomRec(75, 1, 75, 0, 0);   // shaded A + raw B halves
+
+  auto bni = SyntheticBni::build({
+      {"MISSILE",  static_cast<std::uint32_t>(missile.size())},
+      {"FALLP1",   768u},
+      {"ZOOM0000", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0001", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0002", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0003", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0004", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0005", static_cast<std::uint32_t>(z5.size())},
+      {"ZOOM0006", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0007", static_cast<std::uint32_t>(z7.size())},
+      {"ZOOM0008", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0009", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0010", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0011", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0012", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0013", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0014", static_cast<std::uint32_t>(z0.size())},
+      {"ZOOM0015", static_cast<std::uint32_t>(z0.size())},
+      {"FLARE4",   static_cast<std::uint32_t>(fl4.size())},
+      {"PICK",     static_cast<std::uint32_t>(pck.size())},
+  });
+  bniPutPayload(bni, "MISSILE", missile);
+  bniPutPayload(bni, "FALLP1", pal);
+  for (int z = 0; z < 16; ++z) {
+    char zn[16];
+    std::snprintf(zn, sizeof zn, "ZOOM%04d", z);
+    bniPutPayload(bni, zn, z == 5 ? z5 : z == 7 ? z7 : z0);
+  }
+  bniPutPayload(bni, "FLARE4", fl4);
+  bniPutPayload(bni, "PICK", pck);
+  std::ofstream(tmp / "FALL3D" / "FALL3D.BNI", std::ios::binary)
+      .write(reinterpret_cast<const char*>(bni.buf.data()),
+             static_cast<std::streamsize>(bni.buf.size()));
+
+  // Chunks: frame i filled with pen (0x40+i), corner px0 transparent.
+  std::vector<std::vector<std::uint8_t>> chunks(8);
+  auto mti = SyntheticMti::build("FALL3D_1.MTI", {
+      {"LEVEL1", 0u, 0u, 0u, static_cast<std::uint32_t>(lvl.size())},
+      {"POD1",   0u, 0u, 0u, static_cast<std::uint32_t>(pod.size())},
+      {"L1_C0001", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0002", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0003", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0004", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0005", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0006", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0007", 0u, 0u, 0u, 4u + 64u * 108u},
+      {"L1_C0008", 0u, 0u, 0u, 4u + 64u * 108u},
+  });
+  mtiPutPayload(mti, "LEVEL1", lvl);
+  mtiPutPayload(mti, "POD1", pod);
+  for (int i = 0; i < 8; ++i) {
+    chunks[std::size_t(i)] = ffSpriteRec(64, 108,
+        [&i](int x, int y) {
+          return (x == 0 && y == 0)
+                     ? std::uint8_t(0)
+                     : std::uint8_t(0x40 + i);
+        });
+    char cn[24];
+    std::snprintf(cn, sizeof cn, "L1_C000%d", i + 1);
+    mtiPutPayload(mti, cn, chunks[std::size_t(i)]);
+  }
+  std::ofstream(tmp / "FALL3D" / "FALL3D_1.MTI", std::ios::binary)
+      .write(reinterpret_cast<const char*>(mti.buf.data()),
+             static_cast<std::streamsize>(mti.buf.size()));
+
+  std::string err;
+  auto root = mdk::DataRoot::open(tmp, &err);
+  CHECK(root.has_value());
+  mdk::FreefallScene s;
+  CHECK(mdk::freefallSceneLoad(*root, 0, &s, &err) ==
+        mdk::FreefallSceneError::kOk);
+
+  // -- load surface ----------------------------------------------------------
+  CHECK(s.backdropOk && s.backdropW == 1024 && s.backdropH == 1024);
+  CHECK(s.backdropWork.size() == 1024u * 1024u);
+  CHECK(s.backdropFrame.size() == 600u * 360u);
+  CHECK(s.podW == 64 && s.podH == 1024);
+  CHECK(s.zoomCount == 16 && s.zoomRows[0].size() == 180);
+  CHECK(s.zoomRows[0][0].a == 150 && s.zoomRows[0][0].sa.size() == 600);
+  CHECK(s.chunkCount == 8 && s.chunks[0].w == 64 &&
+        s.chunks[0].h == 108);
+  CHECK(s.flare4.w == 64 && s.flare4.h == 64);
+  CHECK(s.pick.w == 64 && s.pick.h == 64);
+  CHECK(s.lutOk && s.lut.size() == 384u * 256u);
+
+  // -- the generated LUT -----------------------------------------------------
+  // keyColors = the OBSERVED 9-keyframe ramp lerped 8 rows/segment;
+  // bank 0 row r: LUT[c] = nearestPal((pal[c]*(256-90)+key*90)>>8).
+  CHECK(s.keyColors[0][0] == 0x5a && s.keyColors[0][1] == 0xce &&
+        s.keyColors[0][2] == 0xde);
+  CHECK(s.keyColors[8][0] == 0x21 && s.keyColors[8][1] == 0x7b &&
+        s.keyColors[8][2] == 0x8c);
+  CHECK(s.keyColors[16][2] == 0x7b);            // deep blue anchor
+  // Row 0, color 0: pal[0]={0,0,0} -> (key*90)>>8 toward {5a,ce,de}.
+  {
+    const int er = (0x5a * 90) >> 8;
+    const int eg = (0xce * 90) >> 8;
+    const int eb = (0xde * 90) >> 8;
+    // nearest gray index in pal (r=g=b=i): the LUT stores the
+    // winning palette index — verify it round-trips the blend.
+    const std::uint8_t idx = s.lut[0];
+    const int dr = int(pal[idx * 3]) - er;
+    const int dg = int(pal[idx * 3 + 1]) - eg;
+    const int db = int(pal[idx * 3 + 2]) - eb;
+    CHECK(dr * dr + dg * dg + db * db <=
+          (int(pal[0]) - er) * (int(pal[0]) - er) * 3 + 4);
+    CHECK(idx != 0);      // a real blend, not the black source
+  }
+
+  // -- step 1: scroll integration + seam wedge + sampling --------------------
+  // cam (0,0,5280): p = 5280*0.0001893939 = ~1.0 (descent start).
+  mdk::freefallSceneBackdropStep(s, 0.0f, 0.0f, 5280.0f);
+  const mdk::FreefallScene::BackdropDiag& dg = s.backdropDiag;
+  CHECK(near(dg.p, 1.0, 1e-3));
+  CHECK(near(dg.uStart, 212.0, 1e-2));
+  CHECK(dg.zoomTable == 1);
+  CHECK(dg.scrollRow == 790);   // trunc(824 - 0.6290909 - 33)
+  CHECK(dg.chunkFrame == 0);    // chunkScroll 0.5 -> L1_C0001
+
+  // Seam wedge — first call: delta clamps to 24 (prev = -1); rows
+  // 790..813 get count = round(r*2/3 + 16) POD bytes ending at
+  // LEVEL column 512 (OBSERVED wedge formula).
+  {
+    const auto& work = s.backdropWork;
+    const auto& podp = s.podPixels;
+    for (int r = 0; r < 24; ++r) {
+      const int count = static_cast<int>(r * (2.0 / 3.0) + 16.5);
+      const int row = 790 + r;
+      for (int k = 0; k < count; ++k) {
+        CHECK(work[std::size_t(row) * 1024 + 512 - count + k] ==
+              podp[std::size_t(row) * 64 + 32 - count + k]);
+      }
+      // The byte just LEFT of the wedge keeps the LEVEL gradient.
+      CHECK(work[std::size_t(row) * 1024 + 512 - count - 1] ==
+            std::uint8_t((((512 - count - 1) + (row << 4)) & 0x7f) | 1));
+    }
+    // The pristine span is untouched — the wedge hits the working
+    // copy only.
+    CHECK(s.backdropPixels[std::size_t(790) * 1024 + 500] ==
+          std::uint8_t(((500 + (790 << 4)) & 0x7f) | 1));
+  }
+
+  // Span sampling — line doubling: each span row feeds TWO output
+  // rows. The chunk sprite (drawn at 600x360 resolution after the
+  // sampler) legitimately un-doubles the pairs it covers — the rect
+  // y∈[140,220], x∈[276,323] is excluded here.
+  const auto& fr = s.backdropFrame;
+  for (int y = 0; y < 180; ++y) {
+    const int oy = 2 * y;
+    if (oy >= 140 && oy <= 220) continue;
+    for (int x = 0; x < 600; ++x)
+      CHECK(fr[std::size_t(2 * y) * 600 + x] ==
+            fr[std::size_t(2 * y + 1) * 600 + x]);
+  }
+  // Every pixel written (the never-zero LEVEL => no pad holes).
+  for (std::size_t i = 0; i < fr.size(); ++i) CHECK(fr[i] != 0);
+  // LUT application — frame[0][x] = lut[(12+1)*256 + texel(x)] with
+  // texel(x) from the OBSERVED 16.16 walk (a fractional p below 1.0
+  // skips a texel every ~4-5 px, so a naive +1/px read is wrong).
+  {
+    const double p = 5280.0 * 0.0001893939;
+    const double uStart = 512.0 - 300.0 * p;
+    const double v3c = 824.0 + (1.0 / 30.0) * (1.0 / 33.0) * -624.0;
+    const double vStart = v3c - 180.0 * p;
+    for (int x = 0; x < 600; x += 57) {
+      const std::uint8_t tex = ffBackdropTexel(s, p, uStart, vStart,
+                                               x, 0);
+      CHECK(fr[x] == s.lut[std::size_t(13) * 256 + tex]);
+    }
+    for (int x = 0; x < 600; x += 57) {
+      const std::uint8_t tex = ffBackdropTexel(s, p, uStart, vStart,
+                                               x, 1);
+      CHECK(fr[std::size_t(2) * 600 + x] ==
+            s.lut[std::size_t(13) * 256 + tex]);
+    }
+  }
+  // Chunk draw — L1_C0001 (pen 0x40) scaled 192/1: dst 48x81 at
+  // center (300,180). Interior pixels carry the raw chunk pen.
+  CHECK(near(dg.chunkX, 300.0, 1.0) && near(dg.chunkY, 180.0, 1.0));
+  CHECK(near(dg.chunkW, 48.0, 1.0) && near(dg.chunkH, 81.0, 1.0));
+  CHECK(fr[180 * 600 + 300] == 0x40);
+  // A source pen-0 texel (chunk corner) leaves the shaded backdrop.
+  {
+    const int x0 = 300 - 24, y0 = 180 - 40;    // dst top-left
+    CHECK(fr[std::size_t(y0) * 600 + x0] != 0x40);
+  }
+
+  // -- step 5: the raw-copy ZOOM table proves the texel walk ---------
+  for (int i = 0; i < 4; ++i)
+    mdk::freefallSceneBackdropStep(s, 0.0f, 0.0f, 5280.0f);
+  CHECK(s.backdropDiag.zoomTable == 5);
+  // scrollPos = 5/30 -> vStart = 824 - 3.145.. - 180*p; the raw
+  // phase writes the LEVEL texel unmapped.
+  {
+    const double vStart = 824.0 +
+        (5.0 / 30.0) * (1.0 / 33.0) * -624.0 - 180.0 * dg.p;
+    const double uStart = 512.0 - 300.0 * dg.p;
+    for (int x = 0; x < 600; x += 97) {
+      const std::uint8_t tex =
+          ffBackdropTexel(s, dg.p, uStart, vStart, x, 0);
+      CHECK(fr[std::size_t(x)] == tex);
+    }
+  }
+
+  // -- step 7: the half-shaded table (a=75 -> 300 shaded px, b=75
+  // -> 300 raw px) verifies the A/B phase boundary at x=300. ------
+  for (int i = 0; i < 2; ++i)
+    mdk::freefallSceneBackdropStep(s, 0.0f, 0.0f, 5280.0f);
+  CHECK(s.backdropDiag.zoomTable == 7);
+  {
+    const double vStart = 824.0 +
+        (7.0 / 30.0) * (1.0 / 33.0) * -624.0 - 180.0 * dg.p;
+    const double uStart = 512.0 - 300.0 * dg.p;
+    const int x = 290;   // inside the shaded half
+    const std::uint8_t tex =
+        ffBackdropTexel(s, dg.p, uStart, vStart, x, 0);
+    CHECK(fr[std::size_t(x)] == s.lut[std::size_t(13) * 256 + tex]);
+    const int xr = 310;  // inside the raw half — texel unmapped
+    const std::uint8_t texr =
+        ffBackdropTexel(s, dg.p, uStart, vStart, xr, 0);
+    CHECK(fr[std::size_t(xr)] == texr);
+  }
+
+  // -- scroll wrap: 16 more steps cycles the zoom counter to 7 -----
+  for (int i = 0; i < 16; ++i)
+    mdk::freefallSceneBackdropStep(s, 0.0f, 0.0f, 5280.0f);
+  CHECK(s.backdropDiag.zoomTable == ((7 + 16) & 15));
+  // chunkScroll = 23 * 0.5 = 11.5 -> 11.5 mod 8 = 3.5 -> L1_C0004.
+  CHECK(s.backdropDiag.chunkFrame == 3);
+  CHECK(near(s.backdropScrollPos, 23.0f / 30.0f, 1e-5));
+  CHECK(near(s.backdropChunkScroll, 3.5f, 1e-5));
+
+  // -- trail ring + section pens ------------------------------------
+  CHECK(mdk::freefallTrailSectionPen(32, 23) == -1054);
+  CHECK(mdk::freefallTrailSectionPen(32, 24) == -1058);
+  CHECK(mdk::freefallTrailSectionPen(32, 31) == -1065);
+  CHECK(mdk::freefallTrailSectionPen(2, 1) == -1065);
+  CHECK(mdk::freefallTrailSectionPen(5, 1) == -1062);
+  CHECK(mdk::freefallTrailSectionPen(5, 4) == -1065);
+  CHECK(mdk::freefallTrailSectionPen(9, 1) == -1058);  // count-8=1
+  CHECK(mdk::freefallTrailSectionPen(9, 8) == -1065);
+  CHECK(mdk::freefallTrailSectionPen(0, 0) == -1054);  // degenerate
+
+  // The feed — a missile twin bound from the roster slot, anchors
+  // = element-0 min/max-X verts transformed by basis+pos each tick.
+  FreefallRuntime rt;
+  mdk::freefallInit(rt, ffCourse(0, 0), 7);
+  rt.introCountdown = 90;
+  ffStep(rt, {});                    // spawn the player
+  FreefallObject& m = rt.pool[5];
+  m.type = 1;
+  m.model = mdk::kFfModelMissile;
+  m.alive = 1;
+  m.fx = 1;
+  m.scale = 1.0f;
+  m.px = 10.0f; m.py = 20.0f; m.pz = 30.0f;
+  for (int k = 0; k < 9; ++k) m.basis[k] = (k % 4 == 0) ? 1.0f : 0.0f;
+  m.next = -1;
+  rt.pool[0].next = 5;
+  mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  const mdk::FreefallScene::Twin::Trail* tr =
+      mdk::freefallSceneTrail(s, 5);
+  CHECK(tr != nullptr && tr->anchors == 2 && tr->count == 1);
+  // Slot 0: {lo+pos, hi+pos, lo+pos} — anchors at x -2 / +3.
+  CHECK(near(tr->pts[0][0][0], 8.0, 1e-5) &&
+        near(tr->pts[0][0][1], 8.0, 1e-5) &&
+        near(tr->pts[0][0][2], 30.0, 1e-5));
+  CHECK(near(tr->pts[0][1][0], 13.0, 1e-5));
+  CHECK(tr->pts[0][2][0] == tr->pts[0][0][0]);
+
+  // 32 more feeds: the ring caps at 32 and the read cursor chases
+  // the write cursor — slot (read) is always the OLDEST.
+  for (int i = 0; i < 32; ++i) {
+    m.pz += 4.0f;
+    mdk::freefallSceneStep(s, rt, 1.0f / 30.0f);
+  }
+  CHECK(tr->count == 32);
+  CHECK(tr->cursor == (33 & 31));
+  CHECK(tr->read == tr->cursor);      // full ring: oldest = next write
+  // Slot `read` holds feed #2 (pz = 30 + 4), the newest slot feed #33
+  // (pz = 30 + 128) — anchors transformed with the identity basis.
+  CHECK(near(tr->pts[tr->read][0][2], 34.0, 1e-5));
+  const int newest = (tr->read + 31) & 31;
+  CHECK(near(tr->pts[newest][0][2], 158.0, 1e-5));
+
+  fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 13B — freefall→traversal handoff coordinator.
 // ---------------------------------------------------------------------------
 
@@ -29476,6 +29876,7 @@ int main() {
   test_freefall_determinism();
   test_freefall_freelist();
   test_freefall_scene();
+  test_freefall_backdrop();
   test_progression_handoff();
   test_progression_campaign();
   test_save_game();

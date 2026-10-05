@@ -104,8 +104,16 @@ var freefall := false        # --freefall launcher flag
 var ff_materials := {}       # "m:<name>" / "pen:<n>" -> StandardMaterial3D
 var ff_palette := PackedByteArray()  # FALLP_<c+1> bytes (768)
 var ff_handoff_seen := false # printed the mode transition once
-var ff_ground: MeshInstance3D = null  # LEVEL%d minecrawler backdrop
 var ff_trail_mat: StandardMaterial3D = null
+var ff_backdrop: MeshInstance3D = null  # camera-locked backdrop quad
+var ff_backdrop_img: Image = null
+var ff_backdrop_tex: ImageTexture = null
+var ff_key_colors := PackedByteArray()  # 64x3 LUT keyframe ramp
+var ff_flare_px := PackedByteArray()    # FLARE4 indexed pixels
+var ff_flare_wh := Vector2i.ZERO
+var ff_flare_tex := {}                  # count 1..8 -> ImageTexture
+var ff_pick_tex: ImageTexture = null    # kind-1 PICK sprite
+const FF_VEIL_ALPHA := 90.0 / 256.0     # bank-0 LUT strength
 
 # Phase 19B.1 — mode-5 intermission presentation. The StreamScene
 # core owns simulation; the bridge owns the indexed framebuffer.
@@ -2100,16 +2108,31 @@ func _ff_trace_tick() -> void:
 		var b: PackedFloat32Array = o["basis_mdk"]
 		var v: Vector3 = o["vel_mdk"]
 		var align := 0.0
+		var nose_align := 0.0
 		if b.size() >= 9 and v.length() > 0.001:
 			# Row-major 3x3: column 1 (the missile's nose, local +Y)
 			# sits at indices 1,4,7 and must equal norm(vel).
 			align = Vector3(b[1], b[4], b[7]).normalized().dot(v.normalized())
+			# The transformed-nose proof: run the actual element-0
+			# max-Y vertex through the presented basis (geometry,
+			# not the column scalar) — it must track velocity too.
+			if o.has("nose_local"):
+				var nl: Vector3 = o["nose_local"]
+				var nw := Vector3(
+					b[0] * nl.x + b[1] * nl.y + b[2] * nl.z,
+					b[3] * nl.x + b[4] * nl.y + b[5] * nl.z,
+					b[6] * nl.x + b[7] * nl.y + b[8] * nl.z)
+				if nw.length() > 0.001:
+					nose_align = nw.normalized().dot(v.normalized())
 		if _ff_trace_n % 15 == 0 or (dz > -60.0 and dz < 60.0):
-			print("ff-msl t=%.2f rel=%.0f,%.0f,%.0f vel=%.0f,%.0f,%.0f col1=%.2f,%.2f,%.2f align=%.2f trl=%d" %
+			var npens := -1
+			if o.has("trail") and o["trail"].has("pens"):
+				npens = int(o["trail"]["pens"].size())
+			print("ff-msl t=%.2f rel=%.0f,%.0f,%.0f vel=%.0f,%.0f,%.0f col1=%.2f,%.2f,%.2f align=%.2f nose=%.2f trl=%d pens=%d fl=%d" %
 				[float(s["timeline"]) / 60.0, m.x - p.x, m.y - p.y, dz,
 				 v.x, v.y, v.z, b[1] if b.size() >= 9 else 0.0,
 				 b[4] if b.size() >= 9 else 0.0, b[7] if b.size() >= 9 else 0.0,
-				 align, trn])
+				 align, nose_align, trn, npens, int(o.get("flare", 0))])
 		if dz < -5.0 or dz > 600.0:
 			continue   # passed or not yet inbound
 		if mind < 0.0 or lat < mind:
@@ -2271,64 +2294,95 @@ func _ff_bind_mesh(mi: MeshInstance3D, g: Dictionary) -> void:
 	mi.mesh = mesh
 
 
-# LEVEL%d — the minecrawler surface behind the approach. The
-# original's FUN_00412530 is a mode-7-style scroll-sample of the
-# 1024x1024 indexed source through POD%d strips; the port presents
-# the same source image as the ground plane at MDK z=0 (Godot y=0 —
-# the missiles' spawn level below the player) so the camera's own
-# perspective produces the row-parallax scroll. Indexed pixels are
-# expanded through FALLP_<c+1> exactly like the material bank.
-# HYPOTHESIS — texel density: the original's span blitter samples
-# ~64 texels per screen width; 10 units/texel reads comparably at
-# the approach depths.
-const FF_GROUND_SIZE := 30000.0
-const FF_GROUND_TEXEL_UNITS := 10.0
-
-func _ff_ground_plane() -> void:
-	var d: Dictionary = bridge.get_freefall_backdrop()
-	if d.is_empty():
+# FUN_00412530 — the rendered backdrop. The core's freefall
+# presentation step produces the original's 600x360 indexed frame
+# (LEVEL%d scroll-sample through POD%d + the ZOOM span table + the
+# generated 6-bank LUT + the L%d_C000%d pod chunk); the bridge
+# palette-expands it to RGBA. The quad is a camera child sized to
+# the frustum at far depth — the framebuffer IS the whole view in
+# mode 2, so objects occlude it through the normal depth buffer.
+func _ff_backdrop_quad() -> void:
+	if ff_backdrop != null:
 		return
-	var w := int(d["w"])
-	var h := int(d["h"])
-	var px: PackedByteArray = d["pixels"]
-	if w <= 0 or h <= 0 or px.size() < w * h or \
-			ff_palette.size() != 768:
-		return
-	var rgba := PackedByteArray()
-	rgba.resize(w * h * 4)
-	for i in w * h:
-		var c := int(px[i]) * 3
-		rgba[i * 4] = ff_palette[c]
-		rgba[i * 4 + 1] = ff_palette[c + 1]
-		rgba[i * 4 + 2] = ff_palette[c + 2]
-		rgba[i * 4 + 3] = 255
-	var img := Image.create_from_data(w, h, false, Image.FORMAT_RGBA8,
-		rgba)
-	var tex := ImageTexture.create_from_image(img)
 	var mat := StandardMaterial3D.new()
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
-	mat.set_flag(BaseMaterial3D.FLAG_USE_TEXTURE_REPEAT, true)
-	mat.albedo_texture = tex
-	# The original draws the POD strip through brightness-LUT rows
-	# (0x4edc34) — the far surface reads markedly darker than the
-	# raw indices (DOS captures show a deep-red hull). Exact row
-	# curve is unresolved; a flat dim approximates it.
-	mat.albedo_color = Color(0.60, 0.55, 0.58, 1.0)
-	var rep: float = FF_GROUND_SIZE / \
-		(FF_GROUND_TEXEL_UNITS * float(w))
-	mat.uv1_scale = Vector3(rep, rep, 1.0)
-	var pm := PlaneMesh.new()
-	pm.size = Vector2(FF_GROUND_SIZE, FF_GROUND_SIZE)
-	pm.material = mat
-	ff_ground = MeshInstance3D.new()
-	ff_ground.name = "FfGround"
-	ff_ground.mesh = pm
-	# MDK z=0 plane -> Godot y=0; PlaneMesh faces +Y already (the
-	# player/camera descend toward it from +Z_mdk = +Y_godot).
-	$FreefallRoot.add_child(ff_ground)
-	$FreefallRoot.move_child(ff_ground, 0)
+	var qm := QuadMesh.new()
+	qm.material = mat
+	ff_backdrop = MeshInstance3D.new()
+	ff_backdrop.name = "FfBackdrop"
+	ff_backdrop.mesh = qm
+	$Camera3D.add_child(ff_backdrop)
+
+
+func _ff_backdrop_frame(ff: Dictionary) -> void:
+	_ff_backdrop_quad()
+	var bdf: Dictionary = bridge.get_freefall_backdrop_frame()
+	if bdf.is_empty():
+		return
+	if ff_key_colors.is_empty():
+		ff_key_colors = bdf["key_colors"]
+	var w := int(bdf["w"])
+	var h := int(bdf["h"])
+	ff_backdrop_img = Image.create_from_data(w, h, false,
+		Image.FORMAT_RGBA8, bdf["rgba"])
+	if ff_backdrop_tex == null:
+		ff_backdrop_tex = ImageTexture.create_from_image(
+			ff_backdrop_img)
+		(ff_backdrop.mesh.material as StandardMaterial3D) \
+			.albedo_texture = ff_backdrop_tex
+	else:
+		ff_backdrop_tex.update(ff_backdrop_img)
+	# Frustum-covering size at the quad's depth — 25000 units sits
+	# behind every freefall object (world z max ~5300).
+	var d := 25000.0
+	var vh := 2.0 * d * tan(deg_to_rad($Camera3D.fov) * 0.5)
+	var vw := vh * float(ff.get("aspect", 1.6667))
+	(ff_backdrop.mesh as QuadMesh).size = Vector2(vw, vh)
+	ff_backdrop.position = Vector3(0, 0, -d)
+	ff_backdrop.visible = true
+
+
+# The veil color a dst = LUT[row][dst] remap converges toward —
+# the keyframe ramp color, blended at the bank-0 strength
+# (90/256; OBSERVED FUN_00406d84 row build + 0x42b8c0 init).
+func _ff_veil_color(row: int) -> Color:
+	row = clampi(row, 0, 63)
+	if ff_key_colors.size() >= 192:
+		return Color(ff_key_colors[row * 3] / 255.0,
+			ff_key_colors[row * 3 + 1] / 255.0,
+			ff_key_colors[row * 3 + 2] / 255.0, FF_VEIL_ALPHA)
+	return Color(0.85, 0.87, 0.9, FF_VEIL_ALPHA)
+
+
+func _ff_flat_pen_color(idx: int) -> Color:
+	idx = clampi(idx, 0, 255)
+	if ff_palette.size() == 768:
+		return Color(ff_palette[idx * 3] / 255.0,
+			ff_palette[idx * 3 + 1] / 255.0,
+			ff_palette[idx * 3 + 2] / 255.0, 1.0)
+	return Color(0.9, 0.9, 0.9, 1.0)
+
+
+# Pen -> draw class (OBSERVED FUN_0040c860): < -1028 = LUT row
+# (-1029-pen); -1027..-1024 = LUT rows 0..3; -1028 = the textured
+# fill (unresolved shading — approximated as the brightest LUT
+# veil); -1023..-1011 = flat palette colors 255..243; -1010..-990 =
+# the 0x47a770 family (approximated like -1028); -255..-1 = flat
+# -pen & 0xff. Mode-2 trails emit only the LUT classes.
+func _ff_trail_pen_color(pen: int) -> Color:
+	if pen < -1028:
+		return _ff_veil_color(-1029 - pen)
+	if pen >= -1027 and pen <= -1024:
+		return _ff_veil_color(-1024 - pen)
+	if pen >= -1023 and pen <= -1011:
+		return _ff_flat_pen_color((-pen) & 0xff)
+	if pen < 0:
+		if pen == -1028 or (pen >= -1010 and pen <= -990):
+			return _ff_veil_color(0)   # HYPOTHESIS fallback rows
+		return _ff_flat_pen_color((-pen) & 0xff)
+	return _ff_flat_pen_color(pen & 0xff)
 
 
 func _ff_trail_material() -> StandardMaterial3D:
@@ -2338,17 +2392,18 @@ func _ff_trail_material() -> StandardMaterial3D:
 		m.cull_mode = BaseMaterial3D.CULL_DISABLED
 		m.vertex_color_use_as_albedo = true
 		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		# Pen -1054 indexes a palette LUT row (FUN_00412970 fill);
-		# the row's exact ramp is unresolved — near-white smoke with
-		# the age taper mapped onto alpha is the approximation.
-		m.albedo_color = Color(0.92, 0.92, 0.94, 1.0)
+		# The original fills the ribbon through the pen->LUT row
+		# remap — a destination veil, not a smoke overlay; the per-
+		# section vertex colors carry the pen's veil color/alpha.
+		m.albedo_color = Color(1.0, 1.0, 1.0, 1.0)
 		ff_trail_mat = m
 	return ff_trail_mat
 
 
 func _ff_apply_trail(node: Node3D, o: Dictionary) -> void:
-	# Kind-4 — the bridge emits per-slot (spine, tapered-edge) pairs;
-	# consecutive pairs form the ribbon quads (FUN_0042ee74).
+	# Kind-4 — the bridge emits per-slot edge pairs in the original
+	# draw order (oldest -> newest from the +0x20 read cursor);
+	# section s pairs slots s-1,s and carries pen `pens[s-1]`.
 	var tr: Dictionary = o.get("trail", {})
 	var mi: MeshInstance3D = node.get_node_or_null("Trail")
 	if tr.is_empty() or int(tr.get("count", 0)) < 2:
@@ -2369,7 +2424,7 @@ func _ff_apply_trail(node: Node3D, o: Dictionary) -> void:
 	mi.visible = true
 	var mesh: ImmediateMesh = mi.mesh
 	var edges: PackedVector3Array = tr["edges"]
-	var shade: PackedFloat32Array = tr["shade"]
+	var pens: PackedInt32Array = tr.get("pens", PackedInt32Array())
 	var n: int = min(int(tr["count"]), edges.size() / 2)
 	mesh.clear_surfaces()
 	if n < 2:
@@ -2380,19 +2435,151 @@ func _ff_apply_trail(node: Node3D, o: Dictionary) -> void:
 		var r0: Vector3 = edges[j * 2 + 1]
 		var l1: Vector3 = edges[j * 2 + 2]
 		var r1: Vector3 = edges[j * 2 + 3]
-		var a0: float = clamp(shade[j], 0.0, 1.0)
-		var a1: float = clamp(shade[j + 1], 0.0, 1.0)
-		mesh.surface_set_color(Color(1, 1, 1, a0))
+		var c: Color = _ff_trail_pen_color(
+			int(pens[j]) if j < pens.size() else -1054)
+		mesh.surface_set_color(c)
 		mesh.surface_add_vertex(l0)
 		mesh.surface_add_vertex(r0)
-		mesh.surface_set_color(Color(1, 1, 1, a1))
 		mesh.surface_add_vertex(l1)
-		mesh.surface_set_color(Color(1, 1, 1, a0))
 		mesh.surface_add_vertex(r0)
-		mesh.surface_set_color(Color(1, 1, 1, a1))
 		mesh.surface_add_vertex(r1)
 		mesh.surface_add_vertex(l1)
 	mesh.surface_end()
+
+
+# Kind-5 — the launch FLARE. FLARE4's pixels (0..8) index the LUT
+# at row 6 + obj+0x108 + srcPx (OBSERVED 0x410dfb-0x410e10: the blit
+# LUT arg = 0x4edc34+0x600 + count<<8; 0x46d6d1: px0 transparent,
+# else dst = lut[row][dst]); each count 1..8 pre-bakes a texture of
+# that row's keyframe colors at the bank-0 veil alpha.
+func _ff_flare_texture(count: int) -> ImageTexture:
+	var key: int = clampi(count, 1, 8)
+	if ff_flare_tex.has(key):
+		return ff_flare_tex[key]
+	var w := ff_flare_wh.x
+	var h := ff_flare_wh.y
+	var rgba := PackedByteArray()
+	rgba.resize(w * h * 4)
+	for i in w * h:
+		var px := int(ff_flare_px[i])
+		if px == 0:
+			rgba[i * 4 + 3] = 0
+			continue
+		var row: int = clampi(6 + key + px, 0, 63)
+		var c := 0
+		if ff_key_colors.size() >= 192:
+			c = row * 3
+			rgba[i * 4] = ff_key_colors[c]
+			rgba[i * 4 + 1] = ff_key_colors[c + 1]
+			rgba[i * 4 + 2] = ff_key_colors[c + 2]
+		else:
+			rgba[i * 4] = 216
+			rgba[i * 4 + 1] = 222
+			rgba[i * 4 + 2] = 230
+		rgba[i * 4 + 3] = int(255.0 * FF_VEIL_ALPHA)
+	var img := Image.create_from_data(w, h, false,
+		Image.FORMAT_RGBA8, rgba)
+	var tex := ImageTexture.create_from_image(img)
+	ff_flare_tex[key] = tex
+	return tex
+
+
+func _ff_apply_flare(node: Node3D, o: Dictionary) -> void:
+	var fl := int(o.get("flare", 0))
+	var mi: MeshInstance3D = node.get_node_or_null("Flare")
+	if fl <= 0 or ff_flare_px.is_empty() or \
+			not bool(o.get("presented", false)):
+		if mi != null:
+			mi.visible = false
+		return
+	if mi == null:
+		mi = MeshInstance3D.new()
+		mi.name = "Flare"
+		var qm := QuadMesh.new()
+		var m := StandardMaterial3D.new()
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+		m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		qm.material = m
+		mi.mesh = qm
+		mi.top_level = true
+		node.add_child(mi)
+	(mi.mesh.material as StandardMaterial3D).albedo_texture = \
+		_ff_flare_texture(fl)
+	# 0x46d6d1's scale arg 0x80 -> 32x32 SCREEN px at the projected
+	# pos (src 64x64 * 0x80 >> 8); convert to world units at the
+	# missile's depth. The draw sorts at z+10 — a small camera-
+	# ward offset reproduces the in-front-of-body layering.
+	var wp: Vector3 = node.transform.origin
+	var cam: Vector3 = $Camera3D.global_position
+	var dist := cam.distance_to(wp)
+	var wpp := 2.0 * dist * tan(deg_to_rad($Camera3D.fov) * 0.5) \
+		/ 360.0
+	var s := 32.0 * wpp
+	(mi.mesh as QuadMesh).size = Vector2(s, s)
+	mi.global_position = wp + (cam - wp).normalized() * 10.0
+	mi.visible = true
+
+
+# Kind-1 — the +0x10c marker: the PICK sprite drawn scaled at the
+# object's projected pos (OBSERVED 0x410bf2 -> 0x46d680). The exact
+# screen-scale constant (0x494d30) is runtime-patched in BUILD_A —
+# the port presents a world-space disc at the object position;
+# footprint size HYPOTHESIS (~ the pickup's visible span).
+func _ff_apply_marker(node: Node3D, o: Dictionary) -> void:
+	var mi: MeshInstance3D = node.get_node_or_null("Marker")
+	if not bool(o.get("marker", false)) or ff_pick_tex == null or \
+			not bool(o.get("presented", false)):
+		if mi != null:
+			mi.visible = false
+		return
+	if mi == null:
+		mi = MeshInstance3D.new()
+		mi.name = "Marker"
+		var qm := QuadMesh.new()
+		var m := StandardMaterial3D.new()
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+		m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		m.albedo_texture = ff_pick_tex
+		qm.material = m
+		mi.mesh = qm
+		mi.top_level = true
+		node.add_child(mi)
+	(mi.mesh as QuadMesh).size = Vector2(40.0, 40.0)
+	mi.global_position = node.transform.origin
+	mi.visible = true
+
+
+func _ff_sprites_load() -> void:
+	var d: Dictionary = bridge.get_freefall_sprites()
+	if d.has("flare4") and ff_flare_px.is_empty():
+		var s: Dictionary = d["flare4"]
+		ff_flare_wh = Vector2i(int(s["w"]), int(s["h"]))
+		ff_flare_px = s["pixels"]
+	if d.has("pick") and ff_pick_tex == null:
+		var s: Dictionary = d["pick"]
+		var w := int(s["w"])
+		var h := int(s["h"])
+		var px: PackedByteArray = s["pixels"]
+		var rgba := PackedByteArray()
+		rgba.resize(w * h * 4)
+		for i in w * h:
+			var c := int(px[i])
+			if c == 0 or ff_palette.size() != 768:
+				rgba[i * 4 + 3] = 0
+				continue
+			rgba[i * 4] = ff_palette[c * 3]
+			rgba[i * 4 + 1] = ff_palette[c * 3 + 1]
+			rgba[i * 4 + 2] = ff_palette[c * 3 + 2]
+			rgba[i * 4 + 3] = 255
+		var img := Image.create_from_data(w, h, false,
+			Image.FORMAT_RGBA8, rgba)
+		ff_pick_tex = ImageTexture.create_from_image(img)
 
 
 func _apply_freefall() -> void:
@@ -2406,19 +2593,22 @@ func _apply_freefall() -> void:
 		$StreamLayer.visible = false
 	if ff_palette.is_empty() and bool(ff.get("palette_ok", false)):
 		ff_palette = ff["palette"]
-	# FUN_00412530 — the minecrawler backdrop needs the palette for
-	# the indexed->RGBA expansion; build the ground plane once.
-	if ff_ground == null and ff_palette.size() == 768:
-		_ff_ground_plane()
 
 	# FUN_004123f4's camera — fixed orientation (right=+X, down=-Y,
 	# back=+Z semantic rows) at cameraPos, fov from scaleY at the
-	# 600x360 projection divisors. Far covers the LEVEL%d ground
-	# plane's full extent (FF_GROUND_SIZE diagonal ~42k at z=0).
+	# 600x360 projection divisors. Far covers the camera-locked
+	# backdrop quad (placed at 25000).
 	var ct: Transform3D = ff["camera"]
 	$Camera3D.global_transform = ct
 	$Camera3D.fov = float(ff["fov_deg"])
 	$Camera3D.far = 50000.0
+
+	# FUN_00412530 — the per-frame rendered backdrop (LEVEL/POD
+	# sampler + ZOOM dither + LUT + chunk sprite) on the camera-
+	# locked quad, and the one-shot FLARE4/PICK sprite loads.
+	_ff_backdrop_frame(ff)
+	if ff_flare_px.is_empty() or ff_pick_tex == null:
+		_ff_sprites_load()
 
 	# 0x4edc04 — palette-bright factor applied at upload: <1 dims to
 	# black (fade), >1 saturates (damage flash / missile-bump).
@@ -2471,6 +2661,10 @@ func _apply_freefall() -> void:
 			node.transform = o["transform"]
 		# Kind-4 — the missile trail ring (world-space edges).
 		_ff_apply_trail(node, o)
+		# Kind-5 — the launch FLARE4 veil quad (obj+0x108 gate).
+		_ff_apply_flare(node, o)
+		# Kind-1 — the +0x10c PICK marker (pickups).
+		_ff_apply_marker(node, o)
 		# +0x306 — the chute attachment: a second kind-2 entry under
 		# the object's own basis while the flag is set.
 		var chute: MeshInstance3D = node.get_node_or_null("Chute")
@@ -3760,6 +3954,10 @@ func _process(delta: float) -> void:
 		# once-per-rendered-frame cadence as traversal/mode-5.
 		_drain_audio_fx()
 		return
+	if ff_backdrop != null and ff_backdrop.visible:
+		# The mode-2 backdrop quad is a camera child — gate it off
+		# the moment any other mode's presenter takes over.
+		ff_backdrop.visible = false
 	if mode == 5:
 		# Standalone StreamScene — the step above may have run the
 		# exit handoff; the terminal fill frame still uploads. Under

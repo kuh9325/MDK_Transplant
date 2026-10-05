@@ -182,6 +182,10 @@ void MdkBridge::_bind_methods() {
       &MdkBridge::get_freefall_object_geometry);
   ClassDB::bind_method(D_METHOD("get_freefall_backdrop"),
                        &MdkBridge::get_freefall_backdrop);
+  ClassDB::bind_method(D_METHOD("get_freefall_backdrop_frame"),
+                       &MdkBridge::get_freefall_backdrop_frame);
+  ClassDB::bind_method(D_METHOD("get_freefall_sprites"),
+                       &MdkBridge::get_freefall_sprites);
   ClassDB::bind_method(D_METHOD("get_freefall_material", "name"),
                        &MdkBridge::get_freefall_material);
   // Phase 19B.1 — mode-5 StreamScene presentation.
@@ -2821,6 +2825,14 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   // step consumed (objectAnimTickDt's rate*animRate*dtSec ==
   // frameUnits for the rate-1.0 records).
   mdk::freefallSceneStep(*ffScene_, *ff_, timing_.deltaSec);
+  // FUN_00410920's frame order — the backdrop pass (FUN_00412530)
+  // runs before the object draw walk, fed by the just-updated
+  // camera block (0x540b28/2c/30 == rt.cameraPos). The scroll/chunk
+  // integrators are dt-scaled (the original's per-frame constants
+  // are its 30 fps render cadence); the zoom dither stays per-call.
+  mdk::freefallSceneBackdropStep(*ffScene_, ff_->cameraPos[0],
+                                 ff_->cameraPos[1], ff_->cameraPos[2],
+                                 timing_.deltaSec);
   // 19C.3 — this frame's kFfEvSound batch into the shared voice
   // pool + the per-step mixer pass (events self-clear at the next
   // step, so the drain runs here, drain-once).
@@ -3039,6 +3051,17 @@ Array MdkBridge::get_freefall_object_snapshots() {
     d["timer"] = int64_t(o.timer);
     d["sub_timer"] = int64_t(o.subTimer);
     d["pickup_rec"] = int64_t(o.pickupRec);
+    // Kind-5 — the launch FLARE (FUN_004109d8 case 5 gate +0x108).
+    // subTimer ramps 0->8 while the +0x11c launch timer runs and
+    // decays after; the draw selects LUT row 10+count (+srcPx) and
+    // always binds FLARE4. Emitted raw — the presenter gates on
+    // flare > 0.
+    d["flare"] = int64_t(o.subTimer);
+    // Kind-1 — the +0x10c marker entry (PICK sprite through the
+    // scaled transparent blit, z-1e-5 sort). The generic object-
+    // record init sets +0x10c on pickups; mode-2 missiles never
+    // carry it. Emit for type-4 records.
+    d["marker"] = o.type == 4;
     // The kind-4 trail / kind-3 BANG gates — state only (the FX
     // renders stay documented seams).
     d["trail_fx"] = int64_t(o.fx);
@@ -3050,12 +3073,35 @@ Array MdkBridge::get_freefall_object_snapshots() {
         o.basis[0], o.basis[1], o.basis[2],
         o.basis[3], o.basis[4], o.basis[5],
         o.basis[6], o.basis[7], o.basis[8]};
+    // The element-0 maximum-Y vertex — the missile's model-space
+    // nose tip (MISSILE's +Y axis is the heading axis the kind-5
+    // basis writes; the tail anchors sit at y~-12.4). Emitted so
+    // the presenter can transform actual geometry, not just the
+    // basis column, when proving nose-track-velocity.
+    if (t != nullptr && !t->obj.model.elemVerts.empty()) {
+      const auto& ev = t->obj.model.elemVerts[0];
+      float bestY = -1e30f;
+      int bi = -1;
+      for (std::size_t vi = 0; vi + 2 < ev.size(); vi += 3) {
+        if (ev[vi + 1] > bestY) { bestY = ev[vi + 1]; bi = int(vi); }
+      }
+      if (bi >= 0) {
+        d["nose_local"] = Vector3(ev[std::size_t(bi)],
+                                  ev[std::size_t(bi) + 1],
+                                  ev[std::size_t(bi) + 2]);
+      }
+    }
     // Kind-4 — the trail ribbon (FUN_0042ee74 over the +0x60 ring).
-    // Emitted as Godot-space edge pairs (spine, tapered edge) per
-    // ring slot, newest first, plus the per-slot taper factor — the
-    // original's age ramp {1.0,1.25,1.2,1.1,1.05,1.0} for slots
-    // under 6 frames, then 1-(age-6)/(cap-6) linear decay. The
-    // presenter draws consecutive pairs as a quad strip.
+    // The draw walk iterates `count` slots OLDEST->NEWEST starting
+    // at the +0x20 read cursor (mod-32 indexed). Each slot stores
+    // world anchors; the drawn edge points taper toward the slot
+    // centroid: v_i = centroid + (anchor_i - centroid) * t with
+    // t = headRamp[count-1-secIdx] for the newest six slots
+    // ({1.0,1.25,1.2,1.1,1.05,1.0} at 0x49b634) then the linear
+    // 1-(age-6)/(cap-6) decay. `pens` carries one pen per SECTION
+    // (s = 1..count-1 pairing walked slots s-1,s): -1054 for the
+    // older body, count-s-1066 (-1058..-1065 -> LUT rows 29-36)
+    // for the newest eight (OBSERVED 0x42efba/0x42f096).
     if (const mdk::FreefallScene::Twin::Trail* tr =
             mdk::freefallSceneTrail(*ffScene_, i)) {
       if (tr->count > 1) {
@@ -3063,29 +3109,43 @@ Array MdkBridge::get_freefall_object_snapshots() {
             {1.0f, 1.25f, 1.2f, 1.1f, 1.05f, 1.0f};
         constexpr int cap = mdk::FreefallScene::Twin::kTrailCap;
         PackedVector3Array edges;
-        PackedFloat32Array shade;
+        PackedFloat32Array taper;
+        PackedInt32Array pens;
         edges.resize(tr->count * 2);
-        shade.resize(tr->count);
-        for (int j = 0; j < tr->count; ++j) {
-          const int k = (tr->cursor - 1 - j + cap) % cap;
+        taper.resize(tr->count);
+        pens.resize(tr->count - 1);
+        for (int s = 0; s < tr->count; ++s) {
+          const int k = (tr->read + s) & (cap - 1);
+          const int age = tr->count - 1 - s;
           const float t =
-              j < 6 ? kHeadRamp[j]
-                  : std::max(0.0f, 1.0f - float(j - 6) / float(cap - 6));
+              age < 6 ? kHeadRamp[age]
+                      : std::max(0.0f, 1.0f - float(age - 6) /
+                                              float(cap - 6));
           const float* l = tr->pts[k][0];
           const float* r = tr->pts[k][1];
-          const mdkfront::Vec3 gl =
-              mdkfront::mdkVecToGodot(l[0], l[1], l[2]);
-          edges[j * 2] = Vector3(gl.x, gl.y, gl.z);
+          const float cx = (l[0] + r[0]) * 0.5f;
+          const float cy = (l[1] + r[1]) * 0.5f;
+          const float cz = (l[2] + r[2]) * 0.5f;
+          const mdkfront::Vec3 gl = mdkfront::mdkVecToGodot(
+              cx + (l[0] - cx) * t,
+              cy + (l[1] - cy) * t,
+              cz + (l[2] - cz) * t);
+          edges[s * 2] = Vector3(gl.x, gl.y, gl.z);
           const mdkfront::Vec3 gr = mdkfront::mdkVecToGodot(
-              l[0] + (r[0] - l[0]) * t,
-              l[1] + (r[1] - l[1]) * t,
-              l[2] + (r[2] - l[2]) * t);
-          edges[j * 2 + 1] = Vector3(gr.x, gr.y, gr.z);
-          shade[j] = t;
+              cx + (r[0] - cx) * t,
+              cy + (r[1] - cy) * t,
+              cz + (r[2] - cz) * t);
+          edges[s * 2 + 1] = Vector3(gr.x, gr.y, gr.z);
+          taper[s] = t;
+        }
+        for (int s = 1; s < tr->count; ++s) {
+          pens[s - 1] = int32_t(
+              mdk::freefallTrailSectionPen(tr->count, s));
         }
         Dictionary td;
         td["edges"] = edges;
-        td["shade"] = shade;
+        td["taper"] = taper;
+        td["pens"] = pens;
         td["count"] = int64_t(tr->count);
         td["anchors"] = int64_t(tr->anchors);
         d["trail"] = td;
@@ -3144,6 +3204,77 @@ Dictionary MdkBridge::get_freefall_backdrop() {
               ffScene_->backdropPixels.size());
   out["pixels"] = px;
   out["course"] = int64_t(ffScene_->course);
+  return out;
+}
+
+// FUN_00412530's per-frame product: the rendered 600x360 indexed
+// framebuffer palette-expanded to RGBA, the frame's sampling
+// diagnostics, and the LUT keyframe row colors the presenter needs
+// to reproduce the trail/flare veil materials.
+Dictionary MdkBridge::get_freefall_backdrop_frame() {
+  Dictionary out;
+  if (!ffScene_ || ffScene_->backdropFrame.empty() ||
+      !ffScene_->paletteOk) {
+    return out;
+  }
+  constexpr int kW = 600, kH = 360;
+  PackedByteArray rgba;
+  rgba.resize(int64_t(kW) * kH * 4);
+  const std::uint8_t* idx = ffScene_->backdropFrame.data();
+  const std::uint8_t* pal = ffScene_->palette.data();
+  std::uint8_t* w = rgba.ptrw();
+  for (int i = 0; i < kW * kH; ++i) {
+    const std::uint8_t c = idx[i];
+    w[i * 4 + 0] = pal[c * 3 + 0];
+    w[i * 4 + 1] = pal[c * 3 + 1];
+    w[i * 4 + 2] = pal[c * 3 + 2];
+    w[i * 4 + 3] = 255;
+  }
+  out["w"] = int64_t(kW);
+  out["h"] = int64_t(kH);
+  out["rgba"] = rgba;
+  const auto& dg = ffScene_->backdropDiag;
+  out["p"] = double(dg.p);
+  out["u_start"] = double(dg.uStart);
+  out["v_start"] = double(dg.vStart);
+  out["scroll_row"] = int64_t(dg.scrollRow);
+  out["zoom_table"] = int64_t(dg.zoomTable);
+  out["chunk_frame"] = int64_t(dg.chunkFrame);
+  out["chunk_x"] = double(dg.chunkX);
+  out["chunk_y"] = double(dg.chunkY);
+  out["chunk_w"] = double(dg.chunkW);
+  out["chunk_h"] = double(dg.chunkH);
+  // The LUT's 64 keyframe row colors — what a dst=LUT[row][src]
+  // remap converges toward. The presenter approximates the veil as
+  // an alpha blend toward these (strength 90/256 for bank 0).
+  PackedByteArray keys;
+  keys.resize(64 * 3);
+  std::memcpy(keys.ptrw(), ffScene_->keyColors.data(), 64 * 3);
+  out["key_colors"] = keys;
+  return out;
+}
+
+// One-shot upload of the kind-5 FLARE4 and kind-1 PICK indexed
+// sprites (BNI {u16 w, u16 h, px} records). The presenter expands
+// FLARE4's 0..8 values through the LUT row colors (kind-5 uses
+// dst = lut[10 + count + srcPx][dstPx]) and PICK through palette.
+Dictionary MdkBridge::get_freefall_sprites() {
+  Dictionary out;
+  if (!ffScene_) return out;
+  auto emit = [](Dictionary& d, const char* key,
+                 const mdk::FreefallScene::BackdropSprite& sp) {
+    if (sp.px.empty() || sp.w <= 0 || sp.h <= 0) return;
+    Dictionary s;
+    s["w"] = int64_t(sp.w);
+    s["h"] = int64_t(sp.h);
+    PackedByteArray px;
+    px.resize(static_cast<int64_t>(sp.px.size()));
+    std::memcpy(px.ptrw(), sp.px.data(), sp.px.size());
+    s["pixels"] = px;
+    d[key] = s;
+  };
+  emit(out, "flare4", ffScene_->flare4);
+  emit(out, "pick", ffScene_->pick);
   return out;
 }
 

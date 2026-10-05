@@ -485,6 +485,16 @@ class MdkBridge : public RefCounted {
   Dictionary get_freefall_object_geometry(int64_t pool_slot,
                                           int64_t part);
   Dictionary get_freefall_backdrop();
+  // FUN_00412530's per-frame product — the 600x360 indexed backdrop
+  // rendered this freefallStep (LEVEL/POD seam wedge + ZOOM span
+  // sampling + generated LUT + L%d_C000%d chunk), palette-expanded
+  // to RGBA here, plus the frame's diagnostics (scroll row, zoom
+  // table, chunk frame/pos/scale, p/uStart/vStart) and the 64-entry
+  // keyframe row colors the trail/flare veils converge toward.
+  Dictionary get_freefall_backdrop_frame();
+  // The kind-5 FLARE4 and kind-1 PICK indexed sprite records
+  // (one-shot upload; Godot expands through keyColors/palette).
+  Dictionary get_freefall_sprites();
   // One FALL3D material by name-table string: palette-expanded
   // ImageTexture + {w, h, frames} for payload records; a flat
   // `palette_color` (and `palette_index`) for index/pen records;

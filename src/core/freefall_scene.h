@@ -165,19 +165,23 @@ struct FreefallScene {
   struct Twin {
     // +0x60 — the trail record (FUN_0042eaa8 freelist alloc +
     // FUN_0042eadc init). `anchorPts` are the model-space points the
-    // spawn-time FUN_0042eb3c scan selects (the extreme-x entries of
-    // the model's +0x20 point table — implemented over the model's
-    // element vertex pools, the only point-table-shaped data the
-    // record format carries; HYPOTHESIS on the table identity).
-    // Each feed (FUN_0042ecc4) transforms the anchors by the object
-    // basis into the next ring slot; slot pt[anchors] = pt[0] closes
-    // the section. The draw walk consumes the ring (FUN_0042ee74).
+    // spawn-time FUN_0042eb3c scan selects — the minimum-x and
+    // maximum-x vertices of the model's +0x20 ELEMENT TABLE entry 0
+    // (OBSERVED: the scan walks model+0x20 -> element[0]'s vertex
+    // list; for MISSILE those are verts 11/12 — the tail's widest
+    // points). Each feed (FUN_0042ecc4) writes the basis-transformed
+    // world-space anchors + centroid into slot +0x1c, advances +0x1c
+    // mod 32, and — once count == cap — advances +0x20 (the read
+    // cursor) the same way: a proper circular buffer, oldest at
+    // `read`. The draw walk (FUN_0042ee74) iterates `count` slots
+    // from `read` upward, mod-32 indexed.
     static constexpr int kTrailCap = 32;      // FUN_0042eadc cap arg
     static constexpr int kTrailPts = 4;       // vec3s per slot
     struct Trail {
       float pts[kTrailCap][kTrailPts][3]{};
       int count = 0;          // +0x10 slots fed
       int cursor = 0;         // +0x1c ring write cursor
+      int read = 0;           // +0x20 ring read cursor (oldest)
       int anchors = 0;        // +0x18 anchor count (<=3)
       float anchorPts[3][3]{};
     };
@@ -194,12 +198,87 @@ struct FreefallScene {
 
   // LEVEL%d — the 1024x1024 indexed minecrawler surface the backdrop
   // pass (FUN_00412530) scroll-samples through POD%d strips and the
-  // FUN_0046d780 span blitter before the object walk. The pixels
-  // span aliases mtiBytes; palette-expanded at upload by the bridge.
+  // FUN_0046d780 span blitter before the object walk. `backdropPixels`
+  // aliases the pristine mtiBytes copy; `backdropWork` is the mutable
+  // per-frame copy the POD seam wedge writes into (the original
+  // splices into the loaded image in place — 0x4edc24). The rendered
+  // 600x360 indexed output lands in `backdropFrame` each step.
   std::span<const std::uint8_t> backdropPixels;
   int backdropW = 0;
   int backdropH = 0;
   bool backdropOk = false;
+  std::vector<std::uint8_t> backdropWork;   // 1024x1024 owned copy
+  std::vector<std::uint8_t> backdropFrame;  // 600x360 indexed
+
+  // POD%d — the 64x1024 seam strip the wedge copy splices into the
+  // LEVEL center columns (OBSERVED: bytes 32-count..31 of each row ->
+  // LEVEL cols 512-count..511).
+  std::span<const std::uint8_t> podPixels;
+  int podW = 0;
+  int podH = 0;
+
+  // ZOOM%04d — the 16 span tables FUN_0046d780 walks, one selected
+  // per frame (0x4edbf0 counter & 15 = temporal dither). Parsed rows:
+  // 180 entries of {a=600,b=0,c=0} spans; each shaded span carries
+  // per-pixel LUT-row bytes. (Record layout: per row [countA,
+  // shadeBytes..., countB, countC, shadeBytes...] — OBSERVED in
+  // FUN_0046d780's three-phase per-row read.)
+  struct BackdropSpanRow {
+    std::vector<std::uint8_t> sa;   // phase-A shade bytes (count a)
+    std::vector<std::uint8_t> sc;   // phase-C shade bytes (count c)
+    std::uint32_t a = 0, b = 0, c = 0;
+  };
+  std::array<std::vector<BackdropSpanRow>, 16> zoomRows;
+  int zoomCount = 0;
+
+  // L%d_C000%d — the 8 pod-column chunk sprites drawn through
+  // FUN_00403a40 -> 0x46d680 (transparent scaled blit, center pos).
+  struct BackdropSprite {
+    int w = 0, h = 0;
+    std::span<const std::uint8_t> px;
+  };
+  std::array<BackdropSprite, 8> chunks;
+  int chunkCount = 0;
+
+  // FLARE4 — the kind-5 launch-glow sprite (FUN_004109d8 case 5,
+  // 0x46d6d1 LUT-remap blit at screen scale 0x80 -> 32x32 px dst).
+  BackdropSprite flare4;
+  // PICK — the kind-1 marker sprite drawn for +0x10c objects.
+  BackdropSprite pick;
+
+  // The generated LUT — 6 banks x 64 rows x 256 palette indices,
+  // built from the FALLP palette + the 0x49b57c keyframe ramp
+  // (FUN_00406d84: LUT[c] = nearestPal(pal[c]*(256-L)/256 + key*L/256),
+  // bank strengths {90,85,80,60,40,15}/256). `keyColors[row]` is the
+  // 64-entry ramp color every bank's row converges toward — the
+  // bridge ships it so Godot can approximate dst=LUT[dst] as an
+  // alpha blend toward keyColors[row].
+  std::vector<std::uint8_t> lut;               // 384*256
+  std::array<std::array<std::uint8_t, 3>, 64> keyColors{};
+  bool lutOk = false;
+
+  // Backdrop scroll state (all FUN_00412530 locals / driver globals):
+  //   scrollPos    0x4edc00 — += 1/30 per frame
+  //   chunkScroll  0x4edb5c — += 0x49b6f0*dt per frame, wraps mod 8
+  //   zoomCounter  0x4edbf0 — += 1 per frame, &15 selects the table
+  //   scrollRow    0x4edc30 — the previous-frame seam row
+  float backdropScrollPos = 0.0f;
+  float backdropChunkScroll = 0.0f;
+  int backdropZoomCounter = 0;
+  int backdropScrollRow = -1;   // -1 = first frame
+
+  // Backdrop diagnostics for the bridge/tests (written each
+  // freefallSceneBackdropStep call).
+  struct BackdropDiag {
+    float p = 0.0f;        // camZ*0.0001893939 perspective step
+    float uStart = 0.0f;   // 16.16 texel u at row 0 px 0
+    float vStart = 0.0f;
+    int scrollRow = 0;     // new seam row this frame
+    int zoomTable = 0;
+    int chunkFrame = -1;   // -1 = not drawn
+    float chunkX = 0.0f, chunkY = 0.0f;   // center, screen px
+    float chunkW = 0.0f, chunkH = 0.0f;
+  } backdropDiag;
 
   // Lazily resolved materials by name-table string ("CB3", "PEN_16",
   // ...); materialMiss caches names that resolve to nothing. The
@@ -248,6 +327,31 @@ const FreefallScene::Twin* freefallSceneTwin(const FreefallScene& s,
 // were scanned — non-FX objects never run FUN_0042eb3c).
 const FreefallScene::Twin::Trail* freefallSceneTrail(
     const FreefallScene& s, int poolIdx);
+
+// The trail section pen per FUN_0042ee74's draw walk (OBSERVED):
+// sections are indexed s = 1..count-1 in ring order (section s pairs
+// walked slots s-1 and s). Sections with s >= count-8 — the NEWEST
+// eight — get pen count-s-1066 (the 0x26+secIdx accumulator at
+// 0x42f096), i.e. -1058..-1065 -> LUT rows 29-36; all older sections
+// get -1054 (0xfffffbe2 -> LUT row 25). `count` is the live ring
+// count.
+int freefallTrailSectionPen(int count, int section);
+
+// FUN_00412530 — one backdrop frame. Integrates the scroll state
+// (0x4edc00 += 1/30 per rendered frame ~= seconds of descent —
+// dt-scaled here; 0x4edb5c chunk cycle +0.5/frame ~= 15/s;
+// 0x4edbf0 zoom dither +1/frame, per call), splices the POD seam
+// wedge into the LEVEL working copy, span-samples the 600x360
+// window through the ZOOM table + generated LUT, then draws the
+// L%d_C000%d pod-column chunk. Output: backdropFrame (600x360
+// indexed px); diagnostics in s.backdropDiag.
+// Cam args are the ORIGINAL camera position components (0x540b28/2c/30:
+// the mode-2 camera copy — 0.85*player.x, 0.85*player.y, player.z+10
+// per FUN_004123f4) in game units. dtSec is the presented frame's
+// delta (the original's per-call constants are its 30 fps cadence).
+void freefallSceneBackdropStep(FreefallScene& s,
+                               float camX, float camY, float camZ,
+                               float dtSec = 1.0f / 30.0f);
 
 // The CHUTE attachment prototype — the pickup's second kind-2 entry
 // renders this model under the SAME object basis (FUN_004109d8 emits
