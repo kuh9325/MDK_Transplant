@@ -59,6 +59,7 @@
 #include "core/frontend_resources.h"
 #include "core/frontend_shell.h"
 #include "core/fti_sprite.h"
+#include "core/mode6_briefing.h"
 #include "core/gameplay_input.h"
 #include "core/progression_runtime.h"
 #include "core/sni_directory.h"
@@ -524,6 +525,17 @@ class MdkBridge : public RefCounted {
   // and the fb/palette FNV digests (pre-palette / 768B applied).
   Dictionary stream_diag();
 
+  // --- Phase 19E — mode-6 briefing (FUN_00429cb4 family) -----------
+  // The briefing machine is bound and stepping — sess_.mode == 6 &&
+  // loaderSub == 3 (the L%d_MAP + typed BRIEF%d stage).
+  bool mode6_active() const { return briefing_ != nullptr; }
+  // The last presented briefing frame — {w,h,rgba} 600x360 RGBA8,
+  // same contract as stream_frame(); seq increments per step.
+  Dictionary mode6_frame();
+  // Machine-state mirrors for diagnostics: fades, cursor, latches,
+  // presented count.
+  Dictionary mode6_diag();
+
   // --- Phase 19D — mode-8 ending cinematic -------------------------
   // QA/host entry — boots the FUN_0047b038 edge directly (sess_.mode
   // 3 stands in for the enclosing traversal frame; the mode-8 head
@@ -751,6 +763,20 @@ class MdkBridge : public RefCounted {
   std::vector<mdk::ArenaRenderMaterial> streamBankA_;
   int streamNowMs_ = 0;          // synthetic 46c650 clock (ms)
   std::uint64_t streamFrameSeq_ = 0;   // presented-frame counter
+
+  // --- Phase 19E — mode-6 briefing host ---------------------------
+  // Lives only while sess_.loaderSub == 3; created on first pump of
+  // that sub-state, reset at the exit edge. Owning buffers hold the
+  // STATS.BNI + MDKFONT.FTI bytes the bound spans point into.
+  bool briefingEnter_(std::string& detail);
+  std::unique_ptr<mdk::Mode6Briefing> briefing_;
+  mdk::IndexedFramebuffer briefingFb_{600, 360};
+  mdk::Palette briefingPal_{};
+  std::vector<std::byte> briefingBniBytes_;
+  std::vector<std::byte> briefingFtiBytes_;
+  std::optional<mdk::FtiFont> briefingFont_;
+  std::vector<std::uint8_t> briefingSysHead_;
+  std::uint64_t briefingFrameSeq_ = 0;
 
   // Phase 19B.3A — bounded route diagnostics. routeFrom_/routeTo_
   // record the last mode-transition edge; the stream/mode-6 enter/

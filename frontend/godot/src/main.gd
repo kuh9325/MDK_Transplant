@@ -2902,6 +2902,36 @@ func _apply_stream() -> void:
 	$StreamLayer.visible = true
 
 
+# --- Phase 19E — mode-6 briefing presentation ------------------------
+# bridge.mode6_frame() returns the briefing's composited indexed frame
+# (L%d_MAP + the typed BRIEF%d page) expanded through the applied DAC —
+# fade-in, the settled palette, and fade-out all live in it. Same
+# persistent-ImageTexture contract as the frontend/stream presenters.
+var m6_img: Image = null
+var m6_tex: ImageTexture = null
+
+func _apply_mode6() -> void:
+	var fr: Dictionary = bridge.mode6_frame()
+	if fr.is_empty():
+		return
+	var w := int(fr["w"])
+	var h := int(fr["h"])
+	m6_img = Image.create_from_data(w, h, false, Image.FORMAT_RGBA8,
+		fr["rgba"])
+	if m6_tex == null:
+		m6_tex = ImageTexture.create_from_image(m6_img)
+	else:
+		m6_tex.update(m6_img)
+	var r: TextureRect = $BriefingLayer/BriefingRect
+	r.texture = m6_tex
+	r.visible = true
+	$BriefingLayer.visible = true
+
+func _mode6_hide() -> void:
+	if $BriefingLayer.visible:
+		$BriefingLayer.visible = false
+
+
 # --- Phase 19D — mode-8 ending cinematic presentation -----------------
 # One FLIC frame per paced ~33.3ms call into the bridge (the file's
 # speed field is the limiter window — the same policy as mode 5).
@@ -6590,6 +6620,7 @@ func _hide_gameplay_layers() -> void:
 	$HudLayer.visible = false
 	$StreamLayer.visible = false
 	$EndingLayer.visible = false
+	$BriefingLayer.visible = false
 
 
 func _show_gameplay_layers() -> void:
@@ -6892,6 +6923,42 @@ func _frontend_frame(delta: float, mode: int) -> void:
 		bridge.frontend_end_frame(delta * 1000.0)
 		if int(bridge.get_mode()) != 8:
 			_ending_hide()
+		return
+	if mode == 6:
+		# 19E — the briefing machine owns the stage edge for
+		# loaderSub 3 (FUN_00429600's key-scan); the placeholder
+		# hold doesn't apply while it runs. Input levels feed the
+		# original's latches: Esc -> skip, bound-advance -> hurry
+		# (60c/s + 2x fades), any-key -> the post-page exit gate.
+		var bi := {
+			"dt_ms": delta * 1000.0,
+			"esc": Input.is_key_pressed(KEY_ESCAPE),
+			"hurry": Input.is_key_pressed(KEY_ENTER) or \
+				Input.is_key_pressed(KEY_SPACE) or \
+				(int(input.get("mouse_buttons", 0)) & 7) != 0,
+		}
+		bi["any_key"] = bi["hurry"] or bi["esc"] or \
+			bool(input.get("confirm", false)) or \
+			bool(input.get("prev", false)) or \
+			bool(input.get("next", false)) or \
+			bool(input.get("left", false)) or \
+			bool(input.get("right", false))
+		if fe_run:
+			# --fe-run: a held key is a legal original path (hurry
+			# rate + the post-page exit gate) — keeps the scripted
+			# route moving through the briefing.
+			bi["any_key"] = true
+			bi["hurry"] = true
+		var res6: Dictionary = bridge.frontend_progression_step(bi)
+		if not bool(res6.get("ok", true)):
+			printerr("mode-6 briefing: ", bridge.get_last_error())
+		if bridge.mode6_active():
+			_apply_mode6()
+		else:
+			_mode6_hide()
+		if int(bridge.get_mode()) != mode:
+			fe_stage_hold = FE_STAGE_HOLD
+		bridge.frontend_end_frame(delta * 1000.0)
 		return
 	fe_stage_hold -= 1
 	var done := fe_stage_hold <= 0 or \

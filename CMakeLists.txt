@@ -60,6 +60,7 @@ add_library(mdk_core STATIC
   src/core/keyboard_menu.cpp
   src/core/lbb_image.cpp
   src/core/mode_dispatch.cpp
+  src/core/mode6_briefing.cpp
   src/core/mouse_menu.cpp
   src/core/mti_directory.cpp
   src/core/object_animation.cpp

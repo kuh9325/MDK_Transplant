@@ -35,6 +35,7 @@
 #include "core/indexed_image.h"
 #include "core/keyboard_menu.h"
 #include "core/lbb_image.h"
+#include "core/mode6_briefing.h"
 #include "core/mode_dispatch.h"
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
@@ -30312,6 +30313,204 @@ void test_ending_cinematic() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mode-6 briefing (FUN_00429cb4 + FUN_0042acd4 + FUN_00429600). Synthetic
+// assets only: a two-glyph font ('X' 4x6, others advance 6), a flat-index
+// L%d_MAP record, and a two-line BRIEF text with \c/\n escapes. Timing is
+// driven at a fixed 1/30 deltaSec — the original's frame-step value.
+// ---------------------------------------------------------------------------
+
+void test_mode6_briefing() {
+  using mdk::Mode6Briefing;
+  using mdk::Mode6BriefingAssets;
+  using mdk::Mode6BriefingInput;
+
+  // --- synthetic font: 'X' -> 4-wide 7-row block of index 9 ---
+  mdk::FtiFont font;
+  font.glyphs.resize(256);
+  {
+    mdk::FtiGlyph g;
+    g.code = 'X';
+    g.top = 6;
+    g.bottom = 0;
+    g.width = 4;
+    g.pixels.assign(std::size_t(g.rows()) * g.width, 9);
+    font.glyphs['X'] = std::move(g);
+    font.mappedCount = 1;
+  }
+
+  // --- synthetic SYS_PAL head: entry 9 = (90,180,10) ---
+  std::array<std::uint8_t, 768> sysHead{};
+  sysHead[9 * 3 + 0] = 90;
+  sysHead[9 * 3 + 1] = 180;
+  sysHead[9 * 3 + 2] = 10;
+
+  // --- synthetic L%d_MAP record: [0..4) header, [4..0x304) palette,
+  //     [0x304..) 600x360 pixels — all index 5 ---
+  std::vector<std::uint8_t> mapRec(0x304 + 600 * 360);
+  for (int i = 0; i < 256; ++i) {
+    mapRec[4 + i * 3 + 0] = std::uint8_t(i);
+    mapRec[4 + i * 3 + 1] = std::uint8_t(255 - i);
+    mapRec[4 + i * 3 + 2] = 7;
+  }
+  std::fill(mapRec.begin() + 0x304, mapRec.end(), 5);
+
+  auto briefChars = [](std::string_view s) {
+    std::vector<char> v(s.begin(), s.end());
+    v.push_back('\0');
+    return v;
+  };
+
+  Mode6BriefingAssets a;
+  a.font = &font;
+  a.sysHead = sysHead;
+  a.mapRecord = mapRec;
+  a.briefText = briefChars("\\cXXXX\nXXXXX");
+
+  // Caller-owned output surfaces (bridge pattern).
+  mdk::IndexedFramebuffer fb{600, 360};
+  mdk::Palette pal;
+  const auto palAt = [&](int i) { return pal.get(i); };
+  auto countIndex = [&](std::uint8_t idx) {
+    int n = 0;
+    for (std::size_t i = 0; i < fb.pixelCount(); ++i)
+      if (fb.pixels()[i] == idx) ++n;
+    return n;
+  };
+
+  Mode6BriefingInput in;
+  in.dtSec = 1.0f / 30.0f;  // original frame step (deltaSec semantics)
+  in.frameStep = 1;
+
+  // --- enter + first frame: init store bee4 = 2*dt, then the pump's
+  //     own fade arm adds another 2*dt -> bee4 = 4*dt after frame 1 ---
+  {
+    Mode6Briefing b;
+    b.enter(0, a);
+    CHECK(b.fadeIn() == 0.0f && b.charCursor() == 1.0f);
+    CHECK(!b.typingDone() && !b.exitDone());
+    CHECK(!b.step(in, fb, pal));
+    CHECK(b.fadeIn() == 4.0f * in.dtSec);
+    CHECK(fb.pixels()[0] == 5 && fb.pixels()[fb.pixelCount() - 1] == 5);
+    // OBSERVED quirk: the original's tail copy is byte-exact from the
+    // record FILE offset 0xc0 — with the 4-byte header that lands
+    // palette bytes [0xbc..0x2fc), shifted 4 bytes vs entries.
+    // srcPal[200] = rec[600..603) = palette bytes [596..599) =
+    // (entry198.B=7, entry199.R=199, entry199.G=56).
+    const int frac = int(4.0f / 30.0f * 256.0f);  // 34
+    auto c200 = palAt(200);
+    CHECK(int(c200.r) == (7 * frac) >> 8);
+    CHECK(int(c200.g) == (199 * frac) >> 8);
+    CHECK(int(c200.b) == (56 * frac) >> 8);
+    CHECK(int(c200.a) == 255);
+    // Sys-head entry blends the same way.
+    auto c9 = palAt(9);
+    CHECK(int(c9.r) == (90 * frac) >> 8);
+    CHECK(int(c9.g) == (180 * frac) >> 8);
+    CHECK(int(c9.b) == (10 * frac) >> 8);
+  }
+
+  // --- natural pace: fade-in completes, typing at 15 c/s, then the
+  //     page holds until a key (FUN_00429600's bf04 gate) ---
+  {
+    Mode6Briefing b;
+    b.enter(0, a);
+    int guard = 600;
+    while (!b.typingDone() && guard--) b.step(in, fb, pal);
+    CHECK(b.typingDone() && guard > 0);
+    // Fade-in pinned at 1.0; settled palette = src verbatim — entry
+    // 200 carries the quirk-shifted (7,199,56), not the record's
+    // intended (200,55,7).
+    CHECK(b.fadeIn() == 1.0f);
+    auto c200 = palAt(200);
+    CHECK(int(c200.r) == 7 && int(c200.g) == 199 && int(c200.b) == 56);
+    // bf04 holds -> 30 more frames, still no exit.
+    for (int i = 0; i < 30; ++i) CHECK(!b.step(in, fb, pal));
+    // Committed lines drew through the backdrop: 'X' glyphs = index 9.
+    CHECK(countIndex(9) == 9 * 4 * 7);  // 9 X's, 4x7 each
+    // Any key: bf04 -> 0, bee8 armed same frame, fade-out then exit.
+    Mode6BriefingInput key = in;
+    key.anyKey = true;
+    CHECK(!b.step(key, fb, pal));  // arm frame — bee8 = 2*dt, not done
+    CHECK(b.fadeOut() > 0.0f && b.fadeOut() < 1.0f);
+    key.anyKey = false;
+    guard = 200;
+    while (!b.step(key, fb, pal) && guard--) {}
+    CHECK(guard > 0);
+    CHECK(palAt(200).r == 0 && palAt(5).r == 0);  // faded to black
+  }
+
+  // --- hurry: fade arms run at rate*dt*2; typing at 60 c/s ---
+  {
+    Mode6Briefing b;
+    b.enter(0, a);
+    Mode6BriefingInput hurry = in;
+    hurry.hurryA = true;
+    int guard = 120;
+    while (!b.typingDone() && guard--) b.step(hurry, fb, pal);
+    CHECK(b.typingDone() && guard > 0);
+    CHECK(b.hurryLatch());
+  }
+
+  // --- esc latch: c24c forced to 2000 -> page completes the same
+  //     frame the fade-in settles; esc also satisfies the key scan ---
+  {
+    Mode6Briefing b;
+    b.enter(0, a);
+    Mode6BriefingInput esc = in;
+    esc.esc = true;
+    int guard = 120;
+    while (!b.typingDone() && guard--) b.step(esc, fb, pal);
+    CHECK(b.typingDone() && guard > 0);
+    CHECK(b.skipLatch());
+    // esc feeds FUN_00429600's scan -> bf04=0 -> bee8 armed the same
+    // page-done frame; exit lands ~0.5s later.
+    esc.esc = false;
+    guard = 200;
+    while (!b.step(esc, fb, pal) && guard--) {}
+    CHECK(guard > 0);
+  }
+
+  // --- '\d'/'\i' count-flag: only counted chars consume the budget;
+  //     the free tail rides the committed line in the same frame ---
+  {
+    Mode6BriefingAssets a2 = a;
+    a2.briefText = briefChars("\\c\\dX\\iXX");
+    Mode6Briefing b;
+    b.enter(0, a2);
+    int guard = 300;
+    while (!b.typingDone() && guard--) b.step(in, fb, pal);
+    CHECK(b.typingDone());
+    CHECK(countIndex(9) == 3 * 4 * 7);
+  }
+
+  // --- '\x-300' negative numeric arg: accepted, page still ends ---
+  {
+    Mode6BriefingAssets a3 = a;
+    a3.briefText = briefChars("\\cX\\x-300X");
+    Mode6Briefing b;
+    b.enter(0, a3);
+    int guard = 300;
+    while (!b.typingDone() && guard--) b.step(in, fb, pal);
+    CHECK(b.typingDone());
+    CHECK(countIndex(9) == 2 * 4 * 7);
+  }
+
+  // --- missing map record: zeroed background, page still runs ---
+  {
+    Mode6BriefingAssets a4;
+    a4.font = &font;
+    a4.sysHead = sysHead;
+    a4.briefText = a.briefText;
+    Mode6Briefing b;
+    b.enter(0, a4);
+    int guard = 300;
+    while (!b.typingDone() && guard--) b.step(in, fb, pal);
+    CHECK(b.typingDone());
+    CHECK(fb.pixels()[fb.pixelCount() - 1] == 0);
+  }
+}
+
 int main() {
   test_framebuffer();
   test_palette_expand();
@@ -30430,6 +30629,7 @@ int main() {
   test_stream_ribbon();
   test_flic_decoder();
   test_ending_cinematic();
+  test_mode6_briefing();
   std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

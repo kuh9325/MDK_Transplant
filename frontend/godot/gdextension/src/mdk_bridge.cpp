@@ -198,6 +198,13 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::stream_frame);
   ClassDB::bind_method(D_METHOD("stream_diag"),
                        &MdkBridge::stream_diag);
+  // Phase 19E — mode-6 briefing (FUN_00429cb4 family).
+  ClassDB::bind_method(D_METHOD("mode6_active"),
+                       &MdkBridge::mode6_active);
+  ClassDB::bind_method(D_METHOD("mode6_frame"),
+                       &MdkBridge::mode6_frame);
+  ClassDB::bind_method(D_METHOD("mode6_diag"),
+                       &MdkBridge::mode6_diag);
   // Phase 19D — mode-8 ending cinematic.
   ClassDB::bind_method(D_METHOD("load_ending"),
                        &MdkBridge::load_ending);
@@ -3824,6 +3831,143 @@ bool MdkBridge::campaignStreamEnter_(std::string& detail) {
   return true;
 }
 
+// --- Phase 19E — mode-6 briefing host ------------------------------
+// FUN_00429cb4's bind: MISC/STATS.BNI's L<levelId+1>_MAP record plus
+// MDKFONT.FTI's SYS_PAL head / FONTBIG / BRIEF<levelId+1>. The buffers
+// outlive the bound spans (member storage, reset on exit).
+bool MdkBridge::briefingEnter_(std::string& detail) {
+  std::string err;
+  auto bni = root_->readFile("MISC/STATS.BNI", 1 << 28, &err);
+  if (!bni) {
+    detail = "MISC/STATS.BNI: " + err;
+    return false;
+  }
+  auto fti = root_->readFile("MISC/MDKFONT.FTI", 1 << 28, &err);
+  if (!fti) {
+    detail = "MISC/MDKFONT.FTI: " + err;
+    return false;
+  }
+  briefingBniBytes_ = std::move(*bni);
+  briefingFtiBytes_ = std::move(*fti);
+
+  // SYS_PAL head (192B) — the working palette's entries 0..63
+  // (FUN_0040163c's resident copy; the map tail fills 64..255).
+  briefingSysHead_.assign(0xc0, 0);
+  const auto fdir = mdk::inspectFtiDirectory(
+      std::span<const std::byte>(briefingFtiBytes_.data(),
+                                 briefingFtiBytes_.size()));
+  if (const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, "SYS_PAL")) {
+    const std::size_t n = static_cast<std::size_t>(
+        r->payloadEnd - r->payloadFileOffset);
+    if (n >= 0xc0) {
+      std::memcpy(briefingSysHead_.data(),
+                  briefingFtiBytes_.data() + r->payloadFileOffset,
+                  0xc0);
+    }
+  }
+
+  // FONTBIG — the briefing's typed-text font (FUN_00414c34 path).
+  {
+    const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, "FONTBIG");
+    if (!r) {
+      detail = "FONTBIG not found in MDKFONT.FTI";
+      return false;
+    }
+    std::string ferr;
+    briefingFont_ = mdk::decodeFtiFont(
+        std::span<const std::byte>(
+            briefingFtiBytes_.data() + r->payloadFileOffset,
+            static_cast<std::size_t>(r->payloadEnd -
+                                     r->payloadFileOffset)),
+        &ferr);
+    if (!briefingFont_) {
+      detail = "FONTBIG decode: " + ferr;
+      return false;
+    }
+  }
+
+  mdk::Mode6BriefingAssets a;
+  a.font = &*briefingFont_;
+  a.sysHead = std::span<const std::uint8_t>(briefingSysHead_.data(),
+                                            briefingSysHead_.size());
+
+  // L<levelId+1>_MAP — the 4B header + 768B palette + 600x360 image.
+  {
+    const auto bdir = mdk::inspectBniDirectory(
+        std::span<const std::byte>(briefingBniBytes_.data(),
+                                   briefingBniBytes_.size()));
+    char name[16];
+    std::snprintf(name, sizeof(name), "L%d_MAP", sess_.levelId + 1);
+    const mdk::BniRecord* r = mdk::findBniRecord(bdir, name);
+    if (!r) {
+      detail = std::string(name) + " not found in STATS.BNI";
+      return false;
+    }
+    const auto* bp = reinterpret_cast<const std::uint8_t*>(
+        briefingBniBytes_.data());
+    a.mapRecord.assign(bp + r->payloadFileOffset, bp + r->payloadEnd);
+  }
+
+  // BRIEF<levelId+1> — NUL-terminated page text via FUN_00414890.
+  {
+    char name[16];
+    std::snprintf(name, sizeof(name), "BRIEF%d", sess_.levelId + 1);
+    const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, name);
+    if (!r) {
+      detail = std::string(name) + " not found in MDKFONT.FTI";
+      return false;
+    }
+    const char* p = reinterpret_cast<const char*>(
+        briefingFtiBytes_.data() + r->payloadFileOffset);
+    const std::size_t n = static_cast<std::size_t>(
+        r->payloadEnd - r->payloadFileOffset);
+    a.briefText.assign(p, p + n);
+    if (a.briefText.empty() || a.briefText.back() != '\0')
+      a.briefText.push_back('\0');
+  }
+
+  briefing_ = std::make_unique<mdk::Mode6Briefing>();
+  briefing_->enter(sess_.levelId, a);
+  briefingFrameSeq_ = 0;
+  return true;
+}
+
+Dictionary MdkBridge::mode6_frame() {
+  Dictionary out;
+  if (!briefing_ || briefingFrameSeq_ == 0) return out;
+  const mdk::IndexedFramebuffer& fb = briefingFb_;
+  out["w"] = fb.width();
+  out["h"] = fb.height();
+  PackedByteArray rgba;
+  rgba.resize(static_cast<int64_t>(fb.pixelCount()) * 4);
+  std::uint8_t* dst = rgba.ptrw();
+  for (std::size_t i = 0; i < fb.pixelCount(); ++i) {
+    const mdk::Palette::Color c = briefingPal_.get(fb.pixels()[i]);
+    dst[i * 4 + 0] = c.r;
+    dst[i * 4 + 1] = c.g;
+    dst[i * 4 + 2] = c.b;
+    dst[i * 4 + 3] = c.a;
+  }
+  out["rgba"] = rgba;
+  out["seq"] = static_cast<int64_t>(briefingFrameSeq_);
+  out["diag"] = mode6_diag();
+  return out;
+}
+
+Dictionary MdkBridge::mode6_diag() {
+  Dictionary out;
+  if (!briefing_) return out;
+  out["fade_in"] = briefing_->fadeIn();
+  out["fade_out"] = briefing_->fadeOut();
+  out["cursor"] = briefing_->charCursor();
+  out["typing_done"] = briefing_->typingDone();
+  out["exit_done"] = briefing_->exitDone();
+  out["skip"] = briefing_->skipLatch();
+  out["hurry"] = briefing_->hurryLatch();
+  out["presented"] = int64_t(briefingFrameSeq_);
+  return out;
+}
+
 Dictionary MdkBridge::stepStream_(double dt_ms, int64_t action_mask,
                                   const Dictionary* input) {
   Dictionary out;
@@ -5783,7 +5927,38 @@ Dictionary MdkBridge::frontend_progression_step(const Dictionary& input) {
     out["sess_mode"] = sess_.mode;
     return out;
   case 6:
-    e = mdk::progressionStepLoader(sess_, stageDone);
+    if (sess_.loaderSub == 3) {
+      // Phase 19E — FUN_00429cb4 owns the stage edge while sub-state
+      // 3 runs: the briefing machine's exit (FUN_00429600's arm) is
+      // the only route out; the placeholder hold does not apply.
+      if (!briefing_) {
+        std::string detail;
+        if (!briefingEnter_(detail)) {
+          setError_("mode-6 briefing: " + detail);
+          out["ok"] = false;
+          out["detail"] = String(detail.c_str());
+          return out;
+        }
+      }
+      // The pump's timing source — the host passes the real frame
+      // delta; frontendTimingUpdate keeps 0x49b6f4/0x49b6e8 semantics
+      // (the same feed the runtime modes use).
+      mdk::frontendTimingUpdate(
+          timing_, double(input.get("dt_ms", 1000.0 / 30.0)));
+      mdk::Mode6BriefingInput bi;
+      bi.dtSec = timing_.deltaSec;
+      bi.frameStep = timing_.frameStep;
+      bi.esc = bool(input.get("esc", false));
+      bi.hurryA = bool(input.get("hurry", false));
+      bi.hurryB = bool(input.get("hurry", false));
+      bi.anyKey = bool(input.get("any_key", false));
+      const bool done6 = briefing_->step(bi, briefingFb_, briefingPal_);
+      ++briefingFrameSeq_;
+      e = mdk::progressionStepLoader(sess_, done6);
+      if (sess_.mode != 6 || sess_.loaderSub != 3) briefing_.reset();
+    } else {
+      e = mdk::progressionStepLoader(sess_, stageDone);
+    }
     break;
   case 7:
     e = mdk::progressionStepMode7(sess_);
