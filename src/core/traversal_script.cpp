@@ -15,6 +15,7 @@
 #include "core/player_projectiles.h"
 #include "core/dynamic_objects.h"
 #include "core/enemy_runtime.h"
+#include "core/player_sniper.h"
 #include "core/dti_structure.h"
 
 namespace mdk {
@@ -1374,6 +1375,16 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
 //             0x74 +0x148 dword |=   0x44/45/46 +0xNN group |=/&=~/^=
 //             1<<(bit&31)          0x47 test bit + linkage
 //   masks:    0x1f {count,strings} -> +0x2c8 element-name/"ALL" mask
+//             0x20 {count,strings} -> +0x2c8 unmask (skip +0x2cc latch)
+//             0xd0 {lstr,linkage} -> branch on +0x2c8 bit of the named
+//             element (FUN_0045c0f0 exact match; the XS damaged-part
+//             gate — LEVEL3 HMO_1$XS XS1_SHOL/SHOR/EYES)
+//   combat:   0x6d {u8} -> FUN_00467888 player damage
+//             0xf8 {u8 mode,f32 a,[f32 b],f32 c} -> melee knockback:
+//             locoState=0x385, eventPriority=9, planar impulse scaled
+//             1/30 into 0x540e44/48, c unscaled into 0x540c78; gates
+//             0x540cbc>=9 / 0x540cac==0x320; unscopes 0x540c9c first
+//             (FUN_00461878) and kills the 0x540c74 fire latch.
 //   vars:     0x41 {mode,idx,u32} -> *FUN_00438654 slot
 //   connect:  0x96 {u32,u32}->+0x306/+0x30a anim recs
 //             0x97 {4 strs}->+0x316/31a/31e/322 sound names
@@ -3438,6 +3449,33 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0xd0: {                              // element-mask link (0x450a48)
+      // {lstr name, linkage}. OBSERVED: FUN_0045c0f0(name) scans the
+      // model's element records (the +0x1c-count / +0x20-array of
+      // 0x5c records, name at +0) for an exact streq hit -> element
+      // index (no "ALL" wildcard, unlike op 0x1f/0x20). cond =
+      // idx >= 0 && (+0x2c8 elemMaskB >> idx) & 1 — i.e. the named
+      // element is currently masked out. Gate semantics (0x450b4f /
+      // 0x450cc2): true -> fc/fe call a, fd return, all else goto a;
+      // false -> fe calls b, all else falls through.
+      const std::string nm = r.str();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("elemlink"); return; }
+      int idx = -1;
+      for (int e = 0; e < obj.elemSet.count; ++e) {
+        if (obj.model.elemName(e) == nm) { idx = e; break; }
+      }
+      const bool cond =
+          idx >= 0 && ((obj.col.elemMaskB >> (idx & 31)) & 1u) != 0;
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default:   if (cond) v.doGoto(L.a); break;   // 0x0c + others
+      }
+      return;
+    }
     case 0xb7: {                              // computed call (0x447754)
       // {u8 mode, u8 idx, u8 n, u32 target[n]}. OBSERVED: iv =
       // trunc(*FUN_00438654(mode,idx)); the table is always consumed;
@@ -4424,6 +4462,63 @@ void objScriptInsn(ObjScriptPass& v) {
         playerDamageApply(*env.rt, dmg, obj.pos);
       return;
     }
+    case 0xf8: {                            // melee knockback (0x448a86)
+      // {u8 mode, f32 a, [f32 b if mode==0], f32 c}. OBSERVED — the
+      // enemy strike against Kurt. mode==0 reads three floats and
+      // shoves in the bound object's yaw frame: a = forward-back
+      // component, b = lateral, through FUN_00437f98(+0x4c):
+      //   0x540e44 += -(a·cos) - (b·sin)
+      //   0x540e48 += -(b·cos) - (a·sin)
+      // mode!=0 reads two floats and shoves radially away from the
+      // object: dir = normalize(playerXY - objXY) in the ground
+      // plane (zero distance -> +x unit); the impulse components are
+      // a·dirX / a·dirY added straight into 0x540e44/48. In both
+      // modes the planar magnitudes scale by 1/30 (0x49b6f4) and c
+      // adds unscaled to 0x540c78 (vertVel).
+      //   Gate (runs before any write): 0x540cbc (eventPriority)
+      //   >= 9 or 0x540cac (locoState) == 0x320 -> no-op. Apply:
+      //   0x540c9c!=0 -> FUN_00461878 unscope; 0x540cac=0x385 (the
+      //   hit tumble), 0x540cbc=9; 0x540c74!=0 -> clear + the
+      //   FUN_00469668(0) HUD pair (mirrored as the fire-kill seam).
+      const std::uint8_t mode = r.u8();
+      float a = r.f32();
+      float b = 0.0f;
+      if (mode == 0) b = r.f32();
+      const float c = r.f32();
+      if (!r.ok) { v.fail("knock"); return; }
+      if (env.rt == nullptr) return;
+      TraversalRuntime& rt = *env.rt;
+      if (mode != 0) {
+        float dx = rt.cs.pos[0] - obj.pos[0];    // 0x540bfc - +0x10
+        float dy = rt.cs.pos[1] - obj.pos[1];    // 0x540c00 - +0x14
+        const float d = std::sqrt(dx * dx + dy * dy);
+        if (d != 0.0f) { dx /= d; dy /= d; }
+        else { dx = 1.0f; dy = 0.0f; }
+        b = a * dy;
+        a = a * dx;
+      }
+      if (rt.flagC9c != 0) sniperReset(rt);      // FUN_00461878
+      if (rt.eventPriority >= 9 || rt.locoState == 0x320) return;
+      a *= (1.0f / 30.0f);
+      b *= (1.0f / 30.0f);
+      rt.locoState = 0x385;                      // 0x540cac
+      rt.eventPriority = 9;                      // 0x540cbc
+      if (mode == 0) {
+        float s, co;
+        sincosDeg(obj.yawDeg, &s, &co);          // FUN_00437f98(+0x4c)
+        rt.animE44 += -(a * co) - (b * s);       // 0x540e44
+        rt.animE48 += -(b * co) - (a * s);       // 0x540e48
+      } else {
+        rt.animE44 += a;
+        rt.animE48 += b;
+      }
+      rt.vert.vertVel += c;                      // 0x540c78
+      if (rt.fieldC74 != 0) {                    // 0x540c74 fire latch
+        rt.fieldC74 = 0;
+        rt.seams.hudEventCalls += 2;             // FUN_00469668(0)
+      }
+      return;
+    }
     case 0xf0: {                            // damage-accum set (0x443c9f)
       // {u8 dmg}. OBSERVED: operand 1 is remapped to 5, then
       // `0 >= 0x540e10` (the player-damage suppress window idle)
@@ -5022,6 +5117,8 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x9a: return "h";
   case 0x25: case 0x72: return "l";
   case 0xf3: return "bhl";                     // refEsc {u8, u16, linkage}
+  case 0xd0: return "sl";                      // elemMask link {lstr, linkage}
+  case 0xf8: return "bf";                      // knockback {u8,f32} + mode tail
   case 0x21: return "wl";                      // pathLink {u32, linkage}
   case 0x30: return "fl"; case 0xbe: return "bs";
   case 0x60: return "ffffl";
@@ -5139,7 +5236,8 @@ const char* opcodeName(std::uint8_t op) {
   case 0x27: return "yawImp";  case 0x3d: return "mdlSpawn"; case 0x39: return "coneLink";
   case 0xcf: return "yawMorph"; case 0x1f: return "elemBind";
   case 0x20: return "elemUnmask"; case 0x26: return "velCmp";
-  case 0xf3: return "refEsc";
+  case 0xf3: return "refEsc";   case 0xd0: return "elemMaskLink";
+  case 0xf8: return "knockback";
   case 0xd8: return "varAcc";  case 0xd9: return "statAcc";  case 0x59: return "sfxBind";
   case 0x0e: return "viewLink"; case 0xc3: return "srcLink";
   default: return nullptr;
@@ -5251,6 +5349,13 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
         std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
       }
     }
+  }
+  if (out.opcode == 0xf8) {                  // mode==0 -> extra planar f32
+    if (imageBase + codeOff + 1 < image.size() &&
+        static_cast<std::uint8_t>(image[imageBase + codeOff + 1]) == 0) {
+      std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+    }
+    std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
   }
   if (out.opcode == 0xbd) {                  // sel==0 -> inline targetZ
     if (imageBase + codeOff + 1 < image.size() &&

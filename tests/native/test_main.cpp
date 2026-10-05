@@ -15715,6 +15715,296 @@ void test_traversal_object_script() {
     CHECK(r.halted && !r.error);
     CHECK(o.scriptCallDepth == 0);       // fd popped the frame
   }
+
+  // --- 0xd0 element-mask link (0x450a48): {lstr, linkage} gated on --
+  // --- FUN_0045c0f0 name -> element index, +0x2c8 bit test -----------
+  {
+    auto bindElems = [](mdk::DynamicObject& o) {
+      o.model = makeHomingModel({{"XS1_SHOL", 0.0f}, {"XS1_SHOR", 0.0f}});
+      o.elemSet = o.model.elementSet();      // +0x1c count / +0x20 arr
+    };
+
+    // masked element + 0x0c linkage -> goto a (mark[depth] cleared).
+    {
+      ScriptFixture f;
+      f.write(C, {0xd0});
+      f.writeStr(C + 1, "XS1_SHOR");          // element idx 1
+      f.write(C + 11, {0x0c});                // goto linkage
+      f.writeW(C + 12, 0x300);
+      f.write(C + 0x10, {0xff});
+      f.write(0x300, {0x01, 0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      bindElems(o);
+      o.col.elemMaskB = 1u << 1;              // +0x2c8: SHOR masked
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(o.field108 ==
+            static_cast<const void*>(f.image.data() + 4 + 0x300 + 1));
+    }
+
+    // element enabled (bit clear) + 0x0c -> falls through past the op.
+    {
+      ScriptFixture f;
+      f.write(C, {0xd0});
+      f.writeStr(C + 1, "XS1_SHOR");
+      f.write(C + 11, {0x0c});
+      f.writeW(C + 12, 0x300);
+      f.write(C + 0x10, {0x01, 0xff});        // ckpt; suspend
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      bindElems(o);
+      o.col.elemMaskB = 1u << 0;              // only SHOL masked
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(o.field108 ==
+            static_cast<const void*>(f.image.data() + 4 + C + 0x11));
+    }
+
+    // unknown element name -> index -1 -> 0xfe calls the else target.
+    {
+      ScriptFixture f;
+      f.write(C, {0xd0});
+      f.writeStr(C + 1, "XS1_NONE");
+      f.write(C + 11, {0xfe});
+      f.writeW(C + 12, 0x300);                 // a: gate-true call
+      f.writeW(C + 16, 0x340);                 // b: else call
+      f.write(C + 0x14, {0xff});
+      f.write(0x340, {0x01, 0xfd});            // else body: ckpt; ret
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      bindElems(o);
+      o.col.elemMaskB = 0;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(o.field108 ==                     // fd restored saved +0x108
+            static_cast<const void*>(f.image.data() + 4 + C));
+      CHECK(o.scriptCallDepth == 0);           // fd returned
+    }
+
+    // masked element + 0xfc -> pushes a frame and calls a.
+    {
+      ScriptFixture f;
+      f.write(C, {0xd0});
+      f.writeStr(C + 1, "XS1_SHOL");          // element idx 0
+      f.write(C + 11, {0xfc});
+      f.writeW(C + 12, 0x300);
+      f.write(C + 0x10, {0x01, 0xff});
+      f.write(0x300, {0xfd});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      bindElems(o);
+      o.col.elemMaskB = 1u;                    // SHOL masked
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(o.scriptCallDepth == 0);           // call+return balanced
+      CHECK(o.field108 ==
+            static_cast<const void*>(f.image.data() + 4 + C + 0x11));
+    }
+
+    // masked element + 0xfd -> conditional return pops a frame.
+    {
+      ScriptFixture f;
+      f.write(C, {0xfc, 0x01});                // rcall n=1 -> callee
+      f.writeW(C + 2, 0x300);
+      f.write(C + 6, {0x01, 0xff});
+      f.write(0x300, {0xd0});
+      f.writeStr(0x301, "XS1_SHOL");
+      f.write(0x30b, {0xfd});                  // return-on-masked
+      f.write(0x30c, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      bindElems(o);
+      o.col.elemMaskB = 1u;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(o.scriptCallDepth == 0);
+      CHECK(o.field108 ==
+            static_cast<const void*>(f.image.data() + 4 + C + 7));
+    }
+
+    // decode: {lstr, linkage} — "elemMaskLink \"XS1_SHOR\" link0c:300".
+    {
+      ScriptFixture f;
+      f.write(C, {0xd0});
+      f.writeStr(C + 1, "XS1_SHOR");
+      f.write(C + 11, {0x0c});
+      f.writeW(C + 12, 0x300);
+      auto d = mdk::traversalScriptDecode(f.image, 4, C);
+      CHECK(d.opcode == 0xd0 && d.length == 16);
+      CHECK(d.text.find("XS1_SHOR") != std::string::npos);
+      CHECK(d.linkTargets.size() == 1 && d.linkTargets[0] == 0x300);
+    }
+  }
+
+  // --- 0xf8 melee knockback (0x448a86): the enemy strike vs Kurt ----
+  {
+    // mode 1 radial: player at +x of the object -> impulse (a,0,up c),
+    // planar scaled 1/30, c unscaled; tumble 0x385 + latch 9 direct.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x01});                // mode 1
+      f.writeF(C + 2, 40.0f);                  // a
+      f.writeF(C + 6, 20.0f);                  // c (vertical)
+      f.write(C + 0x0a, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.pos[0] = 0.0f; o.pos[1] = 0.0f;
+      f.rt.cs.pos[0] = 10.0f;                  // player due +x
+      f.rt.cs.pos[1] = 0.0f;
+      f.rt.locoState = 0x64;
+      f.rt.eventPriority = 0;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.locoState == 0x385);          // 0x540cac
+      CHECK(f.rt.eventPriority == 9);          // 0x540cbc
+      CHECK(near(f.rt.animE44, 40.0 / 30.0, 1e-4));
+      CHECK(near(f.rt.animE48, 0.0, 1e-5));
+      CHECK(near(f.rt.vert.vertVel, 20.0, 1e-4)); // c unscaled
+    }
+
+    // mode 1 radial, zero distance -> unit +x dir (OBSERVED fallback).
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x02});
+      f.writeF(C + 2, 30.0f);
+      f.writeF(C + 6, 0.0f);
+      f.write(C + 0x0a, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.pos[0] = 5.0f; o.pos[1] = 5.0f;
+      f.rt.cs.pos[0] = 5.0f; f.rt.cs.pos[1] = 5.0f;
+      f.rt.locoState = 0x64; f.rt.eventPriority = 0;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(near(f.rt.animE44, 1.0, 1e-4));
+      CHECK(near(f.rt.animE48, 0.0, 1e-5));
+    }
+
+    // mode 0 yaw frame: yaw=0 -> (animE44,animE48) += -(a,b)/30.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x00});
+      f.writeF(C + 2, 30.0f);                  // a (forward comp)
+      f.writeF(C + 6, 60.0f);                  // b (lateral comp)
+      f.writeF(C + 0x0a, -5.0f);               // c
+      f.write(C + 0x0e, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.yawDeg = 0.0f;                          // +0x4c -> cos=1,sin=0
+      f.rt.locoState = 0x64; f.rt.eventPriority = 0;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(near(f.rt.animE44, -1.0, 1e-4));
+      CHECK(near(f.rt.animE48, -2.0, 1e-4));
+      CHECK(near(f.rt.vert.vertVel, -5.0, 1e-4));
+    }
+
+    // mode 0 yaw=90 -> sin=1,cos=0: animE44 += -b, animE48 += -a.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x00});
+      f.writeF(C + 2, 30.0f);
+      f.writeF(C + 6, 60.0f);
+      f.writeF(C + 0x0a, 0.0f);
+      f.write(C + 0x0e, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      o.yawDeg = 90.0f;
+      f.rt.locoState = 0x64; f.rt.eventPriority = 0;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(near(f.rt.animE44, -2.0, 1e-3));
+      CHECK(near(f.rt.animE48, -1.0, 1e-3));
+    }
+
+    // gate: eventPriority >= 9 blocks the hit entirely (no writes).
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x01});
+      f.writeF(C + 2, 40.0f); f.writeF(C + 6, 20.0f);
+      f.write(C + 0x0a, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      f.rt.cs.pos[0] = 10.0f;
+      f.rt.locoState = 0x64;
+      f.rt.eventPriority = 10;                  // already latched
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.locoState == 0x64);
+      CHECK(near(f.rt.animE44, 0.0, 1e-6));
+      CHECK(near(f.rt.vert.vertVel, 0.0, 1e-6));
+    }
+
+    // gate: locoState == 0x320 (mantle) blocks the hit.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x01});
+      f.writeF(C + 2, 40.0f); f.writeF(C + 6, 20.0f);
+      f.write(C + 0x0a, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      f.rt.cs.pos[0] = 10.0f;
+      f.rt.locoState = 0x320;
+      f.rt.eventPriority = 0;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.locoState == 0x320);
+      CHECK(f.rt.eventPriority == 0);           // untouched
+    }
+
+    // fieldC74 fire latch + FUN_00469668(0) HUD pair on the hit.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x01});
+      f.writeF(C + 2, 0.0f); f.writeF(C + 6, 0.0f);
+      f.write(C + 0x0a, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      f.rt.cs.pos[0] = 10.0f;
+      f.rt.locoState = 0x64; f.rt.eventPriority = 0;
+      f.rt.fieldC74 = 1;
+      const int ev0 = f.rt.seams.hudEventCalls;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.fieldC74 == 0);
+      CHECK(f.rt.seams.hudEventCalls == ev0 + 2);
+    }
+
+    // flagC9c scoped -> FUN_00461878 unscope BEFORE the gate — the
+    // reset zeroes eventPriority/locoState so the knockback lands.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x01});
+      f.writeF(C + 2, 30.0f); f.writeF(C + 6, 0.0f);
+      f.write(C + 0x0a, {0xff});
+      mdk::DynamicObject& o = f.arena->dyn.allocFront();
+      f.rt.cs.pos[0] = 10.0f;
+      f.rt.locoState = 0x64;
+      f.rt.eventPriority = 10;                  // would block — but
+      f.rt.flagC9c = 1;                         // the unscope resets it
+      f.rt.cur = f.arena;
+      o.field108 = f.image.data() + 4 + C;
+      auto r = mdk::traversalObjectScriptTick(f.env, o);
+      CHECK(r.halted && !r.error);
+      CHECK(f.rt.flagC9c == 0);
+      CHECK(f.rt.locoState == 0x385);           // hit applied post-reset
+      CHECK(f.rt.eventPriority == 9);
+    }
+
+    // decode: mode 1 reads {u8, f32, f32}; mode 0 reads three floats.
+    {
+      ScriptFixture f;
+      f.write(C, {0xf8, 0x01});
+      f.writeF(C + 2, 40.0f); f.writeF(C + 6, 20.0f);
+      auto d = mdk::traversalScriptDecode(f.image, 4, C);
+      CHECK(d.opcode == 0xf8 && d.length == 10);
+      f.write(0x300, {0xf8, 0x00});
+      f.writeF(0x302, 1.0f); f.writeF(0x306, 2.0f); f.writeF(0x30a, 3.0f);
+      auto d2 = mdk::traversalScriptDecode(f.image, 4, 0x300);
+      CHECK(d2.length == 14);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
