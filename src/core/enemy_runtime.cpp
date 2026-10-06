@@ -926,18 +926,6 @@ void cmdArmAnim(DynamicObject& o, const void* rec, float acc) {
 // FX/spawn seams — counted, presentation-only (FUN_00402160 child FX
 // spawn, FUN_00405ffc afterimage, FUN_00403f6c/0x4108 spawn FX,
 // FUN_004575fc remnant, FUN_004387ec anim-ctx spawn).
-// FUN_00402160 doubles as the positional sound spawn: when the object
-// carries a bound +0x15c voice name the call starts the owned voice
-// instance at +0x10 (pos source) — emit that event here. An empty
-// name maps to the original's snd==0 early-out (no instance).
-DynamicObject* fxChildSpawn(TraversalRuntime& rt, DynamicObject& o) {
-  rt.seams.reticleSpawnCalls++;    // same FUN_00402160 seam family
-  if (!o.field15c.empty())
-    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
-                                 o.field15c, o.pos, &o, 0x2000e);
-  return nullptr;                  // the FX child is presentation-only
-}
-
 void fxAfterimage(TraversalRuntime& rt, DynamicObject& o) {
   rt.seams.remnantSpawnCalls++;
   (void)o;
@@ -1206,6 +1194,18 @@ void cmdDropperSpawn(TraversalRuntime& rt, DynamicObject& o,
 }
 
 } // namespace
+
+// FUN_00402160 doubles as the positional sound spawn: when the object
+// carries a bound +0x15c voice name the call starts the owned voice
+// instance at +0x10 (pos source) — emit that event here. An empty
+// name maps to the original's snd==0 early-out (no instance).
+DynamicObject* fxChildSpawn(TraversalRuntime& rt, DynamicObject& o) {
+  rt.seams.reticleSpawnCalls++;    // same FUN_00402160 seam family
+  if (!o.field15c.empty())
+    traversalAudioEmitPositional(rt, TraversalAudioOp::kSpawnPositional,
+                                 o.field15c, o.pos, &o, 0x2000e);
+  return nullptr;                  // the FX child is presentation-only
+}
 
 void fxShockwave(TraversalRuntime& rt, DynamicObject& o, float scale) {
   // FUN_004575fc — the detonation remnant seam (CombatFxEvent kind

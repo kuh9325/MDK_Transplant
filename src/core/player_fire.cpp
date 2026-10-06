@@ -219,44 +219,6 @@ DynamicObject* objectOf(const CollisionObject* o) {
 }
 
 // ---------------------------------------------------------------------------
-// FUN_0046153c — bounded ray-vs-world probe as invoked by the weapon-5
-// charge probe (flags=3: object scan + BSP stab, +0x148 mask 0x30).
-// `end` arrives as the ray target and is clipped to the nearest object
-// hit; a BSP hit overwrites it with the stab crossing (the original's
-// outPos writes through to the caller's vec). Returns true on any hit.
-// ---------------------------------------------------------------------------
-bool weapon5RayProbe(TraversalRuntime& rt, const float start[3],
-                     float end[3]) {
-  bool hit = false;
-  const DynamicArena* lists[2] = {
-      rt.cur ? &rt.cur->dyn : nullptr,
-      (rt.partnerActive && rt.partner) ? &rt.partner->dyn : nullptr};
-  for (const DynamicArena* la : lists) {
-    if (!la) continue;
-    for (const auto& up : la->storage) {
-      const DynamicObject& o = *up;
-      if (!o.col.named || o.col.model == nullptr) continue;  // +6/+8
-      if ((o.col.flags148 & 0x30) != 0) continue;            // mask arg
-      int elem = -1, tri = -1;
-      collisionObjectProbe(&o.col, start, end, &elem, &tri);
-      if (elem >= 0) hit = true;
-    }
-  }
-  float stabPt[3] = {0, 0, 0};
-  if (rt.cs.arena != nullptr &&
-      collisionStab(*rt.cs.arena, start, end, stabPt) != nullptr) {
-    for (int i = 0; i < 3; ++i) end[i] = stabPt[i];
-    return true;
-  }
-  if (rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0 &&
-      collisionStab(*rt.cs.carrier, start, end, stabPt) != nullptr) {
-    for (int i = 0; i < 3; ++i) end[i] = stabPt[i];
-    return true;
-  }
-  return hit;
-}
-
-// ---------------------------------------------------------------------------
 // FUN_0045a4dc — weapon-5 thrown X_STRIKE spawn + charged trajectory.
 // The object is an ordinary arena DynamicObject bound to cmd 0x80 and
 // the shared five-key path record at 0x54ca00.
@@ -413,6 +375,45 @@ void weapon5Spawn(TraversalRuntime& rt) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// FUN_0046153c — bounded ray-vs-world probe as invoked by the weapon-5
+// charge probe and the mounted bomb-sight fire path (flags=3: object
+// scan + BSP stab, +0x148 mask 0x30). `end` arrives as the ray target
+// and is clipped to the nearest object hit; a BSP hit overwrites it
+// with the stab crossing (the original's outPos writes through to the
+// caller's vec). Returns true on any hit.
+// ---------------------------------------------------------------------------
+bool weapon5RayProbe(TraversalRuntime& rt, const float start[3],
+                     float end[3]) {
+  bool hit = false;
+  const DynamicArena* lists[2] = {
+      rt.cur ? &rt.cur->dyn : nullptr,
+      (rt.partnerActive && rt.partner) ? &rt.partner->dyn : nullptr};
+  for (const DynamicArena* la : lists) {
+    if (!la) continue;
+    for (const auto& up : la->storage) {
+      const DynamicObject& o = *up;
+      if (!o.col.named || o.col.model == nullptr) continue;  // +6/+8
+      if ((o.col.flags148 & 0x30) != 0) continue;            // mask arg
+      int elem = -1, tri = -1;
+      collisionObjectProbe(&o.col, start, end, &elem, &tri);
+      if (elem >= 0) hit = true;
+    }
+  }
+  float stabPt[3] = {0, 0, 0};
+  if (rt.cs.arena != nullptr &&
+      collisionStab(*rt.cs.arena, start, end, stabPt) != nullptr) {
+    for (int i = 0; i < 3; ++i) end[i] = stabPt[i];
+    return true;
+  }
+  if (rt.cs.carrier != nullptr && rt.cs.carrierBusy == 0 &&
+      collisionStab(*rt.cs.carrier, start, end, stabPt) != nullptr) {
+    for (int i = 0; i < 3; ++i) end[i] = stabPt[i];
+    return true;
+  }
+  return hit;
+}
 
 // ---------------------------------------------------------------------------
 // FUN_0045f138 — the player weapon-fire dispatch (sniper callsite).

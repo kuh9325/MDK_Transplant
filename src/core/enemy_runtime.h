@@ -141,6 +141,12 @@ float remnantBankDeg(const TraversalRuntime& rt, const float pos[3],
 // opcode bodies call it too. Exported so the frontend diagnostics
 // can drive the same seam the opcodes reach.
 void fxShockwave(TraversalRuntime& rt, DynamicObject& o, float scale);
+
+// FUN_00402160 — the child-FX/positional-sound spawn: emits the
+// object's bound +0x15c voice as a positional event at +0x10 and
+// returns the FX child (presentation-only — always nullptr here).
+// Shared by the cmd bodies and the mounted bomb-sight fire path.
+DynamicObject* fxChildSpawn(TraversalRuntime& rt, DynamicObject& o);
 // FUN_00437f98 — degree sin/cos pair (deg * pi/180 -> {sin,cos}).
 void sincosDeg(float deg, float* sinOut, float* cosOut);
 // The shared seek-op tail (OBSERVED in the 0x4e/0x2b/0x2b-broadcast

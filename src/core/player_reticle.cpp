@@ -5,12 +5,15 @@
 
 #include "core/player_reticle.h"
 
+#include <cmath>
 #include <string>
 
 #include "core/collision_query.h"
 #include "core/dynamic_objects.h"
+#include "core/enemy_runtime.h"
 #include "core/motion_channels.h"
 #include "core/player_camera.h"
+#include "core/player_fire.h"
 #include "core/player_look.h"
 #include "core/player_sniper.h"
 #include "core/traversal_runtime.h"
@@ -170,6 +173,110 @@ void playerReticleDispatchMounted(TraversalRuntime& rt,
   }
 }
 
+// ---------------------------------------------------------------------------
+// FUN_004691c4's armed-fire tail (0x469385..0x469517) — the XBN_BOMB
+// lob. OBSERVED (MDK95.EXE BUILD_A, instruction-level):
+//   - 0x4693f8: 540ea0 -= 1 runs BEFORE the trace/spawn — the bomb is
+//     consumed even when the class lookup fails.
+//   - launch = playerPos (0x540bfc) with z += -5.0 (0x498c08).
+//   - dir.xy = (d48-300)*M2row0 + (d4c-180)*M2row1 through the camera
+//     basis rows 0x540bb0/b4 + 0x540bc0/c4 (0x498c10/0x498c18
+//     offsets); dir.z = -600.0 / 0x540b58 (0x498c20 / zoom).
+//   - FUN_0046153c(pos, dir, 1000.0, &hit, 0,0, 3, 0x30, 0): outPos is
+//     the unclipped far end on a miss and the clipped point on a hit.
+//   - hit: t = sqrt(2*(launch.z - hit.z)/mount+0x48); miss: t = 2.5
+//     (0x40200000). vel.xy = (hit.xy - pos.xy)/t; vel.z = 0 — a pure
+//     lob: horizontal launch velocity only, gravity does the drop.
+//   - spawn = FUN_00454af8(arena 0x540c48, launch, spawnId 1,
+//     classIdx("XBN_BOMB"), scriptOff 0, flag 0) — a scriptless object
+//     driven entirely by the +0x30a = 0x81 command body.
+//   - tail writes: +0x30e=900 (fuse), +0x58=1.0 (scale), +0x30a=0x81,
+//     +0x44=0 (drag off), +0x148 dword |= 0x818a6, +0x28..0x30 = vel,
+//     +0x4c = 0x540c2c (locomotion yaw), FUN_0045612c rebuild,
+//     +0x15c = "DROP" (0x49bacc -> 0x4985f8), FUN_00402160 FX child
+//     (&+0x158, slot, &+0x10, 0, 0x7fff, 1.0f, 50.0f).
+// `mount` is the original's 0x540e6c — the object whose +0x48 gravity
+// feeds the flight-time solve. On the scripted Level-3 ride there is
+// no mount object; the FUN_004566f0 default +0x48 = 32.0 applies
+// (every object inits to 32.0 and no class-record write to +0x48
+// exists — DOCUMENTED at initObjectDefaults).
+// ---------------------------------------------------------------------------
+void playerReticleFireBomb(TraversalRuntime& rt,
+                           const DynamicObject* mount) {
+  rt.bombs -= 1;                                 // 0x4693f8
+  ++rt.seams.reticleSpawnCalls;   // FUN_0046153c + spawn-family seam
+
+  // 0x46939c..0x469407 — the reticle offset through the unscaled M2
+  // basis rows plus the fixed downward reach -600/zoom.
+  const float* pos = rt.cs.pos;
+  const float retX = rt.motion.moveVel - 300.0f;   // 0x498c10
+  const float retY = rt.motion.strafeVel - 180.0f; // 0x498c18
+  const float dir[3] = {
+      retX * rt.camera.pose.basis[0][0] + retY * rt.camera.pose.basis[0][1],
+      retX * rt.camera.pose.basis[1][0] + retY * rt.camera.pose.basis[1][1],
+      -600.0f / rt.camera.zoom};                   // 0x498c20 / 0x540b58
+
+  // FUN_0046153c — end = pos + dir*1000, then the object/BSP clip.
+  float hit[3] = {pos[0] + dir[0] * 1000.0f,
+                  pos[1] + dir[1] * 1000.0f,
+                  pos[2] + dir[2] * 1000.0f};
+  const bool traced = weapon5RayProbe(rt, pos, hit);
+
+  // 0x46941c..0x469432 / 0x4695e7 — the flight-time solve.
+  const float g = mount != nullptr ? mount->field48 : 32.0f;
+  float t = 2.5f;                                  // 0x40200000
+  if (traced) {
+    const float q = 2.0f * ((pos[2] - 5.0f) - hit[2]) / g;
+    // PORT GUARD: a hit above the launch pushes q < 0 into fsqrt —
+    // the original propagates the NaN into the velocity (dead bomb).
+    // Keeping the miss time is observable-equivalent without
+    // poisoning the port's collision sweep math.
+    if (q > 0.0f) t = std::sqrt(q);
+  }
+  // 0x469435..0x469459 — horizontal velocity only; vel.z = 0 always.
+  const float vel[3] = {(hit[0] - pos[0]) / t, (hit[1] - pos[1]) / t,
+                        0.0f};
+
+  // FUN_00454794 — class record lookup; a miss skips the spawn tail
+  // (0x469461 jl) but the bomb stays consumed.
+  ++rt.seams.classLookupCalls;
+  const int idx = rt.level.enemies.indexOf("XBN_BOMB");
+  if (idx < 0) return;
+  const RuntimeModel* src = traversalModelFor(idx, &rt.level);
+  if (src == nullptr || rt.cur == nullptr) return;  // port bound
+
+  // FUN_00454af8 — generic spawn into the current arena (0x540c48):
+  // pos + spawnId 1 + class idx + scriptOff 0.
+  DynamicObject& o = rt.cur->dyn.allocFront();      // FUN_0045cffc
+  o.scriptClass = "XBN_BOMB";
+  o.scriptOff = 0;                  // +0x108 — scriptless object
+  o.enemyIndex = static_cast<std::uint16_t>(idx);
+  o.arena = &rt.cur->dyn;
+  o.spawnId = 1;                    // +0x146
+  o.setPosition(pos[0], pos[1], pos[2] - 5.0f);   // 0x498c08 launch
+  o.prevPos[0] = pos[0]; o.prevPos[1] = pos[1];
+  o.prevPos[2] = pos[2] - 5.0f;                     // +0x180..
+  o.behaviorByte = 7;               // +0x11c
+  o.model = deepCopyModel(*src);    // FUN_00403720
+  initObjectCollision(o);           // FUN_004566f0 defaults + rebuild
+
+  // 0x469481..0x469517 — the fire block's own field writes.
+  o.field30e = 900;                 // +0x30e = 0x384 — 30 s fuse
+  o.col.scale = 1.0f;               // +0x58
+  o.field30a = 0x81;                // +0x30a — the bomb command body
+  o.field44 = 0.0f;                 // +0x44 — drag off
+  o.col.flags148 |= 0x18a6;         // +0x148 dword |= 0x818a6
+  o.col.flags14a |= 0x08;
+  o.field28 = vel[0];               // +0x28..+0x30 — launch velocity
+  o.field2c = vel[1];
+  o.field30 = vel[2];
+  o.yawDeg = rt.motion.yawDeg;      // +0x4c = 0x540c2c
+  o.prevYawDeg = rt.motion.yawDeg;
+  rebuildObjectTransform(o);        // FUN_0045612c
+  o.field15c = "DROP";              // +0x15c = PTR 0x49bacc -> "DROP"
+  o.field158 = fxChildSpawn(rt, o); // FUN_00402160
+}
+
 void playerReticleUpdate(TraversalRuntime& rt,
                          const RawGameplayInput& raw,
                          const GameplayInputBindings& bindings,
@@ -237,10 +344,9 @@ void playerReticleUpdate(TraversalRuntime& rt,
       rt.fieldD0c = kReticleLatchArmed;
     } else {
       if (rt.fieldD0c == kReticleLatchArmed && rt.bombs > 0) {
-        // 0x469385 — the ballistic spawn: pos.z -= 5.0, the aim
-        // unproject into M2, projectile spawn + setup — counted seam.
-        rt.bombs -= 1;
-        ++rt.seams.reticleSpawnCalls;
+        // 0x469385 — the XBN_BOMB ballistic lob (the whole spawn tail,
+        // not a counted seam).
+        playerReticleFireBomb(rt, obj);
       }
       rt.fieldD0c -= frameStep;
     }

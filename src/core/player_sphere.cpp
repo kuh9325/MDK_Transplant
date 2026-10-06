@@ -6,8 +6,7 @@
 #include <cmath>
 
 #include "core/frontend_machines.h"
-#include "core/motion_channels.h"
-#include "core/player_reticle.h"
+#include "core/player_sniper.h"
 #include "core/traversal_runtime.h"
 
 namespace mdk {
@@ -22,13 +21,6 @@ constexpr float kSphereEntryDelaySec = 0.7f;
 // canonical AVI (~35.7 s); the path below is traversed at uniform
 // speed over this window.
 constexpr float kSphereRideSeconds = 35.6f;
-
-// HYPOTHESIS — the ladder is observed at x0 (entry), x22 (~19 s in)
-// and x50+ (~35 s in). 75 covers the observed maximum; 0.7 s/unit
-// lands x22 at ~15.4 s and x50 at ~35 s, inside the observed window.
-// The original cap/rate is UNKNOWN.
-constexpr int kSphereAmmoCap = 75;
-constexpr float kSphereRechargeSec = 0.7f;
 
 // The ride path. Endpoints are evidence-bound; interior waypoints are
 // HYPOTHESIS (straight-line segments — the original's spline/shape is
@@ -79,26 +71,27 @@ void spherePathPoint(float dist, float out[3]) {
   out[2] = kSpherePath[kSpherePathCount - 1][2];
 }
 
-// The class-4 mount dword — CORROBORATED: the XE/X_STRIKE object
-// entry selects the same 0x40031 and the reticle/fire machinery is
-// the shared FUN_004691c4 path.
-constexpr std::uint32_t kSphereMountClass = 0x40031u;
-
+// Scripted-ride entry — the masked ride is the sniper scope running on
+// the scripted path. OBSERVED (BUILD_A + canonical AVI): the sequence
+// does NOT set the mount dword (0x540e70's only writers are the
+// standing-mount paths) — the masked view + HUD are the scope overlay.
+// Evidence: the cockpit mask + crosshair + "x N" readout; "x N" is the
+// 0x417f47 zoom-charge percentage ((1-0x540b58)^2 * 1.0519395 * 100),
+// drawn when 0x540ca0 > 1 && traversal mode — NOT ammunition. The ride
+// engages the scope (0x540c9c = 1); FUN_00436100's per-frame advance
+// walks 0x540ca0 1 -> 3 over the entry window, matching the observed
+// wipe-in while Kurt still stands on the pad.
 void sphereSeqEnter(TraversalRuntime& rt) {
   rt.spherePhase = 2;
   rt.sphereTimer = 0.0f;
   rt.sphereDist = 0.0f;
-  rt.mountClass = kSphereMountClass;
+  rt.mountClass = 0;            // 0x540e70 stays 0 — no mount object
   rt.eventMag = 0;
   rt.eventType = 0;
-  rt.reticleAux = 0;
-  rt.motion.moveVel = 300.0f;     // reticle X — class-4 entry center
-  rt.motion.strafeVel = 180.0f;   // reticle Y
-  rt.motion.zoomChannel = 0.0f;
-  rt.motion.turnVel = 0.0f;
-  rt.bombs = 0;                   // OBSERVED: ladder reads "x 0" at
-                                  // entry (SPHERE_ENTRY.md section 2)
-  rt.bombRecharge = kSphereRechargeSec;
+  rt.flagC9c = 1;               // 0x540c9c — scope engaged by sequence
+  rt.transitionPhase = 1;       // 0x540ca0 — advances 1 -> 3
+  // 0x540b58 is not written here — the zoom tail's >= 1.0 ceiling
+  // snaps the unscoped 2.4 default down to 1.0 (the observed "x 0").
 }
 
 } // namespace
@@ -112,111 +105,68 @@ void playerSphereArm(TraversalRuntime& rt, int spawnArena) {
   rt.sphereTimer = 0.0f;
 }
 
-bool playerSphereStep(TraversalRuntime& rt,
-                      const RawGameplayInput& raw,
-                      const GameplayInputBindings& bindings,
-                      const GameplayInputFrame& ctrl,
+void playerSphereStep(TraversalRuntime& rt,
+                      const RawGameplayInput& /*raw*/,
+                      const GameplayInputBindings& /*bindings*/,
+                      const GameplayInputFrame& /*ctrl*/,
                       const FrontendTimingState& timing) {
   if (rt.spherePhase == 1) {
     rt.sphereTimer += timing.deltaSec;
     if (rt.sphereTimer < kSphereEntryDelaySec)
-      return false;
+      return;
     sphereSeqEnter(rt);
   }
-  if (rt.spherePhase != 2) return false;
+  if (rt.spherePhase != 2) return;
 
-  const float dt = timing.deltaSec;
-  const float f0 = timing.smoothed;
+  // Scripted path advance — uniform speed over the observed window.
+  // The pod pos is written BEFORE the dispatch so the sniper branch's
+  // gravity/aim/fire see this frame's pod position; the post-step
+  // re-asserts it after the update (the sequence owns the position).
   const float total = spherePathLength();
   const float speed = total / kSphereRideSeconds;
-
-  // Scripted path advance — uniform speed over the observed window;
-  // player pos follows the pod (the class-4 pin semantic).
-  rt.sphereDist += speed * dt;
+  rt.sphereDist += speed * timing.deltaSec;
+  if (rt.sphereDist > total) rt.sphereDist = total;
   float p[3];
   spherePathPoint(rt.sphereDist, p);
   rt.cs.pos[0] = p[0];
   rt.cs.pos[1] = p[1];
   rt.cs.pos[2] = p[2];
 
-  // Reticle channels — FUN_004691c4's channel block (semantic channels
-  // through accelChannel; the "/3" raw-mouse fallback when no semantic
-  // channel is live; inactive channels decay; integrate + pixel clamp).
-  int dl = 0;
-  if (ctrl.yawThird != 0.0f) {
-    accelChannel(rt.motion.turnVel, ctrl.yawThird, ctrl.yaw10, f0);
-    dl |= 4;
-  }
-  if (ctrl.moveThird != 0.0f) {
-    accelChannel(rt.motion.zoomChannel, ctrl.moveThird, ctrl.move10,
-                 f0);
-    dl |= 8;
-  }
-  if (dl == 0 && (raw.mouseDx != 0 || raw.mouseDy != 0) &&
-      bindings.mouseOn) {
-    const float mk = static_cast<float>(kReticleMouseK);
-    rt.motion.moveVel += static_cast<float>(raw.mouseDx) * mk;
-    rt.motion.strafeVel += static_cast<float>(raw.mouseDy) * mk;
-    rt.motion.turnVel = 0.0f;
-    rt.motion.zoomChannel = 0.0f;
-  }
-  if ((dl & 4) == 0) linearDecay(rt.motion.turnVel, kReticleDecay, f0);
-  if ((dl & 8) == 0)
-    linearDecay(rt.motion.zoomChannel, kReticleDecay, f0);
-  rt.motion.moveVel += rt.motion.turnVel * f0;
-  if (rt.motion.moveVel < kReticleXMin)
-    rt.motion.moveVel = kReticleXMin;
-  if (rt.motion.moveVel > kReticleXMax)
-    rt.motion.moveVel = kReticleXMax;
-  rt.motion.strafeVel += rt.motion.zoomChannel * f0;
-  if (rt.motion.strafeVel < kReticleYMin)
-    rt.motion.strafeVel = kReticleYMin;
-  if (rt.motion.strafeVel > kReticleYMax)
-    rt.motion.strafeVel = kReticleYMax;
+  // Pod footing — the scripted pod is solid footing: pin the contact
+  // flag + vertical velocity so sniperCoreUpdate's abort check
+  // (!grounded && vel outside -30..0) never trips mid-ride.
+  rt.vert.contactFlags |= 1;
+  rt.vert.vertVel = 0.0f;
+}
 
-  // Fire latch — the shared 0x540d0c semi-auto counter (re-arms to
-  // 999 on release; the armed frame + ammo > 0 spawns the projectile
-  // — counted seam — and drains by frameStep while held).
-  if (ctrl.fire == 0) {
-    rt.fieldD0c = kReticleLatchArmed;
-  } else {
-    if (rt.fieldD0c == kReticleLatchArmed && rt.bombs > 0) {
-      rt.bombs -= 1;
-      ++rt.seams.reticleSpawnCalls;
-    }
-    rt.fieldD0c -= timing.frameStep;
-  }
+void playerSpherePostStep(TraversalRuntime& rt) {
+  if (rt.spherePhase != 2) return;
 
-  // Ladder recharge — HYPOTHESIS rate/cap (see header); the class-4
-  // object mount's 1 s/bomb cadence is the nearest OBSERVED analog.
-  if (rt.bombs >= kSphereAmmoCap) {
-    rt.bombRecharge = kSphereRechargeSec;
-  } else {
-    rt.bombRecharge -= dt;
-    if (rt.bombRecharge <= 0.0f) {
-      rt.bombs += 1;
-      rt.bombRecharge = kSphereRechargeSec;
-    }
-  }
+  // The sequence owns the player position — re-assert the path point
+  // over whatever the sniper update wrote (gravity/lateral writes are
+  // superseded), and keep the pod-footing pins for the next frame's
+  // abort check.
+  float p[3];
+  spherePathPoint(rt.sphereDist, p);
+  rt.cs.pos[0] = p[0];
+  rt.cs.pos[1] = p[1];
+  rt.cs.pos[2] = p[2];
+  rt.vert.posX = p[0];
+  rt.vert.posY = p[1];
+  rt.vert.posZ = p[2];
+  rt.vert.vertVel = 0.0f;
+  rt.vert.contactFlags |= 1;
 
-  if (rt.sphereDist >= total) {
-    // Scripted dismount — OBSERVED: Kurt stands third-person on the
-    // alcove pad; the pod is left behind. Single-frame placement like
-    // the takeoff's handoff; the mount dword + channels clear so the
-    // next frame's normal dispatch resumes on foot.
+  if (rt.sphereDist >= spherePathLength()) {
+    // Scripted dismount — OBSERVED: Kurt stands on the alcove pad in
+    // normal third-person traversal; the scope releases. FUN_00461878
+    // is the evidenced unscope write list (c9c/ca0 clear, b58 = 2.4,
+    // view scalar restored, cac = 0x64).
     rt.spherePhase = 0;
-    rt.mountClass = 0;
-    rt.motion.moveVel = 0.0f;
-    rt.motion.strafeVel = 0.0f;
-    rt.motion.turnVel = 0.0f;
-    rt.motion.zoomChannel = 0.0f;
+    sniperReset(rt);
     rt.vert.vertVel = 0.0f;
-    rt.vert.posX = rt.cs.pos[0];
-    rt.vert.posY = rt.cs.pos[1];
-    rt.vert.posZ = rt.cs.pos[2];
     for (int i = 0; i < 3; ++i) rt.cs.entryPos[i] = rt.cs.pos[i];
   }
-  return true;
 }
 
 } // namespace mdk

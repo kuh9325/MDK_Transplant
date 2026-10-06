@@ -194,6 +194,13 @@ void playerFireLatch(TraversalRuntime& rt, const GameplayInputFrame& ctrl);
 // spawn is deferred; `weapon5Probe` carries the live flag for tests.
 void playerChargeProbe(TraversalRuntime& rt);
 
+// FUN_0046153c — the bounded ray-vs-world probe (flags=3: object scan
+// + BSP stab, +0x148 mask 0x30). `end` arrives as the ray target and
+// is clipped to the nearest hit; returns true on any hit. Shared by
+// the weapon-5 charge probe and the mounted bomb-sight fire path.
+bool weapon5RayProbe(TraversalRuntime& rt, const float start[3],
+                     float end[3]);
+
 // FUN_0045c230 — segment-vs-AABB Liang-Barsky ENTRY clipper, shared
 // with the freefall missile/pickup collision path. Returns 2 when the
 // start is inside (out=start), 1 when the segment enters the box

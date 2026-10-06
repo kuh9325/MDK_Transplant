@@ -77,6 +77,7 @@ namespace mdk {
 
 struct TraversalRuntime;
 struct RawGameplayInput;
+struct DynamicObject;
 
 // OBSERVED reticle constants (BUILD_A).
 inline constexpr double kReticleSettleRate = 25.0;    // 0x498bf8 (f64)
@@ -117,6 +118,17 @@ void playerReticleUpdate(TraversalRuntime& rt,
                          const GameplayInputBindings& bindings,
                          const GameplayInputFrame& ctrl,
                          float f0, float f4, int frameStep);
+
+// FUN_004691c4's armed-fire tail (0x469385..0x469517) — the XBN_BOMB
+// ballistic lob: reticle-offset aim unproject through the camera M2
+// rows, the FUN_0046153c object/BSP clip, the sqrt(2*dz/g) flight-time
+// solve, then the scriptless +0x30a=0x81 object spawn with the
+// "DROP" voice + FX child. The bomb is consumed before the spawn
+// attempt (OBSERVED 0x4693f8). `mount` is the original's 0x540e6c
+// object (its +0x48 gravity feeds the solve); nullptr on the scripted
+// Level-3 sphere ride applies the FUN_004566f0 default 32.0.
+void playerReticleFireBomb(TraversalRuntime& rt,
+                           const DynamicObject* mount);
 
 } // namespace mdk
 

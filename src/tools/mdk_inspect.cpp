@@ -1972,6 +1972,8 @@ int main(int argc, char** argv) {
   std::vector<int> itemUseFrames;
   struct HoldSpec { int key; int first; int last; };
   std::vector<HoldSpec> holdSpecs;
+  std::vector<HoldSpec> pressSpecs;
+  std::vector<std::pair<int, int>> ammoSpecs;
   std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
@@ -2152,6 +2154,36 @@ int main(int argc, char** argv) {
       h.first = std::atoi(spec.substr(at + 1, dash - at - 1).c_str());
       h.last = std::atoi(spec.c_str() + dash + 1);
       holdSpecs.push_back(h);
+    } else if (!std::strcmp(a, "--press")) {
+      // QA enabler: inject the raw key CODE edge on a single frame —
+      // the 0x4ce7xx edge path (weapon hotkeys, item use, sniper
+      // toggle are edge-read, not level-read).
+      const char* v = value(a);
+      if (!v) return usage();
+      const std::string spec(v);
+      const size_t at = spec.find('@');
+      if (at == std::string::npos) {
+        std::fprintf(stderr, "--press wants KEY@FRAME\n");
+        return usage();
+      }
+      HoldSpec h;
+      h.key = std::atoi(spec.substr(0, at).c_str());
+      h.first = h.last = std::atoi(spec.c_str() + at + 1);
+      pressSpecs.push_back(h);
+    } else if (!std::strcmp(a, "--ammo")) {
+      // QA enabler: seed ammo block entry I to N at runtime init
+      // (a level-start save carries session ammo; a fresh QA start
+      // has none — the fire-chain proof needs live 0x541633).
+      const char* v = value(a);
+      if (!v) return usage();
+      const std::string spec(v);
+      const size_t at = spec.find('@');
+      if (at == std::string::npos) {
+        std::fprintf(stderr, "--ammo wants I@N\n");
+        return usage();
+      }
+      ammoSpecs.emplace_back(std::atoi(spec.substr(0, at).c_str()),
+                             std::atoi(spec.c_str() + at + 1));
     } else if (!std::strcmp(a, "--boss")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -3767,6 +3799,17 @@ int main(int argc, char** argv) {
                   (double)pos[1], (double)pos[2], (double)yaw);
     }
 
+    // QA ammo seeds — 0x54161f..0x541633 block entries (a real
+    // session carries these across the level transition; a fresh
+    // inspect start has none).
+    for (const auto& am : ammoSpecs) {
+      if (am.first >= 0 && am.first < 6) {
+        rt.ammo[am.first] = am.second;
+        std::printf("ammo-seed: ammo[%d]=%d — QA ONLY\n", am.first,
+                    am.second);
+      }
+    }
+
     // Scripted input: idle -> KeyUp (forward) -> idle -> KeyJump.
     // Key bindings are the factory defaults (KeyUp=103, KeyJump=56).
     const mdk::GameplayInputBindings bindings;
@@ -3847,6 +3890,9 @@ int main(int argc, char** argv) {
       for (const auto& h : holdSpecs)
         if (f >= h.first && f <= h.last)
           raw.keyLevel[h.key >> 5] |= 1u << (h.key & 31);
+      for (const auto& p : pressSpecs)
+        if (f == p.first)
+          raw.keyEdge[p.key >> 5] |= 1u << (p.key & 31);
       for (const int iu : itemUseFrames)
         if (iu == f) raw.keyEdge[0] |= (1u << 28);   // kSlotItemUse
       const auto out =
@@ -4058,11 +4104,34 @@ int main(int argc, char** argv) {
       // Phase 16A — the player-animation identity fields:
       // st=locoState (hex) af=animFrame at=K_table[frameIdx]
       // (FUN_00461954's selected sprite) dr=draw gate.
-      char sphBuf[48] = "";
-      if (rt.spherePhase != 0) {
-        std::snprintf(sphBuf, sizeof sphBuf, " sph=%d am=%d d=%.1f",
-                      rt.spherePhase, rt.bombs,
-                      (double)rt.sphereDist);
+      // Sphere-ride diagnostics — scope phase (0x540ca0), FOV zoom
+      // (0x540b58), weapon-5 ammo (0x541633), live X_STRIKE bolts
+      // (FUN_0045a4dc's spawn) and the weapon5Spawn seam — the
+      // fire->spawn->world chain is visible through the ride and
+      // past dismount while a bolt is still live.
+      int strikeCount = 0;
+      int kamikazeCount = 0;   // field30a==5 — cmd-0x80's dropped
+                             // X_TOOTH bomblets (the live world-side
+                             // fire consequence on the path end).
+      if (rt.cur != nullptr)
+        for (const auto& up : rt.cur->dyn.storage) {
+          if (up->scriptClass == "X_STRIKE") ++strikeCount;
+          if (up->field30a == 5u) ++kamikazeCount;
+        }
+      char sphBuf[160] = "";
+      if (rt.spherePhase != 0 || strikeCount != 0 ||
+          kamikazeCount != 0) {
+        std::snprintf(sphBuf, sizeof sphBuf,
+                      " sph=%d ca0=%d zoom=%.3f wpn=%d am=%d d=%.1f"
+                      " e14=%d d0c=%d fcd=%.2f w5s=%d deny=%d xst=%d"
+                      " kmk=%d",
+                      rt.spherePhase, rt.transitionPhase,
+                      (double)rt.camera.zoom, rt.wpnSel0, rt.ammo[5],
+                      (double)rt.sphereDist, rt.fieldE14,
+                      rt.fieldD0c, (double)rt.fireCadence,
+                      (int)rt.seams.weapon5SpawnCalls,
+                      (int)rt.seams.fireDenyCalls, strikeCount,
+                      kamikazeCount);
       }
       std::printf(
           "f=%03d a=%d p=%d pos=(%8.2f,%8.2f,%8.2f) yaw=%6.1f "

@@ -1412,15 +1412,17 @@ TraversalFrameResult stepTraversalRuntime(
     // event clears, branch dispatch, prevFrame commit, and every
     // tail below are all skipped on this path.
     takeoffFlightStep(rt, *cur, timing);
-  } else if (playerSphereStep(rt, raw, bindings, rt.prevFrame,
-                              timing)) {
-    // The scripted Level-3 sphere segment owns this frame (phase 2
-    // ride). Phase 1 is the on-foot entry window — playerSphereStep
-    // returns false there and the normal dispatch runs unchanged.
-    // The segment still consumes the merge: commit the N+1 hand-off
-    // exactly as the normal path does.
-    rt.prevFrame = nextFrame;
   } else {
+    // Scripted Level-3 sphere tick — the sequence's pre-dispatch
+    // piece: the ~0.7 s entry window idles on foot, sphereSeqEnter
+    // engages the scope (flagC9c), and during the ride it advances
+    // cs.pos along the scripted path + pins pod footing. The sniper
+    // branch below then runs the frame (aim / fire gate / zoom) —
+    // the same sequence+scope composition the original uses.
+    // playerSpherePostStep (after the dispatch) re-asserts the path
+    // position and runs the scripted dismount.
+    playerSphereStep(rt, raw, bindings, rt.prevFrame, timing);
+
     // OBSERVED dispatch head (0x463638): the pending-event slots
     // 0x54cb00/0x54cb08 are cleared every frame; the current event
     // priority 0x540cbc is reset while the dispatched state sits in
@@ -1826,6 +1828,11 @@ TraversalFrameResult stepTraversalRuntime(
     }
   }
 
+  // Scripted sphere ride tail — the sequence owns cs.pos: re-assert
+  // the path point over whatever the sniper branch wrote, and run the
+  // scripted dismount (unscope + on-foot fields) at path end.
+  playerSpherePostStep(rt);
+
   // ================= traversal-active section =====================
   // 0x540c30..0x540c44 — the per-query player AABB (the original
   // rebuilds it here when mode 0x541492 == 3).
@@ -1879,6 +1886,14 @@ TraversalFrameResult stepTraversalRuntime(
     objEnv.gFlags = rt.scriptGFlags;
     for (int i = 0; i < 8; ++i) objEnv.gVars[i] = rt.scriptGVars[i];
 
+    // OBSERVED (0x436295..0x4362a2): the command flags 0x540e54 and
+    // 0x540e58 are cleared to 0 EVERY FRAME immediately before the
+    // arena object pass (FUN_004572ac) — the command bodies set them
+    // during the update, and consumers (the wpn-5 charge probe's
+    // "dead while a bomb lives" gate at FUN_00437aa8) read them later
+    // in the same frame.
+    rt.cmdFlag54 = 0;            // 0x540e54 = 0
+    rt.cmdDetonate58 = 0;        // 0x540e58 = 0
     // FUN_00436100 (OBSERVED 0x4362a8..0x4362e6): the object pass and
     // the FUN_0045cf18 corpse sweep run per arena, cur first, then the
     // partner — with the ca8/ca4 gate evaluated AT the partner call
