@@ -14050,6 +14050,70 @@ void test_traversal_script() {
     CHECK(r.halted && !r.error);
     CHECK((f.env.gFlags & (1u << 4)) == 0);
   }
+
+  // -- shared-table fallback: object ops run on eventLatch ------------
+  // BUILD_A dispatches one opcode table for controlalien and alien
+  // contexts; the port routes arena-unowned ops through the object
+  // handler against env.ctxObject (the arena's eventLatch record).
+  {
+    ScriptFixture f;
+    // 0xba {u8 mode, varop} is object-VM-only: mode 3 = inline f32
+    // -> ctx+0xe8. It must execute in an arena script via the
+    // fallback and land on eventLatch.
+    f.write(C, {0xba, 0x03});
+    f.writeF(C + 2, 4.5f);
+    f.write(C + 6, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 4.5f);
+  }
+
+  // -- fallback sees the same locals store (one original record) ------
+  {
+    ScriptFixture f;
+    // 0x41 setVar {mode,idx,u32} is an arena op writing ctx locals;
+    // 0xba mode 2 reads locals through the object handler. The
+    // mirror must unify the two state views.
+    f.write(C, {0x41, 0x02, 0x00});
+    f.writeW(C + 3, 0x40f00000u);               // locals[0] = 7.5f
+    f.write(C + 7, {0xba, 0x02, 0x00});         // +0xe8 = locals[0]
+    f.write(C + 10, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 7.5f);
+  }
+
+  // -- cross-context call: arena rcall -> fallback op -> 0xfd ---------
+  {
+    ScriptFixture f;
+    f.write(C, {0xfc, 0x01});                   // rcall n1 -> 0x300
+    f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xba, 0x03});               // post-call fallback
+    f.writeF(C + 8, 9.0f);
+    f.write(C + 12, {0xff});
+    f.write(0x300, {0xba, 0x03});               // callee fallback op
+    f.writeF(0x302, 4.5f);
+    f.write(0x306, {0xfd});                     // return
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->script.callDepth == 0);
+    CHECK(f.arena->eventLatch.fieldE8 == 9.0f);
+  }
+
+  // -- orig-dead op still halts through the fallback ------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x8d, 0xff});                   // 0x8d: dead in BUILD_A
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.error);
+    CHECK(r.diag.find("0x8d") != std::string::npos);
+    CHECK(f.arena->script.pcImageOff == 0);
+    CHECK(f.arena->script.active == false);
+  }
 }
 
 // ---------------------------------------------------------------------------

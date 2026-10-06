@@ -242,6 +242,17 @@ struct TraversalSeams {
   int profilerHooks = 0;        // FUN_0042fecc rdtsc probe sites
   int postTailCalls = 0;        // FUN_0042ff9c + FUN_0042fef4 walk
   int teleportCalls = 0;        // 0x540cdc teleport block
+  // op-0x70 named form (0x44c0d3): the resolved teleport object is
+  // latched to 0x540ebc and its four args to 0x540ec0..0x540ecc.
+  const DynamicObject* teleportLatchObj = nullptr;
+  float teleportLatchArg[4] = {0, 0, 0, 0};
+  int fxEmitSeams = 0;          // ops 0x88/0x8a/0x8b — presentation
+                                // emits consumed as counted seams
+  int path9eCalls = 0;          // op 0x9e — FUN_00454c6c spatial
+                                // registration seam
+  int fxSpawnCalls = 0;         // op 0x9f — mode-dependent spawn seam
+  int namedSlotCalls = 0;       // op 0x9d — named-record slot seam
+  int varB6Calls = 0;           // op 0xb6 — var-repeat loop seam
   int pendingViewSnaps = 0;     // 0x540ebc snap consumed
   int endLevelRequests = 0;     // 0x540ebc == -1 consumed — the
                                 // FUN_00436100 -1 arm (0x436d30)

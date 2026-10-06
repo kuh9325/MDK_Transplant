@@ -6280,6 +6280,15 @@ New canonical 60f digests (supersede the Phase 16A.1 set):
 | L7 | `57bdd179a944a4c9` |
 | L8 | `2edeb4aa6c7ef486` |
 
+**Golden provenance (2026-10-06, post-P0 gate):** the L4–L8 digests
+above remain exact at `b4a762d` (byte-identical to `e516b81`). The
+L3 legacy digest is intentionally **superseded** by evidence-backed
+P0 semantic fixes — the scripted scope/ride model and the OBSERVED
+`0x540e54/0x540e58` per-frame clear change in-window state on L3
+only. The superseded L3 value is retained here for provenance and
+must not be reported as "exact"; a separately named post-P0 L3
+golden will be recorded once P1 gameplay semantics are stable.
+
 Closeout regression (f52aa5f): mdk_tests 5582/0, CTest 1/1, pytest
 19/0 (canonical Godot binary), selftests 4/4, campaign handoff 5/5,
 campaign sequence `23c84c9f241af58b` unchanged, save-restore +

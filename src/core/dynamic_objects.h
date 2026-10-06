@@ -595,6 +595,11 @@ struct DynamicObject {
   std::uint8_t field277 = 0;
   // +0x278 — the op-0x4a bound object (subtype 0x4a attach target).
   DynamicObject* field278 = nullptr;
+  // op-0x63 (0x44bfa7) writes slot (a-1)%16 of the model record's
+  // +0x7c byte / +0x8c dword material arrays; the port keeps the
+  // per-slot pair on the object.
+  std::uint8_t surfSlotByte[16] = {};
+  std::uint32_t surfSlotVal[16] = {};
   // +0x158 — spawned FX/child object written by the command bodies
   // (FUN_00402160 seam child). +0x15c — its model-name token.
   DynamicObject* field158 = nullptr;

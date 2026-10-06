@@ -295,6 +295,17 @@ bool coneLosTest(TraversalScriptEnv& env, const DynamicObject& obj,
 
 } // namespace
 
+namespace {
+// Forward declaration for the shared-table fallback: BUILD_A runs a
+// single opcode jump table for controlalien and alien contexts, so an
+// op the arena switch doesn't own still dispatches through the object
+// handler with ctx = the controlalien record (env.ctxObject).
+// Returns false when the arena pass should end (halt/error/stop).
+bool arenaSharedInsn(TraversalScriptEnv& env, TraversalScriptState& st,
+                     Reader& r, TraversalScriptResult& res,
+                     const char* name, std::uint32_t insnOff);
+} // namespace
+
 // ---------------------------------------------------------------------------
 // CMI table-3 script lookup — FUN_00458550 (OBSERVED)
 // ---------------------------------------------------------------------------
@@ -1303,18 +1314,78 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
       break;
     }
 
-    default:
-      // Unknown / unimplemented opcode — OBSERVED behavior is the
-      // "Unrecognised controlalien" diagnostic + exit. We halt the
-      // script so the stream can't desynchronize silently.
-      {
-        char buf[160];
-        std::snprintf(buf, sizeof buf,
-                      "Unrecognised controlalien op 0x%02x at +%x",
-                      op, insnOff);
-        fail(buf);
+    case 0x87: {                            // camFx floor (0x4401c8)
+      // {f32}. OBSERVED: 0x540ce4 = fmax(0x540ce4, arg) — the camera
+      // shake magnitude floor. HMO_4's init reaches it at +c8bb.
+      const float v0 = r.f32();
+      if (!r.ok) { fail("camfx"); return res; }
+      if (env.rt != nullptr && v0 > env.rt->camera.shakeMag)
+        env.rt->camera.shakeMag = v0;
+      break;
+    }
+
+    case 0x59: {                            // sfx bind (0x43a112)
+      // Same handler as the object-VM case — operand shape and the
+      // +0x15c / fireSoundCalls + traversalAudioEmit seams are
+      // identical; the ctx object is the arena's +0x118 latch
+      // (env.ctxObject). HMO_4 +c8c0/+c8cb, CHMO_9 +20c37 reach it.
+      const std::uint8_t mode = r.u8();
+      if ((mode & 0x10) != 0) {
+        r.f32(); r.f32(); r.f32();
+      } else if ((mode & 0x20) != 0) {
+        r.u8();
+      } else if ((mode & 0x40) != 0) {
+        r.f32(); r.f32(); r.f32();
       }
-      return res;
+      const std::string sfx = r.str();
+      if (!r.ok) { fail("sfx-args"); return res; }
+      if ((mode & 4) != 0 && env.ctxObject != nullptr)
+        env.ctxObject->field15c = sfx;
+      if ((mode & 0x80) != 0 && env.rt != nullptr) {
+        ++env.rt->seams.fireSoundCalls;
+        static const TraversalAudioOp kSfxOps[3] = {
+            TraversalAudioOp::kPlayOnce, TraversalAudioOp::kRestart,
+            TraversalAudioOp::kEnsurePlaying};
+        const int sub = mode & 3;
+        if (sub <= 2 && !sfx.empty())
+          traversalAudioEmit(*env.rt, kSfxOps[sub], sfx);
+      }
+      break;
+    }
+
+    case 0x88: case 0x8a: case 0x8b: {      // fx emit family
+      // Same presentation seam as the object-VM cases — operands are
+      // consumed, the emit is counted. CHMO_9 reaches op 0x8b at
+      // +20c18.
+      switch (op) {
+      case 0x88:                            // {u8,u32x4,u8,f32x3,u32}
+        (void)r.u8();
+        for (int i = 0; i < 4; ++i) (void)r.u32();
+        (void)r.u8();
+        for (int i = 0; i < 3; ++i) (void)r.f32();
+        (void)r.u32();
+        break;
+      case 0x8a:                            // {u8,u32x3,f32x6}
+        (void)r.u8();
+        for (int i = 0; i < 3; ++i) (void)r.u32();
+        for (int i = 0; i < 6; ++i) (void)r.f32();
+        break;
+      default:                              // 0x8b {u8,u32x3,f32x3}
+        (void)r.u8();
+        for (int i = 0; i < 3; ++i) (void)r.u32();
+        for (int i = 0; i < 3; ++i) (void)r.f32();
+        break;
+      }
+      if (!r.ok) { fail("fxemit"); return res; }
+      if (env.rt != nullptr) ++env.rt->seams.fxEmitSeams;
+      break;
+    }
+
+    default:
+      // Shared-table fallback (OBSERVED dispatch shape: BUILD_A runs
+      // one opcode jump table for both contexts) — see arenaSharedInsn.
+      if (!arenaSharedInsn(env, st, r, res, name, insnOff)) return res;
+      continue;
     }
   }
 
@@ -4890,6 +4961,395 @@ void objScriptInsn(ObjScriptPass& v) {
       return;
     }
 
+    case 0x14:                              // clrEC (0x439158)
+      // {} — +0xec = 0, the bound path record is dropped.
+      obj.fieldEC = nullptr;
+      return;
+    case 0x38: {                            // hpAdd {i16} (0x439fce)
+      // OBSERVED: +0x8 += i16 only while +0x8 < 0xfde8; <=0 clamps to
+      // 0 and calls the FUN_004581a4 death boundary (the same arm
+      // case 0x10's hv==0 path takes).
+      const std::int16_t d = static_cast<std::int16_t>(r.u16());
+      if (!r.ok) { v.fail("hpadd"); return; }
+      if (obj.health < 0xfde8) obj.health += d;
+      if (obj.health <= 0) {
+        obj.health = 0;
+        if (obj.field110 != nullptr) {
+          obj.field11e = 0;
+          obj.field22c = 0.0f;
+          obj.col.flags148 |= 0x20;
+          obj.field108 = obj.field230 = obj.field110;
+          obj.field110 = nullptr;
+        } else if (env.rt != nullptr) {
+          objectTeardownNow(*env.rt, obj);
+        }
+        v.done = true;
+      }
+      return;
+    }
+    case 0xa5: {                            // callA5 {linkage} (0x44274c)
+      // OBSERVED: unconditional linkage dispatch gated on 0x540e60
+      // (cmdObj60 — the cmd-2 spin object) being clear; 0xfc/0xfe
+      // gosub-push, 0x0c goto, 0xfd return.
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("calla5"); return; }
+      if (env.rt != nullptr && env.rt->cmdObj60 != nullptr) return;
+      switch (L.mode) {
+      case 0xfe:
+      case 0xfc: v.doCall(L.a); break;
+      case 0x0c: v.doGoto(L.a); break;
+      case 0xfd: v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xbc: {                            // planar camera-dist link (0x444570)
+      // {u8 kind, f32 a, [f32 b if kind==7|8], linkage}. OBSERVED:
+      // compared = FUN_004301bc(ctx+0x10, 0x54c6c4) — the XY distance
+      // between the object's position and the camera pose position.
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("distlink"); return; }
+      float dist = 0.0f;
+      if (env.rt != nullptr) {
+        const float* cam = env.rt->camera.pose.pos;   // 0x54c6c4..cc
+        const float dx = obj.pos[0] - cam[0];
+        const float dy = obj.pos[1] - cam[1];
+        dist = std::sqrt(dx * dx + dy * dy);
+      }
+      const bool cond = cmpOp5ad40(kind, dist, va, vb);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xbf: {                            // axis delta link (0x4441a6)
+      // {u8 sel, u8 kind, f32 a, [f32 b if kind==7|8], linkage}.
+      // OBSERVED: delta[i] = 0x540bfc[i]-ctx+0x10[i] for i=0..2;
+      // sel&0x80 -> compared = delta[sel&0x7f] raw, else fabs of it.
+      const std::uint8_t sel = r.u8();
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("axislink"); return; }
+      float d = 0.0f;
+      const int ax = sel & 0x7f;
+      if (env.rt != nullptr && ax < 3) {
+        const float* pp = env.rt->cs.pos;             // 0x540bfc..04
+        d = pp[ax] - obj.pos[ax];
+        if ((sel & 0x80) == 0) d = std::fabs(d);
+      }
+      const bool cond = cmpOp5ad40(kind, d, va, vb);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xa0: {                            // yaw link (0x44e1f9)
+      // {u8 kind, f32 a, [f32 b if kind==7|8], linkage}. OBSERVED:
+      // compared = ctx+0x4c wrapped into [0,360) (single fmod-style
+      // normalise; the ctx field itself is not rewritten).
+      const std::uint8_t kind = r.u8();
+      const float va = r.f32();
+      float vb = 0.0f;
+      if (kind == 7 || kind == 8) vb = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("yawlink"); return; }
+      float yaw = obj.yawDeg;
+      while (yaw >= 360.0f) yaw -= 360.0f;
+      while (yaw < 0.0f) yaw += 360.0f;
+      const bool cond = cmpOp5ad40(kind, yaw, va, vb);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0xe9: {                            // named-live-object link (0x43a8ea)
+      // {lstr name, linkage}. OBSERVED: FUN_00402fe8 walks the global
+      // live-object list (0x4a1220) matching node+0x14 by FUN_0042fa50;
+      // FUN_00402148/FUN_00402658 gates the node live. cond = a live
+      // object with that name exists.
+      const std::string nm = r.str();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("namelink"); return; }
+      bool cond = false;
+      if (env.rt != nullptr) {
+        for (const auto& ap : env.rt->arenas) {
+          if (!ap) continue;
+          for (const auto& up : ap->dyn.storage) {
+            const DynamicObject& o = *up;
+            if (!o.col.named || o.health <= 0) continue;
+            if (objectEnemyName(env, o) == nm) { cond = true; break; }
+          }
+          if (cond) break;
+        }
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0x4a: {                            // bind4a {u8,u8,lstr} (0x4484c2)
+      // OBSERVED: +0x276/+0x277 = the two refpoint indices; then scan
+      // the ctx's home-arena object list for the node whose printed
+      // name sprintf("%s_%d", node+0xc, node+0x144>>16) matches —
+      // +0x278 = node, +0x11e = 0x4a, +0x138 = node. No match falls
+      // through with no error.
+      obj.field276 = r.u8();
+      obj.field277 = r.u8();
+      const std::string nm = r.str();
+      if (!r.ok) { v.fail("bind4a"); return; }
+      if (env.selfArena != nullptr) {
+        DynamicArena& home = env.selfArena->dyn;
+        for (auto& up : home.storage) {
+          DynamicObject& o = *up;
+          if (!o.col.named || o.arena != &home) continue;
+          char want[64];
+          std::snprintf(want, sizeof want, "%s_%d",
+                        objectEnemyName(env, o).c_str(), o.spawnId);
+          if (nm != want) continue;
+          obj.field278 = &o;
+          obj.field11e = 0x4a;
+          obj.field138 = &o;
+          break;
+        }
+      }
+      return;
+    }
+    case 0xe5: {                            // anchor-steer link (0x446d57)
+      // {f32 rate, linkage}. OBSERVED: FUN_0045dfd4 steps +0x4c
+      // toward atan2(+0x124-pos.y, +0x120-pos.x) by rate*(1/30) and
+      // arms +0x11e=0xe5 while the approach is still in progress
+      // (position drive to +0x128 is the subtype's own machinery —
+      // the port's +0x120 anchor move models it). The linkage fires
+      // while the arm is set.
+      const float rate = r.f32();
+      Linkage L;
+      if (!readLinkage(r, L)) { v.fail("steerlink"); return; }
+      const float dx = obj.field120[0] - obj.pos[0];
+      const float dy = obj.field120[1] - obj.pos[1];
+      float ang = bearingDeg(dy, dx);
+      while (ang < 0.0f) ang += 360.0f;
+      while (ang >= 360.0f) ang += -360.0f;
+      const float next =
+          approachAngle5dc18(ang, obj.yawDeg, rate * (1.0f / 30.0f));
+      obj.yawDeg = next;
+      if (next != ang) obj.field11e = 0xe5;   // in-progress arm
+      const bool cond = (obj.field11e == 0xe5);
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
+    case 0x70: {                            // posLatch/teleport (0x44c0d3)
+      // {lstr name, u32 x, u32 y, u32 z, u32 yaw}. OBSERVED: empty
+      // name writes 0x540bfc..0x540c04 (cs.pos) + 0x540c2c (player
+      // yaw) and re-latches 0x540c08 (posPrev) — an absolute player
+      // teleport. A non-empty name resolves a teleport record through
+      // FUN_004328d4 and latches 0x540ebc..cc; a miss prints
+      // "Teleport %s not found" and kills the script.
+      const std::string nm = r.str();
+      const float tx = r.f32();
+      const float ty = r.f32();
+      const float tz = r.f32();
+      const float tyaw = r.f32();
+      if (!r.ok) { v.fail("poslatch"); return; }
+      if (nm.empty()) {
+        if (env.rt != nullptr) {
+          env.rt->cs.pos[0] = tx;
+          env.rt->cs.pos[1] = ty;
+          env.rt->cs.pos[2] = tz;
+          env.rt->motion.yawDeg = tyaw;
+          env.rt->cs.entryPos[0] = tx;                // 0x540c08
+          env.rt->cs.entryPos[1] = ty;
+          env.rt->cs.entryPos[2] = tz;
+        }
+        return;
+      }
+      {
+        // Named form: resolve a live object by name (the original
+        // scans the 0x54c670 teleport-record table, stride 0x466 —
+        // the port's nearest table is the live-object name space).
+        DynamicObject* tgt = nullptr;
+        if (env.rt != nullptr) {
+          for (const auto& ap : env.rt->arenas) {
+            if (!ap) continue;
+            for (const auto& up : ap->dyn.storage) {
+              DynamicObject& o = *up;
+              if (!o.col.named) continue;
+              if (objectEnemyName(env, o) == nm ||
+                  o.model.modelName() == nm) { tgt = &o; break; }
+            }
+            if (tgt != nullptr) break;
+          }
+        }
+        if (tgt == nullptr) {
+          char buf[160];
+          std::snprintf(buf, sizeof buf, "Teleport %s not found",
+                        nm.c_str());
+          v.fail(buf);
+          return;
+        }
+        if (env.rt != nullptr) {
+          env.rt->seams.teleportLatchObj = tgt;             // 0x540ebc
+          env.rt->seams.teleportLatchArg[0] = tx;           // 0x540ec0..cc
+          env.rt->seams.teleportLatchArg[1] = ty;
+          env.rt->seams.teleportLatchArg[2] = tz;
+          env.rt->seams.teleportLatchArg[3] = tyaw;
+          ++env.rt->seams.teleportCalls;
+        }
+      }
+      return;
+    }
+    case 0x88: case 0x8a: case 0x8b: {      // fx emit family
+      // OBSERVED (0x4401f3 / 0x44b02c / 0x44b137): the operands write
+      // the 0x4a2438..0x4a2450 FX scratch block and a presentation
+      // emit follows. The scratch state is call-local — nothing
+      // downstream consumes it — so the port consumes operands and
+      // counts the emit (same seam class as op 0x59).
+      switch (op) {
+      case 0x88:                            // {u8,u32x4,u8,f32x3,u32}
+        (void)r.u8();
+        for (int i = 0; i < 4; ++i) (void)r.u32();
+        (void)r.u8();
+        for (int i = 0; i < 3; ++i) (void)r.f32();
+        (void)r.u32();
+        break;
+      case 0x8a:                            // {u8,u32x3,f32x6}
+        (void)r.u8();
+        for (int i = 0; i < 3; ++i) (void)r.u32();
+        for (int i = 0; i < 6; ++i) (void)r.f32();
+        break;
+      default:                              // 0x8b {u8,u32x3,f32x3}
+        (void)r.u8();
+        for (int i = 0; i < 3; ++i) (void)r.u32();
+        for (int i = 0; i < 3; ++i) (void)r.f32();
+        break;
+      }
+      if (!r.ok) { v.fail("fxemit"); return; }
+      if (env.rt != nullptr) ++env.rt->seams.fxEmitSeams;
+      return;
+    }
+    case 0x64: {                            // partnerArena {lstr} (0x44c032)
+      // Same handler as the arena-VM case — reachable here through
+      // shared code regions (+0x1acb, +0x7a58).
+      const std::string nm = r.str();
+      if (!r.ok) { v.fail("partnerArena"); return; }
+      if (env.rt == nullptr) return;
+      if (nm.empty()) {
+        traversalDetachPartner(*env.rt);
+        return;
+      }
+      TraversalArena* a = traversalFindArena(*env.rt, nm);
+      if (a == nullptr) { v.fail("arena not found"); return; }
+      traversalAttachPartner(*env.rt, *a);
+      return;
+    }
+    case 0xba: {                            // +0xe8 set (0x43af4b)
+      // {u8 mode, f32 | u8 idx} — same varop shape as 0x32..0x37;
+      // stores to ctx+0xe8 (the 0x5a-ramp target field).
+      const std::uint8_t mode = r.u8();
+      const float val = resolveVarMode(mode, r, env, ctx);
+      if (!r.ok) { v.fail("sete8"); return; }
+      obj.fieldE8 = val;
+      return;
+    }
+    case 0x9e: {                            // path9e (0x44f453)
+      // {u8 mode, u16 arg, u32 flags[, u32 imgref if flags&2]}.
+      // OBSERVED: FUN_00454c6c(ctx, mode, arg, flags) runs a spatial
+      // cell/AABB registration; when its result is nonzero AND
+      // flags&2 the script jumps to imgref. No Level-3 site sets
+      // flags&2, so the branch never fires — the port consumes the
+      // operands and counts the registration seam (UNKNOWN: the
+      // FUN_00454c6c grid side-effect itself).
+      const std::uint8_t mode = r.u8();
+      const std::uint16_t arg = r.u16();
+      const std::uint32_t flags = r.u32();
+      if ((flags & 2) != 0) (void)r.u32();
+      if (!r.ok) { v.fail("path9e"); return; }
+      (void)mode; (void)arg;
+      if (env.rt != nullptr) ++env.rt->seams.path9eCalls;
+      return;
+    }
+    case 0x9f: {                            // fxSpawn (0x449614)
+      // {u8 mode, [u32x3 if mode&3], u32x3, lstr, u32} — a
+      // mode-dependent spawn/presentation op. UNKNOWN semantics in
+      // the port — operands consumed, counted.
+      const std::uint8_t mode = r.u8();
+      if ((mode & 3) != 0) {
+        for (int i = 0; i < 3; ++i) (void)r.u32();
+      }
+      for (int i = 0; i < 3; ++i) (void)r.u32();
+      (void)r.str();
+      (void)r.u32();
+      if (!r.ok) { v.fail("fxspawn"); return; }
+      if (env.rt != nullptr) ++env.rt->seams.fxSpawnCalls;
+      return;
+    }
+    case 0x9d: {                            // named slot op (0x44880e)
+      // {lstr name, u32, u32} — "XPGUN"-class named-record bind.
+      // UNKNOWN semantics — operands consumed, counted.
+      (void)r.str();
+      (void)r.u32();
+      (void)r.u32();
+      if (!r.ok) { v.fail("op9d"); return; }
+      if (env.rt != nullptr) ++env.rt->seams.namedSlotCalls;
+      return;
+    }
+    case 0xb6: {                            // varB6 loop (0x4474a2)
+      // {u8,u8,u8} — FUN_00438654 var resolve then an int compare /
+      // repeat-loop over the trailing block. UNKNOWN loop semantics —
+      // operands consumed, counted.
+      (void)r.u8(); (void)r.u8(); (void)r.u8();
+      if (!r.ok) { v.fail("varb6"); return; }
+      if (env.rt != nullptr) ++env.rt->seams.varB6Calls;
+      return;
+    }
+    case 0x63: {                            // surf slot write (0x44bfa7)
+      // {u8 slot, u8 byte, u32 val}. OBSERVED: idx = (slot-1) mod 16;
+      // the object's +0xc record gets [idx]+0x7c = byte and
+      // [idx*4]+0x8c = val — a per-slot material/surface override on
+      // the model record.
+      const std::uint8_t slot = r.u8();
+      const std::uint8_t byte = r.u8();
+      const std::uint32_t val = r.u32();
+      if (!r.ok) { v.fail("surf63"); return; }
+      const int idx = static_cast<int>(
+          static_cast<std::int8_t>(slot - 1)) & 0x0f;
+      obj.surfSlotByte[idx] = byte;
+      obj.surfSlotVal[idx] = val;
+      return;
+    }
     default: {
       char buf[160];
       std::snprintf(buf, sizeof buf,
@@ -4900,6 +5360,87 @@ void objScriptInsn(ObjScriptPass& v) {
       return;
     }
   }
+}
+
+// Arena-VM shared-table fallback. OBSERVED dispatch shape: BUILD_A
+// runs one opcode jump table (0x438a5c, indexed op-1) for controlalien
+// and alien contexts alike, so ops the arena-specific cases don't own
+// still execute against the controlalien record — in the port that
+// record is env.ctxObject (&selfArena->eventLatch), a full
+// DynamicObject. The two state views are one store in the original
+// (+0x108 PC, +0x22c/+0x230 wait pair, +0x21e/+0x21d marks, +0x234
+// locals, +0x244/+0x312 flags, +0x248 call stack); the port keeps them
+// split, so each fallback insn mirrors the arena TraversalScriptState
+// into eventLatch's object fields and back. Orig-dead ops
+// (0x00/0x07/0x1e/0x8d/0xfe) still halt through the object VM's own
+// default — HMO_9 +1c996 keeps its verified-match kill.
+bool arenaSharedInsn(TraversalScriptEnv& env, TraversalScriptState& st,
+                     Reader& r, TraversalScriptResult& res,
+                     const char* name, std::uint32_t insnOff) {
+  DynamicObject* co = env.ctxObject;
+  if (co == nullptr) {
+    char buf[160];
+    const std::size_t abs = env.imageBase + insnOff;
+    const std::uint8_t op =
+        abs < env.image.size()
+            ? std::to_integer<std::uint8_t>(env.image[abs]) : 0;
+    std::snprintf(buf, sizeof buf,
+                  "%s: Unrecognised controlalien op 0x%02x at +%x",
+                  name, op, insnOff);
+    res.error = true;
+    res.diag = buf;
+    if (env.diagLog) env.diagLog->push_back(res.diag);
+    st.pcImageOff = 0;
+    st.active = false;
+    return false;
+  }
+  r.pc = insnOff;   // objScriptInsn fetches the op byte itself
+  ObjScriptPass v{env, *co, r, res, name};
+  // st -> eventLatch (one original state store, two port views)
+  co->field108 = v.ptrAt(st.pcImageOff);
+  co->field22c = st.waitSeconds;
+  co->field230 = v.ptrAt(st.waitResumeImageOff);
+  co->field21e = st.running;
+  co->field21d = st.eventByte;
+  co->scriptCallDepth = st.callDepth;
+  for (int d = 0; d < 4; ++d) {
+    co->scriptRetPc[d] = v.ptrAt(st.retPc[d]);
+    co->scriptSavedPc[d] = v.ptrAt(st.savedPc[d]);
+  }
+  for (int d = 0; d < 5; ++d) co->scriptMark[d] = st.marker[d];
+  for (int d = 0; d < 16; ++d) co->scriptLocals[d] = st.locals[d];
+  co->scriptFlagsLocal = st.flagsLocal;
+  co->scriptFlagsChild = st.flagsChild;
+
+  objScriptInsn(v);
+  --res.instructions;   // already counted at the arena loop top
+
+  // eventLatch -> st
+  st.pcImageOff = v.offAt(co->field108);
+  st.waitSeconds = co->field22c;
+  st.waitResumeImageOff = v.offAt(co->field230);
+  st.running = co->field21e;
+  st.eventByte = co->field21d;
+  st.callDepth = co->scriptCallDepth;
+  for (int d = 0; d < 4; ++d) {
+    st.retPc[d] = v.offAt(co->scriptRetPc[d]);
+    st.savedPc[d] = v.offAt(co->scriptSavedPc[d]);
+  }
+  for (int d = 0; d < 5; ++d) st.marker[d] = co->scriptMark[d];
+  for (int d = 0; d < 16; ++d) st.locals[d] = co->scriptLocals[d];
+  st.flagsLocal = co->scriptFlagsLocal;
+  st.flagsChild = co->scriptFlagsChild;
+
+  if (res.error || v.done) {
+    if (res.error) st.active = false;
+    return false;
+  }
+  if (st.pcImageOff == 0) {     // gate cleared (field108 = 0)
+    res.stopped = true;
+    st.active = false;
+    return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -5184,7 +5725,7 @@ namespace {
 const char* opcodeGrammar(std::uint8_t op) {
   switch (op) {
   case 0x01: case 0x09: case 0xff: case 0xfd: case 0x65: case 0x6e:
-  case 0x7d: case 0x4b: case 0x0f: case 0x3c: case 0x82:
+  case 0x7d: case 0x4b: case 0x0f: case 0x3c: case 0x82: case 0x14:
     return "";
   case 0x08: case 0x10: return "h";         // i16 yaw / u16 health
   case 0x28: case 0x35: case 0x40: case 0x86: case 0xb1: case 0x3a:
@@ -5249,6 +5790,31 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x25: case 0x72: return "l";
   case 0xf3: return "bhl";                     // refEsc {u8, u16, linkage}
   case 0xd0: return "sl";                      // elemMask link {lstr, linkage}
+  case 0x38: return "h";                       // hpAdd {i16}
+  case 0x2b: return "ff";                      // seekCam {f32,f32}
+  case 0x4a: return "bbs";                     // bind4a {u8,u8,lstr}
+  case 0x70: return "swwww";                   // posLatch {lstr,u32x4}
+  case 0x8b: return "bwwwfff";                 // emit8b {u8,u32x3,f32x3}
+  case 0x93: return "s";                       // mark93 {lstr}
+  case 0xa2: return "bh";                      // slotA2 {u8,u16}
+  case 0xb6: return "bbb";                     // varB6 {u8x3}
+  case 0xba: return "v";                       // setE8 {u8 mode,varop}
+  case 0xbf: return "bb";                      // distLink {u8,u8,f32,[f32],link}
+  case 0xc2: return "bbbbb";                   // dmgRng {u8x5}
+  case 0xe5: return "fl";                      // linkE5 {f32,linkage}
+  case 0xe9: return "sl";                      // nameLink {lstr,linkage}
+  case 0xf0: return "b";                       // dmgSet {u8}
+  case 0xa5: return "l";                       // callA5 {linkage}
+  case 0x9e: return "bhw";                     // path9e {u8,u16,u32[,u32]}
+  case 0x88: return "bwwwwbfffw";              // fx88 {u8,u32x4,u8,f32x3,u32}
+  case 0x8a: return "bwwwffffff";              // fx8a {u8,u32x3,f32x6}
+  case 0xef: return "ffffff";                  // vecPair {f32x6}
+  case 0x1c: return "w";                       // call1c {imgref}
+  case 0xd4: return "l";                       // {linkage}
+  case 0x9d: case 0x94: return "sww";          // {lstr,u32,u32}
+  case 0x53: case 0x59: case 0xa0: case 0xbc: case 0xde:
+  case 0x9f: case 0xe4:
+    return "b";                                // lead u8 + shaped tail
   case 0xf8: return "bf";                      // knockback {u8,f32} + mode tail
   case 0x21: return "wl";                      // pathLink {u32, linkage}
   case 0x22: return "l";                       // leaderless {linkage}
@@ -5374,6 +5940,22 @@ const char* opcodeName(std::uint8_t op) {
   case 0x20: return "elemUnmask"; case 0x26: return "velCmp";
   case 0xf3: return "refEsc";   case 0xd0: return "elemMaskLink";
   case 0xf8: return "knockback";
+  case 0x14: return "clrEC";    case 0x38: return "hpAdd";
+  case 0x2b: return "seekCam";  case 0x4a: return "bind4a";
+  case 0x70: return "posLatch"; case 0x8b: return "emit8b";
+  case 0x93: return "mark93";   case 0x9e: return "path9e";
+  case 0xa0: return "yawCmp";   case 0xa2: return "slotA2";
+  case 0xa5: return "callA5";   case 0xb6: return "varB6";
+  case 0xba: return "rateBA";   case 0xbc: return "srcCmp";
+  case 0xbf: return "distLink"; case 0xc2: return "dmgRng";
+  case 0xde: return "insnLink"; case 0xe5: return "linkE5";
+  case 0xe9: return "nameLink"; case 0xf0: return "dmgSet";
+  case 0x9f: return "fxSpawn";  case 0xe4: return "slotE4";
+  case 0x88: return "fx88";     case 0x53: return "setScale";
+  case 0x37: return "set48v";   case 0x8a: return "fx8a";
+  case 0xef: return "vecPair";  case 0x1c: return "call1c";
+  case 0xd4: return "linkD4";   case 0x9d: return "op9d";
+  case 0x94: return "op94";
   case 0xd8: return "varAcc";  case 0xd9: return "statAcc";  case 0x59: return "sfxBind";
   case 0x0e: return "viewLink"; case 0xc3: return "srcLink";
   default: return nullptr;
@@ -5705,6 +6287,95 @@ TraversalScriptInsn traversalScriptDecode(std::span<const std::byte> image,
       }
     }
     std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+  }
+  // --- BUILD_A-recovered tails (jump-table handlers, 0x438a5c) ---
+  if (out.opcode == 0x53) {                  // scale: 0xff -> {u8,u32,u32}
+    Reader r2{image, imageBase, codeOff + 1};  //        else varop
+    const std::uint8_t m = r2.ok ? r2.u8() : 0;
+    if (m == 0xff) {
+      std::snprintf(arg, sizeof arg, " %u 0x%x 0x%x", r.u8(), r.u32(),
+                    r.u32()); text += arg;
+    } else {
+      const std::uint8_t v = m;
+      if (v == 3) { std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg; }
+      else { std::snprintf(arg, sizeof arg, " v%u:%u", v, r.u8()); text += arg; }
+    }
+  }
+  if (out.opcode == 0x59) {                  // sfxBind {u8,[pos],lstr}
+    Reader r2{image, imageBase, codeOff + 1};
+    const std::uint8_t m = r2.ok ? r2.u8() : 0;
+    if (m & 0x10) {
+      for (int k = 0; k < 3; ++k) {
+        std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+      }
+    } else if (m & 0x20) {
+      std::snprintf(arg, sizeof arg, " r%u", r.u8()); text += arg;
+    } else if (m & 0x40) {
+      for (int k = 0; k < 3; ++k) {
+        std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+      }
+    }
+    const std::string s = r.str();
+    text += " \"" + s + "\"";
+  }
+  if (out.opcode == 0x9e) {                  // path9e {u8,u16,u32[,u32]}
+    Reader r2{image, imageBase, codeOff + 5};  // flags at +5..+8
+    const std::uint32_t fl = r2.ok ? r2.u32() : 0;
+    if (fl & 2) {
+      const std::uint32_t t = r.u32();
+      std::snprintf(arg, sizeof arg, " ->%x", t); text += arg;
+      out.linkTargets.push_back(t);
+    }
+  }
+  if (out.opcode == 0x9f) {                  // fxSpawn {u8,[3u32],3u32,lstr,u32}
+    Reader r2{image, imageBase, codeOff + 1};
+    const std::uint8_t m = r2.ok ? r2.u8() : 0;
+    if (m == 1 || m == 2) {
+      for (int k = 0; k < 3; ++k) {
+        std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+      }
+    }
+    for (int k = 0; k < 3; ++k) {
+      std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+    }
+    const std::string s = r.str();
+    text += " \"" + s + "\"";
+    const std::uint32_t t = r.u32();
+    std::snprintf(arg, sizeof arg, " ->%x", t); text += arg;
+    out.linkTargets.push_back(t);
+  }
+  if (out.opcode == 0xe4) {                  // slotE4 {u8 -> u8|lstr}
+    Reader r2{image, imageBase, codeOff + 1};
+    const std::uint8_t m = r2.ok ? r2.u8() : 0;
+    if (m == 0) {
+      std::snprintf(arg, sizeof arg, " %u", r.u8()); text += arg;
+    } else {
+      const std::string s = r.str();
+      text += " \"" + s + "\"";
+    }
+  }
+  if (out.opcode == 0xa0 || out.opcode == 0xbc || out.opcode == 0xde ||
+      out.opcode == 0xbf) {                  // kind-f32 cmp + linkage
+    // 0xa0/0xbc/0xde: {u8 kind, f32, [f32], link}
+    // 0xbf:           {u8 axis, u8 kind, f32, [f32], link}
+    Reader r2{image, imageBase,
+              codeOff + (out.opcode == 0xbf ? 2 : 1)};
+    const std::uint8_t kind = r2.ok ? r2.u8() : 0;
+    std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+    if (kind == 7 || kind == 8) {
+      std::snprintf(arg, sizeof arg, " %.3g", r.f32()); text += arg;
+    }
+    const std::uint8_t m = r.u8();
+    std::snprintf(arg, sizeof arg, " link%02x", m); text += arg;
+    if (m == 0xfe) {
+      std::uint32_t a = r.u32(), b = r.u32();
+      std::snprintf(arg, sizeof arg, ":%x,%x", a, b); text += arg;
+      out.linkTargets.push_back(a); out.linkTargets.push_back(b);
+    } else if (m == 0xfc || m == 0x0c) {
+      std::uint32_t a = r.u32();
+      std::snprintf(arg, sizeof arg, ":%x", a); text += arg;
+      out.linkTargets.push_back(a);
+    }
   }
   out.length = static_cast<int>(r.pc - codeOff);
   out.text = text;
