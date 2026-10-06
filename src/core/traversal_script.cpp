@@ -646,6 +646,7 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
     const std::uint32_t insnOff = r.pc;
     const std::uint8_t op = r.u8();
     ++res.instructions;
+    env.curInsnOff = insnOff;          // QA spawn-provenance stamp
     if (!r.ok) { fail("opcode fetch out of bounds"); return res; }
     {
       static const char* tr = std::getenv("MDK_TRACE_ARENA");
@@ -1602,6 +1603,7 @@ void objScriptInsn(ObjScriptPass& v) {
   const std::uint32_t insnOff = r.pc;
   const std::uint8_t op = r.u8();
   ++res.instructions;
+  v.env.curInsnOff = insnOff;          // QA spawn-provenance stamp
   if (!r.ok) { v.fail("opcode fetch out of bounds"); return; }
   static const char* traceCls = std::getenv("MDK_TRACE_OBJ");
   if (traceCls != nullptr && obj.scriptClass == traceCls) {
@@ -5866,8 +5868,32 @@ void traversalScriptSpawn(TraversalScriptEnv& env, float x, float y,
     }
     o.col.elemMaskA = o.connMaskLock;              // +0x326 alias
   }
-  traversalSpawnLog().push_back(
-      {cls, name, self->name, variant});
+  {
+    // QA-only provenance for --traversal-runtime's spawn list: the
+    // executing ctx object (arena latch = empty) and the instruction
+    // offset so the spawning site can be mapped back to the CMI.
+    TraversalSpawnRecord rec;
+    rec.cls = cls;
+    rec.name = name;
+    rec.arena = self->name;
+    rec.variant = variant;
+    if (env.ctxObject) {
+      char pb[48];
+      std::snprintf(pb, sizeof pb, "@(%.0f,%.0f,%.0f)",
+                    (double)env.ctxObject->pos[0],
+                    (double)env.ctxObject->pos[1],
+                    (double)env.ctxObject->pos[2]);
+      rec.spawner = env.ctxObject->scriptClass.empty()
+                        ? env.ctxObject->model.modelName()
+                        : env.ctxObject->scriptClass;
+      rec.spawner += pb;
+    }
+    if (!env.image.empty()) {
+      // env.curInsnOff is set by the exec loop before dispatch.
+      rec.spawnPc = env.curInsnOff;
+    }
+    traversalSpawnLog().push_back(rec);
+  }
   ++env.seamsSpawned;
 }
 

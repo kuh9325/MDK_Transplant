@@ -2063,20 +2063,30 @@ TraversalFrameResult stepTraversalRuntime(
   if (rt.teleportFlag != 0) ++rt.seams.teleportCalls;
 
   // FUN_00435178 portal test -> current-arena swap. OBSERVED
-  // (0x436374..0x4363be): slideChannel <- -15 when >0; ca4 <- old
-  // c48; ca8 <- 1; c48 <- dest; FUN_00432d9c(dest) — whose own
-  // dest!=ca4 branch then leaves ca4 = dest = new current (the old
-  // arena stays resident via the LRU slots, not the partner slot).
+  // (0x4363a1..0x4363be):
+  //   MOV EAX,[c48] / MOV [ca4],EAX  — ca4 <- OLD c48: the departed
+  //     arena stays the collision carrier while the player transits
+  //     a geometry-less connector (CHMO_*) on the old arena's floor.
+  //   MOV [ca8],1                  — partnerActive
+  //   MOV [c48],EDX                — c48 <- dest
+  //   CALL FUN_00432d9c(dest)      — its arg==c48 first branch runs
+  //     the FUN_00432980 migrate/pull-in only; ca4 is NOT rewritten
+  //     to dest. (An earlier comment claimed "dest!=ca4 leaves
+  //     ca4=dest" — wrong: c48 is already dest at the call, so the
+  //     dest==c48 branch is the one that runs.)
   bool swapped = false;
   int portalCand = -1;
   if (TraversalArena* dest = traversalPortalTest(rt)) {
     if (rt.slideChannel > 0) rt.slideChannel = -15; // OBSERVED
+    TraversalArena* prev = cur;
+    if (prev != nullptr && prev != dest) {
+      rt.partner = prev;                        // ca4 <- old c48
+      rt.cs.carrier = &prev->dyn.col;
+    }
+    rt.partnerActive = true;                    // 0x540ca8 = 1
+    rt.cs.carrierValid = 1;
     rt.cur = dest;                              // 0x540c48 <- dest
     cur = dest;
-    rt.partner = dest;                          // net ca4 <- dest
-    rt.partnerActive = true;                    // 0x540ca8 = 1
-    rt.cs.carrier = &dest->dyn.col;
-    rt.cs.carrierValid = 1;
     portalCand = dest->index;
     rt.cs.arena = &cur->dyn.col;
     rt.cs.surface = &cur->surface;

@@ -176,6 +176,10 @@ struct TraversalScriptEnv {
   // latch and object-spawned children by their spawner.
   DynamicObject* ctxObject = nullptr;
 
+  // QA-only: image offset of the instruction currently dispatching —
+  // stamped on spawn-log records so a spawn maps back to the CMI.
+  std::uint32_t curInsnOff = 0;
+
   // Mirrored globals the subset touches (0x541534, 0x540b58,
   // 0x540d98, 0x540d88[8], 0x54b5e0/0x5414e8 read-only, 0x540e24/cbc).
   std::int8_t g541534 = 0;
@@ -301,6 +305,10 @@ struct TraversalSpawnRecord {
   std::string name;
   std::string arena;      // owning arena at spawn time
   int variant = 0;
+  // QA-only provenance: the executing object's class + model and the
+  // spawn instruction's image offset (0 when arena-script spawned).
+  std::string spawner;
+  std::uint32_t spawnPc = 0;
 };
 std::vector<TraversalSpawnRecord>& traversalSpawnLog();
 

@@ -160,8 +160,16 @@ int segAabbResolve(const float* start, const float* target, const float* box,
 //   Returns 1 = overlap on every axis projection, 0 = separated.
 // ---------------------------------------------------------------------------
 
-int boxTri(const float* contact, const float* ext, const float* gate,
-           const float* v0, const float* v1, const float* v2) {
+// TEMP QA instrumentation (MDK_BT_TRACE): record the +a0 inside-face
+// crossing query + result to prove the L4/L8 first divergence.
+static bool gBtTrace;
+static bool gBtIfHit;
+static int gBtAxis;
+static float gBtContact[3], gBtV[9];
+
+static int boxTriCore(const float* contact, const float* ext,
+                      const float* gate, const float* v0,
+                      const float* v1, const float* v2) {
   static const int kAxis[3][2] = {{1, 2}, {0, 2}, {0, 1}}; // DAT_00499f54
   const float* verts[3] = {v0, v1, v2};
   for (int a = 0; a < 3; ++a) {
@@ -244,6 +252,14 @@ int boxTri(const float* contact, const float* ext, const float* gate,
               // OBSERVED (FUN_004089c0): an in-range crossing of the
               // +a0 face breaks the edge scan and the axis PASSES —
               // the mask is not consulted on this exit path.
+              if (gBtTrace) {
+                gBtIfHit = true;
+                gBtAxis = a;
+                std::memcpy(gBtContact, contact, sizeof gBtContact);
+                std::memcpy(gBtV + 0, v0, 12);
+                std::memcpy(gBtV + 3, v1, 12);
+                std::memcpy(gBtV + 6, v2, 12);
+              }
               mask = 0;
               break;
             }
@@ -257,6 +273,26 @@ int boxTri(const float* contact, const float* ext, const float* gate,
     }
   }
   return 1;
+}
+
+int boxTri(const float* contact, const float* ext, const float* gate,
+           const float* v0, const float* v1, const float* v2) {
+  static const bool initTrace =
+      (gBtTrace = std::getenv("MDK_BT_TRACE") != nullptr, true);
+  (void)initTrace;
+  gBtIfHit = false;
+  const int r = boxTriCore(contact, ext, gate, v0, v1, v2);
+  if (gBtTrace && gBtIfHit)
+    std::fprintf(stderr,
+                 "BTIF a=%d c=(%g,%g,%g) ext=(%g,%g,%g) "
+                 "tri=(%g,%g,%g)(%g,%g,%g)(%g,%g,%g) ret=%d\n",
+                 gBtAxis, (double)gBtContact[0], (double)gBtContact[1],
+                 (double)gBtContact[2], (double)ext[0], (double)ext[1],
+                 (double)ext[2], (double)gBtV[0], (double)gBtV[1],
+                 (double)gBtV[2], (double)gBtV[3], (double)gBtV[4],
+                 (double)gBtV[5], (double)gBtV[6], (double)gBtV[7],
+                 (double)gBtV[8], r);
+  return r;
 }
 
 // ---------------------------------------------------------------------------

@@ -1318,6 +1318,7 @@ struct HitSpec {
   std::string objName, elemName;
   int type = 0;
   int count = 1;
+  int frame = 0;                // QA: earliest frame the shot may fire
 };
 
 // Phase 16B.1 — `--pdamage AMT@FRM`: applies the authentic producer
@@ -1341,9 +1342,9 @@ bool combatBossMatches(const mdk::DynamicObject& o, const char* nm) {
 
 void fireCombatHits(mdk::TraversalRuntime& rt,
                     std::vector<HitSpec>& hitSpecs,
-                    bool& elemShotFired) {
+                    bool& elemShotFired, int frameNow) {
   for (auto& h : hitSpecs) {
-    if (h.count <= 0) continue;
+    if (h.count <= 0 || frameNow < h.frame) continue;
     if (!h.elemName.empty() && elemShotFired) continue;
     const mdk::CollisionArena* ar =
         (rt.cs.arena != nullptr)
@@ -1482,6 +1483,29 @@ void fireCombatHits(mdk::TraversalRuntime& rt,
                 start[0], start[1], start[2],
                 end[0], end[1], end[2], pe, elemIdx);
           if (pe != elemIdx) continue;
+          // World-occlusion gate: the approach must also be clear in
+          // the arena BSP — probing is object-local, but the real
+          // shot dies on any wall between spawn and the element face
+          // (e.g. XH1_KEY* sit inside the door recess; a lateral
+          // approach resolves locally yet spawns inside the housing
+          // wall). Require a clean stab to just past the target.
+          float ocEnd[3] = {tp[0] - d[0] * (elemHalf[ax] + 4.0f),
+                            tp[1] - d[1] * (elemHalf[ax] + 4.0f),
+                            tp[2] - d[2] * (elemHalf[ax] + 4.0f)};
+          float ocPt[3] = {0, 0, 0};
+          bool occluded = false;
+          if (rt.cs.arena != nullptr &&
+              mdk::collisionStabFull(*rt.cs.arena, start, ocEnd, ocPt,
+                                     nullptr) != nullptr)
+            occluded = true;
+          if (!occluded && rt.cs.carrier != nullptr &&
+              rt.cs.carrierBusy == 0 &&
+              mdk::collisionStabFull(*rt.cs.carrier, start, ocEnd, ocPt,
+                                     nullptr) != nullptr)
+            occluded = true;
+          if (traceAim && occluded)
+            std::fprintf(stderr, "      (occluded by BSP)\n");
+          if (occluded) continue;
           dir[0] = -d[0]; dir[1] = -d[1]; dir[2] = -d[2];
           s.pos[0] = start[0]; s.pos[1] = start[1];
           s.pos[2] = start[2];
@@ -2178,6 +2202,9 @@ int main(int argc, char** argv) {
   struct HoldSpec { int key; int first; int last; };
   std::vector<HoldSpec> holdSpecs;
   std::vector<HoldSpec> pressSpecs;
+  // QA route driver — see the --route parse branch for semantics.
+  struct RouteWaypoint { float x, y, z, r; bool jump; };
+  std::vector<RouteWaypoint> routeWps;
   std::vector<std::pair<int, int>> ammoSpecs;
   std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
@@ -2308,6 +2335,13 @@ int main(int argc, char** argv) {
       if (!v) return usage();
       HitSpec h;
       std::string spec = v;
+      const auto cm = spec.rfind(',');
+      if (cm != std::string::npos && cm + 2 < spec.size() &&
+          spec[cm + 1] == 'f' &&
+          std::isdigit(static_cast<unsigned char>(spec[cm + 2]))) {
+        h.frame = std::atoi(spec.c_str() + cm + 2);
+        spec.erase(cm);
+      }
       const auto x = spec.rfind('x');
       if (x != std::string::npos && x + 1 < spec.size() &&
           std::isdigit(static_cast<unsigned char>(spec[x + 1]))) {
@@ -2381,6 +2415,37 @@ int main(int argc, char** argv) {
       h.key = std::atoi(spec.substr(0, at).c_str());
       h.first = h.last = std::atoi(spec.c_str() + at + 1);
       pressSpecs.push_back(h);
+    } else if (!std::strcmp(a, "--route")) {
+      // QA route driver: one waypoint per --route "x,y,z[,r[,j]]".
+      // Steers with REAL key levels (105/106 turn, 103 forward, 56
+      // jump-hold on flag 'j'); a waypoint counts reached only while
+      // grounded, so scripted vehicle legs can't consume waypoints.
+      // r = arrive radius (default 4). No runtime fields are written.
+      const char* v = value(a);
+      if (!v) return usage();
+      RouteWaypoint w;
+      std::string spec(v);
+      std::vector<float> vals;
+      size_t p = 0;
+      bool jumpFlag = false;
+      while (p <= spec.size()) {
+        const size_t c = spec.find(',', p);
+        const std::string tok =
+            spec.substr(p, c == std::string::npos ? spec.size() - p
+                                                  : c - p);
+        if (tok == "j") jumpFlag = true;
+        else vals.push_back(std::strtof(tok.c_str(), nullptr));
+        if (c == std::string::npos) break;
+        p = c + 1;
+      }
+      if (vals.size() < 3) {
+        std::fprintf(stderr, "--route wants x,y,z[,r[,j]]\n");
+        return usage();
+      }
+      w.x = vals[0]; w.y = vals[1]; w.z = vals[2];
+      w.r = vals.size() > 3 ? vals[3] : 4.f;
+      w.jump = jumpFlag;
+      routeWps.push_back(w);
     } else if (!std::strcmp(a, "--ammo")) {
       // QA enabler: seed ammo block entry I to N at runtime init
       // (a level-start save carries session ammo; a fresh QA start
@@ -3016,7 +3081,7 @@ int main(int argc, char** argv) {
           idleInput ? 0
                     : f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
       bool elemShotFired = false;
-      fireCombatHits(rt, hitSpecs, elemShotFired);
+      fireCombatHits(rt, hitSpecs, elemShotFired, f);
       auto raw = rawFor(phase);
       for (const auto& h : holdSpecs)
         if (f >= h.first && f <= h.last)
@@ -3086,9 +3151,9 @@ int main(int argc, char** argv) {
         }
       }
       for (const auto& r : mdk::traversalSpawnLog())
-        std::printf("  spawn %s name=%s arena=%s v%d\n",
+        std::printf("  spawn %s name=%s arena=%s v%d pc=0x%x by=%s\n",
                     r.cls.c_str(), r.name.c_str(), r.arena.c_str(),
-                    r.variant);
+                    r.variant, r.spawnPc, r.spawner.c_str());
       std::printf(
           "  completion: endLevel=%d ending=%d vsnapPending=%d "
           "vsnaps=%d objDeathCalls=%d shotHits=%d\n",
@@ -3874,6 +3939,29 @@ int main(int argc, char** argv) {
         std::printf("  unresolved-names=%zu", failed.size());
       }
       std::printf("\n");
+      // QA route planning: dump every sub-record type with its
+      // fields (type-6 portals get the side/box decode).
+      for (const auto& r : work.subRecords) {
+        std::printf("  sub t=%-2u f0=%u f1=%u box=(%.0f,%.0f,%.0f)-"
+                    "(%.0f,%.0f,%.0f)\n",
+                    r.type, r.fields[0], r.fields[1],
+                    (double)r.fieldAsFloat(2),
+                    (double)r.fieldAsFloat(3),
+                    (double)r.fieldAsFloat(4),
+                    (double)r.fieldAsFloat(5),
+                    (double)r.fieldAsFloat(6),
+                    (double)r.fieldAsFloat(7));
+        if (r.type != 6) continue;
+        std::printf("  portal side=%u ->%u box=(%.0f,%.0f,%.0f)-"
+                    "(%.0f,%.0f,%.0f)\n",
+                    r.fields[1], r.fields[0],
+                    (double)r.fieldAsFloat(2),
+                    (double)r.fieldAsFloat(3),
+                    (double)r.fieldAsFloat(4),
+                    (double)r.fieldAsFloat(5),
+                    (double)r.fieldAsFloat(6),
+                    (double)r.fieldAsFloat(7));
+      }
       for (const auto* o : spawned) {
         std::printf("  obj idx=%-3u spawn=%-5u pos=(%g, %g, %g) "
                     "elems=%zd tris=%d aabb=(%g..%g, %g..%g, %g..%g)\n",
@@ -4098,10 +4186,20 @@ int main(int argc, char** argv) {
     // schedule (genuinely idle frames; needed to test spawn-adjacent
     // scripted triggers the default schedule walks the player off).
     const bool idleInput = std::getenv("MDK_IDLE_INPUT") != nullptr;
+    // QA route driver state: wpIdx advances only on grounded contact
+    // (scripted vehicle legs move the player without consuming
+    // waypoints); routeStall counts frames since forward progress.
+    std::size_t wpIdx = 0;
+    bool prevGrounded = true;
+    int routeStall = 0;
+    int routeArena = -2;
+    float routeBestDist = 1e30f;
+    bool routeStallReported = false;
     for (int f = 0; f < travFrames; ++f) {
       const int phase =
-          idleInput ? 0
-                    : f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
+          (idleInput || !routeWps.empty())
+              ? 0
+              : f < 10 ? 0 : f < 30 ? 1 : f < 35 ? 0 : f < 50 ? 3 : 0;
       // Phase 15A — combat harness: each pending --hit injects ONE
       // shot into a free pool slot, aimed through the named
       // object/element. The pool's own collision + damage tail
@@ -4114,7 +4212,7 @@ int main(int argc, char** argv) {
       // the same reason the original can't register simultaneous
       // element kills — so at most one @ELEM spec fires per frame.
       bool elemShotFired = false;
-      fireCombatHits(rt, hitSpecs, elemShotFired);
+      fireCombatHits(rt, hitSpecs, elemShotFired, f);
       const bool colProfFrame =
           std::getenv("MDK_COL_PROFILE_FRAME") != nullptr;
       const mdk::CollisionProfile colPrev =
@@ -4128,8 +4226,67 @@ int main(int argc, char** argv) {
           raw.keyEdge[p.key >> 5] |= 1u << (p.key & 31);
       for (const int iu : itemUseFrames)
         if (iu == f) raw.keyEdge[0] |= (1u << 28);   // kSlotItemUse
+      if (std::getenv("MDK_BT_TRACE"))
+        std::fprintf(stderr, "BTFRAME %d\n", f);
+      // QA route driver: steer toward routeWps[wpIdx] with real key
+      // levels. Waypoints only advance while grounded — scripted
+      // vehicle legs move the player without consuming the route.
+      if (!routeWps.empty()) {
+        const int arenaNow = rt.cur ? rt.cur->index : -1;
+        if (arenaNow != routeArena) {
+          std::printf("route: arena %d->%d (%s) f=%d pos=(%.1f,%.1f,"
+                      "%.1f)\n",
+                      routeArena, arenaNow,
+                      rt.cur ? rt.cur->name.c_str() : "?", f,
+                      (double)rt.cs.pos[0], (double)rt.cs.pos[1],
+                      (double)rt.cs.pos[2]);
+          routeArena = arenaNow;
+        }
+        if (wpIdx < routeWps.size() && (prevGrounded || f == 0)) {
+          const RouteWaypoint& w = routeWps[wpIdx];
+          const float dx = w.x - rt.cs.pos[0];
+          const float dy = w.y - rt.cs.pos[1];
+          const float dist = std::sqrt(dx * dx + dy * dy);
+          float targ = std::atan2(dy, dx) * (180.f / 3.14159265f);
+          float err = targ - rt.motion.yawDeg;
+          while (err > 180.f) err -= 360.f;
+          while (err < -180.f) err += 360.f;
+          if (err > 2.f)
+            raw.keyLevel[105 >> 5] |= 1u << (105 & 31);  // turn left
+          else if (err < -2.f)
+            raw.keyLevel[106 >> 5] |= 1u << (106 & 31);  // turn right
+          if (std::fabs(err) < 25.f || w.jump)
+            raw.keyLevel[103 >> 5] |= 1u << (103 & 31);  // forward
+          if (w.jump)
+            raw.keyLevel[56 >> 5] |= 1u << (56 & 31);    // jump-hold
+          if (dist < routeBestDist) {
+            routeBestDist = dist;
+            routeStall = 0;
+            routeStallReported = false;
+          } else if (++routeStall == 300 && !routeStallReported) {
+            std::printf("route: STALL wp%zu f=%d pos=(%.1f,%.1f,%.1f) "
+                        "arena=%d dist=%.1f\n",
+                        wpIdx, f, (double)rt.cs.pos[0],
+                        (double)rt.cs.pos[1], (double)rt.cs.pos[2],
+                        arenaNow, (double)dist);
+            routeStallReported = true;
+          }
+          if (dist < w.r) {
+            std::printf("route: wp%02d reached f=%d pos=(%.1f,%.1f,"
+                        "%.1f) arena=%d\n",
+                        (int)wpIdx, f, (double)rt.cs.pos[0],
+                        (double)rt.cs.pos[1], (double)rt.cs.pos[2],
+                        arenaNow);
+            ++wpIdx;
+            routeStall = 0;
+            routeBestDist = 1e30f;
+            routeStallReported = false;
+          }
+        }
+      }
       const auto out =
           mdk::stepTraversalRuntime(rt, raw, bindings, timing);
+      prevGrounded = out.grounded;
       ++framesRun;
       for (const int iu : itemUseFrames)
         if (iu == f || iu + 1 == f || iu + 10 == f) {
@@ -4467,6 +4624,36 @@ int main(int argc, char** argv) {
               (double)o.field30, (double)o.yawDeg,
               (double)o.col.scale, o.animDone() ? 1 : 0);
         }
+      // QA-only (MDK_TRACE_DOOR=substr): per-frame trace of every live
+      // object whose model/class contains the substring — pos, world
+      // AABB, anim cursor — for watching scripted movers like
+      // LEVEL3's XH1_DOOR land.
+      if (const char* dw = std::getenv("MDK_TRACE_DOOR")) {
+        const std::string want = dw;
+        for (const auto& ap : rt.arenas)
+          for (const auto& up : ap->dyn.storage) {
+            const mdk::DynamicObject& o = *up;
+            const std::string tok = o.model.modelName();
+            if (tok.find(want) == std::string::npos &&
+                o.scriptClass.find(want) == std::string::npos)
+              continue;
+            std::printf(
+                "      TDOOR f=%d %s home=%s pos=(%.1f,%.1f,%.1f) "
+                "aabb=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) anim=%c cur=%d "
+                "lat=%04x f148=%04x f14a=%02x hp=%d v21e=%02x\n",
+                f, tok.c_str(),
+                o.arena && o.arena->owner ? o.arena->owner->name.c_str()
+                                          : "?",
+                (double)o.pos[0], (double)o.pos[1], (double)o.pos[2],
+                (double)o.col.aabb[0], (double)o.col.aabb[1],
+                (double)o.col.aabb[2], (double)o.col.aabb[3],
+                (double)o.col.aabb[4], (double)o.col.aabb[5],
+                o.animRec ? 'Y' : 'n', (int)o.animFrame,
+                (unsigned)(std::uint16_t)o.animLatch,
+                (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
+                o.health, (unsigned)o.field21e);
+          }
+      }
       // The digest mixes only deterministic state — raw contact
       // tokens are process addresses and are mixed as booleans.
       mix(static_cast<std::uint64_t>(out.frame));
@@ -4588,6 +4775,34 @@ int main(int argc, char** argv) {
                 static_cast<int>(rt.scriptDiag.size()));
     for (const std::string& m : rt.scriptDiag)
       std::printf("           ! %s\n", m.c_str());
+    // QA-only (MDK_OBJDUMP=1): per-arena census of every live dynamic
+    // object — class/name token, pos, connector state, collision
+    // presence — for route-planning and spawn evidence.
+    if (std::getenv("MDK_OBJDUMP") != nullptr) {
+      for (const auto& tap : rt.arenas) {
+        const mdk::TraversalArena& ta = *tap;
+        int n = 0;
+        for (const auto& up : ta.dyn.storage) {
+          const mdk::DynamicObject& o = *up;
+          const std::string tok = o.model.modelName();
+          std::printf("OBJ %2d %-8s %-2d %-12s cls=%-10s pos=(%8.2f,%8.2f,"
+                      "%8.2f) hp=%d f14a=%05x conn=%d cs=%02x"
+                      " aabb=(%8.2f,%8.2f,%8.2f)-(%8.2f,%8.2f,%8.2f)"
+                      " el=%d\n",
+                      ta.index, ta.name.c_str(), n,
+                      tok.empty() ? "-" : tok.c_str(),
+                      o.scriptClass.empty() ? "-" : o.scriptClass.c_str(),
+                      (double)o.pos[0], (double)o.pos[1],
+                      (double)o.pos[2], o.health, o.col.flags14a,
+                      o.connDest ? o.connDest->index : -1, o.connState,
+                      (double)o.col.aabb[0], (double)o.col.aabb[1],
+                      (double)o.col.aabb[2], (double)o.col.aabb[3],
+                      (double)o.col.aabb[4], (double)o.col.aabb[5],
+                      o.elemSet.count);
+          ++n;
+        }
+      }
+    }
     // Phase 17B.1 — traversal HUD core diagnostic: the bound-record
     // census (25 expected slots: 18 images, 4 sprite tables, SNIPERS2
     // stream layer, SNIPERS1 bezel, FONTBIG), the latches/gates the
@@ -4745,9 +4960,9 @@ int main(int argc, char** argv) {
         }
       }
       for (const auto& r : mdk::traversalSpawnLog())
-        std::printf("  spawn %s name=%s arena=%s v%d\n",
+        std::printf("  spawn %s name=%s arena=%s v%d pc=0x%x by=%s\n",
                     r.cls.c_str(), r.name.c_str(), r.arena.c_str(),
-                    r.variant);
+                    r.variant, r.spawnPc, r.spawner.c_str());
       std::printf(
           "  completion: endLevel=%d ending=%d vsnapPending=%d "
           "vsnaps=%d objDeathCalls=%d shotHits=%d\n",
@@ -5663,10 +5878,14 @@ int main(int argc, char** argv) {
                     standableHit, standableMiss);
       std::printf("  arena[%2d] %-9s polys=%d colSkip=%d rendSkip=%d "
                   "floorish=%d | renderNoCollide=%d invisWall=%d | "
-                  "objs=%d standable=%d maskedElems=%d/%d\n",
+                  "objs=%d standable=%d maskedElems=%d/%d | "
+                  "bounds=(%.0f..%.0f, %.0f..%.0f, %.0f..%.0f)\n",
                   a->index, a->name.c_str(), npoly, colSkip, rendSkip,
                   floorish, escape, invisWall, objs, standable,
-                  maskedElems, totalElems);
+                  maskedElems, totalElems,
+                  (double)bmin[0], (double)bmax[0],
+                  (double)bmin[1], (double)bmax[1],
+                  (double)bmin[2], (double)bmax[2]);
       // -- support grid ------------------------------------------------
       // 2-unit cells over the XY bbox; from vert-top sweep down past
       // the bottom. Owner: BSP poly (returned hit), object element
@@ -5679,6 +5898,16 @@ int main(int argc, char** argv) {
         const int ny =
             std::max(1, static_cast<int>((bmax[1] - bmin[1]) / 2.f));
         sup.assign(static_cast<std::size_t>(nx) * ny, 0);
+        // QA-only (MDK_FLOORMAP=<name-substr>): capture the landed z
+        // per supported cell and print a coarse ASCII heightmap —
+        // route planning aid, not part of the census accounting.
+        const char* fmWant = std::getenv("MDK_FLOORMAP");
+        const bool fmOn =
+            fmWant != nullptr && a->name.find(fmWant) !=
+            std::string::npos;
+        std::vector<float> fmZ;
+        if (fmOn) fmZ.assign(static_cast<std::size_t>(nx) * ny,
+                            -1e30f);
         int nBsp = 0, nObj = 0;
         for (int gy = 0; gy < ny; ++gy) {
           for (int gx = 0; gx < nx; ++gx) {
@@ -5712,10 +5941,73 @@ int main(int argc, char** argv) {
               ++nObj;
             }
             sup[static_cast<std::size_t>(gy) * nx + gx] = s;
+            if (fmOn && s != 0)
+              fmZ[static_cast<std::size_t>(gy) * nx + gx] =
+                  cs.pos[2];
+          }
+        }
+        // QA-only (MDK_STRIPMAP="x0,y0,x1,y1[,zTop]"): for each cell
+        // in the rect, peel the column — repeatedly sweep down,
+        // restart just under each contact — and report the LOWEST
+        // reachable surface. Reveals walkable floors hidden under
+        // overhangs that the top-surface floormap cannot see.
+        if (const char* sm = std::getenv("MDK_STRIPMAP")) {
+          float x0 = 0, y0 = 0, x1 = 0, y1 = 0, zTop = bmax[2] + 4.f;
+          const int got = std::sscanf(sm, "%f,%f,%f,%f,%f",
+                                      &x0, &y0, &x1, &y1, &zTop);
+          if (got >= 4 && zTop > 1e29f) zTop = bmax[2] + 4.f;
+          if (got >= 4) {
+            // Cells of 2u; char = bucket of the lowest surface z in
+            // 10u steps above zLo2; ' ' = cell outside arena bounds,
+            // '.' = column peeled to void.
+            std::printf("           stripmap (%g,%g)-(%g,%g) "
+                        "lowest-surface map (2u/cell, top=+y):\n",
+                        (double)x0, (double)y0, (double)x1,
+                        (double)y1);
+            for (float y = y1; y >= y0; y -= 4.0f) {
+              std::string row;
+              for (float x = x0; x <= x1; x += 2.0f) {
+                float zc = zTop;
+                int hits = 0;
+                float lastZ = -1e30f;
+                for (int peel = 0; peel < 8; ++peel) {
+                  mdk::CollisionState cs2;
+                  cs2.arena = &col;
+                  cs2.queryEnabled = 1;
+                  cs2.arenaValid = 1;
+                  cs2.objectDataLoaded = 1;
+                  cs2.pos[0] = x; cs2.pos[1] = y; cs2.pos[2] = zc;
+                  cs2.playerBox[0] = x - 1.25f;
+                  cs2.playerBox[1] = y - 1.25f;
+                  cs2.playerBox[2] = zc;
+                  cs2.playerBox[3] = x + 1.25f;
+                  cs2.playerBox[4] = y + 1.25f;
+                  cs2.playerBox[5] = zc + 4.25f;
+                  const mdk::CollisionPoly* h = mdk::collisionApply(
+                      cs2, 0.f, 0.f, -(zc - bmin[2] + 20.f), 0.5f,
+                      nullptr, nullptr);
+                  if (h == nullptr) break;
+                  ++hits;
+                  lastZ = cs2.pos[2];
+                  zc = cs2.pos[2] - 0.75f;
+                }
+                if (!hits) { row += '.'; continue; }
+                const int b2 = static_cast<int>((lastZ - 0.f) / 10.f);
+                row += (b2 < 0) ? '~'
+                     : b2 < 10 ? static_cast<char>('0' + b2)
+                     : b2 < 36 ? static_cast<char>('A' + b2 - 10)
+                     : '#';
+              }
+              std::printf("           y=%6.1f %s\n", (double)y,
+                          row.c_str());
+            }
           }
         }
         // interior holes: unsupported cell with >=3 supported
-        // 4-neighbors (excludes the rim/void fringe around geometry)
+        // 4-neighbors (excludes the rim/void fringe around geometry).
+        // EVERY hole is classified below — verbose forensics print
+        // for the first 12 per arena and for every cell classified
+        // as a true unsupported visible floor.
         int holeN = 0;
         std::vector<std::pair<float, float>> holePos;
         for (int gy = 0; gy < ny; ++gy)
@@ -5732,26 +6024,79 @@ int main(int argc, char** argv) {
                 sup[static_cast<std::size_t>(gy + 1) * nx + gx]) ++nb;
             if (nb >= 3) {
               ++holeN;
-              if (holePos.size() < 12)
-                holePos.emplace_back(
-                    bmin[0] + (gx + 0.5f) * 2.f,
-                    bmin[1] + (gy + 0.5f) * 2.f);
+              holePos.emplace_back(bmin[0] + (gx + 0.5f) * 2.f,
+                                   bmin[1] + (gy + 0.5f) * 2.f);
             }
           }
         const int cells = nx * ny;
         std::printf("           grid %dx%d cells=%d supported=%d "
                     "(bsp=%d obj=%d) interiorHoles=%d\n",
                     nx, ny, cells, nBsp + nObj, nBsp, nObj, holeN);
+        if (fmOn) {
+          // ASCII heightmap: downsampled so output stays ~100x50.
+          // char = floor-z bucket (10u steps, '0'..'9'+'A'..), '.'=void
+          const int sx = std::max(1, nx / 100 + 1);
+          const int sy = std::max(1, ny / 50 + 1);
+          float zLo = 1e30f, zHi = -1e30f;
+          for (const float z : fmZ)
+            if (z > -1e29f) {
+              if (z < zLo) zLo = z;
+              if (z > zHi) zHi = z;
+            }
+          std::printf("           floor-map z=%.0f..%.0f "
+                      "(%d u/cell, top=+y):\n",
+                      (double)zLo, (double)zHi, sx * 2);
+          for (int ry = ny - 1; ry >= 0; ry -= sy) {
+            std::string row;
+            for (int rx = 0; rx < nx; rx += sx) {
+              float acc = 0.f;
+              int cnt = 0;
+              for (int j = 0; j < sy && ry - j >= 0; ++j)
+                for (int i = 0; i < sx && rx + i < nx; ++i) {
+                  const float z =
+                      fmZ[static_cast<std::size_t>(ry - j) * nx +
+                          rx + i];
+                  if (z > -1e29f) { acc += z; ++cnt; }
+                }
+              if (!cnt) {
+                row += '.';
+              } else {
+                const int bucket = static_cast<int>(
+                    (acc / cnt - zLo) / 10.f);
+                row += bucket < 10
+                    ? static_cast<char>('0' + bucket)
+                    : bucket < 36
+                        ? static_cast<char>('A' + bucket - 10)
+                        : '#';
+              }
+            }
+            std::printf("           %s\n", row.c_str());
+          }
+        }
+
+        // ---- classify EVERY interior hole --------------------------
+        // cls: 0 void (no covering geometry) | 1 object-elem |
+        // 2 down-facing covering poly (ceiling/underside — correctly
+        //   not support) | 3 stepped-hit (per-frame support exists;
+        //   the column sweep slide-off is an artefact) |
+        // 4 slide-off (column hit then slid, no stepped support) |
+        // 5 UNSUPPORTED VISIBLE FLOOR (up-facing rendered poly, no
+        //   support by any probe — needs investigation) | 6 unknown
+        struct HoleInfo {
+          float x, y, nz, z;
+          std::uint16_t flags;
+          int poly, expect, cls, iters, stepHit;
+          float stepZ;
+        };
+        std::vector<HoleInfo> infos;
+        infos.reserve(holePos.size());
         for (const auto& hp : holePos) {
+          HoleInfo hi{hp.first, hp.second, 0.f, 0.f, 0, -1, 0, 6, 0,
+                      -1, -1e30f};
           // expected owner: a rendered (not render-skip) floor-ish
           // poly whose XY projection covers the cell, or a standable
           // object's element AABB covering it.
-          int expect = 0;          // 0 none 1 bsp-poly 2 object-elem
-          float expNz = 0.f;       // covering poly's winding nz
-          float expZ = 0.f;        // covering poly centroid z
-          std::uint16_t expFlags = 0;
-          int expPoly = -1;
-          for (int p = 0; p < npoly && expect == 0; ++p) {
+          for (int p = 0; p < npoly && hi.expect != 1; ++p) {
             const mdk::CollisionPoly& pl = col.polys[p];
             if ((pl.flags & 0x10) != 0) continue;   // render-skipped
             const float* v0 = col.verts + pl.v[0] * 3;
@@ -5777,14 +6122,14 @@ int main(int argc, char** argv) {
             const bool neg = d1 < 0 || d2 < 0 || d3 < 0;
             const bool pos = d1 > 0 || d2 > 0 || d3 > 0;
             if (!(neg && pos)) {
-              expect = 1;
-              expNz = nz / nn;
-              expZ = (v0[2] + v1[2] + v2[2]) / 3.f;
-              expFlags = pl.flags;
-              expPoly = p;
+              hi.expect = 1;
+              hi.nz = nz / nn;
+              hi.z = (v0[2] + v1[2] + v2[2]) / 3.f;
+              hi.flags = pl.flags;
+              hi.poly = p;
             }
           }
-          if (expect == 0)
+          if (hi.expect != 1)
             for (const mdk::CollisionObject* o = col.objects; o;
                  o = o->next) {
               if (!o->named || o->model == nullptr ||
@@ -5796,12 +6141,80 @@ int main(int argc, char** argv) {
                 const float* ea = o->elements->elems[e].aabb;
                 if (hp.first >= ea[0] && hp.first <= ea[3] &&
                     hp.second >= ea[1] && hp.second <= ea[4]) {
-                  expect = 2;
+                  hi.expect = 2;
                   break;
                 }
               }
-              if (expect == 2) break;
+              if (hi.expect == 2) break;
             }
+          if (hi.expect == 1 && hi.nz >= 0.f) {
+            // Real long-column replay (isolates iters — slide count)
+            // + stepped re-probe (per-frame gameplay support).
+            mdk::collisionProfileReset();
+            {
+              mdk::CollisionState vcs;
+              vcs.arena = &col;
+              vcs.queryEnabled = 1;
+              vcs.arenaValid = 1;
+              vcs.objectDataLoaded = 0;
+              vcs.pos[0] = hp.first;
+              vcs.pos[1] = hp.second;
+              vcs.pos[2] = bmax[2] + 4.f;
+              mdk::collisionApply(vcs, 0.f, 0.f, -span, 0.5f,
+                                  nullptr, nullptr);
+            }
+            hi.iters = static_cast<int>(mdk::collisionProfile().sweepIters);
+            {
+              mdk::CollisionState scs;
+              scs.arena = &col;
+              scs.queryEnabled = 1;
+              scs.arenaValid = 1;
+              scs.objectDataLoaded = 1;
+              scs.pos[0] = hp.first;
+              scs.pos[1] = hp.second;
+              scs.pos[2] = bmax[2] + 4.f;
+              const mdk::CollisionPoly* sh = nullptr;
+              while (!sh && scs.pos[2] > bmin[2] - 6.f) {
+                sh = mdk::collisionApply(scs, 0.f, 0.f, -3.f, 0.5f,
+                                         nullptr, nullptr);
+              }
+              if (sh) {
+                hi.stepHit = static_cast<int>(sh - col.polys);
+                hi.stepZ = scs.pos[2];
+              }
+            }
+          }
+          if (hi.expect == 0) hi.cls = 0;
+          else if (hi.expect == 2) hi.cls = 1;
+          else if (hi.nz < 0.f) hi.cls = 2;
+          else if (hi.stepHit >= 0) hi.cls = 3;
+          else if (hi.iters >= 2) hi.cls = 4;
+          else hi.cls = 5;
+          infos.push_back(hi);
+        }
+        {
+          int cnt[7] = {};
+          for (const auto& hi : infos) ++cnt[hi.cls];
+          std::printf("           holes=%d classified: void=%d "
+                      "object=%d down-facing=%d stepped-hit=%d "
+                      "slide-off=%d UNSUPPORTED-FLOOR=%d unknown=%d\n",
+                      (int)infos.size(), cnt[0], cnt[1], cnt[2],
+                      cnt[3], cnt[4], cnt[5], cnt[6]);
+        }
+        // Verbose forensics: first 12 holes + every UNSUPPORTED-FLOOR
+        // cell (cls 5 — must be investigated, never silently counted).
+        int shown = 0;
+        for (std::size_t k = 0; k < infos.size(); ++k) {
+          const auto& hi = infos[k];
+          const bool verbose = shown < 12 || hi.cls == 5;
+          if (!verbose) continue;
+          ++shown;
+          const std::pair<float, float> hp{hi.x, hi.y};
+          const int expect = hi.expect;
+          const float expNz = hi.nz;
+          const float expZ = hi.z;
+          const std::uint16_t expFlags = hi.flags;
+          const int expPoly = hi.poly;
           if (expect == 1) {
             // Descent trace for the column segment — same
             // pos/target/ext/fatMargin the real sweep used.
@@ -5880,31 +6293,8 @@ int main(int argc, char** argv) {
               if (std::find(tr.visited.begin(), tr.visited.end(), on) !=
                   tr.visited.end())
                 ++ownerVisited;
-            // Stepped re-probe: gameplay never sweeps a whole column —
-            // per-frame falls are a few units. Walk 3-unit steps down
-            // the column and see whether the per-frame query finds
-            // support the single long sweep missed.
-            int stepHit = -1;
-            float stepZ = -1e30f;
-            {
-              mdk::CollisionState scs;
-              scs.arena = &col;
-              scs.queryEnabled = 1;
-              scs.arenaValid = 1;
-              scs.objectDataLoaded = 1;
-              scs.pos[0] = hp.first;
-              scs.pos[1] = hp.second;
-              scs.pos[2] = bmax[2] + 4.f;
-              const mdk::CollisionPoly* sh = nullptr;
-              while (!sh && scs.pos[2] > bmin[2] - 6.f) {
-                sh = mdk::collisionApply(scs, 0.f, 0.f, -3.f, 0.5f,
-                                         nullptr, nullptr);
-              }
-              if (sh) {
-                stepHit = static_cast<int>(sh - col.polys);
-                stepZ = scs.pos[2];
-              }
-            }
+            const int stepHit = hi.stepHit;   // stepped probe already
+            const float stepZ = hi.stepZ;     // ran in classification
             const char* cls =
                 inSet >= 0      ? "IN-TESTED-SET(port-suspect)"
                 : ownerVisited  ? "owner-visited-not-crossed(data)"
