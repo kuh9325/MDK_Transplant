@@ -1123,6 +1123,10 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
     a->dyn.owner = a.get();
     a->scalar = rt.level.work[i].scalar();
     a->hasScriptObject = cmiTable3Has(rt.level.cmi, a->name);
+    // The controlalien record's +0x60 = its home arena — shared
+    // opcode handlers read ctx+0x60->+0x68 (the object list) and
+    // +0x60 itself. Wire it at load (save-restore already does).
+    a->eventLatch.arena = &a->dyn;
     // FUN_00458550 bind — +0x220 = image-relative code offset (the
     // VM's persisted gate + entry PC; 0 when no record / codeOff==0).
     a->script.pcImageOff = cmiScriptCodeOffset(

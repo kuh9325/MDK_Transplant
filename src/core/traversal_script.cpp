@@ -5284,55 +5284,213 @@ void objScriptInsn(ObjScriptPass& v) {
       obj.fieldE8 = val;
       return;
     }
-    case 0x9e: {                            // path9e (0x44f453)
-      // {u8 mode, u16 arg, u32 flags[, u32 imgref if flags&2]}.
-      // OBSERVED: FUN_00454c6c(ctx, mode, arg, flags) runs a spatial
-      // cell/AABB registration; when its result is nonzero AND
-      // flags&2 the script jumps to imgref. No Level-3 site sets
-      // flags&2, so the branch never fires — the port consumes the
-      // operands and counts the registration seam (UNKNOWN: the
-      // FUN_00454c6c grid side-effect itself).
-      const std::uint8_t mode = r.u8();
-      const std::uint16_t arg = r.u16();
-      const std::uint32_t flags = r.u32();
-      if ((flags & 2) != 0) (void)r.u32();
+    case 0x9e: {                            // damage volume (0x44f453)
+      // {u8 flags1, u16 amount, u32 flags2[, u32 imgref iff flags2&2]}.
+      // OBSERVED FUN_00454c6c(ctx, flags1, amount, flags2):
+      //   copy ctx+0x198 AABB, re-scale about its centre by +0x2c0
+      //   (FUN_0045c138, the same rescale op 0x6c uses);
+      //   flags1&1 — when the volume overlaps the player box
+      //     0x540c30, each unmasked (+0x2c8) element world AABB that
+      //     overlaps it applies FUN_0046771c(amount, ctx+0x10) —
+      //     player damage sourced at the object;
+      //   flags1&2 — sweep the home-arena +0x68 list: skip nodes
+      //     with +0x06==0, +0x148&0x820, or ctx itself; on AABB
+      //     overlap mark +0x21e=0xfd/+0x21d=0xfc, latch
+      //     +0x224=ctx+0x4c / +0x228=ctx+0x13c, decrement +0x08 by
+      //     amount when < 0xfde8 (the invulnerable cap) and kill via
+      //     FUN_004581a4 at <=0;
+      //   flags2&1 && hit — self-kill: +0x08=0 then FUN_004581a4(ctx).
+      // Op level: ctx+0x08==0 after the sweep -> the pass ends (the
+      // object was wiped); hit && flags2&2 -> goto imgref with the
+      // mark[depth]=0 clear (the 0x451e83 checks share the goto tail).
+      const std::uint8_t flags1 = r.u8();
+      const std::uint16_t amount = r.u16();
+      const std::uint32_t flags2 = r.u32();
+      const std::uint32_t imgref = (flags2 & 2) ? r.u32() : 0;
       if (!r.ok) { v.fail("path9e"); return; }
-      (void)mode; (void)arg;
       if (env.rt != nullptr) ++env.rt->seams.path9eCalls;
-      return;
-    }
-    case 0x9f: {                            // fxSpawn (0x449614)
-      // {u8 mode, [u32x3 if mode&3], u32x3, lstr, u32} — a
-      // mode-dependent spawn/presentation op. UNKNOWN semantics in
-      // the port — operands consumed, counted.
-      const std::uint8_t mode = r.u8();
-      if ((mode & 3) != 0) {
-        for (int i = 0; i < 3; ++i) (void)r.u32();
+      bool hit = false;
+      if (env.rt != nullptr) {
+        float box[6];
+        std::memcpy(box, obj.col.aabb, sizeof box);
+        for (int i = 0; i < 3; ++i) {
+          const float half =
+              (box[3 + i] - box[i]) * 0.5f * obj.field2c0;
+          const float mid = (box[3 + i] + box[i]) * 0.5f;
+          box[i] = mid - half;
+          box[3 + i] = mid + half;
+        }
+        if ((flags1 & 1) &&
+            aabbOverlapLocal(box, env.rt->cs.playerBox)) {
+          for (std::size_t e = 0; e < obj.model.elems.size(); ++e) {
+            if ((obj.col.elemMaskB & (1u << (e & 31))) != 0) continue;
+            if (aabbOverlapLocal(env.rt->cs.playerBox,
+                                 obj.model.elems[e].aabb)) {
+              mdk::playerDamageApply(*env.rt, amount, obj.pos);
+              hit = true;
+            }
+          }
+        }
+        if ((flags1 & 2) && obj.arena != nullptr &&
+            obj.arena->owner != nullptr) {
+          for (const auto& up : obj.arena->owner->dyn.storage) {
+            DynamicObject& o = *up;
+            if (!o.col.named) continue;          // +0x06 == 0
+            if (o.col.flags148 & 0x820) continue;
+            if (&o == &obj) continue;
+            if (!aabbOverlapLocal(o.col.aabb, box)) continue;
+            hit = true;
+            o.field21e = 0xfd;
+            o.field21d = 0xfc;
+            o.field224 = obj.yawDeg;
+            o.field228 = obj.bankDeg;
+            if (o.health < 0xfde8) o.health -= amount;
+            if (o.health <= 0) objectTeardownNow(*env.rt, o);
+          }
+        }
+        if (hit && (flags2 & 1)) {
+          obj.health = 0;
+          objectTeardownNow(*env.rt, obj);
+        }
       }
-      for (int i = 0; i < 3; ++i) (void)r.u32();
-      (void)r.str();
-      (void)r.u32();
-      if (!r.ok) { v.fail("fxspawn"); return; }
-      if (env.rt != nullptr) ++env.rt->seams.fxSpawnCalls;
+      if (obj.health <= 0) { v.done = true; return; }
+      // OBSERVED (0x44f4f0): hit && flags2&2 -> +0x108 = imgref and
+      // mark[depth]=0 — no null normalization (a 0 operand jumps to
+      // image offset 0 verbatim, unlike 0xb6's base==check).
+      if (hit && (flags2 & 2)) v.doGoto(imgref);
       return;
     }
-    case 0x9d: {                            // named slot op (0x44880e)
-      // {lstr name, u32, u32} — "XPGUN"-class named-record bind.
-      // UNKNOWN semantics — operands consumed, counted.
-      (void)r.str();
-      (void)r.u32();
-      (void)r.u32();
+    case 0x9f: {                            // fx spawn (0x449614)
+      // {u8 mode, [f32x3 iff mode==1||2], f32 f0..f2, lstr name,
+      //  u32 imgref}. OBSERVED (FUN_004549b4 spawn body): pos is ctx
+      // +0x10..0x18 (mode 0), ctx pos + yaw-rotated {fwd,lat,z}
+      // offset (mode 1, FUN_0045546c), or the inline triple
+      // (mode 2); FUN_0045cffc allocates + push-fronts on the home
+      // arena; FUN_00403538(name, f0..f2) builds the +0xc procedural
+      // record (+0x04 = 0xffff tag); pos -> +0x1c..0x24, +0x10, and
+      // +0x180 prevPos; +0x60 = arena; FUN_004566f0 init;
+      // +0x11c = 7; +0x146 = -1; +0x108 = imgref (the FX object's
+      // script PC); +0x316/+0x31a/+0x31e = f0..f2; +0x322 = name.
+      const std::uint8_t mode = r.u8();
+      float off[3] = {0, 0, 0};
+      if (mode == 1 || mode == 2) {
+        off[0] = r.f32();
+        off[1] = r.f32();
+        off[2] = r.f32();
+      }
+      const float f0 = r.f32();
+      const float f1 = r.f32();
+      const float f2 = r.f32();
+      const std::string nm = r.str();
+      const std::uint32_t imgref = r.u32();
+      if (!r.ok) { v.fail("fxspawn"); return; }
+      if (env.rt == nullptr || obj.arena == nullptr) {
+        v.fail("fxspawn-env");
+        return;
+      }
+      ++env.rt->seams.fxSpawnCalls;
+      float pos[3] = {obj.pos[0], obj.pos[1], obj.pos[2]};
+      if (mode == 2) {
+        pos[0] = off[0];
+        pos[1] = off[1];
+        pos[2] = off[2];
+      } else if (mode == 1) {
+        // FUN_0045546c — local {a,b,c} rotated by ctx +0x4c yaw:
+        // x' = x - a*cos - b*sin, y' = y - b*cos - a*sin, z' = z + c.
+        float sn, cs;
+        sincosDeg(obj.yawDeg, &sn, &cs);
+        pos[0] = obj.pos[0] - off[0] * cs - off[1] * sn;
+        pos[1] = obj.pos[1] - off[1] * cs - off[0] * sn;
+        pos[2] = obj.pos[2] + off[2];
+      }
+      DynamicObject& o = obj.arena->allocFront();   // FUN_0045cffc
+      o.enemyIndex = 0xffff;                        // +0x04 record tag
+      o.field1c[0] = pos[0];                        // +0x1c anchor
+      o.field1c[1] = pos[1];
+      o.field1c[2] = pos[2];
+      o.setPosition(pos[0], pos[1], pos[2]);        // +0x10
+      o.prevPos[0] = pos[0];                        // +0x180
+      o.prevPos[1] = pos[1];
+      o.prevPos[2] = pos[2];
+      initObjectCollision(o);                       // FUN_004566f0
+      o.behaviorByte = 7;                           // +0x11c
+      o.spawnId = 0xffff;                           // +0x146
+      o.field108 = v.ptrAt(imgref);                 // +0x108 script PC
+      o.fxParam[0] = f0;                            // +0x316
+      o.fxParam[1] = f1;                            // +0x31a
+      o.fxParam[2] = f2;                            // +0x31e
+      o.fxName = nm;                                // +0x322
+      return;
+    }
+    case 0x9d: {                            // repel impulse (0x44880e)
+      // {lstr name, u32 sel, f32 speed}. OBSERVED: walk the ctx's
+      // home-arena (+0x60) +0x68 list for a node with +0x06 != 0 whose
+      // +0x0c name matches AND (sel == -1 || (i16)+0x146 == sel). On a
+      // match, d = ctx.pos - tgt.pos; when |d|^2 > 0 the ctx's
+      // +0x28..0x30 velocity becomes d * speed/|d| — a repel impulse
+      // pointing the running object AWAY from the named target — and
+      // +0xec is cleared (path unbound). No match / coincident -> no-op.
+      const std::string nm = r.str();
+      const std::uint32_t sel = r.u32();
+      const float speed = r.f32();
       if (!r.ok) { v.fail("op9d"); return; }
       if (env.rt != nullptr) ++env.rt->seams.namedSlotCalls;
+      if (obj.arena == nullptr) return;
+      DynamicObject* tgt = nullptr;
+      for (auto& up : obj.arena->storage) {
+        DynamicObject& o = *up;
+        if (!o.col.named) continue;
+        if (objectEnemyName(env, o) != nm) continue;
+        if (sel != 0xffffffffu &&
+            static_cast<std::int16_t>(o.spawnId) !=
+                static_cast<std::int32_t>(sel))
+          continue;
+        tgt = &o;
+        break;
+      }
+      if (tgt == nullptr) return;
+      const float dx = obj.pos[0] - tgt->pos[0];
+      const float dy = obj.pos[1] - tgt->pos[1];
+      const float dz = obj.pos[2] - tgt->pos[2];
+      const float d2 = dx * dx + dy * dy + dz * dz;
+      if (!(d2 > 0.f)) return;
+      const float k = speed / std::sqrt(d2);
+      obj.field28 = dx * k;
+      obj.field2c = dy * k;
+      obj.field30 = dz * k;
+      obj.fieldEC = nullptr;
       return;
     }
-    case 0xb6: {                            // varB6 loop (0x4474a2)
-      // {u8,u8,u8} — FUN_00438654 var resolve then an int compare /
-      // repeat-loop over the trailing block. UNKNOWN loop semantics —
-      // operands consumed, counted.
-      (void)r.u8(); (void)r.u8(); (void)r.u8();
+    case 0xb6: {                            // indexed goto (0x4474a2)
+      // {u8 mode, u8 idx, u8 cnt, u32 op0[, u32 op1]}. OBSERVED:
+      // n = trunc(*FUN_00438654(mode,idx)) via FUN_0047d59a (FRNDINT
+      // under RC=11 — toward zero, the same helper 0xb7 uses); when
+      // 0 <= n < cnt the insn consumes op0 AND op1 then performs a
+      // mode-0x0c plain goto to op1 (+0x108 = target, mark[depth] = 0);
+      // otherwise only op0 is consumed and control falls through. The
+      // original's in-range loop dead-reads op0 n times without
+      // advancing the reader — an idempotent quirk reproduced here as a
+      // single consume.
+      const std::uint8_t mode = r.u8();
+      const std::uint8_t idx = r.u8();
+      const std::uint8_t cnt = r.u8();
       if (!r.ok) { v.fail("varb6"); return; }
+      const float* slot = resolveVarRef(mode, idx, env, ctx);
+      const long n = slot != nullptr
+                         ? static_cast<long>(std::trunc(*slot))
+                         : 0;
+      (void)r.u32();                       // op0 — consumed, dead-read
       if (env.rt != nullptr) ++env.rt->seams.varB6Calls;
+      if (n >= 0 && n < static_cast<long>(cnt)) {
+        const std::uint32_t tgt = r.u32();
+        if (!r.ok) { v.fail("varb6"); return; }
+        // OBSERVED: +0x108 = tgt even when 0 (0x44758c — a null ref
+        // halts the script rather than falling through).
+        v.doGoto(tgt);
+        if (tgt == 0) v.done = true;
+        return;
+      }
+      if (!r.ok) { v.fail("varb6"); return; }
       return;
     }
     case 0x63: {                            // surf slot write (0x44bfa7)
@@ -5397,6 +5555,8 @@ bool arenaSharedInsn(TraversalScriptEnv& env, TraversalScriptState& st,
   r.pc = insnOff;   // objScriptInsn fetches the op byte itself
   ObjScriptPass v{env, *co, r, res, name};
   // st -> eventLatch (one original state store, two port views)
+  if (co->arena == nullptr)
+    co->arena = &env.selfArena->dyn;   // +0x60 — invariant home arena
   co->field108 = v.ptrAt(st.pcImageOff);
   co->field22c = st.waitSeconds;
   co->field230 = v.ptrAt(st.waitResumeImageOff);
@@ -5797,7 +5957,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x8b: return "bwwwfff";                 // emit8b {u8,u32x3,f32x3}
   case 0x93: return "s";                       // mark93 {lstr}
   case 0xa2: return "bh";                      // slotA2 {u8,u16}
-  case 0xb6: return "bbb";                     // varB6 {u8x3}
+  case 0xb6: return "bbbw";                    // varB6 {u8x3,u32[,u32 in-range]}
   case 0xba: return "v";                       // setE8 {u8 mode,varop}
   case 0xbf: return "bb";                      // distLink {u8,u8,f32,[f32],link}
   case 0xc2: return "bbbbb";                   // dmgRng {u8x5}

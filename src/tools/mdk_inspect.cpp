@@ -83,6 +83,10 @@ int usage() {
                "<relative-path> <record>\n"
                "       mdk-inspect --data-path DIR --collision-probe "
                "<relative-path> [<x> <y> <z>]\n"
+               "       mdk-inspect --data-path DIR --collision-census "
+               "<relative-path>   (a .DTI path; per-arena flag census +\n"
+               "                            spawn-pose support grid — QA\n"
+               "                            floor-support audit)\n"
                "       mdk-inspect --data-path DIR --arena-objects "
                "<relative-path>   (a .DTI path; the sibling .CMI and\n"
                "                            <stem>O.MTO are loaded too)\n"
@@ -104,7 +108,8 @@ int usage() {
                "                            .CMI + <stem>O.MTO, assembles the\n"
                "                            Phase 5G runtime and steps frames.\n"
                "                            Options: --arena NAME --start X Y Z\n"
-               "                            --yaw DEG --frames N --pdamage A@F)\n"
+               "                            --yaw DEG --frames N --pdamage A@F\n"
+               "                            --script-pc HEX — QA script entry\n"
                "       mdk-inspect --data-path DIR --freefall-runtime "
                "<relative-path>\n"
                "                            (a FALL3D.BNI path; reads the\n"
@@ -1934,6 +1939,205 @@ int frontendScript(const std::optional<std::string>& dataPath) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Collision-census descent trace — mirrors bspSweep's visit/crossing
+// structure (FUN_00408260) for a fixed segment, recording every node
+// whose poly set the real sweep would polyScan. QA only: classifies a
+// support-grid miss as "poly never testable via BSP descent" (data-side
+// quirk the original shares) vs "poly in a tested set but no contact"
+// (port-side suspect).
+// ---------------------------------------------------------------------------
+// QA mirror of FUN_004089c0 (boxTri) for census forensics — identical
+// projected box-vs-triangle logic; reports which axis separated.
+int censusBoxTri(const float* contact, const float* ext,
+                 const float* v0, const float* v1, const float* v2,
+                 int* failAxis) {
+  static const int kAxis[3][2] = {{1, 2}, {0, 2}, {0, 1}};
+  const float* verts[3] = {v0, v1, v2};
+  for (int a = 0; a < 3; ++a) {
+    if (std::fabs(ext[a]) < 0.1f) continue;
+    const int a0 = kAxis[a][0], a1 = kAxis[a][1];
+    float rel[3][2];
+    std::uint32_t codes[3] = {0, 0, 0};
+    int outside = 0;
+    for (int i = 0; i < 3; ++i) {
+      rel[i][0] = verts[i][a0] - contact[a0];
+      rel[i][1] = verts[i][a1] - contact[a1];
+      std::uint32_t c = 0;
+      if (rel[i][0] >= -ext[a0]) {
+        if (rel[i][0] > ext[a0]) c = 2;
+      } else {
+        c = 1;
+      }
+      if (rel[i][1] >= -ext[a1]) {
+        if (rel[i][1] > ext[a1]) c |= 8;
+      } else {
+        c |= 4;
+      }
+      if (c == 0) break;
+      codes[i] = c;
+      ++outside;
+    }
+    if (outside != 3) continue;
+    if ((codes[0] & codes[1] & codes[2]) != 0) {
+      if (failAxis) *failAxis = a;
+      return 0;
+    }
+    if (((codes[0] | codes[1] | codes[2]) & 3) == 0) {
+      std::uint32_t mask = 3;
+      for (int i = 0; i < 3 && mask != 0; ++i) {
+        const int j = (i + 1) % 3;
+        const std::uint32_t diff = codes[i] ^ codes[j];
+        if (diff & 4) {
+          const float t =
+              ((rel[j][0] - rel[i][0]) * (-ext[a1] - rel[i][1])) /
+                  (rel[j][1] - rel[i][1]) +
+              rel[i][0];
+          if (-ext[a0] <= t && t <= ext[a0]) mask = 0;
+        }
+        if (diff & 8) {
+          const float t =
+              ((rel[j][0] - rel[i][0]) * (ext[a1] - rel[i][1])) /
+                  (rel[j][1] - rel[i][1]) +
+              rel[i][0];
+          if (-ext[a0] <= t && t <= ext[a0]) mask = 0;
+        }
+      }
+      if (mask != 0) {
+        if (failAxis) *failAxis = a;
+        return 0;
+      }
+    } else {
+      std::uint32_t mask = 0xc;
+      for (int i = 0; i < 3 && mask != 0; ++i) {
+        const int j = (i + 1) % 3;
+        if ((codes[i] & 3) == 0) mask &= codes[i];
+        const std::uint32_t diff = codes[i] ^ codes[j];
+        if (diff & 1) {
+          const float t =
+              ((rel[j][1] - rel[i][1]) * (-ext[a0] - rel[i][0])) /
+                  (rel[j][0] - rel[i][0]) +
+              rel[i][1];
+          if (-ext[a1] <= t) {
+            if (t <= ext[a1]) {
+              mask = 0;
+            } else {
+              mask &= 8;
+            }
+          } else {
+            mask &= 4;
+          }
+        }
+        if (diff & 2) {
+          const float t =
+              ((rel[j][1] - rel[i][1]) * (ext[a0] - rel[i][0])) /
+                  (rel[j][0] - rel[i][0]) +
+              rel[i][1];
+          if (-ext[a1] <= t) {
+            if (t <= ext[a1]) {
+              mask = 0;   // OBSERVED: breaks edge scan, axis passes
+              break;
+            }
+            mask &= 8;
+          } else {
+            mask &= 4;
+          }
+        }
+      }
+      if (mask != 0) {
+        if (failAxis) *failAxis = a;
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+struct CensusSweepTrace {
+  struct TestedSet {
+    int node;
+    int neg;                 // 1 = polysNeg tested, 0 = polysPos
+    std::uint32_t first;
+    std::uint32_t count;
+    float cx, cy, cz;        // contact point on the node plane
+    float fcx, fcy, fcz;     // first-attempt contact (dFace-adjusted)
+  };
+  const mdk::CollisionNode* nodes;
+  float pos[3];
+  float target[3];
+  float delta[3];
+  float ext[3];
+  float fatMargin;
+  std::vector<TestedSet> tested;
+  std::vector<int> visited;
+
+  void descend(const mdk::CollisionNode* node) {
+    for (;;) {
+      const int nodeIdx = static_cast<int>(node - nodes);
+      visited.push_back(nodeIdx);
+      const float margin = std::fabs(ext[2] * node->nz) +
+                           std::fabs(ext[0] * node->nx) +
+                           std::fabs(ext[1] * node->ny);
+      const float dStart = pos[1] * node->ny + node->d +
+                           pos[2] * node->nz + pos[0] * node->nx;
+      std::uint8_t sideStart = 0;
+      if (-fatMargin <= dStart) {
+        sideStart = 1;
+        if (node->childNear >= 0) descend(nodes + node->childNear);
+      }
+      if (dStart <= fatMargin) {
+        sideStart |= 2;
+        if (node->childFar >= 0) descend(nodes + node->childFar);
+      }
+      const float dTarget = target[1] * node->ny + node->d +
+                            target[2] * node->nz + target[0] * node->nx;
+      std::uint8_t sideTarget = 0;
+      if (-fatMargin <= dTarget) sideTarget = 1;
+      if (dTarget <= fatMargin) sideTarget |= 2;
+      if ((sideStart | sideTarget) == 3 &&
+          ((dStart < 0.0f && dStart <= dTarget) ||
+           (0.0f <= dStart && dTarget <= dStart))) {
+        float dFace;
+        if (0.0f <= dStart) {
+          dFace = margin;
+          if (dStart < margin) dFace = dStart;
+        } else {
+          dFace = -margin;
+          if (-margin < dStart) dFace = dStart;
+        }
+        const float dDelta = delta[2] * node->nz + delta[0] * node->nx +
+                             delta[1] * node->ny;
+        if (dDelta != 0.0f) {
+          const float t = -dStart / dDelta;
+          const float tf = -(dStart - dFace) / dDelta;
+          // real gate: t1 <= bestT(5000 on a miss column) && t1 <= 1
+          if (tf > 1.0f) goto descend;
+          const std::uint32_t set =
+              (dStart < 0.0f) ? node->polysNeg : node->polysPos;
+          tested.push_back(
+              {nodeIdx, dStart < 0.0f ? 1 : 0, set >> 16,
+               set & 0xffffu, t * delta[0] + pos[0],
+               t * delta[1] + pos[1], t * delta[2] + pos[2],
+               tf * delta[0] + pos[0], tf * delta[1] + pos[1],
+               tf * delta[2] + pos[2]});
+        }
+      }
+    descend:
+      const std::uint8_t next =
+          static_cast<std::uint8_t>(sideTarget & (sideStart ^ sideTarget));
+      if (next & 1) {
+        if (node->childNear < 0) return;
+        node = nodes + node->childNear;
+      } else if (next & 2) {
+        if (node->childFar < 0) return;
+        node = nodes + node->childFar;
+      } else {
+        return;
+      }
+    }
+  }
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1945,6 +2149,7 @@ int main(int argc, char** argv) {
   std::optional<unsigned> fontInfoCode;
   bool entriesMode = false;
   bool collisionProbe = false;
+  bool collisionCensus = false;
   bool arenaObjects = false;
   bool surfaceCensus = false;
   bool arenaRender = false;
@@ -1980,6 +2185,7 @@ int main(int argc, char** argv) {
   bool travStartGiven = false;
   float travYaw = 0.0f;
   bool travYawGiven = false;
+  std::uint32_t travScriptPc = 0;
   int travFrames = 90;
   float probePos[3] = {0.0f, 0.0f, 0.0f};
   int probePosGiven = 0;
@@ -2067,6 +2273,11 @@ int main(int argc, char** argv) {
                              "position or all of <x> <y> <z>\n");
         return usage();
       }
+    } else if (!std::strcmp(a, "--collision-census")) {
+      const char* v = value(a);
+      if (!v) return usage();
+      target = v;
+      collisionCensus = true;
     } else if (!std::strcmp(a, "--arena-objects")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -2307,6 +2518,16 @@ int main(int argc, char** argv) {
         return usage();
       }
       travYawGiven = true;
+    } else if (!std::strcmp(a, "--script-pc")) {
+      const char* c = value(a);
+      if (!c) return usage();
+      char* endp = nullptr;
+      const long pv = std::strtol(c, &endp, 16);
+      if (!endp || *endp != '\0' || pv < 1) {
+        std::fprintf(stderr, "invalid --script-pc: %s\n", c);
+        return usage();
+      }
+      travScriptPc = static_cast<std::uint32_t>(pv);
     } else if (!std::strcmp(a, "--frames")) {
       const char* c = value(a);
       if (!c) return usage();
@@ -3514,7 +3735,8 @@ int main(int argc, char** argv) {
   }
 
   if (!entriesMode && !visualInfoName && !fontInfoName &&
-      !spriteInfoName && !collisionProbe && !arenaObjects &&
+      !spriteInfoName && !collisionProbe && !collisionCensus &&
+      !arenaObjects &&
       !surfaceCensus && !arenaRender && !traversalRuntime &&
       !freefallRuntime && !campaignHandoff && !scriptDisasm &&
       !objScriptDisasm) {
@@ -3797,6 +4019,17 @@ int main(int argc, char** argv) {
                   "— NATIVE DIAGNOSTIC OVERRIDE\n",
                   rt.cur->index, rt.cur->name.c_str(), (double)pos[0],
                   (double)pos[1], (double)pos[2], (double)yaw);
+    }
+    // QA-only script entry: seed the current arena's persisted script
+    // PC (+0x220, the same field a script goto/link writes) at a raw
+    // image offset. Lets the diagnostic reach link-gated regions
+    // without routing through gameplay triggers.
+    if (travScriptPc) {
+      rt.cur->script.pcImageOff = travScriptPc;
+      rt.cur->script.active = true;
+      rt.cur->script.waitSeconds = 0.0f;
+      std::printf("script-pc: %s pc=+%x — QA SCRIPT ENTRY\n",
+                  rt.cur->name.c_str(), travScriptPc);
     }
 
     // QA ammo seeds — 0x54161f..0x541633 block entries (a real
@@ -5275,6 +5508,463 @@ int main(int argc, char** argv) {
     }
     std::printf("arena-render: %zu/%zu blocks decoded\n", blocksOk,
                 mto.blocks.size());
+    return 0;
+  }
+
+  // --collision-census: QA floor-support audit over every arena of a
+  // .DTI level (sibling .CMI + <stem>O.MTO loaded too). For each arena:
+  //   * flag census — poly +0x20 byte: bit 0x10 = render skip,
+  //     bit 0x20 = collision skip. A floor-ish poly that renders but
+  //     doesn't collide is the "visible floor / no support" escape
+  //     mechanism (and the converse is an invisible wall).
+  //   * object census — named/modelled objects, standable flags, and
+  //     elemMaskB-masked element counts.
+  //   * support grid — XY cells over the collision-vert bbox; a
+  //     standing downward collisionApply + collisionFloorProbe at each
+  //     cell, classified BSP / object / none. Interior no-support
+  //     cells ringed by supported cells are escape holes.
+  //   * per no-support cell, whether a rendered floor-ish poly or a
+  //     standable object element covers the cell (expected-vs-actual
+  //     owner disagreement).
+  // Each arena is attached via the diagnostic entry and settled 45
+  // frames so runtime-spawned and mover objects populate +0x68; the
+  // census then measures the resulting collision state.
+  if (collisionCensus) {
+    const std::string dtiPath = *target;
+    const auto slash = dtiPath.find_last_of("/\\");
+    const auto dot = dtiPath.find_last_of('.');
+    if (dot == std::string::npos) {
+      std::fprintf(stderr, "--collision-census wants a .DTI path\n");
+      return 1;
+    }
+    const std::string dir =
+        slash == std::string::npos ? "" : dtiPath.substr(0, slash + 1);
+    const std::string stem = dtiPath.substr(
+        slash == std::string::npos ? 0 : slash + 1,
+        dot - (slash == std::string::npos ? 0 : slash + 1));
+    mdk::TraversalRuntime rt;
+    const auto le = mdk::traversalRuntimeLoad(
+        *root, dtiPath, dir + stem + ".CMI", dir + stem + "O.MTO", rt,
+        &err);
+    if (le != mdk::TraversalLoadError::kOk) {
+      std::fprintf(stderr, "traversal-load: FAILED (%s: %s)\n",
+                   mdk::traversalLoadErrorName(le), err.c_str());
+      return 1;
+    }
+    if (rt.fieldHealth <= 0) rt.fieldHealth = 150;
+
+    std::printf("collision-census: %s — %zu arenas\n",
+                dtiPath.c_str(), rt.arenas.size());
+    const mdk::GameplayInputBindings cBinds;
+    mdk::FrontendTimingState cTiming;
+    for (const auto& a : rt.arenas) {
+      // Attach + settle so spawned/mover objects populate +0x68.
+      // Idle input — the census measures the collision state, not
+      // the player path.
+      {
+        float cp[3] = {0.f, 0.f, 0.f};
+        mdk::traversalRuntimeDiagnosticStart(rt, a->index, cp, 0.f,
+                                             nullptr);
+        for (int f = 0; f < 45; ++f) {
+          mdk::RawGameplayInput ri{};
+          mdk::stepTraversalRuntime(rt, ri, cBinds, cTiming);
+          if (rt.cur != a.get()) break;   // script pulled us elsewhere
+        }
+      }
+      const mdk::CollisionArena& col = a->dyn.col;
+      const int npoly = static_cast<int>(a->surface.polyCount);
+      if (col.verts == nullptr || npoly == 0) {
+        std::printf("  arena[%2d] %-9s no collision geometry\n",
+                    a->index, a->name.c_str());
+        continue;
+      }
+      // -- flag census ------------------------------------------------
+      int colSkip = 0, rendSkip = 0, floorish = 0, escape = 0,
+          invisWall = 0;
+      float bmin[3] = {1e30f, 1e30f, 1e30f};
+      float bmax[3] = {-1e30f, -1e30f, -1e30f};
+      struct FloorHole { int poly; float cx, cy, cz; };
+      std::vector<FloorHole> holes;
+      for (int p = 0; p < npoly; ++p) {
+        const mdk::CollisionPoly& pl = col.polys[p];
+        const float* v0 = col.verts + pl.v[0] * 3;
+        const float* v1 = col.verts + pl.v[1] * 3;
+        const float* v2 = col.verts + pl.v[2] * 3;
+        const float ux = v1[0] - v0[0], uy = v1[1] - v0[1],
+                    uz = v1[2] - v0[2];
+        const float wx = v2[0] - v0[0], wy = v2[1] - v0[1],
+                    wz = v2[2] - v0[2];
+        // face normal (winding-independent magnitude)
+        const float nx = uy * wz - uz * wy;
+        const float ny = uz * wx - ux * wz;
+        const float nz = ux * wy - uy * wx;
+        const float len =
+            std::sqrt(nx * nx + ny * ny + nz * nz);
+        const bool floorP =
+            len > 0.f && std::fabs(nz) / len > 0.6f;  // walkable slope
+        const bool rs = (pl.flags & 0x10) != 0;       // render skip
+        const bool cs2 = (pl.flags & 0x20) != 0;      // collision skip
+        colSkip += cs2;
+        rendSkip += rs;
+        floorish += floorP;
+        if (floorP && !rs && cs2) {
+          ++escape;
+          if (holes.size() < 24)
+            holes.push_back(
+                {p, (v0[0] + v1[0] + v2[0]) / 3.f,
+                 (v0[1] + v1[1] + v2[1]) / 3.f,
+                 (v0[2] + v1[2] + v2[2]) / 3.f});
+        }
+        if (floorP && rs && !cs2) ++invisWall;
+        for (int k = 0; k < 3; ++k) {
+          for (int c = 0; c < 3; ++c) {
+            const float vv = col.verts[pl.v[k] * 3 + c];
+            if (vv < bmin[c]) bmin[c] = vv;
+            if (vv > bmax[c]) bmax[c] = vv;
+          }
+        }
+      }
+      // -- object census ----------------------------------------------
+      int objs = 0, standable = 0, maskedElems = 0, totalElems = 0;
+      int standableHit = 0, standableMiss = 0;
+      for (const mdk::CollisionObject* o = col.objects; o;
+           o = o->next) {
+        if (!o->named || o->model == nullptr) continue;
+        ++objs;
+        if (o->flags149 & 1) ++standable;
+        if (o->elements != nullptr) {
+          totalElems += o->elements->count;
+          for (int e = 0; e < o->elements->count && e < 32; ++e)
+            if (o->elemMaskB & (1u << e)) ++maskedElems;
+        }
+        // Per-element probe over each unmasked element AABB center —
+        // does the floor probe see standable object geometry?
+        // (+0x148 bit4 skips the object in the floor probe entirely)
+        if ((o->flags149 & 1) && (o->flags148 & 0x10) == 0 &&
+            o->elements != nullptr) {
+          for (int e = 0; e < o->elements->count && e < 32; ++e) {
+            if (o->elemMaskB & (1u << e)) continue;
+            const float* ea = o->elements->elems[e].aabb;
+            mdk::CollisionState cs;
+            cs.arena = &col;
+            cs.queryEnabled = 1;
+            cs.arenaValid = 1;
+            cs.objectDataLoaded = 1;
+            cs.pos[0] = (ea[0] + ea[3]) * 0.5f;
+            cs.pos[1] = (ea[1] + ea[4]) * 0.5f;
+            cs.pos[2] = ea[5] + 1.0f;
+            mdk::collisionFloorProbe(cs);
+            if (cs.floorObj == o) ++standableHit; else ++standableMiss;
+          }
+        }
+      }
+      if (standableHit + standableMiss > 0)
+        std::printf("           standable-probe: hit=%d miss=%d\n",
+                    standableHit, standableMiss);
+      std::printf("  arena[%2d] %-9s polys=%d colSkip=%d rendSkip=%d "
+                  "floorish=%d | renderNoCollide=%d invisWall=%d | "
+                  "objs=%d standable=%d maskedElems=%d/%d\n",
+                  a->index, a->name.c_str(), npoly, colSkip, rendSkip,
+                  floorish, escape, invisWall, objs, standable,
+                  maskedElems, totalElems);
+      // -- support grid ------------------------------------------------
+      // 2-unit cells over the XY bbox; from vert-top sweep down past
+      // the bottom. Owner: BSP poly (returned hit), object element
+      // (floorObj set after probe), or nothing.
+      {
+        const float span = bmax[2] - bmin[2] + 10.f;
+        std::vector<std::uint8_t> sup;   // 0 none 1 bsp 2 obj
+        const int nx =
+            std::max(1, static_cast<int>((bmax[0] - bmin[0]) / 2.f));
+        const int ny =
+            std::max(1, static_cast<int>((bmax[1] - bmin[1]) / 2.f));
+        sup.assign(static_cast<std::size_t>(nx) * ny, 0);
+        int nBsp = 0, nObj = 0;
+        for (int gy = 0; gy < ny; ++gy) {
+          for (int gx = 0; gx < nx; ++gx) {
+            mdk::CollisionState cs;
+            cs.arena = &col;
+            cs.queryEnabled = 1;
+            cs.arenaValid = 1;
+            cs.objectDataLoaded = 1;
+            const float x = bmin[0] + (gx + 0.5f) * 2.f;
+            const float y = bmin[1] + (gy + 0.5f) * 2.f;
+            cs.pos[0] = x;
+            cs.pos[1] = y;
+            cs.pos[2] = bmax[2] + 4.f;
+            cs.playerBox[0] = x - 1.25f;
+            cs.playerBox[1] = y - 1.25f;
+            cs.playerBox[2] = cs.pos[2];
+            cs.playerBox[3] = x + 1.25f;
+            cs.playerBox[4] = y + 1.25f;
+            cs.playerBox[5] = cs.pos[2] + 4.25f;
+            const mdk::CollisionPoly* hit =
+                mdk::collisionApply(cs, 0.f, 0.f, -span, 0.5f,
+                                    nullptr, nullptr);
+            mdk::collisionFloorProbe(cs);
+            std::uint8_t s = 0;
+            if (hit != nullptr) {
+              s = 1;
+              ++nBsp;
+            } else if (cs.floorObj != nullptr ||
+                       (cs.contactFlags & 2) != 0) {
+              s = 2;
+              ++nObj;
+            }
+            sup[static_cast<std::size_t>(gy) * nx + gx] = s;
+          }
+        }
+        // interior holes: unsupported cell with >=3 supported
+        // 4-neighbors (excludes the rim/void fringe around geometry)
+        int holeN = 0;
+        std::vector<std::pair<float, float>> holePos;
+        for (int gy = 0; gy < ny; ++gy)
+          for (int gx = 0; gx < nx; ++gx) {
+            if (sup[static_cast<std::size_t>(gy) * nx + gx] != 0)
+              continue;
+            int nb = 0;
+            if (gx > 0 && sup[static_cast<std::size_t>(gy) * nx + gx - 1]) ++nb;
+            if (gx + 1 < nx &&
+                sup[static_cast<std::size_t>(gy) * nx + gx + 1]) ++nb;
+            if (gy > 0 &&
+                sup[static_cast<std::size_t>(gy - 1) * nx + gx]) ++nb;
+            if (gy + 1 < ny &&
+                sup[static_cast<std::size_t>(gy + 1) * nx + gx]) ++nb;
+            if (nb >= 3) {
+              ++holeN;
+              if (holePos.size() < 12)
+                holePos.emplace_back(
+                    bmin[0] + (gx + 0.5f) * 2.f,
+                    bmin[1] + (gy + 0.5f) * 2.f);
+            }
+          }
+        const int cells = nx * ny;
+        std::printf("           grid %dx%d cells=%d supported=%d "
+                    "(bsp=%d obj=%d) interiorHoles=%d\n",
+                    nx, ny, cells, nBsp + nObj, nBsp, nObj, holeN);
+        for (const auto& hp : holePos) {
+          // expected owner: a rendered (not render-skip) floor-ish
+          // poly whose XY projection covers the cell, or a standable
+          // object's element AABB covering it.
+          int expect = 0;          // 0 none 1 bsp-poly 2 object-elem
+          float expNz = 0.f;       // covering poly's winding nz
+          float expZ = 0.f;        // covering poly centroid z
+          std::uint16_t expFlags = 0;
+          int expPoly = -1;
+          for (int p = 0; p < npoly && expect == 0; ++p) {
+            const mdk::CollisionPoly& pl = col.polys[p];
+            if ((pl.flags & 0x10) != 0) continue;   // render-skipped
+            const float* v0 = col.verts + pl.v[0] * 3;
+            const float* v1 = col.verts + pl.v[1] * 3;
+            const float* v2 = col.verts + pl.v[2] * 3;
+            const float ux = v1[0] - v0[0], uy = v1[1] - v0[1],
+                        uz = v1[2] - v0[2];
+            const float wx = v2[0] - v0[0], wy = v2[1] - v0[1],
+                        wz = v2[2] - v0[2];
+            const float nz = ux * wy - uy * wx;
+            const float nn =
+                std::sqrt((uy * wz - uz * wy) * (uy * wz - uz * wy) +
+                          (uz * wx - ux * wz) * (uz * wx - ux * wz) +
+                          nz * nz);
+            if (nn <= 0.f || std::fabs(nz) / nn <= 0.6f) continue;
+            // point-in-triangle (XY)
+            const float d1 = (hp.first - v1[0]) * (v0[1] - v1[1]) -
+                             (v0[0] - v1[0]) * (hp.second - v1[1]);
+            const float d2 = (hp.first - v2[0]) * (v1[1] - v2[1]) -
+                             (v1[0] - v2[0]) * (hp.second - v2[1]);
+            const float d3 = (hp.first - v0[0]) * (v2[1] - v0[1]) -
+                             (v2[0] - v0[0]) * (hp.second - v0[1]);
+            const bool neg = d1 < 0 || d2 < 0 || d3 < 0;
+            const bool pos = d1 > 0 || d2 > 0 || d3 > 0;
+            if (!(neg && pos)) {
+              expect = 1;
+              expNz = nz / nn;
+              expZ = (v0[2] + v1[2] + v2[2]) / 3.f;
+              expFlags = pl.flags;
+              expPoly = p;
+            }
+          }
+          if (expect == 0)
+            for (const mdk::CollisionObject* o = col.objects; o;
+                 o = o->next) {
+              if (!o->named || o->model == nullptr ||
+                  (o->flags148 & 0x10) != 0 || !(o->flags149 & 1) ||
+                  o->elements == nullptr)
+                continue;
+              for (int e = 0; e < o->elements->count && e < 32; ++e) {
+                if (o->elemMaskB & (1u << e)) continue;
+                const float* ea = o->elements->elems[e].aabb;
+                if (hp.first >= ea[0] && hp.first <= ea[3] &&
+                    hp.second >= ea[1] && hp.second <= ea[4]) {
+                  expect = 2;
+                  break;
+                }
+              }
+              if (expect == 2) break;
+            }
+          if (expect == 1) {
+            // Descent trace for the column segment — same
+            // pos/target/ext/fatMargin the real sweep used.
+            CensusSweepTrace tr;
+            tr.nodes = col.nodes;
+            tr.pos[0] = hp.first; tr.pos[1] = hp.second;
+            tr.pos[2] = bmax[2] + 4.f + 2.5f + 0.01f;
+            tr.target[0] = hp.first; tr.target[1] = hp.second;
+            tr.target[2] = tr.pos[2] - span;
+            for (int k = 0; k < 3; ++k) {
+              tr.delta[k] = tr.target[k] - tr.pos[k];
+              tr.ext[k] = 0.f;
+            }
+            tr.ext[0] = tr.ext[1] = 0.4f; tr.ext[2] = 2.5f;
+            tr.fatMargin = (0.4f + 0.4f + 2.5f) * 2.f;
+            tr.descend(col.nodes);
+            // Cross-check the replica against the REAL sweep: replay
+            // the same column through collisionApply with the profile
+            // counters reset. objectDataLoaded=0 isolates the pure
+            // BSP sweep (no second sweep from the object pass).
+            mdk::collisionProfileReset();
+            {
+              mdk::CollisionState vcs;
+              vcs.arena = &col;
+              vcs.queryEnabled = 1;
+              vcs.arenaValid = 1;
+              vcs.objectDataLoaded = 0;
+              vcs.pos[0] = hp.first;
+              vcs.pos[1] = hp.second;
+              vcs.pos[2] = bmax[2] + 4.f;
+              mdk::collisionApply(vcs, 0.f, 0.f, -span, 0.5f,
+                                  nullptr, nullptr);
+            }
+            // value copy — the stepped probe below runs more sweeps.
+            const mdk::CollisionProfile cp = mdk::collisionProfile();
+            std::size_t trPolyTests = 0;
+            for (const auto& ts : tr.tested)
+              trPolyTests += 2u * ts.count;  // two attempts, full scan
+            // Was the covering poly inside a tested node set?
+            int inSet = -1;          // index into tr.tested
+            for (std::size_t ti = 0; ti < tr.tested.size(); ++ti) {
+              const auto& ts = tr.tested[ti];
+              if (expPoly >= (int)ts.first &&
+                  expPoly < (int)(ts.first + ts.count)) {
+                inSet = static_cast<int>(ti);
+                break;
+              }
+            }
+            // Where IS the poly registered? Walk the whole tree's
+            // sets and record owner nodes.
+            std::vector<int> owners;
+            {
+              std::vector<int> stack;
+              std::vector<char> seen(32768, 0);
+              stack.push_back(0);
+              while (!stack.empty()) {
+                const int ni = stack.back();
+                stack.pop_back();
+                if (ni < 0 || ni >= 32768 || seen[ni]) continue;
+                seen[ni] = 1;
+                const mdk::CollisionNode& nd = col.nodes[ni];
+                for (int side = 0; side < 2; ++side) {
+                  const std::uint32_t set =
+                      side ? nd.polysNeg : nd.polysPos;
+                  const std::uint32_t f = set >> 16,
+                                      c = set & 0xffffu;
+                  if (expPoly >= (int)f && expPoly < (int)(f + c))
+                    owners.push_back(ni);
+                }
+                if (nd.childNear >= 0) stack.push_back(nd.childNear);
+                if (nd.childFar >= 0) stack.push_back(nd.childFar);
+              }
+            }
+            int ownerVisited = 0;
+            for (const int on : owners)
+              if (std::find(tr.visited.begin(), tr.visited.end(), on) !=
+                  tr.visited.end())
+                ++ownerVisited;
+            // Stepped re-probe: gameplay never sweeps a whole column —
+            // per-frame falls are a few units. Walk 3-unit steps down
+            // the column and see whether the per-frame query finds
+            // support the single long sweep missed.
+            int stepHit = -1;
+            float stepZ = -1e30f;
+            {
+              mdk::CollisionState scs;
+              scs.arena = &col;
+              scs.queryEnabled = 1;
+              scs.arenaValid = 1;
+              scs.objectDataLoaded = 1;
+              scs.pos[0] = hp.first;
+              scs.pos[1] = hp.second;
+              scs.pos[2] = bmax[2] + 4.f;
+              const mdk::CollisionPoly* sh = nullptr;
+              while (!sh && scs.pos[2] > bmin[2] - 6.f) {
+                sh = mdk::collisionApply(scs, 0.f, 0.f, -3.f, 0.5f,
+                                         nullptr, nullptr);
+              }
+              if (sh) {
+                stepHit = static_cast<int>(sh - col.polys);
+                stepZ = scs.pos[2];
+              }
+            }
+            const char* cls =
+                inSet >= 0      ? "IN-TESTED-SET(port-suspect)"
+                : ownerVisited  ? "owner-visited-not-crossed(data)"
+                                : "owner-unreached(data)";
+            std::printf("             hole@(%.1f, %.1f) expect=bsp-poly "
+                        "#%d z=%.1f nz=%.2f flags=0x%02x %s",
+                        (double)hp.first, (double)hp.second, expPoly,
+                        (double)expZ, (double)expNz, expFlags, cls);
+            if (inSet >= 0) {
+              const auto& ts = tr.tested[inSet];
+              const mdk::CollisionPoly& pl = col.polys[expPoly];
+              const float* wv[3] = {col.verts + pl.v[0] * 3,
+                                    col.verts + pl.v[1] * 3,
+                                    col.verts + pl.v[2] * 3};
+              const float c1[3] = {ts.fcx, ts.fcy, ts.fcz};
+              const float c2[3] = {ts.cx, ts.cy, ts.cz};
+              int fa1 = -1, fa2 = -1;
+              const int b1 = censusBoxTri(c1, tr.ext, wv[0], wv[1],
+                                          wv[2], &fa1);
+              const int b2 = censusBoxTri(c2, tr.ext, wv[0], wv[1],
+                                          wv[2], &fa2);
+              std::printf(" verts=(%g,%g,%g)(%g,%g,%g)(%g,%g,%g)",
+                          (double)wv[0][0], (double)wv[0][1],
+                          (double)wv[0][2], (double)wv[1][0],
+                          (double)wv[1][1], (double)wv[1][2],
+                          (double)wv[2][0], (double)wv[2][1],
+                          (double)wv[2][2]);
+              std::printf(" [node#%d %s c1z=%.1f bt=%d(a%d) "
+                          "c2z=%.1f bt=%d(a%d)]",
+                          ts.node, ts.neg ? "neg" : "pos",
+                          (double)ts.fcz, b1, fa1, (double)ts.cz, b2,
+                          fa2);
+            }
+            std::printf(" owners=%d(%dvis) nodes=%zu/%llu "
+                        "polyTests=%zu/%llu calls=%llu iters=%llu",
+                        (int)owners.size(), ownerVisited,
+                        tr.visited.size(),
+                        (unsigned long long)cp.sweepNodes,
+                        trPolyTests,
+                        (unsigned long long)cp.sweepPolyTests,
+                        (unsigned long long)cp.sweepCalls,
+                        (unsigned long long)cp.sweepIters);
+            if (stepHit >= 0)
+              std::printf(" stepped-hit=#%d@z%.1f", stepHit,
+                          (double)stepZ);
+            std::printf("\n");
+          }
+          else
+            std::printf("             hole@(%.1f, %.1f) expect=%s\n",
+                        (double)hp.first, (double)hp.second,
+                        expect == 2 ? "object-elem" : "none");
+        }
+      }
+      for (const auto& h : holes)
+        std::printf("           escape-poly #%d centroid(%.1f, %.1f, "
+                    "%.1f) flags=0x%02x surface=%u\n", h.poly,
+                    (double)h.cx, (double)h.cy, (double)h.cz,
+                    col.polys[h.poly].flags,
+                    col.polys[h.poly].surface);
+    }
     return 0;
   }
 

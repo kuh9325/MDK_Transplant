@@ -11511,6 +11511,31 @@ void test_player_collision() {
     CHECK(near(cs.pos[2], 11.95));
   }
 
+  // ---- boxTri: inside-face edge crossing must pass the axis --------
+  // FUN_004089c0: when an edge crosses the a0=+ext face and the
+  // crossing's a1 coordinate is inside the extent, the original breaks
+  // the edge scan and lets the axis pass. A port that instead reports
+  // separation makes swept boxes fall through floors whose projected
+  // edges straddle the box face (the LEVEL3 play-space escapes).
+  {
+    CollisionFixture f;
+    // All verts share x=0 so the (x,z) and (x,y) projections always
+    // contain a vertex inside the box; the (y,z) projection alone
+    // exercises the inside-face crossing at both sweep contacts.
+    f.verts = {0, 1.5f, 0.0f, 0, 0.55f, 2.8f, 0, 0.0f, -3.0f};
+    f.polys = {makePoly(0, 1, 2)};
+    f.nodes = {makeNode(0, 0, 1, 0, polySet(1, 0), 0, -1, -1)};
+    f.finish();
+    mdk::CollisionState cs = makeCollisionState(&f.arena);
+    cs.pos[2] = 10;
+    const mdk::CollisionNode* node = nullptr;
+    const mdk::CollisionPoly* hit = mdk::collisionApply(
+        cs, 0.0f, 0.0f, -20.0f, 0.5f, nullptr, &node);
+    CHECK(hit == &f.polys[0]);
+    CHECK(node == &f.nodes[0]);
+    CHECK(near(cs.pos[2], -0.01f, 1e-4));
+  }
+
   // ---- ceiling: upward contact, normal -z --------------------------
   {
     CollisionFixture f = makeCeilArena();
@@ -14114,6 +14139,320 @@ void test_traversal_script() {
     CHECK(f.arena->script.pcImageOff == 0);
     CHECK(f.arena->script.active == false);
   }
+
+  // -- fallback: wait/PC state mirrors out of the object handler ------
+  {
+    ScriptFixture f;
+    // 0xe9 nameLink {lstr,link}: name misses (no live objects) ->
+    // cond false -> link not taken -> falls through. Then a fallback
+    // wait op pair must still land the arena script on the resume PC.
+    f.write(C, {0xe9});
+    f.writeStr(C + 1, "NOBODY");
+    // link mode 0x0c goto -> not taken.
+    f.write(C + 9, {0x0c});
+    f.writeW(C + 10, 0x300);
+    // post-link: 0x9a animWait {u16} — obj-only; animFrame(0) < 45 ->
+    // suspends with +0x108 = the wait insn (re-test each tick). The
+    // mirror must carry the checkpoint back to st.pcImageOff.
+    f.write(C + 0xe, {0x9a, 0x2d, 0x00});
+    f.write(C + 0x11, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->script.pcImageOff == C + 0xe);   // resume PC mirrored
+    // anim progress (eventLatch-side field) re-tests the same insn;
+    // proceed -> terminator -> script ends.
+    f.arena->eventLatch.animFrame = 45;
+    r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->script.running == 0);
+  }
+
+  // -- fallback: handler mutations write back into arena view --------
+  {
+    ScriptFixture f;
+    // Fallback op mutates ctx locals via varAdd (0x42 {u8,u8,u32}):
+    // seed st.locals[1]=2.0 (arena 0x41), fallback varAdd +3.0,
+    // then arena-side 0x43 varcmpLink reads locals[1] — proves the
+    // write landed in the shared store (5.0 == 5.0 -> cond true).
+    f.write(C, {0x41, 0x02, 0x01});
+    f.writeW(C + 3, 0x40000000u);               // locals[1] = 2.0
+    f.write(C + 7, {0x42, 0x02, 0x01});         // varAdd locals[1] += 3.0
+    f.writeW(C + 10, 0x40400000u);
+    // 0x43 varcmpLink {mode,idx,kind,a,link}: kind 5 = |v-a|<0.05 —
+    // locals[1] == 5.0 -> link mode 0x0c goto 0x300.
+    f.write(C + 0xe, {0x43, 0x02, 0x01, 0x05});
+    f.writeF(C + 0x12, 5.0f);
+    f.write(C + 0x16, {0x0c});
+    f.writeW(C + 0x17, 0x300);
+    f.write(C + 0x1b, {0xff});                  // not-taken path: end
+    f.write(0x300, {0xba, 0x03});               // taken: fallback op
+    f.writeF(0x302, 6.25f);
+    f.write(0x306, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 6.25f);
+  }
+
+  // -- fallback: unrelated arena fields are not clobbered ------------
+  {
+    ScriptFixture f;
+    f.arena->script.var11a = 7;                  // +0x11a arena-side
+    f.arena->script.field30e = 9.0f;             // +0x30e arena-side
+    f.arena->script.eventByte = 5;               // +0x21d — IS mirrored
+    // fallback op that writes only +0xe8 (eventLatch-side field)
+    f.write(C, {0xba, 0x03});
+    f.writeF(C + 2, 4.5f);
+    f.write(C + 6, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 4.5f);
+    CHECK(f.arena->script.var11a == 7);          // untouched
+    CHECK(f.arena->script.field30e == 9.0f);     // untouched
+    CHECK(f.arena->script.eventByte == 5);       // mirrored integ
+  }
+
+  // -- fallback: repeated dispatches don't accumulate stale state ----
+  {
+    ScriptFixture f;
+    // Two consecutive fallback insns; the second must observe the
+    // exact post-state of the first (no depth/marker drift).
+    f.write(C, {0xba, 0x03});                    // +0xe8 = 4.5
+    f.writeF(C + 2, 4.5f);
+    f.write(C + 6, {0xba, 0x03});                // +0xe8 = 8.0
+    f.writeF(C + 8, 8.0f);
+    f.write(C + 12, {0xff});
+    f.arena->script.pcImageOff = C;
+    f.arena->script.marker[0] = 3;
+    f.arena->script.marker[3] = 4;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 8.0f);
+    CHECK(f.arena->script.callDepth == 0);
+    CHECK(f.arena->script.marker[0] == 3);
+    CHECK(f.arena->script.marker[3] == 4);
+  }
+
+  // -- fallback: gosub pushed by a shared op returns into arena code --
+  {
+    ScriptFixture f;
+    // 0xa5 callA5 {link}: unconditional, mode 0xfc = call -> pushes
+    // the post-insn PC onto the mirrored stack; callee is a fallback
+    // op then 0xfd — the 0xfd pops through the ARENA pre-dispatch.
+    f.write(C, {0xa5, 0xfc});
+    f.writeW(C + 2, 0x300);                      // call target
+    f.write(C + 6, {0xba, 0x03});                // post-return point
+    f.writeF(C + 8, 9.0f);
+    f.write(C + 12, {0xff});
+    f.write(0x300, {0xba, 0x03});                // callee
+    f.writeF(0x302, 4.5f);
+    f.write(0x306, {0xfd});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->script.callDepth == 0);
+    CHECK(f.arena->eventLatch.fieldE8 == 9.0f);  // post-return ran
+  }
+
+  // -- fallback: shared-op return (link mode 0xfd) --------------------
+  {
+    ScriptFixture f;
+    // rcall -> callee whose first insn is 0xa5 mode 0xfd (return on
+    // cond; unconditional handler) — returns into the caller stream.
+    f.write(C, {0xfc, 0x01});
+    f.writeW(C + 2, 0x300);
+    f.write(C + 6, {0xba, 0x03});
+    f.writeF(C + 8, 9.0f);
+    f.write(C + 12, {0xff});
+    f.write(0x300, {0xa5, 0xfd});                // immediate return
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->script.callDepth == 0);
+    CHECK(f.arena->eventLatch.fieldE8 == 9.0f);
+  }
+
+  // -- 0x9d repel impulse (0x44880e): vel = (ctx-tgt) * speed/|d| -----
+  {
+    ScriptFixture f;
+    // Named sibling "TGT" in the home arena at +2x; eventLatch at
+    // origin. speed=10 -> d=(-2,0,0), |d|=2, k=5 -> vel=(-10,0,0).
+    auto& o = f.arena->dyn.allocFront();
+    o.scriptClass = "TGT";
+    o.col.named = true;
+    o.enemyIndex = 0xffff;
+    o.setPosition(2.f, 0.f, 0.f);
+    f.arena->eventLatch.setPosition(0.f, 0.f, 0.f);
+    f.arena->eventLatch.fieldEC =
+        reinterpret_cast<const void*>(std::uintptr_t(0xdead));  // bound
+    f.write(C, {0x9d});
+    f.writeStr(C + 1, "TGT");
+    f.writeW(C + 6, 0xffffffffu);            // sel = -1 wildcard
+    f.writeF(C + 0xa, 10.0f);
+    f.write(C + 0xe, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.field28 == -10.0f);
+    CHECK(f.arena->eventLatch.field2c == 0.0f);
+    CHECK(f.arena->eventLatch.field30 == 0.0f);
+    CHECK(f.arena->eventLatch.fieldEC == nullptr); // +0xec cleared
+  }
+
+  // -- 0x9d: spawnId selector gates the match ------------------------
+  {
+    ScriptFixture f;
+    auto& o = f.arena->dyn.allocFront();
+    o.scriptClass = "TGT";
+    o.col.named = true;
+    o.enemyIndex = 0xffff;
+    o.spawnId = 7;
+    o.setPosition(0.f, 2.f, 0.f);
+    f.arena->eventLatch.setPosition(0.f, 0.f, 0.f);
+    f.write(C, {0x9d});
+    f.writeStr(C + 1, "TGT");
+    f.writeW(C + 6, 4);                      // sel=4 != 7 -> no match
+    f.writeF(C + 0xa, 10.0f);
+    f.write(C + 0xe, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.field28 == 0.0f);   // no impulse
+  }
+
+  // -- 0xb6 indexed goto (0x4474a2): in-range -> op1 target ----------
+  {
+    ScriptFixture f;
+    // {mode=1(arena vars), idx=0, cnt=2, op0, op1}. objVars48[0]=1.7
+    // -> n = trunc(1.7) = 1 < 2 -> consume op0, goto op1=0x300 (the
+    // original's FUN_0047d59a truncates toward zero; round-to-nearest
+    // would give n=2 and wrongly fall through). mark[0] cleared.
+    f.arena->objVars48[0] = 1.7f;
+    f.arena->script.marker[0] = 7;
+    f.write(C, {0xb6, 0x01, 0x00, 0x02});
+    f.writeW(C + 4, 0x111);                  // op0 — dead-read
+    f.writeW(C + 8, 0x300);                  // op1 — goto target
+    f.write(C + 0xc, {0x09});                // unreachable (stop)
+    f.write(0x300, {0xba, 0x03});
+    f.writeF(0x302, 3.5f);
+    f.write(0x306, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 3.5f);
+    CHECK(f.arena->script.marker[0] == 0);   // mode-0x0c mark clear
+  }
+
+  // -- 0xb6 out-of-range: consumes op0 only, falls through -----------
+  {
+    ScriptFixture f;
+    f.arena->objVars48[0] = 5.0f;            // n=5 >= cnt=2
+    f.write(C, {0xb6, 0x01, 0x00, 0x02});
+    f.writeW(C + 4, 0x111);                  // op0 consumed, no jump
+    f.write(C + 8, {0xba, 0x03});            // next insn at op1's slot
+    f.writeF(C + 0xa, 8.0f);
+    f.write(C + 0xe, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 8.0f);   // fell through, ran
+  }
+
+  // -- 0x9e sibling sweep (0x44f453): mark/wake + health decrement ---
+  {
+    ScriptFixture f;
+    // flags1=2: sweep the home-arena list; an overlapping named sibling
+    // gets +0x21e=0xfd/+0x21d=0xfc, +0x224=ctx yaw, +0x228=ctx bank,
+    // +0x08 -= amount. ctx box {0..1}^3 scaled by field2c0=1.
+    f.arena->eventLatch.col.aabb[3] = 1.f;
+    f.arena->eventLatch.col.aabb[4] = 1.f;
+    f.arena->eventLatch.col.aabb[5] = 1.f;
+    f.arena->eventLatch.field2c0 = 1.0f;
+    f.arena->eventLatch.yawDeg = 30.f;
+    f.arena->eventLatch.bankDeg = 15.f;
+    f.arena->eventLatch.health = 10;         // +0x08==0 ends the pass
+    auto& o = f.arena->dyn.allocFront();
+    o.scriptClass = "SIB";
+    o.col.named = true;
+    o.enemyIndex = 0xffff;
+    o.col.aabb[0] = 0.5f; o.col.aabb[3] = 1.5f;   // overlaps
+    o.col.aabb[1] = 0.5f; o.col.aabb[4] = 1.5f;
+    o.col.aabb[2] = 0.5f; o.col.aabb[5] = 1.5f;
+    o.health = 100;
+    f.write(C, {0x9e, 0x02});                  // flags1=2
+    f.write(C + 2, {0x32, 0x00});              // amount=50
+    f.writeW(C + 4, 0);                        // flags2=0
+    f.write(C + 8, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field21e == 0xfd);
+    CHECK(o.field21d == 0xfc);
+    CHECK(o.field224 == 30.f);
+    CHECK(o.field228 == 15.f);
+    CHECK(o.health == 50);                     // 100 - 50
+  }
+
+  // -- 0x9e jump flag (flags2&2): hit -> goto imgref -----------------
+  {
+    ScriptFixture f;
+    f.arena->eventLatch.col.aabb[3] = 1.f;
+    f.arena->eventLatch.col.aabb[4] = 1.f;
+    f.arena->eventLatch.col.aabb[5] = 1.f;
+    f.arena->eventLatch.field2c0 = 1.0f;
+    f.arena->eventLatch.health = 10;
+    auto& o = f.arena->dyn.allocFront();
+    o.scriptClass = "SIB";
+    o.col.named = true;
+    o.enemyIndex = 0xffff;
+    o.col.aabb[0] = 0.5f; o.col.aabb[3] = 1.5f;
+    o.col.aabb[1] = 0.5f; o.col.aabb[4] = 1.5f;
+    o.col.aabb[2] = 0.5f; o.col.aabb[5] = 1.5f;
+    o.health = 0xfde8;                          // above the damage cap
+    f.write(C, {0x9e, 0x02});
+    f.write(C + 2, {0x32, 0x00});
+    f.writeW(C + 4, 2);                         // flags2&2 -> imgref
+    f.writeW(C + 8, 0x300);
+    f.write(C + 0xc, {0x09});                   // not-taken: unreachable
+    f.write(0x300, {0xba, 0x03});
+    f.writeF(0x302, 6.5f);
+    f.write(0x306, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->eventLatch.fieldE8 == 6.5f);   // jump ran
+  }
+
+  // -- 0x9f fx spawn (0x449614): mode-0 spawn at ctx pos -------------
+  {
+    ScriptFixture f;
+    f.arena->eventLatch.setPosition(3.f, 4.f, 5.f);
+    f.write(C, {0x9f, 0x00});                   // mode 0 = ctx pos
+    f.writeF(C + 2, 1.25f); f.writeF(C + 6, 2.5f); f.writeF(C + 0xa, 3.75f);
+    f.writeStr(C + 0xe, "FXBOLT");
+    f.writeW(C + 0x16, 0x350);                  // script PC imgref
+    f.write(C + 0x1a, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.arena->dyn.storage.size() == 1);
+    auto& o = *f.arena->dyn.storage.front();
+    CHECK(o.enemyIndex == 0xffff);              // procedural record tag
+    CHECK(o.spawnId == 0xffff);                 // +0x146
+    CHECK(o.behaviorByte == 7);                 // +0x11c
+    CHECK(o.pos[0] == 3.f && o.pos[1] == 4.f && o.pos[2] == 5.f);
+    CHECK(o.fxParam[0] == 1.25f && o.fxParam[2] == 3.75f);
+    CHECK(o.fxName == "FXBOLT");
+    CHECK(o.field108 != nullptr);               // +0x108 = imgref
+  }
+
+  // Real LEVEL3 shared-op regions (e.g. the HMO_5 XG1 combat block at
+  // +124a8, +105ac, +147xx) are exercised through mdk-inspect's
+  // --traversal-runtime --script-pc QA entry — their bytecode is
+  // original game data and cannot be embedded in the test tree, and
+  // their link targets only resolve against the real level state.
 }
 
 // ---------------------------------------------------------------------------

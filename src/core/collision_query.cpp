@@ -240,7 +240,13 @@ int boxTri(const float* contact, const float* ext, const float* gate,
                   (rel[j][0] - rel[i][0]) +
               rel[i][1];
           if (-ext[a1] <= t) {
-            if (t <= ext[a1]) break; // inside face — projection overlaps
+            if (t <= ext[a1]) {
+              // OBSERVED (FUN_004089c0): an in-range crossing of the
+              // +a0 face breaks the edge scan and the axis PASSES —
+              // the mask is not consulted on this exit path.
+              mask = 0;
+              break;
+            }
             mask &= 8;
           } else {
             mask &= 4;

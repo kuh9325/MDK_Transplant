@@ -604,6 +604,13 @@ struct DynamicObject {
   // (FUN_00402160 seam child). +0x15c — its model-name token.
   DynamicObject* field158 = nullptr;
   std::string field15c;
+  // +0x316/+0x31a/+0x31e — the op-0x9f fxSpawn parameter triple; the
+  // activate path feeds it to FUN_00403538's procedural record build
+  // (the enemyIndex==0xffff branch). +0x322 — its instance-name copy
+  // (FUN_0047f417 strcpy). These alias the connector 0x97 sound
+  // slots; an fx object is never a connector.
+  float fxParam[3] = {0, 0, 0};
+  std::string fxName;
   // +0x160..+0x17c — eight refpoint emitter handles managed by op
   // 0x80 (0x43d227): attach FUN_004055f4 binds a particle-emitter
   // record to worldRef[slot] (cosmetic); release frees the slot.
