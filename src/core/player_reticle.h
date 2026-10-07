@@ -125,8 +125,8 @@ void playerReticleUpdate(TraversalRuntime& rt,
 // solve, then the scriptless +0x30a=0x81 object spawn with the
 // "DROP" voice + FX child. The bomb is consumed before the spawn
 // attempt (OBSERVED 0x4693f8). `mount` is the original's 0x540e6c
-// object (its +0x48 gravity feeds the solve); nullptr on the scripted
-// Level-3 sphere ride applies the FUN_004566f0 default 32.0.
+// object (its +0x48 gravity feeds the solve); nullptr applies the
+// FUN_004566f0 default 32.0.
 void playerReticleFireBomb(TraversalRuntime& rt,
                            const DynamicObject* mount);
 

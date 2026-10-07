@@ -4494,11 +4494,11 @@ int main(int argc, char** argv) {
       // Phase 16A — the player-animation identity fields:
       // st=locoState (hex) af=animFrame at=K_table[frameIdx]
       // (FUN_00461954's selected sprite) dr=draw gate.
-      // Sphere-ride diagnostics — scope phase (0x540ca0), FOV zoom
-      // (0x540b58), weapon-5 ammo (0x541633), live X_STRIKE bolts
-      // (FUN_0045a4dc's spawn) and the weapon5Spawn seam — the
-      // fire->spawn->world chain is visible through the ride and
-      // past dismount while a bolt is still live.
+      // Sniper-scope diagnostics — scope latch (0x540c9c), scope
+      // phase (0x540ca0), FOV zoom (0x540b58), weapon-5 ammo
+      // (0x541633), live X_STRIKE bolts (FUN_0045a4dc's spawn) and
+      // the weapon5Spawn seam — the fire->spawn->world chain stays
+      // visible past unscope while a bolt is still live.
       int strikeCount = 0;
       int kamikazeCount = 0;   // field30a==5 — cmd-0x80's dropped
                              // X_TOOTH bomblets (the live world-side
@@ -4509,15 +4509,15 @@ int main(int argc, char** argv) {
           if (up->field30a == 5u) ++kamikazeCount;
         }
       char sphBuf[160] = "";
-      if (rt.spherePhase != 0 || strikeCount != 0 ||
-          kamikazeCount != 0) {
+      if (rt.flagC9c != 0 || rt.transitionPhase != 0 ||
+          strikeCount != 0 || kamikazeCount != 0) {
         std::snprintf(sphBuf, sizeof sphBuf,
-                      " sph=%d ca0=%d zoom=%.3f wpn=%d am=%d d=%.1f"
+                      " c9c=%d ca0=%d zoom=%.3f wpn=%d am=%d"
                       " e14=%d d0c=%d fcd=%.2f w5s=%d deny=%d xst=%d"
                       " kmk=%d",
-                      rt.spherePhase, rt.transitionPhase,
+                      rt.flagC9c, rt.transitionPhase,
                       (double)rt.camera.zoom, rt.wpnSel0, rt.ammo[5],
-                      (double)rt.sphereDist, rt.fieldE14,
+                      rt.fieldE14,
                       rt.fieldD0c, (double)rt.fireCadence,
                       (int)rt.seams.weapon5SpawnCalls,
                       (int)rt.seams.fireDenyCalls, strikeCount,

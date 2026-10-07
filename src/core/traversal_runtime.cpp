@@ -26,7 +26,6 @@
 #include "core/player_projectiles.h"
 #include "core/player_reticle.h"
 #include "core/player_sniper.h"
-#include "core/player_sphere.h"
 #include "core/sni_directory.h"
 
 namespace mdk {
@@ -1193,14 +1192,6 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
   rt.cs.playerBox[4] = pos[1] + 1.25f;
   rt.cs.playerBox[5] = pos[2] + 4.25f;
 
-  // Level-3 scripted sphere ride — armed only on the fresh natural
-  // load (the OBSERVED ~0.7 s automatic entry; the original's analog
-  // is the level-entry scripted-sequence arm — CORROBORATED
-  // MDK95.EXE). Save-suppressed and diagnostic starts are not the
-  // fresh-entry path and leave it off.
-  if ((flags & kTraversalLoadSuppressSpawn) == 0)
-    playerSphereArm(rt, spawnArena);
-
   // Initial-arena stream + spawn-once (the loader's warm attach).
   // kTraversalLoadSuppressSpawn mirrors FUN_004346e8(param=2): the
   // save-load path leaves every arena's object list empty for the
@@ -1214,8 +1205,6 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
 TraversalLoadError traversalRuntimeDiagnosticStart(
     TraversalRuntime& rt, int arenaIndex, const float pos[3],
     float yawDeg, std::string* detail) {
-  rt.spherePhase = 0;   // a diagnostic start is not the fresh-entry
-                        // path — cancel the armed sphere segment
   if (arenaIndex < 0 ||
       static_cast<std::size_t>(arenaIndex) >= rt.arenas.size()) {
     if (detail)
@@ -1417,16 +1406,6 @@ TraversalFrameResult stepTraversalRuntime(
     // tail below are all skipped on this path.
     takeoffFlightStep(rt, *cur, timing);
   } else {
-    // Scripted Level-3 sphere tick — the sequence's pre-dispatch
-    // piece: the ~0.7 s entry window idles on foot, sphereSeqEnter
-    // engages the scope (flagC9c), and during the ride it advances
-    // cs.pos along the scripted path + pins pod footing. The sniper
-    // branch below then runs the frame (aim / fire gate / zoom) —
-    // the same sequence+scope composition the original uses.
-    // playerSpherePostStep (after the dispatch) re-asserts the path
-    // position and runs the scripted dismount.
-    playerSphereStep(rt, raw, bindings, rt.prevFrame, timing);
-
     // OBSERVED dispatch head (0x463638): the pending-event slots
     // 0x54cb00/0x54cb08 are cleared every frame; the current event
     // priority 0x540cbc is reset while the dispatched state sits in
@@ -1831,11 +1810,6 @@ TraversalFrameResult stepTraversalRuntime(
       }
     }
   }
-
-  // Scripted sphere ride tail — the sequence owns cs.pos: re-assert
-  // the path point over whatever the sniper branch wrote, and run the
-  // scripted dismount (unscope + on-foot fields) at path end.
-  playerSpherePostStep(rt);
 
   // ================= traversal-active section =====================
   // 0x540c30..0x540c44 — the per-query player AABB (the original
@@ -2481,7 +2455,6 @@ TraversalFrameResult stepTraversalRuntime(
   out.portalCandidate = portalCand;
   out.endLevelRequested = rt.endLevelRequest != 0;
   out.takeoffActive = rt.fieldDa0 != 0;
-  out.sphereRideActive = rt.spherePhase == 2;
   out.takeoffDone = rt.takeoffDone != 0;
   out.endingRequested = rt.endingRequest != 0;
   out.eventTimer = rt.eventTimer;
