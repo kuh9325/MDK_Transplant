@@ -716,6 +716,11 @@ void applyPickup(FreefallRuntime& rt, int recIdx) {
   const FreefallPickupRec& rec = rt.pickups[recIdx];
   for (int i = 0; i < 12; ++i) {
     if (std::strncmp(rec.name, kGrantTable[i], 8) == 0) {
+      // OBSERVED FUN_0046a790 shared tail (0x46a7f7): each granted pickup
+      // posts its table name through the teletype ring — flags=1,
+      // rate=2.0 — except rows 9 (SW_H01) and 0xb (BONEFLC) which return
+      // early without posting.
+      if (i != 9 && i != 11) rt.teletypePost = {kGrantTable[i], 1u, 2.0f};
       switch (i) {
         case 5: {  // SW_H25 +10 cap 100
           rt.health += 10;
@@ -763,6 +768,9 @@ void applyPickup(FreefallRuntime& rt, int recIdx) {
   }
   for (int i = 0; i < 9; ++i) {
     if (std::strncmp(rec.name, kKeyTable[i], 8) == 0) {
+      // OBSERVED FUN_0046a500 — every collected item posts its key name
+      // through the teletype ring (flags=1, rate=2.0) alongside the grant.
+      rt.teletypePost = {kKeyTable[i], 1u, 2.0f};
       emit(rt, kFfEvGrantKey, i, 0);
       return;
     }

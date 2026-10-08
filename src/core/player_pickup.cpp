@@ -291,9 +291,8 @@ void itemUseSpawn(TraversalRuntime& rt) {
     o.animLatch = -1;                             // +0x118 = 0xffff
     o.animFrame = -1;                             // +0xe4 = 0xffff
     o.animAcc = 0.0f;                             // +0xdc = 0
-    o.animRec = nullptr;                          // +0x114 = 0x54c6a0
-    ++rt.seams.itemAnimRecSeams;                  //   (image record —
-                                                //   unresolved seam)
+    o.animRec = rt.animSwDumI;                    // +0x114 = 0x54c6a0
+                                                //   (SW_DUM_I record)
   }
   if (id == 8 || id == 9) o.field30e = 0x2ee;      // 750 — SEAL/SBONE
   rebuildObjectTransform(o);                      // FUN_0045612c

@@ -2923,6 +2923,15 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   // pool + the per-step mixer pass (events self-clear at the next
   // step, so the drain runs here, drain-once).
   freefallDrainAudio_();
+  // A recorded post drains once the current entry finishes — the
+  // OBSERVED queue is a 4-entry ring serviced a frame at a time;
+  // course-start FALL_T1 and the pickup-name posts share it. Gating on
+  // !ffTtActive_ keeps a queued post from cutting the live one short;
+  // a resolve miss drops silently per 0x41cb25.
+  if (ff_ && ff_->teletypePost && !ffTtActive_) {
+    std::string tdetail;
+    (void)ffTtEnter_(tdetail);
+  }
   // FUN_0041cb44 — the mode-2 draw block's teletype service; the
   // FALL_T1 entry slides/holds/pages out through it.
   ffTtService_();
@@ -4086,6 +4095,12 @@ bool MdkBridge::ffTtEnter_(std::string& detail) {
     ffTtPal_.set(i, {0, 0, 0, 0});   // fully transparent base
   if (!ff_ || !ff_->teletypePost) return true;  // course > 0: none
 
+  // Consume the recorded post — the mailbox clears so a later pickup's
+  // post is picked up by the per-frame drain in stepFreefall_ (the
+  // OBSERVED queue is a 4-entry ring; this covers the pending-post case).
+  const auto post = *ff_->teletypePost;
+  ff_->teletypePost.reset();
+
   // FUN_0041cad0's FTI resolve (FUN_00414890) + the renderer fonts —
   // MISC/MDKFONT.FTI carries FALL_T1, FONTBIG, FONTSML and SYS_PAL.
   std::string err;
@@ -4122,8 +4137,7 @@ bool MdkBridge::ffTtEnter_(std::string& detail) {
     ffTtPal_.set(i, {ffTtSysHead_[i * 3 + 0], ffTtSysHead_[i * 3 + 1],
                      ffTtSysHead_[i * 3 + 2], 255});
 
-  const mdk::FtiRecord* r =
-      mdk::findFtiRecord(fdir, ff_->teletypePost->name);
+  const mdk::FtiRecord* r = mdk::findFtiRecord(fdir, post.name);
   if (!r) {
     // The resolve-miss path (0x41cb25): post fails silently — no
     // queue entry ever lands.
@@ -4141,8 +4155,8 @@ bool MdkBridge::ffTtEnter_(std::string& detail) {
   ffTtLine_[0] = nl == std::string::npos ? text : text.substr(0, nl);
   ffTtLine_[1] = nl == std::string::npos ? "" : text.substr(nl + 2);
   ffTtLines_ = ffTtLine_[1].empty() ? 1 : 2;
-  ffTtFlags_ = ff_->teletypePost->flags;
-  ffTtChar_ = ff_->teletypePost->rate;
+  ffTtFlags_ = post.flags;
+  ffTtChar_ = post.rate;
   ffTtHold_ = 0.0f;
   ffTtPending_ = false;
   ffTtActive_ = true;

@@ -407,6 +407,14 @@ const char* traversalLoadErrorName(TraversalLoadError e) {
   return "unknown";
 }
 
+const void* traversalBniAnimPayload(const BniDirectory& dir,
+                                    const std::byte* base,
+                                    const char* name) {
+  const BniRecord* r = findBniRecord(dir, name);
+  if (!r || base == nullptr) return nullptr;
+  return base + r->payloadFileOffset;
+}
+
 // ---------------------------------------------------------------------------
 // FUN_00419ee0 — arena collision blob from the same-named MTO block.
 // OBSERVED chain: table-1 lookup by name -> block at +0x08 file offset;
@@ -1039,14 +1047,14 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
       const BniDirectory bd = inspectBniDirectory(
           std::span<const std::byte>(rt.level.travsprtBytes));
       if (bd.status == BniDirectoryStatus::kOk) {
-        const auto payload4 = [&](const char* nm) -> const void* {
-          const BniRecord* r = findBniRecord(bd, nm);
-          if (!r) return nullptr;
-          // FUN_004039ec — record payload + 4 (skips the head u32).
-          return rt.level.travsprtBytes.data() + r->payloadFileOffset + 4;
-        };
-        rt.animH150I = payload4("H150_I");    // 0x54c6a4
-        rt.animH150R = payload4("H150_R");    // 0x54c6b0
+        const auto* base = rt.level.travsprtBytes.data();
+        rt.animH150I = traversalBniAnimPayload(bd, base, "H150_I");   // 0x54c6a4
+        rt.animH150R = traversalBniAnimPayload(bd, base, "H150_R");   // 0x54c6b0
+        rt.animSwDumI = traversalBniAnimPayload(bd, base, "SW_DUM_I");   // 0x54c6a0
+        rt.animSwDumM = traversalBniAnimPayload(bd, base, "SW_DUM_M");   // 0x54c6ac
+        rt.animSwInter = traversalBniAnimPayload(bd, base, "SW_INTER");  // 0x54c698
+        rt.animSwThump = traversalBniAnimPayload(bd, base, "SW_THUMP");  // 0x54c6b4
+        rt.animSwNuke = traversalBniAnimPayload(bd, base, "SW_NUKE");    // 0x54c6a8
       }
     }
   }

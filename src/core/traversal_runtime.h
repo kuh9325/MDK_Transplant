@@ -98,6 +98,7 @@
 namespace mdk {
 
 class DataRoot;
+struct BniDirectory;
 
 // ---------------------------------------------------------------------------
 // Level + arena runtime types
@@ -218,6 +219,15 @@ enum class TraversalLoadError : int {
   kBadStart,               // diagnostic override invalid
 };
 const char* traversalLoadErrorName(TraversalLoadError e);
+
+// FUN_004039ec — resolve a named TRAVSPRT.BNI record to its payload
+// base inside `base` (travsprtBytes). The payload leads with the rate
+// f32 (+0x00): CMI and FALL3D.BNI anim records bind at
+// payloadFileOffset with the same +0 rate layout, so the anim view
+// reads rate/channelCount/frameCount from the base — not base+4.
+const void* traversalBniAnimPayload(const BniDirectory& dir,
+                                    const std::byte* base,
+                                    const char* name);
 
 // ---------------------------------------------------------------------------
 // Frame accounting + result
@@ -640,6 +650,19 @@ struct TraversalRuntime {
   // +0x114 against them verbatim.
   const void* animH150I = nullptr;    // 0x54c6a4
   const void* animH150R = nullptr;    // 0x54c6b0
+
+  // --- FUN_00433d40 image-resident anim records (TRAVSPRT.BNI) ---
+  // The remaining globals FUN_00433d40 binds at context init
+  // (0x434534..0x434561, FUN_004039ec payloads). The thrown-item /
+  // command transitions dereference them verbatim — the port bound
+  // them all as null "seams", so armed objects read animDone()
+  // immediately and never played their records. Null when the bank
+  // is absent (matches the original's unloaded-asset early-out).
+  const void* animSwDumI = nullptr;    // 0x54c6a0 — itemUseSpawn id==1
+  const void* animSwDumM = nullptr;    // 0x54c6ac — cmdBody1 re-arm
+  const void* animSwInter = nullptr;   // 0x54c698 — cmd==2 (SW_INTER)
+  const void* animSwThump = nullptr;   // 0x54c6b4 — cmd==4 (SW_THUMP)
+  const void* animSwNuke = nullptr;    // 0x54c6a8 — cmd==7 (SW_NUKE)
 
   // --- Phase 5L — sniper mode + mounted reticle (OBSERVED globals) ---
   // Shared counter + fire cadence (0x540d0c family): the sniper fire

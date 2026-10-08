@@ -944,7 +944,7 @@ void cmdBody1(TraversalRuntime& rt, DynamicObject& o, DynamicArena& home,
     }
     o.field15c = "DUMMY";                      // s_DUMMY_004980fc
     o.field158 = fxChildSpawn(rt, o);          // FUN_00402160
-    cmdArmAnim(o, /*rec*/ nullptr, 0.0f);      // _DAT_0054c6ac seam
+    cmdArmAnim(o, rt.animSwDumM, 0.0f);        // _DAT_0054c6ac = SW_DUM_M
     o.col.flags148 |= 8;
   }
   objectTouchScan(rt, o, home, other, /*excl*/ 0x810, /*req*/ 0, nullptr);
@@ -1370,7 +1370,7 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
       return;
     }
     if (cmd == 2) {
-      cmdArmAnim(o, /*rec*/ nullptr, 0.0f);    // _DAT_0054c698 seam
+      cmdArmAnim(o, rt.animSwInter, 0.0f);     // _DAT_0054c698 = SW_INTER
       o.animLatch = 0;                         // spin phase first
       o.field30e = 600;
       return;
@@ -1388,7 +1388,7 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
     return;
   }
   if (cmd == 4) {
-    cmdArmAnim(o, /*rec*/ nullptr, 0.0f);      // _DAT_0054c6b4 seam
+    cmdArmAnim(o, rt.animSwThump, 0.0f);       // _DAT_0054c6b4 = SW_THUMP
     o.field302 = 0;
     o.field30e = 0x1e;
     cmdBody4(rt, o, home);                     // body runs immediately
@@ -1412,7 +1412,8 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
     }
     o.model = deepCopyModel(*src);
     o.syncCollisionView();
-    cmdArmAnim(o, /*rec*/ nullptr, 1.0f);      // +0xdc=1.0 (OBSERVED)
+    cmdArmAnim(o, rt.animSwNuke, 1.0f);        // _DAT_0054c6a8 = SW_NUKE
+                                             //   (+0xdc=1.0 OBSERVED)
     o.field30e = 900;
     o.col.flags148 &= ~6u;
     if (rt.fieldDa4 < 0xff) rt.fieldDa4 = 0xff;

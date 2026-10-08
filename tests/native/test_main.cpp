@@ -13710,7 +13710,8 @@ void test_player_item_use() {
   }
 
   // ---- DUMMY (id1): the decoy anim arm — +0x118/-1 etc, +0x114
-  // record unresolved in the port (counted seam) ----
+  // bound to the resolved SW_DUM_I record (null when the bank is
+  // absent, matching the original's unloaded-asset early-out) ----
   {
     TraversalRuntime rt;
     iuSetup(rt, "SW_DUMMY", 1, 1);
@@ -13722,8 +13723,8 @@ void test_player_item_use() {
     CHECK(o.animLatch == -1);                  // +0x118 = 0xffff
     CHECK(o.animFrame == -1);                  // +0xe4 = 0xffff
     CHECK(o.animAcc == 0.0f);                  // +0xdc = 0
-    CHECK(o.animRec == nullptr);               // 0x54c6a0 — seam
-    CHECK(rt.seams.itemAnimRecSeams == 1);
+    CHECK(o.animRec == rt.animSwDumI);         // 0x54c6a0 = SW_DUM_I
+    CHECK(rt.seams.itemAnimRecSeams == 0);     // bound, no longer a seam
   }
 
   // ---- the K_SPWEP frame-8 anim trigger spawns the same way ----
@@ -17901,6 +17902,204 @@ void test_object_animation() {
       CHECK(near(o.animAcc, 0.5, 1e-6));
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// TRAVSPRT.BNI anim binding — the SW_H150 (I Feel Top) payload base.
+// traversalBniAnimPayload returns the record base (rate f32 @+0x00);
+// a base+4 misread binds the channelCount field as the rate (~0), so
+// the accumulator never advances and the leg (THIGH/LEG/FOOT)
+// channels never apply — the observed "stationary, no legs" defect.
+// ---------------------------------------------------------------------------
+
+void test_travsprt_anim_payload() {
+  // One anim record in the OBSERVED {rate, channelCount, frameCount,
+  // chanOff[], rootKeys, refCount, refKeys, channels} shape, with the
+  // channel named "LEGL" to match the leg element it drives.
+  std::vector<std::uint8_t> rec;
+  aF(rec, 1.0f);                            // rate @+0x00
+  aW(rec, 1);                               // channelCount @+0x04
+  aW(rec, 2);                               // frameCount @+0x08
+  const std::size_t offPos = rec.size();
+  aW(rec, 0);                               // chanOff[0] @+0x0c (patched)
+  aV3(rec, 0, 0, 0);                        // rootKey[0]
+  aV3(rec, 0, 0, 0);                        // rootKey[1]
+  aW(rec, 0);                               // refCount = 0
+  const std::size_t chanAt = rec.size();    // channel lands here
+  const std::uint32_t chanOff = static_cast<std::uint32_t>(chanAt - 4);
+  rec[offPos + 0] = static_cast<std::uint8_t>(chanOff);
+  rec[offPos + 1] = static_cast<std::uint8_t>(chanOff >> 8);
+  rec[offPos + 2] = static_cast<std::uint8_t>(chanOff >> 16);
+  rec[offPos + 3] = static_cast<std::uint8_t>(chanOff >> 24);
+  aName(rec, "LEGL");                       // +0x00 name[12]
+  aW(rec, 3);                               // +0x0c vertCount
+  aF(rec, 0.5f);                            // +0x10 scale (delta, not rigid)
+  aV3(rec, 0, 0, 0); aV3(rec, 1, 0, 0); aV3(rec, 2, 0, 0);  // basePose
+  aH(rec, 1);                               // delta key tag = frame 1
+  for (int i = 0; i < 9; ++i) rec.push_back(4);   // i8 deltas +4
+  aH(rec, -1);                              // terminator
+
+  // Minimal BNI wrapper: u32@0 = size-4 length envelope, u32@4 =
+  // record count, {name[12], imageOffset} @0x08 -> payload at 4+off.
+  std::vector<std::uint8_t> bni(4, 0);
+  aW(bni, 1);                               // record count
+  aName(bni, "H150_R");                     // directory name field
+  aW(bni, 20);                              // imageOffset -> payloadFileOffset=24
+  const std::size_t payloadAt = bni.size(); // == 24 (directory end)
+  for (std::uint8_t b : rec) bni.push_back(b);
+  const std::uint32_t len = static_cast<std::uint32_t>(bni.size() - 4);
+  bni[0] = static_cast<std::uint8_t>(len);
+  bni[1] = static_cast<std::uint8_t>(len >> 8);
+  bni[2] = static_cast<std::uint8_t>(len >> 16);
+  bni[3] = static_cast<std::uint8_t>(len >> 24);
+
+  const mdk::BniDirectory bd = mdk::inspectBniDirectory(
+      std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(bni.data()), bni.size()));
+  CHECK(bd.status == mdk::BniDirectoryStatus::kOk);
+
+  const std::byte* base =
+      reinterpret_cast<const std::byte*>(bni.data());
+  const void* rp = mdk::traversalBniAnimPayload(bd, base, "H150_R");
+  CHECK(rp == base + payloadAt);            // record base, not base+4
+  CHECK(mdk::traversalBniAnimPayload(bd, base, "NOPE") == nullptr);
+  CHECK(mdk::traversalBniAnimPayload(bd, nullptr, "H150_R") == nullptr);
+
+  // The resolved base yields a well-formed anim view — rate=1.0@+0.
+  // The base+4 form reads channelCount(1) as the rate (~0) instead.
+  mdk::ObjectAnimView av{
+      reinterpret_cast<const std::uint8_t*>(rp),
+      reinterpret_cast<const std::uint8_t*>(rp) + rec.size()};
+  CHECK(av.ok);
+  CHECK(near(av.rate(), 1.0, 1e-6));
+  CHECK(av.channelCount() == 1);
+  CHECK(av.frameCount() == 2);
+  mdk::ObjectAnimView bad{
+      reinterpret_cast<const std::uint8_t*>(rp) + 4,
+      reinterpret_cast<const std::uint8_t*>(rp) + rec.size()};
+  CHECK(!near(bad.rate(), 1.0, 1e-3));      // +4 base: count-as-rate ~0
+
+  // End-to-end: the bound record ticks and drives the leg element's
+  // verts (the "legs become visible" arm).
+  mdk::DynamicArena da;
+  mdk::DynamicObject& o = animObject(da, rec);
+  o.animRec = rp;                           // the resolved payload base
+  o.model = makePlatformModel("PEN_36", "LEGL", 0.0f);
+  o.col.flags148 &= ~0x8u;                  // one-shot (H150_I form)
+  const std::uint8_t* lim =
+      reinterpret_cast<const std::uint8_t*>(bni.data()) + bni.size();
+  mdk::objectAnimTick(o, lim);              // acc -1 -> 0 -> frame 0
+  CHECK(o.animFrame == 0);
+  CHECK(near(o.model.elemVerts[0][0], 0.0, 1e-6));  // base pose copy
+  mdk::objectAnimTick(o, lim);              // frame 1 — delta applies
+  CHECK(o.animFrame == 1);
+  CHECK(near(o.model.elemVerts[0][0], 2.0, 1e-6));  // leg moved (+4*0.5)
+  CHECK(near(o.model.elemVerts[0][3], 3.0, 1e-6));
+}
+
+// ---------------------------------------------------------------------------
+// SW_INTER thrown-item anim binding (the World's Smallest Nuclear
+// Explosion mushroom-cloud sequence). FUN_00433d40 binds the image-
+// resident record 0x54c698 ("SW_INTER") at context init; the cmd==2
+// transition-init (0x458fd0) then arms it onto +0x114. The port bound
+// it as a null seam, so the armed object read animDone() immediately
+// — the device spun out its +0x30e then tore down with no explosion-
+// animation frames. OBSERVED: spin phase first (+0x118=0), then the
+// armed record plays its frames before detonation.
+// ---------------------------------------------------------------------------
+
+void test_swinter_anim_binding() {
+  // One anim record in the OBSERVED {rate, channelCount, frameCount,
+  // chanOff[], rootKeys, refCount, refKeys, channels} shape, with a
+  // delta channel named "SW_INTER" matching the device element.
+  std::vector<std::uint8_t> rec;
+  aF(rec, 1.0f);                            // rate @+0x00
+  aW(rec, 1);                               // channelCount @+0x04
+  aW(rec, 3);                               // frameCount = 3 (one-shot)
+  const std::size_t offPos = rec.size();
+  aW(rec, 0);                               // chanOff[0] @+0x0c (patched)
+  aV3(rec, 0, 0, 0);                        // rootKey[0]
+  aV3(rec, 0, 0, 0);                        // rootKey[1]
+  aV3(rec, 0, 0, 0);                        // rootKey[2]
+  aW(rec, 0);                               // refCount = 0
+  const std::size_t chanAt = rec.size();
+  const std::uint32_t chanOff = static_cast<std::uint32_t>(chanAt - 4);
+  rec[offPos + 0] = static_cast<std::uint8_t>(chanOff);
+  rec[offPos + 1] = static_cast<std::uint8_t>(chanOff >> 8);
+  rec[offPos + 2] = static_cast<std::uint8_t>(chanOff >> 16);
+  rec[offPos + 3] = static_cast<std::uint8_t>(chanOff >> 24);
+  aName(rec, "SW_INTER");                   // +0x00 channel name[12]
+  aW(rec, 3);                               // +0x0c vertCount
+  aF(rec, 1.0f);                            // +0x10 scale (delta form)
+  aV3(rec, 0, 0, 0); aV3(rec, 1, 0, 0); aV3(rec, 2, 0, 0);  // basePose
+  aH(rec, 1);                               // delta key tag = frame 1
+  for (int i = 0; i < 9; ++i) rec.push_back(4);   // i8 deltas +4
+  aH(rec, -1);                              // terminator
+
+  // Minimal BNI: u32@0 size-4 envelope, u32@4 count, {name,imageOff}.
+  std::vector<std::uint8_t> bni(4, 0);
+  aW(bni, 1);                               // record count
+  aName(bni, "SW_INTER");                   // directory name field
+  aW(bni, 20);                              // imageOffset -> payload@24
+  const std::size_t payloadAt = bni.size(); // == 24 (directory end)
+  for (std::uint8_t b : rec) bni.push_back(b);
+  const std::uint32_t len = static_cast<std::uint32_t>(bni.size() - 4);
+  bni[0] = static_cast<std::uint8_t>(len);
+  bni[1] = static_cast<std::uint8_t>(len >> 8);
+  bni[2] = static_cast<std::uint8_t>(len >> 16);
+  bni[3] = static_cast<std::uint8_t>(len >> 24);
+
+  const mdk::BniDirectory bd = mdk::inspectBniDirectory(
+      std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(bni.data()), bni.size()));
+  CHECK(bd.status == mdk::BniDirectoryStatus::kOk);
+
+  mdk::TraversalRuntime rt;
+  rt.animSwInter =
+      mdk::traversalBniAnimPayload(bd,
+          reinterpret_cast<const std::byte*>(bni.data()), "SW_INTER");
+  CHECK(rt.animSwInter ==
+        reinterpret_cast<const std::byte*>(bni.data()) + payloadAt);
+
+  // Thrown SW_INTER in the IDLE phase — field30e expires this tick so
+  // the dispatch reaches the cmd==2 transition-init.
+  mdk::DynamicArena home;
+  mdk::DynamicObject& o = home.allocFront();
+  o.col.named = true;
+  o.enemyIndex = 0;
+  o.field30a = 2;                          // +0x30a cmd = item id 2
+  o.field30e = 1;                          // expires -> transition
+  o.col.scale = 1.0f;                      // grow-in already done
+  o.col.flags149 = 0;                      // IDLE (+0x40 clear)
+  o.col.flags148 = 0;                      // non-loop
+  o.col.flags14c = 0;
+  o.model = makePlatformModel("SW_INTER", "SW_INTER", 0.0f);
+  o.syncCollisionView();
+  const float dt = 1.0f / 30.0f;
+
+  mdk::enemyCommandDispatch(rt, o, home, dt);   // IDLE -> cmd==2 init
+  CHECK(o.animRec == rt.animSwInter);      // THE FIX — was a null seam
+  CHECK(o.animLatch == 0);                 // +0x118 = 0 (spin phase)
+  CHECK(o.field30e == 600);                // +0x30e = 0x258
+  CHECK((o.col.flags149 & 0x40) != 0);     // -> EXEC phase
+
+  // The record resolves to a well-formed view — rate=1.0@+0, 3 frames.
+  mdk::ObjectAnimView av{
+      reinterpret_cast<const std::uint8_t*>(o.animRec),
+      reinterpret_cast<const std::uint8_t*>(o.animRec) + rec.size()};
+  CHECK(av.ok && av.frameCount() == 3);
+
+  // Arm the spin-complete state (+0x118=-1), then the record plays
+  // its frames to the non-loop done latch — the "explosion anim".
+  o.animLatch = -1;                        // cmdBody2's spin-done arm
+  o.animFrame = -1;
+  const std::uint8_t* lim =
+      reinterpret_cast<const std::uint8_t*>(bni.data()) + bni.size();
+  for (int i = 0; i < 8 && o.animLatch != -256; ++i)
+    mdk::objectAnimTick(o, lim);
+  CHECK(o.animFrame == 2);                 // reached the last frame
+  CHECK(o.animLatch == -256);              // +0x118 = 0xff00 (done)
+  CHECK(o.animDone());                     // -> cmdBody2 detonates
 }
 
 // ---------------------------------------------------------------------------
@@ -22635,6 +22834,64 @@ void test_freefall_pickup() {
   CHECK(ffFirstOfType(rt2, 4) == nullptr);
 }
 
+void test_freefall_pickup_teletype() {
+  // OBSERVED FUN_0046a790 shared tail (0x46a7f7) + FUN_0046a500 — a
+  // collected pickup posts its name through the teletype ring with
+  // flags=1, rate=2.0 (FUN_0041cad0). Pickup-table rows 9 (SW_H01) and
+  // 0xb (BONEFLC) return early without posting; every key-table item
+  // posts.
+  auto collectPost = [](const char* name) {
+    FreefallRuntime rt;
+    // course 1 — no FALL_T1 course-start post, so a recorded post can
+    // only come from the pickup.
+    mdk::freefallInit(rt, ffCourse(1, 0, {name}), 777);
+    ffRunIntro(rt);
+    rt.radarTimer = 0;
+    rt.pickupTimer = 1;
+    ffStep(rt, {});
+    FreefallObject* p = ffFirstOfType(rt, 4);
+    FreefallObject* pl = ffPlayer(rt);
+    CHECK(p != nullptr && pl != nullptr);
+    if (p && pl) {
+      p->timer = 1;  // expire the fall timer -> chute + collect check
+      p->px = pl->px;
+      p->py = pl->py;
+      p->pz = pl->pz + 2.0f;
+      ffStep(rt, {});
+      CHECK(ffFirstOfType(rt, 4) == nullptr);  // collected (freed)
+    }
+    return rt.teletypePost;
+  };
+  // Distinct pickups across both grant tables post their own name.
+  {
+    auto tp = collectPost("SW_SGREN");   // grant-table ammo (row 1)
+    CHECK(tp.has_value());
+    CHECK(tp && tp->name && std::string(tp->name) == "SW_SGREN");
+    CHECK(tp && tp->flags == 1u && near(tp->rate, 2.0));
+  }
+  {
+    auto tp = collectPost("SW_GATT");    // key-table item (row 5)
+    CHECK(tp.has_value());
+    CHECK(tp && tp->name && std::string(tp->name) == "SW_GATT");
+    CHECK(tp && tp->flags == 1u && near(tp->rate, 2.0));
+  }
+  {
+    auto tp = collectPost("SW_H25");     // grant-table health (row 5)
+    CHECK(tp.has_value());
+    CHECK(tp && tp->name && std::string(tp->name) == "SW_H25");
+    CHECK(tp && tp->flags == 1u && near(tp->rate, 2.0));
+  }
+  // The two shared-tail early-return rows grant but do NOT post.
+  {
+    auto tp = collectPost("SW_H01");     // grant row 9
+    CHECK(!tp.has_value());
+  }
+  {
+    auto tp = collectPost("BONEFLC");    // grant row 0xb
+    CHECK(!tp.has_value());
+  }
+}
+
 void test_freefall_radar() {
   FreefallRuntime rt;
   mdk::freefallInit(rt, ffCourse(0, 0), 5150);
@@ -25967,11 +26224,12 @@ std::vector<std::byte> hudTestTravsprt() {
   recs.push_back({"BOMBTARG", hudTestSpriteTable({hudTestStream(10)})});
   recs.push_back({"SNIPERGA", hudTestSpriteTable({hudTestStream(11),
                                                   hudTestStream(12)})});
-  // PICKUPS frames 0..7 — ids index directly (frame(rec.id)).
+  // PICKUPS frames 0..8 — the 1-based record id selects frames[id-1]
+  // (FUN_00469f7c indexes the table body by id -> frameOffset[id-1]).
   recs.push_back({"PICKUPS", hudTestSpriteTable(
       {hudTestStream(20), hudTestStream(21), hudTestStream(22),
        hudTestStream(23), hudTestStream(24), hudTestStream(25),
-       hudTestStream(26), hudTestStream(27)})});
+       hudTestStream(26), hudTestStream(27), hudTestStream(28)})});
   // SNIPERS2 u16 stream: literal 4px 'A'-'D', skip 2, literal 'E'-'H',
   // end. Layer: [0..3]=A-D, [4,5]=0, [6..9]=E-H.
   std::vector<std::byte> sn2 = {std::byte(0), std::byte(0), std::byte(0),
@@ -26022,7 +26280,7 @@ void test_traversal_hud() {
     CHECK(rt.hud.cross.frames.size() == 1);
     CHECK(rt.hud.bombtarg.frames.size() == 1);
     CHECK(rt.hud.sniperga.frames.size() == 2);
-    CHECK(rt.hud.pickups.frames.size() == 8);
+    CHECK(rt.hud.pickups.frames.size() == 9);
     CHECK(rt.hud.overlayPx.size() == 600u * 360u);
     CHECK(rt.hud.overlayPx[0] == 'A' && rt.hud.overlayPx[1] == 'B' &&
           rt.hud.overlayPx[2] == 'C' && rt.hud.overlayPx[3] == 'D');
@@ -26161,20 +26419,51 @@ void test_traversal_hud() {
     CHECK(rt.hud.fb.at(55, 351) == 1);
     CHECK(rt.hud.fb.at(8, 328) == 1);           // side column mid
     CHECK(rt.hud.fb.at(55, 328) == 1);
-    // PICKUPS frame 5 (2x2 pen 25) top-left at (100,200).
-    CHECK(rt.hud.fb.at(100, 200) == 25);
-    CHECK(rt.hud.fb.at(101, 201) == 25);
+    // id==5 selects frames[id-1] = frame 4 (2x2 pen 24) at (100,200).
+    CHECK(rt.hud.fb.at(100, 200) == 24);
+    CHECK(rt.hud.fb.at(101, 201) == 24);
     // Timer 0 (scoped pin) hides the whole inventory draw.
     rt.invHudTimer = 0;
     mdk::traversalHudCompose(rt);
     CHECK(rt.hud.fb.at(8, 304) == 0);
     CHECK(rt.hud.fb.at(100, 200) == 0);
-    // id==6 selected: no box, icon still draws.
+    // id==6 selected: no box, icon still draws (frame 5, pen 25).
     rt.inventory[0].id = 6;
     rt.invHudTimer = 30;
     mdk::traversalHudCompose(rt);
     CHECK(rt.hud.fb.at(8, 304) == 0);
-    CHECK(rt.hud.fb.at(100, 200) == 26);        // frame 6's pen
+    CHECK(rt.hud.fb.at(100, 200) == 25);        // frame 5's pen
+  }
+
+  // ---- compose: all nine inventory ids map to frames[id-1] --------
+  // Regression for the off-by-one: FUN_00469f7c reads the 1-based
+  // record id into the table body, landing on frameOffset[id-1].
+  {
+    mdk::TraversalRuntime rt;
+    rt.level.travsprtBytes = hudTestTravsprt();
+    rt.hudActive = 1;
+    mdk::traversalHudBind(rt);
+    for (int id = 1; id <= 9; ++id) {
+      rt.inventoryCount = 1;
+      rt.inventorySel = 0;
+      rt.inventory[0].id = id;
+      rt.inventory[0].charges = 1;
+      rt.inventory[0].animX = 100.0f;
+      rt.inventory[0].animY = 200.0f;
+      rt.inventory[0].slotX = 100;
+      rt.inventory[0].slotY = 200;
+      rt.invHudTimer = 30;
+      mdk::traversalHudCompose(rt);
+      // frame(id-1) carries pen 20+(id-1); the neighbouring frames'
+      // pens must not appear (guards the off-by-one both ways).
+      const int want = 20 + (id - 1);
+      CHECK(rt.hud.fb.at(100, 200) == want);
+      CHECK(rt.hud.fb.at(101, 201) == want);
+      if (id > 1)
+        CHECK(rt.hud.fb.at(100, 200) != 20 + (id - 2));
+      if (id < 9)
+        CHECK(rt.hud.fb.at(100, 200) != 20 + id);
+    }
   }
 
   // ---- compose: scoped gate — CROSS, SNIPERS2, SNIPERGA ----------
@@ -32258,6 +32547,8 @@ int main() {
   test_enemy_runtime();
   test_mover_runtime();
   test_object_animation();
+  test_travsprt_anim_payload();
+  test_swinter_anim_binding();
   test_player_look();
   test_traversal_chute_dispatch();
   test_player_camera();
@@ -32277,6 +32568,7 @@ int main() {
   test_freefall_motion();
   test_freefall_missile();
   test_freefall_pickup();
+  test_freefall_pickup_teletype();
   test_freefall_radar();
   test_freefall_completion_death();
   test_freefall_determinism();

@@ -620,8 +620,10 @@ void traversalHudCompose(TraversalRuntime& rt) {
       if (rec.id == 0) continue;
       const int rx = hudRintf(rec.animX);
       const int ry = hudRintf(rec.animY);
+      // FUN_00469f7c indexes the PICKUPS table body by the 1-based
+      // record id: table[id] == frameOffset[id-1] -> frames[id-1].
       if (const FtiSpriteFrame* f = hud.pickups.frame(
-              static_cast<std::size_t>(rec.id)))
+              static_cast<std::size_t>(rec.id - 1)))
         blitFtiSpriteFrame(*f, fb, rx, ry);
       if (rec.charges > 1)
         hudPrintCentered(hud,
