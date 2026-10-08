@@ -3164,10 +3164,14 @@ Array MdkBridge::get_freefall_object_snapshots() {
     // flare > 0.
     d["flare"] = int64_t(o.subTimer);
     // Kind-1 — the +0x10c marker entry (PICK sprite through the
-    // scaled transparent blit, z-1e-5 sort). The generic object-
-    // record init sets +0x10c on pickups; mode-2 missiles never
-    // carry it. Emit for type-4 records.
-    d["marker"] = o.type == 4;
+    // scaled transparent blit, z-1e-5 sort). +0x10c is a relocated
+    // sprite-source pointer populated only by the traversal/load
+    // fixup (FUN_00426f34; callers sit in 0x42xxxx) — spawned
+    // freefall objects get +0x10c=0 from the zeroed alloc and no
+    // spawn or tick path writes it, so the marker is never drawn.
+    // The pickup's complete visual is the kind-2 medallion (verified
+    // against the original freefall AVI: no badge/marker renders).
+    d["marker"] = false;
     // The kind-4 trail / kind-3 BANG gates — state only (the FX
     // renders stay documented seams).
     d["trail_fx"] = int64_t(o.fx);
@@ -3473,6 +3477,18 @@ Dictionary MdkBridge::get_freefall_material(const String& name) {
   out["w"] = int64_t(m->width);
   out["h"] = int64_t(m->height);
   out["frames"] = int64_t(m->frameCount);
+  // Index 0 is the texture fill's transparent texel key (the
+  // EXPLODE record is a transparent-surround fireball). Report
+  // whether any index-0 texel exists so the presenter can gate
+  // alpha only where it matters — opaque textures stay in the
+  // depth-writing opaque pass.
+  bool hasAlpha = false;
+  const std::size_t npix =
+      std::size_t(m->width) * std::size_t(m->height);
+  for (std::size_t i = 0; i < npix && i < m->pixels.size(); ++i) {
+    if (m->pixels[i] == 0) { hasAlpha = true; break; }
+  }
+  out["has_alpha"] = hasAlpha;
   out["tex"] = freefallTexture_(*m);
   return out;
 }

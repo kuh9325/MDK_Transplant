@@ -25,13 +25,16 @@
 //                 stores it as parseGeometryRecord's head word, so the
 //                 record bytes are re-headed with the roster flag).
 //   FUN_004109d8  the per-object render walk emits up to six sorted
-//                 entries: radar sprite, trail, launch glow, BANG
-//                 explosion (kind 3), the main model (kind 2), and the
-//                 chute attachment (kind 2) — kind-2 entries render a
-//                 RuntimeModel through the shared projector under the
-//                 object's +0xac basis (FUN_0046b2f8: pitch/roll/yaw/
-//                 scale + pos). This scene produces exactly the kind-2
-//                 product; the sprite/FX kinds stay documented seams.
+//                 entries: a +0x10c sprite-marker entry, trail, launch
+//                 glow, BANG explosion (kind 3), the main model
+//                 (kind 2), and the chute attachment (kind 2) — kind-2
+//                 entries render a RuntimeModel through the shared
+//                 projector under the object's +0xac basis
+//                 (FUN_0046b2f8: pitch/roll/yaw/scale + pos). This scene
+//                 produces exactly the kind-2 product; the sprite/FX
+//                 kinds stay documented seams. (The +0x10c marker is a
+//                 dead branch in mode 2 — spawned objects never carry
+//                 it; see FREEFALL_BACKDROP.md §6.)
 //   FUN_004555bc  the object anim driver — object_animation.cpp's
 //                 objectAnimTick. Freefall objects carry the same
 //                 fields (+0xdc acc, +0xe0 rate, +0xe4 frame, +0x114
@@ -47,9 +50,10 @@
 // drives gameplay; the FreefallObject fields stay authoritative.
 //
 // Deferred seams (presented only as state, matching the runtime's
-// existing seams): the kind-1 radar marker sprite, missile launch
-// glow/trail (kind 5/4), the kind-3 BANG frame-block overlay, the
-// ZOOM%04d intro sprite sequence, and every sound.
+// existing seams): the kind-1 +0x10c sprite-marker path (never
+// populated on spawned freefall objects — dead branch in mode 2),
+// missile launch glow/trail (kind 5/4), the kind-3 BANG frame-block
+// overlay, the ZOOM%04d intro sprite sequence, and every sound.
 
 #ifndef MDK_CORE_FREEFALL_SCENE_H
 #define MDK_CORE_FREEFALL_SCENE_H
@@ -86,9 +90,8 @@ extern const std::array<FreefallModelRecord, 23> kFreefallModelTable;
 // The object's model-slot index (0x4edcc0-table identity). Resolves
 // the fixed tags and the FALLPU pickup names through the roster
 // table; returns -1 when the tag carries no geometry record
-// (kFfModelRadar — slot 2 exists but the radar's visual is the
-// kind-1 marker sprite, a documented seam — or an unlisted pickup
-// name).
+// (kFfModelRadar — slot 2 produces the code-built wedge model rather
+// than a stream geometry record — or an unlisted pickup name).
 int freefallObjectModelSlot(const FreefallRuntime& rt,
                             const FreefallObject& o);
 

@@ -252,9 +252,20 @@ would encode `00..00 08 40`). The next qword `0x494d38` = -1e-5
 is the kind-1 sort bias.
 Effective: PICK 64x64 -> outW = 64*scale>>8 — first visible pixel
 at z' <= 2000, ~16px at z' = 500, full 64px at z' ~= 31.
-It is the pickup marker visual — not a missile radar. Missile
-approach warning in mode 2 = the kind-5 FLARE + the trail; there is
-no separate radar ring on missiles.
+`+0x10c` is a relocated sprite-source pointer set only by the
+traversal/load fixup path (FUN_00426f34; callers in 0x42xxxx).
+Freefall objects get `+0x10c = 0` from the zeroed pool alloc
+(FUN_0040f96c -> memset FUN_0047d20a) and no spawn/tick writes it
+(missile FUN_0041151c, pickup FUN_004118b0, radar FUN_00412060 /
+FUN_004119ec / FUN_00411aac all verified), so kind 1 is never
+emitted for spawned freefall objects — it is a dead branch in
+mode 2. The PICK payload itself is a 64x64 coin icon whose
+background ring is pen 0xff (no pen-0 pixels), which the pen-0
+blit would draw opaque — consistent with it never being bound to
+a freefall object. Pickups render as the kind-2 medallion model
+alone (verified against the original AVI: no badge/marker
+appears). Missile approach warning in mode 2 = the kind-5 FLARE
++ the trail; there is no separate radar ring on missiles.
 
 ## 7. FALL_T1 opening teletype (OBSERVED, implemented)
 

@@ -423,8 +423,10 @@ void traversalPickupCollect(TraversalRuntime& rt) {
     }
     if (rt.inventoryCount < 5) {
       // New slot (0x46998d..0x469b96): id2's sfx is the WMIB record
-      // (0x54c65c — the World's Most Interesting Bomb jingle, the
-      // SW_INTER item); all other ids play COLLECT.
+      // (0x54c65c — the World's Smallest Nuclear Explosion jingle,
+      // the SW_INTER item; owner-confirmed name 2026-10-08 —
+      // the earlier "Most Interesting Bomb" read is DISPROVEN);
+      // all other ids play COLLECT.
       collectSfx(rt, itemId == 2 ? "WMIB" : "COLLECT");
       collectNotify(rt);
       rt.invHudTimer = 0x3c;

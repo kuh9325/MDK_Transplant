@@ -17189,6 +17189,8 @@ void test_mover_runtime() {
     o.col.named = true;
     o.health = 10;
     o.model = makePlatformModel(modelName, "ELEM", 0.0f);
+    o.scriptClass = modelName;  // the op-0xa1/0xce spawn writes this
+                                // before the +0x148 tail below
     o.col.flags148 = 0x08a6;          // dword 0x2008a6 (0xa1/0xce tail)
     o.col.flags149 = 0x08;
     o.col.flags14a = 0x20;

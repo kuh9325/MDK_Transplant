@@ -2466,11 +2466,13 @@ void objectMover(TraversalRuntime& rt, DynamicObject& o,
         if (o.moverChild == nullptr)
           moverChuteSpawn(rt, o, home);
       }
+      rebuildObjectTransform(o);                      // FUN_0045612c tail
       return;
     }
     o.zBias = 1.5f;                                   // +0x5c = 0x3fc00000
     o.col.flags14a |= 2;                              // hop-landed
     o.pos[2] += 1.5f;                                 // C(0x498078)
+    rebuildObjectTransform(o);                        // FUN_0045612c tail
     return;
   }
   // Child fade (0x4586bd..0x4586fc).
@@ -2482,10 +2484,25 @@ void objectMover(TraversalRuntime& rt, DynamicObject& o,
       o.moverChild = nullptr;                         // +0x312 = 0
     }
   }
-  const std::string& nm = o.model.modelName();
-  if (nm == "SW_H150") { moverSwH150(rt, o, dt, frameStep); return; }
-  if (nm == "SW_SEAL" || nm == "SW_SBONE") return;    // no-op names
-  o.yawDeg += dt * 180.0f;                            // C(0x498030)
+  // *(obj+0xc) byte-0 — the table-1 ENTRY NAME written by
+  // FUN_004286c8 (same streq target as the pickup collector), NOT
+  // the geometry's name-table[0]. SW_H150's geometry record names
+  // itself "PEN_36"; dispatching on modelName() leaves the flee
+  // branch unreachable and the pickup spins forever.
+  const std::string& nm =
+      o.enemyIndex < rt.level.enemies.entries.size()
+          ? rt.level.enemies.entries[o.enemyIndex].name
+          : o.scriptClass;
+  if (nm == "SW_H150") moverSwH150(rt, o, dt, frameStep);
+  else if (nm == "SW_SEAL" || nm == "SW_SBONE") {}    // no-op names
+  else o.yawDeg += dt * 180.0f;                       // C(0x498030)
+  // FUN_0045612c — the original's tail: the mover's transform + world
+  // AABB refresh lives INSIDE FUN_004585c4, which is exactly why the
+  // frame-end pass (FUN_0047c9e0) skips +0x14a&0x20 objects. Without
+  // this call a descending pickup (e.g. the LEVEL7 SW_KEY nuke at
+  // DANT_1 (-40,328,150)) keeps its spawn-height AABB and can never be
+  // collected — the observed playtest progression blocker.
+  rebuildObjectTransform(o);
 }
 
 // ---------------------------------------------------------------------------

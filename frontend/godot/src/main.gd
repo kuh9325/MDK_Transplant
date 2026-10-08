@@ -180,6 +180,17 @@ const STREAM_STEP_MS := 1000.0 / 30.0
 const STREAM_MAX_CATCHUP := 4
 var stream_pace_ms := 0.0
 var stream_pace_armed := false
+# Mode 2/3 gameplay pacing — the same host contract as the mode-5
+# pacer above (19C.1): the original ran one sim step per dispatcher
+# tick (~30Hz), FUN_0042fdc8's frameStep is per-CALL catch-up math,
+# not a per-render-frame grant. A 60/120Hz display otherwise runs
+# the world 2-4x fast while deltaSec collapses toward 0 (rawDelta
+# truncates to 0 below ~9ms frames). One sim step per ~33.3ms of
+# wall time; catch-up bounded at 4 — the limiter's own resync bound.
+# Deterministic harnesses drive step_frame_input directly, so
+# goldens are untouched.
+var game_pace_ms := 0.0
+var game_pace_armed := false
 # --pace-trace: bounded wall-clock evidence for the mode-5 limiter —
 # sim steps vs monotonic elapsed + presented frames, once per second.
 var pace_trace := false
@@ -2411,6 +2422,12 @@ func _ff_material(mat_name: String, pen: int) -> StandardMaterial3D:
 	tm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	tm.cull_mode = BaseMaterial3D.CULL_DISABLED
 	tm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	# Index 0 is the fill's transparent texel key (OBSERVED — the
+	# EXPLODE fireball is a transparent-surround sprite). Opaque
+	# textures stay in the depth-writing opaque pass; only
+	# alpha-bearing textures enter the transparent pass.
+	if bool(d.get("has_alpha", false)):
+		tm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	tm.albedo_texture = d["tex"]
 	var tw := float(d["w"])
 	var th := float(d["h"])
@@ -4304,18 +4321,54 @@ func _process(delta: float) -> void:
 				if not k.has(0x38):
 					k.append(0x38)
 				input["keys"] = k
-		bridge.step_frame_input(delta * 1000.0, input)
+		# Paced sim stepping: one ~33.3ms step per completed slice of
+		# accumulated wall time (see game_pace_* above — the original
+		# contract is one step per ~30Hz dispatcher tick, NOT one per
+		# rendered frame). Input state is sampled once per render
+		# frame and held across the substeps — the same relationship
+		# a period 30Hz loop had to its input merge.
+		game_pace_ms += delta * 1000.0
+		if not game_pace_armed:
+			# First gameplay frame — present it immediately rather
+			# than dead-waiting the slice that just landed.
+			game_pace_armed = true
+			game_pace_ms += STREAM_STEP_MS
+		var n := int(game_pace_ms / STREAM_STEP_MS)
+		if n > STREAM_MAX_CATCHUP:
+			n = STREAM_MAX_CATCHUP
+			game_pace_ms = 0.0   # drop the backlog — no death spiral
+		else:
+			game_pace_ms -= n * STREAM_STEP_MS
+		var first_step := true
+		while n > 0:
+			var step_mode := int(bridge.get_mode())
+			if step_mode != 2 and step_mode != 3:
+				break   # mode flipped mid-frame — other presenters own it
+			bridge.step_frame_input(STREAM_STEP_MS, input)
+			n -= 1
+			if first_step:
+				# Device deltas are per-sample-period — applying them
+				# to every substep would double-count aim. Held keys
+				# and buttons are level state and correctly persist.
+				input["mouse_dx"] = 0.0
+				input["mouse_dy"] = 0.0
+				input["mouse_dz"] = 0.0
+				first_step = false
+			if step_mode == 2:
+				if _ff_steps == 0:
+					_ff_wall0 = Time.get_ticks_msec()
+				_ff_steps += 1
+				if ff_trace:
+					_ff_trace_tick()
 		# The freefall->traversal handoff can flip the mode inside the
 		# step — re-read so the apply path follows the live runtime.
 		# (Traversal sessions are always mode != 2; only a session
 		# that STARTED in mode 2 logs the transition.)
 		mode = int(bridge.get_mode())
-		if mode == 2:
-			if _ff_steps == 0:
-				_ff_wall0 = Time.get_ticks_msec()
-			_ff_steps += 1
-		if ff_trace and mode == 2:
-			_ff_trace_tick()
+		if mode != 2 and mode != 3:
+			# Non-gameplay mode took over (death->0, handoff->5..8);
+			# a later gameplay load re-arms with a present-first tick.
+			game_pace_armed = false
 		if (freefall or fe_run or frontend) and mode != 2 and \
 				not ff_handoff_seen:
 			var fs: Dictionary = bridge.get_freefall_snapshot()
