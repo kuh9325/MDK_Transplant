@@ -11938,6 +11938,193 @@ void test_player_collision() {
 }
 
 // ---------------------------------------------------------------------------
+// Corridor arena geometry source — .MTO first, O.SNI fallback.
+//
+// OBSERVED on LEVEL3: corridor arenas (CHMO_*) have no .MTO block; their
+// region-C collision/render mesh lives in the level O.SNI stream under a
+// same-named record. traversalArenaLoadGeometry resolves the .MTO block
+// first and only falls back to O.SNI when no block exists.
+// ---------------------------------------------------------------------------
+
+// Minimal self-consistent region-C blob: countA=0, one BSP node, one
+// poly, three verts at height vertZ (same proven layout as the
+// FUN_00419ee0 parse test in test_player_collision). vertZ is the
+// distinguishing signature — the parsed deepFloorZ reports the source.
+static std::vector<std::uint8_t> makeRegionCBlob(float vertZ) {
+  std::vector<std::uint8_t> b;
+  auto put32 = [&](std::uint32_t v) {
+    b.push_back((std::uint8_t)(v & 0xff));
+    b.push_back((std::uint8_t)((v >> 8) & 0xff));
+    b.push_back((std::uint8_t)((v >> 16) & 0xff));
+    b.push_back((std::uint8_t)((v >> 24) & 0xff));
+  };
+  auto putF = [&](float f) {
+    std::uint32_t v;
+    std::memcpy(&v, &f, 4);
+    put32(v);
+  };
+  put32(0);                                          // countA
+  put32(1);                                          // countB
+  putF(0.0f); putF(0.0f); putF(1.0f); putF(-10.0f);  // node plane
+  b.push_back(0xff); b.push_back(0xff);              // childFar -1
+  b.push_back(0xff); b.push_back(0xff);              // childNear -1
+  put32(1);                                          // polysPos {count1}
+  put32(0);                                          // polysNeg
+  put32(0); put32(0); put32(0); put32(0);            // +0x1c..+0x28
+  put32(1);                                          // countC
+  b.push_back(0); b.push_back(0);                    // v0
+  b.push_back(1); b.push_back(0);                    // v1
+  b.push_back(2); b.push_back(0);                    // v2
+  for (int i = 0; i < 30; ++i) b.push_back(0);       // poly pad
+  put32(3);                                          // countD
+  putF(-1.0f); putF(-1.0f); putF(vertZ);
+  putF(1.0f); putF(-1.0f); putF(vertZ);
+  putF(1.0f); putF(1.0f); putF(vertZ);
+  put32(0);                                          // tail
+  return b;
+}
+
+// Write `blob` into the named SNI record's payload (reserved at build
+// time as zeroed space of the same size).
+static void sniWritePayload(SyntheticSni& sni, const char* name,
+                            const std::vector<std::uint8_t>& blob) {
+  const auto dir = mdk::inspectSniDirectory(sni.buf);
+  for (const auto& e : dir.entries) {
+    if (e.name() == name && e.payloadSize == blob.size()) {
+      std::memcpy(sni.buf.data() + e.payloadFileOffset(), blob.data(),
+                  blob.size());
+      return;
+    }
+  }
+}
+
+// Write `blob` into the named MTO block's region-C section (reserved at
+// build time as zeroed space of the same size via the spec's c-counts).
+static void mtoWriteRegionC(SyntheticMto& mto, const char* name,
+                            const std::vector<std::uint8_t>& blob) {
+  const auto dir = mdk::inspectMtoDirectory(mto.buf);
+  for (std::size_t i = 0; i < dir.entries.size(); ++i) {
+    if (dir.entries[i].name() == name) {
+      const std::size_t tC = static_cast<std::size_t>(
+          dir.blocks[i].fileOffset + 4 + dir.blocks[i].fieldAt0x0C);
+      std::memcpy(mto.buf.data() + tC, blob.data(), blob.size());
+      return;
+    }
+  }
+}
+
+void test_traversal_corridor_geometry() {
+  using mdk::TraversalArena;
+  using mdk::TraversalLoadError;
+  using mdk::TraversalRuntime;
+  using mdk::inspectMtoDirectory;
+  using mdk::traversalArenaLoadGeometry;
+
+  // -- O.SNI fallback: corridor name absent from .MTO, present in the
+  //    level O.SNI stream -> its region-C blob is loaded as geometry.
+  {
+    const auto blob = makeRegionCBlob(77.0f);
+    SyntheticMto::BlockSpec spec;
+    spec.entryName = "HMO_1";   // .MTO holds only the HMO_ arena
+    spec.innerName = "MAT";
+    spec.c2 = 1; spec.c3 = 1; spec.c4 = 3;
+    auto mto = SyntheticMto::build("LEVEL3O.MTO", {spec});
+    auto sni = SyntheticSni::build(
+        "LEVEL3O.SNI", {{"CHMO_1", 0, (std::uint32_t)blob.size()}});
+    sniWritePayload(sni, "CHMO_1", blob);
+
+    TraversalRuntime rt;
+    rt.level.mtoBytes = mto.buf;
+    rt.level.mto = inspectMtoDirectory(rt.level.mtoBytes);
+    rt.level.sniOBytes = sni.buf;
+    TraversalArena arena;
+    arena.name = "CHMO_1";
+    std::string detail;
+    CHECK(traversalArenaLoadGeometry(rt, arena, &detail) ==
+          TraversalLoadError::kOk);
+    CHECK(arena.geometryLoaded);
+    CHECK(arena.dyn.col.polys != nullptr && arena.dyn.col.verts != nullptr);
+    CHECK(arena.surface.polyCount == 1);
+    CHECK(near(arena.dyn.col.deepFloorZ, 77.0));
+
+    // No double-load: a second call early-outs on geometryLoaded and
+    // returns the same installed poly table.
+    const mdk::CollisionPoly* first = arena.dyn.col.polys;
+    CHECK(traversalArenaLoadGeometry(rt, arena, &detail) ==
+          TraversalLoadError::kOk);
+    CHECK(arena.dyn.col.polys == first);
+  }
+
+  // -- .MTO wins: a same-named .MTO block is used even when O.SNI also
+  //    has the record. The O.SNI payload here is junk (not region-C) —
+  //    had the loader consulted it, the parse would have failed.
+  {
+    const auto blobMto = makeRegionCBlob(10.0f);
+    SyntheticMto::BlockSpec spec;
+    spec.entryName = "HMO_9";
+    spec.innerName = "MAT";
+    spec.c2 = 1; spec.c3 = 1; spec.c4 = 3;
+    auto mto = SyntheticMto::build("LEVEL9O.MTO", {spec});
+    mtoWriteRegionC(mto, "HMO_9", blobMto);
+    auto sni = SyntheticSni::build("LEVEL9O.SNI", {{"HMO_9", 0, 32}});
+
+    TraversalRuntime rt;
+    rt.level.mtoBytes = mto.buf;
+    rt.level.mto = inspectMtoDirectory(rt.level.mtoBytes);
+    rt.level.sniOBytes = sni.buf;
+    TraversalArena arena;
+    arena.name = "HMO_9";
+    std::string detail;
+    CHECK(traversalArenaLoadGeometry(rt, arena, &detail) ==
+          TraversalLoadError::kOk);
+    CHECK(arena.geometryLoaded);
+    CHECK(near(arena.dyn.col.deepFloorZ, 10.0));  // .MTO, not O.SNI
+  }
+
+  // -- corridor name in neither .MTO nor O.SNI -> missing, empty.
+  {
+    TraversalRuntime rt;
+    rt.level.mto = inspectMtoDirectory(rt.level.mtoBytes);  // empty
+    auto sni = SyntheticSni::build("LEVEL3O.SNI",
+                                   {{"CHMO_2", 0, 136}});
+    rt.level.sniOBytes = sni.buf;
+    TraversalArena arena;
+    arena.name = "CHMO_1";   // absent from both streams
+    std::string detail;
+    CHECK(traversalArenaLoadGeometry(rt, arena, &detail) ==
+          TraversalLoadError::kCollisionBlobMissing);
+    CHECK(!arena.geometryLoaded);
+  }
+
+  // -- O.SNI record present but not a region-C blob (a "NONE"-style /
+  //    junk payload) -> parse fails, arena stays empty, no crash.
+  {
+    auto sni = SyntheticSni::build("LEVEL3O.SNI",
+                                   {{"CHMO_1", 0, 197}});  // zeroed junk
+    TraversalRuntime rt;
+    rt.level.sniOBytes = sni.buf;
+    TraversalArena arena;
+    arena.name = "CHMO_1";
+    std::string detail;
+    CHECK(traversalArenaLoadGeometry(rt, arena, &detail) ==
+          TraversalLoadError::kCollisionBlobParse);
+    CHECK(!arena.geometryLoaded);
+    CHECK(arena.dyn.col.polys == nullptr);
+  }
+
+  // -- no O.SNI stream at all -> missing, empty.
+  {
+    TraversalRuntime rt;
+    TraversalArena arena;
+    arena.name = "CHMO_1";
+    std::string detail;
+    CHECK(traversalArenaLoadGeometry(rt, arena, &detail) ==
+          TraversalLoadError::kCollisionBlobMissing);
+    CHECK(!arena.geometryLoaded);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 5E — dynamic collision objects
 // ---------------------------------------------------------------------------
 
@@ -32055,6 +32242,7 @@ int main() {
   test_player_motion();
   test_player_vertical();
   test_player_collision();
+  test_traversal_corridor_geometry();
   test_player_surface();
   test_dynamic_objects();
   test_traversal_connect_pairing();

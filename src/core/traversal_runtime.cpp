@@ -79,6 +79,34 @@ bool cmiTable3Has(const CmiDirectory& cmi, const std::string& name) {
   return false;
 }
 
+// Corridor arenas carry their region-C collision/render mesh in the
+// level O.SNI stream as a same-named record — corridors have no .MTO
+// block (OBSERVED all 6 MTOs hold only HMO_*). OBSERVED on LEVEL3:
+// `LEVEL3O.SNI` `CHMO_1` is a countA/countB/countC/countD region-C
+// layout (7/300/357/189) covering the HMO_1->HMO_2 walkway; `CHMO_2`
+// and the other present corridors are the same shape, while absent
+// corridors (`CHMO_3`, `CHMO_7` — LEVEL3 has no script for either)
+// are 197-byte "NONE" markers. Locate `name`'s payload.
+const std::uint8_t* findSniOPayload(const TraversalLevel& lv,
+                                    const std::string& name,
+                                    std::size_t* size) {
+  if (lv.sniOBytes.empty()) return nullptr;
+  const SniDirectory dir =
+      inspectSniDirectory(std::span<const std::byte>(lv.sniOBytes));
+  if (dir.status != SniDirectoryStatus::kOk) return nullptr;
+  for (const SniEntry& e : dir.entries) {
+    if (e.name() != name || e.isSentinel() || e.payloadSize == 0)
+      continue;
+    const std::uint64_t off = e.payloadFileOffset();
+    if (off > lv.sniOBytes.size() ||
+        e.payloadSize > lv.sniOBytes.size() - off)
+      return nullptr;
+    if (size) *size = e.payloadSize;
+    return reinterpret_cast<const std::uint8_t*>(lv.sniOBytes.data() + off);
+  }
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Zone ambience — FUN_00431e50 (resolve) / FUN_00431cf4 (crossfade) /
 // FUN_00431fbc (teardown-on-unload).
@@ -392,22 +420,29 @@ TraversalLoadError traversalArenaLoadGeometry(TraversalRuntime& rt,
                                               TraversalArena& arena,
                                               std::string* detail) {
   if (arena.geometryLoaded) return TraversalLoadError::kOk;
+  const std::uint8_t* blob = nullptr;
+  std::size_t avail = 0;
   const MtoBlock* block = findMtoBlock(rt.level, arena.name);
-  if (!block) {
-    if (detail) *detail = "no MTO block named " + arena.name;
-    return TraversalLoadError::kCollisionBlobMissing;
+  if (block) {
+    const std::uint64_t geom = block->fileOffset + 4 + block->fieldAt0x0C;
+    const std::uint64_t blockEnd = block->fileOffset + block->blockLength;
+    if (geom + 4 > blockEnd ||
+        geom + 4 > rt.level.mtoBytes.size()) {
+      if (detail) *detail = "region-C offset out of block for " + arena.name;
+      return TraversalLoadError::kCollisionBlobParse;
+    }
+    blob = reinterpret_cast<const std::uint8_t*>(rt.level.mtoBytes.data() + geom);
+    avail = static_cast<std::size_t>(
+        std::min<std::uint64_t>(blockEnd, rt.level.mtoBytes.size()) - geom);
+  } else {
+    // No .MTO block — corridor arenas carry their region-C mesh in
+    // the level O.SNI stream under the same name (see findSniOPayload).
+    blob = findSniOPayload(rt.level, arena.name, &avail);
+    if (!blob) {
+      if (detail) *detail = "no MTO block or O.SNI record named " + arena.name;
+      return TraversalLoadError::kCollisionBlobMissing;
+    }
   }
-  const std::uint64_t geom = block->fileOffset + 4 + block->fieldAt0x0C;
-  const std::uint64_t blockEnd = block->fileOffset + block->blockLength;
-  if (geom + 4 > blockEnd ||
-      geom + 4 > rt.level.mtoBytes.size()) {
-    if (detail) *detail = "region-C offset out of block for " + arena.name;
-    return TraversalLoadError::kCollisionBlobParse;
-  }
-  const std::uint8_t* blob = reinterpret_cast<const std::uint8_t*>(
-      rt.level.mtoBytes.data() + geom);
-  const std::size_t avail = static_cast<std::size_t>(
-      std::min<std::uint64_t>(blockEnd, rt.level.mtoBytes.size()) - geom);
   std::uint32_t counts[4] = {};
   if (!collisionBlobParse(blob, avail, &arena.dyn.col, counts)) {
     if (detail) *detail = "collision blob parse failed for " + arena.name;
