@@ -1036,6 +1036,12 @@ func _object_material(oid: int, mat_name: String, pen: int,
 	tm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	tm.cull_mode = BaseMaterial3D.CULL_DISABLED
 	tm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	# Index 0 is the fill's transparent texel key — the EXPLODE remnant
+	# and the FIRE/splat bursts are transparent-surround sprites. Opaque
+	# textures stay in the depth-writing opaque pass; only alpha-bearing
+	# textures enter the transparent pass (else index 0 renders black).
+	if bool(d.get("has_alpha", false)):
+		tm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	tm.albedo_texture = d["tex"]
 	var tw := float(d.get("w", 0))
 	var th := float(d.get("h", 0))

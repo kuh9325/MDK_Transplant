@@ -2084,6 +2084,20 @@ Dictionary MdkBridge::get_object_material(int64_t object_id,
   out["w"] = int64_t(mat->width);
   out["h"] = int64_t(mat->height);
   out["frames"] = int64_t(mat->frameCount);
+  // Index 0 is the texture fill's transparent texel key (same as the
+  // freefall path — the EXPLODE/FIRE/SB_* FX records are transparent-
+  // surround sprites). Report whether any index-0 texel exists so the
+  // presenter can gate alpha only where it matters: opaque geometry
+  // textures stay in the depth-writing opaque pass.
+  {
+    bool hasAlpha = false;
+    const std::size_t npix =
+        std::size_t(mat->width) * std::size_t(mat->height);
+    for (std::size_t i = 0; i < npix && i < mat->pixels.size(); ++i) {
+      if (mat->pixels[i] == 0) { hasAlpha = true; break; }
+    }
+    out["has_alpha"] = hasAlpha;
+  }
   out["tex"] = objectTexture_(key, *mat, pal);
   return out;
 }
