@@ -7495,3 +7495,61 @@ stop rule invoked, inventory preserved for a dedicated phase.
   port is explicitly out of Phase-19A scope per §22.
 
 Engine contract: `docs/reverse-engineering/STREAM_SCENE.md`.
+
+## 242. Level-1 playtest repair — index-0 texel transparency (IMPLEMENTED)
+
+The L1 owner playtest surfaced one shared rendering defect across
+three presentations, all with the same root cause: **MTI index-0 is
+the software fill's transparent-texel key** (OBSERVED — the freefall
+`FUN_004109d8` and traversal texture records carry index-0 surrounds
+on transparent-surround sprites). The bridge already emitted index-0
+texels as RGBA alpha 0 (`objectTexture_` / `freefallTexture_`), but
+the Godot `StandardMaterial3D` never enabled the transparency mode —
+so index-0 rendered as **opaque black**, not transparency.
+
+Fix: `get_object_material` / `get_freefall_material` now report
+`has_alpha` (frame-0 scan for any index-0 texel — the same frame the
+texture upload samples). `main.gd`'s `_object_material` /
+`_ff_material` set `TRANSPARENCY_ALPHA` only when `has_alpha` is true;
+opaque geometry textures stay in the depth-writing opaque pass.
+
+A `LEVEL3S.MTI` census confirms index-0 is confined to FX records —
+`EXPLODE`, `TRAIL`, `SB_MED`/`SB_SMA`, `SL_BIG`/`SL_MED`, `BUBB`,
+`PULSE`, `FIRE` — so no opaque wall/enemy/pickup geometry takes the
+transparent pass. This matches the original's transparent-texel fill
+contract (the software rasterizer skips index 0).
+
+Defects resolved:
+
+- **Aircraft/enemy death remnant (black sphere).** The `EXPLODE`
+  corpse (kind-4/6 remnant, §213) is a 26-frame transparent-surround
+  fireball, ~60.7% index-0 on frame 0. It rendered as a featureless
+  black sphere; now a translucent fireball — verified on a live
+  scoped-fire remnant.
+- **Combat FX sprites (opaque black blobs).** The `FIRE` teardown
+  burst (~83% index-0) and the `SB_*`/`SL_*` blood splats (45–77%
+  index-0, dominant red index-3) rendered as opaque black blobs; now
+  transparent-surround sprays.
+- **Freefall hit explosion (grey dome).** Same class — the freefall
+  `EXPLODE` sphere's index-0 surround rendered opaque. Now a
+  translucent fireball (Phase-D freefall fix, `_ff_material`).
+
+### Headshot gore — partially implemented seam (not a regression)
+
+The grunt headshot (`XG1_HEAD` element kill) has a split status:
+
+- **Works (gameplay state):** script op `0x81` `elKill` applies the
+  element mask+ latch — `elemMaskB |= 1<<idx` and
+  `elemMaskLatch |= 1<<idx` (`0x4387..0x4389`), so the head element is
+  correctly masked off and the `0x20` unmask op can never re-arm it.
+- **Counted cosmetic seams (unrendered):** the gore visuals are
+  request-counted, not presented — `0x81` also detaches the element's
+  geometry into a `FUN_0041c420` centroid-relativized debris shard
+  (`elemShardCalls`); `0x80` `refEmit` binds a refpoint blood emitter
+  (`refEmitCalls`); `0x82` submits the hit-point decal
+  (`impactDecalCalls`, gated on `+0x21c`); `0x84` `sfxPee` rolls the
+  one-shot splat (`sfxPeeCalls`, gated on `rand%100`). These seams
+  predate the playtest; the index-0 fix makes the underlying
+  `SB_*`/`SL_*`/`FIRE` sprites renderable-correct but does **not** wire
+  the emitters. Classified as a deferred presentation gap, not a
+  newly-introduced defect.
