@@ -5259,12 +5259,16 @@ func _run_smoke(data_root: String) -> void:
 		_check(int(dspc["portals_crossed"]) >= 1,
 			"portal crossing counted")
 		# Post-crossing view: cur==HMO_3 and CHMO_2 is no longer the
-		# active partner, so the corridor's object list leaves the
-		# presentation set — no seen door id may alias onto another
-		# arena's object.
+		# active partner. A corridor door that self-migrated to follow
+		# the player is legitimately re-enumerated on its destination —
+		# the SAME object transfers between arena lists (FUN_004574d0:
+		# unlink+relink same record, +0x302 dest, connDest flips back to
+		# the old home), so its id is stable and it stays a connector.
+		# The real alias to reject is a seen door id worn by a
+		# DIFFERENT object — which only shows as a non-connector.
 		for od in bridge.get_object_snapshots():
-			_check(not door_ids_seen.has(int(od["id"])) or
-				int(od["arena"]) == 11,
+			_check(not (door_ids_seen.has(int(od["id"])) and
+				int(od["arena"]) != 11 and not bool(od["connector"])),
 				"door id never aliases another arena")
 		print("  note: object_migrations=%d door_ids=%d (sequential transients)" %
 			[int(dspc["object_migrations"]), door_ids_seen.size()])
