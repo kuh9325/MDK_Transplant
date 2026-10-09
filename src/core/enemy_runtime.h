@@ -164,8 +164,10 @@ void objectWaypointReseek(DynamicObject& o, DynamicArena& home);
 void objectOpSeekCamera(TraversalRuntime& rt, DynamicObject& o,
                         DynamicArena& cur, float fwd, float lat);
 
-// tr_alcmd 0xa6 (handler 0x442de1) — flee-the-cmd2-object seek
-// target; no-op while 0x540e60 (rt.cmdObj60) is clear.
+// tr_alcmd 0xa7 (handler 0x442de1) — converge-to-ring seek around the
+// live cmd-2 object (pulls objects farther than dist toward it = the
+// WMIB lure, pushes those inside out = flee); no-op while 0x540e60
+// (rt.cmdObj60) is clear.
 void objectOpSeekAway(TraversalRuntime& rt, DynamicObject& o,
                       float dist);
 

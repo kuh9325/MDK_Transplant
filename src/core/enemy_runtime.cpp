@@ -954,8 +954,15 @@ void cmdBody1(TraversalRuntime& rt, DynamicObject& o, DynamicArena& home,
   }
 }
 
-// cmd2 — FUN_00459c5c (spin/detonate): yaw spin while +0x118==0, then
-// detonate on anim completion.
+// cmd2 — FUN_00459c5c (SW_INTER / "World's Most Interesting Bomb"):
+// yaw spin while +0x118==0, then detonate on anim completion. The
+// owner-confirmed contract is spin -> ATTRACT -> open -> explode ->
+// lethal damage. The spin is only half of it — while the box spins it
+// publishes itself via +0x540e60 (cmdObj60), and enemy scripts'
+// 0xa6 losLink (clear-LOS to cmdObj60) rcalls their attract subroutine
+// which runs 0xa7 objectOpSeekAway so they converge on a ring around
+// the device (OBSERVED LEVEL3 XF_* grunts: `a7 5.0`). The attraction
+// lives in the enemy AI, not this device tick.
 void cmdBody2(TraversalRuntime& rt, DynamicObject& o, DynamicArena& home,
               TraversalArena* other) {
   (void)home;
@@ -2588,12 +2595,16 @@ void objectOpSeekCamera(TraversalRuntime& rt, DynamicObject& o,
   seekOpcodeTail(o);
 }
 
-// tr_alcmd 0xa6 (handler 0x442de1) — flee-the-cmd2-object seek
-// target. {f32 dist}: +0x120..+0x124 = cmdObj60.pos + awayDir*dist
-// plus a rand()-jittered perpendicular step (dist capped at 6.0,
-// jitter = (rand-0x4000)*6.103515625e-5*dist); +0x128 = cmdObj60.z +
-// 2.5 + zBias; subtype 0x4e, path unbound, re-seek. No-op while no
-// cmd-2 object is registered (0x540e60 == 0). OBSERVED.
+// tr_alcmd 0xa7 (handler 0x442de1) — converge-to-ring seek around the
+// live cmd-2 object. {f32 dist}: +0x120..+0x124 = cmdObj60.pos +
+// awayDir*dist — awayDir is the device's outward radial toward the
+// object, so the target sits `dist` out along it; an object farther
+// than `dist` is pulled TOWARD the device (the WMIB lure), one inside
+// is pushed out (flee). plus a rand()-jittered perpendicular step
+// (dist capped at 6.0, jitter = (rand-0x4000)*6.103515625e-5*dist);
+// +0x128 = cmdObj60.z + 2.5 + zBias; subtype 0x4e, path unbound,
+// re-seek. No-op while no cmd-2 object is registered (0x540e60 == 0).
+// OBSERVED.
 void objectOpSeekAway(TraversalRuntime& rt, DynamicObject& o,
                       float dist) {
   DynamicObject* anchor = rt.cmdObj60;

@@ -16648,6 +16648,73 @@ mdk::DynamicObject& animObject(mdk::DynamicArena& da,
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// WMIB (SW_INTER / item 2) attraction — owner-confirmed contract: the
+// thrown box spins while cmdObj60 is live; a nearby enemy's 0xa6 losLink
+// sees it and rcalls the attract subroutine (0xa7 objectOpSeekAway), so
+// the enemy converges on a radius-`dist` ring around the device before
+// it detonates. OBSERVED LEVEL3 XF_* grunt scripts:
+//   ckpt -> losLink fc:attract -> viewLink -> end     (re-runs each tick)
+//   attract: a7 5.0 -> 36 seekdist-cmp -> loop
+// ---------------------------------------------------------------------------
+void test_traversal_wmib_attract() {
+  const std::uint32_t C = 0x200;    // enemy script entry
+  const std::uint32_t SUB = 0x300;  // shared attract subroutine
+
+  // -- live cmdObj60 -> losLink fires -> a7 arms the ring seek ---------
+  {
+    ScriptFixture f;
+    // enemy script: ckpt ; losLink fc:SUB ; end
+    f.write(C, {0x01});               // ckpt — resume lands on losLink
+    f.write(C + 1, {0xa6, 0xfc});     // a6 losLink, mode fc (call)
+    f.writeW(C + 3, SUB);             //   -> call SUB on clear LOS
+    f.write(C + 7, {0xff});           // end — suspend the tick
+    // SUB: a7 dist ; fd (return)
+    f.write(SUB, {0xa7});             // a7 — objectOpSeekAway
+    f.writeF(SUB + 1, 5.0f);          //   dist = 5.0 (LEVEL3 `a7 5.0`)
+    f.write(SUB + 5, {0xfd});         // fd — return
+
+    // The spinning device 30 units from the enemy; empty arena -> LOS
+    // clear, so the enemy must converge to a radius-5 ring.
+    mdk::DynamicObject dev;
+    dev.setPosition(30.0f, 0.0f, 0.0f);
+    f.rt.cmdObj60 = &dev;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.field108 = f.image.data() + 4 + C;
+
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK(o.field11e == 0x4e);        // seek subtype armed
+    CHECK(o.fieldEC == nullptr);      // path unbound
+    // field120 = dev.pos + awaydir*dist -> x = 30 - 5 = 25: a point on
+    // the enemy's radial 5 units from the device. The enemy is pulled
+    // TOWARD the device (target 25 is between origin and the device 30),
+    // settling on the radius-5 crowd ring — the OBSERVED lure.
+    CHECK(near(o.field120[0], 25.0, 1e-3));
+    CHECK(near(o.field120[0] - dev.pos[0], -5.0, 1e-3));  // ring offset
+    CHECK(o.field120[0] > o.pos[0]);  // toward the device, not past it
+  }
+
+  // -- cmdObj60 clear -> losLink exits, no seek armed ------------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x01, 0xa6, 0xfc});
+    f.writeW(C + 3, SUB);
+    f.write(C + 7, {0xff});
+    f.write(SUB, {0xa7});
+    f.writeF(SUB + 1, 5.0f);
+    f.write(SUB + 5, {0xfd});
+    f.rt.cmdObj60 = nullptr;          // no live WMIB
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted);
+    CHECK(o.field11e == 0);           // subtype untouched — 0xa6 no-op
+  }
+}
+
 void test_enemy_runtime() {
   // -- FUN_0047d2b5 / FUN_00401ed4 — the MSVC CRT rand LCG -------------
   {
@@ -32821,6 +32888,7 @@ int main() {
   test_traversal_script();
   test_traversal_object_init();
   test_traversal_object_script();
+  test_traversal_wmib_attract();
   test_enemy_runtime();
   test_mover_runtime();
   test_object_animation();

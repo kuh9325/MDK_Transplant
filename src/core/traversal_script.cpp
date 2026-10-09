@@ -2351,7 +2351,7 @@ void objScriptInsn(ObjScriptPass& v) {
       objectOpSeekCamera(*env.rt, obj, env.currentArena->dyn, fwd, lat);
     return;
   }
-  case 0xa7: {                            // flee cmd2 obj (0x442de1)
+  case 0xa7: {                            // ring-seek cmd2 obj (0x442de1)
     const float dist = r.f32();
     if (!r.ok) { v.fail("seekaway"); return; }
     if (env.rt != nullptr)
