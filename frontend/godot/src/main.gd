@@ -5172,10 +5172,11 @@ func _run_smoke(data_root: String) -> void:
 		"above-plane object survives (FUN_0045bac0, real floor)")
 
 	# ---- G3: corridor door + portal crossing + arena transfer ----
-	# CHMO_2 has no MTO render block — the partner's geometry carries
-	# the view while its script-spawned XCORDOOR door presents from
-	# the corridor's own object list. Walking +y crosses the proven
-	# y=1237 portal into HMO_3 (arena 11 -> 2).
+	# CHMO_2 has no MTO render block — its connector render geometry
+	# comes from the O.SNI region-C fallback (726ed3e), so the corridor
+	# itself is the displayed arena while its script-spawned XCORDOOR
+	# door presents from the corridor's own object list. Walking +y
+	# crosses the proven y=1237 portal into HMO_3 (arena 11 -> 2).
 	# OBSERVED lifecycle on this route (FUN_004572ac pass order +
 	# FUN_0045bac0 kill plane + FUN_0045cf18 reap): the corridor door
 	# spawns at z=-935 — below CHMO_2's real deepFloorZ-200 plane —
@@ -5236,8 +5237,12 @@ func _run_smoke(data_root: String) -> void:
 			live_door = -1
 		if int(dspc["cur_arena"]) == 11 and not corridor_checked:
 			corridor_checked = true
-			_check(int(dspc["primary"]) != 11,
-				"corridor cur -> partner geometry displayed")
+			# The corridor now renders its own O.SNI geometry
+			# (726ed3e): when it is current it is the primary
+			# displayed arena — the old geometry-less-connector
+			# assumption (partner carried the view) no longer holds.
+			_check(int(dspc["primary"]) == 11,
+				"corridor cur -> corridor geometry displayed")
 		if int(dspc["cur_arena"]) == 2:
 			crossed = true
 			break
