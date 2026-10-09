@@ -17,6 +17,12 @@ std::uint16_t rdU16(const std::uint8_t* p) {
   return v;
 }
 
+std::uint32_t rdU32(const std::uint8_t* p) {
+  std::uint32_t v;
+  std::memcpy(&v, p, 4);
+  return v;
+}
+
 float rdF32(const std::uint8_t* p) {
   float v;
   std::memcpy(&v, p, 4);
@@ -118,6 +124,50 @@ bool nameMatch(const std::string& a, const std::string& b) {
   return a == b;
 }
 
+// Shared tail of arenaRenderDataBuild / arenaRenderDataBuildCorridor:
+// `d` arrives with verts/nodes/counts/polys/materialNames populated
+// (and, for an MTO block, the embedded bank-B records). This decodes
+// the shared bank-A set and runs the FUN_0041a694 matlkup — bank A
+// first then bank B, -1 = the original's NULL fallback record.
+void arenaRenderDataResolveMats(ArenaRenderData& d,
+                                std::span<const std::byte> sharedBankFile) {
+  // Bank A — the shared level bank (LEVELnS.MTI), searched FIRST.
+  if (!sharedBankFile.empty()) {
+    const MtiDirectory mti = inspectMtiDirectory(sharedBankFile);
+    if (mti.status == MtiDirectoryStatus::kOk) {
+      d.bankA.reserve(mti.entries.size());
+      for (const MtiEntry& e : mti.entries) {
+        ArenaRenderMaterial m;
+        if (arenaRenderMaterialDecode(sharedBankFile,
+                                      e.payloadFileOffset(),
+                                      e.fieldAt0x08, e.fieldAt0x0C,
+                                      e.fieldAt0x10, e.nameField, &m)) {
+          d.bankA.push_back(std::move(m));
+        }
+      }
+    }
+  }
+  // FUN_0041a694 — matlkup: per name slot, bank A first then bank B;
+  // -1 = the original's fallback record.
+  d.materialOfName.assign(d.materialNames.size(), -1);
+  for (std::size_t i = 0; i < d.materialNames.size(); ++i) {
+    const std::string& want = d.materialNames[i];
+    for (std::size_t j = 0; j < d.bankA.size(); ++j) {
+      if (nameMatch(d.bankA[j].name, want)) {
+        d.materialOfName[i] = (int)j;
+        break;
+      }
+    }
+    if (d.materialOfName[i] >= 0) continue;
+    for (std::size_t j = 0; j < d.bankB.size(); ++j) {
+      if (nameMatch(d.bankB[j].name, want)) {
+        d.materialOfName[i] = (int)(d.bankA.size() + j);
+        break;
+      }
+    }
+  }
+}
+
 } // namespace
 
 ArenaRenderPoly arenaRenderPolyDecode(const CollisionPoly& poly) {
@@ -213,23 +263,6 @@ bool arenaRenderDataBuild(std::span<const std::byte> fileBytes,
     d.materialNames.push_back(n.name());
   }
 
-  // Bank A — the shared level bank (LEVELnS.MTI), searched FIRST.
-  if (!sharedBankFile.empty()) {
-    const MtiDirectory mti = inspectMtiDirectory(sharedBankFile);
-    if (mti.status == MtiDirectoryStatus::kOk) {
-      d.bankA.reserve(mti.entries.size());
-      for (const MtiEntry& e : mti.entries) {
-        ArenaRenderMaterial m;
-        if (arenaRenderMaterialDecode(sharedBankFile,
-                                      e.payloadFileOffset(),
-                                      e.fieldAt0x08, e.fieldAt0x0C,
-                                      e.fieldAt0x10, e.nameField, &m)) {
-          d.bankA.push_back(std::move(m));
-        }
-      }
-    }
-  }
-
   // Bank B — the arena's embedded ".MAT" file. Payload offsets are
   // img-relative where img = the embedded name field at block+0x14.
   const std::uint64_t imgBase =
@@ -244,25 +277,7 @@ bool arenaRenderDataBuild(std::span<const std::byte> fileBytes,
     }
   }
 
-  // FUN_0041a694 — matlkup: per name slot, bank A first then bank B;
-  // -1 = the original's fallback record.
-  d.materialOfName.assign(d.materialNames.size(), -1);
-  for (std::size_t i = 0; i < d.materialNames.size(); ++i) {
-    const std::string& want = d.materialNames[i];
-    for (std::size_t j = 0; j < d.bankA.size(); ++j) {
-      if (nameMatch(d.bankA[j].name, want)) {
-        d.materialOfName[i] = (int)j;
-        break;
-      }
-    }
-    if (d.materialOfName[i] >= 0) continue;
-    for (std::size_t j = 0; j < d.bankB.size(); ++j) {
-      if (nameMatch(d.bankB[j].name, want)) {
-        d.materialOfName[i] = (int)(d.bankA.size() + j);
-        break;
-      }
-    }
-  }
+  arenaRenderDataResolveMats(d, sharedBankFile);
 
   // Palette — region B RGB triplets (aliases the file).
   if (block.regionBOffset + block.regionBSize <= fileBytes.size()) {
@@ -271,6 +286,52 @@ bool arenaRenderDataBuild(std::span<const std::byte> fileBytes,
             block.regionBOffset,
         static_cast<std::size_t>(block.regionBSize));
   }
+
+  *out = std::move(d);
+  return true;
+}
+
+bool arenaRenderDataBuildCorridor(std::span<const std::byte> blob,
+                                  const CollisionArena& arena,
+                                  std::uint32_t nodeCount,
+                                  std::uint32_t polyCount,
+                                  std::uint32_t vertCount,
+                                  std::span<const std::byte> sharedBankFile,
+                                  ArenaRenderData* out) {
+  if (!out || !arena.verts || !arena.nodes || !arena.polys ||
+      blob.size() < 4) {
+    return false;
+  }
+  const std::uint8_t* const base =
+      reinterpret_cast<const std::uint8_t*>(blob.data());
+  const std::uint8_t* const blobEnd = base + blob.size();
+
+  // Array-1 material names — the same 10-byte name-field records the
+  // MTO block's region-C array-1 carries, at blob+4 (countA leading).
+  const std::uint32_t cA = rdU32(base);
+
+  ArenaRenderData d;
+  d.verts = arena.verts;
+  d.nodes = arena.nodes;
+  d.vertCount = vertCount;
+  d.nodeCount = nodeCount;
+  d.polys.reserve(polyCount);
+  for (std::uint32_t i = 0; i < polyCount; ++i) {
+    d.polys.push_back(arenaRenderPolyDecode(arena.polys[i]));
+  }
+  d.materialNames.reserve(cA);
+  for (std::uint32_t i = 0; i < cA; ++i) {
+    const std::uint8_t* const rec = base + 4 + std::size_t(i) * 10;
+    if (rec + 10 > blobEnd) return false;
+    MtoRegionCName n;
+    std::memcpy(n.nameField.data(), rec, 10);
+    d.materialNames.push_back(n.name());
+  }
+
+  // A connector carries no embedded ".MAT" bank B and no region-B
+  // palette — it draws on the shared level set. d.bankB stays empty
+  // and d.paletteRgb stays the empty span.
+  arenaRenderDataResolveMats(d, sharedBankFile);
 
   *out = std::move(d);
   return true;

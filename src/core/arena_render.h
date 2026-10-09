@@ -253,6 +253,22 @@ bool arenaRenderDataBuild(std::span<const std::byte> fileBytes,
                           std::span<const std::byte> sharedBankFile,
                           ArenaRenderData* out);
 
+// Corridor/connector variant of the above. A connector (CHMO_* — an
+// arena with no .MTO overlay block) still ships its region-C
+// counted-array blob in LEVEL<n>O.SNI: geometry + the array-1
+// material-name table, but no embedded ".MAT" bank B and no region-B
+// palette (it draws on the shared level set). `blob` is that O.SNI
+// record's payload — the same span collisionBlobParse parses;
+// `sharedBankFile` is bank A as before. Bank B stays empty and the
+// region-B palette span stays empty.
+bool arenaRenderDataBuildCorridor(std::span<const std::byte> blob,
+                                  const CollisionArena& arena,
+                                  std::uint32_t nodeCount,
+                                  std::uint32_t polyCount,
+                                  std::uint32_t vertCount,
+                                  std::span<const std::byte> sharedBankFile,
+                                  ArenaRenderData* out);
+
 // ---------------------------------------------------------------------------
 // FUN_00409a6c — BSP submission order. Produces the ordered list of
 // poly-table indices the original submits for `camPos`, honoring the

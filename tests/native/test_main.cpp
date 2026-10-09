@@ -22327,6 +22327,95 @@ void test_arena_render() {
     CHECK(rd2.polyMaterialClass(0) == ArenaMatClass::kPen);
     CHECK(arenaPenIndex(-37) == 37);
   }
+
+  // ---- corridor build: the connector's region-C blob (a LEVEL<n>O.SNI
+  //      record) carries its own array-1 name table but no embedded
+  //      ".MAT" bank B and no region-B palette. ----
+  {
+    // Region-C counted-array blob: countA=2 names {TEX,MISSING}, one
+    // node, one poly (material 0 -> TEX), three verts.
+    std::vector<std::uint8_t> blob;
+    auto pu32 = [&](std::uint32_t v) {
+      blob.push_back(std::uint8_t(v & 0xff));
+      blob.push_back(std::uint8_t((v >> 8) & 0xff));
+      blob.push_back(std::uint8_t((v >> 16) & 0xff));
+      blob.push_back(std::uint8_t((v >> 24) & 0xff));
+    };
+    auto pf = [&](float f) {
+      std::uint32_t v;
+      std::memcpy(&v, &f, 4);
+      pu32(v);
+    };
+    auto pname = [&](const char* s) {
+      for (int i = 0; i < 10; ++i) {
+        blob.push_back(std::uint8_t(s[i] ? s[i] : 0));
+      }
+    };
+    pu32(2);                                   // countA
+    pname("TEX"); pname("MISSING");            // even count -> no pad
+    pu32(1);                                   // countB (1 node)
+    pf(0.0f); pf(0.0f); pf(1.0f); pf(-10.0f);  // split plane
+    blob.push_back(0xff); blob.push_back(0xff);  // childFar = -1
+    blob.push_back(0xff); blob.push_back(0xff);  // childNear = -1
+    pu32(1);                                   // polysPos {count=1,first=0}
+    pu32(0);                                   // polysNeg
+    pu32(0); pu32(0); pu32(0); pu32(0);        // +0x1c..+0x28
+    pu32(1);                                   // countC (1 poly)
+    blob.push_back(0); blob.push_back(0);      // v0
+    blob.push_back(1); blob.push_back(0);      // v1
+    blob.push_back(2); blob.push_back(0);      // v2
+    blob.push_back(0); blob.push_back(0);      // material s16 = 0 -> TEX
+    for (int i = 0; i < 28; ++i) blob.push_back(0);  // poly pad -> 36B
+    pu32(3);                                   // countD (3 verts)
+    pf(-1.0f); pf(-1.0f); pf(0.0f);
+    pf(1.0f); pf(-1.0f); pf(0.0f);
+    pf(1.0f); pf(1.0f); pf(0.0f);
+    pu32(0);                                   // tail
+
+    mdk::CollisionArena arena;
+    std::uint32_t counts[4] = {};
+    CHECK(mdk::collisionBlobParse(blob.data(), blob.size(), &arena,
+                                  counts));
+    CHECK(counts[0] == 2 && counts[1] == 1 && counts[2] == 1 &&
+          counts[3] == 3);
+
+    // Shared bank A: a TEX record (4-byte header + 2x2 pixels).
+    auto sb = SyntheticMti::build("LEVELXS.MTI",
+        {{"TEX", 0x00000000, 0, 0, 4 + 2 * 2}});
+    const auto sdir = inspectMtiDirectory(sb.buf);
+    CHECK(sdir.status == MtiDirectoryStatus::kOk);
+    sb.put16(static_cast<std::size_t>(sdir.entries[0].payloadFileOffset()), 2);
+    sb.put16(static_cast<std::size_t>(sdir.entries[0].payloadFileOffset() + 2),
+             2);
+
+    ArenaRenderData rd;
+    CHECK(mdk::arenaRenderDataBuildCorridor(
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(blob.data()), blob.size()),
+        arena, counts[1], counts[2], counts[3],
+        std::span<const std::byte>(sb.buf.data(), sb.buf.size()), &rd));
+    CHECK(rd.vertCount == 3 && rd.nodeCount == 1 && rd.polys.size() == 1);
+    CHECK(rd.materialNames.size() == 2);
+    CHECK(rd.materialNames[0] == "TEX" && rd.materialNames[1] == "MISSING");
+    CHECK(rd.bankA.size() == 1 && rd.bankB.empty());
+    // TEX resolves to bank-A slot 0; MISSING -> -1 (the fallback).
+    CHECK(rd.materialOfName[0] == 0 && rd.materialOfName[1] == -1);
+    CHECK(rd.paletteRgb.empty());
+    CHECK(rd.polys[0].material == 0);
+    CHECK(rd.polyMaterialClass(0) == ArenaMatClass::kTextured);
+    CHECK(rd.materialFor(0) == &rd.bankA[0]);
+    // A poly whose material names a missing slot -> kUnresolved.
+    ArenaRenderData rd2 = rd;
+    rd2.polys[0].material = 1;
+    CHECK(rd2.polyMaterialClass(0) == ArenaMatClass::kUnresolved);
+
+    // Bad inputs fail rather than yield a usable render set.
+    ArenaRenderData rd3;
+    CHECK(!mdk::arenaRenderDataBuildCorridor(
+        std::span<const std::byte>{}, arena, counts[1], counts[2],
+        counts[3],
+        std::span<const std::byte>(sb.buf.data(), sb.buf.size()), &rd3));
+  }
 }
 
 // Phase 7 (G1) — src/core/arena_mesh.h. Palette composition, the

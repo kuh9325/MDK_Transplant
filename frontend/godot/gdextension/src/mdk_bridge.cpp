@@ -1227,8 +1227,11 @@ MdkBridge::ArenaSet* MdkBridge::ensureArenaSet_(
   }
   if (arenaSetFailed_.count(idx)) return nullptr;   // static failure
 
-  // MTO block lookup by 8-char name — the same search
-  // traversalArenaLoadGeometry performs (FUN_00432404's lookup).
+  // Region-C source lookup — the same search traversalArenaLoadGeometry
+  // performs (FUN_00432404's MTO lookup, then its O.SNI connector
+  // fallback). A named .MTO block wins; a connector (CHMO_* — no .MTO
+  // block) falls back to its LEVEL<n>O.SNI record, which carries the
+  // same counted-array region-C blob.
   const mdk::MtoBlock* block = nullptr;
   for (std::size_t i = 0; i < rt_->level.mto.entries.size(); ++i) {
     if (rt_->level.mto.entries[i].name() == a.name) {
@@ -1236,26 +1239,55 @@ MdkBridge::ArenaSet* MdkBridge::ensureArenaSet_(
       break;
     }
   }
-  if (!block) {
-    arenaSetFailed_.insert(idx);
-    return nullptr;   // corridor — no direct render block
-  }
 
-  // Region-C parse — the same call traversalArenaLoadGeometry /
-  // mdk-inspect run (block->regionCOffset == fileOffset+4+fieldAt0x0C).
   const std::uint8_t* mb = reinterpret_cast<const std::uint8_t*>(
       rt_->level.mtoBytes.data());
   const std::size_t mn = rt_->level.mtoBytes.size();
-  if (block->regionCOffset >= mn) {
-    arenaSetFailed_.insert(idx);
-    return nullptr;
+
+  const std::uint8_t* regionC = nullptr;
+  std::size_t regionCSize = 0;
+  std::span<const std::byte> sniBlob;
+  if (block) {
+    if (block->regionCOffset >= mn) {
+      arenaSetFailed_.insert(idx);
+      return nullptr;
+    }
+    regionC = mb + block->regionCOffset;
+    regionCSize = mn - block->regionCOffset;
+  } else {
+    // Connector — the O.SNI record of the same name supplies the blob
+    // (findSniOPayload's lookup for the collision path, mirrored here
+    // for the render path).
+    const mdk::SniDirectory odir = mdk::inspectSniDirectory(
+        std::span<const std::byte>(rt_->level.sniOBytes.data(),
+                                   rt_->level.sniOBytes.size()));
+    for (const mdk::SniEntry& e : odir.entries) {
+      if (e.name() != a.name || e.isSentinel() || e.payloadSize == 0) {
+        continue;
+      }
+      const std::uint64_t off = e.payloadFileOffset();
+      if (off <= rt_->level.sniOBytes.size() &&
+          e.payloadSize <= rt_->level.sniOBytes.size() - off) {
+        sniBlob = std::span<const std::byte>(
+            rt_->level.sniOBytes.data() + off, e.payloadSize);
+      }
+      break;
+    }
+    if (sniBlob.empty()) {
+      arenaSetFailed_.insert(idx);
+      return nullptr;
+    }
+    regionC = reinterpret_cast<const std::uint8_t*>(sniBlob.data());
+    regionCSize = sniBlob.size();
   }
+
+  // Region-C parse — the same call traversalArenaLoadGeometry /
+  // mdk-inspect run on whichever blob the lookup produced.
   auto set = std::make_unique<ArenaSet>();
   set->index = idx;
   set->name = a.name;
   std::uint32_t counts4[4] = {};
-  if (!mdk::collisionBlobParse(mb + block->regionCOffset,
-                             mn - block->regionCOffset, &set->col,
+  if (!mdk::collisionBlobParse(regionC, regionCSize, &set->col,
                              counts4)) {
     arenaSetFailed_.insert(idx);
     return nullptr;
@@ -1264,12 +1296,20 @@ MdkBridge::ArenaSet* MdkBridge::ensureArenaSet_(
   set->counts[1] = counts4[2];
   set->counts[2] = counts4[3];
 
-  if (!mdk::arenaRenderDataBuild(
-          std::span<const std::byte>(rt_->level.mtoBytes.data(), mn),
-          *block, set->col, counts4[1], counts4[2], counts4[3],
-          std::span<const std::byte>(sharedMtiBytes_.data(),
-                                     sharedMtiBytes_.size()),
-          &set->rd)) {
+  const bool built =
+      block
+          ? mdk::arenaRenderDataBuild(
+                std::span<const std::byte>(rt_->level.mtoBytes.data(), mn),
+                *block, set->col, counts4[1], counts4[2], counts4[3],
+                std::span<const std::byte>(sharedMtiBytes_.data(),
+                                           sharedMtiBytes_.size()),
+                &set->rd)
+          : mdk::arenaRenderDataBuildCorridor(
+                sniBlob, set->col, counts4[1], counts4[2], counts4[3],
+                std::span<const std::byte>(sharedMtiBytes_.data(),
+                                           sharedMtiBytes_.size()),
+                &set->rd);
+  if (!built) {
     arenaSetFailed_.insert(idx);
     return nullptr;
   }

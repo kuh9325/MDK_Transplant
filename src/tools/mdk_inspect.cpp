@@ -5723,6 +5723,103 @@ int main(int argc, char** argv) {
     }
     std::printf("arena-render: %zu/%zu blocks decoded\n", blocksOk,
                 mto.blocks.size());
+
+    // Corridor fallback: a named arena with no .MTO block ships its
+    // region-C blob in <stem>O.SNI. Decode it through
+    // arenaRenderDataBuildCorridor to verify the connector render path.
+    if (travArena && blocksOk == 0) {
+      const std::string sniPath = dir + stem + "O.SNI";
+      auto sniFile = root->readFile(sniPath, kEntriesMaxBytes, &err);
+      if (!sniFile) {
+        std::fprintf(stderr, "read-file: FAILED (%s) — need %s\n",
+                     err.c_str(), sniPath.c_str());
+        return 1;
+      }
+      const auto odir = mdk::inspectSniDirectory(
+          std::span<const std::byte>(sniFile->data(), sniFile->size()));
+      const mdk::SniEntry* rec = nullptr;
+      for (const mdk::SniEntry& e : odir.entries) {
+        if (e.name() == *travArena && !e.isSentinel() &&
+            e.payloadSize != 0) {
+          rec = &e;
+          break;
+        }
+      }
+      if (!rec) {
+        std::printf("corridor %-8.8s  no %s record\n",
+                    travArena->c_str(), sniPath.c_str());
+        return 1;
+      }
+      const std::uint64_t off = rec->payloadFileOffset();
+      const std::uint8_t* pb =
+          reinterpret_cast<const std::uint8_t*>(sniFile->data()) + off;
+      const std::size_t pn = rec->payloadSize;
+      mdk::CollisionArena arena;
+      std::uint32_t counts[4] = {};
+      if (!mdk::collisionBlobParse(pb, pn, &arena, counts)) {
+        std::printf("corridor %-8.8s  collision blob: PARSE FAILED\n",
+                    travArena->c_str());
+        return 1;
+      }
+      mdk::ArenaRenderData rd;
+      if (!mdk::arenaRenderDataBuildCorridor(
+              std::span<const std::byte>(
+                  reinterpret_cast<const std::byte*>(pb), pn),
+              arena, counts[1], counts[2], counts[3], mtiSpan, &rd)) {
+        std::printf("corridor %-8.8s  render data: BUILD FAILED\n",
+                    travArena->c_str());
+        return 1;
+      }
+      float bb[6] = {1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
+      for (std::size_t p = 0; p < rd.vertCount; ++p) {
+        for (int k = 0; k < 3; ++k) {
+          const float v = rd.verts[p * 3 + k];
+          if (v < bb[k]) bb[k] = v;
+          if (v > bb[k + 3]) bb[k + 3] = v;
+        }
+      }
+      std::uint32_t resolved = 0, missing = 0;
+      std::string missingList;
+      for (std::size_t i = 0; i < rd.materialOfName.size(); ++i) {
+        if (rd.materialOfName[i] >= 0) {
+          ++resolved;
+        } else {
+          ++missing;
+          if (missingList.size() < 200) {
+            if (!missingList.empty()) missingList += ',';
+            missingList += rd.materialNames[i];
+          }
+        }
+      }
+      std::uint32_t cls[6] = {};
+      for (std::size_t p = 0; p < rd.polys.size(); ++p) {
+        using mdk::ArenaMatClass;
+        switch (rd.polyMaterialClass(p)) {
+        case ArenaMatClass::kTextured: ++cls[0]; break;
+        case ArenaMatClass::kUnresolved: ++cls[1]; break;
+        case ArenaMatClass::kPen: ++cls[2]; break;
+        case ArenaMatClass::kEffect770: ++cls[3]; break;
+        case ArenaMatClass::kEffectE94: ++cls[4]; break;
+        case ArenaMatClass::kEffect12970: ++cls[5]; break;
+        }
+      }
+      std::printf(
+          "corridor %-8.8s  verts=%u nodes=%u polys=%zu names=%zu\n"
+          "    aabb=[%.1f %.1f %.1f .. %.1f %.1f %.1f]\n"
+          "    bankA=%zu bankB=%zu names resolved=%u missing=%u\n"
+          "    polys textured=%u unresolved=%u pen=%u fx770=%u "
+          "fxe94=%u fx12970=%u\n",
+          travArena->c_str(), rd.vertCount, rd.nodeCount,
+          rd.polys.size(), rd.materialNames.size(), bb[0], bb[1], bb[2],
+          bb[3], bb[4], bb[5], rd.bankA.size(), rd.bankB.size(),
+          resolved, missing, cls[0], cls[1], cls[2], cls[3], cls[4],
+          cls[5]);
+      if (missing) {
+        std::printf("    missing names: %s%s\n", missingList.c_str(),
+                    missingList.size() >= 200 ? "..." : "");
+      }
+      return 0;
+    }
     return 0;
   }
 
