@@ -37,10 +37,14 @@
 #ifndef MDK_CORE_TRAVERSAL_HUD_H
 #define MDK_CORE_TRAVERSAL_HUD_H
 
+#include <array>
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/framebuffer.h"
+#include "core/fti_directory.h"
 #include "core/fti_font.h"
 #include "core/fti_sprite.h"
 
@@ -53,6 +57,44 @@ struct TraversalHudImage {
   int w = 0;
   int h = 0;
   const std::uint8_t* px = nullptr;  // aliases level.travsprtBytes
+};
+
+// The engine-global teletype status queue — FUN_0041cad0 (post) and
+// FUN_0041cb44 (per-frame service), scoped to the runtime here. The
+// OBSERVED ring is 4 slots of the 12-byte {f32 rate, u32 flags, char*
+// str} record (0x54b800 read index / 0x54b804 records / 0x54b7c8 write
+// index); a posted NAME resolves through MDKFONT.FTI via FUN_00414890
+// into the drawn string, and the service slides/steadies/pages it out
+// into the HUD pen buffer. Both record the post (player_pickup's
+// collectNotify and the mission-timer OOT_L%d arm).
+struct TraversalTeletype {
+  // Resolve source — the retained MDKFONT.FTI image + its directory.
+  // The original keeps the resident FTI loaded engine-wide and looks
+  // the posted name up inside FUN_0041cad0; the port retains the bytes
+  // at level load so the collect-time resolve matches (FUN_00414890).
+  std::vector<std::byte> ftiBytes;
+  FtiDirectory ftiDir;
+
+  // One ring record. The native stores the RESOLVED char*; the port
+  // stores the resolved display string (the byte-0 cursor the consume
+  // pass would carry is the string itself).
+  struct Entry {
+    float rate = 0.0f;             // rec+0x00 — the steady-hold budget
+    std::uint32_t flags = 0;       // rec+0x04 — bit0 slide-in, bit1
+                                   //   front-push (queue-head insert)
+    std::string text;              // rec+0x08 str — resolved text
+  };
+  Entry queue[4];
+  int qRead = 0;                   // 0x54b800
+  int qWrite = 0;                  // 0x54b7c8
+
+  // The 0x54b7xx live globals the service mutates.
+  std::uint32_t flags = 0;         // 0x54b7ec — the current entry's
+                                   //   flags (bit0 drives slide-in)
+  int curLine = 0;                 // 0x54b7f0 — consumed line count
+  float charTimer = 0.0f;          // 0x54b7f4 — steady-hold countdown
+  float holdTimer = 0.0f;          // 0x54b7f8 — slide/page ramp 0..0.5
+  std::array<std::string, 2> line; // the two 36-col consume buffers
 };
 
 struct TraversalHudState {
@@ -81,6 +123,10 @@ struct TraversalHudState {
 
   FtiFont fontBig;                    // MDKFONT.FTI FONTBIG — reticle %d
   bool fontBigOk = false;
+  FtiFont fontSml;                    // MDKFONT.FTI FONTSML — teletype
+                                      //   renderer-0 overflow fallback
+  bool fontSmlOk = false;
+  TraversalTeletype tt;               // FUN_0041cad0 ring + 0041cb44 svc
 
   int rngLatch = 0;                   // 0x49a8e0 — SNIP_RNG slide latch
   int blinkPhase = 0;                 // 0x49a8dc — blink counter &0x1f
@@ -106,6 +152,35 @@ void traversalHudBind(TraversalRuntime& rt);
 // Supply the decoded FONTBIG (MDKFONT.FTI "FONTBIG") for the mounted
 // reticle's bomb-count text (FUN_0046911c -> FUN_00414be8/00414c34).
 void traversalHudBindFontBig(TraversalRuntime& rt, const FtiFont& font);
+
+// Supply the decoded FONTSML (MDKFONT.FTI "FONTSML") for the teletype's
+// renderer-0 overflow path (FUN_00414d2c falls back to FONTSML when the
+// FONTBIG measure reaches the 600px frame — FUN_00414f1c).
+void traversalHudBindFontSml(TraversalRuntime& rt, const FtiFont& font);
+
+// Retain the MDKFONT.FTI image for the teletype's name->text resolve.
+// Call once per level load AFTER traversalHudBind (the bind wipes the
+// HUD state — a fresh BSS). The bytes are owned by the runtime; the
+// directory is parsed into tt.ftiDir for the at-post FUN_00414890
+// lookup.
+void traversalHudBindTeletypeFti(TraversalRuntime& rt,
+                                 std::vector<std::byte> ftiBytes);
+
+// FUN_0041cad0 — the status-message post. Resolves `name` through the
+// retained MDKFONT.FTI (FUN_00414890) and pushes a ring entry. `flags`
+// bit0 = slide-in, bit1 = front-push (a qRead-1 insert that preempts
+// the live entry — the mission-expiry OOT_L%d uses it). Pickups post
+// (name,1,2.0); OOT posts (name,3,5.0). A resolve-miss stores nothing
+// and returns false (the 0x41cb25 bail). Returns the post success.
+bool traversalTeletypePost(TraversalRuntime& rt, std::string_view name,
+                           std::uint32_t flags, float rate);
+
+// FUN_0041cb44 — the per-frame teletype service. Advances the current
+// entry through slide-in -> steady-hold -> page-out and draws into
+// rt.hud.fb (FONTBIG, FONTSML on overflow; the scaled arm pages the
+// strip in/out). Called once per presented frame from
+// traversalHudCompose; a no-op when the ring is empty and idle.
+void traversalTeletypeService(TraversalRuntime& rt);
 
 // FUN_0041b654 — the mission countdown. OBSERVED gates: fadeTimer
 // (0x5414a0) > 0, level index != 5 (0x541498 — the level id), the

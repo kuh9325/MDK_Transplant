@@ -26261,6 +26261,41 @@ std::vector<std::byte> hudTestBni(
   return out;
 }
 
+// MDKFONT.FTI form — u32 @0 = size-4 (length envelope), u32 @4 = count,
+// then count x 12-byte records {name[8], u32 imageOffset}; payloads are
+// image-relative (image = file+4, so payloadFileOffset = imageOffset+4)
+// and NUL-terminated. Used for the teletype's name -> text resolve.
+std::vector<std::byte> hudTestFti(
+    const std::vector<std::pair<std::string, std::string>>& recs) {
+  std::vector<std::byte> out;
+  const auto u32 = [&out](std::uint32_t x) {
+    for (int i = 0; i < 4; ++i)
+      out.push_back(static_cast<std::byte>((x >> (i * 8)) & 0xff));
+  };
+  const std::uint32_t dirEnd =
+      8 + static_cast<std::uint32_t>(recs.size()) * 12;
+  u32(0);                                        // size-4: patched below
+  u32(static_cast<std::uint32_t>(recs.size()));  // count
+  std::uint32_t ofs = dirEnd - 4;                // image-relative offset
+  for (const auto& [name, pl] : recs) {
+    for (int i = 0; i < 8; ++i)
+      out.push_back(i < static_cast<int>(name.size())
+                        ? static_cast<std::byte>(name[i])
+                        : std::byte(0));
+    u32(ofs);
+    ofs += static_cast<std::uint32_t>(pl.size() + 1);   // +1 NUL
+  }
+  for (const auto& [name, pl] : recs) {
+    for (char c : pl) out.push_back(static_cast<std::byte>(c));
+    out.push_back(std::byte(0));
+  }
+  const std::uint32_t len =
+      static_cast<std::uint32_t>(out.size()) - 4;
+  for (int i = 0; i < 4; ++i)
+    out[i] = static_cast<std::byte>((len >> (i * 8)) & 0xff);
+  return out;
+}
+
 // {u16 w, u16 h, px} — the FUN_00403a00 image form.
 std::vector<std::byte> hudTestImage(int w, int h, std::uint8_t pen) {
   std::vector<std::byte> v = {
@@ -26826,6 +26861,159 @@ void test_traversal_hud() {
     for (std::size_t i = 0; i < rt2.hud.fb.pixelCount(); ++i)
       nonzero += rt2.hud.fb.pixels()[i] == 9;
     CHECK(nonzero == 2);              // right column of the 2x2
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Traversal teletype — FUN_0041cad0 post + FUN_0041cb44 service. The
+// posted object/pickup NAME resolves through the retained MDKFONT.FTI
+// (FUN_00414890) into the drawn string; the service slides/holds/pages
+// it into rt.hud.fb. OBSERVED mapping (MDKFONT.FTI BUILD_A): SW_H150 ->
+// "I Feel Top!!!", SW_KEY -> "World's Smallest\nNuclear Explosion",
+// SW_INTER -> "World's Most\nInteresting Bomb".
+// ---------------------------------------------------------------------------
+namespace {
+
+// A FONTBIG/FONTSML stand-in: every byte maps to a 1-px pen-15 glyph,
+// so a posted line draws a solid strip one row tall at its pen y.
+mdk::FtiFont ttTestFont() {
+  mdk::FtiFont f;
+  f.glyphs.resize(256);
+  for (int c = 0; c < 256; ++c) {
+    mdk::FtiGlyph g;
+    g.code = static_cast<std::uint8_t>(c);
+    g.top = 0;
+    g.bottom = 0;
+    g.width = 1;
+    g.pixels.assign(1, 15);
+    f.glyphs[c] = g;
+  }
+  return f;
+}
+
+mdk::TraversalRuntime ttTestRuntime() {
+  mdk::TraversalRuntime rt;
+  rt.level.travsprtBytes = hudTestTravsprt();
+  mdk::traversalHudBind(rt);
+  mdk::traversalHudBindFontBig(rt, ttTestFont());
+  mdk::traversalHudBindFontSml(rt, ttTestFont());
+  mdk::traversalHudBindTeletypeFti(rt, hudTestFti({
+      {"SW_H150", "I Feel Top!!!"},
+      {"SW_KEY", "World's Smallest\\nNuclear Explosion"},
+      {"SW_INTER", "World's Most\\nInteresting Bomb"},
+      {"OOT_L3", "OUT OF TIME"},
+  }));
+  return rt;
+}
+
+} // namespace
+
+void test_traversal_teletype() {
+  using mdk::TraversalRuntime;
+
+  // --- post + resolve (FUN_0041cad0 -> FUN_00414890) ----------------
+  {
+    TraversalRuntime rt = ttTestRuntime();
+    CHECK(mdk::traversalTeletypePost(rt, "SW_H150", 1, 2.0f));
+    CHECK(rt.hud.tt.qWrite == 1 && rt.hud.tt.qRead == 0);
+    CHECK(rt.hud.tt.queue[0].text == "I Feel Top!!!");
+    CHECK(rt.hud.tt.queue[0].rate == 2.0f);
+    CHECK(rt.hud.tt.queue[0].flags == 1u);
+    CHECK(rt.seams.hudMsgPosts == 1);
+
+    // The corrected item/name attribution (owner-adjudicated).
+    CHECK(mdk::traversalTeletypePost(rt, "SW_KEY", 1, 2.0f));
+    CHECK(rt.hud.tt.queue[1].text ==
+          "World's Smallest\\nNuclear Explosion");
+    CHECK(mdk::traversalTeletypePost(rt, "SW_INTER", 1, 2.0f));
+    CHECK(rt.hud.tt.queue[2].text == "World's Most\\nInteresting Bomb");
+    CHECK(rt.hud.tt.qWrite == 3);
+
+    // Resolve miss: no qWrite advance, false return (0x41cb25).
+    CHECK(!mdk::traversalTeletypePost(rt, "NO_SUCH", 1, 2.0f));
+    CHECK(rt.hud.tt.qWrite == 3);
+
+    // Front-push (flags&2): qRead decremented, lands at the new head.
+    CHECK(mdk::traversalTeletypePost(rt, "OOT_L3", 3, 5.0f));
+    CHECK(rt.hud.tt.qRead == 3);      // (0 - 1) & 3
+    CHECK(rt.hud.tt.queue[3].text == "OUT OF TIME");
+    CHECK(rt.hud.tt.queue[3].flags == 3u && rt.hud.tt.queue[3].rate == 5.0f);
+  }
+
+  // --- consume + slide-in + steady + page-out + idle ----------------
+  {
+    TraversalRuntime rt = ttTestRuntime();
+    CHECK(mdk::traversalTeletypePost(rt, "SW_H150", 1, 2.0f));
+
+    // Frame 1 — charTimer==0 + pending entry: load + consume, no draw.
+    mdk::traversalTeletypeService(rt);
+    CHECK(rt.hud.tt.curLine == 1);
+    CHECK(rt.hud.tt.line[0] == "I Feel Top!!!");
+    CHECK(rt.hud.tt.charTimer == 2.0f);        // <- entry rate
+    CHECK(rt.hud.tt.holdTimer == 0.0f);
+    CHECK(rt.hud.tt.qRead == 1 && rt.hud.tt.qWrite == 1);  // dequeued
+
+    // Frames 2.. — flags&1 set: slide-in, holdTimer ramps 0 -> 0.5.
+    mdk::traversalTeletypeService(rt);
+    CHECK(rt.hud.tt.holdTimer > 0.0f && rt.hud.tt.holdTimer < 0.5f);
+    // ramp to 0.5 over ~15 calls.
+    int n = 0;
+    while (rt.hud.tt.holdTimer < 0.5f && n < 40) {
+      mdk::traversalTeletypeService(rt);
+      ++n;
+    }
+    CHECK(rt.hud.tt.holdTimer == 0.5f);
+
+    // Steady hold: charTimer drains toward 0; text stays drawn at
+    // y = 0x78 (120) — the 1-line centered row.
+    rt.hud.fb.clear(0);
+    mdk::traversalTeletypeService(rt);
+    bool drawn = false;
+    for (int x = 0; x < 600 && !drawn; ++x)
+      drawn = rt.hud.fb.at(x, 0x78) == 15;
+    CHECK(drawn);
+    CHECK(rt.hud.tt.charTimer < 2.0f);        // counting down
+
+    // Run to page-out: charTimer hits 0, then holdTimer ramps down.
+    int guard = 0;
+    while (rt.hud.tt.charTimer > 0.0f && guard < 200) {
+      mdk::traversalTeletypeService(rt);
+      ++guard;
+    }
+    CHECK(rt.hud.tt.charTimer == 0.0f);
+    mdk::traversalTeletypeService(rt);        // first page-out call
+    CHECK(rt.hud.tt.holdTimer < 0.5f);        // ramping back down
+    guard = 0;
+    while (rt.hud.tt.holdTimer > 0.0f && guard < 40) {
+      mdk::traversalTeletypeService(rt);
+      ++guard;
+    }
+    CHECK(rt.hud.tt.holdTimer == 0.0f);
+    // Idle: empty ring, dead timers — no state churn.
+    const int line = rt.hud.tt.curLine;
+    mdk::traversalTeletypeService(rt);
+    CHECK(rt.hud.tt.curLine == line);
+  }
+
+  // --- two-line consume + draw rows ---------------------------------
+  {
+    TraversalRuntime rt = ttTestRuntime();
+    CHECK(mdk::traversalTeletypePost(rt, "SW_INTER", 1, 5.0f));
+    mdk::traversalTeletypeService(rt);        // consume -> 2 lines
+    CHECK(rt.hud.tt.curLine == 2);
+    CHECK(rt.hud.tt.line[0] == "World's Most");
+    CHECK(rt.hud.tt.line[1] == "Interesting Bomb");
+    // Slide to full, then steady draws both lines at 0x69 / 0x87.
+    while (rt.hud.tt.holdTimer < 0.5f)
+      mdk::traversalTeletypeService(rt);
+    rt.hud.fb.clear(0);
+    mdk::traversalTeletypeService(rt);
+    bool r0 = false, r1 = false;
+    for (int x = 0; x < 600; ++x) {
+      r0 |= rt.hud.fb.at(x, 0x69) == 15;
+      r1 |= rt.hud.fb.at(x, 0x87) == 15;
+    }
+    CHECK(r0 && r1);
   }
 }
 
@@ -32675,6 +32863,7 @@ int main() {
   test_save_full_restore();
   test_save_full_write();
   test_traversal_hud();
+  test_traversal_teletype();
   test_traversal_audio();
   test_sni_wave();
   test_traversal_audio_dsp();

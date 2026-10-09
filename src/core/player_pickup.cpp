@@ -108,10 +108,13 @@ void collectDespawn(TraversalRuntime& rt, DynamicObject& o) {
   }
 }
 
-// FUN_0041cad0(name, 1, 0x40000000) — the status-message post; a
-// counted seam in the port (the same convention as the OOT_L%d
-// mission posts).
-void collectNotify(TraversalRuntime& rt) { ++rt.seams.hudMsgPosts; }
+// FUN_0041cad0(name, 1, 0x40000000) — the status-message post. The
+// `name` is the object's +0xc entry name for items / the table name
+// for pickups; FUN_00414890 resolves it through MDKFONT.FTI into the
+// drawn string. flags=1 (slide-in), rate=2.0 (0x40000000).
+void collectNotify(TraversalRuntime& rt, const std::string& name) {
+  traversalTeletypePost(rt, name, 1, 2.0f);
+}
 
 // FUN_00402388(record, 1) — kRestart play of the named SNI record.
 // Record bindings OBSERVED from the FUN_0043394c table-init writes
@@ -187,8 +190,9 @@ void pickupGrant(TraversalRuntime& rt, int id) {
       collectSfx(rt, "BONES");
       break;
   }
-  // FUN_0041cad0 tail: ids 9 and 11 post nothing (OBSERVED).
-  if (id != 9 && id != 11) collectNotify(rt);
+  // FUN_0041cad0 tail: ids 9 and 11 post nothing (OBSERVED). The name
+  // is the pickup-table entry ([ecx*4 + 0x49bad4]) — kPickupNames[id].
+  if (id != 9 && id != 11) collectNotify(rt, kPickupNames[id]);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +415,7 @@ void traversalPickupCollect(TraversalRuntime& rt) {
         } else {
           rec.charges += isDant2 ? 1 : row[4];
         }
-        collectNotify(rt);
+        collectNotify(rt, name);              // +0xc — the entry name
         collectDespawn(rt, o);
         ++rt.seams.pickupCollects;
         rt.invHudTimer = 0x3c;                // 0x541558
@@ -422,12 +426,12 @@ void traversalPickupCollect(TraversalRuntime& rt) {
     }
     if (rt.inventoryCount < 5) {
       // New slot (0x46998d..0x469b96): id2's sfx is the WMIB record
-      // (0x54c65c — the World's Smallest Nuclear Explosion jingle,
-      // the SW_INTER item; owner-confirmed name 2026-10-08 —
-      // the earlier "Most Interesting Bomb" read is DISPROVEN);
-      // all other ids play COLLECT.
+      // (0x54c65c — the "World's Most Interesting Bomb" jingle, the
+      // SW_INTER item; MDKFONT.FTI maps SW_INTER -> "World's Most\n
+      // Interesting Bomb", while SW_KEY (id 7) is the nuke -> "World's
+      // Smallest\nNuclear Explosion"); all other ids play COLLECT.
       collectSfx(rt, itemId == 2 ? "WMIB" : "COLLECT");
-      collectNotify(rt);
+      collectNotify(rt, name);                // +0xc — the entry name
       rt.invHudTimer = 0x3c;
       collectDespawn(rt, o);
       ++rt.seams.pickupCollects;

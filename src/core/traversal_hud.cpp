@@ -24,13 +24,12 @@
 //   FUN_00436f2c — mounted reticle (FUN_0046911c), then under
 //     hudActive (0x5414d4): event bars, FUN_00417e20 (mission-timer
 //     pie + health digits + scoped tail), then unconditionally the
-//     message flush (FUN_0041cb44 — counted seam) and the SKULL
-//     death overlay (541554==0 && 540dac>0 && 540cac==0x3ea).
+//     message flush (FUN_0041cb44 — the teletype service, now
+//     composed) and the SKULL death overlay (541554==0 && 540dac>0 &&
+//     540cac==0x3ea).
 //
 // Deferred/counted seams (documented, not composed):
 //   - FUN_00437aa8 per-row scope-zoom transition warp (cosmetic).
-//   - FUN_0041cb44 status-message flush (hudMsgPosts counts the
-//     OOT_L%d posts the mission timer makes).
 //   - the 0x540b20 per-level shade-LUT remap on the selected
 //     inventory cell (raster-subsystem data; the border box IS drawn).
 //   - FUN_0041664c/FUN_00416700 scope-entry palette fades.
@@ -42,6 +41,7 @@
 
 #include "core/traversal_hud.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -393,6 +393,41 @@ inline bool scopedHud(const TraversalRuntime& rt) {
   return rt.flagC9c != 0 && rt.transitionPhase > 1;
 }
 
+// FUN_00414d2c (renderer 0) + FUN_0041518c (renderer 1) — the teletype
+// text draw into rt.hud.fb. renderer 0 centers FONTBIG and falls back
+// to FONTSML when its measure reaches the 600px frame (FUN_00414f1c);
+// renderer 1 centers FONTBIG scaled by `scale` (the slide-in/page-out
+// envelope). line indexes the two consumed buffers.
+void ttDraw(TraversalRuntime& rt, int renderer, int line, int y,
+            float scale) {
+  TraversalHudState& hud = rt.hud;
+  if (line < 0 || line >= hud.tt.curLine || !hud.fontBigOk) return;
+  const std::string& text = hud.tt.line[line];
+  if (text.empty()) return;
+  IndexedFramebuffer& fb = hud.fb;
+  const int fw = fb.width();
+  if (renderer == 0) {
+    const int wBig =
+        measureFtiText(hud.fontBig, text, kFtiFontBigMissingAdvance);
+    if (wBig >= fw && hud.fontSmlOk) {
+      const int w = measureFtiText(hud.fontSml, text,
+                                   kFtiFontSmlMissingAdvance);
+      drawFtiText(hud.fontSml, text, fb, (fw - w) / 2, y,
+                  kFtiFontSmlMissingAdvance);
+    } else {
+      drawFtiText(hud.fontBig, text, fb, (fw - wBig) / 2, y,
+                  kFtiFontBigMissingAdvance);
+    }
+  } else {
+    const int w =
+        measureFtiText(hud.fontBig, text, kFtiFontBigMissingAdvance);
+    const int x =
+        static_cast<int>((fw - w * static_cast<double>(scale)) * 0.5);
+    drawFtiTextScaled(hud.fontBig, text, fb, x, y, scale,
+                      kFtiFontBigMissingAdvance);
+  }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -497,6 +532,164 @@ void traversalHudBindFontBig(TraversalRuntime& rt,
   rt.hud.fontBigOk = true;
 }
 
+void traversalHudBindFontSml(TraversalRuntime& rt,
+                             const FtiFont& font) {
+  rt.hud.fontSml = font;
+  rt.hud.fontSmlOk = true;
+}
+
+void traversalHudBindTeletypeFti(TraversalRuntime& rt,
+                                 std::vector<std::byte> ftiBytes) {
+  // Parse the directory from the incoming image BEFORE the move (the
+  // record offsets are image-relative and stay valid once the bytes
+  // are retained — FUN_00414890's record scan + two-u32 name compare).
+  rt.hud.tt.ftiDir = inspectFtiDirectory(
+      std::span<const std::byte>(ftiBytes.data(), ftiBytes.size()));
+  rt.hud.tt.ftiBytes = std::move(ftiBytes);
+}
+
+// ---------------------------------------------------------------------------
+// FUN_0041cad0 — the status-message post. EAX=name, EDX=flags,
+// [EBP+8]=rate; RET 0x4. Writes the slot's resolved str BEFORE the
+// qWrite advance so a resolve miss (0x41cb25) leaves no entry — and on
+// the flags&2 front-push the qRead decrement commits either way.
+// ---------------------------------------------------------------------------
+
+bool traversalTeletypePost(TraversalRuntime& rt, std::string_view name,
+                           std::uint32_t flags, float rate) {
+  TraversalTeletype& tt = rt.hud.tt;
+  ++rt.seams.hudMsgPosts;
+  int slot;
+  if (flags & 2u) {
+    slot = (tt.qRead - 1) & 3;      // front-push: preempt the head
+    tt.qRead = slot;              // committed before the resolve
+  } else {
+    slot = tt.qWrite;
+  }
+  // FUN_00414890 — the FTI record lookup. On a miss the native stores a
+  // NULL str and returns without writing flags/rate or advancing
+  // qWrite; the port stores the empty text and bails the same way.
+  const FtiRecord* r = findFtiRecord(tt.ftiDir, name);
+  if (!r || r->payloadFileOffset >= tt.ftiBytes.size()) {
+    tt.queue[slot].text.clear();
+    return false;
+  }
+  const char* p = reinterpret_cast<const char*>(
+      static_cast<const void*>(tt.ftiBytes.data() + r->payloadFileOffset));
+  const std::size_t n =
+      static_cast<std::size_t>(r->payloadEnd - r->payloadFileOffset);
+  tt.queue[slot].text.assign(p, strnlen(p, n));
+  tt.queue[slot].flags = flags;
+  tt.queue[slot].rate = rate;
+  if (!(flags & 2u)) tt.qWrite = (tt.qWrite + 1) & 3;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// FUN_0041cb44 — the per-frame teletype service. One pass per presented
+// frame (the mode-3 draw block calls it with the frame-due flag); the
+// ported version always draws. The four OBSERVED arms:
+//   charTimer==0, holdTimer!=0  -> page-out (hold ramps 0.5 -> 0)
+//   charTimer==0, pending entry -> entry load + consume (splits the
+//                                  resolved string on "\n" into the two
+//                                  36-col line buffers)
+//   charTimer>0, flags&1 set, hold!=0.5 -> slide-in (hold ramps to 0.5)
+//   else                          -> steady hold (charTimer -= rate)
+// A queued NEXT entry makes the current hold expire twice as fast
+// (localRate = dt*2.0 — the pending-work arm). The 0x4999d0/0x541548
+// suppress + alternate-steady arms are dead in BUILD_A (never written).
+// ---------------------------------------------------------------------------
+
+void traversalTeletypeService(TraversalRuntime& rt) {
+  TraversalTeletype& tt = rt.hud.tt;
+  ++rt.seams.hudMsgFlush;
+  const float dt30 = std::bit_cast<float>(0x3d088889u);  // 0x49b6f4
+  const int entry = tt.qRead != tt.qWrite ? tt.qRead : -1;
+  const float localRate =
+      entry >= 0 ? static_cast<float>(static_cast<double>(dt30) * 2.0)
+                 : dt30;
+  const auto zero = [](float v) { return !(v > 0.0f) && !(v < 0.0f); };
+  const auto eq = [](float v, float c) { return !(v > c) && !(v < c); };
+
+  if (zero(tt.charTimer)) {                       // 0x41cd9b arm
+    // holdTimer zero test is INTEGER — f32 bits & 0x7fffffff == 0, so
+    // -0.0 counts as zero but a NaN lands in the page-out arm.
+    if ((std::bit_cast<std::uint32_t>(tt.holdTimer) & 0x7fffffffu) !=
+        0) {
+      // ---- page-out (0x41cdba) ----
+      const float s2 =
+          static_cast<float>(static_cast<double>(tt.holdTimer) * 2.0);
+      if (tt.curLine == 1) {
+        ttDraw(rt, 1, 0, 0x78, s2);
+      } else {
+        const float t = s2 * 15.0f;
+        ttDraw(rt, 1, 0, static_cast<int>(std::lround(120.0f - t)), s2);
+        ttDraw(rt, 1, 1, static_cast<int>(std::lround(t + 120.0f)), s2);
+      }
+      const float h = tt.holdTimer - dt30;
+      tt.holdTimer = h < 0.0f ? 0.0f : h;
+    } else if (entry >= 0) {
+      // ---- entry load + consume (0x41ce98..0x41cf4d) ----
+      tt.charTimer = tt.queue[entry].rate;
+      tt.flags = tt.queue[entry].flags;
+      tt.holdTimer = 0.0f;
+      tt.curLine = 0;
+      // Consume the resolved string into the two 36-col line buffers,
+      // splitting on the literal "\n" escape (the queue's str cursor
+      // walks the whole payload in one pass here).
+      const std::string& s = tt.queue[entry].text;
+      std::string line0, line1;
+      int col = 0;
+      for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '\\' && i + 1 < s.size() && s[i + 1] == 'n') {
+          ++i;                                     // eat the 'n'
+          if (tt.curLine == 1) {                   // 0x41cf1e — second
+            break;                                 //   newline ends it
+          }
+          ++tt.curLine;                            // line0 -> line1
+          col = 0;
+          continue;
+        }
+        if (col < 36) {                            // the 36-col bound
+          (tt.curLine == 0 ? line0 : line1) += c;
+          ++col;
+        }
+      }
+      tt.line[0] = std::move(line0);
+      tt.line[1] = std::move(line1);
+      ++tt.curLine;                                // 0x41cf26 TERM
+      tt.qRead = (tt.qRead + 1) & 3;               // consume the slot
+    }
+    // else — empty ring and dead timers: idle (0x41cbeb).
+  } else if ((tt.flags & 1u) && !eq(tt.holdTimer, 0.5f)) {
+    // ---- slide-in (0x41cc1a): flags&1 set, hold ramps 0 -> 0.5 ----
+    const float s2 =
+        static_cast<float>(static_cast<double>(tt.holdTimer) * 2.0);
+    if (tt.curLine == 1) {
+      ttDraw(rt, 1, 0, 0x78, s2);
+    } else {
+      const float t = s2 * 15.0f;
+      ttDraw(rt, 1, 0, static_cast<int>(std::lround(120.0f - t)), s2);
+      ttDraw(rt, 1, 1, static_cast<int>(std::lround(t + 120.0f)), s2);
+    }
+    const float h = dt30 + tt.holdTimer;
+    tt.holdTimer = h > 0.5f ? 0.5f : h;
+  } else {
+    // ---- steady hold (0x41cb8e): flags&1 clear or hold==0.5 ----
+    // flag541548 is never written in BUILD_A so the renderer-0
+    // (plain centered) arm is the live path.
+    if (tt.curLine == 1) {
+      ttDraw(rt, 0, 0, 0x78, 0.0f);
+    } else {
+      ttDraw(rt, 0, 0, 0x69, 0.0f);
+      ttDraw(rt, 0, 1, 0x87, 0.0f);
+    }
+    const float t = tt.charTimer - localRate;
+    tt.charTimer = t < 0.0f ? 0.0f : t;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // FUN_0041b654 — the mission countdown (call site: the FUN_00436100
 // head, gated fieldE9c == 0; caller mirrors that here).
@@ -517,8 +710,16 @@ void traversalHudMissionTick(TraversalRuntime& rt) {
   // bit7 (scriptGFlags byte3 bit7) is set, else |= 0x40.
   rt.fadeTimer5414a0 = 0.0f;
   if (rt.camera.shakeMag < 5.0f) rt.camera.shakeMag = 5.0f;
-  ++rt.seams.hudMsgPosts;                // FUN_0041cad0 OOT_L%d — seam
+  // FUN_0041cad0 OOT_L%d post (0x41b6a2..0x41b6f1): flags=3 (slide-in
+  // | front-push — preempts the live entry), rate=5.0 (0x40a00000);
+  // the name is sprintf'd "OOT_L%dA" when 0x540d9b bit7 is already set
+  // (a revisit — format @0x4953d8) else "OOT_L%d" (@0x4953e4), with
+  // %d = 0x541498 + 1. The flag reads BEFORE the |= below.
   const bool bit7 = (rt.scriptGFlags & 0x80000000u) != 0;
+  char ttName[12];
+  std::snprintf(ttName, sizeof ttName, bit7 ? "OOT_L%dA" : "OOT_L%d",
+                rt.field541498 + 1);
+  traversalTeletypePost(rt, ttName, 3, 5.0f);
   rt.scriptGFlags |= bit7 ? 0x20000000u : 0x40000000u;
   hud.fieldD9b = static_cast<std::uint8_t>(rt.scriptGFlags >> 24);
 }
@@ -832,9 +1033,9 @@ void traversalHudCompose(TraversalRuntime& rt) {
     }
   }
 
-  // --- FUN_0041cb44 — status-message flush: counted seam (the text
-  //     render needs the unported message queue). --------------------
-  ++rt.seams.hudMsgFlush;
+  // --- FUN_0041cb44 — the status-message flush: the teletype queue
+  //     service (pickup/OOT posts slide, hold, page out into fb). ----
+  traversalTeletypeService(rt);
 
   // --- SKULL death overlay (0x437016): health == 0 && dac > 0 &&
   //     locoState == 0x3ea — scaled 256x256 -> dac x dac centered

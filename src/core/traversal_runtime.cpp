@@ -1118,23 +1118,29 @@ TraversalLoadError traversalRuntimeLoad(const DataRoot& root,
   // unbound state and compose degrades to the empty overlay.
   traversalHudBind(rt);
 
-  // FONTBIG — the reticle's %d printer resolves MISC/MDKFONT.FTI at
-  // the same context init (FUN_004149c4). Non-fatal: unbound keeps
-  // fontBigOk clear and the bomb-count digits are skipped.
+  // FONTBIG/FONTSML — the reticle's %d printer + the teletype resolve
+  // MISC/MDKFONT.FTI at the same context init (FUN_004149c4). The FTI
+  // image is retained for the teletype's at-post name lookup
+  // (FUN_0041cad0 -> FUN_00414890). Non-fatal: unbound keeps the
+  // fontOk flags clear and posts resolve-miss out.
   if (auto fti = root.readFile("MISC/MDKFONT.FTI", kMaxDataFileBytes,
                                detail)) {
     const FtiDirectory fd =
         inspectFtiDirectory(std::span<const std::byte>(*fti));
-    if (const FtiRecord* r = findFtiRecord(fd, "FONTBIG");
-        r && r->payloadEnd <= fti->size()) {
+    const auto decodeFont = [&](const char* name)
+        -> std::optional<FtiFont> {
+      const FtiRecord* r = findFtiRecord(fd, name);
+      if (!r || r->payloadEnd > fti->size()) return std::nullopt;
       std::string ferr;
-      if (auto font = decodeFtiFont(
-              std::span<const std::byte>(
-                  fti->data() + r->payloadFileOffset,
-                  r->payloadEnd - r->payloadFileOffset),
-              &ferr))
-        traversalHudBindFontBig(rt, *font);
-    }
+      return decodeFtiFont(
+          std::span<const std::byte>(
+              fti->data() + r->payloadFileOffset,
+              r->payloadEnd - r->payloadFileOffset),
+          &ferr);
+    };
+    if (auto font = decodeFont("FONTBIG")) traversalHudBindFontBig(rt, *font);
+    if (auto font = decodeFont("FONTSML")) traversalHudBindFontSml(rt, *font);
+    traversalHudBindTeletypeFti(rt, std::move(*fti));
   }
 
   // FUN_0046445c — bind the 29 Kurt sprite tables (23 TRAVSPRT.BNI
