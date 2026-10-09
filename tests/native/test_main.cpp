@@ -18065,8 +18065,9 @@ void test_travsprt_anim_payload() {
 }
 
 // ---------------------------------------------------------------------------
-// SW_INTER thrown-item anim binding (the World's Smallest Nuclear
-// Explosion mushroom-cloud sequence). FUN_00433d40 binds the image-
+// SW_INTER thrown-item anim binding (the "World's Most Interesting
+// Bomb" open/detonate sequence — NOT the nuke; SW_KEY/item 7 is the
+// World's Smallest Nuclear Explosion). FUN_00433d40 binds the image-
 // resident record 0x54c698 ("SW_INTER") at context init; the cmd==2
 // transition-init (0x458fd0) then arms it onto +0x114. The port bound
 // it as a null seam, so the armed object read animDone() immediately

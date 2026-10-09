@@ -25,10 +25,15 @@ Repair commits this round:
   Level-3 start** was incorrect. There is no such path; the packaged
   app opens the frontend and play starts at Level 1. Recorded so the
   claim is not repeated.
-- The Level-1 progression pickup is the **"World's Smallest Nuclear
+- **RECLASSIFIED 2026-10-09** — the line below had the mapping
+  backwards. Corrected canonical mapping (owner-confirmed +
+  `MDKFONT.FTI` + item dispatch): `SW_INTER`/item 2 = **"World's Most
+  Interesting Bomb"** (WMIB — spins, attracts enemies, opens/explodes);
+  `SW_KEY`/item 7 = **"World's Smallest Nuclear Explosion"** (the nuke).
+- ~~The Level-1 progression pickup is the **"World's Smallest Nuclear
   Explosion"** (item id 2 / `SW_INTER`), sound record `WMIB`. An
   earlier note mislabelled it "World's Most Interesting Bomb"; the
-  comment is corrected.
+  comment is corrected.~~
 
 ## Phase rows
 
