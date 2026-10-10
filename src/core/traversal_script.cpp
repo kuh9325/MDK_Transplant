@@ -2245,10 +2245,13 @@ void objScriptInsn(ObjScriptPass& v) {
   case 0xc8: {                            // move-toward + arrive link
     // {f32 rate, f32 x,y,z, linkage}. OBSERVED (0x451261): writes the
     // +0x294/+0x298/+0x29c per-axis approach values —
-    // field = (1/30) / clamp(rate*(1/30)*delta/manhattan, delta) —
-    // with manhattan = |dx|+|dy| (+|dz| unless +0x148&2) floored at
-    // 0.1; z skipped when +0x148&2. The linkage fires when
-    // manhattan < 0.5 ("arrived").
+    // field = clamp(rate*(1/30)*delta/manhattan, delta) / (1/30)
+    // = rate*delta/manhattan — a rate-scaled velocity toward the
+    // target (the 0x45145c/0x4514be FDIVR does mem/ST, i.e. divides
+    // the stored temp by 1/30 — NOT (1/30)/temp). manhattan =
+    // |dx|+|dy| (+|dz| unless +0x148&2) floored at 0.1; z skipped
+    // when +0x148&2. The linkage fires when manhattan < 0.5
+    // ("arrived").
     float rate = r.f32();
     const float pt[3] = {r.f32(), r.f32(), r.f32()};
     Linkage L;
@@ -2265,7 +2268,7 @@ void objScriptInsn(ObjScriptPass& v) {
       float t = rate * d[i] / man;
       if ((d[i] > 0.0f && t > d[i]) || (d[i] < 0.0f && t < d[i]))
         t = d[i];
-      obj.animImpulse[i] = 0.03333333507180214f / t;
+      obj.animImpulse[i] = t / 0.03333333507180214f;
     }
     const bool cond = man < 0.5f;                 // C(0x497d04)
     switch (L.mode) {

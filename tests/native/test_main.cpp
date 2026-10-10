@@ -17327,6 +17327,49 @@ void test_enemy_runtime() {
     CHECK(r.halted && !r.error && near(o.yawDeg, 90.0, 1e-4));
   }
 
+  // -- obj op 0xc8: moveTo writes rate*delta/man approach impulse -------
+  // OBSERVED (0x45145c/0x4514be): the +0x294 store is FDIVR m32 = mem/ST,
+  // i.e. field = temp/(1/30) = rate*delta/man — a rate-scaled velocity.
+  // A former build wrote (1/30)/temp (the reciprocal), which left the
+  // DANT_2 XGTARGs crawling ~1/141 of intended and never reaching their
+  // case perches. This guards the direction. Uses the authored LEVEL7
+  // XGTARG#1 perch (-17,941,-22) from pod origin (0,967,-27).
+  {
+    ScriptFixture f;
+    f.write(C, {0xc8});
+    f.writeF(C + 1, 30.0f);                   // rate
+    f.writeF(C + 5, -17.0f);                  // target x
+    f.writeF(C + 9, 941.0f);                  // target y
+    f.writeF(C + 13, -22.0f);                 // target z
+    f.write(C + 17, {0x0c});                  // arrived link (goto 0x300)
+    f.writeW(C + 18, 0x300);
+    f.write(C + 22, {0xff});                  // end (not arrived path)
+    f.write(0x300, {0xff});                   // link target
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.flags148 |= 0x2;                    // gravity obj -> man=|dx|+|dy|
+    o.pos[0] = 0.0f; o.pos[1] = 967.0f; o.pos[2] = -27.0f;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    // d=(-17,-26,+5); man=17+26=43 (z skipped); impulse = rate*d/man.
+    CHECK(near(o.animImpulse[0], 30.0 * -17.0 / 43.0, 1e-3));  // ~-11.86
+    CHECK(near(o.animImpulse[1], 30.0 * -26.0 / 43.0, 1e-3));  // ~-18.14
+    CHECK(near(o.animImpulse[2], 0.0, 1e-6));                  // z skipped
+    // The reciprocal would have produced ~-0.0843 — assert the driver is
+    // a real approach velocity (|imp| well above the reciprocal floor).
+    CHECK(std::fabs(o.animImpulse[0]) > 5.0);
+
+    // Non-gravity object: z enters manhattan too. Same rate, diagonal
+    // target (30,40,0) -> man=70 -> impulse = rate*d/man.
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error);
+    // target (-17,941,-22) from (0,0,0): d=(-17,941,-22), man=980.
+    CHECK(near(o2.animImpulse[0], 30.0 * -17.0 / 980.0, 1e-3));
+    CHECK(near(o2.animImpulse[2], 30.0 * -22.0 / 980.0, 1e-3));
+  }
+
   // -- obj op 0x52: var -> +0x44 -----------------------------------------
   {
     ScriptFixture f;
