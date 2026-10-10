@@ -16649,6 +16649,102 @@ void test_traversal_object_script() {
       CHECK(d2.length == 14);
     }
   }
+
+  // --- Commit-F gore producers (0x80-0x84) emit real combatFx events ---
+  // The headshot branch's elKill/refEmit/impactDecal/sfxPee ops now emit
+  // CombatFxEvent records (the authored-asset locators + spawn points the
+  // frontend presents), alongside the gameplay mask/latch semantics.
+  {
+    ScriptFixture f;
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    // One-element "grunt head": modelName XG_BOD, elem XG1_HEAD, world
+    // AABB fixed so the debris centroid is deterministic.
+    mdk::RuntimeModel m;
+    m.flag = 1;
+    mdk::RuntimeModel::NameRec nr;
+    std::snprintf(nr.name.data(), nr.name.size(), "XG_BOD");
+    m.names.push_back(nr);
+    m.elems.resize(1);
+    m.elemNames.resize(1);
+    m.elemField2.resize(1);
+    m.elemVerts.resize(1);
+    m.elemTris.resize(1);
+    std::snprintf(m.elemNames[0].data(), m.elemNames[0].size(), "XG1_HEAD");
+    m.elemVerts[0] = {-1, -1, -1, 1, -1, -1, 1, 1, -1};
+    m.elemTris[0].assign(0x24, 0);
+    auto* ei = reinterpret_cast<std::uint16_t*>(m.elemTris[0].data());
+    ei[0] = 0; ei[1] = 1; ei[2] = 2;
+    m.elems[0].triCount = 1;
+    float wab[6] = {100, 200, 50, 104, 206, 56};
+    std::memcpy(m.elems[0].aabb, wab, sizeof(wab));
+    m.rebind();
+    o.model = mdk::deepCopyModel(m);
+    o.elemSet = o.model.elementSet();
+    o.arena = &f.arena->dyn;
+    o.col.named = true;
+    o.yawDeg = 30.0f;
+    o.field224 = 90.0f;
+    o.field210[0] = 1; o.field210[1] = 2; o.field210[2] = 3;
+    o.field21c = 1;
+    o.worldRef[2][0] = 7; o.worldRef[2][1] = 8; o.worldRef[2][2] = 9;
+
+    // 0x81 elKill sel0 n1 "XG1_HEAD": masks+latches AND emits the
+    // FUN_0041c420 element-debris event at the element world centroid.
+    f.write(C, {0x81, 0x00, 0x01});
+    f.writeStr(C + 3, "XG1_HEAD");
+    f.write(C + 13, {0xff});
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    CHECK((o.col.elemMaskB & 1) != 0);
+    CHECK((o.col.elemMaskLatch & 1) != 0);
+    CHECK(!f.rt.combatFx.empty());
+    CHECK(f.rt.combatFx.back().kind == mdk::CombatFxKind::kElementDebris);
+    CHECK(f.rt.combatFx.back().elemIndex == 0);
+    CHECK(f.rt.combatFx.back().modelName == "XG_BOD");
+    CHECK(near(f.rt.combatFx.back().pos[0], 102.0, 1e-4));
+    CHECK(near(f.rt.combatFx.back().pos[1], 203.0, 1e-4));
+    f.rt.combatFx.clear();
+
+    // 0x80 refEmit "SPR" s1 s2 binds a refpoint emitter: the +0x160 slot
+    // latches and the kRefEmit event carries worldRef[s1].
+    f.write(C, {0x80});
+    f.writeStr(C + 1, "SPR");
+    f.write(C + 6, {0x02, 0x00, 0xff});
+    o.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.halted && !r2.error);
+    CHECK(o.field160[2] != 0);
+    CHECK(f.rt.combatFx.back().kind == mdk::CombatFxKind::kRefEmit);
+    CHECK(f.rt.combatFx.back().refPoint == 2);
+    CHECK(near(f.rt.combatFx.back().pos[0], 7.0, 1e-4));
+    CHECK(near(f.rt.combatFx.back().pos[2], 9.0, 1e-4));
+    f.rt.combatFx.clear();
+
+    // 0x82 impactDecal: gated on +0x21c — emits the hit-point decal at
+    // +0x210; a zero +0x21c leaves the queue empty.
+    f.write(C, {0x82, 0xff});
+    o.field108 = f.image.data() + 4 + C;
+    auto r3 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r3.halted && !r3.error);
+    CHECK(f.rt.combatFx.back().kind == mdk::CombatFxKind::kImpactDecal);
+    CHECK(near(f.rt.combatFx.back().pos[0], 1.0, 1e-4));
+    f.rt.combatFx.clear();
+    o.field21c = 0;
+    o.field108 = f.image.data() + 4 + C;
+    auto r3b = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r3b.halted && f.rt.combatFx.empty());
+
+    // 0x84 sfxPee chance ref — a passing roll emits kSplat at the
+    // ref-point (ref!=0xff reads worldRef[ref]).
+    f.write(C, {0x84, 0x64, 0x02, 0xff});
+    o.field108 = f.image.data() + 4 + C;
+    auto r4 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r4.halted && !r4.error);
+    CHECK(f.rt.combatFx.back().kind == mdk::CombatFxKind::kSplat);
+    CHECK(near(f.rt.combatFx.back().pos[0], 7.0, 1e-4));
+    f.rt.combatFx.clear();
+  }
 }
 
 // ---------------------------------------------------------------------------

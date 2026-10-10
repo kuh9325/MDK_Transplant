@@ -2557,6 +2557,14 @@ Array MdkBridge::drain_combat_fx() {
     d["facing_deg"] = double(ev.facingDeg);
     d["bank_deg"] = double(ev.bankDeg);
     d["model_name"] = String(ev.modelName.c_str());
+    // Commit-F gore fields (kElementDebris/kRefEmit/kImpactDecal/
+    // kSplat). vel is the debris launch velocity (MDK axes); elemIndex
+    // the detached element; refPoint/refParam the emitter/decal args.
+    d["vel_mdk"] = Vector3(ev.vel[0], ev.vel[1], ev.vel[2]);
+    d["vel"] = mdkToGodotVec(ev.vel);
+    d["elem_index"] = int64_t(ev.elemIndex);
+    d["ref_point"] = int64_t(ev.refPoint);
+    d["ref_param"] = int64_t(ev.refParam);
     // The remnant/corpse spawn (FUN_004575fc / the FUN_00457cf4
     // teardown path, OBSERVED): a dead EXPLODE-class object placed
     // at pos, yaw = facingDeg (+0x4c/+0x50), bank = bankDeg

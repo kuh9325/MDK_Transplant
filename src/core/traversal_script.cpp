@@ -4499,7 +4499,24 @@ void objScriptInsn(ObjScriptPass& v) {
           obj.field160[s1] = 0;
         } else if (obj.field160[s1] == 0) {
           obj.field160[s1] = 0x8000u | (static_cast<std::uint32_t>(s2) << 8) | s1;
-          if (env.rt != nullptr) ++env.rt->seams.refEmitCalls;
+          if (env.rt != nullptr) {
+            ++env.rt->seams.refEmitCalls;
+            // FUN_004055f4's refpoint emitter — a blood-spray emitter
+            // bound to the object at worldRef[s1] (arg s2 selects the
+            // spray variant). The event carries the live ref-point
+            // world position so the frontend can anchor the authored
+            // splat spray to the moving object.
+            CombatFxEvent fx;
+            fx.kind = CombatFxKind::kRefEmit;
+            fx.obj = &obj;
+            fx.pos[0] = obj.worldRef[s1][0];
+            fx.pos[1] = obj.worldRef[s1][1];
+            fx.pos[2] = obj.worldRef[s1][2];
+            fx.refPoint = s1;
+            fx.refParam = s2;
+            fx.arena = obj.arena ? &obj.arena->col : nullptr;
+            env.rt->combatFx.push_back(fx);
+          }
         }
       }
       return;
@@ -4527,6 +4544,33 @@ void objScriptInsn(ObjScriptPass& v) {
           if (obj.model.elemName(e) == s) {
             obj.col.elemMaskB |= (1u << (e & 31));
             obj.col.elemMaskLatch |= (1u << (e & 31));
+            // FUN_0041c420's centroid-relativized debris shard — the
+            // detached element's authored mesh bursts off at its world
+            // AABB centroid, pushed along the hit bearing (+0x224) and
+            // biased up like the FUN_00404108 record init. The mask+
+            // latch above is the gameplay effect; this event is the
+            // cosmetic shard the original emits alongside it. sel 2's
+            // FUN_004541a4 arm is gated on the 0x54150c debris-enable
+            // flag (rt->fxEnable); sel 0/1 detach unconditionally.
+            if (env.rt != nullptr && (sel < 2 || env.rt->fxEnable) &&
+                e < static_cast<int>(obj.elemSet.count)) {
+              const CollisionElement& el = obj.elemSet.elems[e];
+              const float cx = (el.aabb[0] + el.aabb[3]) * 0.5f;
+              const float cy = (el.aabb[1] + el.aabb[4]) * 0.5f;
+              const float cz = (el.aabb[2] + el.aabb[5]) * 0.5f;
+              float sn, cs;
+              sincosDeg(obj.field224, &sn, &cs);
+              CombatFxEvent fx;
+              fx.kind = CombatFxKind::kElementDebris;
+              fx.obj = &obj;
+              fx.modelName = obj.model.modelName();
+              fx.elemIndex = e;
+              fx.pos[0] = cx; fx.pos[1] = cy; fx.pos[2] = cz;
+              fx.vel[0] = cs; fx.vel[1] = sn; fx.vel[2] = 2.0f;
+              fx.facingDeg = obj.yawDeg;
+              fx.arena = obj.arena ? &obj.arena->col : nullptr;
+              env.rt->combatFx.push_back(fx);
+            }
           }
         }
       }
@@ -4543,6 +4587,20 @@ void objScriptInsn(ObjScriptPass& v) {
       // the emit request only when the +0x21c gate would pass.
       if (obj.field21c != 0 && env.rt != nullptr) {
         ++env.rt->seams.impactDecalCalls;   // FUN_00453ba4 seam
+        // FUN_00453ba4's hit-point decal — submitted at +0x210 in
+        // model space against the +0x21c-hit element's surface. The
+        // event carries the world hit point so the frontend can plant
+        // the authored splat decal where the shot landed.
+        CombatFxEvent fx;
+        fx.kind = CombatFxKind::kImpactDecal;
+        fx.obj = &obj;
+        fx.pos[0] = obj.field210[0];
+        fx.pos[1] = obj.field210[1];
+        fx.pos[2] = obj.field210[2];
+        fx.refParam = obj.field21c;
+        fx.facingDeg = obj.field224;
+        fx.arena = obj.arena ? &obj.arena->col : nullptr;
+        env.rt->combatFx.push_back(fx);
       }
       return;
     }
@@ -4559,13 +4617,31 @@ void objScriptInsn(ObjScriptPass& v) {
       // the rand draw for parity and counts the request.
       const std::uint8_t chance = r.u8();
       const std::uint8_t ref = r.u8();
-      if (ref == 0xff) { r.f32(); r.f32(); r.f32(); }
+      float spos[3] = {0.0f, 0.0f, 0.0f};
+      if (ref == 0xff) {
+        spos[0] = r.f32(); spos[1] = r.f32(); spos[2] = r.f32();
+      } else {
+        const int i = (ref < 8) ? ref : 0;
+        spos[0] = obj.worldRef[i][0];
+        spos[1] = obj.worldRef[i][1];
+        spos[2] = obj.worldRef[i][2];
+      }
       if (!r.ok) { v.fail("sfxPee-args"); return; }
       if (env.rt != nullptr) {
         const std::uint32_t roll = enemyRandNext(env.rt->rngState) % 100u;
         const int gate = (chance < 0x96) ? chance : (chance - 0x96);
         if (static_cast<int>(roll) < gate) {
           ++env.rt->seams.sfxPeeCalls;      // FUN_00405270/0x404108 seam
+          // FUN_00405270's positional one-shot — the authored splat FX
+          // record at the ref-point (or inline pos). Carried through the
+          // event so the frontend spawns the real splat, not a stand-in.
+          CombatFxEvent fx;
+          fx.kind = CombatFxKind::kSplat;
+          fx.obj = &obj;
+          fx.pos[0] = spos[0]; fx.pos[1] = spos[1]; fx.pos[2] = spos[2];
+          fx.refParam = ref;
+          fx.arena = obj.arena ? &obj.arena->col : nullptr;
+          env.rt->combatFx.push_back(fx);
         }
       }
       return;

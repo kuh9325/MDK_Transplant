@@ -260,6 +260,8 @@ var fx_enable_live := false       # 0x54150c gate (per-frame)
 var shards: Array = []            # live shard dicts {mi, vel, ttl}
 var remnant_seq := 0              # remnant node counter
 var remnants: Array = []          # live EXPLODE remnant Node3Ds
+var ref_emitters: Array = []      # live refEmit blood emitters
+var fx_sprites := {}              # FX sprite name -> {tex, has_alpha}
 var fx_seq := 0                   # deterministic jitter counter (see
                                   #   _fx_rand — never touches core RNG)
 var fx_recent: Array = []         # last drained events (diag, cap 16)
@@ -1677,15 +1679,264 @@ func _drain_combat_fx() -> void:
 				# (both spawned inside the teardown, OBSERVED).
 				_spawn_tear_shards(ev["pos"], int(ev["arena_index"]))
 				_spawn_remnant(ev)
+			7:
+				# elKill (0x81) — FUN_0041c420's element debris: the
+				# killed element's authored mesh bursts off.
+				_spawn_elem_debris(ev)
+			8:
+				# refEmit (0x80) — FUN_004055f4's refpoint emitter:
+				# a persistent SB_*/SL_* blood spray bound to the object.
+				_spawn_ref_emitter(ev)
+			9:
+				# impactDecal (0x82) — FUN_00453ba4's hit-point splat decal.
+				_spawn_impact_decal(ev)
+			10:
+				# sfxPee (0x84) — FUN_00405270's positional splat burst.
+				_spawn_splat(ev)
+
+
+# --- Commit-F gore ------------------------------------------------------------
+# The 0x80-0x84 emitters are presented here. FUN_0041c420's element
+# debris reuses the killed element's own authored mesh, recentred on
+# its centroid exactly like the original's centroid-relativized
+# record, and flies under the shared FUN_00405014 shard tick. refEmit
+# sprays the authored SB_*/SL_* blood-splat sprites from the bound
+# refpoint; impactDecal/sfxPee lay the authored splat where it struck.
+
+func _fx_sprite(name: String) -> Dictionary:
+	# One SB_*/SL_*/FIRE sprite record -> {tex, alpha}. matlkup through
+	# get_object_material(0, name, -1) resolves the level-MTI texture.
+	if fx_sprites.has(name):
+		return fx_sprites[name]
+	var d: Dictionary = bridge.get_object_material(0, name, -1)
+	var rec := {}
+	if bool(d.get("valid", false)) and d.get("tex") != null:
+		rec = {"tex": d["tex"], "alpha": bool(d.get("has_alpha", false))}
+	fx_sprites[name] = rec
+	return rec
+
+
+func _blood_texture() -> Texture2D:
+	# The authored small-blood spray sprite (OBSERVED family — SB_* are
+	# the blood splats, dominant red index-3).
+	for nm in ["SB_MED", "SB_SMA"]:
+		var r := _fx_sprite(nm)
+		if r.get("tex") != null:
+			return r["tex"]
+	return null
+
+
+func _splat_texture() -> Texture2D:
+	# The authored large splat/wound sprite (SL_* family).
+	for nm in ["SL_MED", "SL_BIG", "SL_SMA"]:
+		var r := _fx_sprite(nm)
+		if r.get("tex") != null:
+			return r["tex"]
+	return null
+
+
+func _fx_billboard(tex: Texture2D, px: float) -> Sprite3D:
+	var s := Sprite3D.new()
+	s.texture = tex
+	s.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	s.shaded = false
+	s.double_sided = true
+	s.pixel_size = px
+	return s
+
+
+func _tumble_spin() -> Vector3:
+	return Vector3((_fx_rand() - 0.5) * 28.0,
+		(_fx_rand() - 0.5) * 28.0, (_fx_rand() - 0.5) * 28.0)
+
+
+func _spawn_elem_debris(ev: Dictionary) -> void:
+	# FUN_0041c420 — the killed element's authored mesh bursts off as a
+	# centroid-relativized shard. The mesh is recentred on the element's
+	# local centroid so it tumbles about its own centre, and it keeps
+	# the object's orientation at detach.
+	# The detached element's geometry comes from the live object's own
+	# model when it survives the shot (get_object_geometry), else the
+	# named-model table (a kill-headshot tears the object down before
+	# the drain). Both carry the authored element mesh.
+	var g: Dictionary = bridge.get_object_geometry(int(ev["obj_id"]))
+	if g.is_empty():
+		g = bridge.get_named_geometry(ev["model_name"])
+	if g.is_empty():
+		return
+	var names: PackedStringArray = g["elem_names"]
+	var groups := []
+	for sm in _split_elem_meshes(g["mesh"], g["surface_elems"],
+			g["surface_mats"], g["surface_pen"]):
+		if int(sm["elem"]) == int(ev["elem_index"]):
+			groups.append(sm)
+	if groups.is_empty():
+		return
+	# Element local centroid — the union AABB centre across all the
+	# element's material-group surfaces (model space).
+	var ua: AABB = groups[0]["mesh"].get_aabb()
+	for sm in groups:
+		ua = ua.merge(sm["mesh"].get_aabb())
+	var lc: Vector3 = ua.get_center()
+	var mesh := ArrayMesh.new()
+	var mats := []
+	for sm in groups:
+		for s in sm["mesh"].get_surface_count():
+			var arrays: Array = sm["mesh"].surface_get_arrays(s)
+			var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+			for i in verts.size():
+				verts[i] -= lc
+			arrays[Mesh.ARRAY_VERTEX] = verts
+			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+			mats.append(sm)
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	var si := 0
+	for sm in mats:
+		mi.set_surface_override_material(si, _object_material(0,
+			String(sm["mat"]), int(sm["pen"]),
+			names[int(sm["elem"])] if int(sm["elem"]) < names.size() else ""))
+		si += 1
+	# Spawn at the element's world centroid with the object's facing.
+	mi.position = ev["pos"]
+	var onode: Node3D = $DynamicObjectRoot.get_node_or_null(
+		"Object_%d" % int(ev["obj_id"]))
+	if onode != null:
+		mi.basis = onode.transform.basis
+	$FxRoot.add_child(mi)
+	shards.append({"mi": mi, "vel": ev["vel"],
+		"ttl": 60.0 + floorf(_fx_rand() * 64.0),
+		"arena": int(ev["arena_index"]), "spin": _tumble_spin()})
+	fx_stats["shards"] = int(fx_stats["shards"]) + 1
+
+
+func _spray_blood(emit: Dictionary) -> void:
+	var tex: Texture2D = _blood_texture()
+	# FUN_004055f4 scatters 8 droplets per tick (OBSERVED ecx=8).
+	for i in 8:
+		var node: Node3D
+		if tex != null:
+			var s := _fx_billboard(tex, 0.05)
+			node = s
+		else:
+			var mi := MeshInstance3D.new()
+			if shard_tetra.size() < 8:
+				shard_tetra.append(_shard_mesh(shard_tetra.size() * 7919))
+			mi.mesh = shard_tetra[(fx_seq + i) & 7]
+			mi.material_override = _shard_material(3)
+			mi.scale = Vector3.ONE * 0.3
+			node = mi
+		node.position = emit["pos"]
+		$FxRoot.add_child(node)
+		# Up-biased radial spray (the +0x18a/+0x18e/+0x192 velo field).
+		var vel := Vector3((_fx_rand() - 0.5) * 3.0,
+			_fx_rand() * 2.0 + 0.5,
+			(_fx_rand() - 0.5) * 3.0)
+		shards.append({"mi": node, "vel": vel,
+			"ttl": 11.0 + floorf(_fx_rand() * 20.0),
+			"arena": int(emit["arena"]), "spin": _tumble_spin()})
+		fx_stats["shards"] = int(fx_stats["shards"]) + 1
+
+
+func _spawn_ref_emitter(ev: Dictionary) -> void:
+	# FUN_004055f4 binds a persistent emitter to the object's refpoint
+	# (+0x160 slot). Each 30Hz-tick it sprays ~8 blood droplets that fly
+	# under the shard tick; the record lives ~64 ticks (+0x196).
+	var emit := {"oid": int(ev["obj_id"]), "off": Vector3.ZERO,
+		"pos": ev["pos"], "acc": 0.0, "ttl": 64.0,
+		"arena": int(ev["arena_index"])}
+	var onode: Node3D = $DynamicObjectRoot.get_node_or_null(
+		"Object_%d" % int(ev["obj_id"]))
+	if onode != null:
+		emit["off"] = ev["pos"] - onode.global_transform.origin
+	ref_emitters.append(emit)
+
+
+func _tick_ref_emitters(delta: float) -> void:
+	if ref_emitters.is_empty():
+		return
+	var keep := []
+	for e in ref_emitters:
+		# Track the bound object's origin + the captured refpoint
+		# offset while the object lives; else hold the last point.
+		var onode: Node3D = $DynamicObjectRoot.get_node_or_null(
+			"Object_%d" % int(e["oid"]))
+		if onode != null:
+			e["pos"] = onode.global_transform.origin + e["off"]
+		# 8 droplets per 30Hz tick; +0x196 decrements per tick.
+		e["acc"] = float(e["acc"]) + delta * SHARD_TICKS_PER_SEC
+		var ticks := int(e["acc"])
+		e["acc"] = float(e["acc"]) - ticks
+		for t in ticks:
+			_spray_blood(e)
+		e["ttl"] = float(e["ttl"]) - ticks
+		if float(e["ttl"]) > 0.0:
+			keep.append(e)
+	ref_emitters = keep
+
+
+func _spawn_impact_decal(ev: Dictionary) -> void:
+	# FUN_00453ba4 — the authored splat laid on the strike surface.
+	# Held in the shard list with zero velocity so it sits for its TTL.
+	var tex: Texture2D = _splat_texture()
+	var node: Node3D
+	if tex != null:
+		node = _fx_billboard(tex, 0.08)
+	else:
+		var mi := MeshInstance3D.new()
+		if shard_tetra.size() < 8:
+			shard_tetra.append(_shard_mesh(shard_tetra.size() * 7919))
+		mi.mesh = shard_tetra[fx_seq & 7]
+		mi.material_override = _shard_material(3)
+		mi.scale = Vector3.ONE * 0.6
+		node = mi
+	node.position = ev["pos"]
+	$FxRoot.add_child(node)
+	# static — the decal sits where it struck; it skips the shard
+	# stab/flutter so it doesn't slide or bounce off its own surface.
+	shards.append({"mi": node, "vel": Vector3.ZERO,
+		"ttl": 90.0, "arena": int(ev["arena_index"]),
+		"spin": Vector3.ZERO, "static": true})
+
+
+func _spawn_splat(ev: Dictionary) -> void:
+	# FUN_00405270 — the positional one-shot splat: a small burst of
+	# authored splat sprites at the point.
+	var tex: Texture2D = _splat_texture()
+	var btex: Texture2D = _blood_texture()
+	for i in 6:
+		var node: Node3D
+		var t: Texture2D = tex if i < 2 else btex
+		if t != null:
+			node = _fx_billboard(t, 0.07 if i < 2 else 0.05)
+		else:
+			var mi := MeshInstance3D.new()
+			if shard_tetra.size() < 8:
+				shard_tetra.append(_shard_mesh(shard_tetra.size() * 7919))
+			mi.mesh = shard_tetra[(fx_seq + i) & 7]
+			mi.material_override = _shard_material(3)
+			mi.scale = Vector3.ONE * 0.4
+			node = mi
+		node.position = ev["pos"]
+		$FxRoot.add_child(node)
+		var vel := Vector3((_fx_rand() - 0.5) * 2.0,
+			_fx_rand() * 1.5 + 0.5, (_fx_rand() - 0.5) * 2.0)
+		shards.append({"mi": node, "vel": vel,
+			"ttl": 30.0 + floorf(_fx_rand() * 30.0),
+			"arena": int(ev["arena_index"]), "spin": _tumble_spin()})
+		fx_stats["shards"] = int(fx_stats["shards"]) + 1
 
 
 func _tick_combat_fx(delta: float) -> void:
+	_tick_ref_emitters(delta)
 	if shards.is_empty():
 		return
 	var step := delta * SHARD_TICKS_PER_SEC
 	var keep := []
 	for sh in shards:
-		var mi: MeshInstance3D = sh["mi"]
+		# Node3D (not just MeshInstance3D) — the head-gib debris and the
+		# SB_*/SL_* blood sprites share this FUN_00405014 tick.
+		var mi: Node3D = sh["mi"]
 		var vel: Vector3 = sh["vel"]
 		# FUN_00405014 (OBSERVED): newPos = pos + vel*smoothed, then
 		# the FUN_00406a0c contact stab (record arena -> cur ->
@@ -1693,24 +1944,27 @@ func _tick_combat_fx(delta: float) -> void:
 		# (0x4943ec lossy reflect), pos = crossing point. On a miss:
 		# vel.z_mdk = 0.0711 - vel.z_mdk — the 0.2844*0.25 flutter
 		# (0x4943dc*0x4943e4) — z_mdk is Godot +Y.
-		var np: Vector3 = mi.position + vel * step
-		var hit: Dictionary = bridge.fx_stab(mi.position, np,
-			int(sh["arena"]))
-		if not hit.is_empty():
-			mi.position = hit["pos"]
-			var n: Vector3 = hit["normal"]
-			vel = vel - n * (1.4 * vel.dot(n))
-			sh["ttl"] = float(sh["ttl"]) - 20.0
-		else:
-			mi.position = np
-			vel.y = 0.0711 - vel.y
-		sh["vel"] = vel
+		# "static" records (impact decals) sit where they were laid —
+		# no stab/flutter/tumble, just the +0x196 countdown.
+		if not bool(sh.get("static", false)):
+			var np: Vector3 = mi.position + vel * step
+			var hit: Dictionary = bridge.fx_stab(mi.position, np,
+				int(sh["arena"]))
+			if not hit.is_empty():
+				mi.position = hit["pos"]
+				var n: Vector3 = hit["normal"]
+				vel = vel - n * (1.4 * vel.dot(n))
+				sh["ttl"] = float(sh["ttl"]) - 20.0
+			else:
+				mi.position = np
+				vel.y = 0.0711 - vel.y
+			sh["vel"] = vel
+			# The 0x46b180 tumble — cosmetic random-axis spin.
+			var sp: Vector3 = sh["spin"]
+			mi.rotation += sp * (step * (PI / 180.0))
 		# +0x196 -= frameStep (0x49b6e8 — ~1 per 30Hz tick); the
 		# countdown is frame-domain, so ttl decrements per tick.
 		sh["ttl"] = float(sh["ttl"]) - step
-		# The 0x46b180 tumble — cosmetic random-axis spin.
-		var sp: Vector3 = sh["spin"]
-		mi.rotation += sp * (step * (PI / 180.0))
 		if float(sh["ttl"]) <= 0.0:
 			mi.queue_free()
 		else:

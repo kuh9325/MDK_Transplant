@@ -306,6 +306,15 @@ enum class CombatFxKind : int {
                          // (remnant DynamicObject, scale 2.0f)
   kObjectDeathScript,    // FUN_00458140 -> +0x110 script handoff
   kObjectTeardown,       // FUN_00458140 -> FUN_00457cf4 teardown
+  // Commit-F gore producers — the elKill/refEmit/decal/sfxPee script
+  // ops whose original callees (FUN_0041c420 / FUN_004055f4 /
+  // FUN_00453ba4 / FUN_00405270) were request-counted only. Each event
+  // carries the authored-asset locator + spawn point so the frontend
+  // presents the real debris/emitter/decal/splat, not a substitute.
+  kElementDebris,        // op-0x81 elKill -> FUN_0041c420 element shard
+  kRefEmit,              // op-0x80 -> FUN_004055f4 refpoint emitter
+  kImpactDecal,          // op-0x82 -> FUN_00453ba4 surface decal
+  kSplat,                // op-0x84 sfxPee -> FUN_00405270 one-shot
   // FUN_0045bec8's two water-splash FUN_00437444 callsites are NOT
   // emitted here: they sit on the generic sweep helper chain
   // (FUN_004572ac -> FUN_004533d4 -> FUN_0045b6f8), classified-only.
@@ -356,8 +365,23 @@ struct CombatFxEvent {
   float bankDeg = 0.0f;
   // modelName — the victim's model name captured pre-teardown for
   //   kObjectTeardown (the record is wiped; the frontend resolves
-  //   geometry by name). Empty on other kinds.
+  //   geometry by name). Empty on other kinds. On kElementDebris it is
+  //   the gore source's model (to resolve the element's authored mesh).
   std::string modelName;
+  // --- Commit-F gore fields ------------------------------------------------
+  // vel — the debris shard's launch velocity (units/tick, MDK axes).
+  //   kElementDebris: the detached element's burst velocity, up-biased
+  //   like the FUN_00404108 record init. 0 on non-debris kinds.
+  float vel[3] = {0.0f, 0.0f, 0.0f};
+  // elemIndex — kElementDebris: the detached element's index in the
+  //   model's element array (the elKill target); the frontend picks
+  //   that element's authored mesh out of the model geometry.
+  int elemIndex = -1;
+  // refPoint — kRefEmit: the emitter's ref-point slot (s1, +0x1b0
+  //   index). refParam — its secondary arg (s2). kSplat/kImpactDecal
+  //   reuse refParam for the rolled/surface variant.
+  int refPoint = -1;
+  int refParam = 0;
 };
 
 } // namespace mdk
