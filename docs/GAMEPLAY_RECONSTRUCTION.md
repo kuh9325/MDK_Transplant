@@ -1763,6 +1763,10 @@ opcodes. The native interpreter implements the proven traversal subset:
 | `0x63` | mask,surfId,off | surface handler bind `+0x7c/+0x8c` |
 | `0xa8` | surfId,mask | surface config `+0x6c` (+ set-`0x10` if `0x80`) |
 | `0x8e` | u8,str,u8,u8,f32 | type-7 volume activation `FUN_00412d04` |
+| `0x8f` | lstr | named `+0x45e` record delete `FUN_00413210` (0x44ab80) |
+| `0x90` | lstr,f32×6,u8,u8,f32 | named volume box create `FUN_00412e10` (0x44abc4) |
+| `0x91` | lstr,f32,f32 | named record rate/ramp `FUN_004132e0` (0x44ad46) |
+| `0x92` | u8,lstr,f32×6 | named surface record create `FUN_00413380` (0x44adcc) |
 | `0x95/56/a1/e6` | spawn forms | create dormant object (Phase 5E seam) |
 | `0xca` | u8 | write global byte `0x541534` |
 | `0x99` | f32 | write ctx `+0x30e` |
@@ -1774,6 +1778,7 @@ opcodes. The native interpreter implements the proven traversal subset:
 | `0x7b` | link | linkage only when ctx-obj ≠ current arena (partner-only) |
 | `0xe0` | flag[,f32,f32] | type-9 slide/deflect-zone; flag 0 clears `0x540e24/cbc` |
 | `0xfc/0x0c` | n,offs | indexed/random call / goto |
+| `0x9b` | varop,link | `0x12` timed-link varop form (0x43e27a) |
 | `0xf7` | u8,lstr,f32 | `FUN_0041cad0` teletype post (0x4511e9) |
 | `0xfd` | — | return |
 | `0xff` | — | end-of-frame (clears running flag) |

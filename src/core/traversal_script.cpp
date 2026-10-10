@@ -2828,6 +2828,37 @@ void objScriptInsn(ObjScriptPass& v) {
       }
       return;
     }
+    case 0x9b: {                              // timed link, varop (0x43e27a)
+      // {varop wait, linkage}. OBSERVED: identical to op 0x12 except
+      // the wait resolves through FUN_00438654 — mode 3 is an inline
+      // f32, anything else is a u8 index into the mode's slot array.
+      // mark[depth] >= wait*30.0 (C 0x497a08 = 30.0f) clears the mark
+      // and dispatches the linkage; otherwise mark[depth] += the u16
+      // frame delta 0x49b6e8 (frameStep) and the else arm applies.
+      const float wait = resolveVar(r, env, ctx);
+      Linkage L;
+      if (!r.ok || !readLinkage(r, L)) { v.fail("timeLinkV"); return; }
+      const bool cond =
+          static_cast<float>(obj.scriptMark[obj.scriptCallDepth]) >=
+          wait * 30.0f;
+      if (cond) {
+        obj.scriptMark[obj.scriptCallDepth] = 0;
+      } else {
+        obj.scriptMark[obj.scriptCallDepth] =
+            static_cast<std::uint16_t>(
+                obj.scriptMark[obj.scriptCallDepth] +
+                env.frameStep);
+      }
+      switch (L.mode) {
+      case 0xfe: if (cond) v.doCall(L.a); else if (L.b) v.doCall(L.b);
+                 break;
+      case 0xfc: if (cond) v.doCall(L.a); break;
+      case 0x0c: if (cond) v.doGoto(L.a); break;
+      case 0xfd: if (cond) v.doReturn(); break;
+      default: break;
+      }
+      return;
+    }
     case 0x21: {                              // path-frame link (0x43dc44)
       // {u32 n, linkage}. OBSERVED: while +0xec (path record) is
       // bound and (n-1) > FRNDINT(+0xf0) — the path frame truncated
@@ -3202,6 +3233,111 @@ void objScriptInsn(ObjScriptPass& v) {
         case 0xfd: v.doReturn(); break;
         default: break;
         }
+      }
+      return;
+    }
+    case 0x8f: {                              // named record delete (0x44ab80)
+      // {lstr name} -> FUN_00413210. OBSERVED: unlinks the ctx's
+      // +0x45e record matching the name (stricmp, FUN_0047e02c) and
+      // pushes it onto the allocator's free list 0x5411c8. A name
+      // miss is a silent no-op.
+      const std::string nm = r.str();
+      if (!r.ok) { v.fail("recDel"); return; }
+      SurfaceObjectState* s8f = &obj.surface;
+      if (env.selfArena && env.ctxObject == &env.selfArena->eventLatch)
+        s8f = &env.selfArena->surface;
+      for (SurfaceRecord** pp = &s8f->records; *pp; pp = &(*pp)->next) {
+        if (stricmpEq((*pp)->nameText, nm)) {
+          SurfaceRecord* dead = *pp;
+          *pp = dead->next;
+          delete dead;                        // free-list 0x5411c8 push
+          break;
+        }
+      }
+      return;
+    }
+    case 0x90: {                              // named volume box (0x44abc4)
+      // {lstr name, f32 box[6], u8 f10, u8 kind, f32 rate} ->
+      // FUN_00412e10. OBSERVED: creates a +0x45e volume record on the
+      // executing ctx. kind==6 derives rate = (box[5]-box[2]) /
+      // (rate-0.5) (C 0x495030 = -0.5); the stored box[2] shrinks by
+      // 0.5; +0x10 = f10, +0x1c = 0xffffffff (all-pass query mask),
+      // +0x8 = the name, +0x18/+0x40 = rate, +0x44 = 0.
+      const std::string nm = r.str();
+      float box[6];
+      for (int i = 0; i < 6; ++i) box[i] = r.f32();
+      const std::uint8_t f10 = r.u8();
+      const std::uint8_t kind = r.u8();
+      float rate = r.f32();
+      if (!r.ok) { v.fail("volBox"); return; }
+      if (kind == 6) rate = (box[5] - box[2]) / (rate - 0.5f);
+      box[2] -= 0.5f;
+      // The executing ctx owns the record — the arena fallback ctx is
+      // the controlalien whose +0x45e block the port carries on
+      // TraversalArena::surface; an object ctx uses its own block.
+      SurfaceObjectState* s = &obj.surface;
+      if (env.selfArena && env.ctxObject == &env.selfArena->eventLatch)
+        s = &env.selfArena->surface;
+      SurfaceRecord* rec =
+          surfaceVolumeCreate(*s, kind, box, rate, 0xffffffffu);
+      if (rec != nullptr) {
+        rec->nameText = nm;
+        rec->f10 = f10;
+      }
+      return;
+    }
+    case 0x91: {                              // named record rate (0x44ad46)
+      // {lstr name, f32 rate, f32 secs} -> FUN_004132e0. OBSERVED:
+      // looks the ctx's +0x45e record up by name (FUN_00412c80).
+      // secs != 0 arms a ramp — +0x40 (target) = rate, +0x44 =
+      // (target - +0x18)/secs; secs == 0 sets +0x18 = +0x40 = rate
+      // and clears +0x44. A miss only prints a diagnostic (0x495080)
+      // in the original — silent here.
+      const std::string nm = r.str();
+      const float rate = r.f32();
+      const float secs = r.f32();
+      if (!r.ok) { v.fail("recRate"); return; }
+      SurfaceObjectState* s91 = &obj.surface;
+      if (env.selfArena && env.ctxObject == &env.selfArena->eventLatch)
+        s91 = &env.selfArena->surface;
+      for (SurfaceRecord* rec = s91->records; rec; rec = rec->next) {
+        if (stricmpEq(rec->nameText, nm)) {
+          if (secs != 0.0f) {
+            rec->target = rate;
+            rec->ramp = (rate - rec->rate) / secs;
+          } else {
+            rec->rate = rate;
+            rec->target = rate;
+            rec->ramp = 0.0f;
+          }
+          break;
+        }
+      }
+      return;
+    }
+    case 0x92: {                          // named surface record (0x44adcc)
+      // {u8 surfType, lstr name, f32 rate, f32 dir[3], f32 uv[2]} ->
+      // FUN_00413380. OBSERVED: creates a +0x45e surface (conveyor/
+      // scroll) record on the executing ctx — +0x14 = -1, +0x8 = name,
+      // +0xc = surfType, v[0..2] = dir/sqrt(dir*dir) with v[5] = the
+      // inverse length, v[3]/v[4] = uv * v[5], +0x18/+0x40 = rate,
+      // +0x1c = 0xffffffff, +0x3c/+0x44 = 0.
+      const std::uint8_t surf = r.u8();
+      const std::string nm = r.str();
+      const float rate = r.f32();
+      float dir[3], uv[2];
+      for (int i = 0; i < 3; ++i) dir[i] = r.f32();
+      for (int i = 0; i < 2; ++i) uv[i] = r.f32();
+      if (!r.ok) { v.fail("surfRec"); return; }
+      SurfaceObjectState* s92 = &obj.surface;
+      if (env.selfArena && env.ctxObject == &env.selfArena->eventLatch)
+        s92 = &env.selfArena->surface;
+      SurfaceRecord* rec =
+          surfaceRecordCreate(*s92, surf, dir, rate);
+      if (rec != nullptr) {
+        rec->nameText = nm;
+        rec->v[3] = uv[0] * rec->v[5];
+        rec->v[4] = uv[1] * rec->v[5];
       }
       return;
     }
@@ -6035,6 +6171,11 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0xc3: return "bl";                      // {i8 src, linkage}
   case 0x95: return "ffffwssw";
   case 0x56: case 0xa1: case 0x71: return "fffsw";
+  case 0x8f: return "s";                        // recDel {lstr}
+  case 0x90: return "sffffffbbf";               // volBox {lstr,f32x6,u8,u8,f32}
+  case 0x91: return "sff";                      // recRate {lstr,f32,f32}
+  case 0x92: return "bsffffff";                 // surfRec {u8,lstr,f32x6}
+  case 0x9b: return "vl";                       // timeLinkV {varop,linkage}
   case 0x9c: return "bsw";                      // spawnRef {u8,lstr,u32}
   case 0x1d: return "bsw";                      // createChain {u8,lstr,u32}
   case 0x77: return "skl"; case 0xd3: return "";
@@ -6080,6 +6221,9 @@ const char* opcodeName(std::uint8_t op) {
   case 0x63: return "surfbind";  case 0xa8: return "surfcfg";
   case 0x0c: return "rgoto";  case 0xfc: return "rcall";
   case 0x95: return "spawn";  case 0x56: return "spawn2";
+  case 0x8f: return "recDel";  case 0x90: return "volBox";
+  case 0x91: return "recRate"; case 0x92: return "surfRec";
+  case 0x9b: return "timeLinkV";
   case 0x9c: return "spawnRef";
   case 0xe6: return "spawn3"; case 0xa1: return "spawnNamed";
   case 0x71: return "spawnOfs"; case 0x77: return "cntLink";

@@ -17058,6 +17058,151 @@ void test_enemy_runtime() {
     CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8));
   }
 
+  // -- obj op 0x9b: timed link, varop wait — mark >= wait*30 ----------
+  {
+    ScriptFixture f;
+    f.write(C, {0x9b, 0x03});               // varop mode 3 = inline f32
+    f.writeF(C + 2, 1.0f);                  // wait 1.0s -> 30 marks
+    f.write(C + 6, {0x0c});
+    f.writeW(C + 7, 0x300);
+    f.write(C + 11, {0xff});
+    f.write(0x300, {0x44, 0x02, 0x03, 0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.scriptMark[0] = 31;                   // >= 30 -> fires
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && (o.scriptFlagsLocal & 8) &&
+          o.scriptMark[0] == 0);            // fired mark resets
+    mdk::DynamicObject& o2 = f.arena->dyn.allocFront();
+    o2.scriptMark[0] = 10;                  // < 30 -> mark += frameStep
+    o2.field108 = f.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o2);
+    CHECK(r2.halted && !r2.error && !(o2.scriptFlagsLocal & 8) &&
+          o2.scriptMark[0] == 10 + f.env.frameStep);
+  }
+
+  // -- obj op 0x90: named volume box — FUN_00412e10 record create -----
+  {
+    ScriptFixture f;
+    f.write(C, {0x90});
+    f.writeStr(C + 1, "VOLZ");
+    f.writeF(C + 7, -10.0f);                // box x0,y0,z0
+    f.writeF(C + 11, -20.0f);
+    f.writeF(C + 15, 8.0f);
+    f.writeF(C + 19, 30.0f);                // box x1,y1,z1
+    f.writeF(C + 23, 40.0f);
+    f.writeF(C + 27, 50.0f);
+    f.write(C + 31, {0x01, 0x02});          // f10=1, kind=2
+    f.writeF(C + 33, 3.5f);                 // rate
+    f.write(C + 37, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    const mdk::SurfaceRecord* rec = o.surface.records;
+    CHECK(rec != nullptr && rec->nameText == "VOLZ" &&
+          rec->kind == 2 && rec->f10 == 1 &&
+          rec->queryMask == 0xffffffffu &&
+          rec->rate == 3.5f && rec->target == 3.5f);
+    if (rec != nullptr) {
+      CHECK(rec->v[0] == -10.0f && rec->v[1] == -20.0f &&
+            rec->v[2] == 7.5f);             // box[2] -= 0.5 (OBSERVED)
+      CHECK(rec->v[3] == 30.0f && rec->v[4] == 40.0f &&
+            rec->v[5] == 50.0f);
+    }
+    // kind==6 derives rate = (box[5]-box[2])/(rate-0.5) before the pad
+    ScriptFixture f2;
+    f2.write(C, {0x90});
+    f2.writeStr(C + 1, "VOL6");
+    f2.writeF(C + 7, 0.0f); f2.writeF(C + 11, 0.0f); f2.writeF(C + 15, 10.0f);
+    f2.writeF(C + 19, 0.0f); f2.writeF(C + 23, 0.0f); f2.writeF(C + 27, 40.0f);
+    f2.write(C + 31, {0x00, 0x06});         // f10=0, kind=6
+    f2.writeF(C + 33, 1.5f);                // rate arg
+    f2.write(C + 37, {0xff});
+    mdk::DynamicObject& o2 = f2.arena->dyn.allocFront();
+    o2.field108 = f2.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f2.env, o2);
+    CHECK(r2.halted && !r2.error);
+    const mdk::SurfaceRecord* rec2 = o2.surface.records;
+    CHECK(rec2 != nullptr && rec2->kind == 6 &&
+          rec2->rate == (40.0f - 10.0f) / (1.5f - 0.5f) &&
+          rec2->v[2] == 9.5f);
+  }
+
+  // -- obj op 0x92: named surface record — FUN_00413380 create --------
+  {
+    ScriptFixture f;
+    f.write(C, {0x92, 0x07});               // surfType 7
+    f.writeStr(C + 2, "CONVY");
+    f.writeF(C + 9, 4.0f);                  // rate
+    f.writeF(C + 13, 0.0f);                 // dir = (0,3,4) -> len 5
+    f.writeF(C + 17, 3.0f);
+    f.writeF(C + 21, 4.0f);
+    f.writeF(C + 25, 1.0f);                 // uv = (1,2)
+    f.writeF(C + 29, 2.0f);
+    f.write(C + 33, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error);
+    const mdk::SurfaceRecord* rec = o.surface.records;
+    CHECK(rec != nullptr && rec->kind == -1 && rec->surfType == 7 &&
+          rec->nameText == "CONVY" && rec->rate == 4.0f &&
+          rec->target == 4.0f);
+    if (rec != nullptr) {
+      CHECK(rec->v[0] == 0.0f && rec->v[1] == 0.6f && rec->v[2] == 0.8f &&
+            rec->v[5] == 0.2f);             // 1/len
+      CHECK(rec->v[3] == 0.2f && rec->v[4] == 0.4f);  // uv * inv len
+      CHECK(rec->queryMask == 0xffffffffu); // +0x1c = -1 (OBSERVED)
+    }
+  }
+
+  // -- obj ops 0x91/0x8f: named rate ramp + record delete -------------
+  {
+    ScriptFixture f;
+    f.write(C, {0x92, 0x02});               // create "V1" surface rec
+    f.writeStr(C + 2, "V1");
+    f.writeF(C + 6, 1.0f);                  // rate 1
+    f.writeF(C + 10, 1.0f); f.writeF(C + 14, 0.0f); f.writeF(C + 18, 0.0f);
+    f.writeF(C + 22, 0.0f); f.writeF(C + 26, 0.0f);
+    f.write(C + 30, {0x91});                // recRate "V1", 5.0, 2.0s
+    f.writeStr(C + 31, "V1");
+    f.writeF(C + 35, 5.0f);                 // target rate
+    f.writeF(C + 39, 2.0f);                 // ramp secs
+    f.write(C + 43, {0x91});                // recRate "V1", 9.0, 0s
+    f.writeStr(C + 44, "V1");
+    f.writeF(C + 48, 9.0f);
+    f.writeF(C + 52, 0.0f);                 // secs 0 -> instant set
+    f.write(C + 56, {0x8f});                // recDel "V1"
+    f.writeStr(C + 57, "V1");
+    f.write(C + 61, {0xff});
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.field108 = f.image.data() + 4 + C;
+    // first pass: create + ramp (script keeps running to 0x8f+end, but
+    // the 0x91 ramp is observable only if we inspect mid-run — run it
+    // whole and check the delete took it; then re-test the ramp fields
+    // with a truncated script).
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.halted && !r.error && o.surface.records == nullptr);
+    ScriptFixture f2;                       // ramp-only variant
+    f2.write(C, {0x92, 0x02});
+    f2.writeStr(C + 2, "V1");
+    f2.writeF(C + 6, 1.0f);
+    f2.writeF(C + 10, 1.0f); f2.writeF(C + 14, 0.0f); f2.writeF(C + 18, 0.0f);
+    f2.writeF(C + 22, 0.0f); f2.writeF(C + 26, 0.0f);
+    f2.write(C + 30, {0x91});
+    f2.writeStr(C + 31, "V1");
+    f2.writeF(C + 35, 5.0f); f2.writeF(C + 39, 2.0f);
+    f2.write(C + 43, {0xff});
+    mdk::DynamicObject& o2 = f2.arena->dyn.allocFront();
+    o2.field108 = f2.image.data() + 4 + C;
+    auto r2 = mdk::traversalObjectScriptTick(f2.env, o2);
+    CHECK(r2.halted && !r2.error);
+    const mdk::SurfaceRecord* rec = o2.surface.records;
+    CHECK(rec != nullptr && rec->target == 5.0f &&
+          rec->ramp == (5.0f - 1.0f) / 2.0f && rec->rate == 1.0f);
+  }
+
   // -- obj op 0x2f: probability link (rng state 1 -> draw 5137) --------
   {
     ScriptFixture f;

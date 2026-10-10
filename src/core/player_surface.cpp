@@ -101,6 +101,7 @@ SurfaceRecord* surfaceRecordCreate(SurfaceObjectState& ctx,
   r->rate = rate;
   r->target = rate;
   r->ramp = 0.0f;
+  r->queryMask = 0xffffffffu;      // FUN_00413380 writes +0x1c = -1
   r->next = ctx.records;
   ctx.records = r;
   return r;
