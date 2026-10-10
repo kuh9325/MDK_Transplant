@@ -580,6 +580,7 @@ class MdkBridge : public RefCounted {
     Ref<Image> atlasImage;
     Ref<ImageTexture> atlasTex;
     Ref<ShaderMaterial> mat;
+    Ref<ShaderMaterial> matFx;   // translucent arm — fx12970 LUT-remap
   };
 
   // Shared frame step behind step_frame/step_frame_input.

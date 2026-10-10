@@ -1737,8 +1737,27 @@ Dictionary MdkBridge::arenaSnapshotDict_(ArenaSet& s) {
   PackedVector3Array positions;
   PackedVector2Array uvs;
   PackedFloat32Array matDesc;
-  Ref<ArrayMesh> mesh = arenaArrayMesh(s.texs, s.tris, &positions,
+  // Split the painter-ordered soup: the translucent LUT-remap polys
+  // (fx12970 — force-field/shimmer surfaces the original draws by
+  // remapping the framebuffer behind them) go to a separate
+  // alpha-blended mesh; everything else stays in the opaque pass.
+  // positions/uvs/matDesc describe the opaque surface (the snapshot
+  // selftest arena HMO_1 carries no fx12970 polys).
+  std::vector<mdk::ArenaMeshTri> opaqueTris, fxTris;
+  opaqueTris.reserve(s.tris.size());
+  for (const auto& t : s.tris) {
+    if (t.cls == mdk::ArenaMatClass::kEffect12970) {
+      fxTris.push_back(t);
+    } else {
+      opaqueTris.push_back(t);
+    }
+  }
+  Ref<ArrayMesh> mesh = arenaArrayMesh(s.texs, opaqueTris, &positions,
                                        &uvs, &matDesc);
+  Ref<ArrayMesh> meshFx;
+  if (!fxTris.empty()) {
+    meshFx = arenaArrayMesh(s.texs, fxTris, nullptr, nullptr, nullptr);
+  }
   // Atlas + material are camera-independent — built lazily once per
   // arena set and reused across painter-order rebuilds.
   if (s.atlasImage.is_null()) {
@@ -1758,6 +1777,20 @@ Dictionary MdkBridge::arenaSnapshotDict_(ArenaSet& s) {
           "MdkBridge: arena_unshaded.gdshader missing");
     }
   }
+  if (s.matFx.is_null()) {
+    s.matFx.instantiate();
+    Ref<Shader> shader =
+        ResourceLoader::get_singleton()->load(
+            "res://shaders/arena_translucent.gdshader");
+    if (shader.is_valid()) {
+      s.matFx->set_shader(shader);
+      if (s.atlasTex.is_valid())
+        s.matFx->set_shader_parameter("atlas", s.atlasTex);
+    } else {
+      UtilityFunctions::printerr(
+          "MdkBridge: arena_translucent.gdshader missing");
+    }
+  }
 
   PackedInt32Array polyOrder;
   polyOrder.resize(static_cast<int64_t>(s.tris.size()));
@@ -1774,6 +1807,11 @@ Dictionary MdkBridge::arenaSnapshotDict_(ArenaSet& s) {
   out["role"] = s.role.c_str();
   out["mesh"] = mesh;
   out["material"] = s.mat;
+  out["has_fx"] = meshFx.is_valid();
+  if (meshFx.is_valid()) {
+    out["mesh_fx"] = meshFx;
+    out["material_fx"] = s.matFx;
+  }
   out["atlas_image"] = s.atlasImage;
   out["positions"] = positions;
   out["uvs"] = uvs;

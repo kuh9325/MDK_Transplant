@@ -948,10 +948,28 @@ func _apply_arena_snapshots() -> void:
 			$ArenaRoot.add_child(node)
 		node.mesh = s["mesh"]
 		node.set_surface_override_material(0, s["material"])
+		# Translucent LUT-remap arm (fx12970 force-field/shimmer polys)
+		# renders in its own alpha-blend pass so the opaque soup keeps
+		# depth-writing. Created only when the arena submits any.
+		var fxnode: MeshInstance3D = $ArenaRoot.get_node_or_null(
+			"Arena_%d_fx" % idx)
+		if bool(s.get("has_fx", false)):
+			if fxnode == null:
+				fxnode = MeshInstance3D.new()
+				fxnode.name = "Arena_%d_fx" % idx
+				$ArenaRoot.add_child(fxnode)
+			fxnode.mesh = s["mesh_fx"]
+			fxnode.set_surface_override_material(0, s["material_fx"])
+			live["%d_fx" % idx] = true
+		elif fxnode != null:
+			fxnode.queue_free()
 		lines.append_array(s["collision_lines"])
 	for child in $ArenaRoot.get_children():
-		var idx := int(child.name.trim_prefix("Arena_"))
-		if not live.has(idx):
+		# Base nodes key as int idx; translucent nodes key as "<idx>_fx".
+		var cn := String(child.name)
+		var key: Variant = cn.trim_prefix("Arena_") if cn.ends_with("_fx") \
+			else int(cn.trim_prefix("Arena_"))
+		if not live.has(key):
 			child.queue_free()
 	# Combined collision soup for the F1 debug view.
 	var arrays := []

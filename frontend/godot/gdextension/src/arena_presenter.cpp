@@ -16,7 +16,9 @@ namespace {
 constexpr std::uint8_t kFxPlaceholderRgb[3][3] = {
     {64, 128, 224},   // fx770    — cool blue
     {224, 160, 48},   // fxe94    — amber
-    {96, 200, 128},   // fx12970  — pale green
+    {0, 255, 255},    // fx12970  — cyan (the energy-barrier tint the
+                      //   LUT-remap fill produces; LEVEL3 palette
+                      //   index 6 is 0,255,255 — OBSERVED authored hue)
 };
 
 }  // namespace
