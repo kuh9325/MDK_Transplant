@@ -27299,6 +27299,47 @@ void test_traversal_teletype() {
     }
     CHECK(r0 && r1);
   }
+
+  // --- script op 0xf7 (0x4511e9): {u8 flags, lstr name, f32 rate} ---
+  // The arena-VM shared-table fallback routes it to the object-VM
+  // handler, which posts through FUN_0041cad0 and continues.
+  {
+    ScriptFixture f;
+    mdk::traversalHudBindTeletypeFti(f.rt, hudTestFti({
+        {"DA2_SNIP", "Shoot targets using\\nsniper mode"},
+    }));
+    const std::uint32_t C = 0x200;
+    f.write(C, {0xf7, 0x01});                   // flags=1 (slide-in)
+    f.writeStr(C + 2, "DA2_SNIP");
+    f.writeF(C + 0xc, 5.0f);                     // rate
+    f.write(C + 0x10, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);
+    CHECK(f.rt.seams.hudMsgPosts == 1);
+    CHECK(f.rt.hud.tt.qWrite == 1);
+    CHECK(f.rt.hud.tt.queue[0].text ==
+          "Shoot targets using\\nsniper mode");
+    CHECK(f.rt.hud.tt.queue[0].flags == 1u);
+    CHECK(f.rt.hud.tt.queue[0].rate == 5.0f);
+  }
+
+  // Resolve miss — FUN_0041cad0's 0x41cb25 bail: the ring is untouched
+  // and the script still continues (no error, next op runs).
+  {
+    ScriptFixture f;
+    mdk::traversalHudBindTeletypeFti(f.rt, hudTestFti({}));
+    const std::uint32_t C = 0x200;
+    f.write(C, {0xf7, 0x03});                   // front-push flags
+    f.writeStr(C + 2, "NO_SUCH");
+    f.writeF(C + 0xb, 2.0f);
+    f.write(C + 0xf, {0xff});
+    f.arena->script.pcImageOff = C;
+    auto r = mdk::traversalScriptRun(f.env);
+    CHECK(r.halted && !r.error);                // script survived
+    CHECK(f.rt.seams.hudMsgPosts == 1);         // post counted pre-resolve
+    CHECK(f.rt.hud.tt.qWrite == 0);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1774,6 +1774,7 @@ opcodes. The native interpreter implements the proven traversal subset:
 | `0x7b` | link | linkage only when ctx-obj ≠ current arena (partner-only) |
 | `0xe0` | flag[,f32,f32] | type-9 slide/deflect-zone; flag 0 clears `0x540e24/cbc` |
 | `0xfc/0x0c` | n,offs | indexed/random call / goto |
+| `0xf7` | u8,lstr,f32 | `FUN_0041cad0` teletype post (0x4511e9) |
 | `0xfd` | — | return |
 | `0xff` | — | end-of-frame (clears running flag) |
 

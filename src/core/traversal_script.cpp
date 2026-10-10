@@ -1452,6 +1452,8 @@ TraversalScriptResult traversalScriptRun(TraversalScriptEnv& env) {
 //             element (FUN_0045c0f0 exact match; the XS damaged-part
 //             gate — LEVEL3 HMO_1$XS XS1_SHOL/SHOR/EYES)
 //   combat:   0x6d {u8} -> FUN_00467888 player damage
+//             0xf7 {u8 flags,lstr name,f32 rate} -> FUN_0041cad0
+//                teletype post (0x4511e9)
 //             0xf8 {u8 mode,f32 a,[f32 b],f32 c} -> melee knockback:
 //             locoState=0x385, eventPriority=9, planar impulse scaled
 //             1/30 into 0x540e44/48, c unscaled into 0x540c78; gates
@@ -4666,6 +4668,24 @@ void objScriptInsn(ObjScriptPass& v) {
         playerDamageApply(*env.rt, dmg, obj.pos);
       return;
     }
+    case 0xf7: {                            // teletype post (0x4511e9)
+      // {u8 flags, lstr name, f32 rate}. OBSERVED: the handler reads
+      // the flag byte into EDX, the length-prefixed FTI record name
+      // into EAX (empty-len names resolve as the empty string), then
+      // calls FUN_0041cad0(name, flags, rate) — the engine-global
+      // status-message post. The LEVEL7 DANT_2 arena uses it for the
+      // second-section mission hints (DA2_PRM/SNIP/GLAS/CRAT/HAND/
+      // PAR/LOB, rate 5.0, flags 1 = slide-in); DANT_1 posts DA1_WSN1.
+      // A resolve miss leaves the ring untouched (FUN_0041cad0's
+      // 0x41cb25 bail) — the script still continues.
+      const std::uint8_t flags = r.u8();
+      const std::string nm = r.str();
+      const float rate = r.f32();
+      if (!r.ok) { v.fail("ttpost"); return; }
+      if (env.rt != nullptr)
+        traversalTeletypePost(*env.rt, nm, flags, rate);
+      return;
+    }
     case 0xf8: {                            // melee knockback (0x448a86)
       // {u8 mode, f32 a, [f32 b if mode==0], f32 c}. OBSERVED — the
       // enemy strike against Kurt. mode==0 reads three floats and
@@ -6001,6 +6021,7 @@ const char* opcodeGrammar(std::uint8_t op) {
   case 0x53: case 0x59: case 0xa0: case 0xbc: case 0xde:
   case 0x9f: case 0xe4:
     return "b";                                // lead u8 + shaped tail
+  case 0xf7: return "bsf";                     // ttPost {u8,lstr,f32}
   case 0xf8: return "bf";                      // knockback {u8,f32} + mode tail
   case 0x21: return "wl";                      // pathLink {u32, linkage}
   case 0x22: return "l";                       // leaderless {linkage}
@@ -6125,7 +6146,7 @@ const char* opcodeName(std::uint8_t op) {
   case 0xcf: return "yawMorph"; case 0x1f: return "elemBind";
   case 0x20: return "elemUnmask"; case 0x26: return "velCmp";
   case 0xf3: return "refEsc";   case 0xd0: return "elemMaskLink";
-  case 0xf8: return "knockback";
+  case 0xf7: return "ttPost";   case 0xf8: return "knockback";
   case 0x14: return "clrEC";    case 0x38: return "hpAdd";
   case 0x2b: return "seekCam";  case 0x4a: return "bind4a";
   case 0x70: return "posLatch"; case 0x8b: return "emit8b";
