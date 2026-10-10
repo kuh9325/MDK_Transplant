@@ -28,6 +28,14 @@ struct TraversalRuntime;
 // item path is the only outcome that lets the scan continue.
 void traversalPickupCollect(TraversalRuntime& rt);
 
+// The freefall->traversal carry grant — applies a 0x49bba0 key/seal
+// table row (kFfEvGrantKey `a`) to the shared 0x54155c inventory
+// block via the FUN_0046a500 insert, so a mid-fall SW_GATT/SW_KEY/
+// SW_SEAL pickup lands in the traversal inventory. The row is the
+// 0-based table index -> item id index+1. No presentation (the
+// freefall pickup's teletype post already ran).
+void traversalInventoryCarryItem(TraversalRuntime& rt, int itemIndex);
+
 // ---------------------------------------------------------------------------
 // P0-C — item use (FUN_00465228 tail + FUN_0046a190; see the cpp for
 // the full evidence map).

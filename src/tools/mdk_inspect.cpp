@@ -38,6 +38,7 @@
 #include "core/mti_directory.h"
 #include "core/mto_directory.h"
 #include "core/player_motion.h"
+#include "core/player_pickup.h"
 #include "core/player_projectiles.h"
 #include "core/player_surface.h"
 #include "core/player_vertical.h"
@@ -2206,6 +2207,7 @@ int main(int argc, char** argv) {
   struct RouteWaypoint { float x, y, z, r; bool jump; };
   std::vector<RouteWaypoint> routeWps;
   std::vector<std::pair<int, int>> ammoSpecs;
+  std::vector<int> itemSpecs;
   std::vector<std::string> bossNames;
   std::optional<std::string> travArena;
   float travStart[3] = {0.0f, 0.0f, 0.0f};
@@ -2460,6 +2462,13 @@ int main(int argc, char** argv) {
       }
       ammoSpecs.emplace_back(std::atoi(spec.substr(0, at).c_str()),
                              std::atoi(spec.c_str() + at + 1));
+    } else if (!std::strcmp(a, "--item")) {
+      // QA enabler: insert inventory item id N (1..9) at init through
+      // the real FUN_0046a500 insert path — lets the harness reach the
+      // itemUse/morph behavior without a physical pickup walk.
+      const char* v = value(a);
+      if (!v) return usage();
+      itemSpecs.push_back(std::atoi(v));
     } else if (!std::strcmp(a, "--boss")) {
       const char* v = value(a);
       if (!v) return usage();
@@ -4128,6 +4137,14 @@ int main(int argc, char** argv) {
         rt.ammo[am.first] = am.second;
         std::printf("ammo-seed: ammo[%d]=%d — QA ONLY\n", am.first,
                     am.second);
+      }
+    }
+    // QA item seeds — the same FUN_0046a500 inventory insert a real
+    // pickup runs, minus the collect presentation.
+    for (const int it : itemSpecs) {
+      if (it >= 1 && it <= 9) {
+        mdk::traversalInventoryCarryItem(rt, it - 1);
+        std::printf("item-seed: item id %d — QA ONLY\n", it);
       }
     }
 

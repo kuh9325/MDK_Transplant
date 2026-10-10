@@ -4035,13 +4035,27 @@ abort in the original).
 
 ## 160. `+0x312` union + the mover-child lifecycle (OBSERVED)
 
-`+0x312` is a contextual union — three views proven:
+`+0x312` is a contextual union — four views proven:
 
 - **connector** (`+0x14a & 0x10`): byte door-state
   (`connState`, §107) — integer, never pointer-relocated.
 - **mover** (`+0x14a & 0x20`): `DynamicObject*` child pointer.
   Save/load treats it as a pointer: `0x42710c` gates `+0x14a&0x20`
   → `FUN_004282dc` rebase at `0x427115`.
+- **script flag group 5** (`0x44..0x48` ops, grp=5): the ctx
+  dword. Connector scripts DO reach it — LEVEL7 `DANT_1$X7DOOR`'s
+  bcast handler `0x9dd` ends `ckpt; brClr 5 6 -> 0x9f7`, a
+  standing poll on connector bit6. The nuke-blast rewrite
+  (cmdBody7 `+0x312 = (b & 0x1f) | 0x80` — clears bits 5/6) is
+  the trigger: on the clear, `0x9f7` runs once (`bcast XF ->
+  0xdb8` cleanup + `bitclr grp1-bit2`), permanently disarming the
+  `0xa72` `SW_KEY`/`SW_NUKE` respawn helper — the original's
+  "nuke drops once" latch. The port previously split grp5 into a
+  separate `scriptFlagsChild` dword, so the poll read a
+  never-written zero and fired at spawn instead; the door then
+  stayed parked past its arm and the helper re-dropped the nuke
+  after the gate opened (owner-reported). The port now aliases
+  the connector bytes and grp5 dword in one union.
 - **AABB extent** (`+0x30e/312/316` f32 block): `FUN_0045612c`
   reads `+0x312` as the half-extent y (`fld * scale → +0xc0`);
   `0x4495b5` snapshots `+0xbc/c0/c4` → `+0x30e/312/316`.

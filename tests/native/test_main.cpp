@@ -15068,6 +15068,59 @@ void test_traversal_object_script() {
           static_cast<const void*>(f.image.data() + 4 + C + 7));
   }
 
+  // --- +0x312 aliasing: grp5 flag ops observe the connector byte ----
+  // LEVEL7 DANT_1$X7DOOR's spawn script (0x9dd) ends `ckpt; brClr 5 6
+  // -> 0x9f7`: a per-tick poll on the same +0x312 dword the connector
+  // phase byte occupies. In the original the nuke-blast rewrite
+  // (cmdBody7 clears bits 5/6, sets 0x80) is what fires the one-shot
+  // arm — `bitclr grp1-bit2`, disabling the SW_KEY respawn helper so
+  // the nuke can't re-drop after the gate opens. A split flag dword
+  // fires the poll at spawn instead (bit6 never set), disarming the
+  // helper early and leaving it armed after the blast -> re-drop.
+  {
+    ScriptFixture f;
+    f.write(C, {0x98}); f.writeW(C + 1, 0x50);   // f312hi -> 0x58
+    f.write(C + 5, {0x01});                       // ckpt -> resume C+6
+    f.write(C + 6, {0x48, 0x05, 0x06, 0x0c});     // brClr 5 6 -> stop
+    f.writeW(C + 10, C + 0x20);
+    f.write(C + 0x0e, {0xff});
+    f.write(C + 0x20, {0x09});                    // one-shot arm: stop
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.connState = 8;                              // born closed
+    o.field108 = f.image.data() + 4 + C;
+    auto r1 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r1.halted && !r1.error && !r1.stopped);
+    CHECK(o.connState == 0x58);                   // f312hi landed
+    CHECK(o.field108 ==
+          static_cast<const void*>(f.image.data() + 4 + C + 6));
+    // Idle polls while bit6 stays set leave the arm unfired.
+    auto r1b = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r1b.halted && !r1b.stopped &&
+          o.field108 ==
+              static_cast<const void*>(f.image.data() + 4 + C + 6));
+    // The nuke blast clears bits 5/6 and sets the unlock bit — the
+    // next poll sees bit6 clear and the one-shot arm fires.
+    o.connState = static_cast<std::uint8_t>((o.connState & 0x1f) | 0x80);
+    auto r2 = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r2.stopped && o.field108 == nullptr);
+    CHECK(o.connState == 0x98);
+  }
+  // The write direction aliases too: a grp5 bitset lands in the
+  // connector phase byte (the same dword a door's own script writes).
+  {
+    ScriptFixture f;
+    f.write(C, {0x44, 0x05, 0x06, 0x09});         // bitset grp5 bit6
+    mdk::DynamicObject& o = f.arena->dyn.allocFront();
+    o.col.named = true;
+    o.connState = 8;
+    o.field108 = f.image.data() + 4 + C;
+    auto r = mdk::traversalObjectScriptTick(f.env, o);
+    CHECK(r.stopped && !r.error);
+    CHECK(o.connState == (8 | 0x40));             // +0x312 bit6 set
+    CHECK((o.scriptFlagsChild & 0x40) != 0);
+  }
+
   // --- wcall (0x5f): pick=0 -> first positive weight -------------------
   {
     ScriptFixture f;
@@ -24855,6 +24908,34 @@ void test_progression_handoff() {
                                           &err) ==
           ProgressionError::kAlreadyHandedOff);
     CHECK(s.mode == 3);
+  }
+
+  // --- freefall key/item grants carry into the traversal inventory ---
+  // SW_GATT is key-table row 5 -> item id 6 (the super-chaingun feed
+  // item); a mid-fall collect must land its record + ammo[0] rounds.
+  {
+    ProgressionSession s;
+    mdk::progressionNewGame(s, 1);              // normal skill
+    mdk::progressionEnterFreefall(s);
+    s.levelId = 0;                              // course 0 -> LEVEL7
+    FreefallRuntime ff;
+    mdk::freefallInit(ff, ffCourse(0, 1), 0xBEEF);
+    ff.finished = true;
+    ff.phase = FreefallRuntime::Phase::kDone;
+    ff.health = 120;
+    ff.events.push_back({mdk::kFfEvGrantKey, 5, 0});   // SW_GATT
+    TraversalRuntime trav;
+    ProgressionHandoff out;
+    CHECK(mdk::progressionFreefallHandoff(*root, s, ff, &trav, out,
+                                          &err) == ProgressionError::kOk);
+    CHECK(out.route == ProgressionRoute::kTraversal);
+    // FUN_0046a500 insert: id6 lands slot 0, charges 1, feeds ammo[0]
+    // by the skill-1 row (kItemAmt[1][5] = 200).
+    CHECK(trav.inventoryCount == 1);
+    CHECK(trav.inventory[0].id == 6);
+    CHECK(trav.inventory[0].charges == 1);
+    CHECK(trav.ammo[0] == 200);
+    CHECK(trav.inventorySel == 0);      // empty-inventory id6 selects
   }
 
   // --- failure route: died -> frontend, no traversal load ---

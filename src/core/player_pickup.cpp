@@ -345,15 +345,62 @@ void traversalItemUseAnimTrigger(TraversalRuntime& rt) {
   itemUseSpawn(rt);
 }
 
-void traversalPickupCollect(TraversalRuntime& rt) {
-  if (rt.cur == nullptr) return;
+// FUN_0046a500 — the shared 0x54155c-block insert (stack an existing
+// id5/id6 record or append a new slot). Returns the slot index the
+// item landed in, or -1 when the five-slot block is full and the
+// pickup is left standing. `*stacked` reports a merge into an
+// existing record so the collect site can pick the plain COLLECT sfx
+// over the new-slot WMIB/insert jingle. Pure state — the item's
+// sfx/notify/despawn presentation stays at the call site.
+int inventoryItemInsert(TraversalRuntime& rt, int itemId,
+                        bool* stacked) {
   const int* row = kItemAmt[rt.difficulty == 0 ? 0
                             : rt.difficulty == 1 ? 1
                                                  : 2];
-  const bool isDant2 = rt.cur->name == "DANT_2";  // +0x540c48 arena
-                                                  // name compare —
-                                                  // the id5 charge
-                                                  // override (OBSERVED)
+  const bool isDant2 = rt.cur != nullptr && rt.cur->name == "DANT_2";
+  if (stacked) *stacked = false;
+  if (itemId == 5 || itemId == 6) {
+    for (int s = 0; s < rt.inventoryCount; ++s) {
+      InventoryRecord& rec = rt.inventory[s];
+      if (rec.id != itemId) continue;
+      // Stack onto the existing slot (0x469885..0x469872). id6 lands
+      // its rounds on ammo[0] and returns before the sel write
+      // (OBSERVED); id5 carries its charge row and selects the slot.
+      if (itemId == 6) rt.ammo[0] += row[5];    // 0x54161f carry rounds
+      else rec.charges += isDant2 ? 1 : row[4];
+      if (itemId != 6) rt.inventorySel = s;
+      if (stacked) *stacked = true;
+      return s;
+    }
+  }
+  if (rt.inventoryCount >= 5) return -1;
+  const int idx = rt.inventoryCount;
+  // id6 selects the new slot only when the inventory was empty
+  // (0x469a19 — OBSERVED exception); all other ids always select.
+  if (itemId != 6 || rt.inventoryCount == 0) rt.inventorySel = idx;
+  rt.inventoryCount += 1;
+  InventoryRecord& rec = rt.inventory[idx];
+  rec.aux = 0;                            // +0x20
+  rec.slotX = idx * 0x30 + 0x20;          // +0x18 HUD target x
+  rec.slotY = 0x148;                      // +0x1c bar row y
+  // animX/animY start at the object's screen-rect center
+  // ((+0x64 + +0x6c)/2, (+0x68 + +0x70)/2) and slide to the slot
+  // at rate 2.0 (0x498d08). +0x64..+0x70 is render-projection
+  // scratch with no headless-core mirror — the port evaluates
+  // the same formulas with the absent input = 0 (the icon flies
+  // from the origin; presentation-only difference).
+  rec.animX = 0.0f;
+  rec.animY = 0.0f;
+  rec.animVel = (static_cast<float>(rec.slotX) - rec.animX) * 2.0f;
+  rec.animAux = (static_cast<float>(rec.slotY) - rec.animY) * 2.0f;
+  rec.id = itemId;
+  rec.charges = (itemId == 5 && !isDant2) ? row[4] : 1;
+  if (itemId == 6) rt.ammo[0] += row[5];
+  return idx;
+}
+
+void traversalPickupCollect(TraversalRuntime& rt) {
+  if (rt.cur == nullptr) return;
   for (auto& up : rt.cur->dyn.storage) {
     DynamicObject& o = *up;
     if (!o.col.named) continue;                    // +0x06
@@ -404,64 +451,44 @@ void traversalPickupCollect(TraversalRuntime& rt) {
     }
 
     // --- item path (the FUN_0046a500 body inlined at 0x46987c+) ---
-    if ((itemId == 5 || itemId == 6) && rt.inventoryCount > 0) {
-      for (int s = 0; s < rt.inventoryCount; ++s) {
-        InventoryRecord& rec = rt.inventory[s];
-        if (rec.id != itemId) continue;
-        // Stack onto the existing slot (0x469885..0x469872).
-        collectSfx(rt, "COLLECT");
-        if (itemId == 6) {
-          rt.ammo[0] += row[5];               // 0x54161f carry rounds
-        } else {
-          rec.charges += isDant2 ? 1 : row[4];
-        }
-        collectNotify(rt, name);              // +0xc — the entry name
-        collectDespawn(rt, o);
-        ++rt.seams.pickupCollects;
-        rt.invHudTimer = 0x3c;                // 0x541558
-        if (itemId == 6) return;              // id6 returns before the
-        rt.inventorySel = s;                  // sel write (OBSERVED)
-        return;                               // 0x541614
-      }
+    bool stacked = false;
+    if (inventoryItemInsert(rt, itemId, &stacked) < 0) {
+      // Full inventory — the object stays; scanning continues
+      // (0x469a2c loop-continue, OBSERVED).
+      continue;
     }
-    if (rt.inventoryCount < 5) {
-      // New slot (0x46998d..0x469b96): id2's sfx is the WMIB record
-      // (0x54c65c — the "World's Most Interesting Bomb" jingle, the
-      // SW_INTER item; MDKFONT.FTI maps SW_INTER -> "World's Most\n
-      // Interesting Bomb", while SW_KEY (id 7) is the nuke -> "World's
-      // Smallest\nNuclear Explosion"); all other ids play COLLECT.
-      collectSfx(rt, itemId == 2 ? "WMIB" : "COLLECT");
-      collectNotify(rt, name);                // +0xc — the entry name
-      rt.invHudTimer = 0x3c;
+    if (stacked) {
+      // Stack onto the existing slot (0x469885..0x469872).
+      collectSfx(rt, "COLLECT");
+      collectNotify(rt, name);              // +0xc — the entry name
       collectDespawn(rt, o);
       ++rt.seams.pickupCollects;
-      const int idx = rt.inventoryCount;
-      // id6 selects the new slot only when the inventory was empty
-      // (0x469a19 — OBSERVED exception); all other ids always select.
-      if (itemId != 6 || rt.inventoryCount == 0) rt.inventorySel = idx;
-      rt.inventoryCount += 1;
-      InventoryRecord& rec = rt.inventory[idx];
-      rec.aux = 0;                            // +0x20
-      rec.slotX = idx * 0x30 + 0x20;          // +0x18 HUD target x
-      rec.slotY = 0x148;                      // +0x1c bar row y
-      // animX/animY start at the object's screen-rect center
-      // ((+0x64 + +0x6c)/2, (+0x68 + +0x70)/2) and slide to the slot
-      // at rate 2.0 (0x498d08). +0x64..+0x70 is render-projection
-      // scratch with no headless-core mirror — the port evaluates
-      // the same formulas with the absent input = 0 (the icon flies
-      // from the origin; presentation-only difference).
-      rec.animX = 0.0f;
-      rec.animY = 0.0f;
-      rec.animVel = (static_cast<float>(rec.slotX) - rec.animX) * 2.0f;
-      rec.animAux = (static_cast<float>(rec.slotY) - rec.animY) * 2.0f;
-      rec.id = itemId;
-      rec.charges = (itemId == 5 && !isDant2) ? row[4] : 1;
-      if (itemId == 6) rt.ammo[0] += row[5];
-      return;
+      rt.invHudTimer = 0x3c;                // 0x541558
+      return;                               // 0x541614
     }
-    // Full inventory — the object stays; scanning continues
-    // (0x469a2c loop-continue, OBSERVED).
+    // New slot (0x46998d..0x469b96): id2's sfx is the WMIB record
+    // (0x54c65c — the "World's Most Interesting Bomb" jingle, the
+    // SW_INTER item; MDKFONT.FTI maps SW_INTER -> "World's Most\n
+    // Interesting Bomb", while SW_KEY (id 7) is the nuke -> "World's
+    // Smallest\nNuclear Explosion"); all other ids play COLLECT.
+    collectSfx(rt, itemId == 2 ? "WMIB" : "COLLECT");
+    collectNotify(rt, name);                // +0xc — the entry name
+    rt.invHudTimer = 0x3c;
+    collectDespawn(rt, o);
+    ++rt.seams.pickupCollects;
+    return;
   }
+}
+
+// The freefall carry grant — a kFfEvGrantKey (a 0x49bba0 key/seal
+// table index) collected mid-fall lands on the shared 0x54155c
+// inventory block in the original via the same FUN_0046a500 write;
+// the port applies that insert at the freefall->traversal handoff.
+// No object/sfx/notify — the freefall pickup's own teletype post
+// already ran. `itemIndex` is the 0-based key-table row -> id+1.
+void traversalInventoryCarryItem(TraversalRuntime& rt, int itemIndex) {
+  if (itemIndex < 0 || itemIndex >= 9) return;
+  inventoryItemInsert(rt, itemIndex + 1, nullptr);
 }
 
 } // namespace mdk

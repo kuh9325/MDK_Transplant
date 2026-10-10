@@ -340,14 +340,30 @@ struct DynamicObject {
   // rawMatrix region only when +0x148 & 0x40 is clear — for a
   // connector it is the destination arena record pointer instead.
   TraversalArena* connDest = nullptr;   // +0x302 (connector only)
-  std::uint8_t connState = 0;           // +0x312 — 8 closed / 2 opening
-                                      //    / 1 open / 4 closing; high
-                                      //    nibble bits 0x40/0x10 are
-                                      //    sub-flags (mask +0x313 bit0
-                                      //    variant, collision toggle)
-  std::uint8_t connStateHi = 0;         // +0x313 — sub-flag byte (bit0
-                                      //    gates the closed-state LOCK
-                                      //    mask choice)
+  // +0x312 — ONE dword in the original with three aliased views: the
+  // connector phase byte (low byte), the +0x313 sub-flag byte, and the
+  // script ctx's flag group 5 dword (0x44..0x48 ops). The views share
+  // storage here too — LEVEL7 DANT_1$X7DOOR's spawn script polls grp5
+  // bit6 (`brClr 5 6`) on this dword: the nuke-blast connector rewrite
+  // (cmdBody7 clears bits 5/6 while setting 0x80) is what fires the
+  // one-shot `bitclr grp1-bit2` that disables the SW_KEY respawn
+  // helper. Splitting the views ran the poll at spawn instead — the
+  // helper stayed armed and the nuke re-dropped after the gate opened.
+  union {
+    struct {
+      std::uint8_t connState;     // +0x312 — 8 closed / 2 opening
+                                  //    / 1 open / 4 closing; high
+                                  //    nibble bits 0x40/0x10 are
+                                  //    sub-flags (mask +0x313 bit0
+                                  //    variant, collision toggle)
+      std::uint8_t connStateHi;   // +0x313 — sub-flag byte (bit0
+                                  //    gates the closed-state LOCK
+                                  //    mask choice)
+      std::uint8_t field314;      // +0x314 — grp5 dword high bytes
+      std::uint8_t field315;      // +0x315
+    };
+    std::uint32_t scriptFlagsChild = 0;  // +0x312 — flag group 5
+  };
   float connRadius = 0.0f;              // +0x30e — proximity radius
   const void* animRecNear = nullptr;   // +0x306 — open anim record
                                       // (connector union member)
@@ -513,17 +529,12 @@ struct DynamicObject {
                                      // call tail clears
                                      // mark[depth+1] (post-increment)
                                      // so index 4 (+0x274) is reachable
-  std::uint32_t scriptFlagsChild = 0;// +0x312 dword — flag group 5;
-                                     // aliases connState's byte on
-                                     // connectors (the ctx and
-                                     // connector layouts overlap)
-  // +0x312 — FUN_004585c4 mover child pointer (the SW_CHUTE spawned
-  // by the hop branch). The original holds the child DynamicObject*
-  // in the same dword the script ctx reads as flag group 5 and the
-  // connector reads as its phase byte — three aliased views of one
-  // field. The port keeps them separate; a mover's scripts do not
-  // reach flag group 5 in BUILD_A, and connector/mover flag bits are
-  // disjoint (+0x14a 0x10 vs 0x20).
+  // +0x312 third view — FUN_004585c4 mover child pointer (the
+  // SW_CHUTE spawned by the hop branch). The original aliases it into
+  // the same dword as connState/scriptFlagsChild; a 64-bit pointer
+  // can't share the 4-byte union, so the port keeps this view split —
+  // mover scripts do not reach flag group 5 in BUILD_A, and
+  // connector/mover flag bits are disjoint (+0x14a 0x10 vs 0x20).
   DynamicObject* moverChild = nullptr;
 
   // --- Phase 11A — path binding (op 0x02, handler 0x438e7c) ---

@@ -5,6 +5,7 @@
 #include "core/progression_runtime.h"
 
 #include "core/data_root.h"
+#include "core/player_pickup.h"
 
 #include <cmath>
 #include <cstdio>
@@ -170,8 +171,21 @@ ProgressionError progressionFreefallHandoff(
   trav->fieldHealth = sess.health;   // 0x541554 carries verbatim
   trav->rngState = sess.rng;         // shared CRT rand stream
   trav->ammo = sess.ammo;            // 0x54161f..33 carries verbatim
+  trav->difficulty = sess.skill;     // 0x54147a carries verbatim
   // (The 541618/19/1a/1b indicator reset lives in the loader — it is
   // part of FUN_00433c4c, which traversalRuntimeLoad folds in.)
+
+  // The 0x54155c inventory block is the other shared global the
+  // original carries untouched — FUN_0046a500 lands freefall key/item
+  // grants (kFfEvGrantKey) there mid-flight, and the loader never
+  // resets it. Applying each grant through the same insert keeps the
+  // SW_GATT super-chaingun (and any carried keys/seals) the collect
+  // wrote during the fall. Runs after the ammo copy so an id-6 grant
+  // adds its feed rounds onto the carried ammo[0].
+  for (const auto& e : ff.events) {
+    if (e.kind != kFfEvGrantKey) continue;
+    traversalInventoryCarryItem(*trav, e.a);
+  }
 
   out.healthAfter = sess.health;
   out.spawnArena = trav->cur ? trav->cur->index : -1;
