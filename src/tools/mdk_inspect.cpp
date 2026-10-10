@@ -1332,6 +1332,27 @@ struct PDamageSpec {
   int frame = -1;
 };
 
+// QA-only `--kill NAME,fF`: drive the authentic death boundary
+// (objectDieFacingPlayer = FUN_004581a4 -> FUN_00458140) on the named
+// live object at frame F — the same entry diagnostic_kill uses in the
+// frontend. Lets the headless trace exercise the +0x110 death-script /
+// FUN_00457cf4 teardown paths without routing a live shot through LOS.
+struct KillSpec {
+  std::string name;
+  int frame = -1;
+};
+
+// QA-only `--elmark NAME@ELEM,fF`: set +0x21e (the element-death mark)
+// on the named live object's matching element at frame F. The object's
+// own namedLink then dispatches its real headshot branch on the next
+// script tick — the same entry a true element kill reaches — so the
+// Commit-F gore ops (elKill/refEmit/decal/sfxPee) can be traced without
+// routing an aimed shot through LOS.
+struct ElemMarkSpec {
+  std::string objName, elemName;
+  int frame = -1;
+};
+
 bool combatBossMatches(const mdk::DynamicObject& o, const char* nm) {
   if (nm[0] == '*') return true;
   // Live-only: the shot scan skips +0x08<=0 objects, and dead
@@ -2199,6 +2220,8 @@ int main(int argc, char** argv) {
   std::optional<std::uint32_t> scriptDisasmOff;
   std::vector<HitSpec> hitSpecs;
   std::vector<PDamageSpec> pdmgSpecs;
+  std::vector<KillSpec> killSpecs;
+  std::vector<ElemMarkSpec> elemMarkSpecs;
   std::vector<int> itemUseFrames;
   struct HoldSpec { int key; int first; int last; };
   std::vector<HoldSpec> holdSpecs;
@@ -2365,6 +2388,40 @@ int main(int argc, char** argv) {
         h.objName = spec;
       }
       hitSpecs.push_back(h);
+    } else if (!std::strcmp(a, "--kill")) {
+      // QA: "NAME,fF" — objectDieFacingPlayer on the named live object
+      // at frame F (the real +0x110 / FUN_00457cf4 death boundary).
+      const char* v = value(a);
+      if (!v) return usage();
+      KillSpec k;
+      const std::string spec = v;
+      const auto cm = spec.find(',');
+      if (cm == std::string::npos || cm + 1 >= spec.size() ||
+          spec[cm + 1] != 'f') {
+        std::fprintf(stderr, "--kill wants NAME,fF\n");
+        return usage();
+      }
+      k.name = spec.substr(0, cm);
+      k.frame = std::atoi(spec.c_str() + cm + 2);
+      killSpecs.push_back(k);
+    } else if (!std::strcmp(a, "--elmark")) {
+      // QA: "NAME@ELEM,fF" — set +0x21e on the named object's matching
+      // element at frame F (element-death mark -> headshot dispatch).
+      const char* v = value(a);
+      if (!v) return usage();
+      ElemMarkSpec e;
+      const std::string spec = v;
+      const auto cm = spec.find(',');
+      const auto at = spec.find('@');
+      if (cm == std::string::npos || at == std::string::npos ||
+          at > cm || cm + 1 >= spec.size() || spec[cm + 1] != 'f') {
+        std::fprintf(stderr, "--elmark wants NAME@ELEM,fF\n");
+        return usage();
+      }
+      e.objName = spec.substr(0, at);
+      e.elemName = spec.substr(at + 1, cm - at - 1);
+      e.frame = std::atoi(spec.c_str() + cm + 2);
+      elemMarkSpecs.push_back(e);
     } else if (!std::strcmp(a, "--pdamage")) {
       // Phase 16B.1: "AMT@FRM" — playerDamageApply(AMT) at the end of
       // frame FRM (post-dispatch, matching the in-level producers).
@@ -4230,6 +4287,75 @@ int main(int argc, char** argv) {
       // element kills — so at most one @ELEM spec fires per frame.
       bool elemShotFired = false;
       fireCombatHits(rt, hitSpecs, elemShotFired, f);
+      for (const auto& k : killSpecs) {
+        if (f != k.frame) continue;
+        mdk::DynamicObject* victim = nullptr;
+        int scanned = 0;
+        for (const auto& ap : rt.arenas) {
+          for (const auto& up : ap->dyn.storage) {
+            mdk::DynamicObject& o = *up;
+            if (o.health <= 0) continue;
+            ++scanned;
+            if (o.scriptClass == k.name || o.scriptName == k.name ||
+                o.model.modelName() == k.name) {
+              victim = &o;
+              break;
+            }
+          }
+          if (victim != nullptr) break;
+        }
+        if (victim == nullptr) {
+          std::printf("kill:   %s f=%d -> no live object (scanned=%d)\n",
+                      k.name.c_str(), f, scanned);
+          continue;
+        }
+        const std::size_t fx0 = rt.combatFx.size();
+        mdk::objectDieFacingPlayer(rt, *victim);
+        std::printf("kill:   %s f=%d -> ev=%zu kind=%d\n", k.name.c_str(),
+                    f, rt.combatFx.size() - fx0,
+                    rt.combatFx.empty() ? -1
+                                        : int(rt.combatFx.back().kind));
+      }
+      for (const auto& e : elemMarkSpecs) {
+        if (f != e.frame) continue;
+        mdk::DynamicObject* victim = nullptr;
+        int scanned = 0;
+        for (const auto& ap : rt.arenas) {
+          for (const auto& up : ap->dyn.storage) {
+            mdk::DynamicObject& o = *up;
+            if (o.health <= 0) continue;
+            ++scanned;
+            if (o.scriptClass == e.objName || o.scriptName == e.objName ||
+                o.model.modelName() == e.objName) {
+              victim = &o;
+              break;
+            }
+          }
+          if (victim != nullptr) break;
+        }
+        if (victim == nullptr) {
+          std::printf("elmark: %s@%s f=%d -> no live object (scanned=%d)\n",
+                      e.objName.c_str(), e.elemName.c_str(), f, scanned);
+          continue;
+        }
+        int ei = -1;
+        for (int i = 0; i < victim->elemSet.count; ++i) {
+          if (victim->model.elemName(std::size_t(i)) == e.elemName) {
+            ei = i;
+            break;
+          }
+        }
+        if (ei < 0) {
+          std::printf("elmark: %s@%s f=%d -> no such element\n",
+                      e.objName.c_str(), e.elemName.c_str(), f);
+          continue;
+        }
+        const std::size_t fx0 = rt.combatFx.size();
+        victim->field21e = static_cast<std::uint8_t>(ei + 1);
+        std::printf("elmark: %s@%s f=%d -> mark=%d ev pending\n",
+                    e.objName.c_str(), e.elemName.c_str(), f, ei + 1);
+        (void)fx0;
+      }
       const bool colProfFrame =
           std::getenv("MDK_COL_PROFILE_FRAME") != nullptr;
       const mdk::CollisionProfile colPrev =
@@ -4305,6 +4431,21 @@ int main(int argc, char** argv) {
           mdk::stepTraversalRuntime(rt, raw, bindings, timing);
       prevGrounded = out.grounded;
       ++framesRun;
+      // QA: drain + print the frame's combatFx so the gore events
+      // (elKill/refEmit/decal/sfxPee -> kinds 7-10) surface in the
+      // trace the frame they're emitted — elmark's headshot branch
+      // fires the tick after the mark is written.
+      if (!elemMarkSpecs.empty() || !killSpecs.empty()) {
+        for (const mdk::CombatFxEvent& ev : rt.combatFx) {
+          std::printf("      fx   f=%03d kind=%d pos=(%.1f,%.1f,%.1f) "
+                      "elem=%d ref=%d/%d model=%s\n",
+                      f, int(ev.kind),
+                      (double)ev.pos[0], (double)ev.pos[1],
+                      (double)ev.pos[2], ev.elemIndex, ev.refPoint,
+                      ev.refParam, ev.modelName.c_str());
+        }
+        rt.combatFx.clear();
+      }
       for (const int iu : itemUseFrames)
         if (iu == f || iu + 1 == f || iu + 10 == f) {
           const char* itemName = "-";
