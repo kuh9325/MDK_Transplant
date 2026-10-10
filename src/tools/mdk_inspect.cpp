@@ -2223,6 +2223,7 @@ int main(int argc, char** argv) {
   std::vector<KillSpec> killSpecs;
   std::vector<ElemMarkSpec> elemMarkSpecs;
   std::vector<int> itemUseFrames;
+  std::vector<std::string> namedModels;
   struct HoldSpec { int key; int first; int last; };
   std::vector<HoldSpec> holdSpecs;
   std::vector<HoldSpec> pressSpecs;
@@ -2443,6 +2444,13 @@ int main(int argc, char** argv) {
       const char* v = value(a);
       if (!v) return usage();
       itemUseFrames.push_back(std::atoi(v));
+    } else if (!std::strcmp(a, "--namedmodel")) {
+      // QA: dump a named model's element/AABB structure after the
+      // traversal load — e.g. --namedmodel SW_NUKE resolves the nuke
+      // device's authored can/CLOUD/shock elements + natural size.
+      const char* v = value(a);
+      if (!v) return usage();
+      namedModels.push_back(v);
     } else if (!std::strcmp(a, "--hold")) {
       // QA enabler: hold raw key CODE level-high for frames A..B.
       const char* v = value(a);
@@ -4144,6 +4152,42 @@ int main(int argc, char** argv) {
           a->dyn.storage.size(), a->rec->subRecordCount,
           (double)a->scalar,
           a->hasScriptObject ? "script-obj" : "");
+
+    // QA `--namedmodel NAME` — resolve a named model and dump its
+    // authored element/AABB structure (per-element local AABB + the
+    // model's union span). Lets a headless run inspect device/gore
+    // models like SW_NUKE's can/CLOUD composition.
+    for (const std::string& nm : namedModels) {
+      const mdk::RuntimeModel* mdl = mdk::traversalNamedModel(rt.level, nm);
+      if (mdl == nullptr) {
+        std::printf("namedmodel %-10s : NOT FOUND (enemy-table miss)\n",
+                    nm.c_str());
+        continue;
+      }
+      float lo[3] = {1e30f, 1e30f, 1e30f};
+      float hi[3] = {-1e30f, -1e30f, -1e30f};
+      for (const auto& e : mdl->elems)
+        for (int k = 0; k < 3; ++k) {
+          lo[k] = std::min(lo[k], e.localAabb[k]);
+          hi[k] = std::max(hi[k], e.localAabb[k + 3]);
+        }
+      std::printf(
+          "namedmodel %-10s : elems=%zu refs=%u unionAABB z=[%g..%g] "
+          "xy=[(%g..%g),(%g..%g)] model=%s\n",
+          nm.c_str(), mdl->elems.size(), mdl->refPointCount,
+          (double)lo[2], (double)hi[2], (double)lo[0], (double)hi[0],
+          (double)lo[1], (double)hi[1], mdl->modelName().c_str());
+      for (std::size_t e = 0; e < mdl->elems.size(); ++e) {
+        const auto& el = mdl->elems[e];
+        std::printf(
+            "    elem[%2zu] %-12s localAABB z=[%7.2f..%7.2f] "
+            "x=[%7.2f..%7.2f] y=[%7.2f..%7.2f]\n",
+            e, mdl->elemName(e).c_str(), (double)el.localAabb[2],
+            (double)el.localAabb[5], (double)el.localAabb[0],
+            (double)el.localAabb[3], (double)el.localAabb[1],
+            (double)el.localAabb[4]);
+      }
+    }
 
     // NATIVE DIAGNOSTIC OVERRIDE — not original spawn behavior.
     if (travArena || travStartGiven || travYawGiven) {
