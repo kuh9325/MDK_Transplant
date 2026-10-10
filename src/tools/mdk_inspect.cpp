@@ -4655,10 +4655,30 @@ int main(int argc, char** argv) {
             if (tok.find(want) == std::string::npos &&
                 o.scriptClass.find(want) == std::string::npos)
               continue;
+            // Anim-vert digest — proves whether bound channels actually
+            // deform elemVerts (channel application) vs a bound-but-
+            // static pose. Plus the record header (rate/ch/fr) to name
+            // which rec is bound.
+            std::uint64_t vdig = 0xcbf29ce484222325ull;
+            for (const auto& ev : o.model.elemVerts)
+              for (float v : ev) {
+                std::uint32_t bits;
+                std::memcpy(&bits, &v, 4);
+                vdig = (vdig ^ bits) * 0x100000001b3ull;
+              }
+            float recRate = 0.0f;
+            std::uint32_t recCh = 0, recFr = 0;
+            if (o.animRec != nullptr) {
+              const auto* h = static_cast<const std::uint8_t*>(o.animRec);
+              std::memcpy(&recRate, h, 4);
+              std::memcpy(&recCh, h + 4, 4);
+              std::memcpy(&recFr, h + 8, 4);
+            }
             std::printf(
                 "      TDOOR f=%d %s home=%s pos=(%.1f,%.1f,%.1f) "
                 "aabb=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) anim=%c cur=%d "
-                "lat=%04x f148=%04x f14a=%02x hp=%d v21e=%02x\n",
+                "acc=%.2f lat=%04x f148=%04x f14a=%02x hp=%d v21e=%02x "
+                "rec=(%.2f,%d,%d) vdig=%016llx\n",
                 f, tok.c_str(),
                 o.arena && o.arena->owner ? o.arena->owner->name.c_str()
                                           : "?",
@@ -4667,9 +4687,12 @@ int main(int argc, char** argv) {
                 (double)o.col.aabb[2], (double)o.col.aabb[3],
                 (double)o.col.aabb[4], (double)o.col.aabb[5],
                 o.animRec ? 'Y' : 'n', (int)o.animFrame,
+                (double)o.animAcc,
                 (unsigned)(std::uint16_t)o.animLatch,
                 (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
-                o.health, (unsigned)o.field21e);
+                o.health, (unsigned)o.field21e,
+                (double)recRate, (int)recCh, (int)recFr,
+                (unsigned long long)vdig);
           }
       }
       // The digest mixes only deterministic state — raw contact

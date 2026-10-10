@@ -97,6 +97,13 @@ var ff_dump_every := 1        # --ff-dump-every N: capture every Nth rendered fr
 var _ff_dump_count := 0
 var _shot_pass_lo := -160.0   # --shot-pass-window LO HI: dz trigger window
 var _shot_pass_hi := -25.0
+var _kill_obj_name := ""      # --killobj NAME,F: diagnostic_kill the
+                              # first live object whose script_name/
+                              # script_class/model matches NAME at
+                              # gameplay step F (QA repro only)
+var _kill_obj_frame := -1
+var _qa_step := 0
+var _kill_done := false
 var _ff_held := {}            # synthetic key state for --ff-steer
 var _ff_jink := 0             # committed jink keycode (0 = none)
 var demo_frame := 0
@@ -520,6 +527,11 @@ func _ready() -> void:
 	# combat presentation without a harness.
 	combat_demo = "--combat-demo" in args
 	chute_demo = "--chute-demo" in args
+	var kill_obj := _arg_value(args, "--killobj", "")
+	if not kill_obj.is_empty():
+		var kparts := kill_obj.split(",")
+		_kill_obj_name = kparts[0]
+		_kill_obj_frame = int(kparts[1]) if kparts.size() > 1 else 5
 	step_shot = "--step" in args
 	ff_steer = "--ff-steer" in args
 	ff_trace = "--ff-trace" in args
@@ -4419,6 +4431,23 @@ func _process(delta: float) -> void:
 			if step_mode != 2 and step_mode != 3:
 				break   # mode flipped mid-frame — other presenters own it
 			bridge.step_frame_input(STREAM_STEP_MS, input)
+			if step_mode == 3 and not _kill_obj_name.is_empty() \
+					and not _kill_done:
+				_qa_step += 1
+				if _qa_step >= _kill_obj_frame:
+					for od in bridge.get_object_snapshots():
+						if String(od["script_name"]) == _kill_obj_name or \
+								String(od["script_class"]) == _kill_obj_name or \
+								String(od["model"]) == _kill_obj_name:
+							bridge.diagnostic_kill(int(od["id"]))
+							_kill_done = true
+							print("killobj: ", _kill_obj_name,
+								" id=", od["id"], " f=", _qa_step)
+							break
+					if not _kill_done:
+						_kill_done = true
+						printerr("killobj: no object named ",
+							_kill_obj_name)
 			n -= 1
 			if first_step:
 				# Device deltas are per-sample-period — applying them
