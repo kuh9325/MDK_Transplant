@@ -2450,6 +2450,7 @@ void objScriptInsn(ObjScriptPass& v) {
       // and +0x30e[i] = low16(hpThresh). The only real user in
       // LEVEL3..8 is LEVEL3 HMO_1$XH1_DOOR {XH1_KEY, 7, 120, 0}.
       obj.col.flags149 |= 0x20;
+      obj.col.flags148 |= 0x2000u;             // byte1 mirror stays coherent
       obj.homingPrefix = r.str();
       obj.homingDigitOfs = r.u8();
       const std::uint32_t hp = r.u32();

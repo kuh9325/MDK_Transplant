@@ -18508,6 +18508,142 @@ void test_swinter_anim_binding() {
 }
 
 // ---------------------------------------------------------------------------
+// SW_KEY (item 7) flight->exec transition flag width. OBSERVED
+// (FUN_0045897c): the transition is two BYTE writes — byte[+0x148]
+// &= 0xf9, then byte[+0x149] |= 0x40. The port's flags148 is a u16
+// covering bytes +0x148/+0x149, so the low-byte mask is ~0x06, NOT
+// 0xf9 — masking the u16 by 0xf9 also zeroes byte +0x149 and drops its
+// +0x10 render-transform skip latch. flags149 must stay a coherent
+// mirror of byte +0x149.
+// ---------------------------------------------------------------------------
+
+void test_swkey_transition_flagwidth() {
+  for (const std::uint16_t start : {std::uint16_t(0x18a6),
+                                    std::uint16_t(0x08a0)}) {
+    mdk::TraversalRuntime rt;
+    mdk::DynamicArena home;
+    home.col.objects = nullptr;
+    mdk::DynamicObject& o = home.allocFront();
+    o.col.named = true;
+    o.enemyIndex = 0;
+    o.field30a = 2;                       // SW_INTER — its transition-init
+                                          //   body doesn't touch flags
+    o.field30e = 1;                       // fuse expires -> transition
+    o.col.scale = 1.0f;
+    o.col.flags148 = start;
+    o.col.flags149 = static_cast<std::uint8_t>(start >> 8);
+    o.col.flags14a = 0x08;
+    o.col.flags14c = 0;
+    o.model = makePlatformModel("SW_INTER", "SW_INTER", 0.0f);
+    o.syncCollisionView();
+    // byte[+0x148]&=0xf9 keeps bit0+hi bits; byte[+0x149]|=0x40.
+    const std::uint16_t want =
+        static_cast<std::uint16_t>((start & 0xfff9u) | 0x4000u);
+    mdk::enemyCommandDispatch(rt, o, home, 1.0f / 30.0f);
+    CHECK(o.col.flags148 == want);        // NOT start&0x00f9 (u16 bug)
+    CHECK(o.col.flags149 ==
+          static_cast<std::uint8_t>(want >> 8));
+    CHECK((o.col.flags148 & 0x1000) == (start & 0x1000));  // +0x149
+                                                          // bit0x10 held
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SW_KEY -> SW_NUKE/GLASS4 morph lifecycle (the "World's Smallest
+// Nuclear Explosion" deployment). The byte-flag transition keeps
+// +0x149's +0x10 latch, so the render transform/AABB stay frozen at
+// the throw-point +0xac while logical pos drifts — the cloud deploys
+// where the can sat, not at the projectile's landing coordinate.
+// ---------------------------------------------------------------------------
+
+void test_swkey_morph_lifecycle() {
+  mdk::TraversalRuntime rt;
+  rt.cur = travArenaAdd(rt, "A");
+  pkEntry(rt, "FILLER");                          // eidx 0 (JG needs >0)
+  const int keyIdx = pkEntry(rt, "SW_KEY");       // eidx 1
+  const int nukeIdx = pkEntry(rt, "SW_NUKE");     // eidx 2
+  rt.level.models.resize(3);
+  rt.level.modelTried.assign(3, false);
+  rt.level.models[keyIdx] = makePlatformModel("SW_KEY", "SW_KEY", 0.0f);
+  rt.level.models[nukeIdx] = makePlatformModel("GLASS4", "CLOUD", 0.0f);
+
+  // A 3-frame SW_NUKE anim record with a "CLOUD" delta channel.
+  std::vector<std::uint8_t> nrec;
+  aF(nrec, 1.0f);
+  aW(nrec, 1);
+  aW(nrec, 3);
+  const std::size_t nOff = nrec.size();
+  aW(nrec, 0);
+  aV3(nrec, 0, 0, 0); aV3(nrec, 0, 0, 0); aV3(nrec, 0, 0, 0);
+  aW(nrec, 0);                                     // refCount
+  const std::uint32_t nch =
+      static_cast<std::uint32_t>(nrec.size() - 4);
+  nrec[nOff + 0] = static_cast<std::uint8_t>(nch);
+  nrec[nOff + 1] = static_cast<std::uint8_t>(nch >> 8);
+  nrec[nOff + 2] = static_cast<std::uint8_t>(nch >> 16);
+  nrec[nOff + 3] = static_cast<std::uint8_t>(nch >> 24);
+  aName(nrec, "CLOUD");
+  aW(nrec, 3);                                     // vertCount
+  aF(nrec, 1.0f);                                  // scale (delta)
+  aV3(nrec, 0, 0, 0); aV3(nrec, 1, 0, 0); aV3(nrec, 2, 0, 0);
+  aH(nrec, 1);                                     // delta key frame 1
+  for (int i = 0; i < 9; ++i) nrec.push_back(4);
+  aH(nrec, -1);                                    // terminator
+  rt.animSwNuke = nrec.data();
+
+  rt.inventory[0].id = 7;
+  rt.inventory[0].charges = 1;
+  rt.inventoryCount = 1;
+  rt.inventorySel = 0;
+  rt.cs.pos[0] = 10.f; rt.cs.pos[1] = 20.f; rt.cs.pos[2] = 30.f;
+  rt.motion.yawDeg = 90.0f;
+  iuAirborne(rt, 0x2be);
+  mdk::traversalItemUseEdge(rt);
+  CHECK(rt.seams.itemSpawnCalls == 1);
+  CHECK(rt.cur->dyn.storage.size() == 1);
+  mdk::DynamicObject& o = *rt.cur->dyn.storage.front();
+  CHECK(o.field30a == 7);
+  CHECK(o.col.flags148 == 0x18a6);                 // thrown cmd-object
+  CHECK(o.col.flags149 == 0x18);                   // coherent mirror
+
+  // The render transform/AABB were built once at the throw origin;
+  // logical pos then drifts through the arc while +0xac stays put.
+  const float ox = o.col.origin[0], oy = o.col.origin[1],
+              oz = o.col.origin[2];
+  const float aabb0 = o.col.aabb[0], aabb1 = o.col.aabb[1],
+              aabb2 = o.col.aabb[2], aabb3 = o.col.aabb[3],
+              aabb4 = o.col.aabb[4], aabb5 = o.col.aabb[5];
+  o.pos[0] += 3.0f; o.pos[1] += 40.0f; o.pos[2] -= 30.0f;  // flight drift
+  o.col.flags14c |= 1;                       // wall contact -> cmd7
+  mdk::enemyCommandDispatch(rt, o, rt.cur->dyn, 1.0f / 30.0f);
+
+  CHECK(o.col.flags148 == 0x58a0);           // byte ops — NOT 0x00a0
+  CHECK(o.col.flags149 == 0x58);
+  CHECK((o.col.flags148 & 0x1000) != 0);     // render-skip latch held
+  CHECK(o.model.modelName() == "GLASS4");    // SW_NUKE's own model name
+  CHECK(o.animRec == rt.animSwNuke);         // SW_NUKE record armed
+  CHECK(o.animRate == 30.0f);
+  CHECK(o.field30e == 900);                  // +0x30e = 0x384 lifetime
+  CHECK(o.field15c == "GLASS4");
+
+  // Frozen +0xac transform / +0x198 aabb — NOT rebuilt to the drifted
+  // pos (that rebuild is gated behind the +0x10 latch the old u16
+  // mask wiped). Logical pos stays distinct — splashDamage reads it.
+  CHECK(o.col.origin[0] == ox && o.col.origin[1] == oy &&
+        o.col.origin[2] == oz);
+  CHECK(o.col.aabb[0] == aabb0 && o.col.aabb[1] == aabb1 &&
+        o.col.aabb[2] == aabb2 && o.col.aabb[3] == aabb3 &&
+        o.col.aabb[4] == aabb4 && o.col.aabb[5] == aabb5);
+  CHECK(o.pos[1] == 60.0f);
+
+  // animSwNuke advances through its record.
+  const std::uint8_t* nlim = nrec.data() + nrec.size();
+  for (int i = 0; i < 8 && o.animFrame < 2; ++i)
+    mdk::objectAnimTick(o, nlim);
+  CHECK(o.animFrame == 2);                   // reached the last frame
+}
+
+// ---------------------------------------------------------------------------
 // Phase 5J — player look and view orientation
 // ---------------------------------------------------------------------------
 
@@ -33436,6 +33572,8 @@ int main() {
   test_object_animation();
   test_travsprt_anim_payload();
   test_swinter_anim_binding();
+  test_swkey_transition_flagwidth();
+  test_swkey_morph_lifecycle();
   test_player_look();
   test_traversal_chute_dispatch();
   test_player_camera();

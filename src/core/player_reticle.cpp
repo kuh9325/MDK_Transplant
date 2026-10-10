@@ -266,6 +266,7 @@ void playerReticleFireBomb(TraversalRuntime& rt,
   o.field30a = 0x81;                // +0x30a — the bomb command body
   o.field44 = 0.0f;                 // +0x44 — drag off
   o.col.flags148 |= 0x18a6;         // +0x148 dword |= 0x818a6
+  o.col.flags149 = static_cast<std::uint8_t>(o.col.flags148 >> 8);  // byte1 mirror
   o.col.flags14a |= 0x08;
   o.field28 = vel[0];               // +0x28..+0x30 — launch velocity
   o.field2c = vel[1];

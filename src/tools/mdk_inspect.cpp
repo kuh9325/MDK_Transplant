@@ -4179,13 +4179,41 @@ int main(int argc, char** argv) {
           (double)lo[1], (double)hi[1], mdl->modelName().c_str());
       for (std::size_t e = 0; e < mdl->elems.size(); ++e) {
         const auto& el = mdl->elems[e];
+        // QA: distinct material indices present in this element's tris
+        // (s16 @tri+6, same field the presenter surface-split reads) —
+        // reveals whether a base element like TRUNK is drawable.
+        std::string mats;
+        {
+          const auto& tris = mdl->elemTris[e];
+          const std::size_t tc = tris.size() / 0x24;
+          std::vector<std::int16_t> seen;
+          for (std::size_t t = 0; t < tc; ++t) {
+            std::int16_t mi;
+            std::memcpy(&mi, tris.data() + t * 0x24 + 6, 2);
+            bool have = false;
+            for (std::int16_t x : seen) have |= (x == mi);
+            if (!have) seen.push_back(mi);
+          }
+          for (std::int16_t mi : seen) {
+            char b[32];
+            std::snprintf(b, sizeof(b), "%s%d", mats.empty() ? "" : ",",
+                          (int)mi);
+            mats += b;
+          }
+        }
         std::printf(
             "    elem[%2zu] %-12s localAABB z=[%7.2f..%7.2f] "
-            "x=[%7.2f..%7.2f] y=[%7.2f..%7.2f]\n",
+            "x=[%7.2f..%7.2f] y=[%7.2f..%7.2f] verts=%zu tris=%zu mats=[%s]\n",
             e, mdl->elemName(e).c_str(), (double)el.localAabb[2],
             (double)el.localAabb[5], (double)el.localAabb[0],
             (double)el.localAabb[3], (double)el.localAabb[1],
-            (double)el.localAabb[4]);
+            (double)el.localAabb[4], mdl->elemVerts[e].size() / 3,
+            mdl->elemTris[e].size() / 0x24, mats.c_str());
+      }
+      // QA: model name-table (material names resolved via matlkup)
+      for (std::size_t i = 0; i < mdl->names.size(); ++i) {
+        std::printf("    name[%2zu] %s\n", i,
+                    mdl->names[i].name.data());
       }
     }
 
@@ -4837,8 +4865,11 @@ int main(int argc, char** argv) {
           for (const auto& up : ap->dyn.storage) {
             const mdk::DynamicObject& o = *up;
             const std::string tok = o.model.modelName();
+            // Also catch emptied-model zombies (model cleared without
+            // teardown) when watching — they still occupy storage.
             if (tok.find(want) == std::string::npos &&
-                o.scriptClass.find(want) == std::string::npos)
+                o.scriptClass.find(want) == std::string::npos &&
+                !tok.empty())
               continue;
             // Anim-vert digest — proves whether bound channels actually
             // deform elemVerts (channel application) vs a bound-but-
@@ -4861,13 +4892,18 @@ int main(int argc, char** argv) {
             }
             std::printf(
                 "      TDOOR f=%d %s home=%s pos=(%.1f,%.1f,%.1f) "
+                "org=(%.1f,%.1f,%.1f) "
                 "aabb=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) anim=%c cur=%d "
                 "acc=%.2f lat=%04x f148=%04x f14a=%02x hp=%d v21e=%02x "
-                "rec=(%.2f,%d,%d) vdig=%016llx\n",
+                "rec=(%.2f,%d,%d) vdig=%016llx "
+                "vel=(%.2f,%.2f,%.2f) f14c=%02x f30e=%d f149=%02x "
+                "f30a=%u scl=%.2f drag=%.1f em=%08x\n",
                 f, tok.c_str(),
                 o.arena && o.arena->owner ? o.arena->owner->name.c_str()
                                           : "?",
                 (double)o.pos[0], (double)o.pos[1], (double)o.pos[2],
+                (double)o.col.origin[0], (double)o.col.origin[1],
+                (double)o.col.origin[2],
                 (double)o.col.aabb[0], (double)o.col.aabb[1],
                 (double)o.col.aabb[2], (double)o.col.aabb[3],
                 (double)o.col.aabb[4], (double)o.col.aabb[5],
@@ -4877,7 +4913,12 @@ int main(int argc, char** argv) {
                 (unsigned)o.col.flags148, (unsigned)o.col.flags14a,
                 o.health, (unsigned)o.field21e,
                 (double)recRate, (int)recCh, (int)recFr,
-                (unsigned long long)vdig);
+                (unsigned long long)vdig,
+                (double)o.field28, (double)o.field2c, (double)o.field30,
+                (unsigned)o.col.flags14c, (int)o.field30e,
+                (unsigned)o.col.flags149, (unsigned)o.field30a,
+                (double)o.col.scale, (double)o.field44,
+                (unsigned)o.col.elemMaskB);
           }
       }
       // The digest mixes only deterministic state — raw contact

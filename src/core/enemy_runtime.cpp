@@ -1194,6 +1194,8 @@ void cmdDropperSpawn(TraversalRuntime& rt, DynamicObject& o,
   // +0x148 dword |= 0x818a6 — bytes {a6,18,08,00} -> flags148|=0x18a6
   // covers +0x148/+0x149, flags14a |= 0x08.
   child.col.flags148 |= 0x18a6;
+  child.col.flags149 =
+      static_cast<std::uint8_t>(child.col.flags148 >> 8);  // byte1 mirror
   child.col.flags14a |= 0x08;
   rebuildObjectTransform(child);               // FUN_0045612c
   child.field15c = o.model.modelName();        // PTR_DAT_0049b854 token
@@ -1355,9 +1357,14 @@ void enemyCommandDispatch(TraversalRuntime& rt, DynamicObject& o,
   if (o.field30a == 4u && (o.col.flags14c & 2) == 0) return;
   // TRANSITION to exec (+0x149 |= 0x40) — vel cleared, contacts
   // cleared, gravity/sweep bits off.
+  // OBSERVED (FUN_0045897c): two BYTE writes — byte[+0x148] &= 0xf9,
+  // then byte[+0x149] |= 0x40. As a u16 op the low-byte mask is
+  // ~0x06, NOT 0xf9 — masking the u16 by 0xf9 also wipes byte
+  // +0x149, dropping its 0x10 render-transform skip latch.
   o.field30 = 0.0f;
-  o.col.flags148 &= 0xf9u;
-  o.col.flags149 |= 0x40;
+  o.col.flags148 &= 0xfff9u;
+  o.col.flags148 |= 0x4000u;
+  o.col.flags149 = static_cast<std::uint8_t>(o.col.flags148 >> 8);
   o.col.flags14c &= 0xec;
   o.field2c = o.field30;
   o.field28 = o.field2c;
