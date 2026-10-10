@@ -505,8 +505,22 @@ The camera is the fixed-orientation `FUN_004123f4` block — the
 bridge surfaces it through the same pose/basis contract as the
 traversal camera (right/down/back rows, `scaleZ=+1` "overhead"
 variant, 600×360 zoom-2.4 projection → ~71.36° vertical FOV).
-`fade` drives a full-viewport overlay (the palette-brightness
-machine: 1 = full, 0 = black, >1 = the damage flash).
+`fade` drives a full-viewport overlay whose dim *target* follows
+the observed mode-2 dispatch: intro countdown >90 fades in from
+black, countdown <60 dims toward white (the atmosphere-entry
+flash), play-phase ramps and the post-intro ramp-in dim toward
+white (`0x40fba0`), while the death fade (`health<=0`) and the
+level-exit fade (`timeline>31`) dim toward black (`0x40fb08`).
+`fade>1` remains the saturating damage flash.
+
+The 150-countdown intro (`FUN_0040ff78`) composites the
+SPACE/MOON/EARTH records through the original eased sprite
+contracts plus the ZOOM-table LUT-remap band, in the SPACEPAL
+domain (mode-2 init binds `0x4edb2c`=SPACEPAL and builds the LUT
+against it at `0x40f518`; it rebinds FALLP at countdown 0). Once
+the countdown elapses `ff_hud_frame()` surfaces the mode-2 HUD —
+the SC_STAT gauge plus SNIP_TXT health digits at the
+`FUN_00417e20` positions — as a transparent RGBA overlay.
 
 Completion is health-gated exactly like the dispatcher's mode-2
 tail: `step_frame` returns `done` plus `handoff_route`; route 0
@@ -519,12 +533,11 @@ runtime stays authoritative.
 
 Deferred presentation seams (surfaced as state only): the kind-3
 BANG frame-block overlay (the EXPLODE model mesh still renders),
-the `ZOOM%04d` intro sprite sequence, and palette cycling (the
-0.5·frameUnits accumulator surfaces as `palette_cycle` but is not
-applied to the presented palette). Presented: the procedural
-`FUN_00411f48` type-3 RADAR wedge, the kind-4 missile trail and
-kind-5 launch glow (screen-reading LUT veils), and the sound bank
-set (the `kFfEvSound` drain).
+and palette cycling (the 0.5·frameUnits accumulator surfaces as
+`palette_cycle` but is not applied to the presented palette).
+Presented: the procedural `FUN_00411f48` type-3 RADAR wedge, the
+kind-4 missile trail and kind-5 launch glow (screen-reading LUT
+veils), and the sound bank set (the `kFfEvSound` drain).
 
 ## Arena transitions + display set (G3)
 

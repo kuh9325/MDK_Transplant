@@ -253,6 +253,41 @@ struct FreefallScene {
   // PICK — the kind-1 marker sprite drawn for +0x10c objects.
   BackdropSprite pick;
 
+  // SPACE/MOON/EARTH — the FUN_0040ff78 intro-scene resources
+  // (0x4edb28/0x4edb24/0x4edb20). SPACE is a full 600x360 indexed
+  // frame blitted opaque (FUN_0040fcb0); MOON/EARTH composite
+  // transparent (index-0 skip) through the same FUN_00403a40 ->
+  // 0x46d680 scaled-sprite emitter the chunk sprites use, with the
+  // authored center/scale easing OBSERVED at 0x40fe18/0x40fec0.
+  BackdropSprite space, moon, earth;
+  // SPACEPAL (0x4edb2c) — the intro-scene palette. The init tail
+  // forces entry 0 to black (0x40f0f3). During the intro the whole
+  // presentation maps through this palette — fade-in dims it toward
+  // black (FUN_0040fb08), the 60..90 hold re-uploads it once
+  // (0x413b40), fade-out dims it toward WHITE (FUN_0040fba0:
+  // out = pal*f + (1-f)*255 — OBSERVED).
+  std::array<std::uint8_t, 768> spacePal{};
+  bool spacePalOk = false;
+  // SC_STAT/SC_BSTAT/SNIP_TXT — the mode-2 HUD records resolved
+  // through the shared 21-slot table (0x49a828 -> slots 2/3/7 of
+  // 0x49a7d4's names, FUN_00418688). FUN_00417e20 draws SC_STAT at
+  // (500,287), the SC_BSTAT-stamped mission-timer wedge, and the
+  // 0x541554 health digits centered at (542,312) through 8px
+  // SNIP_TXT column slices (80x12 strip = 10 cells of 8x12). The
+  // wedge envelope collapses in mode 2 (0x5414a0/a4/a8 all held at
+  // 1000.0f — OBSERVED at 0x4014c5/0x401571), so the SC_STAT art
+  // draws unstamped.
+  BackdropSprite scStat, scBstat, snipTxt;
+
+  // The FUN_0040ff78 per-frame product while rt.introCountdown > 0:
+  // SPACE + MOON + EARTH + the ZOOM-table LUT-remap band (0x46d8e2,
+  // shade rows 4+(0x4edbf4>>8) rel LUT base — i.e. absolute rows
+  // 4..16) composited into one 600x360 indexed frame, valid when
+  // `introOk`. The object walk then composites on top, identical to
+  // the descent path.
+  std::vector<std::uint8_t> introFrame;   // 600x360 indexed
+  bool introOk = false;
+
   // The generated LUT — 6 banks x 64 rows x 256 palette indices,
   // built from the FALLP palette + the 0x49b57c keyframe ramp
   // (FUN_00406d84: LUT[c] = nearestPal(pal[c]*(256-L)/256 + key*L/256),
@@ -263,6 +298,14 @@ struct FreefallScene {
   std::vector<std::uint8_t> lut;               // 384*256
   std::array<std::array<std::uint8_t, 3>, 64> keyColors{};
   bool lutOk = false;
+
+  // OBSERVED: the LUT is regenerated on every palette bind
+  // (0x40f75c = bind + rebuild). Mode-2 init binds SPACEPAL first
+  // (0x40f518-0x40f522), so the intro remap reads a SPACEPAL-domain
+  // table; at countdown<=0 (0x4102cc) FALLP rebinds and `lut` above
+  // takes over. `introLut` is the identical build against spacePal.
+  std::vector<std::uint8_t> introLut;          // 384*256, SPACEPAL
+  bool introLutOk = false;
 
   // Backdrop scroll state (all FUN_00412530 locals / driver globals):
   //   scrollPos    0x4edc00 — += 1/30 per frame
@@ -394,6 +437,15 @@ struct FreefallBackdropStatus {
 };
 FreefallBackdropStatus freefallSceneBackdropStatus(
     const FreefallScene& s);
+
+// FUN_0040ff78 — the mode-2 intro scene. Runs each frame while
+// rt.introCountdown > 0 INSTEAD of freefallSceneBackdropStep (the
+// original's FUN_004103d8 early-returns after the intro tick — the
+// whole descent draw block, backdrop included, is skipped). Output:
+// introFrame (600x360 indexed against SPACEPAL), validity in
+// s.introOk.
+void freefallSceneIntroStep(FreefallScene& s,
+                            const FreefallRuntime& rt);
 
 // FUN_00412970 + FUN_0040c860's negative-pen dispatch — the trail's
 // indexed compositor. Walks each bound twin's trail ring OLDEST->

@@ -790,6 +790,10 @@ class MdkBridge : public RefCounted {
   bool ffTtActive_ = false;        // service has visible work
   std::uint64_t ffTtFrameSeq_ = 0;
 
+  // FUN_00417e20 — the mode-2 SC_STAT health gauge + digits overlay.
+  Dictionary ff_hud_frame();
+  int ffHudBlink_ = 0;             // 0x49a8dc blink phase
+
   // --- §4C — serial veil-ordering mask ----------------------------
   // Built per freefall step from the current twins + runtime pool
   // (freefallSceneVeilMask); packed to RGBAH halves for upload.

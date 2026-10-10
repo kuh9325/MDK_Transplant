@@ -24023,7 +24023,10 @@ void test_freefall_backdrop() {
   }
   // Every pixel written (the never-zero LEVEL => no pad holes).
   for (std::size_t i = 0; i < fr.size(); ++i) CHECK(fr[i] != 0);
-  // LUT application — frame[0][x] = lut[(12+1)*256 + texel(x)] with
+  // LUT application — frame[0][x] = lut[(4+12+1)*256 + texel(x)] —
+  // the sampler's row is the 0x4edc34 alias (lut+0x400 = row 4)
+  // + the 0xc00 byte offset (row 12) + the span shade byte (1)
+  // (OBSERVED 0x40f843 alias write, 0x4edbf4=0xc00 at 0x410311).
   // texel(x) from the OBSERVED 16.16 walk (a fractional p below 1.0
   // skips a texel every ~4-5 px, so a naive +1/px read is wrong).
   {
@@ -24034,13 +24037,13 @@ void test_freefall_backdrop() {
     for (int x = 0; x < 600; x += 57) {
       const std::uint8_t tex = ffBackdropTexel(s, p, uStart, vStart,
                                                x, 0);
-      CHECK(fr[x] == s.lut[std::size_t(13) * 256 + tex]);
+      CHECK(fr[x] == s.lut[std::size_t(17) * 256 + tex]);
     }
     for (int x = 0; x < 600; x += 57) {
       const std::uint8_t tex = ffBackdropTexel(s, p, uStart, vStart,
                                                x, 1);
       CHECK(fr[std::size_t(2) * 600 + x] ==
-            s.lut[std::size_t(13) * 256 + tex]);
+            s.lut[std::size_t(17) * 256 + tex]);
     }
   }
   // Chunk draw — L1_C0001 (pen 0x40) scaled 192/1: dst 48x81 at
@@ -24083,7 +24086,7 @@ void test_freefall_backdrop() {
     const int x = 290;   // inside the shaded half
     const std::uint8_t tex =
         ffBackdropTexel(s, dg.p, uStart, vStart, x, 0);
-    CHECK(fr[std::size_t(x)] == s.lut[std::size_t(13) * 256 + tex]);
+    CHECK(fr[std::size_t(x)] == s.lut[std::size_t(17) * 256 + tex]);
     const int xr = 310;  // inside the raw half — texel unmapped
     const std::uint8_t texr =
         ffBackdropTexel(s, dg.p, uStart, vStart, xr, 0);
@@ -24272,8 +24275,11 @@ void test_freefall_backdrop() {
         vm.recs.data() + std::size_t(px) * mdk::VeilMask::kK;
     for (int k = 0; k < n; ++k) {
       CHECK(r[k].z > 0.0f && r[k].z < 50000.0f);
-      if (r[k].row >= 25 && r[k].row <= 36) ++sawTrail;
-      else if (r[k].row <= 4) ++sawWedge;
+      // Rows are absolute (the 0x4edc34 +0x400 alias folded in):
+      // trail pens -1054/-1058..-1065 -> 29/33..40, wedge pens
+      // -1029..-1033 -> 4..8, flare rowBase 10..18+srcPx.
+      if (r[k].row >= 29 && r[k].row <= 40) ++sawTrail;
+      else if (r[k].row >= 4 && r[k].row <= 8) ++sawWedge;
       else if (r[k].row >= 10 && r[k].row <= 18) ++sawFlare;
     }
     // Painter order is ascending mdk-z (far->near): the wedge sits
@@ -24281,9 +24287,11 @@ void test_freefall_backdrop() {
     // carrying a wedge record has it at the START of the chain.
     // Nearer veils (trail pz~30-190, flare m.pz+10) remap over it.
     bool hasWedge = false;
-    for (int k = 0; k < n; ++k) if (r[k].row <= 4) hasWedge = true;
+    for (int k = 0; k < n; ++k)
+      if (r[k].row >= 4 && r[k].row <= 8) hasWedge = true;
     if (hasWedge) {
-      if (r[0].row <= 4) ++wedgeFirst; else ++wedgeNotFirst;
+      if (r[0].row >= 4 && r[0].row <= 8) ++wedgeFirst;
+      else ++wedgeNotFirst;
     }
   }
   CHECK(covered > 0);
@@ -24593,7 +24601,9 @@ void test_freefall_trail_composite() {
                 continue;
               }
               std::size_t i = std::size_t(yy) * 600 + xx;
-              expect[i] = s.lut[std::size_t(row) * 256 + expect[i]];
+              // Absolute row = 4 (the 0x4edc34 alias) + pen row.
+              expect[i] =
+                  s.lut[std::size_t(4 + row) * 256 + expect[i]];
             }
           }
         }
@@ -24675,18 +24685,18 @@ void test_freefall_trail_composite() {
       tr3.pts[i][1][2] = 4500.0f;
     }
     freefallSceneTrailComposite(s3, camX, camY, camZ);
-    // Section 2 (pen 4-2-1066 = -1064, row 35): quad spans slots
-    // 1..2 — px -35..35 at z'=500 -> sx ~ 300.
+    // Section 2 (pen 4-2-1066 = -1064, absolute row 4+35 = 39):
+    // quad spans slots 1..2 — px -35..35 at z'=500 -> sx ~ 300.
     const std::uint8_t c2 = s3.backdropFrame[180 * 600 + 300];
-    CHECK(c2 == std::uint8_t(0x20 + 35));
-    // Section 3 (pen -1065, row 36): slots 2..3 -> px 35..105 —
-    // center ~ (sx of px 70) = 341.9... probe x=342, y=180.
+    CHECK(c2 == std::uint8_t(0x20 + 39));
+    // Section 3 (pen -1065, absolute row 40): slots 2..3 ->
+    // px 35..105 — center ~ (sx of px 70) = 341.9... probe x=342.
     const std::uint8_t c3 = s3.backdropFrame[180 * 600 + 342];
-    CHECK(c3 == std::uint8_t(0x20 + 36));
-    // Section 1 (pen -1063, row 34): slots 0..1 — px -105..-35,
-    // center sx ~ (px -70 projected) ~ 265.
+    CHECK(c3 == std::uint8_t(0x20 + 40));
+    // Section 1 (pen -1063, absolute row 38): slots 0..1 —
+    // px -105..-35, center sx ~ (px -70 projected) ~ 265.
     const std::uint8_t c1 = s3.backdropFrame[180 * 600 + 265];
-    CHECK(c1 == std::uint8_t(0x20 + 34));
+    CHECK(c1 == std::uint8_t(0x20 + 38));
     // Far right of the ribbon: untouched.
     CHECK(s3.backdropFrame[180 * 600 + 500] == 0x20);
   }
@@ -24722,6 +24732,131 @@ void test_freefall_backdrop_status() {
   s.zoomCount = 16;
   st = mdk::freefallSceneBackdropStatus(s);
   CHECK(st.ready && st.zoomMask == 0xffff);
+}
+
+// ---------------------------------------------------------------------------
+// freefallSceneIntroStep — the FUN_0040ff78 frame product. SPACE blit,
+// MOON/EARTH eased sprites (index-0 transparent), and the countdown<120
+// 0x46d8e2 LUT-remap band. OBSERVED: the remap reads the SPACEPAL-domain
+// introLut — mode-2 init binds SPACEPAL first and 0x40f75c rebuilds the
+// table on every palette bind (FALLP takes over at countdown<=0).
+// ---------------------------------------------------------------------------
+
+void test_freefall_intro_step() {
+  mdk::FreefallScene s;
+  mdk::FreefallRuntime rt;
+
+  // Readiness gates — nothing drawn without SPACE/SPACEPAL/introLut.
+  mdk::freefallSceneIntroStep(s, rt);
+  CHECK(!s.introOk);
+
+  // Fixture: SPACE = per-px ramp; MOON = 4x4 solid pen 7; EARTH =
+  // 8x8 solid pen 9 with a pen-0 hole. All index SPACEPAL-domain.
+  // (px spans point into archive storage — owned vectors here.)
+  std::vector<std::uint8_t> spacePx(600 * 360);
+  for (int i = 0; i < 600 * 360; ++i)
+    spacePx[std::size_t(i)] = std::uint8_t(i & 0xff);
+  std::vector<std::uint8_t> moonPx(16, 7);
+  std::vector<std::uint8_t> earthPx(64, 9);
+  earthPx[0] = 0;                        // transparent texel
+  s.space.w = 600; s.space.h = 360; s.space.px = spacePx;
+  s.moon.w = 4; s.moon.h = 4; s.moon.px = moonPx;
+  s.earth.w = 8; s.earth.h = 8; s.earth.px = earthPx;
+  s.spacePalOk = true;
+  for (int i = 0; i < 768; ++i) s.spacePal[std::size_t(i)] = std::uint8_t(i);
+  // introLut: distinguishing transform dst' = (dst + row) & 0xff —
+  // each row's remap uniquely readable.
+  s.introLut.assign(384 * 256, 0);
+  for (int r = 0; r < 384; ++r)
+    for (int c = 0; c < 256; ++c)
+      s.introLut[std::size_t(r) * 256 + c] =
+          std::uint8_t((c + r) & 0xff);
+  s.introLutOk = true;
+  // One ZOOM table — all 180 rows a=1 (4 shaded px), b=1 (4 raw),
+  // c=1 (4 shaded) — covers x 0..11 of every line-doubled row.
+  s.zoomRows[0].assign(180, mdk::FreefallScene::BackdropSpanRow{});
+  for (auto& r : s.zoomRows[0]) {
+    r.a = 1; r.b = 1; r.c = 1;
+    r.sa.assign(4, 3);                           // shade +3
+    r.sc.assign(4, 5);                           // shade +5
+  }
+  s.zoomOk[0] = true;
+
+  // -- countdown >= 120: sprites composite, no remap -----------------
+  rt.introCountdown = 150;
+  rt.introProgress = 0.0f;
+  rt.zoomSub = 0xc00;
+  rt.zoomFrame = 0;
+  mdk::freefallSceneIntroStep(s, rt);
+  CHECK(s.introOk);
+  // t=0: MOON scale=rint(64)=64 -> 4*64>>8 = 1x1 centered at
+  // (300, rint(270)=270) -> the single px (300,270) is pen 7.
+  CHECK(s.introFrame[270 * 600 + 300] == 7);
+  // EARTH: cy = rint(488) = 488, dstH = 8*100>>8 = 3 -> y0 = 487 —
+  // entirely below the 360-tall frame, nothing draws.
+  CHECK(s.introFrame[359 * 600 + 300] ==
+        std::uint8_t((359 * 600 + 300) & 0xff));
+  // Outside the sprites: the raw SPACE ramp survives (no remap at
+  // countdown>=120).
+  CHECK(s.introFrame[0] == 0);
+  CHECK(s.introFrame[180 * 600 + 100] == std::uint8_t(
+      (180 * 600 + 100) & 0xff));
+
+  // -- countdown < 120: the LUT band remaps A/C phases ---------------
+  rt.introCountdown = 100;
+  rt.introProgress = 0.3f;
+  rt.zoomSub = 0x400;                        // row base 4+4 = 8
+  rt.zoomFrame = 0;
+  mdk::freefallSceneIntroStep(s, rt);
+  CHECK(s.introOk);
+  // Phase A (x 0..3): space px = (i&0xff); dst' = px + (8+3) = +11.
+  for (int x = 0; x < 4; ++x) {
+    const std::uint8_t src = std::uint8_t(x & 0xff);
+    CHECK(s.introFrame[std::size_t(x)] ==
+          std::uint8_t(src + 11));
+  }
+  // Phase B (x 4..7): raw — the SPACE ramp survives unremapped.
+  for (int x = 4; x < 8; ++x)
+    CHECK(s.introFrame[std::size_t(x)] == std::uint8_t(x));
+  // Phase C (x 8..11): dst' = px + (8+5) = +13.
+  for (int x = 8; x < 12; ++x) {
+    const std::uint8_t src = std::uint8_t(x & 0xff);
+    CHECK(s.introFrame[std::size_t(x)] ==
+          std::uint8_t(src + 13));
+  }
+  // Line doubling: the same span layout applies to output row 1 —
+  // but each row remaps ITS OWN pixels (row-1 src = (600+x)&0xff).
+  for (int x = 0; x < 4; ++x)
+    CHECK(s.introFrame[600 + std::size_t(x)] ==
+          std::uint8_t((std::uint8_t((600 + x) & 0xff)) + 11));
+  for (int x = 4; x < 8; ++x)
+    CHECK(s.introFrame[600 + std::size_t(x)] ==
+          std::uint8_t((600 + x) & 0xff));
+  for (int x = 8; x < 12; ++x)
+    CHECK(s.introFrame[600 + std::size_t(x)] ==
+          std::uint8_t((std::uint8_t((600 + x) & 0xff)) + 13));
+  // Beyond the span: untouched SPACE.
+  CHECK(s.introFrame[100] == 100);
+
+  // -- the FALLP-domain lut is NOT what the band reads ---------------
+  s.lut.assign(384 * 256, 0xAA);   // if the band read this, px -> 0xAA
+  s.lutOk = true;
+  rt.introCountdown = 100;
+  mdk::freefallSceneIntroStep(s, rt);
+  CHECK(s.introFrame[0] != 0xAA);
+
+  // -- MOON/EARTH ease across progress (observed formulas) -----------
+  rt.introCountdown = 60;
+  rt.introProgress = 0.6f;
+  rt.zoomSub = 0xc00;
+  mdk::freefallSceneIntroStep(s, rt);
+  // MOON: cy = rint(270-54) = 216, scale = rint(64+153.6) = 218 ->
+  // dst 3x3 (4*218>>8 = 3) centered (300,216) -> covers (300,216).
+  CHECK(s.introFrame[216 * 600 + 300] == 7);
+  // EARTH: cy = rint(488-134.4) = 354, sx = rint(300+76.8) = 377 ->
+  // dstW 11 (8*377>>8), sy = rint(100+25.2) = 125 -> dstH 3
+  // (8*125>>8) — y0 = 353: pen 9 visible at (300,354).
+  CHECK(s.introFrame[354 * 600 + 300] == 9);
 }
 
 // ---------------------------------------------------------------------------
@@ -33003,6 +33138,7 @@ int main() {
   test_freefall_causal();
   test_freefall_scene();
   test_freefall_backdrop();
+  test_freefall_intro_step();
   test_freefall_zoom_format();
   test_freefall_trail_composite();
   test_freefall_backdrop_status();

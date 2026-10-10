@@ -474,6 +474,26 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
     };
     bniSprite("FLARE4", &out->flare4);
     bniSprite("PICK", &out->pick);
+    // FUN_0040ff78 intro + FUN_00417e20 mode-2 HUD resources.
+    bniSprite("SPACE", &out->space);
+    bniSprite("MOON", &out->moon);
+    bniSprite("EARTH", &out->earth);
+    bniSprite("SC_STAT", &out->scStat);
+    bniSprite("SC_BSTAT", &out->scBstat);
+    bniSprite("SNIP_TXT", &out->snipTxt);
+  }
+
+  // SPACEPAL (0x4edb2c) — the intro-scene palette; entry 0 forced
+  // black at init (0x40f0f3).
+  if (const BniRecord* r = findBniRecord(out->bni, "SPACEPAL")) {
+    if (r->payloadSize() >= 768) {
+      const auto* base =
+          reinterpret_cast<const std::uint8_t*>(out->bniBytes.data());
+      std::memcpy(out->spacePal.data(),
+                  base + r->payloadFileOffset, 768);
+      out->spacePal[0] = out->spacePal[1] = out->spacePal[2] = 0;
+      out->spacePalOk = true;
+    }
   }
 
   // The generated LUT (0x540b20 block): 6 banks x 64 rows x 256 —
@@ -482,8 +502,13 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
   // 0x42b8c0 init loop). The 64 row colors come from the 0x49b57c
   // keyframe ramp — 8 segments of 8 rows lerping between the
   // OBSERVED .rodata keyframe table (see FREEFALL_BACKDROP.md §2).
+  // OBSERVED: the bind function 0x40f75c rebuilds the rows against
+  // the palette being bound — init binds SPACEPAL (0x40f518), the
+  // countdown<=0 transition rebinds FALLP (0x4102cc). introLut is
+  // therefore the same build over spacePal.
   out->lutOk = false;
-  if (out->paletteOk) {
+  out->introLutOk = false;
+  {
     struct Keyframe { std::uint8_t r, g, b, steps; };
     static constexpr Keyframe kRamp[9] = {
         {0x5a, 0xce, 0xde, 0},   // cyan-white anchor
@@ -519,38 +544,50 @@ FreefallSceneError freefallSceneLoad(const DataRoot& root, int course,
           {kRamp[8].r, kRamp[8].g, kRamp[8].b};
       ++row;
     }
-    out->lut.assign(384 * 256, 0);
     // nearestPal — exact squared-RGB search over the 256-entry
     // palette (the original's helper does the same metric).
-    auto nearest = [&out](int r, int g, int b) -> std::uint8_t {
-      int best = 0;
-      int bestD = 0x7fffffff;
-      for (int i = 0; i < 256; ++i) {
-        const int dr = r - out->palette[i * 3];
-        const int dg = g - out->palette[i * 3 + 1];
-        const int db = b - out->palette[i * 3 + 2];
-        const int d = dr * dr + dg * dg + db * db;
-        if (d < bestD) { bestD = d; best = i; }
-      }
-      return static_cast<std::uint8_t>(best);
-    };
-    for (int bank = 0; bank < 6; ++bank) {
-      const int L = kBankLevel[bank];
-      for (int rw = 0; rw < 64; ++rw) {
-        std::uint8_t* dst =
-            out->lut.data() + (std::size_t(bank) * 64 + rw) * 256;
-        const auto& key = out->keyColors[std::size_t(rw)];
-        for (int c = 0; c < 256; ++c) {
-          const int pr = out->palette[c * 3];
-          const int pg = out->palette[c * 3 + 1];
-          const int pb = out->palette[c * 3 + 2];
-          dst[c] = nearest((pr * (256 - L) + key[0] * L) >> 8,
-                           (pg * (256 - L) + key[1] * L) >> 8,
-                           (pb * (256 - L) + key[2] * L) >> 8);
-        }
-      }
+    const auto buildLut =
+        [](const std::array<std::uint8_t, 768>& pal,
+           const std::array<std::array<std::uint8_t, 3>, 64>& keys) {
+          auto nearest = [&pal](int r, int g, int b) -> std::uint8_t {
+            int best = 0;
+            int bestD = 0x7fffffff;
+            for (int i = 0; i < 256; ++i) {
+              const int dr = r - pal[i * 3];
+              const int dg = g - pal[i * 3 + 1];
+              const int db = b - pal[i * 3 + 2];
+              const int d = dr * dr + dg * dg + db * db;
+              if (d < bestD) { bestD = d; best = i; }
+            }
+            return static_cast<std::uint8_t>(best);
+          };
+          std::vector<std::uint8_t> lut(384 * 256, 0);
+          for (int bank = 0; bank < 6; ++bank) {
+            const int L = kBankLevel[bank];
+            for (int rw = 0; rw < 64; ++rw) {
+              std::uint8_t* dst =
+                  lut.data() + (std::size_t(bank) * 64 + rw) * 256;
+              const auto& key = keys[std::size_t(rw)];
+              for (int c = 0; c < 256; ++c) {
+                const int pr = pal[c * 3];
+                const int pg = pal[c * 3 + 1];
+                const int pb = pal[c * 3 + 2];
+                dst[c] = nearest((pr * (256 - L) + key[0] * L) >> 8,
+                                 (pg * (256 - L) + key[1] * L) >> 8,
+                                 (pb * (256 - L) + key[2] * L) >> 8);
+              }
+            }
+          }
+          return lut;
+        };
+    if (out->paletteOk) {
+      out->lut = buildLut(out->palette, out->keyColors);
+      out->lutOk = true;
     }
-    out->lutOk = true;
+    if (out->spacePalOk) {
+      out->introLut = buildLut(out->spacePal, out->keyColors);
+      out->introLutOk = true;
+    }
   }
 
   // FALLPU_<course+1> — 12-byte {name[8], u32} records terminated by
@@ -732,7 +769,11 @@ void freefallSceneBackdropStep(FreefallScene& s,
   const std::uint8_t* lvl = s.backdropWork.empty()
                               ? s.backdropPixels.data()
                               : s.backdropWork.data();
-  const std::uint8_t* lut = s.lut.data();
+  // 0x4edc34 = generated-LUT base + 0x400 (the row-4 alias the
+  // draws index against — OBSERVED store at 0x40f843); 0x4edbf4 =
+  // 0xc00 is a further +12 relative to it, so absolute rows are
+  // 16+shade.
+  const std::uint8_t* lut = s.lut.data() + 0x400;
   constexpr int kShadeRow = 12;   // 0x4edbf4 = 0xc00 (write 0x410311) rel 0x4edc34
 
   const auto& rows = s.zoomRows[std::size_t(dg.zoomTable) %
@@ -855,6 +896,118 @@ FreefallBackdropStatus freefallSceneBackdropStatus(
 
 namespace {
 
+// FUN_00403a40 -> 0x46d680 — the scaled transparent sprite emitter
+// shared by the chunk sprites and the intro's MOON/EARTH: dst dims
+// (srcW*scaleX)>>8 x (srcH*scaleY)>>8, centered on (cx,cy), nearest
+// sampling, index-0 skips, clipped to the 600x360 frame.
+void ffSpriteEmit(std::uint8_t* fb,
+                  const FreefallScene::BackdropSprite& sp, int cx,
+                  int cy, int scaleX, int scaleY) {
+  if (scaleX <= 0 || scaleY <= 0 || sp.px.empty()) return;
+  const int dstW = (sp.w * scaleX) >> 8;
+  const int dstH = (sp.h * scaleY) >> 8;
+  if (dstW <= 0 || dstH <= 0) return;
+  const int x0 = cx - dstW / 2;
+  const int y0 = cy - dstH / 2;
+  const std::int64_t sxStep = (std::int64_t(sp.w) << 16) / dstW;
+  const std::int64_t syStep = (std::int64_t(sp.h) << 16) / dstH;
+  for (int dy = 0; dy < dstH; ++dy) {
+    const int yy = y0 + dy;
+    if (yy < 0 || yy >= 360) continue;
+    const int srcY =
+        static_cast<int>((std::int64_t(dy) * syStep) >> 16);
+    if (srcY < 0 || srcY >= sp.h) continue;
+    for (int dx = 0; dx < dstW; ++dx) {
+      const int xx = x0 + dx;
+      if (xx < 0 || xx >= 600) continue;
+      const int srcX =
+          static_cast<int>((std::int64_t(dx) * sxStep) >> 16);
+      if (srcX < 0 || srcX >= sp.w) continue;
+      const std::uint8_t v = sp.px[srcY * sp.w + srcX];
+      if (v != 0) fb[yy * 600 + xx] = v;
+    }
+  }
+}
+
+} // namespace
+
+// FUN_0040ff78's per-frame product — the mode-2 intro scene. Order
+// (OBSERVED 0x40ffeb..0x4101f7 per eye):
+//   1. SPACE blit (FUN_0040fcb0, opaque 600x360 copy)
+//   2. MOON   — cx=300, cy=rint(270-90t),  scale=rint(64+256t) 8.8
+//   3. EARTH  — cx=300, cy=rint(488-224t), sx=rint(300+128t),
+//               sy=rint(100+42t)
+//   4. countdown < 120: the 0x46d8e2 LUT-remap band — one ZOOM table
+//      (rt.zoomFrame = 0x4edbf0) walked line-doubled over the whole
+//      frame; phase-A/C pixels map through
+//      lut[(4 + (zoomSub>>8) + shade)*256 + px] — the LUT base is
+//      0x4edc34 = generated-LUT+0x400 (row-4 alias, OBSERVED at
+//      0x40f843) and 0x4edbf4 is its relative row offset.
+//   5. countdown < 90: player spawn + eased arc (runtime state; the
+//      model walk then composites on top as usual).
+// The whole frame indexes SPACEPAL, which the fade arms dim to
+// black (in) / to white (out) — palette conversion is the bridge's.
+void freefallSceneIntroStep(FreefallScene& s,
+                            const FreefallRuntime& rt) {
+  s.introOk = false;
+  if (s.space.px.size() < 600 * 360 || !s.spacePalOk ||
+      s.introLut.empty()) {
+    return;
+  }
+  s.introFrame.assign(s.space.px.begin(),
+                      s.space.px.begin() + 600 * 360);
+  const float t = rt.introProgress;
+  const auto rint = [](float v) { return static_cast<int>(v + 0.5f); };
+  // MOON — the record's rec+0x04 cy and +0x08/+0x0c scales are all
+  // rint() results (fistp) of the eased floats (OBSERVED constants
+  // 0x494c40..0x494c4c).
+  ffSpriteEmit(s.introFrame.data(), s.moon, 300, rint(270.0f - 90.0f * t),
+               rint(64.0f + 256.0f * t), rint(64.0f + 256.0f * t));
+  // EARTH — same emitter (0x494c68..0x494c7c).
+  ffSpriteEmit(s.introFrame.data(), s.earth, 300,
+               rint(488.0f - 224.0f * t), rint(300.0f + 128.0f * t),
+               rint(100.0f + 42.0f * t));
+  // The LUT-remap band — 0x46d8e2, countdown < 120 only. The LUT in
+  // force here is the SPACEPAL-domain build — the mode-2 init binds
+  // SPACEPAL first and 0x40f75c regenerates the table on every bind
+  // (FALLP only takes over at the countdown<=0 rebind, 0x4102cc).
+  const int zi = rt.zoomFrame & 15;
+  if (rt.introCountdown < 120 && s.zoomOk[std::size_t(zi)] &&
+      !s.zoomRows[std::size_t(zi)].empty()) {
+    const int rowBase = 4 + (rt.zoomSub >> 8);
+    const auto& rows = s.zoomRows[std::size_t(zi)];
+    const std::size_t lutSize = s.introLut.size();
+    int y = 0;
+    for (std::size_t r = 0; r < rows.size() && y < 360; ++r) {
+      const FreefallScene::BackdropSpanRow& sr = rows[r];
+      for (int rep = 0; rep < 2 && y < 360; ++rep, ++y) {
+        std::uint8_t* dstRow = s.introFrame.data() + y * 600;
+        int px = 0;
+        const std::uint8_t* sa = sr.sa.data();
+        for (std::uint32_t i = 0; i < sr.a; ++i) {
+          for (int k = 0; k < 4 && px < 600; ++k, ++px) {
+            const std::size_t li =
+                std::size_t(rowBase + sa[i * 4 + k]) * 256 + dstRow[px];
+            if (li < lutSize) dstRow[px] = s.introLut[li];
+          }
+        }
+        px += static_cast<int>(sr.b) * 4;
+        const std::uint8_t* sc = sr.sc.data();
+        for (std::uint32_t i = 0; i < sr.c && px < 600; ++i) {
+          for (int k = 0; k < 4 && px < 600; ++k, ++px) {
+            const std::size_t li =
+                std::size_t(rowBase + sc[i * 4 + k]) * 256 + dstRow[px];
+            if (li < lutSize) dstRow[px] = s.introLut[li];
+          }
+        }
+      }
+    }
+  }
+  s.introOk = true;
+}
+
+namespace {
+
 // The mode-2 folded view — same constants get_freefall_snapshot
 // builds the Godot camera from. Original view record (0x46b4f8
 // input): right = +X, down = -Y, +viewdir = -Z_mdk (the raw M2
@@ -952,7 +1105,10 @@ void freefallSceneTrailComposite(FreefallScene& s,
       {1.0f, 1.25f, 1.2f, 1.1f, 1.05f, 1.0f};   // 0x49b634
   constexpr int cap = FreefallScene::Twin::kTrailCap;
   std::uint8_t* fb = s.backdropFrame.data();
-  const std::uint8_t* lut = s.lut.data();
+  // 0x4edc34 = generated-LUT base + 0x400 — the veil pens' row
+  // offsets are relative to it (OBSERVED mov eax,[0x4edc34] at
+  // 0x41257e), so absolute row = 4 + row.
+  const std::uint8_t* lut = s.lut.data() + 0x400;
 
   // One triangle of the screen-space quad, dst = lut[row*256+dst].
   auto fillTri = [&](const Pt& a, const Pt& b, const Pt& c, int row) {
@@ -994,8 +1150,11 @@ void freefallSceneTrailComposite(FreefallScene& s,
         // SECTION (walk index sw pairing slots sw-1, sw).
         const int pen = freefallTrailSectionPen(tr.count, sw);
         if (pen < -1028) {
+          // 0x4edc34-relative rows — fillTri's base carries the
+          // +0x400 alias, so absolute = 4 + (-1029 - pen).
           const int row = -1029 - pen;   // -1054->25, -1058..-1065->29..36
-          if (row >= 0 && std::size_t(row) * 256 + 255 < s.lut.size()) {
+          if (row >= 0 &&
+              0x400 + std::size_t(row) * 256 + 255 < s.lut.size()) {
             fillTri(prevL, prevR, pr, row);
             fillTri(prevL, pr, pl, row);
           }
@@ -1120,7 +1279,10 @@ void freefallSceneVeilMask(FreefallScene& s, const FreefallRuntime& rt,
       if (sw > 0 && prevL.on && prevR.on && pl.on && pr.on) {
         const int pen = freefallTrailSectionPen(tr.count, sw);
         if (pen < -1028) {
-          const int row = -1029 - pen;
+          // Pens are 0x4edc34-relative (lut+0x400): absolute row
+          // = 4 + (-1029 - pen) — the mask consumers index the LUT
+          // from its base, so the alias folds in here.
+          const int row = 4 + (-1029 - pen);
           if (row >= 0 && row < 64) {
             MaskOp op{};
             op.v[0] = prevL; op.v[1] = prevR;
@@ -1157,7 +1319,9 @@ void freefallSceneVeilMask(FreefallScene& s, const FreefallRuntime& rt,
         op.src = s.flare4.px.data();
         op.srcW = s.flare4.w;
         op.srcH = s.flare4.h;
-        op.rowBase = 6 + std::min(o.subTimer, 8);
+        // 0x46d6d1's base is 0x4edc34+0x600 (doc §7) — relative row
+        // 6 -> absolute 10; +4 alias folded in.
+        op.rowBase = 10 + std::min(o.subTimer, 8);
         const float ow = float(op.srcW * 0x80 >> 8);   // 0x46d6d1
         const float oh = float(op.srcH * 0x80 >> 8);
         op.rx = c.x - ow * 0.5f;
@@ -1191,7 +1355,9 @@ void freefallSceneVeilMask(FreefallScene& s, const FreefallRuntime& rt,
           }
           std::memcpy(&pen, rec + 6, 2);
           if (pen >= -1028) continue;
-          const int row = -1029 - pen;
+          // Same 0x4edc34-relative pen rows as the trail — absolute
+          // = 4 + (-1029 - pen).
+          const int row = 4 + (-1029 - pen);
           if (row < 0 || row >= 64) continue;
           MaskOp op{};
           bool on = true;

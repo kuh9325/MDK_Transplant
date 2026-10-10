@@ -2910,12 +2910,28 @@ func _apply_freefall() -> void:
 	# §4C — this frame's ordered veil records for the serial chain.
 	_ff_mask_update()
 
-	# 0x4edc04 — palette-bright factor applied at upload: <1 dims to
-	# black (fade), >1 saturates (damage flash / missile-bump).
+	# 0x4edc04 — palette-bright factor applied at upload. The original
+	# picks the dim target per state (OBSERVED mode-2 dispatch):
+	#   intro t>90   0x40fb08  BLACK  (fade-in)
+	#   intro t<60   0x40fba0  WHITE  (atmosphere-entry white-out)
+	#   play ramps   0x40fba0  WHITE  (post-intro ramp-in + dips)
+	#   death        0x40fb08  BLACK  (541554 <= 0 -> 0x4106e3)
+	#   exit         0x40fb08  BLACK  (timeline > 31 -> 0x4107b4)
+	#   fade>1       saturating white (damage flash)
 	var fade := float(ff["fade"])
 	var fr: ColorRect = $FadeLayer/FadeRect
+	var ff_intro := int(ff.get("intro_countdown", 0))
 	if fade < 1.0:
-		fr.color = Color(0, 0, 0, 1.0 - fade)
+		var to_white := false
+		if ff_intro > 0:
+			to_white = ff_intro < 60
+		else:
+			to_white = int(ff["health"]) > 0 and \
+				float(ff["timeline"]) <= 31.0
+		if to_white:
+			fr.color = Color(1, 1, 1, 1.0 - fade)
+		else:
+			fr.color = Color(0, 0, 0, 1.0 - fade)
 		fr.visible = true
 	elif fade > 1.0:
 		# Saturating multiply approximated as a white-out — the
@@ -2924,6 +2940,10 @@ func _apply_freefall() -> void:
 		fr.visible = true
 	else:
 		fr.visible = false
+
+	# FUN_00417e20 — the mode-2 SC_STAT health gauge + digits (draws
+	# only once the descent draw block starts running).
+	_apply_ff_hud()
 
 	# The FUN_004109d8 entry domain: walk the active list from
 	# listHead. Painter-depth sorting is a software-renderer artifact;
@@ -3093,6 +3113,36 @@ func _apply_ff_teletype() -> void:
 func _tt_hide() -> void:
 	if $TtLayer.visible:
 		$TtLayer.visible = false
+
+
+# --- Freefall health HUD (FUN_00417e20) --------------------------------
+# bridge.ff_hud_frame() returns the SC_STAT gauge + 0x541554 digits
+# as a transparent RGBA overlay (FALLP-expanded). Only drawn once the
+# descent draw block runs — the intro's early return skips it.
+var ff_hud_img: Image = null
+var ff_hud_tex: ImageTexture = null
+
+func _apply_ff_hud() -> void:
+	var fr: Dictionary = bridge.ff_hud_frame()
+	if fr.is_empty() or not bool(fr.get("show", false)):
+		_ff_hud_hide()
+		return
+	var w := int(fr["w"])
+	var h := int(fr["h"])
+	ff_hud_img = Image.create_from_data(w, h, false,
+		Image.FORMAT_RGBA8, fr["rgba"])
+	if ff_hud_tex == null:
+		ff_hud_tex = ImageTexture.create_from_image(ff_hud_img)
+	else:
+		ff_hud_tex.update(ff_hud_img)
+	var r: TextureRect = $FfHudLayer/FfHudRect
+	r.texture = ff_hud_tex
+	r.visible = true
+	$FfHudLayer.visible = true
+
+func _ff_hud_hide() -> void:
+	if $FfHudLayer.visible:
+		$FfHudLayer.visible = false
 
 
 # --- Phase 19D — mode-8 ending cinematic presentation -----------------

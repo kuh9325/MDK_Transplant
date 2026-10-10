@@ -207,6 +207,8 @@ void MdkBridge::_bind_methods() {
                        &MdkBridge::mode6_diag);
   ClassDB::bind_method(D_METHOD("ff_teletype_frame"),
                        &MdkBridge::ff_teletype_frame);
+  ClassDB::bind_method(D_METHOD("ff_hud_frame"),
+                       &MdkBridge::ff_hud_frame);
   ClassDB::bind_method(D_METHOD("ff_teletype_diag"),
                        &MdkBridge::ff_teletype_diag);
   ClassDB::bind_method(D_METHOD("ff_veil_mask"),
@@ -2970,14 +2972,23 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
   // step consumed (objectAnimTickDt's rate*animRate*dtSec ==
   // frameUnits for the rate-1.0 records).
   mdk::freefallSceneStep(*ffScene_, *ff_, timing_.deltaSec);
-  // FUN_00410920's frame order — the backdrop pass (FUN_00412530)
-  // runs before the object draw walk, fed by the just-updated
-  // camera block (0x540b28/2c/30 == rt.cameraPos). The scroll/chunk
-  // integrators are dt-scaled (the original's per-frame constants
-  // are its 30 fps render cadence); the zoom dither stays per-call.
-  mdk::freefallSceneBackdropStep(*ffScene_, ff_->cameraPos[0],
-                                 ff_->cameraPos[1], ff_->cameraPos[2],
-                                 timing_.deltaSec);
+  // FUN_004103d8's mode-2 dispatch: while 0x4edcb8 > 0 the scripted
+  // intro (FUN_0040ff78 — SPACE + MOON + EARTH + the ZOOM-table LUT
+  // remap) owns the framebuffer and the whole descent draw block
+  // (FUN_00412530 backdrop included) is skipped. The scroll state
+  // therefore starts integrating only at the descent's first frame.
+  if (ff_->introCountdown > 0) {
+    mdk::freefallSceneIntroStep(*ffScene_, *ff_);
+  } else {
+    // FUN_00410920's frame order — the backdrop pass (FUN_00412530)
+    // runs before the object draw walk, fed by the just-updated
+    // camera block (0x540b28/2c/30 == rt.cameraPos). The scroll/chunk
+    // integrators are dt-scaled (the original's per-frame constants
+    // are its 30 fps render cadence); the zoom dither stays per-call.
+    mdk::freefallSceneBackdropStep(*ffScene_, ff_->cameraPos[0],
+                                   ff_->cameraPos[1], ff_->cameraPos[2],
+                                   timing_.deltaSec);
+  }
   // The trail veil — FUN_00412970/FUN_0040c860's indexed op
   // (dst = lut[row*256 + dst]) is presented by the Godot-side
   // veil pass: per-object trail meshes (world-space edges already
@@ -3011,8 +3022,14 @@ Dictionary MdkBridge::stepFreefall_(double dt_ms,
     (void)ffTtEnter_(tdetail);
   }
   // FUN_0041cb44 — the mode-2 draw block's teletype service; the
-  // FALL_T1 entry slides/holds/pages out through it.
-  ffTtService_();
+  // FALL_T1 entry slides/holds/pages out through it. The intro's
+  // early return skips the whole draw block, so the queued FALL_T1
+  // post doesn't start consuming until the descent's first frame
+  // (the "radar warning" lands AFTER the space scene, matching the
+  // original's order).
+  if (ff_->introCountdown <= 0) {
+    ffTtService_();
+  }
   if (done && !ffHandoffDone_) {
     // FUN_0040fa68 — the freefall bank dies at the edge: every live
     // voice releases before the handoff path rebuilds. The queued
@@ -3424,15 +3441,27 @@ Dictionary MdkBridge::get_freefall_backdrop() {
 // to reproduce the trail/flare veil materials.
 Dictionary MdkBridge::get_freefall_backdrop_frame() {
   Dictionary out;
-  if (!ffScene_ || ffScene_->backdropFrame.empty() ||
-      !ffScene_->paletteOk) {
+  // FUN_0040ff78 branch — during the intro the framebuffer holds the
+  // SPACE/MOON/EARTH composite indexed against SPACEPAL, not the
+  // LEVEL backdrop against FALLP. The dimmed palette variants are
+  // presented through the same fade field (rt.fade = 0x4edc04).
+  const bool intro =
+      ff_ && ff_->introCountdown > 0;
+  if (intro && (!ffScene_ || !ffScene_->introOk ||
+                !ffScene_->spacePalOk)) {
+    return out;
+  }
+  if (!intro && (!ffScene_ || ffScene_->backdropFrame.empty() ||
+                 !ffScene_->paletteOk)) {
     return out;
   }
   constexpr int kW = 600, kH = 360;
   PackedByteArray rgba;
   rgba.resize(int64_t(kW) * kH * 4);
-  const std::uint8_t* idx = ffScene_->backdropFrame.data();
-  const std::uint8_t* pal = ffScene_->palette.data();
+  const std::uint8_t* idx = intro ? ffScene_->introFrame.data()
+                                  : ffScene_->backdropFrame.data();
+  const std::uint8_t* pal = intro ? ffScene_->spacePal.data()
+                                  : ffScene_->palette.data();
   std::uint8_t* w = rgba.ptrw();
   for (int i = 0; i < kW * kH; ++i) {
     const std::uint8_t c = idx[i];
@@ -3444,6 +3473,7 @@ Dictionary MdkBridge::get_freefall_backdrop_frame() {
   out["w"] = int64_t(kW);
   out["h"] = int64_t(kH);
   out["rgba"] = rgba;
+  out["intro"] = intro;
   const auto& dg = ffScene_->backdropDiag;
   out["p"] = double(dg.p);
   out["u_start"] = double(dg.uStart);
@@ -4343,6 +4373,92 @@ Dictionary MdkBridge::ff_teletype_frame() {
   }
   out["rgba"] = rgba;
   out["seq"] = static_cast<int64_t>(ffTtFrameSeq_);
+  return out;
+}
+
+// FUN_00417e20's mode-2 product — the SC_STAT health gauge plus the
+// 0x541554 digits, packed as a transparent RGBA overlay that the
+// Godot HUD layer draws over the 3D pass (the original composites it
+// into the shared framebuffer after the object walk).
+//
+//   SC_STAT  — transparent blit (FUN_004185fc) at (500,287), the
+//              84x63 gauge face. The mission-timer wedge it can
+//              carry never stamps in mode 2: 0x5414a0/a4/a8 are held
+//              at 1000.0f for the whole section (OBSERVED dispatcher
+//              writes at 0x4014c5/0x401571), collapsing the
+//              (1-a0/a4)*2pi envelope to zero.
+//   digits   — FUN_004181c0 centered printer over the SNIP_TXT
+//              strip (80x12 = ten 8x12 cells): value = 0x541554
+//              health capped 999, base x = 542-12/-8/-4 for 3/2/1
+//              digits, cell y = 312.
+//   gates    — the stereo branch (0x541544) never suppresses on the
+//              mono path; low-health blink draws only when
+//              (0x49a8dc & 0x1f) > 15. The damage-window arm
+//              (0x540e10 > 0 on odd 0x5414d8 frames) is traversal
+//              state that stays 0 in mode 2 — left documented.
+Dictionary MdkBridge::ff_hud_frame() {
+  Dictionary out;
+  if (!ff_ || !ffScene_ || !ffScene_->paletteOk ||
+      ffScene_->scStat.px.empty() || ffScene_->snipTxt.px.empty()) {
+    return out;
+  }
+  constexpr int kW = 600, kH = 360;
+  PackedByteArray rgba;
+  rgba.resize(int64_t(kW) * kH * 4);
+  std::memset(rgba.ptrw(), 0, std::size_t(kW) * kH * 4);
+  const std::uint8_t* pal = ffScene_->palette.data();
+  const auto putPx = [&](int x, int y, std::uint8_t c) {
+    if (x < 0 || x >= kW || y < 0 || y >= kH || c == 0) return;
+    std::uint8_t* d = rgba.ptrw() + (std::size_t(y) * kW + x) * 4;
+    d[0] = pal[c * 3 + 0];
+    d[1] = pal[c * 3 + 1];
+    d[2] = pal[c * 3 + 2];
+    d[3] = 255;
+  };
+  const auto blit = [&](const mdk::FreefallScene::BackdropSprite& sp,
+                        int x0, int y0, int srcX0, int srcW) {
+    for (int y = 0; y < sp.h; ++y) {
+      for (int x = 0; x < srcW; ++x) {
+        putPx(x0 + x, y0 + y, sp.px[y * sp.w + srcX0 + x]);
+      }
+    }
+  };
+  // SC_STAT at (600-w-16, 360-h-10) = (500,287) for the 84x63 rec.
+  const int gx = kW - ffScene_->scStat.w - 16;
+  const int gy = kH - ffScene_->scStat.h - 10;
+  blit(ffScene_->scStat, gx, gy, 0, ffScene_->scStat.w);
+  // Blink phase — 0x49a8dc += frameStep & 0x1f, once per HUD draw.
+  ffHudBlink_ = (ffHudBlink_ + timing_.frameStep) & 0x1f;
+  const int v = ff_->health > 999 ? 999 : ff_->health;
+  const bool drawDigits =
+      ff_->health > 0x14 || ffHudBlink_ > 15;
+  if (drawDigits) {
+    const int cx = kW - (ffScene_->scStat.w + 16) +
+                   (ffScene_->scStat.w >> 1);   // 542
+    const int digits = v >= 100 ? 3 : v >= 10 ? 2 : 1;
+    const int div = v >= 100 ? 100 : v >= 10 ? 10 : 1;
+    int rem = v;
+    int d = div;
+    int x = cx - 4 * digits;
+    const int y = gy + ((ffScene_->scStat.h - ffScene_->snipTxt.h) >> 1);
+    for (;;) {
+      if (rem < 0 || d <= 0) break;
+      const int digit = rem / d;
+      if (digit * 8 + 8 <= ffScene_->snipTxt.w) {
+        blit(ffScene_->snipTxt, x, y, digit * 8, 8);
+      }
+      x += 8;
+      if (d == 1) break;   // OBSERVED loop-exit quirk (v = -1)
+      rem -= digit * d;
+      d /= 10;
+    }
+  }
+  out["w"] = int64_t(kW);
+  out["h"] = int64_t(kH);
+  out["rgba"] = rgba;
+  out["show"] = ff_->introCountdown <= 0 &&
+                ff_->phase != mdk::FreefallRuntime::Phase::kDone;
+  out["blink"] = int64_t(ffHudBlink_);
   return out;
 }
 

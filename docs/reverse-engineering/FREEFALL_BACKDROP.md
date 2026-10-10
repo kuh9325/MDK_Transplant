@@ -307,6 +307,81 @@ exact name/flags/rate).
 Note the resolve-miss path (`0x41cb25`): a missing record posts
 nothing silently — kept as a no-op rather than an error.
 
+## 7A. Intro scene — FUN_0040ff78 (OBSERVED, implemented)
+
+While `0x4edcb8` (the 150-frame countdown) is positive the mode-2
+dispatcher (`FUN_004103d8`) early-returns after `FUN_0040ff78` — the
+whole descent draw block (backdrop, teletype, HUD) is skipped. The
+intro is self-contained:
+
+1. **SPACE blit** — `FUN_0040fcb0` copies the 600x360 `SPACE`
+   record into `0x541650` (opaque, pen-0 included).
+2. **MOON** — `FUN_0040fe18` emits the 128x128 sprite through
+   `FUN_00403a40` (the shared scaled/transparent emitter, pen-0
+   skip): `cx=300`, `cy=rint(270-90t)`, `sx=sy=rint(64+256t)` in
+   8.8 fixed (dstW = src*scale>>8), `t` = 1-countdown/150.
+3. **EARTH** — `FUN_0040fec0`, same emitter: `cx=300`,
+   `cy=rint(488-224t)`, `sx=rint(300+128t)`, `sy=rint(100+42t)`.
+4. **ZOOM-table LUT-remap band** (`0x46d8e2`) — runs only while
+   countdown < 120. Table `0x4edbb0[0x4edbf0]` (the same ZOOM####
+   span tables the descent uses; `0x4edbf0` increments per frame,
+   wraps at 16), walked line-doubled over the whole frame: phase
+   A/C pixels remap `dst = lut[rowBase + shadeByte][dst]`, phase B
+   is untouched. Row base = `0x4edbf4 >> 8` relative to `0x4edc34`
+   (the LUT +0x400 alias): `0xc00` (row 12) while t<=60, ramping
+   `(120-t)*12/60` for 60<t<120 — i.e. absolute rows 16..4+1.
+5. **countdown < 90** — the player spawns and rides the eased arc
+   (runtime state; the object walk composites on top after this
+   function, same as descent).
+
+### Palette + LUT domain (OBSERVED)
+
+`0x40f75c` is the palette-bind + table-rebuild function
+`(palPtr)`: copies the bound palette, writes `0x499adc`, and
+regenerates the LUT rows through `FUN_00406d84`. Mode-2 init calls
+it at `0x40f518-0x40f522` on **`0x4edb2c` = SPACEPAL** — so during
+the intro the display palette is SPACEPAL and the remap LUT is
+SPACEPAL-domain. At countdown<=0 (`0x4102bf-0x4102cc`) it rebinds
+`0x4edc28` = FALLP and the LUT becomes FALLP-domain for the
+descent. Port: `FreefallScene::introLut` is the identical build
+against `spacePal`; `freefallSceneIntroStep` reads it
+(`s.lut` stays the descent/FALLP table).
+
+### Intro fade targets (OBSERVED, per-phase)
+
+| countdown | op | target |
+|---|---|---|
+| t > 90 | `0x40fb08` | BLACK — fade-in `pal*f` |
+| 60 <= t <= 90 | `0x413b40` | fullbright re-upload (fade=1 hold) |
+| t < 60 | `0x40fba0` | WHITE — `pal*f + (1-f)*255` (the flash) |
+
+### Play-phase fade ops (mode-2 dispatch tail, OBSERVED)
+
+- `health > 0 && timeline <= 31` — ramps in either direction go
+  through `0x40fba0` WHITE (`0x4106ca/0x4106d9`): the descent fades
+  IN from the white-out, ambient dips to 0.9 dim toward white.
+- `0x541554 <= 0` (death) — `0x40fb08` BLACK, `fade -= 1/30` to 0
+  (`0x4106e3` region).
+- `timeline > 31` (exit) — `0x40fb08` BLACK,
+  `fade = 1 - (timeline-31)*0.5` (`0x4107b4`).
+- `fade > 1` — palette saturates toward 255 byte-wise
+  (`0x41071f` loop) — damage flash.
+
+Port: `FreefallRuntime::fade`/`fadeTarget` carry `0x4edc04`/
+`0x4edc0c`; the Godot fade layer picks the dim target with the
+same state test (`intro<60` or play non-death/non-exit -> WHITE,
+else BLACK).
+
+### Oracle comparison
+
+`mdkdos_000.avi` (~t=304.7-310): starfield + crescent moon +
+Earth-disc rising -> Kurt tumbles in over the horizon -> white-out
+-> minecrawler terrain fades in from white -> radar wedge sweep.
+No FALL_T1 in that window (the capture's fall is a later course —
+the dial read 150, i.e. a save-restored health, not the course-0
+new-game 100). Native `freefallSceneIntroStep` output matches the
+composition (verified side-by-side vs extracted frames).
+
 ## 8. Depth-flag semantics probe (§4A, OBSERVED on the shipping build)
 
 The `e5a4487` commit message claimed `depth_draw_never` had disabled
