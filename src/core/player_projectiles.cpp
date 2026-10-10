@@ -710,11 +710,13 @@ void objectDieFacingPlayer(TraversalRuntime& rt, DynamicObject& obj) {
 
 void playerDamageApply(TraversalRuntime& rt, int dmg, const float pt[3]) {
   (void)pt;
+  ++rt.seams.playerDamageCalls;
   if (rt.fieldHealth == 0 && rt.fieldHealthGate == 0) return;
   // Suppress -> landingAccum cleared, no damage.
   if (rt.fieldE10 > 0.0f || rt.locoState == 0x326 ||
       rt.locoState == 0x385 || rt.locoState == 0x3ea ||
       rt.fieldEb8 == 1) {
+    ++rt.seams.playerDamageSuppressed;
     rt.vert.landingAccum = 0.0f;
     return;
   }
@@ -742,6 +744,7 @@ void playerDamageApply(TraversalRuntime& rt, int dmg, const float pt[3]) {
   }
   rt.fieldHealth -= scaled;
   if (rt.fieldHealth < 0) rt.fieldHealth = 0;
+  ++rt.seams.playerDamageApplied;
   rt.vert.landingAccum += static_cast<float>(scaled);
 }
 

@@ -342,6 +342,9 @@ struct TraversalSeams {
   int objectDeathCalls = 0;       // FUN_00458140 deaths run
   int objectTeardownCalls = 0;    // FUN_00457cf4 teardown seam
   int mountDamageCalls = 0;       // FUN_0046771c mount-redirect hits
+  int playerDamageCalls = 0;      // FUN_0046771c entries (any producer)
+  int playerDamageSuppressed = 0; // FUN_0046771c suppress-gate rejections
+  int playerDamageApplied = 0;    // FUN_0046771c hits that reduced health
   int sfxPeeCalls = 0;            // op-0x84 FX spawn (FUN_00405270 /
                                   // 0x403f6c+0x404108) — the probability
                                   // gate passed; spawn stays inert

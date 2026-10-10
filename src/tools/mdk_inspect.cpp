@@ -4566,11 +4566,12 @@ int main(int argc, char** argv) {
       if (!pdmgSpecs.empty()) {
         std::printf(
             "      dmg hp=%d accum=%.3f e10=%.3f eb8=%d dac=%d "
-            "st=%03x ev=%d/%d\n",
+            "st=%03x ev=%d/%d pdc=%d pds=%d pda=%d\n",
             (int)rt.fieldHealth, (double)rt.vert.landingAccum,
             (double)rt.fieldE10, (int)rt.fieldEb8, (int)rt.fieldDac,
             (unsigned)rt.locoState, (int)rt.eventType,
-            (int)rt.eventMag);
+            (int)rt.eventMag, rt.seams.playerDamageCalls,
+            rt.seams.playerDamageSuppressed, rt.seams.playerDamageApplied);
         for (const auto& d : pdmgSpecs) {
           if (d.frame != f) continue;
           const int hpBefore = rt.fieldHealth;
