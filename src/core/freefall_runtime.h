@@ -176,7 +176,7 @@ enum FreefallEventKind : int {
   kFfEvSound = 0,     // a = FreefallSound id, b = channel param
   kFfEvGrantAmmo,     // a = ammo table index (0x49bad4 row), b = amount
   kFfEvGrantKey,      // a = key table index (0x49bba0 row), b = value
-  kFfEvGrantHealth,   // a = health-table row, b = amount applied
+  kFfEvGrantHealth,   // a = health-table row, b = nominal heal/floor
 };
 
 // Sound tags — the 0x4edc3c..0x4edc98 slot block populated by init.
@@ -347,7 +347,13 @@ struct FreefallRuntime {
   };
   std::optional<TeletypePost> teletypePost;
 
+  // Single-frame events (audio, pickup notifications); freefallStep clears
+  // these on every tick. They must not be the sole store for inventory.
   std::vector<FreefallEvent> events;
+  // The original writes ammo and inventory into shared globals at pickup
+  // time. Keep the equivalent grants through the whole fall for the
+  // delayed native freefall->traversal handoff (never cleared per frame).
+  std::vector<FreefallEvent> carryGrants;
 };
 
 // Course init — FUN_0040ef28 gameplay subset: clears the pool, chains
