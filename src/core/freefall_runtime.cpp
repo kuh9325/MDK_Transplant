@@ -101,6 +101,10 @@ inline float ffRound(float v) { return std::nearbyint(v); }
 
 inline void emit(FreefallRuntime& rt, int kind, int a, int b) {
   rt.events.push_back({kind, a, b});
+  // Presentation events are cleared each frame, while FUN_0046a790 /
+  // FUN_0046a500 wrote persistent campaign globals in the original.
+  if (kind == kFfEvGrantAmmo || kind == kFfEvGrantKey)
+    rt.carryGrants.push_back({kind, a, b});
 }
 inline void emitSound(FreefallRuntime& rt, int id, int ch = 0) {
   emit(rt, kFfEvSound, id, ch);
@@ -723,14 +727,22 @@ void applyPickup(FreefallRuntime& rt, int recIdx) {
       if (i != 9 && i != 11) rt.teletypePost = {kGrantTable[i], 1u, 2.0f};
       switch (i) {
         case 5: {  // SW_H25 +10 cap 100
-          rt.health += 10;
-          if (rt.health > 100) rt.health = 100;
+          // A smaller heal must not undo an earlier SW_H150 boost.
+          // OBSERVED FUN_0046a790: the add/cap runs only below 100.
+          if (rt.health < 100) {
+            rt.health += 10;
+            if (rt.health > 100) rt.health = 100;
+          }
           emit(rt, kFfEvGrantHealth, i, 10);
           return;
         }
         case 6: {  // SW_H50 +50 cap 100
-          rt.health += 50;
-          if (rt.health > 100) rt.health = 100;
+          // A smaller heal must not undo an earlier SW_H150 boost.
+          // OBSERVED FUN_0046a790: the add/cap runs only below 100.
+          if (rt.health < 100) {
+            rt.health += 50;
+            if (rt.health > 100) rt.health = 100;
+          }
           emit(rt, kFfEvGrantHealth, i, 50);
           return;
         }
@@ -745,8 +757,12 @@ void applyPickup(FreefallRuntime& rt, int recIdx) {
           return;
         }
         case 9: {  // SW_H01 +1 cap 100
-          rt.health += 1;
-          if (rt.health > 100) rt.health = 100;
+          // A smaller heal must not undo an earlier SW_H150 boost.
+          // OBSERVED FUN_0046a790: the add/cap runs only below 100.
+          if (rt.health < 100) {
+            rt.health += 1;
+            if (rt.health > 100) rt.health = 100;
+          }
           emit(rt, kFfEvGrantHealth, i, 1);
           return;
         }
