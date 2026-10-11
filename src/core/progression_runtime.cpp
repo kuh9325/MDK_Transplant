@@ -108,10 +108,13 @@ ProgressionError progressionFreefallHandoff(
 
   // The ammo block (0x54161f..33) outlives the mode: freefall pickup
   // grants wrote it live in the original via FUN_0046a790; the port
-  // emits grant events instead, so the coordinator applies the
-  // equivalent writes at the boundary — identical observable state.
+  // emits transient events and accumulates matching carryGrants so a
+  // pickup collected many frames before the handoff is not lost when
+  // freefallStep clears events. For direct-handoff test fixtures that
+  // stage only a final-frame event, retain the former fallback.
+  const auto& grants = ff.carryGrants.empty() ? ff.events : ff.carryGrants;
   int granted = 0;
-  for (const auto& e : ff.events) {
+  for (const auto& e : grants) {
     if (e.kind != kFfEvGrantAmmo) continue;
     if (e.a >= 0 && e.a < kGrantAmmoRows) {
       sess.ammo[1 + e.a] += e.b;
@@ -182,7 +185,7 @@ ProgressionError progressionFreefallHandoff(
   // SW_GATT super-chaingun (and any carried keys/seals) the collect
   // wrote during the fall. Runs after the ammo copy so an id-6 grant
   // adds its feed rounds onto the carried ammo[0].
-  for (const auto& e : ff.events) {
+  for (const auto& e : grants) {
     if (e.kind != kFfEvGrantKey) continue;
     traversalInventoryCarryItem(*trav, e.a);
   }
