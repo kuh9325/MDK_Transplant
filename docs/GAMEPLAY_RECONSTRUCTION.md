@@ -6936,8 +6936,10 @@ Verified name->slot map (excerpt): `0x54c5d0 SNIPERSHOT`,
 `CHUTEOUT`, `MULTIFIRE`, `GATTFIRE`, `SNIPRELD`, `BONES`, `COLLECT`,
 `WMIB`, `FAN`, `TORNADO`, `COW`, `DUMMY`, `LOAD_MSG`.
 
-No original waveform data is committed; the port never parses the
-payload — it needs only the record names.
+No original waveform data is committed. Since Phase 17C.2 the bridge
+decodes locally supplied RIFF/WAVE payloads through `decodeSniWave`;
+the core events still carry only record names. The extra-prefix
+description above is superseded by the payload-offset evidence in §232.
 
 ## 230. Reachable traversal sound census (OBSERVED callsites)
 
@@ -6963,8 +6965,20 @@ gameplay LCG** and is reproduced as `enemyRandBelow(rt.rngState,3)`
 (owner-none); wall impacts use the same pick gated by
 `mode>1 || (frameCounter&3)==0`; detonation spawns `EXPLODE`
 positionally; named object-impact sounds (`field150`-resolved CMI
-name) use `FUN_00402288` restart-positional. `MULTIFIRE`/`GATTFIRE`/
-`SNIPRELD` are weapon-table sounds wired through the same fire seam.
+name) use `FUN_00402288` restart-positional.
+
+2026-10-15 source audit correction: the earlier claim that
+`MULTIFIRE`/`GATTFIRE`/`SNIPRELD` were "wired through the same fire
+seam" overstated the implementation. Their registration names are
+recorded in §145, but no explicit emitter for these names exists in
+the current player code. Normal/charged `playerPunch` firing and
+the counted `FUN_00469668` notification sites do not implement gun
+audio. That notification's direct audio role, either weapon's
+sound-name mapping, and its trigger/repeat/overlap/stop semantics
+are **UNKNOWN — NEEDS LOCAL ORIGINAL-BUILD VERIFICATION**. Generic
+sound API semantics in §228 do not establish weapon-specific calls.
+See [the chaingun audio audit](reverse-engineering/KURT_CHAINGUN_AUDIO.md)
+for evidence boundaries, regression coverage, and local checks.
 
 ENEMY/OBJECT: `ALERT` heartbeat (positional, every 32 frames while the
 object is in the player's arena), object voice (`+0x15c` name,
@@ -7123,7 +7137,14 @@ separately (MAINSONG/OPTSONG/OPTBUTT host). Zone-ambient crossfade
 (`FUN_00431cf4`) has since been implemented — see the implemented
 paragraph above.
 
-**TRAVERSAL SFX PLAYBACK: CLOSED FOR BUILD_A**
+**2026-10-15 correction: TRAVERSAL SFX PLAYBACK IS PARTIAL.** The
+historical "CLOSED FOR BUILD_A" declaration above the Phase 18A work
+did not cover the owner-confirmed normal/Super Chaingun defects.
+The historical Dummy-driver results establish command/player
+processing, not audible playback or those weapons' original semantics.
+Normal/Super Chaingun restoration remains **NEEDS LOCAL ORIGINAL-BUILD
+VERIFICATION**; see the linked audit. Other historical results are
+retained here as reported, not rerun or newly certified by this audit.
 
 # Phase 18A — Frontend / Menu RE + Core Contract
 

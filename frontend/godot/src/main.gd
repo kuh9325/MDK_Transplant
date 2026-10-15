@@ -6079,8 +6079,8 @@ func _run_smoke(data_root: String) -> void:
 	# Everything above stepped through _step_n, which drains the core
 	# event batch into the voice pool + presenter. The landed jump,
 	# scope enter/exit, scoped fire, and shockwave detonation all
-	# emitted real events; verify they became audible playbacks —
-	# BEFORE the level reload below clears the counters.
+	# emitted events; verify audio commands and player starts BEFORE
+	# the level reload clears counters. Dummy audio cannot verify sound.
 	var ast: Dictionary = bridge.get_audio_stats()
 	print("smoke(audio): banks=%d resolved=%d missing=%d cache=%d " %
 		[int(ast["banks"]), int(ast["resolved"]),

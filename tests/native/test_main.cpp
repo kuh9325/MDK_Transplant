@@ -20342,6 +20342,97 @@ void test_player_fire() {
   }
 }
 
+// Existing player-fire control boundaries only. These checks do not
+// establish which sound, playback operation, or helper the original used.
+void test_player_chaingun_control_boundaries() {
+  using namespace mdk;
+  TraversalRuntime rt;
+  GameplayInputFrame ctrl{};
+  auto* arena = travArenaAdd(rt, "CTRL");
+  rt.cur = arena;
+  rt.cs.arena = &arena->dyn.col;
+  rt.cs.pos[2] = 10.0f;
+  auto& target = arena->dyn.allocFront();
+  target.model = makePlatformModel("T", "E", 0.0f);
+  target.setPosition(6.0f, 0.0f, 15.0f);
+  initObjectCollision(target);
+  const float bounds[6] = {1, -5, 15, 11, 5, 15};
+  std::memcpy(target.col.aabb, bounds, sizeof(bounds));
+  target.health = 1000;
+  rt.fireCadence = 0.75f;
+  rt.wpnSel0 = 2;
+  rt.wpnSel1 = 3;
+
+  // Released input leaves target health, punch jitter, and charge untouched.
+  playerPunch(rt, 2);
+  CHECK(rt.punchTime == 0 && rt.ammo[0] == 0 && target.health == 1000);
+  ctrl.fire = 1;
+  playerFireLatch(rt, ctrl);
+  CHECK(rt.fieldC74 == 1 && rt.seams.fireNotifyCalls == 1);
+  CHECK(rt.eventMag == 0x12c && rt.eventType == 3);
+  playerFireLatch(rt, ctrl);
+  CHECK(rt.seams.fireNotifyCalls == 1);          // held press is one edge
+  playerPunch(rt, 2);
+  CHECK(rt.punchTime == 2 && rt.ammo[0] == 0 && target.health == 998);
+
+  // Charge is selected before draining: overshoot still uses *6 this
+  // frame, removes the type-6 item, then becomes normal on the next call.
+  rt.ammo[0] = 3;
+  rt.inventoryCount = 2;
+  rt.inventory[0].id = 6;
+  rt.inventory[1].id = 2;
+  playerPunch(rt, 2);
+  CHECK(rt.punchTime == 14 && rt.ammo[0] == 1 && target.health == 986);
+  CHECK(rt.inventoryCount == 2 && rt.seams.fireNotifyCalls == 1);
+  playerPunch(rt, 2);
+  CHECK(rt.punchTime == 26 && rt.ammo[0] == 0 && target.health == 974);
+  CHECK(rt.inventoryCount == 1 && rt.inventory[0].id == 2);
+  CHECK(rt.fieldC74 == 1 && rt.seams.fireNotifyCalls == 2);
+  playerPunch(rt, 2);
+  CHECK(rt.punchTime == 28 && rt.seams.fireNotifyCalls == 2 &&
+        target.health == 972);
+
+  ctrl.fire = 0;
+  playerFireLatch(rt, ctrl);
+  playerFireLatch(rt, ctrl);
+  playerPunch(rt, 2);
+  CHECK(rt.fieldC74 == 0 && rt.seams.fireNotifyCalls == 3);
+  CHECK(rt.punchTime == 28 && rt.ammo[0] == 0 && target.health == 972);
+
+  // Rapid release/repress across charge changes preserves every edge.
+  // Exact depletion, as well as overshoot above, keeps its charged frame.
+  rt.ammo[0] = 1;
+  rt.inventory[1].id = 6;
+  rt.inventoryCount = 2;
+  ctrl.fire = 1;
+  rt.eventMag = 0x258;                         // running fire event
+  playerFireLatch(rt, ctrl);
+  CHECK(rt.eventMag == 0x259 && rt.eventType == 6);
+  playerPunch(rt, 1);
+  CHECK(rt.punchTime == 34 && rt.ammo[0] == 0 && target.health == 966);
+  CHECK(rt.inventoryCount == 1 && rt.inventory[0].id == 2);
+  CHECK(rt.seams.fireNotifyCalls == 5);        // press + depletion
+  ctrl.fire = 0;
+  playerFireLatch(rt, ctrl);
+  ctrl.fire = 1;
+  playerFireLatch(rt, ctrl);
+  playerPunch(rt, 1);
+  CHECK(rt.punchTime == 35 && rt.seams.fireNotifyCalls == 7 &&
+        target.health == 965);
+  rt.ammo[0] = 4;
+  playerPunch(rt, 1);
+  CHECK(rt.punchTime == 41 && rt.ammo[0] == 3 && target.health == 959);
+
+  // Priority rejection clears once and prevents further resource drain.
+  rt.eventPriority = 8;
+  playerFireLatch(rt, ctrl);
+  playerFireLatch(rt, ctrl);
+  playerPunch(rt, 1);
+  CHECK(rt.fieldC74 == 0 && rt.seams.fireNotifyCalls == 8);
+  CHECK(rt.punchTime == 41 && rt.ammo[0] == 3 && target.health == 959);
+  CHECK(rt.fireCadence == 0.75f && rt.wpnSel0 == 2 && rt.wpnSel1 == 3);
+}
+
 // Phase 10A — FUN_0045f9b8 shot-pool update, the fly callbacks, the
 // FUN_00460b7c/0x60d44/0x60c08 detonate/splash, FUN_0046771c player
 // damage, and the FUN_00458140/0x581a4 death boundary — all OBSERVED
@@ -28861,6 +28952,149 @@ void test_traversal_audio_mixer() {
   }
 }
 
+// Synthetic named-bank integration: these rates, PCM bytes, volumes,
+// and loop flags are test choices, not original MULTIFIRE/GATTFIRE
+// metadata or evidence of their gameplay mapping/playback semantics.
+void test_traversal_named_sni_audio() {
+  using namespace mdk;
+  const auto multi = SyntheticWave::build(1, 1, 8000, 8,
+                                         {0x80, 0x00, 0xff, 0x42});
+  const auto gatt = SyntheticWave::build(1, 1, 16000, 16,
+                                        {0x1234, -4, 0x7fff});
+  const auto other = SyntheticWave::build(1, 1, 6000, 8, {0x44, 0x55});
+  const auto multiSize = static_cast<std::uint32_t>(multi.buf.size());
+  const auto gattSize = static_cast<std::uint32_t>(gatt.buf.size());
+  const auto otherSize = static_cast<std::uint32_t>(other.buf.size());
+  constexpr std::uint32_t multiMeta = 0x34560000;
+  constexpr std::uint32_t gattMeta = 0x67890001;
+  constexpr std::uint32_t otherMeta = 0x12340001;
+
+  const auto bankWith = [&](std::initializer_list<
+                            std::tuple<const char*, std::uint32_t,
+                                       std::uint32_t>> records) {
+    auto bank = SyntheticSni::build("TEST.SND", records);
+    const auto dir = inspectSniDirectory(bank.buf);
+    CHECK(dir.status == SniDirectoryStatus::kOk);
+    for (const auto& entry : dir.entries) {
+      const auto& wave = entry.name() == "MULTIFIRE" ? multi :
+                         entry.name() == "GATTFIRE" ? gatt : other;
+      std::copy(wave.buf.begin(), wave.buf.end(),
+                bank.buf.begin() + entry.payloadFileOffset());
+    }
+    return bank;
+  };
+  const auto resolveBank = [](const SyntheticSni& bank,
+                              const std::string& name,
+                              TraversalAudioSoundDef& def) {
+    const auto dir = inspectSniDirectory(bank.buf);
+    if (dir.status != SniDirectoryStatus::kOk) return false;
+    for (const auto& entry : dir.entries) {
+      if (entry.isSentinel() || entry.name() != name) continue;
+      SniWave wave;
+      const auto payload = std::span<const std::byte>(bank.buf).subspan(
+          entry.payloadFileOffset(), entry.payloadSize);
+      const auto status = decodeSniWave(payload, &wave);
+      CHECK(status == SniWaveStatus::kOk);
+      if (status != SniWaveStatus::kOk) return false;
+      if (name == "MULTIFIRE") {
+        CHECK(wave.pcm == (std::vector<std::uint8_t>{0x80, 0x00, 0xff, 0x42}));
+        CHECK(wave.frames == 4 && wave.bitsPerSample == 8);
+      } else if (name == "GATTFIRE") {
+        CHECK(wave.pcm == (std::vector<std::uint8_t>{
+            0x34, 0x12, 0xfc, 0xff, 0xff, 0x7f}));
+        CHECK(wave.frames == 3 && wave.bitsPerSample == 16);
+      }
+      def.volume = static_cast<int>(entry.fieldAt0x0C >> 16);
+      def.loop = (entry.fieldAt0x0C & 1) != 0;
+      def.rateHz = wave.rateHz;
+      def.frames = static_cast<std::uint32_t>(wave.frames);
+      return true;
+    }
+    return false;
+  };
+
+  const auto full = bankWith({{"MULTIFIRE", multiMeta, multiSize},
+                               {"GATTFIRE", gattMeta, gattSize},
+                               {"UNRELATED", otherMeta, otherSize}});
+  const auto originalBytes = full.buf;
+  const TraversalAudioMixer::ResolveFn resolve =
+      [&](const std::string& name, TraversalAudioSoundDef& def) {
+        return resolveBank(full, name, def);
+      };
+  TraversalAudioMixer mixer;
+  mixer.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "UNRELATED"),
+                   resolve);
+  drained(mixer);
+  mixer.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "MULTIFIRE"),
+                   resolve);
+  mixer.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "GATTFIRE"),
+                   resolve);
+  const auto starts = drained(mixer);
+  CHECK(starts.size() == 2 && mixer.activeCount() == 3);
+  if (starts.size() == 2) {
+    CHECK(starts[0].op == TraversalAudioCmdOp::kStart &&
+          starts[0].name == "MULTIFIRE");
+    CHECK(starts[0].vol == 0x3456 && starts[0].rateHz == 8000 &&
+          starts[0].freqHz == 8000 && !starts[0].loop);
+    CHECK(starts[1].op == TraversalAudioCmdOp::kStart &&
+          starts[1].name == "GATTFIRE");
+    CHECK(starts[1].vol == 0x6789 && starts[1].rateHz == 16000 &&
+          starts[1].freqHz == 16000 && starts[1].loop);
+    CHECK(starts[0].handle != starts[1].handle);
+  }
+  for (const char* name : {"MULTIFIRE", "GATTFIRE"})
+    mixer.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, name), resolve);
+  CHECK(drained(mixer).empty() && mixer.activeCount() == 3);
+  mixer.tick(1.0, kNoOwner);                 // synthetic 4/8000s duration
+  const auto finished = drained(mixer);
+  CHECK(finished.size() == 1);
+  if (finished.size() == 1)
+    CHECK(finished[0].op == TraversalAudioCmdOp::kStop &&
+          finished[0].name == "MULTIFIRE");
+  CHECK(!mixer.nameActive("MULTIFIRE") && mixer.nameActive("GATTFIRE"));
+  mixer.applyEvent(mkEv(TraversalAudioOp::kStop, "GATTFIRE"), resolve);
+  const auto stopped = drained(mixer);
+  CHECK(stopped.size() == 1);
+  if (stopped.size() == 1)
+    CHECK(stopped[0].op == TraversalAudioCmdOp::kStop &&
+          stopped[0].name == "GATTFIRE");
+  CHECK(mixer.activeCount() == 1 && mixer.nameActive("UNRELATED"));
+  CHECK(full.buf == originalBytes);           // source PCM stays verbatim
+
+  const SyntheticSni partial[] = {
+      bankWith({{"MULTIFIRE", multiMeta, multiSize},
+                 {"UNRELATED", otherMeta, otherSize}}),
+      bankWith({{"GATTFIRE", gattMeta, gattSize},
+                 {"UNRELATED", otherMeta, otherSize}}),
+      bankWith({{"UNRELATED", otherMeta, otherSize}})};
+  for (int i = 0; i < 3; ++i) {
+    TraversalAudioMixer missing;
+    const TraversalAudioMixer::ResolveFn partialResolve =
+        [&](const std::string& name, TraversalAudioSoundDef& def) {
+          return resolveBank(partial[i], name, def);
+        };
+    missing.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, "UNRELATED"),
+                       partialResolve);
+    drained(missing);
+    for (const char* name : {"MULTIFIRE", "GATTFIRE"})
+      missing.applyEvent(mkEv(TraversalAudioOp::kEnsurePlaying, name),
+                         partialResolve);
+    const auto commands = drained(missing);
+    CHECK(missing.missingCount() == (i == 2 ? 2 : 1));
+    CHECK(missing.activeCount() == (i == 2 ? 1 : 2));
+    CHECK(commands.size() == (i == 2 ? 0u : 1u));
+    CHECK(missing.nameActive("UNRELATED"));
+    CHECK(missing.nameActive("MULTIFIRE") == (i == 0));
+    CHECK(missing.nameActive("GATTFIRE") == (i == 1));
+    if (!commands.empty()) {
+      CHECK(commands[0].op == TraversalAudioCmdOp::kStart);
+      CHECK(commands[0].name == (i == 0 ? "MULTIFIRE" : "GATTFIRE"));
+      CHECK(commands[0].rateHz == (i == 0 ? 8000 : 16000));
+      CHECK(commands[0].vol == (i == 0 ? 0x3456 : 0x6789));
+    }
+  }
+}
+
 // Zone ambience — FUN_00431e50 (resolve) + FUN_00431cf4 (crossfade).
 // The tick reads the current arena's CMI table-3 record structure head
 // {lenstr A, lenstr B, u32} and drives fades through rt.audioFx.
@@ -33582,6 +33816,7 @@ int main() {
   test_player_animation();
   test_player_sniper();
   test_player_fire();
+  test_player_chaingun_control_boundaries();
   test_player_projectiles();
   test_traversal_damage_dispatch();
   test_traversal_residual_dispatch();
@@ -33617,6 +33852,7 @@ int main() {
   test_sni_wave();
   test_traversal_audio_dsp();
   test_traversal_audio_mixer();
+  test_traversal_named_sni_audio();
   test_traversal_zone_ambience();
   test_lbb_image();
   test_thmb_capture();
