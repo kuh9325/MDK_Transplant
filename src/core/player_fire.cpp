@@ -632,6 +632,10 @@ void playerWeaponSelect(TraversalRuntime& rt,
 // FUN_00432f84 — the normal-mode punch hitscan. `frameStep` is
 // timing.frameStep (0x49b6e8). Phase 10A: the full damage/death tail
 // is ported (shared boundary with player_projectiles).
+// Gun audio remains unimplemented: the registered MULTIFIRE/GATTFIRE
+// names alone do not establish normal/charged mapping or playback
+// semantics. FUN_00469668's direct audio role is also UNKNOWN.
+// See docs/reverse-engineering/KURT_CHAINGUN_AUDIO.md before wiring it.
 // ---------------------------------------------------------------------------
 
 void playerPunch(TraversalRuntime& rt, int frameStep) {
