@@ -105,6 +105,14 @@ regressions pass.
 
 ## Minimal read-only verification on the owner's Mac
 
+2026-10-16: a runnable, guarded Ghidra helper is now available at
+[`tools/ghidra/MdkChaingunAudit.java`](../../tools/ghidra/MdkChaingunAudit.java).
+Start with its [local procedure and compact return table](../../tools/ghidra/README.md).
+It uses an existing project with `-process -readOnly -noanalysis`, prints
+reference/call/flow metadata, and never exports instruction/decompiler
+bodies. Its index locates candidate consumers; the local UI review must
+establish actual arguments, predicates, aliases, and runtime ordering.
+
 Use the existing legal installation and private analysis in place. Do not
 upload binaries, SNI payloads, private analysis files, or substantial
 disassembly. Return only compact text findings with build hash, address,
@@ -175,8 +183,9 @@ PY
 
 In the matching existing private analysis project, inspect the following
 without saving or exporting proprietary analysis into this repository.
-The private helper script argument formats are not committed, so no
-unverified headless CLI syntax is prescribed here.
+The public helper's procedure gives the exact headless command and
+explains its guard, incomplete-report, and truncation signals; the older
+private scripts are not required.
 
 | Target | Minimal finding needed |
 |---|---|
